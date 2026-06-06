@@ -7,6 +7,33 @@ mod search;
 pub use pull::{pull, ImageConfig, OciError};
 pub use search::{search, SearchResult};
 
+/// Fuzzing surface — **not** part of the public API (hidden from docs, no stability guarantee). It
+/// exposes the pure functions that parse untrusted registry input so the `fuzz/` harness can drive
+/// them. See `fuzz/README.md`.
+#[doc(hidden)]
+pub mod __fuzz {
+    /// Drive the registry-JSON string scanner over arbitrary input — it must never panic (e.g. on a
+    /// non-UTF-8-boundary slice) no matter how malformed the bytes are.
+    pub fn json_walk(s: &str) {
+        use crate::json::*;
+        let _ = matching_bracket(s, 0, b'{', b'}');
+        let _ = array_after(s, "layers");
+        let _ = object_after(s, "config");
+        let _ = str_array_after(s, "diff_ids");
+        let _ = split_objects(s);
+        let _ = value_after_colon(s);
+        let _ = first_str(s, "digest");
+        let _ = all_str_values(s, "digest");
+        let _ = u64_field(s, "size");
+        let _ = bool_field(s, "ok");
+    }
+
+    /// The tar-member-path escape check: would extracting `p` escape the rootfs?
+    pub fn unsafe_member_path(p: &str) -> bool {
+        crate::pull::unsafe_member_path(p)
+    }
+}
+
 use std::path::PathBuf;
 
 /// Returns `true` if every component of `dir` under `rootfs_dir` is a REAL directory (none is

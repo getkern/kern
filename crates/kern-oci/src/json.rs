@@ -92,13 +92,18 @@ pub(crate) fn split_objects(arr: &str) -> Vec<&str> {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'{' {
-            if let Some(end) = matching_bracket(arr, i, b'{', b'}') {
-                out.push(&arr[i..=end]);
-                i = end + 1;
-                continue;
-            }
+            // A `{` either opens a complete object (jump past its close) or is unbalanced — and if it
+            // doesn't close, no later brace can either, so stop. Advancing by one instead would
+            // rescan to end-of-input for every unmatched `{`: O(n^2), a parse-time DoS on a crafted
+            // array of open braces. (Found by the `oci_json` fuzz target.)
+            let Some(end) = matching_bracket(arr, i, b'{', b'}') else {
+                break;
+            };
+            out.push(&arr[i..=end]);
+            i = end + 1;
+        } else {
+            i += 1;
         }
-        i += 1;
     }
     out
 }
