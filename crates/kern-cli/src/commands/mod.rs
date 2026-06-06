@@ -39,7 +39,7 @@ pub fn help() -> Result<(), Error> {
     {c}top{z}                                                            Interactive task manager (TUI)
     {c}stats{z} [--json]                                                 Per-box memory + CPU
     {c}logs{z} <name>                                                    Show a box's output
-    {c}stop{z} <name>                                                    Stop running box(es)
+    {c}stop{z} <name>... | --all                                         Stop box(es), or all
     {c}run{z}        Run with resource limits               {d}(roadmap){z}
 
 {b}OPTIONS for box:{z}
@@ -938,24 +938,48 @@ fn scratch_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/kern-{uid}/scratch"))
 }
 
-/// `kern stop <name>` — stop running box(es) with that name: SIGKILL the supervisor's process
-/// group (which tears down the box's PID namespace), drop the registry entry, and remove the
-/// writable scratch.
-pub fn stop(name: &str) -> Result<(), Error> {
+/// `kern stop <name>... | --all` — stop running box(es): SIGKILL each target supervisor's process
+/// group (tearing down the box's PID namespace), drop its registry entry, and remove its writable
+/// scratch. Stops every name in `names` (a name may match more than one box if names ever collide),
+/// or — with `all` — every running box. A requested name that isn't running is reported on stderr
+/// (never silently ignored); the command succeeds as long as at least one box was stopped.
+pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     let dir = registry::dir().map_err(|e| Error::Sandbox(format!("registry: {e}")))?;
-    let matches: Vec<_> = registry::list()
-        .into_iter()
-        .filter(|b| b.name == name)
-        .collect();
-    if matches.is_empty() {
-        return Err(Error::Sandbox(format!("no running box named '{name}'")));
+    let running = registry::list();
+    let targets: Vec<_> = if all {
+        running
+    } else {
+        running
+            .into_iter()
+            .filter(|b| names.iter().any(|n| n == &b.name))
+            .collect()
+    };
+    if targets.is_empty() {
+        return Err(Error::Sandbox(if all {
+            "no running boxes to stop".to_string()
+        } else {
+            let listed = names
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("no running box named {listed}")
+        }));
     }
-    for b in matches {
+    for b in &targets {
         // The supervisor `setsid`-ed, so its pgid == its pid; the box shares the group.
         unsafe { libc::kill(-b.pid, libc::SIGKILL) };
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
         cleanup_box_scratch(&b.rootfs);
         println!("stopped '{}' (pid {})", b.name, b.pid);
+    }
+    // Don't silently ignore names that matched no running box.
+    if !all {
+        for n in names {
+            if !targets.iter().any(|b| &b.name == n) {
+                eprintln!("kern: no running box named '{n}'");
+            }
+        }
     }
     Ok(())
 }

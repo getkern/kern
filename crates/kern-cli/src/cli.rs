@@ -53,9 +53,10 @@ pub enum Command {
         env: Vec<String>,
         workdir: Option<String>,
     },
-    /// `kern stop <name>`: stop running box(es) by name.
+    /// `kern stop <name>... | --all`: stop running box(es) by name, or every running box.
     Stop {
-        name: String,
+        names: Vec<String>,
+        all: bool,
     },
     /// `kern pull <image> [--dest <dir>]`: download an OCI image into a rootfs.
     Pull {
@@ -125,12 +126,19 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             json: rest.contains(&"--json"),
         },
         // `stop <name>`: stop running box(es).
-        Some("stop") => match rest.get(1) {
-            Some(n) if !n.starts_with('-') => Command::Stop {
-                name: (*n).to_string(),
-            },
-            _ => return Err(Error::Usage("stop <name>")),
-        },
+        Some("stop") => {
+            let all = rest.iter().any(|a| *a == "--all" || *a == "-a");
+            let names: Vec<String> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if !all && names.is_empty() {
+                return Err(Error::Usage("stop <name>... | stop --all"));
+            }
+            Command::Stop { names, all }
+        }
         // `ps`: list running boxes.
         Some("ps") => Command::Ps {
             json: rest.contains(&"--json"),
@@ -365,7 +373,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
         Command::Pull { image, dest } => commands::pull(&image, dest.as_deref()),
-        Command::Stop { name } => commands::stop(&name),
+        Command::Stop { names, all } => commands::stop(&names, all),
         Command::Ps { json } => commands::ps(json),
         Command::Stats { json } => commands::stats(json),
         Command::Logs { name } => commands::logs(&name),
@@ -406,6 +414,39 @@ mod tests {
             parse(&["box".into(), "web".into()]).unwrap().1,
             Command::BoxRun { name, rootfs: None, image: None, .. } if name == "web"
         ));
+    }
+
+    #[test]
+    fn stop_takes_multiple_names_or_all() {
+        // Multiple names are ALL captured (the old parser silently kept only the first).
+        let cmd = parse(&["stop".into(), "a".into(), "b".into(), "c".into()])
+            .unwrap()
+            .1;
+        assert_eq!(
+            cmd,
+            Command::Stop {
+                names: vec!["a".into(), "b".into(), "c".into()],
+                all: false,
+            }
+        );
+        // `--all` sets the flag; names may be empty.
+        assert_eq!(
+            parse(&["stop".into(), "--all".into()]).unwrap().1,
+            Command::Stop {
+                names: vec![],
+                all: true
+            }
+        );
+        // Flags are not captured as names: `stop --all x` keeps all=true and name x.
+        assert_eq!(
+            parse(&["stop".into(), "--all".into(), "x".into()])
+                .unwrap()
+                .1,
+            Command::Stop {
+                names: vec!["x".into()],
+                all: true
+            }
+        );
     }
 
     #[test]
