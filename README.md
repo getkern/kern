@@ -91,7 +91,7 @@ scp kern pi:  &&  ssh pi 'kern box edge --image alpine -- ./agent'
 kern box audit --image alpine --plan
 ```
 
-## Features (0.5)
+## Features
 
 **Run anything, isolated:**
 
@@ -445,7 +445,7 @@ method + caveats in **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Project status
 
-**0.5 — a feature-complete sandbox & resource runtime.** Everything in [Features](#features-05) works
+**0.5.7 — a feature-complete sandbox & resource runtime.** Everything in [Features](#features) works
 today and is tested (214 tests, clippy-clean, `cargo-deny`-clean, security-audited slice by slice);
 the isolation is real. The CLI and config surface are **not frozen until 1.0**.
 
@@ -459,10 +459,10 @@ in CI ([Platforms](#platforms)).
 kern starts as a small, fast sandbox/OCI runtime and grows deliberately. The set of resources it
 governs is driven by what proves useful, not a fixed list.
 
-### Shipped in 0.5 ✅
+### Shipped in 0.5.7 ✅
 
 kern grew from a fast sandbox/OCI runtime into a **feature-complete daemonless container +
-resource runtime** — everything in [Features](#features-05) landed and is tested/audited:
+resource runtime** — everything in [Features](#features) landed and is tested/audited:
 
 - ✅ **Full volume system** — bind, named (`kern volume` CRUD + quota), and network (`nfs`/`smb`/`sshfs`).
 - ✅ **Secrets** (`--secret`) and an **in-box SSH** workspace (`--ssh`).
