@@ -50,6 +50,8 @@ pub fn help() -> Result<(), Error> {
     -v, --volume S:D[:ro]   Bind-mount a host path into the box (repeatable)
     -e, --env K=V       Set an environment variable (repeatable)
     -w, --workdir <dir> Working directory inside the box
+    -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default 512m)
+    --cpus <n>          CPU cap in cores (e.g. 1.5, 2; default uncapped)
     --net               Share the host network (outbound; no network isolation)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
                         only the caller (faster + more isolated)
@@ -98,6 +100,10 @@ pub struct BoxRunArgs<'a> {
     pub share_net: bool,
     pub uid_range: bool,
     pub bind_rootfs: bool,
+    /// `--memory`/`-m`: hard memory ceiling in bytes (default cap if `None`).
+    pub memory: Option<u64>,
+    /// `--cpus`: CPU cap in cores, K8s semantics (uncapped if `None`).
+    pub cpus: Option<f64>,
 }
 
 /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-v ...] [--env ...] [-- cmd...]` — run
@@ -110,9 +116,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let volumes = parse_volumes(args.volumes)?;
     let env = parse_envs(args.env)?;
     // Robust resource caps: re-exec this whole invocation inside a transient systemd user scope
-    // with memory + task limits (proper cgroup delegation). No-op if already scoped or if
-    // systemd --user isn't available — then the best-effort cgroup in run_in_sandbox applies.
-    reexec_in_scope_if_possible();
+    // with memory + task limits (proper cgroup delegation). The scope's caps track `--memory`/
+    // `--cpus` so the outer scope never strangles a box that asked for more. No-op if already
+    // scoped or if systemd --user isn't available — then the best-effort cgroup in run_in_sandbox
+    // applies the same caps.
+    reexec_in_scope_if_possible(args.memory, args.cpus);
 
     // `--bind-rootfs` only makes sense for a real `--rootfs` directory: an `--image` must stay an
     // immutable, shareable overlay (the cache is read-only and shared across boxes), and a bind
@@ -152,6 +160,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         share_net: args.share_net,
         uid_range: args.uid_range,
         bind_rootfs: args.bind_rootfs,
+        memory: args.memory,
+        cpus: args.cpus,
     })?;
 
     if args.detached {
@@ -179,6 +189,8 @@ struct BuildSpec<'a> {
     share_net: bool,
     uid_range: bool,
     bind_rootfs: bool,
+    memory: Option<u64>,
+    cpus: Option<f64>,
 }
 
 /// Build the sandbox spec. **Always an overlay** (the image/rootfs is the read-only lower; a
@@ -221,6 +233,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
             workdir: b.workdir,
             share_net: b.share_net,
             uid_range: b.uid_range,
+            memory_max: b.memory,
+            cpus: b.cpus,
         };
         return Ok((spec, None));
     }
@@ -262,6 +276,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         workdir: b.workdir,
         share_net: b.share_net,
         uid_range: b.uid_range,
+        memory_max: b.memory,
+        cpus: b.cpus,
     };
     Ok((spec, Some(scratch)))
 }
@@ -478,7 +494,7 @@ const SCOPE_TASKS_MAX: &str = "TasksMax=512";
 /// the whole `kern` invocation under `systemd-run --user --scope` with cgroup caps, so the
 /// sandbox (and any fork bomb in it) is hard-limited. This replaces the process on success; on
 /// any failure it returns and the caller falls back to the best-effort cgroup path.
-fn reexec_in_scope_if_possible() {
+fn reexec_in_scope_if_possible(memory: Option<u64>, cpus: Option<f64>) {
     use std::os::unix::process::CommandExt;
 
     if std::env::var_os("KERN_SCOPE").is_some() {
@@ -496,23 +512,31 @@ fn reexec_in_scope_if_possible() {
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // The scope's memory cap tracks `--memory` (so the outer scope never caps a box below what it
+    // asked for); `--cpus` maps to a CPUQuota. Swap stays 0 (hard cap) and TasksMax stays default.
+    let mem_prop = match memory {
+        Some(b) => format!("MemoryMax={b}"),
+        None => SCOPE_MEMORY_MAX.to_string(),
+    };
+    let mut props: Vec<String> = vec![
+        "-p".into(),
+        mem_prop,
+        "-p".into(),
+        SCOPE_SWAP_MAX.into(),
+        "-p".into(),
+        SCOPE_TASKS_MAX.into(),
+    ];
+    if let Some(c) = cpus {
+        props.push("-p".into());
+        props.push(format!("CPUQuota={}%", (c * 100.0).round() as u64));
+    }
     let mut cmd = std::process::Command::new("systemd-run");
-    cmd.args([
-        "--user",
-        "--scope",
-        "--quiet",
-        "--collect",
-        "-p",
-        SCOPE_MEMORY_MAX,
-        "-p",
-        SCOPE_SWAP_MAX,
-        "-p",
-        SCOPE_TASKS_MAX,
-        "--",
-    ])
-    .arg(self_exe)
-    .args(&args)
-    .env("KERN_SCOPE", "1");
+    cmd.args(["--user", "--scope", "--quiet", "--collect"])
+        .args(&props)
+        .arg("--")
+        .arg(self_exe)
+        .args(&args)
+        .env("KERN_SCOPE", "1");
     // exec() only returns on failure → fall through to the best-effort path.
     let _ = cmd.exec();
 }

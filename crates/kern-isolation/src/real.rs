@@ -53,6 +53,11 @@ pub struct SandboxSpec {
     /// isolated. Needed only for workloads that use multiple uids inside the box (`apt`/`dpkg`,
     /// daemons that drop to `www-data`, …).
     pub uid_range: bool,
+    /// Hard memory ceiling in bytes for the box's cgroup (`--memory`). `None` → the default cap.
+    pub memory_max: Option<u64>,
+    /// CPU cap in cores (`--cpus`, K8s semantics: 1.5 = 1½ cores). `None` → uncapped. Best-effort:
+    /// silently skipped where the cgroup CPU controller isn't delegated (e.g. some Android kernels).
+    pub cpus: Option<f64>,
 }
 
 /// overlayfs directories. `lower` is the read-only image; `upper`/`work` are the writable layer.
@@ -914,7 +919,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
 
     // Best-effort cgroup v2 cap (memory + PIDs) BEFORE namespacing, so the forked workload
     // inherits it. Degrades gracefully where the hierarchy isn't delegated.
-    let _cg = crate::cgroup::apply_limits(&spec.hostname);
+    let _cg = crate::cgroup::apply_limits(&spec.hostname, spec.memory_max, spec.cpus);
 
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };

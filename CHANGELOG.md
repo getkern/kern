@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to SemVer.
 Pre-1.0: the CLI and config surface are NOT frozen; minor versions may break them.
 
+## [Unreleased] — 0.4 (in progress)
+
+### Added
+- **`--memory`/`-m` and `--cpus` per box** — tunable resource caps (previously a fixed 512 MiB /
+  uncapped CPU). `--memory 512m|1g|<bytes>` sets a hard memory ceiling (the box is OOM-killed at the
+  limit); `--cpus 1.5` caps CPU to 1½ cores (K8s semantics, clamped to the host's CPU count). Both
+  the transient systemd scope and the best-effort in-namespace cgroup honor them; the CPU cap is
+  best-effort where the cgroup CPU controller isn't delegated (e.g. some Android kernels).
+
 ## [0.3.3] — contextual hint for box-not-running errors
 
 ### Fixed
