@@ -6,9 +6,11 @@ governed slice of the machine: CPU, memory, process and filesystem.
 Kernel-enforced (user namespaces + cgroups v2 + seccomp + pivot_root/overlayfs), no daemon,
 tiny footprint. The same model is designed to extend to GPUs and other devices.
 
-> **Status: 0.1 — early.** This is the foundation: the workspace, the module/test architecture,
-> and the first hardened pieces (OCI whiteout path-safety, the sandbox characterization seam).
-> The full runtime lands as it grows (see **[Direction](#direction)**). **The CLI and config
+> **Status: 0.2 — early.** Foundation + the first hardened internals: the mount-ordering
+> **typestate** (remounting the root read-only before pivoting in is a *compile* error, not a
+> sandbox-escape bug), the step sequence, and OCI whiteout path-safety — all behind a
+> characterization harness. Try `kern box <name> --plan` to print the isolation sequence. The
+> full runtime lands as it grows (see **[Direction](#direction)**). **The CLI and config
 > surface are NOT frozen until 1.0.**
 
 ## What it is
@@ -33,7 +35,7 @@ reproducible here as the runtime lands per the roadmap):
   + seccomp). That is the load-bearing guarantee — the one kern actually makes.
 - **Cross-arch:** validated by **manual runs** on x86_64, NVIDIA Jetson (L4T/aarch64),
   Raspberry Pi 5, and an Android-Debian aarch64 board. Automated ARM CI is tracked in the
-  issues — at 0.1, "ARM works" is manual-validated, not CI-proven.
+  issues — for now "ARM works" is manual-validated, not CI-proven.
 
 ## Build & try
 

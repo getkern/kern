@@ -1,12 +1,67 @@
 //! Sandbox setup.
 //!
-//! 0.1 scaffold: the real setup (user namespace, mounts, pivot_root, seccomp, exec) lands per
-//! the roadmap (0.2 = the step-sequence + mount-ordering typestate refactor). It is expressed
-//! against the [`kern_isolation::MountOps`] seam so the mount/pivot sequence is characterized
-//! (recorded & asserted byte-identical) before and after that refactor.
+//! 0.2 lands the **step sequence** and wires it to the `kern-isolation` mount-ordering
+//! typestate. [`SandboxCtx`] holds the resolved configuration; [`SandboxCtx::build_root`] runs
+//! the ordered mount steps against any [`MountOps`] — the real libc impl (privileged) and the
+//! `Recorder` (used by `kern box <name> --plan`) share the exact same sequence.
+//!
+//! The remaining post-fork steps (user namespace, seccomp, exec) are privileged and land with
+//! the real-syscall layer (0.3); they are NOT faked here.
 
-#[allow(unused_imports)]
-use kern_isolation::{overlay_ro_sequence, MountOps};
+use kern_common::BoxName;
+use kern_isolation::{MountMode, MountOps, Recorder, Rootfs};
 
-// Intentionally empty at 0.1 beyond the re-export above; this module is the home of the
-// step-sequence runner (`steps/`) and the `MountMode` enum + `Rootfs<State>` typestate.
+/// Resolved configuration for one sandbox.
+pub(crate) struct SandboxCtx {
+    /// Validated box name (no path separators / traversal — see [`BoxName`]).
+    pub name: BoxName,
+    /// New-root path the box's filesystem is assembled at.
+    pub root: String,
+    /// How the root filesystem is provided.
+    pub mode: MountMode,
+}
+
+impl SandboxCtx {
+    /// A context for box `name`, with the default overlay root layout. The root path is
+    /// derived, not yet created — `--plan` only records the sequence.
+    pub fn new(name: BoxName) -> Self {
+        let root = format!("/var/lib/kern/{}/rootfs", name.as_str());
+        SandboxCtx {
+            name,
+            root,
+            mode: MountMode::Overlay,
+        }
+    }
+
+    /// Run the ordered mount steps against `ops`. The ordering (pivot before read-only) is
+    /// enforced by the `Rootfs<State>` typestate, so an out-of-order edit is a COMPILE error,
+    /// not a sandbox-escape bug.
+    pub fn build_root<M: MountOps>(&self, ops: &mut M) {
+        Rootfs::mount(ops, self.mode, &self.root)
+            .create_old_root(ops)
+            .into_readonly(ops);
+    }
+
+    /// The isolation plan as an ordered, human-readable list — privilege-free, used by
+    /// `kern box <name> --plan` to show exactly what the sandbox setup would do.
+    pub fn plan(&self) -> Vec<String> {
+        let mut rec = Recorder::default();
+        self.build_root(&mut rec);
+        rec.calls
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_is_ordered_mount_pivot_readonly() {
+        let ctx = SandboxCtx::new(BoxName::parse("web").unwrap());
+        let plan = ctx.plan();
+        assert_eq!(plan.len(), 3);
+        assert!(plan[0].starts_with("mount(overlay,/var/lib/kern/web/rootfs"));
+        assert!(plan[1].starts_with("pivot("));
+        assert_eq!(plan[2], "remount_ro(/)");
+    }
+}
