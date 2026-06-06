@@ -10,7 +10,8 @@ CPU and memory — kernel-enforced, with no daemon and a ~1 MB binary.
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-informational.svg)](#install)
-[![Status: 0.5](https://img.shields.io/badge/status-0.5%20%E2%80%94%20feature--complete%20sandbox-brightgreen.svg)](#project-status)
+[![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
+[![Status: feature-complete sandbox](https://img.shields.io/badge/status-feature--complete%20sandbox-brightgreen.svg)](#project-status)
 
 <p align="center">
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in 5.5 ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1 MB static binary, no daemon.">
