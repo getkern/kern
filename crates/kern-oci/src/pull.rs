@@ -5,7 +5,9 @@
 //! applies OCI whiteouts — with the symlink-escape guard from [`crate::whiteout_dir_symlink_free`].
 //!
 //! Tooling: `curl` (TLS, auth, redirects) and GNU `tar` (gzip + traversal-safe extraction, no
-//! `-P`). Anonymous Docker Hub auth is supported out of the box.
+//! `-P`). Authentication follows the standard registry-v2 `WWW-Authenticate` challenge, so any
+//! compliant registry works (Docker Hub, GHCR, GitLab, quay, Harbor, self-hosted) — anonymously, or
+//! with `kern login` credentials (sent off-argv). All requests are https-pinned.
 //!
 //! Hardening (adversarial images): every blob is verified to hash to its `sha256:` digest
 //! ([`verify_digest`]) before use. Each layer is then vetted ([`check_layer_safe`]: no
@@ -15,7 +17,9 @@
 //! a later layer's writes, so the cross-layer escape class is closed structurally, not by
 //! trusting tar.
 
-use crate::json::{all_str_values, array_after, first_str, split_objects};
+use crate::json::{
+    all_str_values, array_after, first_str, object_after, split_objects, str_array_after,
+};
 use crate::net::curl;
 use crate::whiteout_dir_symlink_free;
 use std::path::Path;
@@ -49,26 +53,46 @@ impl std::fmt::Display for OciError {
 
 impl std::error::Error for OciError {}
 
-/// Pull `image` into `dest` (created if needed), producing a usable rootfs. Progress is reported
-/// to **stderr** (so stdout stays clean) — the user always sees what's happening, never a silent
-/// hang.
-pub fn pull(image: &str, dest: &Path) -> Result<(), OciError> {
+/// An image's runtime configuration, read from its OCI config blob — the defaults `kern box --image`
+/// applies (explicit CLI flags win) so an official image runs like `docker run`, not a bare shell.
+#[derive(Debug, Default, Clone)]
+pub struct ImageConfig {
+    /// `config.Entrypoint` — prepended to the command.
+    pub entrypoint: Vec<String>,
+    /// `config.Cmd` — the default command (used when the user gives none).
+    pub cmd: Vec<String>,
+    /// `config.Env` — `KEY=VALUE` strings, applied UNDER the user's `--env` (user wins).
+    pub env: Vec<String>,
+    /// `config.WorkingDir` — default working directory.
+    pub workdir: Option<String>,
+    /// `config.User` — default `uid[:gid]` / name.
+    pub user: Option<String>,
+}
+
+/// Pull `image` into `dest` (created if needed), producing a usable rootfs, and return its OCI
+/// runtime config (entrypoint/cmd/env/workdir/user). Progress is reported to **stderr** (so stdout
+/// stays clean) — the user always sees what's happening, never a silent hang.
+pub fn pull(image: &str, dest: &Path) -> Result<ImageConfig, OciError> {
     eprintln!("→ resolving {image} ({})", current_arch());
     let (registry, repo, reference) = parse_ref(image)?;
-    let token = auth_token(&registry, &repo)?;
+    let auth = discover_auth(&registry, &repo)?;
 
-    let manifest = fetch_manifest(&registry, &repo, &reference, &token)?;
+    let manifest = fetch_manifest(&registry, &repo, &reference, &auth)?;
     let manifest = if is_manifest_list(&manifest) {
         let digest = select_arch_digest(&manifest)
             .ok_or_else(|| OciError::Registry(format!("no manifest for {}", current_arch())))?;
-        fetch_manifest(&registry, &repo, &digest, &token)?
+        fetch_manifest(&registry, &repo, &digest, &auth)?
     } else {
         manifest
     };
 
+    // The image's runtime config (entrypoint/env/…) lives in a small blob the manifest points at.
+    // Best-effort: a missing/odd config just yields defaults, never fails the pull.
+    let config = fetch_config(&registry, &repo, &manifest, &auth, dest);
+
     let layers = layer_digests(&manifest);
     if layers.is_empty() {
-        return Err(OciError::Registry("no layers in manifest".into()));
+        return Err(manifest_error(&manifest, &registry, &repo));
     }
     let total = layers.len();
     eprintln!(
@@ -77,10 +101,107 @@ pub fn pull(image: &str, dest: &Path) -> Result<(), OciError> {
     );
     std::fs::create_dir_all(dest).map_err(|e| OciError::Extract(e.to_string()))?;
     for (i, digest) in layers.iter().enumerate() {
-        extract_layer(&registry, &repo, digest, &token, dest, i + 1, total)?;
+        extract_layer(&registry, &repo, digest, &auth, dest, i + 1, total)?;
     }
     eprintln!("✓ pulled {image} → {} ({total} layers)", dest.display());
+    Ok(config)
+}
+
+/// Fetch and parse the image's OCI config blob (the descriptor is in `manifest.config`). Best-effort:
+/// any failure (missing descriptor, network, digest mismatch) returns the default config rather than
+/// failing the pull — the box just falls back to a shell / the user's flags. The blob is
+/// sha256-verified against its digest before use, like every other blob.
+fn fetch_config(
+    registry: &str,
+    repo: &str,
+    manifest: &str,
+    auth: &Auth,
+    dest: &Path,
+) -> ImageConfig {
+    let Some(digest) = object_after(manifest, "config").and_then(|d| first_str(d, "digest")) else {
+        return ImageConfig::default();
+    };
+    let tmp = dest.join(".kern-image-config.json");
+    let tmp_s = tmp.to_string_lossy().into_owned();
+    let url = format!("https://{registry}/v2/{repo}/blobs/{digest}");
+    // Independent size guard checked AFTER the download, BEFORE we read the blob into memory: curl's
+    // `--max-filesize` only aborts a transfer whose length is known in advance, so a hostile registry
+    // could stream a huge Content-Length-less body. A real config blob is a few KB; refuse over 4 MB.
+    const MAX_CONFIG_BYTES: u64 = 4_000_000;
+    let within_cap = || {
+        std::fs::metadata(&tmp)
+            .map(|m| m.len() <= MAX_CONFIG_BYTES)
+            .unwrap_or(false)
+    };
+    let parsed = if download_blob_quiet(&url, &tmp_s, auth).is_ok()
+        && within_cap()
+        && verify_digest(&tmp, &digest).is_ok()
+    {
+        parse_image_config(&std::fs::read_to_string(&tmp).unwrap_or_default())
+    } else {
+        ImageConfig::default()
+    };
+    let _ = std::fs::remove_file(&tmp);
+    parsed
+}
+
+/// Run `curl <base> [Authorization: Bearer …] -- <url>`, routing Basic credentials off-argv (`-K`
+/// STDIN config) exactly like every other request — the ONE place the "Basic creds never in argv"
+/// decision is made for GET-style fetches (manifest + config blob). Returns curl's stdout (empty
+/// when `base` already redirects the body to a file with `-o`).
+fn curl_authed(base: &[&str], url: &str, auth: &Auth) -> Result<Vec<u8>, OciError> {
+    let bearer = auth.bearer_header();
+    let mut args: Vec<&str> = base.to_vec();
+    if let Some(b) = &bearer {
+        args.push("-H");
+        args.push(b);
+    }
+    args.push("--");
+    args.push(url);
+    match auth.basic_config() {
+        Some(cfg) => crate::net::curl_with_config(&args, &cfg),
+        None => crate::net::curl(&args),
+    }
+}
+
+/// Quietly download a small blob (the config JSON) to `tmp` — no progress bar (unlike a layer), size-
+/// and time-capped, https-pinned, with the same off-argv auth as every other request.
+fn download_blob_quiet(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
+    let args = vec![
+        "-sS",
+        "-L",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-redirs",
+        "10",
+        "--max-filesize",
+        "4000000",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "120",
+        "-o",
+        tmp,
+    ];
+    curl_authed(&args, url, auth)?;
     Ok(())
+}
+
+/// Parse the OCI image config blob's `config.{Entrypoint,Cmd,Env,WorkingDir,User}` into [`ImageConfig`].
+fn parse_image_config(blob: &str) -> ImageConfig {
+    // No `"config"` object (malformed/unexpected) → scan the whole blob defensively; a real OCI
+    // config always carries it, so this fallback is belt-and-braces, not the normal path.
+    let cfg = object_after(blob, "config").unwrap_or(blob);
+    let nonempty = |s: String| (!s.is_empty()).then_some(s);
+    ImageConfig {
+        entrypoint: str_array_after(cfg, "Entrypoint"),
+        cmd: str_array_after(cfg, "Cmd"),
+        env: str_array_after(cfg, "Env"),
+        workdir: first_str(cfg, "WorkingDir").and_then(nonempty),
+        user: first_str(cfg, "User").and_then(nonempty),
+    }
 }
 
 /// `[registry/]repo[:tag]` → `(registry, repo, reference)`. Bare names get `library/` +
@@ -104,6 +225,25 @@ fn parse_ref(image: &str) -> Result<(String, String, String), OciError> {
     Ok((registry, repo, reference))
 }
 
+/// Explain a manifest that yielded no layers. A registry error body (`UNAUTHORIZED`/`denied`) or an
+/// empty body (a bare `401`) almost always means a **private repo you're not logged into**, so point
+/// at `kern login` rather than the opaque "no layers"; otherwise the tag is malformed or absent.
+fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
+    let low = manifest.to_ascii_lowercase();
+    let auth_ish = manifest.trim().is_empty()
+        || low.contains("unauthorized")
+        || low.contains("denied")
+        || low.contains("authentication");
+    if auth_ish {
+        OciError::Registry(format!(
+            "cannot access '{repo}' on {registry} — it may be private (run `kern login {registry}`) \
+             or the tag may not exist"
+        ))
+    } else {
+        OciError::Registry("no layers in manifest".into())
+    }
+}
+
 fn current_arch() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "arm64"
@@ -113,14 +253,21 @@ fn current_arch() -> &'static str {
 }
 
 /// Download a blob to `tmp` showing curl's live progress bar (`-#`, stderr inherited) so a big
-/// layer never looks frozen. `-S` still surfaces errors; `-L` follows redirects.
-fn curl_download(url: &str, tmp: &str, token: &str) -> Result<(), OciError> {
-    let auth = format!("Authorization: Bearer {token}");
+/// layer never looks frozen. `-S` surfaces errors; `-L` follows redirects (registries hand blobs off
+/// to a CDN) but `--proto-redir =https` keeps every hop on TLS — a hostile registry can't redirect a
+/// blob to `http://`/`file://`. Bearer creds go in a header; Basic creds go via `-K` STDIN (off-argv).
+fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
     let mut cmd = Command::new("curl");
     cmd.args([
         "-#",
         "-S",
         "-L",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-redirs",
+        "10",
         "--connect-timeout",
         "10",
         "--max-time",
@@ -128,12 +275,26 @@ fn curl_download(url: &str, tmp: &str, token: &str) -> Result<(), OciError> {
         "-o",
         tmp,
     ]);
-    if !token.is_empty() {
-        cmd.args(["-H", &auth]);
+    if let Some(h) = auth.bearer_header() {
+        cmd.args(["-H", &h]);
     }
-    cmd.arg(url).stderr(Stdio::inherit()); // live progress bar to the terminal
-    let status = cmd
-        .status()
+    // This re-hand-rolls the `-K -` STDIN plumbing that `net::curl_with_config` owns because it needs
+    // a different I/O shape: stream to `-o tmp` and INHERIT stderr for the live progress bar, rather
+    // than capturing stdout — so it can't reuse that helper.
+    let basic_cfg = auth.basic_config();
+    if basic_cfg.is_some() {
+        cmd.args(["-K", "-"]).stdin(Stdio::piped());
+    }
+    cmd.arg("--").arg(url).stderr(Stdio::inherit()); // live progress bar to the terminal
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| OciError::Tool("curl", e.to_string()))?;
+    if let (Some(cfg), Some(mut sin)) = (basic_cfg, child.stdin.take()) {
+        use std::io::Write;
+        let _ = sin.write_all(cfg.as_bytes()); // drop closes stdin → curl proceeds
+    }
+    let status = child
+        .wait()
         .map_err(|e| OciError::Tool("curl", e.to_string()))?;
     if !status.success() {
         return Err(OciError::Tool(
@@ -144,35 +305,261 @@ fn curl_download(url: &str, tmp: &str, token: &str) -> Result<(), OciError> {
     Ok(())
 }
 
-/// Anonymous Docker Hub pull token. (Other registries' auth flows land later.)
-fn auth_token(registry: &str, repo: &str) -> Result<String, OciError> {
-    if registry != DEFAULT_REGISTRY {
-        // No token: many registries serve public manifests unauthenticated; if not, the
-        // manifest fetch will fail clearly.
-        return Ok(String::new());
+/// Escape a value for curl's `-K` config double-quoted string: backslash-escape `\` and `"`, and
+/// DROP control characters (`\n`/`\r`/…). A newline would otherwise close the `user = "…"` line and
+/// let a crafted credential inject an arbitrary curl directive; control chars can't appear in a valid
+/// HTTP Basic credential anyway. (`kern login` already reads a single line, so this is defence in
+/// depth against a hand-edited credentials file.)
+fn curl_cfg_escape(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// How to authenticate requests to a registry, discovered from its `WWW-Authenticate` challenge.
+enum Auth {
+    /// Open (or already-satisfied) — no `Authorization` header.
+    None,
+    /// A short-lived Bearer token from the registry's token endpoint (Docker Hub, GHCR, GitLab,
+    /// Harbor, quay, …). Sent as a header (tokens are not the long-lived secret).
+    Bearer(String),
+    /// HTTP Basic — the `kern login` credentials, sent to curl **off-argv** via a `-K` STDIN config.
+    Basic { user: String, pass: String },
+}
+
+impl Auth {
+    /// The `Authorization: Bearer …` header, if this is a Bearer auth.
+    fn bearer_header(&self) -> Option<String> {
+        match self {
+            Auth::Bearer(t) => Some(format!("Authorization: Bearer {t}")),
+            _ => None,
+        }
     }
-    let url = format!(
-        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
-    );
-    let body = curl(&["-sSL", "--connect-timeout", "10", "--max-time", "60", &url])?;
-    let s = String::from_utf8_lossy(&body);
-    first_str(&s, "token").ok_or_else(|| OciError::Registry("no auth token in response".into()))
+    /// A curl `-K` config line carrying the Basic credentials off-argv, if this is Basic auth.
+    fn basic_config(&self) -> Option<String> {
+        match self {
+            Auth::Basic { user, pass } => Some(curl_user_config(user, pass)),
+            _ => None,
+        }
+    }
+}
+
+/// The single place that renders stored credentials into curl's `-K` config `user = "u:p"` line,
+/// with the control-char/quote escaping ([`curl_cfg_escape`]) that stops a crafted credential from
+/// injecting a curl directive. Every credential-bearing request goes through here.
+fn curl_user_config(user: &str, pass: &str) -> String {
+    format!(
+        "user = \"{}:{}\"\n",
+        curl_cfg_escape(user),
+        curl_cfg_escape(pass)
+    )
+}
+
+/// Discover how to authenticate to `registry` for pulling `repo`, via the standard registry-v2
+/// `WWW-Authenticate` challenge — so ANY compliant registry works (Docker Hub, GHCR, GitLab, Harbor,
+/// quay, self-hosted `distribution`), not just Docker Hub. Pings `/v2/`: a `200` means no auth is
+/// needed; a `401` carries the challenge. For a `Bearer` challenge we fetch a pull-scoped token from
+/// the advertised realm (anonymously, or upgraded with `kern login` credentials for private repos);
+/// for a `Basic` challenge we carry the credentials directly. Credentials always travel to curl via a
+/// `-K` STDIN config, never argv, so another same-uid process can't read them from `/proc/<pid>/cmdline`.
+fn discover_auth(registry: &str, repo: &str) -> Result<Auth, OciError> {
+    let headers = match crate::net::head_headers(&format!("https://{registry}/v2/")) {
+        Ok(h) => h,
+        // A registry that won't answer the ping (older/odd) — fall back to anonymous and let the
+        // manifest fetch surface a clear error if auth turns out to be required.
+        Err(_) => return Ok(Auth::None),
+    };
+    if http_status(&headers) != 401 {
+        return Ok(Auth::None); // open registry, or already authorized
+    }
+    let creds = kern_common::registry_auth::lookup(registry);
+    match parse_www_authenticate(&headers) {
+        Some(Challenge::Bearer { realm, service }) => {
+            // Ask the token endpoint for a pull-scoped token for this repo. The realm/service come
+            // from the (TLS-authenticated) challenge; the scope we request ourselves.
+            let scope = format!("repository:{repo}:pull");
+            let sep = if realm.contains('?') { '&' } else { '?' };
+            let url = format!("{realm}{sep}service={service}&scope={scope}");
+            let base = [
+                "-sSL",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--max-redirs",
+                "5",
+                "--max-filesize",
+                "8000000", // a token response is tiny — cap it so a hostile realm can't OOM us
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "60",
+                "--",
+                &url,
+            ];
+            // CREDENTIAL SAFETY (CVE-2020-15157 class): only send the stored credentials to the token
+            // endpoint if its host belongs to the SAME registry (same host, or a subdomain of the
+            // registry's parent domain — e.g. Docker Hub's registry-1.docker.io ↔ auth.docker.io). A
+            // hostile/compromised registry could otherwise advertise `realm="https://evil/token"` and
+            // harvest the creds the user stored for it. If the realm is foreign we withhold the creds
+            // and fetch an ANONYMOUS token instead (fine for public repos; a private one then fails
+            // with a clear 401), warning so it's never a silent behaviour change.
+            let send_creds = creds
+                .as_ref()
+                .filter(|_| realm_host_trusted(&realm, registry));
+            if creds.is_some() && send_creds.is_none() {
+                eprintln!(
+                    "kern: withholding credentials — {registry} pointed its auth to a different host \
+                     ({realm}); fetching an anonymous token instead"
+                );
+            }
+            let body = match send_creds {
+                Some((user, pass)) => {
+                    crate::net::curl_with_config(&base, &curl_user_config(user, pass))?
+                }
+                None => curl(&base)?,
+            };
+            let s = String::from_utf8_lossy(&body);
+            // Docker uses `token`; GHCR/others use `access_token` (both per the OAuth2 token spec).
+            let tok = first_str(&s, "token")
+                .or_else(|| first_str(&s, "access_token"))
+                .ok_or_else(|| OciError::Registry("no auth token in token response".into()))?;
+            Ok(Auth::Bearer(tok))
+        }
+        Some(Challenge::Basic) => {
+            let (user, pass) = creds.ok_or_else(|| {
+                OciError::Registry(format!(
+                    "{registry} requires authentication — run `kern login {registry}`"
+                ))
+            })?;
+            Ok(Auth::Basic { user, pass })
+        }
+        // A 401 with no recognizable scheme: nothing we can do but try anonymously.
+        None => Ok(Auth::None),
+    }
+}
+
+/// Whether it's safe to send the registry's stored credentials to a Bearer `realm` (token endpoint).
+/// True only when the realm host is the registry host, or a subdomain of the registry's parent domain
+/// (so Docker Hub's `registry-1.docker.io` trusts `auth.docker.io`, but no registry can point auth at
+/// an unrelated host to harvest creds — the CVE-2020-15157 credential-leak class). The realm must be
+/// `https://`. Both hosts are parsed the SAME way curl resolves them (userinfo + port stripped, see
+/// [`host_from_authority`]) — a parser differential here would itself be an allowlist bypass.
+fn realm_host_trusted(realm: &str, registry: &str) -> bool {
+    let reg_host = host_from_authority(registry.split('/').next().unwrap_or(registry));
+    let Some(after) = realm.strip_prefix("https://") else {
+        return false; // non-TLS realm → never trust creds to it
+    };
+    let realm_host = host_from_authority(after.split(['/', '?', '#']).next().unwrap_or(after));
+    if realm_host.is_empty() {
+        return false;
+    }
+    if realm_host == reg_host {
+        return true;
+    }
+    // Parent domain = registry host minus its first label (registry-1.docker.io → docker.io). Guards:
+    // it must have a dot and >3 chars (so a single-label TLD `io`/`com` is never a trusted parent),
+    // and must not be a known multi-label public suffix (so two unrelated `*.co.uk` registries can't
+    // cross-trust).
+    match reg_host.split_once('.') {
+        Some((_, parent))
+            if parent.len() > 3 && parent.contains('.') && !is_public_suffix(parent) =>
+        {
+            realm_host == parent || realm_host.ends_with(&format!(".{parent}"))
+        }
+        _ => false,
+    }
+}
+
+/// The host of a URL authority as curl would dial it: drop any `userinfo@` (curl uses the part after
+/// the LAST `@` as the host — a `realm="https://trusted:0@evil.com/…"` connects to `evil.com`, NOT
+/// `trusted`) and any `:port`, lowercased (DNS is case-insensitive). Parsing the host the same way
+/// curl resolves it is what keeps [`realm_host_trusted`] sound.
+fn host_from_authority(authority: &str) -> String {
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    host.split(':').next().unwrap_or(host).to_ascii_lowercase()
+}
+
+/// A registrable-domain check without a full public-suffix list (out of scope for a dependency-free
+/// build): the common multi-label public suffixes that must never count as a trustable parent domain
+/// in [`realm_host_trusted`]. Not exhaustive — it closes the realistic ccTLD second-levels; a full
+/// PSL would be the complete fix.
+fn is_public_suffix(d: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "co.jp", "ne.jp", "or.jp", "com.au",
+        "net.au", "org.au", "co.nz", "co.in", "co.za", "com.br", "com.cn", "com.mx", "com.tr",
+        "com.sg", "com.hk", "co.kr", "com.ar", "com.pl", "co.il",
+    ];
+    SUFFIXES.contains(&d)
+}
+
+/// The auth scheme advertised in a registry's `WWW-Authenticate` challenge header.
+enum Challenge {
+    Bearer { realm: String, service: String },
+    Basic,
+}
+
+/// Parse the `WWW-Authenticate` header from a raw HTTP response-header block.
+fn parse_www_authenticate(headers: &str) -> Option<Challenge> {
+    let line = headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("www-authenticate:"))?;
+    let val = line.split_once(':')?.1.trim();
+    let scheme = val.split_whitespace().next()?.to_ascii_lowercase();
+    match scheme.as_str() {
+        "bearer" => Some(Challenge::Bearer {
+            realm: auth_param(val, "realm")?,
+            service: auth_param(val, "service").unwrap_or_default(),
+        }),
+        "basic" => Some(Challenge::Basic),
+        _ => None,
+    }
+}
+
+/// Pull `key="value"` out of a `WWW-Authenticate` parameter list (`realm="…",service="…"`).
+fn auth_param(s: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}=\"");
+    let start = s.find(&pat)? + pat.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The numeric status from an HTTP response's first line (`HTTP/1.1 401 …` → `401`).
+fn http_status(headers: &str) -> u16 {
+    headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
 }
 
 fn fetch_manifest(
     registry: &str,
     repo: &str,
     reference: &str,
-    token: &str,
+    auth: &Auth,
 ) -> Result<String, OciError> {
     let url = format!("https://{registry}/v2/{repo}/manifests/{reference}");
     let accept = "Accept: application/vnd.oci.image.index.v1+json,\
         application/vnd.oci.image.manifest.v1+json,\
         application/vnd.docker.distribution.manifest.list.v2+json,\
         application/vnd.docker.distribution.manifest.v2+json";
-    let auth = format!("Authorization: Bearer {token}");
-    let mut args = vec![
+    let args = vec![
         "-sSL",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-redirs",
+        "5",
+        // A manifest is small (KBs); cap the body so a hostile registry can't stream GBs into memory
+        // (unlike blobs, the manifest is buffered in RAM).
+        "--max-filesize",
+        "8000000",
         "--connect-timeout",
         "10",
         "--max-time",
@@ -180,12 +567,7 @@ fn fetch_manifest(
         "-H",
         accept,
     ];
-    if !token.is_empty() {
-        args.push("-H");
-        args.push(&auth);
-    }
-    args.push(&url);
-    let body = curl(&args)?;
+    let body = curl_authed(&args, &url, auth)?;
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
@@ -193,7 +575,7 @@ fn extract_layer(
     registry: &str,
     repo: &str,
     digest: &str,
-    token: &str,
+    auth: &Auth,
     dest: &Path,
     idx: usize,
     total: usize,
@@ -209,7 +591,7 @@ fn extract_layer(
         digest.replace([':', '/'], "_")
     ));
     let tmp_s = tmp.to_string_lossy().into_owned();
-    curl_download(&url, &tmp_s, token)?;
+    curl_download(&url, &tmp_s, auth)?;
 
     // INTEGRITY: the blob's content must hash to its digest — defends against a compromised or
     // MITM'd registry (TLS only protects the transport), and against a corrupt download.
@@ -507,6 +889,134 @@ mod tests {
             parse_ref("ghcr.io/org/app:v1").unwrap(),
             ("ghcr.io".into(), "org/app".into(), "v1".into())
         );
+    }
+
+    #[test]
+    fn parses_bearer_challenge() {
+        let h = "HTTP/1.1 401 Unauthorized\r\n\
+            Www-Authenticate: Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\",scope=\"repository:library/alpine:pull\"\r\n\
+            Content-Type: application/json\r\n";
+        assert_eq!(http_status(h), 401);
+        match parse_www_authenticate(h) {
+            Some(Challenge::Bearer { realm, service }) => {
+                assert_eq!(realm, "https://auth.docker.io/token");
+                assert_eq!(service, "registry.docker.io");
+            }
+            _ => panic!("expected a Bearer challenge"),
+        }
+    }
+
+    #[test]
+    fn parses_basic_challenge_and_status() {
+        let h = "HTTP/2 401\r\nwww-authenticate: Basic realm=\"Registry\"\r\n";
+        assert_eq!(http_status(h), 401);
+        assert!(matches!(parse_www_authenticate(h), Some(Challenge::Basic)));
+    }
+
+    #[test]
+    fn open_registry_and_unknown_scheme() {
+        // A 200 ping → no challenge line at all.
+        assert_eq!(http_status("HTTP/1.1 200 OK\r\n\r\n"), 200);
+        assert!(parse_www_authenticate("HTTP/1.1 200 OK\r\n").is_none());
+        // A 401 with an unrecognized scheme → None (fall back to anonymous).
+        assert!(parse_www_authenticate("HTTP/1.1 401\r\nWWW-Authenticate: Digest x\r\n").is_none());
+    }
+
+    #[test]
+    fn realm_trust_pins_creds_to_the_registry() {
+        // Docker Hub: registry-1.docker.io must trust auth.docker.io (shared parent docker.io).
+        assert!(realm_host_trusted(
+            "https://auth.docker.io/token",
+            "registry-1.docker.io"
+        ));
+        // Same-host token endpoints (GHCR, quay, GitLab).
+        assert!(realm_host_trusted("https://ghcr.io/token", "ghcr.io"));
+        assert!(realm_host_trusted("https://quay.io/v2/auth", "quay.io"));
+        assert!(realm_host_trusted(
+            "https://registry.gitlab.com/jwt/auth",
+            "registry.gitlab.com"
+        ));
+        // CVE-2020-15157: a registry pointing auth at a foreign host must NOT get the creds.
+        assert!(!realm_host_trusted(
+            "https://collector.evil.com/token",
+            "registry-1.docker.io"
+        ));
+        assert!(!realm_host_trusted("https://evil.com/token", "ghcr.io"));
+        // CRITICAL bypass class — userinfo (`user@host`) with/without a port: curl connects to the
+        // host AFTER the last `@`, so the check must too. Every one of these dials `evil.com`.
+        assert!(!realm_host_trusted(
+            "https://ghcr.io@evil.com/token",
+            "ghcr.io"
+        ));
+        assert!(!realm_host_trusted(
+            "https://ghcr.io:0@evil.com/token",
+            "ghcr.io"
+        ));
+        assert!(!realm_host_trusted(
+            "https://auth.docker.io:0@evil.com/token",
+            "registry-1.docker.io"
+        ));
+        assert!(!realm_host_trusted(
+            "https://registry.gitlab.com@evil.com/token",
+            "registry.gitlab.com"
+        ));
+        // `#` ends the authority (curl treats it as a fragment) — must not smuggle a foreign host.
+        assert!(!realm_host_trusted(
+            "https://ghcr.io:0@evil.com#x",
+            "ghcr.io"
+        ));
+        // Public-suffix parent: a `label.co.uk` registry must NOT cross-trust another `*.co.uk`.
+        assert!(!realm_host_trusted(
+            "https://attacker.co.uk/token",
+            "myreg.co.uk"
+        ));
+        // …but a real registrable domain under a ccTLD still trusts its own subdomains.
+        assert!(realm_host_trusted(
+            "https://auth.company.co.uk/token",
+            "registry.company.co.uk"
+        ));
+        // Case-insensitive host comparison (DNS is case-insensitive).
+        assert!(realm_host_trusted(
+            "https://AUTH.DOCKER.IO/token",
+            "registry-1.docker.io"
+        ));
+        // A bare public suffix parent (`io`) must never count as trusted across registries.
+        assert!(!realm_host_trusted("https://evil.io/token", "ghcr.io"));
+        // Non-https realm is never trusted with creds.
+        assert!(!realm_host_trusted(
+            "http://auth.docker.io/token",
+            "registry-1.docker.io"
+        ));
+        // A registry carrying a :port compares on host only.
+        assert!(realm_host_trusted(
+            "https://localhost/token",
+            "localhost:5000"
+        ));
+    }
+
+    #[test]
+    fn manifest_error_points_at_login_for_auth_failures() {
+        // An empty body (a bare 401) or a registry auth-error body → the `kern login` hint.
+        for body in [
+            "",
+            "{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}",
+            "{\"errors\":[{\"code\":\"DENIED\"}]}",
+        ] {
+            let e = manifest_error(body, "ghcr.io", "org/app").to_string();
+            assert!(e.contains("kern login ghcr.io"), "got: {e}");
+        }
+        // A genuinely layerless-but-valid manifest keeps the plain message.
+        let e =
+            manifest_error("{\"schemaVersion\":2,\"config\":{}}", "ghcr.io", "org/app").to_string();
+        assert!(e.contains("no layers"), "got: {e}");
+    }
+
+    #[test]
+    fn auth_param_extracts_quoted_values() {
+        let v = "Bearer realm=\"https://a/b?c=d\",service=\"svc\"";
+        assert_eq!(auth_param(v, "realm").as_deref(), Some("https://a/b?c=d"));
+        assert_eq!(auth_param(v, "service").as_deref(), Some("svc"));
+        assert_eq!(auth_param(v, "scope"), None);
     }
 
     #[test]

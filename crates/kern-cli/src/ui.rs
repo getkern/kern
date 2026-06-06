@@ -155,6 +155,27 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
+/// A ONE-LINE box summary — the default for a foreground run, so a beginner who just wants their
+/// command's output isn't buried under a six-line posture panel. Shows the name, source, and a green
+/// "isolated" (or a yellow heads-up when a boundary is deliberately open). The full [`box_banner`] is
+/// one `--verbose` away. Pure (returns the string) so it's unit-testable.
+pub fn box_line(s: &BoxStatus, p: &Palette, gl: &Glyphs) -> String {
+    let (b, c, d, g, y, z) = (p.b, p.c, p.d, p.g, p.y, p.z);
+    let name = scrub(s.name);
+    let source = scrub(s.source);
+    let posture = if s.share_net {
+        format!("{y}{} host network — not isolated{z}", gl.warn)
+    } else if s.bind_rootfs {
+        format!("{y}{} shared rootfs — writes persist{z}", gl.warn)
+    } else {
+        format!("{g}{} isolated{z}", gl.ok)
+    };
+    format!(
+        "{b}{c}{} box {z}{b}{name}{z} {d}{} {source}{z}   {posture}   {d}(--verbose for detail){z}\n",
+        gl.lead, gl.dot,
+    )
+}
+
 /// Build the `kern box` status panel: an aligned, semantically-coloured summary of the box's
 /// isolation + resource posture, with an actionable warning block for the *deliberately open*
 /// choices (`--net`, `--bind-rootfs`). Pure (returns the string) so it's unit-testable; the caller
@@ -335,7 +356,7 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
 /// crafted image ref, rootfs path or command can't inject ANSI sequences into the panel (spoofing
 /// the cursor, title, or clipboard). The box *name* is already charset-validated by `BoxName`;
 /// `source` and `cmd` are not. Mirrors the `search`/`images` table hardening.
-fn scrub(s: &str) -> String {
+pub(crate) fn scrub(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
@@ -352,8 +373,9 @@ fn scrub_truncate(s: &str, max: usize, gl: &Glyphs) -> String {
     format!("{head}{}", gl.ell)
 }
 
-/// `--cpus` for display: `1.5`, `2`, `0.5` (drop a trailing `.0`).
-fn fmt_cpus(c: f64) -> String {
+/// A non-negative `f64` for display: `1.5`, `2`, `0.5` (drop a trailing `.0`). Shared by `--cpus`
+/// here and the `kern top` profile forms.
+pub(crate) fn fmt_cpus(c: f64) -> String {
     if c.fract() == 0.0 {
         format!("{}", c as u64)
     } else {
@@ -505,5 +527,37 @@ mod tests {
         let out = box_banner(&s, &plain(), &ascii_glyphs(), 80);
         assert!(out.contains("bind (mutable, shared source)"));
         assert!(out.contains("--bind-rootfs binds the source directly"));
+    }
+
+    #[test]
+    fn line_is_one_line_and_shows_isolated() {
+        let out = box_line(&base(), &plain(), &ascii_glyphs());
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("box demo"));
+        assert!(out.contains("alpine"));
+        assert!(out.contains("isolated"));
+        assert!(out.contains("--verbose"));
+    }
+
+    #[test]
+    fn line_surfaces_open_boundaries_inline() {
+        let mut s = base();
+        s.share_net = true;
+        let out = box_line(&s, &plain(), &ascii_glyphs());
+        assert!(out.contains("not isolated"));
+        s.share_net = false;
+        s.bind_rootfs = true;
+        let out = box_line(&s, &plain(), &ascii_glyphs());
+        assert!(out.contains("writes persist"));
+    }
+
+    #[test]
+    fn line_strips_terminal_escapes() {
+        let mut s = base();
+        s.name = "x\x1b]0;PWNED\x07";
+        s.source = "alpine\x1b[2J";
+        let out = box_line(&s, &plain(), &ascii_glyphs());
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\x07'));
     }
 }

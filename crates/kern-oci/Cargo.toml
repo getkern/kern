@@ -7,3 +7,6 @@ license.workspace = true
 repository.workspace = true
 description = "OCI image pull / layer extraction / whiteout handling for kern (internal)."
 publish = false
+
+[dependencies]
+kern-common = { path = "../kern-common", version = "0.5.7" }

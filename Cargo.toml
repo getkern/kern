@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.7"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -22,8 +22,8 @@ authors = ["kern contributors"]
 # min-startup, switch opt-level to "z" — kept at 3 here on purpose.)
 [profile.release]
 # opt-level "z" (size): kern's cold start is syscall-bound (unshare/mount/exec), not CPU-bound, so
-# size-optimised codegen shrinks the binary ~14% (804→688 KB musl x86_64) with no measurable latency
-# cost — verified a hair faster, likely better I-cache. There is no hot CPU path to slow down.
+# size-optimised codegen shrinks the binary noticeably with no measurable latency cost — verified a
+# hair faster, likely better I-cache. There is no hot CPU path to slow down.
 opt-level = "z"
 lto = "fat"
 codegen-units = 1

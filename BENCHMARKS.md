@@ -23,7 +23,7 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 > **TL;DR.** kern is in the **fastest tier** — it leads the no-cgroup-cap sandboxes (ahead of
 > `bubblewrap`), and with a hard cgroup cap it **ties `crun`** (the fastest OCI runtime) and is
 > **~2× `runc`** — while being the only one of them that ships a complete daemonless container UX
-> (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~690 KB** binary. Against the real
+> (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~1 MB** binary. Against the real
 > engines it's **~80–160× faster to start** (`podman` ~155 ms, Docker ~308 ms) and carries no
 > resident daemon. It is *not* "the fastest in the world" — the top tier is within a couple ms,
 > i.e. noise; the honest claim is **top-tier speed + a full runtime in a tiny daemonless binary**.
@@ -55,7 +55,7 @@ tier sits within a couple ms of each other and of each other's run-to-run noise 
 single-shot latency outright. The real gap is to the **engines**: `podman` (~155 ms) and Docker
 (~308 ms) fork `conmon` / round-trip a daemon every run, so kern is **~80–160× faster** than the
 tools people actually compare it to — while shipping the same UX (OCI pull, overlay,
-`ps`/`exec`/`logs`, compose) in ~690 KB with no resident daemon.
+`ps`/`exec`/`logs`, compose) in ~1 MB with no resident daemon.
 
 ### Real image, not `/bin/true`
 
@@ -109,7 +109,7 @@ many-sharing-one-rootfs at 12/12 — see the test suite.)
 
 ## Runs everywhere — the same static binary, on boards where the engines can't
 
-The point isn't a single-shot latency crown — the top tier is noise. It's that **one ~690 KB
+The point isn't a single-shot latency crown — the top tier is noise. It's that **one ~1 MB
 static aarch64 binary** runs the *same* `kern box` on a desktop, an NVIDIA Jetson, a Raspberry Pi 5,
 and an **Android-kernel** board — including hardware where Docker/Podman aren't installed (or
 installable) at all. Measured with [`examples/benchmark.py`](examples/benchmark.py) (bare box, time
@@ -124,7 +124,7 @@ per run = total ÷ N):
 
 ✗ = **not installed (nor readily installable) on that board.** The standout row is the **Raspberry
 Pi 5: `kern` is the ONLY runtime that runs at all** — bubblewrap, crun, runc, podman and Docker are
-*none of them present*, while one ~690 KB static binary just works. That reach — not a single-shot
+*none of them present*, while one ~1 MB static binary just works. That reach — not a single-shot
 latency crown — is the differentiator. (Jetson/Arduino had bubblewrap, runc and Docker; crun and
 podman weren't installed there either.)
 
@@ -141,7 +141,8 @@ the rootfs/image stays immutable and shareable, which is sub-millisecond on ever
 the reason kern wins outright on the other three boards. For exactly this case, **`--bind-rootfs`**
 swaps the overlay for a direct bind — kern then starts in **9.9 ms, beating bubblewrap (14.9 ms)**
 while still doing more than it (seccomp, a real `/dev`, lifecycle); the trade-off is a mutable,
-shared source, so it's opt-in. Net: one ~690 KB dependency-free binary, no daemon, no per-distro
+shared source, so it's opt-in. Net: one ~1 MB binary (one Rust dep, `libc`; system `curl`/`tar` for
+OCI pull), no daemon, no per-distro
 packaging, **fastest on all four kernels** — and the only runtime present at all on the Pi and the
 only one that ships OCI images + caps + `ps`/`exec`/`logs`/compose. That reach is the differentiator.
 
@@ -149,7 +150,7 @@ only one that ships OCI images + caps + `ps`/`exec`/`logs`/compose. That reach i
 
 | | |
 |---|---:|
-| **kern** binary (the whole thing) | **~690 KB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`) — musl x86_64 ~692 KB at 0.4 (release profile: `opt-level=z` + LTO + `panic=abort` + strip); aarch64 comparable |
+| **kern** binary (the whole thing) | **~1 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`) — musl x86_64 ~1.1 MB, aarch64 ~0.94 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
 | kern resident memory at rest | **0** — no daemon |
 | kern RSS per box (setup) | ~7 MB |
 | bubblewrap binary | 70 KB (launcher only) |

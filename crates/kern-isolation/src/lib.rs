@@ -13,17 +13,25 @@
 use std::marker::PhantomData;
 
 mod cgroup;
+mod outcome;
 mod ports;
 mod real;
+mod sandbox;
 mod seccomp;
+mod ssh;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 pub use cgroup::apply_limits as apply_cgroup_limits;
+pub use outcome::{Outcome, OutputView, ResourceSource};
+pub use ports::preflight as preflight_ports;
 pub use real::{
-    exec_in_box, run_in_sandbox, run_in_sandbox_with, shed_inherited_fds, OverlayDirs, RealMounts,
-    SandboxSpec, Volume,
+    exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder, set_cpu_affinity,
+    shed_inherited_fds, CapSpec, OverlayDirs, RealMounts, SandboxSpec, VdiskMount, Volume,
 };
+/// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
+pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};
 pub use seccomp::denied_syscall_count;
+pub use ssh::SshSetup;
 
 /// `MS_BIND` from `<sys/mount.h>` — bind-mount an existing tree at a new location.
 pub(crate) const MS_BIND: u64 = 0x1000;
