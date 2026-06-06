@@ -12,7 +12,9 @@ fn version_prints_and_succeeds() {
     let out = kern().arg("--version").output().expect("run kern");
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.starts_with("kern 0.3.0"), "got: {s}");
+    // Version-agnostic: assert the binary reports its own crate version, so a bump never breaks this.
+    let want = format!("kern {}", env!("CARGO_PKG_VERSION"));
+    assert!(s.starts_with(&want), "want prefix {want:?}, got: {s}");
 }
 
 #[test]

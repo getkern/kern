@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to SemVer.
 Pre-1.0: the CLI and config surface are NOT frozen; minor versions may break them.
 
+## [0.3.1] — `--uid-range` fallback hardening
+
+### Fixed
+- **`--uid-range` now degrades gracefully when `newuidmap`/`newgidmap` are present but fail at
+  runtime** (the helper isn't setuid-root, or there's no matching `/etc/subgid` allocation —
+  common on CI runners and minimal hosts). Previously this aborted the box; now, since the process
+  is already in a fresh user namespace, it falls back to the safe single-uid map (box uid 0 →
+  caller) with a clear notice — mirroring how an *absent* helper already degraded. A `box`
+  therefore always starts, with or without a usable subordinate-id range. The single-uid map write
+  is now shared by the default and the fallback paths.
+
 ## [0.3.0] — Real sandbox execution
 
 ### Added
