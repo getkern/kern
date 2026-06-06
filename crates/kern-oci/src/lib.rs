@@ -1,17 +1,25 @@
-//! OCI image handling for kern: pull, layer extraction, and whiteout application.
-//!
-//! 0.1 scaffold: this carries the security-critical whiteout path-safety helper (and its
-//! escape regression test) as the seed; the full pull/extract pipeline lands per the roadmap.
+//! OCI image handling for kern: pull, layer extraction, whiteout application, and Hub search.
+
+mod json;
+mod net;
+mod pull;
+mod search;
+pub use pull::{pull, OciError};
+pub use search::{search, SearchResult};
 
 use std::path::PathBuf;
 
 /// Returns `true` if every component of `dir` under `rootfs_dir` is a REAL directory (none is
 /// a symlink).
 ///
-/// Whiteouts are applied per-layer BEFORE the final symlink-sanitize pass, so an earlier layer
-/// can plant `dir -> /host/path`. Without this guard a whiteout target would resolve THROUGH
-/// the symlink and delete a host file (rootfs escape). A non-existent component is safe
-/// (nothing to delete). No concurrency during extraction, so a lexical check is sound.
+/// A layer can plant `dir -> /host/path`; without this guard a merge or whiteout under `dir`
+/// would resolve THROUGH the symlink and touch a host file (rootfs escape). A non-existent
+/// component is safe (nothing to traverse).
+///
+/// This lexical (check-then-use) guard is sound because there is no concurrent writer to race
+/// it: extraction is single-threaded (so an image's own layers can't race each other), and the
+/// caller's cache/scratch dirs are created mode 0700 owned by the user, so no *other* local user
+/// can swap a component for a symlink between the check and the operation.
 pub fn whiteout_dir_symlink_free(rootfs_dir: &str, dir: &str) -> bool {
     if dir.is_empty() {
         return true;

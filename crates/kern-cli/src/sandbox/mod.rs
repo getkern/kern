@@ -1,15 +1,11 @@
 //! Sandbox setup.
 //!
-//! 0.2 lands the **step sequence** and wires it to the `kern-isolation` mount-ordering
-//! typestate. [`SandboxCtx`] holds the resolved configuration; [`SandboxCtx::build_root`] runs
-//! the ordered mount steps against any [`MountOps`] — the real libc impl (privileged) and the
-//! `Recorder` (used by `kern box <name> --plan`) share the exact same sequence.
-//!
-//! The remaining post-fork steps (user namespace, seccomp, exec) are privileged and land with
-//! the real-syscall layer (0.3); they are NOT faked here.
+//! [`SandboxCtx`] holds the resolved configuration; [`SandboxCtx::build_root`] runs the ordered
+//! mount steps against any [`MountOps`] — the real libc impl (`kern box --rootfs`) and the
+//! `Recorder` (`kern box --plan`) share the exact same typestate-driven sequence.
 
 use kern_common::BoxName;
-use kern_isolation::{MountMode, MountOps, Recorder, Rootfs};
+use kern_isolation::{Error as IsoError, MountMode, MountOps, Recorder, Rootfs};
 
 /// Resolved configuration for one sandbox.
 pub(crate) struct SandboxCtx {
@@ -36,17 +32,19 @@ impl SandboxCtx {
     /// Run the ordered mount steps against `ops`. The ordering (pivot before read-only) is
     /// enforced by the `Rootfs<State>` typestate, so an out-of-order edit is a COMPILE error,
     /// not a sandbox-escape bug.
-    pub fn build_root<M: MountOps>(&self, ops: &mut M) {
-        Rootfs::mount(ops, self.mode, &self.root)
-            .create_old_root(ops)
-            .into_readonly(ops);
+    pub fn build_root<M: MountOps>(&self, ops: &mut M) -> Result<(), IsoError> {
+        Rootfs::mount(ops, self.mode, &self.root)?
+            .create_old_root(ops)?
+            .into_readonly(ops)?;
+        Ok(())
     }
 
     /// The isolation plan as an ordered, human-readable list — privilege-free, used by
     /// `kern box <name> --plan` to show exactly what the sandbox setup would do.
     pub fn plan(&self) -> Vec<String> {
         let mut rec = Recorder::default();
-        self.build_root(&mut rec);
+        // The `Recorder` only appends to a vec; it cannot fail.
+        self.build_root(&mut rec).expect("Recorder is infallible");
         rec.calls
     }
 }

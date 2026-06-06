@@ -10,6 +10,14 @@ pub enum Error {
     NotYetImplemented(&'static str),
     /// A box name failed validation (path separator / traversal / empty).
     InvalidBox(&'static str),
+    /// The sandbox could not be set up or run (namespaces, mounts, exec).
+    Sandbox(String),
+    /// An OCI image pull/extract failed.
+    Oci(String),
+    /// A compose file could not be parsed or brought up.
+    Compose(String),
+    /// A recognised command was invoked with missing/invalid arguments.
+    Usage(&'static str),
 }
 
 impl Error {
@@ -23,6 +31,16 @@ impl Error {
             Error::InvalidBox(_) => Some(
                 "box names: letters/digits/_/./- only, no leading '-' or '.', max 64 chars".into(),
             ),
+            Error::Sandbox(_) => {
+                Some("needs unprivileged user namespaces and a valid --rootfs directory".into())
+            }
+            Error::Oci(_) => {
+                Some("needs `curl` and GNU `tar`; check the image name and network".into())
+            }
+            Error::Compose(_) => {
+                Some("compose: `[box.NAME]` tables with image/rootfs, command, depends_on".into())
+            }
+            Error::Usage(_) => Some("run `kern --help` for full usage".into()),
         }
     }
 }
@@ -33,6 +51,10 @@ impl std::fmt::Display for Error {
             Error::UnknownCommand(c) => write!(f, "unknown command '{c}'"),
             Error::NotYetImplemented(c) => write!(f, "'{c}' is not implemented yet"),
             Error::InvalidBox(why) => write!(f, "invalid box name: {why}"),
+            Error::Sandbox(why) => write!(f, "sandbox: {why}"),
+            Error::Oci(why) => write!(f, "pull: {why}"),
+            Error::Compose(why) => write!(f, "compose: {why}"),
+            Error::Usage(u) => write!(f, "usage: kern {u}"),
         }
     }
 }

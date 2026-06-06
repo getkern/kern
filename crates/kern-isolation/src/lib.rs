@@ -1,51 +1,86 @@
-//! Isolation primitives (namespaces, cgroups, mounts) for kern.
+//! Isolation primitives (namespaces, mounts) for kern.
 //!
-//! 0.2 lands the **mount-ordering typestate** and the `MountMode` enum on top of the 0.1
-//! characterization seam. The headline guarantee: the read-only remount of the new root can
-//! only be reached *after* the pivot (`create_old_root`), because [`Rootfs::into_readonly`]
-//! exists solely on `Rootfs<OldRootReady>`. "Remount read-only before pivoting in" — a classic
-//! sandbox-escape footgun — is therefore **unrepresentable**: it does not compile.
+//! The mount sequence is expressed against the [`MountOps`] trait — one ordered, fallible op
+//! log. A [`Recorder`] captures the calls without privileges (characterization / `--plan`); the
+//! real [`RealMounts`] performs the syscalls. Both flow through the SAME [`Rootfs`] typestate,
+//! so the security-critical ordering (pivot before read-only) is enforced at compile time for
+//! the real path too — not just the recorded one.
 //!
-//! The mount/pivot sequence is still expressed against the [`MountOps`] trait. A [`Recorder`]
-//! captures the exact ordered call list so a test asserts it is byte-identical before and after
-//! a refactor — deterministic, privilege-free, normal CI. This *refactor-safety* net does NOT
-//! replace the real-syscall correctness tests (those actually mount/pivot and assert
-//! escape-blocked); the real `MountOps` impl + fallible `Error` type land with those (0.3).
+//! The headline guarantee: [`Rootfs::into_readonly`] exists only on `Rootfs<OldRootReady>`, so
+//! remounting the root read-only before pivoting into it is **unrepresentable** — it does not
+//! compile.
 
 use std::marker::PhantomData;
 
-/// `MS_BIND` from `<sys/mount.h>` — bind-mount an existing tree at a new location.
-const MS_BIND: u64 = 0x1000;
+mod cgroup;
+mod real;
+mod seccomp;
+pub use real::{
+    exec_in_box, run_in_sandbox, run_in_sandbox_with, OverlayDirs, RealMounts, SandboxSpec, Volume,
+};
 
-/// The mount operations a sandbox setup performs, in order. Abstracted so they can be recorded
-/// (characterization) without privileges, and so the real impl is the single libc boundary.
-pub trait MountOps {
-    fn mount(&mut self, src: &str, dst: &str, fstype: &str, flags: u64);
-    fn pivot(&mut self, new_root: &str, old_root: &str);
-    fn remount_ro(&mut self, target: &str);
+/// `MS_BIND` from `<sys/mount.h>` — bind-mount an existing tree at a new location.
+pub(crate) const MS_BIND: u64 = 0x1000;
+
+/// An isolation error: a failed syscall (with context) or an unsupported environment.
+#[derive(Debug)]
+pub enum Error {
+    /// Syscall `op` failed with the given OS error.
+    Syscall(&'static str, std::io::Error),
+    /// The environment cannot host a sandbox (e.g. unprivileged user namespaces disabled).
+    Unsupported(&'static str),
 }
 
-/// A `MountOps` that records every call instead of performing it — the characterization seam.
+impl Error {
+    /// Build a `Syscall` error from the current `errno` for `op`.
+    pub(crate) fn last(op: &'static str) -> Self {
+        Error::Syscall(op, std::io::Error::last_os_error())
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Syscall(op, e) => write!(f, "{op} failed: {e}"),
+            Error::Unsupported(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// The mount operations a sandbox setup performs, in order. One fallible op log: a `Recorder`
+/// records it without privileges; `RealMounts` performs it. Same trait, two impls.
+pub trait MountOps {
+    fn mount(&mut self, src: &str, dst: &str, fstype: &str, flags: u64) -> Result<(), Error>;
+    fn pivot(&mut self, new_root: &str, old_root: &str) -> Result<(), Error>;
+    fn remount_ro(&mut self, target: &str) -> Result<(), Error>;
+}
+
+/// A `MountOps` that records every call instead of performing it — the characterization seam,
+/// also used by `kern box --plan`.
 #[derive(Default)]
 pub struct Recorder {
     pub calls: Vec<String>,
 }
 
 impl MountOps for Recorder {
-    fn mount(&mut self, src: &str, dst: &str, fstype: &str, flags: u64) {
+    fn mount(&mut self, src: &str, dst: &str, fstype: &str, flags: u64) -> Result<(), Error> {
         self.calls
             .push(format!("mount({src},{dst},{fstype},{flags:#x})"));
+        Ok(())
     }
-    fn pivot(&mut self, new_root: &str, old_root: &str) {
+    fn pivot(&mut self, new_root: &str, old_root: &str) -> Result<(), Error> {
         self.calls.push(format!("pivot({new_root},{old_root})"));
+        Ok(())
     }
-    fn remount_ro(&mut self, target: &str) {
+    fn remount_ro(&mut self, target: &str) -> Result<(), Error> {
         self.calls.push(format!("remount_ro({target})"));
+        Ok(())
     }
 }
 
-/// How a sandbox's root filesystem is provided. A closed set → an exhaustive `enum`, not a
-/// trait object (the variants are known and stable).
+/// How a sandbox's root filesystem is provided. A closed set → an exhaustive `enum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountMode {
     /// Copy-on-write overlay over a read-only lower — the default for OCI images.
@@ -68,9 +103,7 @@ impl MountMode {
 }
 
 // --- Mount-ordering typestate -------------------------------------------------------------
-// States are zero-size markers carried in `PhantomData`. They make the *order* of the mount
-// sequence part of the type, so an out-of-order refactor fails at compile time rather than
-// shipping a sandbox-escape bug.
+// States are zero-size markers carried in `PhantomData`, making the *order* part of the type.
 
 /// The root is mounted but not yet pivoted into.
 pub struct Mounted;
@@ -79,8 +112,7 @@ pub struct OldRootReady;
 /// The new root has been remounted read-only — terminal state.
 pub struct ReadOnly;
 
-/// A sandbox root filesystem tracked through its setup states. See [`MountMode`] and the
-/// module docs for the ordering guarantee.
+/// A sandbox root filesystem tracked through its setup states.
 pub struct Rootfs<S> {
     root: String,
     _state: PhantomData<S>,
@@ -95,9 +127,18 @@ impl<S> Rootfs<S> {
 
 impl Rootfs<Mounted> {
     /// Step 1 — mount the new root for `root` using `mode`.
-    pub fn mount<M: MountOps>(ops: &mut M, mode: MountMode, root: &str) -> Self {
+    pub fn mount<M: MountOps>(ops: &mut M, mode: MountMode, root: &str) -> Result<Self, Error> {
         let (src, fstype, flags) = mode.spec();
-        ops.mount(src, root, fstype, flags);
+        ops.mount(src, root, fstype, flags)?;
+        Ok(Rootfs {
+            root: root.to_string(),
+            _state: PhantomData,
+        })
+    }
+
+    /// Wrap a root that is ALREADY a mount point (e.g. an overlayfs set up directly), so the
+    /// pivot / read-only steps still flow through the ordering typestate.
+    pub fn premounted(root: &str) -> Self {
         Rootfs {
             root: root.to_string(),
             _state: PhantomData,
@@ -106,34 +147,35 @@ impl Rootfs<Mounted> {
 
     /// Step 2 — create `.old_root` inside the new root and `pivot_root` into it. Consumes the
     /// `Mounted` state, so this must precede any read-only remount.
-    pub fn create_old_root<M: MountOps>(self, ops: &mut M) -> Rootfs<OldRootReady> {
+    pub fn create_old_root<M: MountOps>(self, ops: &mut M) -> Result<Rootfs<OldRootReady>, Error> {
         let old = format!("{}/.old_root", self.root);
-        ops.pivot(&self.root, &old);
-        Rootfs {
+        ops.pivot(&self.root, &old)?;
+        Ok(Rootfs {
             root: self.root,
             _state: PhantomData,
-        }
+        })
     }
 }
 
 impl Rootfs<OldRootReady> {
     /// Step 3 — remount the root read-only. Reachable ONLY from `OldRootReady`, so "read-only
     /// before pivot" cannot be written.
-    pub fn into_readonly<M: MountOps>(self, ops: &mut M) -> Rootfs<ReadOnly> {
-        ops.remount_ro("/");
-        Rootfs {
+    pub fn into_readonly<M: MountOps>(self, ops: &mut M) -> Result<Rootfs<ReadOnly>, Error> {
+        ops.remount_ro("/")?;
+        Ok(Rootfs {
             root: self.root,
             _state: PhantomData,
-        }
+        })
     }
 }
 
 /// The overlay → pivot → read-only-root sequence, driven through the typestate so the ordering
 /// is compile-time enforced. The recorded ops are byte-identical to the 0.1 golden.
-pub fn overlay_ro_sequence<M: MountOps>(ops: &mut M, root: &str) {
-    Rootfs::mount(ops, MountMode::Overlay, root)
-        .create_old_root(ops)
-        .into_readonly(ops);
+pub fn overlay_ro_sequence<M: MountOps>(ops: &mut M, root: &str) -> Result<(), Error> {
+    Rootfs::mount(ops, MountMode::Overlay, root)?
+        .create_old_root(ops)?
+        .into_readonly(ops)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -141,11 +183,11 @@ mod tests {
     use super::*;
 
     /// Characterization: the recorded ordered call list must match the 0.1 golden sequence,
-    /// proving the 0.2 typestate refactor did NOT change observable behaviour.
+    /// proving the typestate refactor did NOT change observable behaviour.
     #[test]
     fn overlay_ro_sequence_is_stable() {
         let mut rec = Recorder::default();
-        overlay_ro_sequence(&mut rec, "/tmp/root");
+        overlay_ro_sequence(&mut rec, "/tmp/root").unwrap();
         assert_eq!(
             rec.calls,
             vec![
@@ -165,7 +207,7 @@ mod tests {
             (MountMode::Tmpfs, "mount(tmpfs,/r,tmpfs,0x0)"),
         ] {
             let mut rec = Recorder::default();
-            let _ = Rootfs::mount(&mut rec, mode, "/r");
+            let _ = Rootfs::mount(&mut rec, mode, "/r").unwrap();
             assert_eq!(rec.calls, vec![expected.to_string()], "mode {mode:?}");
         }
     }
@@ -175,17 +217,16 @@ mod tests {
     fn typestate_chain_completes() {
         let mut rec = Recorder::default();
         let ro: Rootfs<ReadOnly> = Rootfs::mount(&mut rec, MountMode::Bind, "/data")
+            .unwrap()
             .create_old_root(&mut rec)
-            .into_readonly(&mut rec);
+            .unwrap()
+            .into_readonly(&mut rec)
+            .unwrap();
         assert_eq!(ro.root(), "/data");
         assert_eq!(rec.calls.len(), 3);
     }
 
-    // COMPILE-TIME GUARANTEE (cannot be unit-tested without a trybuild dependency, documented
-    // here instead): `Rootfs::into_readonly` exists only on `impl Rootfs<OldRootReady>`, so
-    //
-    //     Rootfs::mount(&mut rec, MountMode::Overlay, "/r").into_readonly(&mut rec);
-    //
-    // does NOT compile — `into_readonly` is not a method on `Rootfs<Mounted>`. The read-only
-    // remount is unreachable until `create_old_root` has produced `Rootfs<OldRootReady>`.
+    // COMPILE-TIME GUARANTEE (documented; not unit-testable without trybuild): `into_readonly`
+    // exists only on `impl Rootfs<OldRootReady>`, so calling it on `Rootfs<Mounted>` (i.e.
+    // remounting read-only before the pivot) does NOT compile.
 }

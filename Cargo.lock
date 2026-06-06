@@ -4,21 +4,31 @@ version = 3
 
 [[package]]
 name = "getkern"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "kern-common",
  "kern-isolation",
  "kern-oci",
+ "libc",
 ]
 
 [[package]]
 name = "kern-common"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "kern-isolation"
-version = "0.2.0"
+version = "0.3.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "kern-oci"
-version = "0.2.0"
+version = "0.3.0"
+
+[[package]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"

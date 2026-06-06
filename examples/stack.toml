@@ -1,0 +1,16 @@
+# A tiny stack for `kern compose`. Boxes start detached, in dependency order.
+# `db` comes up first; `api` declares it depends on `db`; `web` depends on `api`.
+
+[box.db]
+image = "alpine"
+command = ["/bin/sh", "-c", "while true; do sleep 1; done"]
+
+[box.api]
+image = "alpine"
+command = ["/bin/sh", "-c", "while true; do sleep 1; done"]
+depends_on = ["db"]
+
+[box.web]
+image = "alpine"
+command = ["/bin/sh", "-c", "while true; do sleep 1; done"]
+depends_on = ["api"]
