@@ -9,8 +9,12 @@
 
 mod cli;
 mod commands;
+mod compose;
 mod error;
+mod registry;
 mod sandbox;
+mod tui;
+mod ui;
 
 use std::process::ExitCode;
 

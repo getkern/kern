@@ -1,0 +1,47 @@
+name: Release
+# Build static (musl) binaries for linux-x86_64 and linux-aarch64 on a version tag and attach
+# them — plus SHA256SUMS — to the GitHub Release. `install.sh` downloads from here.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create/upload release assets
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tooling
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (static)
+        run: cargo build --release --target ${{ matrix.target }} --bin kern
+      - name: Package
+        run: |
+          set -eu
+          name="kern-${{ matrix.target }}"
+          install -Dm755 "target/${{ matrix.target }}/release/kern" "dist/kern"
+          strip "dist/kern" || true
+          tar -C dist -czf "${name}.tar.gz" kern
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kern-${{ matrix.target }}.tar.gz
+            kern-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true
