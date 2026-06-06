@@ -1,0 +1,9 @@
+[package]
+name = "kern-oci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCI image pull / layer extraction / whiteout handling for kern (internal)."
+publish = false

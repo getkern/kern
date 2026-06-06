@@ -1,0 +1,21 @@
+[package]
+name = "getkern"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "kern — a fast, lightweight OCI container / sandbox runtime."
+readme = "../../README.md"
+keywords = ["container", "sandbox", "oci", "runtime", "namespace"]
+categories = ["command-line-utilities", "virtualization"]
+
+[[bin]]
+name = "kern"
+path = "src/main.rs"
+
+[dependencies]
+kern-common = { path = "../kern-common", version = "0.1.0" }
+kern-oci = { path = "../kern-oci", version = "0.1.0" }
+kern-isolation = { path = "../kern-isolation", version = "0.1.0" }

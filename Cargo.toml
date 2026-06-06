@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kern-cli",
+    "crates/kern-common",
+    "crates/kern-oci",
+    "crates/kern-isolation",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/getkern/kern"
+homepage = "https://github.com/getkern/kern"
+authors = ["kern contributors"]
+
+# Release: optimized for a small, fast single binary. Startup speed is the headline
+# (opt-level = 3); fat LTO + one codegen unit give whole-program optimization; panic = abort
+# drops unwinding tables; strip removes symbols + debuginfo. (For a min-SIZE build instead of
+# min-startup, switch opt-level to "z" — kept at 3 here on purpose.)
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
+
+# A separate profile for distributed prebuilt binaries (roadmap 0.5): same as release.
+# Tweak here without touching `cargo build --release` for development.
+[profile.dist]
+inherits = "release"
