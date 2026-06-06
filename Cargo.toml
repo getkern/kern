@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -21,7 +21,10 @@ authors = ["kern contributors"]
 # drops unwinding tables; strip removes symbols + debuginfo. (For a min-SIZE build instead of
 # min-startup, switch opt-level to "z" — kept at 3 here on purpose.)
 [profile.release]
-opt-level = 3
+# opt-level "z" (size): kern's cold start is syscall-bound (unshare/mount/exec), not CPU-bound, so
+# size-optimised codegen shrinks the binary ~14% (804→688 KB musl x86_64) with no measurable latency
+# cost — verified a hair faster, likely better I-cache. There is no hot CPU path to slow down.
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"

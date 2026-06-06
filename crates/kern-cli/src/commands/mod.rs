@@ -1,14 +1,14 @@
-//! Subcommand implementations. One responsibility per function; the roadmap promotes each
-//! `Pending` verb (box/run/pull/compose) to its own module here.
+//! Subcommand implementations. One responsibility per function; the roadmap splits each verb
+//! (box/run/pull/compose) into its own module here as the surface grows.
 
-use crate::cli::GlobalOpts;
 use crate::error::Error;
 use crate::registry;
 use crate::sandbox::SandboxCtx;
 use kern_common::BoxName;
 use kern_isolation::{
-    exec_in_box, run_in_sandbox, run_in_sandbox_with, MountMode, OverlayDirs, SandboxSpec, Volume,
+    exec_in_box, run_in_sandbox_with, MountMode, OverlayDirs, SandboxSpec, Volume,
 };
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 pub fn version() -> Result<(), Error> {
@@ -30,7 +30,8 @@ pub fn help() -> Result<(), Error> {
 {b}COMMANDS:{z}
     {c}box{z} <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     {c}box{z} <name> --plan                                              Preview the isolation sequence
-    {c}exec{z} <name> [--env K=V] [-w <dir>] [-- CMD...]                 Run CMD in a running box
+    {c}run{z} [--memory M] [--cpus N] [--] CMD...                        Run CMD under CPU/mem caps (no sandbox)
+    {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [-- CMD...]           Run CMD in a running box
     {c}search{z} <query> [--json]                                        Search Docker Hub for images
     {c}pull{z} <image> [--dest <dir>]                                    Download an OCI image
     {c}images{z} [--json]                                                List pulled (cached) images
@@ -40,7 +41,6 @@ pub fn help() -> Result<(), Error> {
     {c}stats{z} [--json]                                                 Per-box memory + CPU
     {c}logs{z} <name>                                                    Show a box's output
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
-    {c}run{z}        Run with resource limits               {d}(roadmap){z}
 
 {b}OPTIONS for box:{z}
     --rootfs <dir>      Root filesystem to enter
@@ -52,6 +52,12 @@ pub fn help() -> Result<(), Error> {
     -w, --workdir <dir> Working directory inside the box
     -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default 512m)
     --cpus <n>          CPU cap in cores (e.g. 1.5, 2; default uncapped)
+    -it, -t, -i         Allocate an interactive PTY (shells/REPLs); foreground only
+    -p, --publish H:B   Publish box port B on host port H ([ip:]H:B; binds 127.0.0.1 by
+                        default — use 0.0.0.0:H:B to expose on all interfaces; repeatable)
+    --restart           Restart a detached box if it exits non-zero (on-failure)
+    --health-cmd <cmd>  Shell command probed in the box; sets ps HEALTH (exit 0 = healthy)
+    --health-interval N Seconds between health checks (default 30)
     --net               Share the host network (outbound; no network isolation)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
                         only the caller (faster + more isolated)
@@ -104,6 +110,37 @@ pub struct BoxRunArgs<'a> {
     pub memory: Option<u64>,
     /// `--cpus`: CPU cap in cores, K8s semantics (uncapped if `None`).
     pub cpus: Option<f64>,
+    /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
+    pub tty: bool,
+    /// `-p host:box` (repeatable): publish a box TCP port on a host port.
+    pub ports: &'a [(u32, u16, u16)],
+    /// `--restart`: restart a detached box on non-zero exit (on-failure policy).
+    pub restart: bool,
+    /// `--health-cmd <cmd>`: shell command run periodically in the box (exit 0 = healthy).
+    pub health_cmd: Option<&'a str>,
+    /// `--health-interval <sec>`: seconds between health checks.
+    pub health_interval: u64,
+}
+
+/// Clamp a `--cpus` request to the host's physical CPU count (from `/proc/cpuinfo`), so the cap
+/// is consistent across the systemd scope AND the in-namespace cgroup. The warning fires once — in
+/// the original process, before the scope re-exec (which sets `KERN_SCOPE`) runs the parse again.
+fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
+    let c = cpus?;
+    let host = std::fs::read_to_string("/proc/cpuinfo")
+        .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(1) as f64;
+    if c > host {
+        if std::env::var_os("KERN_SCOPE").is_none() {
+            eprintln!(
+                "kern: --cpus {c} exceeds the {host:.0} available CPUs — clamping to {host:.0}"
+            );
+        }
+        return Some(host);
+    }
+    Some(c)
 }
 
 /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-v ...] [--env ...] [-- cmd...]` — run
@@ -115,12 +152,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let cmd = default_if_empty(args.command);
     let volumes = parse_volumes(args.volumes)?;
     let env = parse_envs(args.env)?;
+    let cpus = clamp_cpus(args.cpus);
     // Robust resource caps: re-exec this whole invocation inside a transient systemd user scope
     // with memory + task limits (proper cgroup delegation). The scope's caps track `--memory`/
     // `--cpus` so the outer scope never strangles a box that asked for more. No-op if already
     // scoped or if systemd --user isn't available — then the best-effort cgroup in run_in_sandbox
     // applies the same caps.
-    reexec_in_scope_if_possible(args.memory, args.cpus);
+    reexec_in_scope_if_possible(args.memory, cpus);
 
     // `--bind-rootfs` only makes sense for a real `--rootfs` directory: an `--image` must stay an
     // immutable, shareable overlay (the cache is read-only and shared across boxes), and a bind
@@ -161,13 +199,36 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         uid_range: args.uid_range,
         bind_rootfs: args.bind_rootfs,
         memory: args.memory,
-        cpus: args.cpus,
+        cpus,
     })?;
 
-    if args.detached {
-        return run_detached(&name, spec, scratch);
+    if args.tty && args.detached {
+        return Err(Error::Sandbox(
+            "-it can't combine with -d — a detached box has no terminal to attach".to_string(),
+        ));
     }
-    let result = run_in_sandbox(&spec);
+    if args.detached {
+        return run_detached(
+            &name,
+            spec,
+            scratch,
+            args.ports,
+            args.restart,
+            args.health_cmd,
+            args.health_interval,
+        );
+    }
+    // Foreground/interactive: print the status panel — but only when stderr is a real terminal, so
+    // it stays out of pipes, scripts and `kern logs`. stderr (not stdout) keeps the box's own
+    // stdout clean. Printed once: when a systemd scope re-execs us, only the inner process (which
+    // actually reaches here) prints.
+    print_box_status(&args, cpus);
+    if args.tty {
+        return run_box_interactive(spec, scratch, args.ports);
+    }
+    // Foreground: run the box (the runtime forks `-p` forwarders before the unshare and tears them
+    // down when the box exits).
+    let result = run_in_sandbox_with(&spec, None, |_| {}, None, args.ports);
     cleanup_scratch(scratch.as_deref());
     match result {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
@@ -175,6 +236,114 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         Ok(code) => std::process::exit(code),
         Err(e) => Err(Error::Sandbox(e.to_string())),
     }
+}
+
+/// Print the `kern box` status panel (aligned isolation + resource posture, actionable warnings)
+/// to stderr — but ONLY when stderr is a terminal, so pipes/scripts/`kern logs` stay clean. `cpus`
+/// is the already-clamped value, so the panel shows the cap that's actually enforced.
+fn print_box_status(args: &BoxRunArgs, cpus: Option<f64>) {
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let source = args.image.or(args.rootfs).unwrap_or("");
+    // The effective command (the box defaults to /bin/sh when none is given) — shown like docker
+    // `ps`'s COMMAND column.
+    let cmd = if args.command.is_empty() {
+        "/bin/sh".to_string()
+    } else {
+        args.command.join(" ")
+    };
+    let status = crate::ui::BoxStatus {
+        name: args.name,
+        source,
+        cmd: &cmd,
+        read_only: args.read_only,
+        bind_rootfs: args.bind_rootfs,
+        share_net: args.share_net,
+        memory: args.memory,
+        cpus,
+        volumes: args.volumes.len(),
+        tty: args.tty,
+        seccomp_syscalls: kern_isolation::denied_syscall_count(),
+    };
+    let p = crate::ui::Palette::detect_stderr();
+    let gl = crate::ui::Glyphs::detect();
+    let w = crate::ui::term_width(libc::STDERR_FILENO);
+    // The wordmark is an *event*, not per-box noise: show it once for the first foreground box of
+    // the session, then only the panel. (`--help` shows it too; that's a separate moment.)
+    if first_box_of_session() {
+        eprintln!("{}\n", crate::ui::logo(&p));
+    }
+    eprint!("{}", crate::ui::box_banner(&status, &p, &gl, w));
+}
+
+/// True the first time a foreground box runs in this login session, recording a marker under
+/// `$XDG_RUNTIME_DIR` (tmpfs → cleared on logout, so "once per session") so the wordmark prints
+/// once and not before every box. Best-effort: with no runtime dir (can't track) it returns false
+/// — better to skip the logo than to reprint it every time. A lost race (two boxes at once) just
+/// prints the logo twice, which is harmless.
+fn first_box_of_session() -> bool {
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let marker = std::path::Path::new(&dir).join("kern").join(".greeted");
+    if marker.exists() {
+        return false;
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&marker, b"").is_ok()
+}
+
+/// Foreground `-it`: allocate a PTY, hand its slave to the box as a controlling terminal, put the
+/// host terminal in raw mode, and let `run_in_sandbox_with` pump bytes between them until the box
+/// exits — then restore the terminal and propagate the exit code.
+fn run_box_interactive(
+    mut spec: SandboxSpec,
+    scratch: Option<PathBuf>,
+    ports: &[(u32, u16, u16)],
+) -> Result<(), Error> {
+    let pty = crate::pty::open().map_err(|e| Error::Sandbox(format!("openpty: {e}")))?;
+    spec.tty_slave = Some(pty.slave);
+    let saved = crate::pty::raw_with_resize(pty.master);
+    let result = run_in_sandbox_with(&spec, None, |_| {}, Some(pty.master), ports);
+    if let Some(ref prev) = saved {
+        crate::pty::restore(0, prev);
+    }
+    unsafe { libc::close(pty.master) };
+    cleanup_scratch(scratch.as_deref());
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(e) => Err(Error::Sandbox(e.to_string())),
+    }
+}
+
+/// `kern run [--memory M] [--cpus N] [--] <cmd...>` — run a command under cgroup CPU/memory caps
+/// WITHOUT a sandbox. The resource-governor verb: it governs *resources*, not isolation (that's
+/// `box`). It replaces this process with the command — no fork, no namespaces, no seccomp — so it's
+/// the leanest possible path: a transient capped cgroup + `exec`. The command's exit code becomes
+/// kern's, exactly like a bare exec.
+pub fn run(command: &[String], memory: Option<u64>, cpus: Option<f64>) -> Result<(), Error> {
+    use std::os::unix::process::CommandExt;
+    if command.is_empty() {
+        return Err(Error::Usage("run [--memory M] [--cpus N] [--] <cmd...>"));
+    }
+    // Robust caps via a transient systemd user scope whose MemoryMax/CPUQuota track the flags; this
+    // re-execs once and returns here under KERN_SCOPE. Where systemd --user isn't present it's a
+    // no-op and the best-effort in-process cgroup below applies the same caps.
+    let cpus = clamp_cpus(cpus);
+    reexec_in_scope_if_possible(memory, cpus);
+    let _ = kern_isolation::apply_cgroup_limits("run", memory, cpus);
+    // exec() replaces this process with the command (which inherits the cgroup) and only returns on
+    // failure — so a successful run propagates the command's own exit code as kern's.
+    let err = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .exec();
+    Err(Error::Sandbox(format!(
+        "cannot run '{}': {err}",
+        command[0]
+    )))
 }
 
 /// Parsed inputs for [`build_spec`].
@@ -235,6 +404,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
             uid_range: b.uid_range,
             memory_max: b.memory,
             cpus: b.cpus,
+            tty_slave: None,
         };
         return Ok((spec, None));
     }
@@ -278,6 +448,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         uid_range: b.uid_range,
         memory_max: b.memory,
         cpus: b.cpus,
+        tty_slave: None,
     };
     Ok((spec, Some(scratch)))
 }
@@ -359,6 +530,7 @@ pub fn exec(
     command: &[String],
     env: &[String],
     workdir: Option<&str>,
+    tty: bool,
 ) -> Result<(), Error> {
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let env = parse_envs(env)?;
@@ -375,7 +547,35 @@ pub fn exec(
         registry::child_of(inst.pid)
             .ok_or_else(|| Error::Sandbox("could not locate the box's main process".to_string()))?
     };
-    match exec_in_box(pid1, &cmd, &env, workdir) {
+
+    // `-it`: allocate a PTY and (when our own stdin is a terminal) put it in raw mode + forward
+    // window resizes, exactly like `kern box -it`. `exec_in_box` hands the slave to the exec'd
+    // process as its controlling tty and pumps host stdio <-> master; we restore the terminal after.
+    let pty = if tty {
+        Some(crate::pty::open().map_err(|e| Error::Sandbox(format!("openpty: {e}")))?)
+    } else {
+        None
+    };
+    let saved = pty
+        .as_ref()
+        .and_then(|p| crate::pty::raw_with_resize(p.master));
+
+    let result = exec_in_box(
+        pid1,
+        &cmd,
+        &env,
+        workdir,
+        pty.as_ref().map(|p| p.slave),
+        pty.as_ref().map(|p| p.master),
+    );
+
+    if let Some(prev) = saved.as_ref() {
+        crate::pty::restore(0, prev);
+    }
+    if let Some(p) = pty.as_ref() {
+        unsafe { libc::close(p.master) };
+    }
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => Err(Error::Sandbox(e.to_string())),
     }
@@ -391,7 +591,193 @@ fn cleanup_scratch(scratch: Option<&std::path::Path>) {
 /// Run the box in the background: fork a supervisor that detaches from the terminal, registers
 /// itself, runs the sandbox to completion, then de-registers. The supervisor's pid is what
 /// `kern ps` tracks (it lives for the box's lifetime).
-fn run_detached(name: &BoxName, spec: SandboxSpec, scratch: Option<PathBuf>) -> Result<(), Error> {
+/// Fork a health-checker for a detached box: every `interval` s it runs `health_cmd` (via
+/// `/bin/sh -c`) inside the box and records `healthy`/`unhealthy` in the registry health sidecar
+/// (shown by `kern ps`). It re-reads the box's PID 1 each round, so it follows `--restart`s.
+/// Returns the checker's pid.
+fn spawn_health_checker(name: String, pid: i32, health_cmd: String, interval: u64) -> i32 {
+    let child = unsafe { libc::fork() };
+    if child != 0 {
+        return child;
+    }
+    // CHILD: shed inherited fds (the detached box's readiness pipe would otherwise hang `box -d`),
+    // then quiet stdio so probe output doesn't land in the box log.
+    kern_isolation::shed_inherited_fds(-1);
+    detach_stdio(None);
+    registry::set_health(&name, pid, "starting");
+    let probe = ["/bin/sh".to_string(), "-c".to_string(), health_cmd];
+    loop {
+        unsafe { libc::sleep(interval as libc::c_uint) };
+        // Current box PID 1 (changes across `--restart`); read it from the registry by name.
+        let pid1 = registry::list()
+            .into_iter()
+            .find(|b| b.name == name)
+            .map(|b| b.pid1)
+            .unwrap_or(0);
+        let status = if pid1 > 0 {
+            // Run the probe in a CHILD: `exec_in_box` joins the box's namespaces *in-process*, so
+            // calling it here would strand the checker in the box's mount ns (its sidecar writes
+            // would then miss the host). The child exits with the probe's code; we just read that.
+            let probe_pid = unsafe { libc::fork() };
+            if probe_pid == 0 {
+                let code = exec_in_box(pid1, &probe, &[], None, None, None).unwrap_or(1);
+                unsafe { libc::_exit(code) };
+            }
+            let mut st = 0i32;
+            if probe_pid > 0
+                && unsafe { libc::waitpid(probe_pid, &mut st, 0) } > 0
+                && libc::WIFEXITED(st)
+                && libc::WEXITSTATUS(st) == 0
+            {
+                "healthy"
+            } else {
+                "unhealthy"
+            }
+        } else {
+            "starting"
+        };
+        registry::set_health(&name, pid, status);
+    }
+}
+
+/// Human-readable summary of `-p` mappings for `kern ps`, always showing the bind address so the
+/// exposure is visible at a glance (e.g. `127.0.0.1:8080->80, 0.0.0.0:443->443`).
+fn ports_summary(ports: &[(u32, u16, u16)]) -> String {
+    ports
+        .iter()
+        .map(|&(ip, h, b)| crate::ports::fmt(ip, h, b))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Foreground-launcher side of a detached start: block on the readiness pipe until the box `exec`s
+/// (EOF = up) or signals failure (one byte → reap the supervisor and report why), then print the
+/// "started" line. With no pipe it just announces. Retries the read on `EINTR` so a stray signal
+/// isn't misread as a successful start.
+fn await_box_started(
+    name: &BoxName,
+    child: i32,
+    rd: i32,
+    wr: i32,
+    have_pipe: bool,
+) -> Result<(), Error> {
+    if have_pipe {
+        unsafe { libc::close(wr) };
+        let mut byte = [0u8; 1];
+        let n = loop {
+            let r = unsafe { libc::read(rd, byte.as_mut_ptr().cast(), 1) };
+            if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break r;
+        };
+        unsafe { libc::close(rd) };
+        if n > 0 {
+            let mut st = 0i32;
+            unsafe { libc::waitpid(child, &mut st, 0) };
+            return Err(Error::Sandbox(format!(
+                "box '{}' exited before starting — run `kern logs {}` for the reason",
+                name.as_str(),
+                name.as_str()
+            )));
+        }
+    }
+    let p = crate::ui::Palette::detect();
+    let gl = crate::ui::Glyphs::detect();
+    let n = name.as_str();
+    println!(
+        "{}{} started{} {}{n}{} {}[pid {child}, detached]{}",
+        p.g, gl.ok, p.z, p.b, p.z, p.d, p.z
+    );
+    println!(
+        "  {}next: kern ps {} kern logs {n} {} kern stop {n}{}",
+        p.d, gl.dot, gl.dot, p.z
+    );
+    Ok(())
+}
+
+/// Supervisor loop: run the box and wait for it; with `--restart` (on-failure) re-run it on a
+/// non-zero exit, up to a cap with a 1 s backoff so a perpetually-crashing box eventually gives up.
+/// Each attempt is a FRESH child — `run_in_sandbox_with` unshares its *caller*, so it can't be
+/// re-run in place (the second `unshare` would `EINVAL`); the supervisor stays un-namespaced and
+/// just waits. Readiness is signalled only on the first attempt (the launcher already returned by
+/// the time a restart happens). `inst` is re-registered with each attempt's box PID 1.
+fn supervise_box(
+    name: &BoxName,
+    spec: &SandboxSpec,
+    have_pipe: bool,
+    wr: i32,
+    ports: &[(u32, u16, u16)],
+    restart: bool,
+    inst: &mut registry::Instance,
+) {
+    const MAX_RESTARTS: u32 = 10;
+    let mut attempt = 0u32;
+    loop {
+        let ready = if attempt == 0 {
+            have_pipe.then_some(wr)
+        } else {
+            None
+        };
+        let runner = unsafe { libc::fork() };
+        if runner == 0 {
+            let code = match run_in_sandbox_with(
+                spec,
+                ready,
+                |pid1| {
+                    inst.pid1 = pid1;
+                    let _ = registry::register(inst);
+                },
+                None,  // detached boxes have no terminal to attach
+                ports, // the runtime forks `-p` forwarders before unshare, kills them on box exit
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("kern: box failed to start: {e}");
+                    127
+                }
+            };
+            unsafe { libc::_exit(code) };
+        }
+        // Supervisor: drop our readiness-pipe copy so the launcher sees EOF when the box exec()s.
+        if attempt == 0 && have_pipe {
+            unsafe { libc::close(wr) };
+        }
+        let mut st = 0i32;
+        let code = if runner > 0 && unsafe { libc::waitpid(runner, &mut st, 0) } > 0 {
+            if libc::WIFEXITED(st) {
+                libc::WEXITSTATUS(st)
+            } else if libc::WIFSIGNALED(st) {
+                128 + libc::WTERMSIG(st)
+            } else {
+                1
+            }
+        } else {
+            1 // fork or waitpid failed — treat as a failure, don't spin
+        };
+        attempt += 1;
+        if restart && code != 0 && attempt <= MAX_RESTARTS {
+            eprintln!(
+                "kern: box '{}' exited {code}; restarting ({attempt}/{MAX_RESTARTS})",
+                name.as_str()
+            );
+            unsafe { libc::sleep(1) }; // brief backoff so a crash loop can't spin
+            continue;
+        }
+        break;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_detached(
+    name: &BoxName,
+    spec: SandboxSpec,
+    scratch: Option<PathBuf>,
+    ports: &[(u32, u16, u16)],
+    restart: bool,
+    health_cmd: Option<&str>,
+    health_interval: u64,
+) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
     // box is up". If the box fails to set up or exec, it writes one byte first → we report a
@@ -412,36 +798,7 @@ fn run_detached(name: &BoxName, spec: SandboxSpec, scratch: Option<PathBuf>) -> 
         return Err(Error::Sandbox("fork for detach failed".to_string()));
     }
     if child > 0 {
-        // ── Foreground launcher ── block on readiness, then report truthfully.
-        if have_pipe {
-            unsafe { libc::close(wr) };
-            // Block until the box exec()s (EOF) or signals failure (1 byte). Retry on EINTR so a
-            // stray signal can't be misread as a successful start.
-            let mut byte = [0u8; 1];
-            let n = loop {
-                let r = unsafe { libc::read(rd, byte.as_mut_ptr().cast(), 1) };
-                if r < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
-                }
-                break r;
-            };
-            unsafe { libc::close(rd) };
-            if n > 0 {
-                // The box signalled failure (or died) before exec. Reap the supervisor so it
-                // can't linger as a zombie, then point at the captured reason.
-                let mut st = 0i32;
-                unsafe { libc::waitpid(child, &mut st, 0) };
-                return Err(Error::Sandbox(format!(
-                    "box '{}' exited before starting — run `kern logs {}` for the reason",
-                    name.as_str(),
-                    name.as_str()
-                )));
-            }
-        }
-        println!("box '{}' started (detached, pid {child})", name.as_str());
-        return Ok(());
+        return await_box_started(name, child, rd, wr, have_pipe);
     }
     // ── Supervisor ──
     // SAFETY (fork): kern is single-threaded (std + libc only, no runtime threads), so running
@@ -465,18 +822,26 @@ fn run_detached(name: &BoxName, spec: SandboxSpec, scratch: Option<PathBuf>) -> 
         command: spec.command.join(" "),
         started: registry::now_unix(),
         starttime: registry::proc_starttime(pid),
+        ports: ports_summary(ports),
     };
     let path = registry::register(&inst).ok();
-    // Run the box; when PID 1 is known, rewrite our registry entry with it so `kern exec` can
-    // join the box's namespaces. The file key is `name-<supervisorpid>`, so this overwrites it.
-    // stderr is the per-box log now (detach_stdio), so a setup failure here is captured for
-    // `kern logs <name>` — and the readiness guard signals the failure to the launcher.
-    if let Err(e) = run_in_sandbox_with(&spec, have_pipe.then_some(wr), |pid1| {
-        inst.pid1 = pid1;
-        let _ = registry::register(&inst);
-    }) {
-        eprintln!("kern: box failed to start: {e}");
-    } // blocks until the box exits
+    // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
+    // `kern ps`. Lives in this supervisor's process group, so it's reaped on stop with everything else.
+    let health_pid = health_cmd.map(|hc| {
+        spawn_health_checker(
+            name.as_str().to_string(),
+            pid,
+            hc.to_string(),
+            health_interval,
+        )
+    });
+    // Run the box (re-registering with its PID 1 so `kern exec` can find it), restarting it per
+    // `--restart`. Blocks for the box's whole lifetime.
+    supervise_box(name, &spec, have_pipe, wr, ports, restart, &mut inst);
+    if let Some(hp) = health_pid {
+        unsafe { libc::kill(hp, libc::SIGTERM) };
+        registry::clear_health(name.as_str(), pid);
+    }
     if let Some(p) = path {
         registry::unregister(&p);
     }
@@ -586,22 +951,83 @@ pub fn ps(json: bool) -> Result<(), Error> {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"name\":{},\"pid\":{},\"rootfs\":{},\"command\":{},\"started\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{}}}",
                 json_str(&b.name),
                 b.pid,
                 json_str(&b.rootfs),
                 json_str(&b.command),
-                b.started
+                b.started,
+                json_str(&b.ports),
+                json_str(&registry::health_of(&b.name, b.pid)),
             ));
         }
         out.push(']');
         println!("{out}");
     } else {
-        println!("{:<16} {:>8} {:>8}  COMMAND", "NAME", "PID", "UPTIME");
+        // Build rows first so the PORTS column can size to its widest value (a published mapping
+        // like `127.0.0.1:8080->80` is wider than the "PORTS" header) — keeps COMMAND aligned.
         let now = registry::now_unix();
-        for b in &boxes {
-            let up = now.saturating_sub(b.started);
-            println!("{:<16} {:>8} {:>7}s  {}", b.name, b.pid, up, b.command);
+        let rows: Vec<(&registry::Instance, u64, String, String)> = boxes
+            .iter()
+            .map(|b| {
+                let up = now.saturating_sub(b.started);
+                let health = registry::health_of(&b.name, b.pid);
+                let health = if health.is_empty() {
+                    "-".to_string()
+                } else {
+                    health
+                };
+                let ports = if b.ports.is_empty() {
+                    "-".to_string()
+                } else {
+                    b.ports.clone()
+                };
+                (b, up, health, ports)
+            })
+            .collect();
+        let pw = rows
+            .iter()
+            .map(|(_, _, _, p)| p.chars().count())
+            .chain(std::iter::once(5)) // len("PORTS")
+            .max()
+            .unwrap_or(5);
+        // On a TTY, truncate COMMAND to the remaining width so a long command never wraps (like
+        // `docker ps`); piped/non-TTY prints it whole so scripts get the full line.
+        let tty = std::io::stdout().is_terminal();
+        let width = crate::ui::term_width(libc::STDOUT_FILENO);
+        let p = crate::ui::Palette::detect();
+        // The visible width before COMMAND is fixed (16+1+7+1+7+2+9+1+pw+1 = 45+pw), so the budget
+        // is computed arithmetically — colour codes never enter the count.
+        let prefix_w = 45 + pw;
+        println!(
+            "{d}{:<16} {:>7} {:>7}  {:<9} {:<pw$} COMMAND{z}",
+            "NAME",
+            "PID",
+            "UPTIME",
+            "HEALTH",
+            "PORTS",
+            d = p.d,
+            z = p.z
+        );
+        for (b, up, health, ports) in &rows {
+            // Colour follows the panel standard: bold-cyan NAME, semantic HEALTH. Each cell is
+            // padded on its PLAIN value, then wrapped in colour, so alignment is preserved.
+            let name = format!("{}{}{:<16}{}", p.b, p.c, b.name, p.z);
+            let hc = match health.as_str() {
+                "healthy" => p.g,
+                "unhealthy" => p.r,
+                _ => p.d,
+            };
+            let health_cell = format!("{hc}{:<9}{}", health, p.z);
+            let cmd = if tty {
+                truncate(&b.command, width.saturating_sub(prefix_w).max(8))
+            } else {
+                b.command.clone()
+            };
+            println!(
+                "{name} {:>7} {:>6}s  {health_cell} {ports:<pw$} {cmd}",
+                b.pid, up
+            );
         }
     }
     Ok(())
@@ -664,12 +1090,22 @@ pub fn stats(json: bool) -> Result<(), Error> {
         out.push(']');
         println!("{out}");
     } else {
-        println!("{:<16} {:>8} {:>9} {:>9}", "NAME", "PID", "MEM", "CPU");
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{d}{:<16} {:>8} {:>9} {:>9}{z}",
+            "NAME",
+            "PID",
+            "MEM",
+            "CPU",
+            d = p.d,
+            z = p.z
+        );
         for b in &boxes {
             let mem = registry::mem_bytes(b.pid).map_or("-".into(), human_bytes);
             let cpu =
                 registry::cpu_usec(b.pid).map_or("-".into(), |u| format!("{:.1}s", u as f64 / 1e6));
-            println!("{:<16} {:>8} {:>9} {:>9}", b.name, b.pid, mem, cpu);
+            let name = format!("{}{}{:<16}{}", p.b, p.c, b.name, p.z);
+            println!("{name} {:>8} {:>9} {:>9}", b.pid, mem, cpu);
         }
     }
     Ok(())
@@ -722,12 +1158,20 @@ pub fn images(json: bool) -> Result<(), Error> {
     } else if rows.is_empty() {
         println!("no images cached yet — pull one with `kern pull <image>` (or `kern box <name> --image <image>`)");
     } else {
-        println!("{:<30} {:>9}  PULLED", "REPOSITORY", "SIZE");
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{d}{:<30} {:>9}  PULLED{z}",
+            "REPOSITORY",
+            "SIZE",
+            d = p.d,
+            z = p.z
+        );
         let now = registry::now_unix();
         for (name, size, pulled) in &rows {
+            // `truncate` also strips escapes — the `.ok` sentinel content is untrusted.
+            let repo = format!("{}{}{:<30}{}", p.b, p.c, truncate(name, 30), p.z);
             println!(
-                "{:<30} {:>9}  {}",
-                truncate(name, 30), // untrusted (the `.ok` sentinel content) — strip escapes
+                "{repo} {:>9}  {}",
                 human_bytes(*size),
                 fmt_age(now.saturating_sub(*pulled))
             );
@@ -785,18 +1229,27 @@ pub fn search(query: &str, json: bool) -> Result<(), Error> {
     } else if results.is_empty() {
         println!("no images found for '{query}'");
     } else {
+        let p = crate::ui::Palette::detect();
+        let gl = crate::ui::Glyphs::detect();
         println!(
-            "{:<32} {:>6} {:<8} DESCRIPTION",
-            "NAME", "STARS", "OFFICIAL"
+            "{d}{:<32} {:>6} {:<8} DESCRIPTION{z}",
+            "NAME",
+            "STARS",
+            "OFFICIAL",
+            d = p.d,
+            z = p.z
         );
         for r in &results {
-            println!(
-                "{:<32} {:>6} {:<8} {}",
-                truncate(&r.name, 32),
-                r.stars,
-                if r.official { "[ok]" } else { "" },
-                truncate(&r.description, 46)
-            );
+            // NAME bold-cyan, OFFICIAL a green check, DESCRIPTION dim — all on PLAIN-padded cells so
+            // alignment holds. Both name and description are untrusted (registry data) → escapes stripped.
+            let name = format!("{}{}{:<32}{}", p.b, p.c, truncate(&r.name, 32), p.z);
+            let official = if r.official {
+                format!("{}{:<8}{}", p.g, gl.ok, p.z)
+            } else {
+                format!("{:<8}", "")
+            };
+            let desc = format!("{}{}{}", p.d, truncate(&r.description, 46), p.z);
+            println!("{name} {:>6} {official} {desc}", r.stars);
         }
         println!("\npull one with:  kern pull <NAME>");
     }
@@ -994,6 +1447,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         // The supervisor `setsid`-ed, so its pgid == its pid; the box shares the group.
         unsafe { libc::kill(-b.pid, libc::SIGKILL) };
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
+        registry::clear_health(&b.name, b.pid); // SIGKILL skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
         println!("stopped '{}' (pid {})", b.name, b.pid);
     }
@@ -1078,10 +1532,4 @@ pub fn compose(file: &str) -> Result<(), Error> {
         order.len()
     );
     Ok(())
-}
-
-/// A recognised runtime verb that lands in a later 0.x release.
-pub fn pending(name: &'static str, opts: &GlobalOpts) -> Result<(), Error> {
-    let _ = opts; // GPU-off is the only behaviour wired so far
-    Err(Error::NotYetImplemented(name))
 }

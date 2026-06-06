@@ -49,13 +49,32 @@ pub enum Command {
         memory: Option<u64>,
         /// `--cpus`: CPU cap in cores, K8s semantics (1.5 = 1½ cores; uncapped if `None`).
         cpus: Option<f64>,
+        /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
+        tty: bool,
+        /// `-p host:box` (repeatable): publish a box TCP port on a host port.
+        ports: Vec<(u32, u16, u16)>,
+        /// `--restart`: restart a detached box on non-zero exit (on-failure policy).
+        restart: bool,
+        /// `--health-cmd <cmd>`: shell command run periodically in the box (exit 0 = healthy).
+        health_cmd: Option<String>,
+        /// `--health-interval <sec>`: seconds between health checks (default 30).
+        health_interval: u64,
     },
-    /// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]`: run a command in a box.
+    /// `kern run [--memory M] [--cpus N] [--] <cmd...>`: run a command under cgroup CPU/memory
+    /// caps WITHOUT a full sandbox — the resource-governor verb (composes with `box`'s isolation).
+    Run {
+        command: Vec<String>,
+        memory: Option<u64>,
+        cpus: Option<f64>,
+    },
+    /// `kern exec <name> [-it] [--env K=V] [--workdir <dir>] [-- cmd...]`: run a command in a box.
     Exec {
         name: String,
         command: Vec<String>,
         env: Vec<String>,
         workdir: Option<String>,
+        /// `-it`/`-t`/`-i`: allocate an interactive PTY for the exec'd command.
+        tty: bool,
     },
     /// `kern stop <name>... | --all`: stop running box(es) by name, or every running box.
     Stop {
@@ -94,8 +113,6 @@ pub enum Command {
     Compose {
         file: String,
     },
-    /// A runtime subcommand recognised but not yet implemented in this 0.x scaffold.
-    Pending(&'static str),
 }
 
 /// Split argv into global options and a subcommand.
@@ -167,8 +184,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             },
             _ => return Err(Error::Usage("compose <file>")),
         },
-        // Recognised runtime verbs — implemented across the 0.x roadmap.
-        Some("run") => Command::Pending("run"),
+        // `run [--memory M] [--cpus N] [--] <cmd...>`: cap a command without a full sandbox.
+        Some("run") => parse_run(&rest)?,
         Some(other) => return Err(Error::UnknownCommand(other.to_string())),
     };
     Ok((opts, cmd))
@@ -176,7 +193,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
 
 /// Parse the `box` subcommand. `--plan` previews the isolation sequence (no privileges);
 /// `--rootfs <dir>` or `--image <ref>` runs the command (after `--`, default `/bin/sh`) in a
-/// real sandbox. Without a rootfs/image and without `--plan` → `Pending`.
+/// real sandbox. Without a rootfs/image it still routes to `BoxRun` (which reports the missing
+/// source); `--plan` previews instead of running.
 fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut name: Option<&str> = None;
     let mut rootfs: Option<String> = None;
@@ -187,6 +205,11 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut share_net = false;
     let mut uid_range = false;
     let mut bind_rootfs = false;
+    let mut tty = false;
+    let mut restart = false;
+    let mut health_cmd: Option<String> = None;
+    let mut health_interval = 30u64;
+    let mut ports: Vec<(u32, u16, u16)> = Vec::new();
     let mut memory: Option<u64> = None;
     let mut cpus: Option<f64> = None;
     let mut volumes: Vec<String> = Vec::new();
@@ -208,6 +231,30 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--net" => share_net = true,
                 "--uid-range" => uid_range = true,
                 "--bind-rootfs" => bind_rootfs = true,
+                // `--restart`: restart a detached box if it exits non-zero (on-failure policy).
+                "--restart" => restart = true,
+                // `--health-cmd <cmd>`: shell command run periodically in the box; exit 0 = healthy.
+                "--health-cmd" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(c) => health_cmd = Some((*c).to_string()),
+                        None => return Err(Error::Usage("--health-cmd <shell command>")),
+                    }
+                }
+                // `--health-interval <sec>`: seconds between health checks (default 30).
+                "--health-interval" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|s| *s > 0)
+                    {
+                        Some(s) => health_interval = s,
+                        None => return Err(Error::Usage("--health-interval <seconds> (e.g. 10)")),
+                    }
+                }
+                // `-it`/`-ti`/`-t`/`-i`: allocate an interactive PTY for the box (shells, REPLs).
+                "-it" | "-ti" | "-t" | "-i" | "--tty" | "--interactive" => tty = true,
                 "--rootfs" => {
                     i += 1;
                     rootfs = rest.get(i).map(|v| (*v).to_string());
@@ -231,6 +278,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "-w" | "--workdir" => {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
+                }
+                "-p" | "--publish" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| crate::ports::parse(v)) {
+                        Some(p) => ports.push(p),
+                        None => return Err(Error::Usage("-p <hostport>:<boxport> (e.g. 8080:80)")),
+                    }
                 }
                 "-m" | "--memory" => {
                     i += 1;
@@ -285,9 +339,69 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             bind_rootfs,
             memory,
             cpus,
+            tty,
+            ports,
+            restart,
+            health_cmd,
+            health_interval,
         }
     };
     Ok(cmd)
+}
+
+/// Parse `run [--memory M] [--cpus N] [--] <cmd...>`. Flags come first; the first bare token (or
+/// everything after `--`) begins the command, after which nothing is treated as a flag. An empty
+/// command is a usage error.
+fn parse_run(rest: &[&str]) -> Result<Command, Error> {
+    let mut memory: Option<u64> = None;
+    let mut cpus: Option<f64> = None;
+    let mut command: Vec<String> = Vec::new();
+    let mut i = 1; // rest[0] == "run"
+    while i < rest.len() {
+        match rest[i] {
+            "--" => {
+                command.extend(rest[i + 1..].iter().map(|s| (*s).to_string()));
+                break;
+            }
+            "-m" | "--memory" => {
+                i += 1;
+                match rest.get(i).and_then(|v| parse_size(v)) {
+                    Some(b) => memory = Some(b),
+                    None => return Err(Error::Usage("--memory <size> (e.g. 512m, 1g)")),
+                }
+            }
+            "--cpus" => {
+                i += 1;
+                match rest
+                    .get(i)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|c| *c > 0.0 && c.is_finite())
+                {
+                    Some(c) => cpus = Some(c),
+                    None => return Err(Error::Usage("--cpus <n> (e.g. 1.5, 2)")),
+                }
+            }
+            s if s.starts_with('-') => {
+                return Err(Error::Usage(
+                    "run: unknown flag (put `--` before the command)",
+                ))
+            }
+            // First bare token → the command starts here; everything from here on is the command.
+            _ => {
+                command.extend(rest[i..].iter().map(|s| (*s).to_string()));
+                break;
+            }
+        }
+        i += 1;
+    }
+    if command.is_empty() {
+        return Err(Error::Usage("run [--memory M] [--cpus N] [--] <cmd...>"));
+    }
+    Ok(Command::Run {
+        command,
+        memory,
+        cpus,
+    })
 }
 
 /// Parse a memory size like `512m`, `1g`, `512mb`, or a bare `268435456` (= bytes) into bytes.
@@ -326,6 +440,7 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
     let mut env: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
+    let mut tty = false;
     let mut after_dd = false;
     let mut i = 1; // rest[0] == "exec"
     while i < rest.len() {
@@ -345,6 +460,7 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
                 }
+                "-it" | "-ti" | "-t" | "-i" | "--tty" | "--interactive" => tty = true,
                 s if s.starts_with('-') => {
                     return Err(Error::Usage("exec: unknown flag (see --help)"))
                 }
@@ -360,6 +476,7 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
             command,
             env,
             workdir,
+            tty,
         }),
         None => Err(Error::Usage("exec <name> [-- cmd...]")),
     }
@@ -390,7 +507,9 @@ fn parse_pull(rest: &[&str]) -> Option<Command> {
 
 /// Parse and run.
 pub fn run(args: &[String]) -> Result<(), Error> {
-    let (opts, cmd) = parse(args)?;
+    // `--no-gpu` is parsed into `opts` (the runtime is GPU-free, so it's a forward-compat no-op for
+    // now); no dispatch arm consumes it yet.
+    let (_opts, cmd) = parse(args)?;
     match cmd {
         Command::Version => commands::version(),
         Command::Help => commands::help(),
@@ -410,6 +529,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             bind_rootfs,
             memory,
             cpus,
+            tty,
+            ports,
+            restart,
+            health_cmd,
+            health_interval,
         } => commands::box_run(commands::BoxRunArgs {
             name: &name,
             rootfs: rootfs.as_deref(),
@@ -425,13 +549,24 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             bind_rootfs,
             memory,
             cpus,
+            tty,
+            ports: &ports,
+            restart,
+            health_cmd: health_cmd.as_deref(),
+            health_interval,
         }),
+        Command::Run {
+            command,
+            memory,
+            cpus,
+        } => commands::run(&command, memory, cpus),
         Command::Exec {
             name,
             command,
             env,
             workdir,
-        } => commands::exec(&name, &command, &env, workdir.as_deref()),
+            tty,
+        } => commands::exec(&name, &command, &env, workdir.as_deref(), tty),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
         Command::Pull { image, dest } => commands::pull(&image, dest.as_deref()),
@@ -441,7 +576,6 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Logs { name } => commands::logs(&name),
         Command::Top => commands::top(),
         Command::Compose { file } => commands::compose(&file),
-        Command::Pending(name) => commands::pending(name, &opts),
     }
 }
 
@@ -519,6 +653,83 @@ mod tests {
     }
 
     #[test]
+    fn box_publish_ports() {
+        let (_, cmd) = parse(&[
+            "box".into(),
+            "x".into(),
+            "-p".into(),
+            "8080:80".into(), // default → 127.0.0.1 (loopback only)
+            "-p".into(),
+            "0.0.0.0:443:443".into(), // explicit all-interfaces
+        ])
+        .unwrap();
+        let Command::BoxRun { ports, .. } = cmd else {
+            panic!("expected BoxRun")
+        };
+        assert_eq!(ports, vec![(0x7f00_0001, 8080, 80), (0, 443, 443)]);
+        // Malformed mappings are usage errors, never silently dropped.
+        for bad in ["0:80", "abc", "80", "80:0", "999.0.0.1:8080:80"] {
+            assert!(
+                matches!(
+                    parse(&["box".into(), "x".into(), "-p".into(), bad.to_string()]),
+                    Err(Error::Usage(_))
+                ),
+                "-p {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn box_it_flag_allocates_tty() {
+        for f in ["-it", "-ti", "-t", "-i", "--tty", "--interactive"] {
+            let (_, cmd) = parse(&["box".into(), "x".into(), f.to_string()]).unwrap();
+            assert!(matches!(cmd, Command::BoxRun { tty: true, .. }), "flag {f}");
+        }
+        // off by default
+        let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
+        assert!(matches!(cmd, Command::BoxRun { tty: false, .. }));
+    }
+
+    #[test]
+    fn run_parses_flags_then_command() {
+        // Flags first, then the command; the first bare token begins the command.
+        let (_, cmd) = parse(&[
+            "run".into(),
+            "--memory".into(),
+            "256m".into(),
+            "--cpus".into(),
+            "2".into(),
+            "echo".into(),
+            "hi".into(),
+        ])
+        .unwrap();
+        let Command::Run {
+            command,
+            memory,
+            cpus,
+        } = cmd
+        else {
+            panic!("expected Run")
+        };
+        assert_eq!(command, ["echo", "hi"]);
+        assert_eq!(memory, Some(256 * 1024 * 1024));
+        assert_eq!(cpus, Some(2.0));
+        // `--` form; flags after it belong to the command.
+        let (_, cmd) = parse(&["run".into(), "--".into(), "ls".into(), "-la".into()]).unwrap();
+        let Command::Run { command, .. } = cmd else {
+            panic!()
+        };
+        assert_eq!(command, ["ls", "-la"]);
+        // An unknown flag before the command is a usage error (catches typos), not a silent run.
+        assert!(matches!(
+            parse(&["run".into(), "--bogus".into()]),
+            Err(Error::Usage(_))
+        ));
+        // Empty command → usage error.
+        assert!(matches!(parse(&["run".into()]), Err(Error::Usage(_))));
+    }
+
+    #[test]
     fn stop_takes_multiple_names_or_all() {
         // Multiple names are ALL captured (the old parser silently kept only the first).
         let cmd = parse(&["stop".into(), "a".into(), "b".into(), "c".into()])
@@ -565,6 +776,30 @@ mod tests {
         assert!(matches!(
             parse(&["frobnicate".into()]),
             Err(Error::UnknownCommand(_))
+        ));
+    }
+
+    #[test]
+    fn exec_parses_it_flag() {
+        let argv: Vec<String> = ["exec", "svc", "-it", "--", "sh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        match parse(&argv).unwrap().1 {
+            Command::Exec {
+                name, tty, command, ..
+            } => {
+                assert_eq!(name, "svc");
+                assert!(tty, "-it should set tty");
+                assert_eq!(command, vec!["sh".to_string()]);
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+        // Without -it, tty is false.
+        let argv: Vec<String> = ["exec", "svc"].iter().map(|s| s.to_string()).collect();
+        assert!(matches!(
+            parse(&argv).unwrap().1,
+            Command::Exec { tty: false, .. }
         ));
     }
 }

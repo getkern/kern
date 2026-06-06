@@ -69,6 +69,12 @@ fn denylist() -> Vec<libc::c_long> {
         libc::SYS_bpf,
         libc::SYS_userfaultfd,
         libc::SYS_perf_event_open,
+        // `syslog(2)` / klogctl — reads the kernel ring buffer (dmesg): kernel pointers + host
+        // activity, an info leak. CAP_SYSLOG is already dropped, but on a host with
+        // `kernel.dmesg_restrict=0` (e.g. some Android-derived kernels) no cap is needed — so deny
+        // the syscall outright. The libc `syslog()` logging function uses the /dev/log socket, NOT
+        // this syscall, so application logging is unaffected.
+        libc::SYS_syslog,
     ];
     // `kexec_file_load` (load a new kernel image from an fd): `libc` exposes the constant on
     // x86_64 but not on aarch64-musl, so add it by number where missing. Denying a number that
@@ -78,6 +84,12 @@ fn denylist() -> Vec<libc::c_long> {
     #[cfg(target_arch = "aarch64")]
     v.push(294); // __NR_kexec_file_load (aarch64)
     v
+}
+
+/// How many syscalls the always-on denylist blocks (for the box status banner — kept truthful by
+/// reading the live list rather than a hard-coded number).
+pub fn denied_syscall_count() -> usize {
+    denylist().len()
 }
 
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
