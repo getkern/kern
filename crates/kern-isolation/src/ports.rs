@@ -36,6 +36,39 @@ impl PortForwarder {
     }
 }
 
+/// Pre-flight: verify every `-p` host port can actually be bound (same `AF_INET` + `SO_REUSEADDR`
+/// the forwarder uses) BEFORE the box is declared started. Without this, a host port already held by
+/// another box (or any process) only fails inside the forked forwarder — whose stderr a detached box
+/// swallows — so the box prints "✔ started" while nothing listens. Returns the first conflicting
+/// `(host_port, os-error)`. Best-effort: a socket-creation failure is skipped (the forwarder still
+/// reports its own bind error as the backstop).
+pub fn preflight(ports: &[(u32, u16, u16)]) -> Result<(), (u16, String)> {
+    for &(ip, hp, _bp) in ports {
+        let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        if s < 0 {
+            continue;
+        }
+        let one: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                s,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &one as *const _ as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        let addr = addr_in(ip, hp);
+        let r = unsafe { libc::bind(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) };
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(s) };
+        if r != 0 {
+            return Err((hp, err.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Fork one forwarder per `(host_port, box_port)` mapping. MUST be called BEFORE the sandbox
 /// `unshare`, so each forwarder inherits the host network + user namespace. Each blocks until
 /// [`activate`](PortForwarder::activate) sends the box PID 1.
@@ -242,5 +275,34 @@ fn write_all(fd: i32, mut data: &[u8]) {
             break;
         }
         data = &data[n as usize..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOOPBACK: u32 = 0x7f00_0001; // 127.0.0.1 (host order; addr_in does the to_be)
+
+    #[test]
+    fn preflight_detects_a_bound_port_and_passes_a_free_one() {
+        use std::net::TcpListener;
+        // An actively-listening port must be reported as taken (this is the check that stops a box
+        // printing "started" while its `-p` forwarder silently fails to bind).
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = l.local_addr().unwrap().port();
+        match preflight(&[(LOOPBACK, taken, 80)]) {
+            Err((p, _)) => assert_eq!(p, taken, "reported the conflicting port"),
+            Ok(()) => panic!("preflight passed a port that is actively listening"),
+        }
+        // A free port passes. (Grab one from the OS, release it, then check.)
+        let free = {
+            let t = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            t.local_addr().unwrap().port()
+        };
+        assert!(
+            preflight(&[(LOOPBACK, free, 80)]).is_ok(),
+            "a free port should pass"
+        );
     }
 }

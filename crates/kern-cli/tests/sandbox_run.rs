@@ -250,6 +250,109 @@ fn box_detached_appears_in_ps_then_prunes() {
 }
 
 #[test]
+fn inspect_shows_detail_then_prune_reclaims_logs() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "inspect");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-insp-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    // A detached box that lives ~2s.
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "insp",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "2",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(out.status.success(), "detached start should succeed");
+
+    // While alive, `inspect --json` reports the box's identity (pid + command).
+    let mut inspected = false;
+    for _ in 0..40 {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["inspect", "insp", "--json"])
+            .output()
+            .expect("run kern");
+        let s = String::from_utf8_lossy(&o.stdout);
+        if o.status.success() && s.contains("\"name\":\"insp\"") && s.contains("\"pid\":") {
+            assert!(
+                s.contains("sleep"),
+                "inspect should include the command: {s}"
+            );
+            inspected = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(inspected, "inspect should report a live box within ~2s");
+
+    // Inspecting a name that isn't running fails (and would carry the `kern ps` hint).
+    let miss = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["inspect", "ghost"])
+        .output()
+        .expect("run kern");
+    assert!(!miss.status.success(), "inspect of a dead name must fail");
+
+    // Wait for the box to exit (its log sidecar stays behind).
+    for _ in 0..60 {
+        let after = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "--json"])
+            .output()
+            .expect("run kern");
+        if !String::from_utf8_lossy(&after.stdout).contains("insp") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // `prune` reclaims the dead box's leftover log; a second prune finds nothing.
+    let pruned = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["prune"])
+        .output()
+        .expect("run kern");
+    assert!(pruned.status.success(), "prune should succeed");
+    let again = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["prune"])
+        .output()
+        .expect("run kern");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("nothing to prune"),
+        "a second prune should have nothing left: {}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
+#[test]
 fn detached_box_with_bad_command_reports_failure_not_started() {
     // A detached box whose command can't exec must NOT print a misleading "started": the readiness
     // pipe makes the launcher wait for the box's `execvp` (EOF = up) and report failure otherwise.
@@ -386,6 +489,409 @@ fn box_logs_capture_output_and_stats_list_the_box() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// A named volume (`-v name:/dest`) is auto-created and **persists across boxes**: what one box
+/// writes, a later box reads back. Fully rootless (a dir bind-mount).
+#[test]
+fn named_volume_persists_across_boxes() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let data = std::env::temp_dir().join(format!("kern-it-vol-{}", std::process::id()));
+    let _ = fs::create_dir_all(&data);
+    let root = build_rootfs(&busybox, "namedvol");
+    let rootfs = root.to_str().unwrap();
+
+    // Box A writes into the auto-created volume.
+    let a = kern()
+        .env("XDG_DATA_HOME", &data)
+        .args([
+            "box",
+            "va",
+            "--rootfs",
+            rootfs,
+            "-v",
+            "shared:/work",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "echo persisted > /work/f; echo OK",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&a.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    assert!(
+        a.status.success(),
+        "box A should write: {}",
+        String::from_utf8_lossy(&a.stderr)
+    );
+
+    // Box B reads it back from the same named volume (retry on the empty-pipe race).
+    let mut got = String::new();
+    for _ in 0..6 {
+        let b = kern()
+            .env("XDG_DATA_HOME", &data)
+            .args([
+                "box",
+                "vb",
+                "--rootfs",
+                rootfs,
+                "-v",
+                "shared:/work",
+                "--",
+                "/bin/busybox",
+                "cat",
+                "/work/f",
+            ])
+            .output()
+            .expect("run kern");
+        got = String::from_utf8_lossy(&b.stdout).into_owned();
+        if !got.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+    assert!(
+        got.contains("persisted"),
+        "box B must read what box A wrote: {got}"
+    );
+
+    // The volume shows up in `kern volume ls`.
+    let ls = kern()
+        .env("XDG_DATA_HOME", &data)
+        .args(["volume", "ls"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&ls.stdout).contains("shared"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A `vdisk:` profile mounts a size-capped volume at `/vdisk/<name>` (rootless: a `tmpfs size=`),
+/// and the size cap is really enforced — writing past it fails with ENOSPC.
+#[test]
+fn box_vdisk_mounts_size_capped_volume() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let cfgdir = std::env::temp_dir().join(format!("kern-it-vd-{}", std::process::id()));
+    let _ = fs::create_dir_all(cfgdir.join("kern"));
+    fs::write(
+        cfgdir.join("kern/kern.toml"),
+        "[[vdisk]]\nname = \"scratch\"\nsize = \"8m\"\n",
+    )
+    .unwrap();
+    let root = build_rootfs(&busybox, "vdisk");
+    let out = kern()
+        .env("XDG_CONFIG_HOME", &cfgdir)
+        .args([
+            "box",
+            "vd",
+            "vdisk:scratch",
+            "--rootfs",
+            root.to_str().unwrap(),
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            // 4 MiB fits (under the 8 MiB cap); a further 8 MiB must fail with ENOSPC.
+            "dd if=/dev/zero of=/vdisk/scratch/a bs=1M count=4 2>/dev/null && echo WROTE4; \
+             dd if=/dev/zero of=/vdisk/scratch/b bs=1M count=8 2>/dev/null && echo WROTE8 || echo capped",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&cfgdir);
+        return;
+    }
+    let o = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        o.contains("WROTE4"),
+        "a write within the quota must succeed: {o}"
+    );
+    assert!(
+        o.contains("capped") && !o.contains("WROTE8"),
+        "a write past the size quota must fail (ENOSPC): {o}"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&cfgdir);
+}
+
+/// A `vgpio:` profile bind-mounts ONLY its listed devices into the box (real I/O passthrough), and
+/// deny-by-default still holds — a device not in the profile stays absent. Skip-graceful: needs a
+/// real host device (any `/dev/i2c-*` or `/dev/gpiochip*`); skipped where none exist (typical CI).
+#[test]
+fn box_vgpio_passes_listed_devices_only() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // Find two distinct real devices: one to grant, one to withhold (proves deny-by-default).
+    let devs: Vec<String> = (0..32)
+        .map(|n| format!("/dev/i2c-{n}"))
+        .filter(|p| Path::new(p).exists())
+        .collect();
+    let (grant, withhold) = match devs.as_slice() {
+        [a, b, ..] => (a.clone(), b.clone()),
+        _ => {
+            eprintln!("skip: need ≥2 /dev/i2c-* devices for the vgpio passthrough test");
+            return;
+        }
+    };
+    let cfgdir = std::env::temp_dir().join(format!("kern-it-vg-{}", std::process::id()));
+    let _ = fs::create_dir_all(cfgdir.join("kern"));
+    fs::write(
+        cfgdir.join("kern/kern.toml"),
+        format!("[[vgpio]]\nname = \"io\"\ni2c = [\"{grant}\"]\n"),
+    )
+    .unwrap();
+    let root = build_rootfs(&busybox, "vgpio");
+    let out = kern()
+        .env("XDG_CONFIG_HOME", &cfgdir)
+        .args([
+            "box",
+            "vg",
+            "vgpio:io",
+            "--rootfs",
+            root.to_str().unwrap(),
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            &format!(
+                "test -e {grant} && echo GRANTED; test -e {withhold} && echo LEAK || echo denied"
+            ),
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&cfgdir);
+        return;
+    }
+    let o = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        o.contains("GRANTED"),
+        "granted device must be in the box: {o}"
+    );
+    assert!(
+        o.contains("denied") && !o.contains("LEAK"),
+        "deny-by-default must hold: {o}"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&cfgdir);
+}
+
+/// A `vcpu:` profile applies to a `kern box` too (private idiom `kern box vcpu:<name> …`): the box
+/// workload runs pinned to the profile's CPUs. Profile token order (before/after the name) is free.
+#[test]
+fn box_applies_vcpu_profile() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let cfgdir = std::env::temp_dir().join(format!("kern-it-bcfg-{}", std::process::id()));
+    let _ = fs::create_dir_all(cfgdir.join("kern"));
+    fs::write(
+        cfgdir.join("kern/kern.toml"),
+        "[[vcpu]]\nname = \"pin0\"\ncpus = \"0\"\nmemory = \"64m\"\n",
+    )
+    .unwrap();
+    let root = build_rootfs(&busybox, "boxprof");
+    let out = kern()
+        .env("XDG_CONFIG_HOME", &cfgdir)
+        .args([
+            "box",
+            "bp",
+            "vcpu:pin0",
+            "--rootfs",
+            root.to_str().unwrap(),
+            "--",
+            "/bin/busybox",
+            "grep",
+            "Cpus_allowed_list",
+            "/proc/self/status",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&cfgdir);
+        return;
+    }
+    let o = String::from_utf8_lossy(&out.stdout);
+    let list = o
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(str::trim)
+        .unwrap_or("");
+    assert_eq!(list, "0", "box should be pinned to CPU 0 by vcpu:pin0: {o}");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&cfgdir);
+}
+
+/// The config command surface round-trips: `kern examples` emits a config that `kern validate`
+/// accepts and `kern config` lists — so the embedded example can never drift out of the schema.
+#[test]
+fn examples_output_validates_and_lists() {
+    let dir = std::env::temp_dir().join(format!("kern-it-ex-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let toml = dir.join("kern.toml");
+    let ex = kern().args(["examples"]).output().expect("run kern");
+    assert!(ex.status.success());
+    fs::write(&toml, &ex.stdout).unwrap();
+
+    let val = kern()
+        .args(["validate", toml.to_str().unwrap()])
+        .output()
+        .expect("run kern");
+    assert!(
+        val.status.success(),
+        "examples output must validate: {}",
+        String::from_utf8_lossy(&val.stderr)
+    );
+    assert!(String::from_utf8_lossy(&val.stdout).contains("vcpu"));
+
+    // A BAD VALUE for a recognized key fails validation with a non-zero exit and a line number.
+    // (An unknown key would be tolerated/ignored — the parser only errors on malformed values of
+    // keys it implements.)
+    fs::write(&toml, "[[vcpu]]\nname = \"x\"\nvcpus = abc\n").unwrap();
+    let bad = kern()
+        .args(["validate", toml.to_str().unwrap()])
+        .output()
+        .expect("run kern");
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("line 3"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A resource-centric `[[vcpu]]` profile in `kern.toml`, referenced by `kern run vcpu:<name>`,
+/// applies its limits end-to-end: the whole chain (config discovery → classify → resolve → pin).
+/// Pinning to CPU 0 is observable in `/proc/self/status` regardless of cgroup delegation.
+#[test]
+fn run_applies_vcpu_profile_from_kern_toml() {
+    let cfgdir = std::env::temp_dir().join(format!("kern-it-cfg-{}", std::process::id()));
+    let _ = fs::create_dir_all(cfgdir.join("kern"));
+    fs::write(
+        cfgdir.join("kern/kern.toml"),
+        "[[vcpu]]\nname = \"pinned\"\ncpus = \"0\"\nmemory = \"64m\"\n",
+    )
+    .unwrap();
+    // Retry on empty stdout — `kern run` re-execs into a systemd scope whose piped output can come
+    // back empty under this suite's heavy parallelism (same race as `kern_out`).
+    let mut o = String::new();
+    for _ in 0..6 {
+        let out = kern()
+            .env("XDG_CONFIG_HOME", &cfgdir)
+            .args([
+                "run",
+                "vcpu:pinned",
+                "--",
+                "grep",
+                "Cpus_allowed_list",
+                "/proc/self/status",
+            ])
+            .output()
+            .expect("run kern");
+        o = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !o.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+    let list = o
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(str::trim)
+        .unwrap_or("");
+    assert_eq!(
+        list, "0",
+        "vcpu:pinned should pin to CPU 0 via the profile: {o}"
+    );
+
+    // `vgpu:` is NOT a kern-public concept (GPU is out of this edition): it is not a profile token,
+    // so it is treated as a plain command — which doesn't exist — and the run fails, rather than
+    // being recognized as any kind of "reserved" profile.
+    let refused = kern()
+        .env("XDG_CONFIG_HOME", &cfgdir)
+        .args(["run", "vgpu:x", "--", "true"])
+        .output()
+        .expect("run kern");
+    assert!(!refused.status.success());
+    let _ = fs::remove_dir_all(&cfgdir);
+}
+
+/// `--cpuset-cpus` really pins the box, via `sched_setaffinity` — no cgroup `cpuset` delegation
+/// needed. Pinning to CPU 0 (present on every host) must yield exactly `0` in the workload's
+/// `Cpus_allowed_list`, which on any multi-CPU host differs from the unpinned `0-N`.
+#[test]
+fn box_cpuset_pins_cpus() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "cpuset");
+    let rootfs = root.to_str().unwrap();
+    let out = kern_out(&[
+        "box",
+        "pin",
+        "--rootfs",
+        rootfs,
+        "--cpuset-cpus",
+        "0",
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "grep Cpus_allowed_list /proc/self/status",
+    ]);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let o = String::from_utf8_lossy(&out.stdout);
+    // The field is `Cpus_allowed_list:\t0` when pinned to CPU 0.
+    let list = o
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(str::trim)
+        .unwrap_or("");
+    assert_eq!(list, "0", "box should be pinned to CPU 0 only, got '{o}'");
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn symlinked_dev_in_rootfs_cannot_escape() {
     // SECURITY regression: a hostile rootfs whose `/dev` is a symlink to a host path must NOT let
@@ -519,6 +1025,61 @@ fn box_provides_essential_dev_nodes() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Device access is deny-by-default: the box's `/dev` is a fresh tmpfs with ONLY the safe
+/// allowlist bound in, so a raw disk / physical-memory node is simply absent — and the box can't
+/// fabricate one, because creating a device node in an unprivileged user namespace is refused by
+/// the kernel (EPERM) even though `mknod` is reachable. That is what makes an eBPF device-cgroup
+/// backstop unnecessary here: the boundary is the namespace + the allowlist, not a cooperative
+/// filter. This test is the adversarial counterpart to `box_provides_essential_dev_nodes`.
+#[test]
+fn box_denies_unauthorized_devices() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "devdeny");
+    let rootfs = root.to_str().unwrap();
+    // (1) A physical-memory / raw-disk node must be ABSENT (never bound into the box's /dev).
+    // (2) Fabricating a block device via mknod must FAIL — the userns forbids device-node creation,
+    //     so a hostile workload can't reach the host disk even with the mknod syscall available.
+    let out = kern_out(&[
+        "box",
+        "dd",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "test -e /dev/mem && echo MEM-PRESENT || echo mem-absent; \
+         test -e /dev/sda && echo SDA-PRESENT || echo sda-absent; \
+         /bin/busybox mknod /dev/rawdisk b 8 0 2>/dev/null && echo MKNOD-OK || echo mknod-denied",
+    ]);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let o = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        o.contains("mem-absent"),
+        "/dev/mem must not be present in the box (deny-by-default /dev): {o}"
+    );
+    assert!(
+        o.contains("sda-absent"),
+        "a host block device must not be present in the box: {o}"
+    );
+    assert!(
+        o.contains("mknod-denied"),
+        "creating a block device via mknod must fail in an unprivileged userns: {o}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn box_run_hardening_uts_net_seccomp() {
     let Some(busybox) = static_busybox() else {
@@ -613,7 +1174,10 @@ fn box_volume_roundtrips_data_and_ro_is_enforced() {
     }
     let root = build_rootfs(&busybox, "vol");
     let rootfs = root.to_str().unwrap();
-    let host = std::env::temp_dir().join(format!("kern-it-vol-{}", std::process::id()));
+    // A per-test-unique base: `std::process::id()` is the SAME for every test in this binary (they
+    // share one process), so a bare `kern-it-vol-<pid>` would collide with the named-volume test's
+    // dir — one test's `remove_dir_all` then races the other's mount ("source … No such file").
+    let host = std::env::temp_dir().join(format!("kern-it-volrt-{}", std::process::id()));
     let _ = fs::remove_dir_all(&host);
     fs::create_dir_all(host.join("rw")).unwrap();
     fs::create_dir_all(host.join("ro")).unwrap();
@@ -1316,4 +1880,70 @@ fn images_strips_terminal_escapes_from_untrusted_ref() {
         "the ESC should appear as the escaped \\u001b"
     );
     let _ = fs::remove_dir_all(&cache);
+}
+
+/// End-to-end: a `compose` file using the extended box schema (resources + env + read-only)
+/// brings the box up — proving every mirror flag `push_box_flags` emits is one `kern box` accepts.
+#[test]
+fn compose_full_schema_brings_box_up() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "compose");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-cmp-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-cmp-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.svc]\nrootfs = \"{rootfs}\"\nmemory = \"256m\"\nworkdir = \"/\"\nread_only = true\nenv = [\"KV=1\"]\ncommand = [\"/bin/busybox\", \"sleep\", \"2\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", toml.to_str().unwrap()])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "compose up should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut listed = false;
+    for _ in 0..40 {
+        let ps = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "--json"])
+            .output()
+            .expect("run kern");
+        if String::from_utf8_lossy(&ps.stdout).contains("svc") {
+            listed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        listed,
+        "the composed box should appear in ps (all mirror flags accepted)"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_file(&toml);
 }

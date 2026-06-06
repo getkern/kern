@@ -1,7 +1,15 @@
-//! `kern top` — a small, dependency-free task-manager TUI over the box registry. Same htop-style
-//! feel as the matrix's `kern top` (alternate screen, tabs, live refresh, keyboard nav) but
-//! **boxes-only** — the public build has no GPU/vCPU/intelligence to monitor. Pure `libc` termios
-//! + ANSI, no curses/ratatui dependency.
+//! `kern top` — a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
+//! keyboard nav). Four tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
+//! per-box table with lifecycle actions — stop/pause/unpause/kill/logs), **Profiles** (the reusable
+//! specs you attach by prefix — vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
+//! disks, and its `[[disk]]` is materialised from that choice, never hand-created) and **Storage** (the
+//! concrete data layer — physical disks read-only + named volumes you create). Host stats come straight
+//! from `/proc`. Pure `libc` termios + ANSI, no curses/ratatui dependency.
+//!
+//! Interaction is a small [`Mode`] state machine — `Nav` plus three modals (`Overlay` read-only pane,
+//! `Form` input, `Confirm` for destructive actions). Profile edits are written **surgically** (see
+//! [`crate::toml_surgery`]) so a single edit never rewrites the whole file and drop the user's other
+//! sections.
 //!
 //! Robustness: the terminal is put in raw mode + the alternate screen on entry and **restored on
 //! drop** (so a panic or early return still leaves a sane terminal). `ISIG` is disabled, so Ctrl-C
@@ -14,7 +22,97 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-const TABS: [&str; 2] = ["Overview", "Boxes"];
+const TABS: [&str; 4] = ["Overview", "Boxes", "Profiles", "Storage"];
+const TAB_OVERVIEW: usize = 0;
+const TAB_BOXES: usize = 1;
+const TAB_PROFILES: usize = 2;
+const TAB_STORAGE: usize = 3;
+
+/// What the TUI is doing right now: plain navigation, or a modal layered over it.
+enum Mode {
+    Nav,
+    /// A read-only text pane (box logs, profile/volume detail). Any key closes it.
+    Overlay(String),
+    /// A multi-field text form (volume create, profile new/edit).
+    Form(Form),
+    /// The "new profile" kind picker (Profiles tab `n`): choose vcpu / vgpio / vdisk / disk.
+    PickKind,
+    /// A destructive action awaiting `y`/`n`.
+    Confirm {
+        prompt: String,
+        action: Pending,
+    },
+}
+
+/// A destructive action held until the user confirms it.
+enum Pending {
+    RemoveVolume(String),
+    PruneVolumes,
+    DeleteProfile(&'static str, String), // (section header, profile name)
+}
+
+/// A multi-field input form. `active` is the focused field; typing edits its value.
+struct Form {
+    title: String,
+    fields: Vec<Field>,
+    active: usize,
+    submit: Submit,
+    error: Option<String>,
+}
+
+struct Field {
+    label: &'static str,
+    /// Shown dim inside an empty field as a placeholder (text fields), or as the toggle's caption.
+    hint: &'static str,
+    value: String,
+    /// A boolean switch (`[x]`/`[ ]`, Space flips) rather than free-text — for keys like `persistent`
+    /// that are a bool, so a beginner never types "true"/"false". On = non-empty value; off = empty.
+    toggle: bool,
+}
+
+impl Field {
+    /// A free-text field with a dim placeholder.
+    fn text(label: &'static str, hint: &'static str) -> Self {
+        Field {
+            label,
+            hint,
+            value: String::new(),
+            toggle: false,
+        }
+    }
+
+    /// A boolean toggle (off by default). Space/`y`/`n` set it; any non-empty value reads as on.
+    fn toggle(label: &'static str, hint: &'static str) -> Self {
+        Field {
+            label,
+            hint,
+            value: String::new(),
+            toggle: true,
+        }
+    }
+}
+
+/// What a submitted [`Form`] does.
+enum Submit {
+    CreateVolume,
+    /// Rename and/or re-quota an existing named volume (Storage tab `e`).
+    EditVolume {
+        orig_name: String,
+    },
+    /// Write a `vcpu`/`vgpio`/`vdisk` profile back to `kern.toml` (all three go through one path).
+    SaveProfile {
+        section: &'static str,
+        /// The name being edited (so a rename can rewrite the old block), or `None` for a new profile.
+        orig_name: Option<String>,
+    },
+}
+
+/// One row in the Profiles tab.
+struct ProfRow {
+    section: &'static str,
+    name: String,
+    summary: String,
+}
 
 /// A box row with its frame-to-frame CPU%.
 struct Row {
@@ -24,6 +122,7 @@ struct Row {
     mem: Option<u64>,
     cpu_pct: f64,
     tasks: Option<u64>,
+    paused: bool,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -114,14 +213,31 @@ pub fn run() -> Result<(), crate::error::Error> {
 
     let p = Palette::detect();
     let mut tab = 0usize;
+    let mut sel = 0usize; // highlighted row on the active list tab
+    let mut mode = Mode::Nav;
     let mut prev: HashMap<i32, (u64, Instant)> = HashMap::new();
+    let mut prev_cpu: Option<(u64, u64)> = None;
 
+    let mut snap = refresh_full(&mut prev, &mut prev_cpu);
     loop {
         let (cols, term_rows) = term_size();
-        let (rows, seen) = collect_rows(&prev);
-        prev = seen;
+        let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols);
+        if sel >= list_len {
+            sel = list_len.saturating_sub(1);
+        }
 
-        let frame = render(&p, tab, &rows, cols, term_rows);
+        let frame = render(
+            &p,
+            tab,
+            &snap.rows,
+            &snap.host,
+            &snap.profs,
+            &snap.vols,
+            cols,
+            term_rows,
+            sel,
+            &mode,
+        );
         // Clear each line to end-of-line (`\x1b[K`) so a shorter/blank line in the new frame wipes
         // any leftover text from the previous one (no residue, no flicker), then erase everything
         // below the frame (`\x1b[J`) in case the new frame has fewer lines.
@@ -131,59 +247,738 @@ pub fn run() -> Result<(), crate::error::Error> {
         let _ = out.write_all(b"\x1b[J");
         let _ = out.flush();
 
-        // Wait up to ~1s for a key; refresh on timeout.
+        // Wait up to ~1s for a key. On timeout, do a full refresh (a proper ~1 s CPU% window).
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        if unsafe { libc::poll(&mut pfd, 1, 1000) } > 0 {
-            let mut buf = [0u8; 8];
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                continue;
-            }
-            match buf[0] {
-                b'q' | b'Q' | 0x03 => break, // q / Ctrl-C
-                b'\t' | b'l' => tab = (tab + 1) % TABS.len(),
-                b'h' => tab = (tab + TABS.len() - 1) % TABS.len(),
-                b'1' => tab = 0,
-                b'2' => tab = 1,
-                0x1b => {
-                    if n >= 3 && buf[1] == b'[' {
-                        match buf[2] {
-                            b'C' => tab = (tab + 1) % TABS.len(),              // →
-                            b'D' => tab = (tab + TABS.len() - 1) % TABS.len(), // ←
-                            _ => {}
-                        }
-                    } else {
-                        break; // lone Esc = quit
-                    }
+        if unsafe { libc::poll(&mut pfd, 1, 1000) } <= 0 {
+            snap = refresh_full(&mut prev, &mut prev_cpu);
+            continue;
+        }
+        let mut buf = [0u8; 8];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            continue;
+        }
+        let key = &buf[..n.max(0) as usize];
+
+        // Dispatch by mode. `mem::replace` takes ownership so a modal can transition cleanly back to
+        // Nav; an edit that stays in the modal puts it back. `dirty` = the action changed on-disk
+        // state (a box lifecycle op, a saved/deleted profile, a created/removed volume), so the lists
+        // are re-read immediately; a pure navigation key just re-renders the existing snapshot.
+        let mut dirty = false;
+        match std::mem::replace(&mut mode, Mode::Nav) {
+            // A read-only pane: any key closes it, quit still quits.
+            Mode::Overlay(_) => {
+                if is_quit(key) {
+                    break;
                 }
-                _ => {}
             }
+            // Confirm a destructive action: `y` performs it, anything else cancels.
+            Mode::Confirm { action, .. } => {
+                if matches!(key.first(), Some(b'y' | b'Y')) {
+                    perform_pending(action);
+                    dirty = true;
+                }
+            }
+            // The Profiles "new" kind picker: a letter opens that form. `v` (vdisk) uses the disk-
+            // selector form; the others are plain field forms.
+            Mode::PickKind => match key.first() {
+                Some(b'c') => mode = Mode::Form(new_profile_form("vcpu")),
+                Some(b'g') => mode = Mode::Form(new_profile_form("vgpio")),
+                Some(b'v') => mode = Mode::Form(new_profile_form("vdisk")),
+                _ => {}
+            },
+            // A form: edit fields; Enter/Ctrl-S saves, Esc cancels.
+            Mode::Form(form) => match handle_form_key(form, key) {
+                FormOutcome::Stay(f) => mode = Mode::Form(f),
+                FormOutcome::Cancel => {}
+                FormOutcome::Submit(f) => match apply_form(&f) {
+                    Ok(()) => dirty = true,
+                    Err(e) => {
+                        mode = Mode::Form(Form {
+                            error: Some(e),
+                            ..f
+                        })
+                    }
+                },
+            },
+            // Normal navigation.
+            Mode::Nav => {
+                if is_quit(key) {
+                    break;
+                }
+                dirty = handle_nav(
+                    key,
+                    &mut tab,
+                    &mut sel,
+                    list_len,
+                    &snap.rows,
+                    &snap.profs,
+                    &snap.vols,
+                    &snap.cfg,
+                    &mut mode,
+                );
+            }
+        }
+        // A mutating action re-reads the lists at once (the stopped box vanishes, the new volume
+        // appears) but leaves the CPU% baselines alone — re-sampling over the sub-second gap since
+        // the last tick would show a spurious spike. The next tick restores a full ~1 s window.
+        if dirty {
+            let (rows, _) = collect_rows(&prev);
+            snap.rows = rows;
+            snap.cfg = crate::config::load(None).unwrap_or_default();
+            snap.profs = profile_rows(&snap.cfg);
+            snap.vols = crate::volume::entries();
         }
     }
     Ok(()) // _guard restores the terminal on drop
 }
 
+/// `q` / `Q` / `Ctrl-C`, or a lone `Esc` (not the start of an arrow-key escape sequence).
+fn is_quit(key: &[u8]) -> bool {
+    matches!(key.first(), Some(b'q' | b'Q' | 0x03)) || key == [0x1b]
+}
+
+/// Number of selectable rows on the active tab (0 for Overview).
+fn tab_list_len(
+    tab: usize,
+    rows: &[Row],
+    profs: &[ProfRow],
+    vols: &[crate::volume::VolInfo],
+) -> usize {
+    match tab {
+        TAB_BOXES => rows.len(),
+        TAB_PROFILES => profs.len(),
+        TAB_STORAGE => vols.len(),
+        _ => 0,
+    }
+}
+
+/// Handle a key in normal navigation: tab switching, row selection, and the per-tab action keys.
+#[allow(clippy::too_many_arguments)]
+fn handle_nav(
+    key: &[u8],
+    tab: &mut usize,
+    sel: &mut usize,
+    list_len: usize,
+    rows: &[Row],
+    profs: &[ProfRow],
+    vols: &[crate::volume::VolInfo],
+    cfg: &crate::config::KernConfig,
+    mode: &mut Mode,
+) -> bool {
+    let down = |s: &mut usize| *s = s.saturating_add(1).min(list_len.saturating_sub(1));
+    let up = |s: &mut usize| *s = s.saturating_sub(1);
+    let switch = |t: &mut usize, s: &mut usize, nt: usize| {
+        *t = nt;
+        *s = 0;
+    };
+    // Arrow-key escape sequences: ↑↓ select, ←→ switch tab. Pure navigation — never dirties data.
+    if key.len() >= 3 && key[0] == 0x1b && key[1] == b'[' {
+        match key[2] {
+            b'A' => up(sel),
+            b'B' => down(sel),
+            b'C' => switch(tab, sel, (*tab + 1) % TABS.len()),
+            b'D' => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
+            _ => {}
+        }
+        return false;
+    }
+    match key[0] {
+        b'\t' | b'l' => switch(tab, sel, (*tab + 1) % TABS.len()),
+        b'h' => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
+        b'1' => switch(tab, sel, TAB_OVERVIEW),
+        b'2' => switch(tab, sel, TAB_BOXES),
+        b'3' => switch(tab, sel, TAB_PROFILES),
+        b'4' => switch(tab, sel, TAB_STORAGE),
+        b'j' => down(sel),
+        // Only the Boxes tab acts immediately (stop/pause/kill). Profiles/Storage keys just open a
+        // modal, so the mutation (if any) happens later via Confirm/Form — nothing to refresh yet.
+        _ if *tab == TAB_BOXES => return nav_boxes(key[0], *sel, rows, mode),
+        _ if *tab == TAB_PROFILES => nav_profiles(key[0], *sel, profs, cfg, mode),
+        _ if *tab == TAB_STORAGE => nav_storage(key[0], *sel, vols, mode),
+        _ => {}
+    }
+    false
+}
+
+/// Boxes-tab action keys: stop / pause / unpause / kill the selected box, or open its logs. The CLI
+/// helpers are reused with muted stdio so their messages don't bleed into the alt-screen. Returns
+/// `true` when a lifecycle op changed box state (so the caller re-reads the list), `false` for a
+/// read-only action (opening logs) or an unbound key.
+fn nav_boxes(k: u8, sel: usize, rows: &[Row], mode: &mut Mode) -> bool {
+    let Some(name) = rows.get(sel).map(|r| r.name.clone()) else {
+        return false;
+    };
+    match k {
+        b's' | b'k' => quiet_io(|| {
+            let _ = crate::commands::stop(std::slice::from_ref(&name), false);
+        }),
+        b'p' => quiet_io(|| {
+            let _ = crate::commands::pause(std::slice::from_ref(&name), false, true);
+        }),
+        b'u' => quiet_io(|| {
+            let _ = crate::commands::pause(std::slice::from_ref(&name), false, false);
+        }),
+        b'\r' | b'\n' => {
+            *mode = Mode::Overlay(
+                crate::commands::box_log_tail(&name).unwrap_or_else(|| "(no output yet)".into()),
+            );
+            return false;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Profiles-tab action keys: new / edit / delete a `kern.toml` profile.
+fn nav_profiles(
+    k: u8,
+    sel: usize,
+    profs: &[ProfRow],
+    cfg: &crate::config::KernConfig,
+    mode: &mut Mode,
+) {
+    match k {
+        // `n` opens the kind picker so any kind (incl. vdisk) is creatable from an empty list.
+        b'n' => *mode = Mode::PickKind,
+        b'e' | b'\r' | b'\n' => {
+            if let Some(row) = profs.get(sel) {
+                *mode = Mode::Form(edit_profile_form(row.section, &row.name, cfg));
+            }
+        }
+        b'd' => {
+            if let Some(row) = profs.get(sel) {
+                *mode = Mode::Confirm {
+                    prompt: format!("delete profile {}:{}?  (y/n)", row.section, row.name),
+                    action: Pending::DeleteProfile(row.section, row.name.clone()),
+                };
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Storage-tab action keys: new / delete / inspect / prune named volumes (the persistent data layer).
+fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mode) {
+    match k {
+        b'n' => *mode = Mode::Form(new_volume_form()),
+        b'e' => {
+            if let Some(v) = vols.get(sel) {
+                *mode = Mode::Form(edit_volume_form(v));
+            }
+        }
+        b'd' => {
+            if let Some(v) = vols.get(sel) {
+                *mode = Mode::Confirm {
+                    prompt: format!("remove volume '{}' and its data?  (y/n)", v.name),
+                    action: Pending::RemoveVolume(v.name.clone()),
+                };
+            }
+        }
+        b'p' => {
+            *mode = Mode::Confirm {
+                prompt: "prune ALL unused volumes?  (y/n)".into(),
+                action: Pending::PruneVolumes,
+            };
+        }
+        b'\r' | b'\n' => {
+            if let Some(v) = vols.get(sel) {
+                *mode = Mode::Overlay(volume_detail(v));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Carry out a confirmed destructive action, muting the helper's stdio.
+fn perform_pending(action: Pending) {
+    match action {
+        Pending::RemoveVolume(name) => quiet_io(|| {
+            let _ = crate::volume::run(&["rm".to_string(), name]);
+        }),
+        Pending::PruneVolumes => quiet_io(|| {
+            let _ = crate::volume::run(&["prune".to_string()]);
+        }),
+        Pending::DeleteProfile(section, name) => {
+            let _ = delete_profile(section, &name);
+        }
+    }
+}
+
+/// Run `f` with fd 1 and fd 2 redirected to `/dev/null`, then restored — so a reused CLI helper's
+/// `println!`/`eprintln!` can't corrupt the alt-screen. Used for the lifecycle key actions.
+fn quiet_io(f: impl FnOnce()) {
+    let _ = std::io::stdout().flush();
+    let (s1, s2) = unsafe { (libc::dup(1), libc::dup(2)) };
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+    if null >= 0 {
+        unsafe {
+            libc::dup2(null, 1);
+            libc::dup2(null, 2);
+            libc::close(null);
+        }
+    }
+    f();
+    let _ = std::io::stdout().flush();
+    unsafe {
+        if s1 >= 0 {
+            libc::dup2(s1, 1);
+            libc::close(s1);
+        }
+        if s2 >= 0 {
+            libc::dup2(s2, 2);
+            libc::close(s2);
+        }
+    }
+}
+
+// ───────────────────────────── Profiles & Volumes: model ─────────────────────────────
+
+/// Flatten the three editable profile kinds into display rows (name + a one-line summary).
+fn profile_rows(cfg: &crate::config::KernConfig) -> Vec<ProfRow> {
+    let mut out = Vec::new();
+    for e in &cfg.vcpu {
+        let mut parts = Vec::new();
+        if let Some(q) = e.vcpus {
+            parts.push(format!("{} cores", trim_f(q)));
+        }
+        if let Some(c) = &e.cpus {
+            parts.push(format!("pin {c}"));
+        }
+        if let Some(m) = &e.memory {
+            parts.push(m.clone());
+        }
+        if let Some(x) = &e.extends {
+            parts.push(format!("extends {x}"));
+        }
+        out.push(ProfRow {
+            section: "vcpu",
+            name: e.name.clone(),
+            summary: parts.join("  "),
+        });
+    }
+    for e in &cfg.vgpio {
+        let mut parts = Vec::new();
+        if !e.backend.is_empty() {
+            parts.push(e.backend.clone());
+        }
+        if !e.pins.is_empty() {
+            let pins: Vec<String> = e.pins.iter().map(u32::to_string).collect();
+            parts.push(format!("pins {}", pins.join(",")));
+        }
+        out.push(ProfRow {
+            section: "vgpio",
+            name: e.name.clone(),
+            summary: parts.join("  "),
+        });
+    }
+    // vdisk — a per-box scratch/disk profile (attached with `vdisk:name`).
+    for e in &cfg.vdisk {
+        let mut parts = Vec::new();
+        parts.push(e.size.clone().unwrap_or_else(|| "uncapped".into()));
+        if e.persistent {
+            parts.push("persistent".into());
+        }
+        // Only surface a placement when a power user pinned one via a [[disk]] backend.
+        if !e.backend.is_empty() {
+            parts.push(format!("on {}", vdisk_location(cfg, e)));
+        }
+        out.push(ProfRow {
+            section: "vdisk",
+            name: e.name.clone(),
+            summary: parts.join("  "),
+        });
+    }
+    out
+}
+
+/// The human location a vdisk sits on: the `[[disk]]` path its backend points at, else the raw backend.
+fn vdisk_location(cfg: &crate::config::KernConfig, e: &crate::config::VDiskEntry) -> String {
+    let want = e.backend.strip_prefix("disk:").unwrap_or(&e.backend);
+    cfg.disk
+        .iter()
+        .find(|d| d.name == want)
+        .map(|d| d.path.clone())
+        .unwrap_or_else(|| e.backend.clone())
+}
+
+/// The list label for a profile row: `section:name`.
+fn prof_label(r: &ProfRow) -> String {
+    format!("{}:{}", r.section, r.name)
+}
+
+/// Format an `f64` core count without a trailing `.0` (`4.0` → `4`, `0.5` → `0.5`).
+fn trim_f(v: f64) -> String {
+    crate::ui::fmt_cpus(v)
+}
+
+/// The editable fields for a compute/IO profile section (`vcpu`/`vgpio`) — used for new and edit.
+/// (Storage kinds — vdisk, volume — have their own forms.)
+fn section_fields(section: &str) -> Vec<Field> {
+    // The common fields first (a beginner rarely scrolls past them), then the advanced ones. The form
+    // scrolls, so every field of every kind is reachable — nothing is CLI-only.
+    match section {
+        "vcpu" => vec![
+            Field::text("name", "e.g. heavy"),
+            Field::text("vcpus", "cores, e.g. 4 or 0.5"),
+            Field::text("cpus", "pin list, e.g. 0-3"),
+            Field::text("memory", "e.g. 512m, 2g"),
+            Field::text("priority", "0-99 (optional)"),
+            Field::text("numa", "NUMA node, e.g. 0 (optional)"),
+            Field::text("nice", "-20..19 (optional)"),
+            Field::text("backend", "cpu/gpio id (optional)"),
+            Field::text("extends", "base profile (optional)"),
+        ],
+        "vgpio" => vec![
+            Field::text("name", "e.g. leds"),
+            Field::text("backend", "e.g. gpio:0"),
+            Field::text("pins", "e.g. 17,27,22"),
+            Field::text("pwm", "PWM lines, e.g. 12,13"),
+            Field::text("adc", "ADC channels"),
+            Field::text("onewire", "1-Wire lines"),
+            Field::text("i2c", "/dev/i2c-1,…"),
+            Field::text("spi", "/dev/spidev0.0,…"),
+            Field::text("uart", "/dev/ttyS0,…"),
+            Field::text("can", "/dev/can0,…"),
+            Field::text("camera", "/dev/video0,…"),
+            Field::text("audio", "/dev/snd/…"),
+            Field::text("leds", "led names/paths"),
+            Field::text("bluetooth", "hci ids"),
+            Field::text("usb", "usb paths"),
+            Field::text("input", "/dev/input/…"),
+            Field::text("midi", "/dev/midi…"),
+            Field::text("display", "display nodes"),
+            Field::text("net", "iface names"),
+            Field::text("extra", "other /dev paths"),
+        ],
+        "vdisk" => vec![
+            Field::text("name", "e.g. scratch"),
+            Field::text("size", "e.g. 2g"),
+            Field::toggle("persistent", "survives box removal"),
+            Field::text("backend", "disk:0 (optional)"),
+            Field::text("iops", "ops/s (optional)"),
+            Field::text("bandwidth", "e.g. 100m (optional)"),
+        ],
+        _ => vec![Field::text("name", "")],
+    }
+}
+
+/// A blank form to create a new profile. `vgpio` pre-fills `backend = gpio:0` (the id
+/// `kern config setup` generates) so a beginner rarely has to touch it.
+fn new_profile_form(section: &'static str) -> Form {
+    let mut fields = section_fields(section);
+    if section == "vgpio" {
+        set_field(&mut fields, "backend", "gpio:0".to_string());
+    }
+    Form {
+        title: format!("new {section} profile"),
+        fields,
+        active: 0,
+        submit: Submit::SaveProfile {
+            section,
+            orig_name: None,
+        },
+        error: None,
+    }
+}
+
+/// A form pre-filled with EVERY set field of the existing profile (via `config::profile_pairs`), so an
+/// edit shows and re-saves all of them — nothing is dropped or hidden.
+fn edit_profile_form(section: &'static str, name: &str, cfg: &crate::config::KernConfig) -> Form {
+    let mut fields = section_fields(section);
+    set_field(&mut fields, "name", name.to_string());
+    for (k, v) in crate::config::profile_pairs(cfg, section, name) {
+        set_field(&mut fields, &k, v);
+    }
+    Form {
+        title: format!("edit {section}:{name}"),
+        fields,
+        active: 0,
+        submit: Submit::SaveProfile {
+            section,
+            orig_name: Some(name.to_string()),
+        },
+        error: None,
+    }
+}
+
+/// A form to create a named volume (name + optional quota).
+fn new_volume_form() -> Form {
+    Form {
+        title: "new volume".into(),
+        fields: vec![
+            Field::text("name", "e.g. data"),
+            Field::text("size", "optional quota, e.g. 2g"),
+        ],
+        active: 0,
+        submit: Submit::CreateVolume,
+        error: None,
+    }
+}
+
+/// An edit form for a named volume, pre-filled with its name and current quota (blank size = no quota).
+fn edit_volume_form(v: &crate::volume::VolInfo) -> Form {
+    let size = v.quota.map(bytes_to_size_str).unwrap_or_default();
+    let mut fields = vec![
+        Field::text("name", "volume name"),
+        Field::text("size", "quota, e.g. 2g (blank = none)"),
+    ];
+    set_field(&mut fields, "name", v.name.clone());
+    set_field(&mut fields, "size", size);
+    Form {
+        title: format!("edit volume:{}", v.name),
+        fields,
+        active: 0,
+        submit: Submit::EditVolume {
+            orig_name: v.name.clone(),
+        },
+        error: None,
+    }
+}
+
+/// Bytes → the shortest EXACT, re-parseable size string (`2147483648`→`2g`, `1`→`1`), so an edit form
+/// pre-fills a value `config::size_to_bytes` can read straight back.
+fn bytes_to_size_str(n: u64) -> String {
+    const K: u64 = 1 << 10;
+    for (unit, suffix) in [(K * K * K, 'g'), (K * K, 'm'), (K, 'k')] {
+        if n >= unit && n % unit == 0 {
+            return format!("{}{suffix}", n / unit);
+        }
+    }
+    n.to_string()
+}
+
+/// Set a field's value by label (used to pre-fill edit forms).
+fn set_field(fields: &mut [Field], label: &str, val: String) {
+    if let Some(f) = fields.iter_mut().find(|f| f.label == label) {
+        f.value = val;
+    }
+}
+
+/// The result of feeding a key to a form.
+enum FormOutcome {
+    Stay(Form),
+    Cancel,
+    Submit(Form),
+}
+
+/// Edit a form with one keypress: type into the active field, navigate fields, submit or cancel.
+fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
+    // Arrow keys ↑/↓ move between fields.
+    if key.len() >= 3 && key[0] == 0x1b && key[1] == b'[' {
+        match key[2] {
+            b'A' => form.active = form.active.saturating_sub(1),
+            b'B' => form.active = (form.active + 1).min(form.fields.len().saturating_sub(1)),
+            _ => {}
+        }
+        return FormOutcome::Stay(form);
+    }
+    // A toggle field is driven by Space (flip) / `y` (on) / `n` (off); typing never lands in it.
+    if form.fields[form.active].toggle && !matches!(key[0], 0x1b | b'\t' | b'\r' | b'\n' | 0x13) {
+        let v = &mut form.fields[form.active].value;
+        match key[0] {
+            b' ' => {
+                *v = if v.is_empty() {
+                    "yes".into()
+                } else {
+                    String::new()
+                }
+            }
+            b'y' | b'Y' | b'1' => *v = "yes".into(),
+            b'n' | b'N' | b'0' | 0x7f | 0x08 => v.clear(),
+            _ => {}
+        }
+        form.error = None;
+        return FormOutcome::Stay(form);
+    }
+    match key[0] {
+        0x1b => FormOutcome::Cancel, // lone Esc
+        b'\t' => {
+            form.active = (form.active + 1) % form.fields.len();
+            FormOutcome::Stay(form)
+        }
+        b'\r' | b'\n' | 0x13 => FormOutcome::Submit(form), // Enter / Ctrl-S
+        0x7f | 0x08 => {
+            form.fields[form.active].value.pop();
+            form.error = None;
+            FormOutcome::Stay(form)
+        }
+        _ => {
+            // Append typed printable ASCII (text fields hold names / numbers / paths).
+            for &b in key {
+                if (0x20..0x7f).contains(&b) {
+                    form.fields[form.active].value.push(b as char);
+                }
+            }
+            form.error = None;
+            FormOutcome::Stay(form)
+        }
+    }
+}
+
+/// Carry out a submitted form: create the volume, or write the profile back to `kern.toml`.
+fn apply_form(form: &Form) -> Result<(), String> {
+    match &form.submit {
+        Submit::CreateVolume => {
+            let name = form.fields[0].value.trim();
+            if name.is_empty() {
+                return Err("name is required".into());
+            }
+            let size = form.fields[1].value.trim();
+            let mut args = vec!["create".to_string(), name.to_string()];
+            if !size.is_empty() {
+                args.push("--size".to_string());
+                args.push(size.to_string());
+            }
+            let mut res = Ok(());
+            quiet_io(|| res = crate::volume::run(&args));
+            res.map_err(|e| e.to_string())
+        }
+        Submit::EditVolume { orig_name } => {
+            let get = |l: &str| {
+                form.fields
+                    .iter()
+                    .find(|f| f.label == l)
+                    .map(|f| f.value.trim())
+                    .unwrap_or("")
+            };
+            let name = get("name");
+            if name.is_empty() {
+                return Err("name is required".into());
+            }
+            let size_raw = get("size");
+            // Blank size clears the quota; otherwise it must parse (and be > 0 — a 0-byte quota is
+            // meaningless and is the mistake that produced the confusing `0 B` quota).
+            let size = if size_raw.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::config::size_to_bytes(size_raw)
+                        .ok_or("size: e.g. 2g, 512m, 1g (or blank for none)")?,
+                )
+            };
+            crate::volume::edit(orig_name, name, size).map_err(|e| e.to_string())
+        }
+        Submit::SaveProfile { section, orig_name } => {
+            let (name, body) = form_to_body(&form.fields)?;
+            // The fields this form controls; every OTHER key already in the block (numa, nice, an i2c
+            // set via `kern config add`, …) is preserved by the merge.
+            let managed: Vec<&str> = form
+                .fields
+                .iter()
+                .map(|f| f.label)
+                .filter(|l| *l != "name")
+                .collect();
+            crate::config::save_named_block(section, orig_name.as_deref(), &name, &managed, &body)
+        }
+    }
+}
+
+/// Turn a profile form's fields into (name, body lines) via the shared `config` schema — the
+/// SAME validation + emission `kern config add` and the loader use, so the two paths can't diverge.
+fn form_to_body(fields: &[Field]) -> Result<(String, Vec<String>), String> {
+    let name = fields
+        .iter()
+        .find(|f| f.label == "name")
+        .map(|f| f.value.trim())
+        .unwrap_or("");
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .filter(|f| f.label != "name")
+        .map(|f| (f.label, f.value.trim()))
+        .collect();
+    let body = crate::config::profile_block(name, &pairs)?;
+    Ok((name.to_string(), body))
+}
+
+/// Remove a profile block from `kern.toml`, preserving the rest (shared with `kern config rm`).
+fn delete_profile(section: &str, name: &str) -> Result<(), String> {
+    crate::config::delete_named_block(section, name)
+}
+
+/// The detail text shown in the Volumes inspect overlay.
+fn volume_detail(v: &crate::volume::VolInfo) -> String {
+    let quota = v.quota.map_or_else(|| "none".to_string(), human_bytes);
+    format!(
+        "volume '{}'\n\n  data used   {}\n  quota       {}\n  mount with  -v {}:/path[:ro]",
+        v.name,
+        human_bytes(v.size),
+        quota,
+        v.name
+    )
+}
+
 /// Snapshot the Boxes table once (used when stdout is not a TTY — e.g. piped).
 pub fn snapshot() -> Result<(), crate::error::Error> {
     let p = Palette::detect();
+    // Two `/proc/stat` samples ~120 ms apart give a real host CPU% even for a one-shot snapshot.
+    let (_, s1) = read_host(None);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let (host, _) = read_host(s1);
+    let mem_pct = host.mem_pct();
+    println!(
+        "host: CPU {:.0}%  RAM {} / {} ({:.0}%)  load {:.2} ({} cores)",
+        host.cpu_pct,
+        human_bytes(host.mem_used),
+        human_bytes(host.mem_total),
+        mem_pct,
+        host.load1,
+        host.cores
+    );
     let (rows, _) = collect_rows(&HashMap::new());
-    print!("{}", boxes_table(&p, &rows, usize::MAX));
+    print!("{}", boxes_table(&p, &rows, usize::MAX, usize::MAX));
     Ok(())
 }
 
 /// Read the registry and compute each box's frame-to-frame CPU%, returning the rows and the new
 /// `(cpu_usec, instant)` map for the next frame.
+/// One frame's worth of data: the box rows + host stats + the `kern.toml` view (profiles) and the
+/// on-disk volumes. Gathered on the 1 s tick (and refreshed after a mutating action) so pure
+/// navigation keys re-render from this cache instead of re-scanning `/proc`, cgroups, `kern.toml`
+/// and every volume dir on every keystroke.
+struct Snapshot {
+    rows: Vec<Row>,
+    host: HostStats,
+    cfg: crate::config::KernConfig,
+    profs: Vec<ProfRow>,
+    vols: Vec<crate::volume::VolInfo>,
+}
+
+/// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) — used
+/// on the 1 s tick, where the ~1 s delta gives a meaningful CPU percentage.
+fn refresh_full(
+    prev: &mut HashMap<i32, (u64, Instant)>,
+    prev_cpu: &mut Option<(u64, u64)>,
+) -> Snapshot {
+    let (rows, seen) = collect_rows(prev);
+    *prev = seen;
+    let (host, cpu_now) = read_host(*prev_cpu);
+    *prev_cpu = cpu_now;
+    let cfg = crate::config::load(None).unwrap_or_default();
+    let profs = profile_rows(&cfg);
+    let vols = crate::volume::entries();
+    Snapshot {
+        rows,
+        host,
+        cfg,
+        profs,
+        vols,
+    }
+}
+
 fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, (u64, Instant)>) {
     let now_t = Instant::now();
     let now_u = registry::now_unix();
     let mut seen = HashMap::new();
     let mut rows = Vec::new();
     for b in registry::list() {
-        let cpu_now = registry::cpu_usec(b.pid).unwrap_or(0);
+        // One cgroup resolve for all four readings (mem/cpu/tasks/frozen) instead of four.
+        let st = registry::box_stats(b.pid);
+        let cpu_now = st.cpu_usec.unwrap_or(0);
         let cpu_pct = match prev.get(&b.pid) {
             Some((pu, t)) => {
                 let dt = now_t.duration_since(*t).as_secs_f64().max(1e-6);
@@ -194,8 +989,9 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         seen.insert(b.pid, (cpu_now, now_t));
         rows.push(Row {
             uptime: now_u.saturating_sub(b.started),
-            mem: registry::mem_bytes(b.pid),
-            tasks: registry::tasks(b.pid),
+            mem: st.mem,
+            tasks: st.tasks,
+            paused: st.paused,
             cpu_pct,
             name: b.name,
             pid: b.pid,
@@ -204,8 +1000,122 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
     (rows, seen)
 }
 
-/// Build a full frame for the active `tab`.
-fn render(p: &Palette, tab: usize, rows: &[Row], cols: usize, term_rows: usize) -> String {
+/// A snapshot of host-wide resource use, shown in the Overview tab (like the private's `kern top`).
+struct HostStats {
+    mem_used: u64,
+    mem_total: u64,
+    cpu_pct: f64,
+    cores: usize,
+    load1: f64,
+}
+
+impl HostStats {
+    /// RAM used as a percentage of total (0 when total is unknown).
+    fn mem_pct(&self) -> f64 {
+        if self.mem_total > 0 {
+            self.mem_used as f64 / self.mem_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// `(busy, total)` jiffies from `/proc/stat`'s aggregate `cpu ` line — CPU% is the delta of two.
+fn host_cpu_sample() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/stat").ok()?;
+    let mut it = s.lines().next()?.split_whitespace();
+    if it.next()? != "cpu" {
+        return None;
+    }
+    let v: Vec<u64> = it.filter_map(|t| t.parse().ok()).collect();
+    if v.len() < 4 {
+        return None;
+    }
+    let total: u64 = v.iter().sum();
+    let idle = v[3] + v.get(4).copied().unwrap_or(0); // idle + iowait
+    Some((total.saturating_sub(idle), total))
+}
+
+/// `(used, total)` host RAM in bytes, from `/proc/meminfo` (`used = total − available`).
+fn host_mem() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = |k: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    let total = kb("MemTotal:")?;
+    let avail = kb("MemAvailable:").or_else(|| kb("MemFree:"))?;
+    Some((total.saturating_sub(avail) * 1024, total * 1024))
+}
+
+/// The host's logical CPU count (per-CPU lines in `/proc/stat`), resolved once — the core count is
+/// fixed for the process's life, so `top` needn't re-read `/proc/stat` for it every frame.
+fn host_cores() -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CORES.get_or_init(|| {
+        std::fs::read_to_string("/proc/stat")
+            .ok()
+            .map(|s| {
+                s.lines()
+                    .filter(|l| {
+                        l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit)
+                    })
+                    .count()
+            })
+            .filter(|&c| c > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// 1-minute load average (read live) plus the cached logical CPU count.
+fn host_load_cores() -> (f64, usize) {
+    let load1 = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|t| t.parse().ok()))
+        .unwrap_or(0.0);
+    (load1, host_cores())
+}
+
+/// Read host stats. CPU% is computed against `prev_cpu` (the previous `/proc/stat` sample, returned
+/// for the next frame); with no previous sample it reports 0.
+fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
+    let sample = host_cpu_sample();
+    let cpu_pct = match (prev_cpu, sample) {
+        (Some((pb, pt)), Some((b, t))) if t > pt => {
+            (b.saturating_sub(pb) as f64 / (t - pt) as f64 * 100.0).clamp(0.0, 100.0)
+        }
+        _ => 0.0,
+    };
+    let (mem_used, mem_total) = host_mem().unwrap_or((0, 0));
+    let (load1, cores) = host_load_cores();
+    (
+        HostStats {
+            mem_used,
+            mem_total,
+            cpu_pct,
+            cores,
+            load1,
+        },
+        sample,
+    )
+}
+
+/// Build a full frame for the active `tab` / `mode`.
+#[allow(clippy::too_many_arguments)]
+fn render(
+    p: &Palette,
+    tab: usize,
+    rows: &[Row],
+    host: &HostStats,
+    profs: &[ProfRow],
+    vols: &[crate::volume::VolInfo],
+    cols: usize,
+    term_rows: usize,
+    sel: usize,
+    mode: &Mode,
+) -> String {
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
     let width = cols.clamp(40, 120);
     // Chrome around the content is ~8 lines (title 2 + tabs 1 + rule 1 + footer 3 + header 1); cap
@@ -231,36 +1141,375 @@ fn render(p: &Palette, tab: usize, rows: &[Row], cols: usize, term_rows: usize) 
     s.push('\n');
     s.push_str(&format!("{d}{}{z}\n", "─".repeat(width)));
 
-    match tab {
-        0 => s.push_str(&overview(p, rows)),
-        _ => s.push_str(&boxes_table(p, rows, body_rows)),
-    }
+    // Body + footer depend on the mode: a modal takes over the body area.
+    let keys = match mode {
+        Mode::Overlay(text) => {
+            s.push_str(&text_pane(p, text, body_rows, width));
+            format!("{d}[{z}any key{d}] back{z}")
+        }
+        Mode::Form(form) => {
+            s.push_str(&form_pane(p, form, width, body_rows));
+            format!("{d}[{z}Tab{d}/{z}↑↓{d}] field   [{z}⏎{d}] save   [{z}Esc{d}] cancel{z}")
+        }
+        Mode::PickKind => {
+            s.push_str(&pick_pane(p));
+            format!("{d}[{z}c{d}]vcpu  [{z}g{d}]vgpio  [{z}v{d}]vdisk   [{z}Esc{d}] cancel{z}")
+        }
+        Mode::Confirm { prompt, .. } => {
+            s.push_str(&confirm_pane(p, prompt));
+            format!("{d}[{z}y{d}] yes   [{z}any other{d}] no{z}")
+        }
+        Mode::Nav => {
+            match tab {
+                TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel)),
+                TAB_PROFILES => s.push_str(&profiles_table(p, profs, body_rows, sel)),
+                TAB_STORAGE => s.push_str(&storage_table(p, vols, body_rows, sel)),
+                _ => s.push_str(&overview(p, rows, host)),
+            }
+            nav_footer(p, tab, rows, profs, vols)
+        }
+    };
+    s.push_str(&format!("\n{d}{}{z}\n  {keys}\n", "─".repeat(width)));
+    s
+}
 
-    // Footer hint bar.
+/// The per-tab footer hint bar in normal navigation.
+fn nav_footer(
+    p: &Palette,
+    tab: usize,
+    rows: &[Row],
+    profs: &[ProfRow],
+    vols: &[crate::volume::VolInfo],
+) -> String {
+    let (d, z) = (p.d, p.z);
+    match tab {
+        TAB_BOXES if !rows.is_empty() => format!(
+            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}p{d}]ause [{z}u{d}]npause [{z}k{d}]ill [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{z}"
+        ),
+        TAB_PROFILES => {
+            let edit = if profs.is_empty() { "" } else { " [e]dit [d]elete" };
+            format!("{d}[{z}↑↓{d}] select   [{z}n{d}]ew{edit}   [{z}Tab{d}] next   [{z}q{d}] quit{z}")
+        }
+        TAB_STORAGE => {
+            let ops = if vols.is_empty() {
+                ""
+            } else {
+                " [e]dit [d]elete [⏎]info"
+            };
+            format!(
+                "{d}[{z}↑↓{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}Tab{d}] next   [{z}q{d}] quit{z}"
+            )
+        }
+        _ => format!(
+            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}4{d}] jump{z}"
+        ),
+    }
+}
+
+/// A read-only text overlay: a bold first-line title, then the tail of the (sanitized) body clipped to
+/// the pane. Terminal escapes in untrusted content (box logs) are stripped so they can't inject SGR /
+/// move the cursor.
+fn text_pane(p: &Palette, text: &str, body_rows: usize, width: usize) -> String {
+    let (b, d, z) = (p.b, p.d, p.z);
+    let mut lines = text.lines();
+    let title = crate::ui::scrub(lines.next().unwrap_or("detail"));
+    let body: Vec<&str> = lines.collect();
+    let mut s = format!("\n  {b}{title}{z}\n");
+    let take = body_rows.saturating_sub(2).max(1);
+    let start = body.len().saturating_sub(take);
+    if body.iter().all(|l| l.trim().is_empty()) && body.len() <= 1 {
+        s.push_str(&format!("  {d}(no output yet){z}\n"));
+    }
+    for l in &body[start..] {
+        let clean: String = crate::ui::scrub(l)
+            .chars()
+            .take(width.saturating_sub(2))
+            .collect();
+        s.push_str(&format!("  {clean}\n"));
+    }
+    s
+}
+
+/// The input-form pane: a title, a one-line hint, then one line per field. The **active** field lights
+/// up (accent caret / label / brackets) and shows the text cursor `▏` **at the insertion point** — right
+/// after what you've typed, or at the very start (before the dim placeholder) when the field is empty —
+/// so it's obvious where your typing lands. When a kind has more fields than fit, the list **scrolls**
+/// to keep the active field visible (`↑ N more` / `↓ N more`), so every field is reachable. Any
+/// validation error shows in red.
+fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String {
+    let (b, c, d, g, r, z) = (p.b, p.c, p.d, p.g, p.r, p.z);
+    let mut s = format!("\n  {b}{}{z}\n", form.title);
     s.push_str(&format!(
-        "\n{d}{}{z}\n  {d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}/{z}2{d}] jump{z}\n",
-        "─".repeat(width)
+        "  {d}type into the {z}{c}highlighted{z}{d} field · {z}{c}Tab{z}{d}/{z}{c}↑↓{z}{d} switch field · {z}{c}⏎{z}{d} save · {z}{c}Esc{z}{d} cancel{z}\n\n"
+    ));
+    // Inner width of the value box (chars). Kept modest so the box hugs the text, not the whole screen.
+    let boxw = width.saturating_sub(24).clamp(14, 30);
+    // Scroll: show a window of fields that keeps the active one visible. Reserve rows for the title,
+    // hint, blank, the two "more" markers and the error line.
+    let n = form.fields.len();
+    let visible = body_rows.saturating_sub(6).max(3).min(n.max(1));
+    let start = form
+        .active
+        .saturating_sub(visible - 1)
+        .min(n.saturating_sub(visible));
+    let end = (start + visible).min(n);
+    if start > 0 {
+        s.push_str(&format!("  {d}  ↑ {start} more{z}\n"));
+    }
+    for (i, f) in form.fields.iter().enumerate().take(end).skip(start) {
+        let active = i == form.active;
+        let caret = if active {
+            format!("{c}▸{z}")
+        } else {
+            " ".into()
+        };
+        let label = if active {
+            format!("{c}{:<9}{z}", f.label)
+        } else {
+            format!("{b}{:<9}{z}", f.label)
+        };
+        // A toggle renders as a checkbox `[x]`/`[ ]` with its hint as caption — no text box / cursor.
+        if f.toggle {
+            let on = !f.value.is_empty();
+            let mark = if on {
+                format!("{g}x{z}")
+            } else {
+                " ".to_string()
+            };
+            let (tlb, trb) = if active {
+                (format!("{c}[{z}"), format!("{c}]{z}"))
+            } else {
+                (format!("{d}[{z}"), format!("{d}]{z}"))
+            };
+            let cap = if active {
+                format!("{d}{}  ·  Space toggles{z}", f.hint)
+            } else {
+                format!("{d}{}{z}", f.hint)
+            };
+            s.push_str(&format!("  {caret} {label} {tlb}{mark}{trb} {cap}\n"));
+            continue;
+        }
+        // Brackets light up (accent) on the active field so the eye lands on it.
+        let (lb, rb) = if active {
+            (format!("{c}[{z}"), format!("{c}]{z}"))
+        } else {
+            (format!("{d}[{z}"), format!("{d}]{z}"))
+        };
+        // Inner content, cursor placed at the insertion point (active field only).
+        let inner = if active {
+            let cur = format!("{c}▏{z}");
+            if f.value.is_empty() {
+                // Cursor FIRST, then the dim placeholder → "start typing right here".
+                let ph: String = f.hint.chars().take(boxw.saturating_sub(1)).collect();
+                let pad = boxw.saturating_sub(1 + ph.chars().count());
+                format!("{cur}{d}{ph}{z}{:pad$}", "")
+            } else {
+                // Value, then the cursor right after it.
+                let val: String = f.value.chars().take(boxw.saturating_sub(1)).collect();
+                let pad = boxw.saturating_sub(1 + val.chars().count());
+                format!("{g}{val}{z}{cur}{:pad$}", "")
+            }
+        } else if f.value.is_empty() {
+            let ph: String = f.hint.chars().take(boxw).collect();
+            format!("{d}{ph:<boxw$}{z}")
+        } else {
+            let val: String = f.value.chars().take(boxw).collect();
+            format!("{g}{val:<boxw$}{z}")
+        };
+        s.push_str(&format!("  {caret} {label} {lb}{inner}{rb}\n"));
+    }
+    if end < n {
+        s.push_str(&format!("  {d}  ↓ {} more{z}\n", n - end));
+    }
+    if let Some(e) = &form.error {
+        s.push_str(&format!("\n  {r}✗ {e}{z}\n"));
+    }
+    s
+}
+
+/// The confirm pane: a centred prompt for a destructive action.
+fn confirm_pane(p: &Palette, prompt: &str) -> String {
+    let (b, y, z) = (p.b, p.y, p.z);
+    format!("\n\n  {y}⚠{z}  {b}{prompt}{z}\n")
+}
+
+/// The Profiles "new" kind picker: vcpu / vgpio / vdisk, each attachable to a box by prefix.
+fn pick_pane(p: &Palette) -> String {
+    let (b, c, d, z) = (p.b, p.c, p.d, p.z);
+    let row = |key: &str, name: &str, what: &str| {
+        format!("    {b}[{c}{key}{b}]{z}  {b}{name:<8}{z}{d}{what}{z}\n")
+    };
+    let mut s = format!("\n  {b}new profile{z}  {d}— pick a kind:{z}\n\n");
+    s.push_str(&row("c", "vcpu", "CPU / memory limits for a box"));
+    s.push_str(&row("g", "vgpio", "GPIO / I²C / SPI access for a box"));
+    s.push_str(&row(
+        "v",
+        "vdisk",
+        "a private, size-capped scratch disk for one box",
     ));
     s
 }
 
-/// The Overview tab: aggregate stats.
-fn overview(p: &Palette, rows: &[Row]) -> String {
+/// The lead marker + name colour for a table row: the selected row gets a `›` caret and bold, so it
+/// reads at a glance which row the lifecycle keys act on. (Reverse-video is avoided — an embedded
+/// colour reset mid-row would cut it.) Shared by the Boxes / Profiles / Storage tables.
+fn sel_marker(p: &Palette, selected: bool) -> (String, String) {
+    if selected {
+        (format!("{}›{} ", p.b, p.z), format!("{}{}", p.b, p.c))
+    } else {
+        ("  ".into(), p.c.to_string())
+    }
+}
+
+/// The physical-disk one-liner for the Overview / Storage panes: the first two disks, then a
+/// `(+N more)` tail when there are others. `None` when no disk was detected. The caller wraps it in
+/// its own dim styling. Cached — disks are fixed hardware, so `top` scans `/sys/block` once, not
+/// every frame.
+fn disks_summary() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let disks = crate::commands::host_disks();
+            if disks.is_empty() {
+                return None;
+            }
+            let shown = disks
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("   ");
+            let more = disks.len().saturating_sub(2);
+            Some(if more > 0 {
+                format!("{shown}   (+{more} more)")
+            } else {
+                shown
+            })
+        })
+        .clone()
+}
+
+/// The Profiles tab: the `kern.toml` vcpu / vgpio / vdisk profiles, `section:name` + a summary.
+fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -> String {
+    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
+    let mut s = format!(
+        "\n  {d}reusable specs — attach to a box: {z}{c}kern box vcpu:heavy vgpio:leds vdisk:scratch …{z}\n\n"
+    );
+    s.push_str(&format!("  {b}{:<22}  {}{z}\n", "PROFILE", "SUMMARY"));
+    if profs.is_empty() {
+        s.push_str(&format!(
+            "  {d}no profiles yet — press {z}{g}n{z}{d} to add a vcpu / vgpio / vdisk profile{z}\n"
+        ));
+        return s;
+    }
+    let shown = profs.len().min(max_rows);
+    for (i, r) in profs[..shown].iter().enumerate() {
+        let (lead, col) = sel_marker(p, i == sel);
+        s.push_str(&format!(
+            "  {lead}{col}{:<22}{z}  {d}{}{z}\n",
+            trunc(&prof_label(r), 22),
+            r.summary
+        ));
+    }
+    if shown < profs.len() {
+        s.push_str(&format!("  {d}… {} more{z}\n", profs.len() - shown));
+    }
+    s
+}
+
+/// The Storage tab — the concrete data layer: the read-only physical disks, then the named volumes
+/// (persistent storage you mount with `-v`). Per-box vdisks are *specs*, so they live in Profiles.
+fn storage_table(
+    p: &Palette,
+    vols: &[crate::volume::VolInfo],
+    max_rows: usize,
+    sel: usize,
+) -> String {
+    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
+    let mut s = String::new();
+
+    // Physical disks — read-only hardware; where volumes and vdisks physically live.
+    if let Some(summary) = disks_summary() {
+        s.push_str(&format!(
+            "\n  {b}DISKS{z} {d}(physical, read-only){z}\n    {d}{summary}{z}\n"
+        ));
+    }
+
+    s.push_str(&format!(
+        "\n  {d}named volumes — persistent, shared: {z}{c}kern box -v NAME:/data …{z}  {d}(per-box vdisks are in Profiles){z}\n\n"
+    ));
+    s.push_str(&format!(
+        "  {b}{:<24}  {:>10}  {:>10}{z}\n",
+        "VOLUME", "SIZE", "QUOTA"
+    ));
+    if vols.is_empty() {
+        s.push_str(&format!(
+            "  {d}no volumes yet — press {z}{g}n{z}{d} to create one{z}\n"
+        ));
+        return s;
+    }
+    let shown = vols.len().min(max_rows);
+    for (i, v) in vols[..shown].iter().enumerate() {
+        let (lead, col) = sel_marker(p, i == sel);
+        let quota = v.quota.map_or("-".into(), human_bytes);
+        s.push_str(&format!(
+            "  {lead}{col}{:<24}{z}  {:>10}  {:>10}\n",
+            trunc(&v.name, 24),
+            human_bytes(v.size),
+            quota
+        ));
+    }
+    if shown < vols.len() {
+        s.push_str(&format!("  {d}… {} more{z}\n", vols.len() - shown));
+    }
+    s
+}
+
+/// The Overview tab: host resources first (the machine kern runs on), then the box aggregate.
+fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     let (b, d, z) = (p.b, p.d, p.z);
+    let mut s = String::from("\n");
+    let row = |k: &str, v: String| format!("  {b}{:<16}{z}{v}\n", k);
+
+    // Host — the machine kern is running on (like the private's top).
+    let mem_pct = host.mem_pct();
+    s.push_str(&format!("  {b}HOST{z}\n"));
+    s.push_str(&row(
+        "CPU",
+        format!(
+            "{:>4.0} %   {d}{} cores · load {:.2}{z}",
+            host.cpu_pct, host.cores, host.load1
+        ),
+    ));
+    s.push_str(&row(
+        "RAM",
+        format!(
+            "{} / {}   {d}({:.0} %){z}",
+            human_bytes(host.mem_used),
+            human_bytes(host.mem_total),
+            mem_pct
+        ),
+    ));
+    // Physical disks — read-only hardware, the pool a `vdisk:` profile's image lives on.
+    if let Some(summary) = disks_summary() {
+        s.push_str(&row("Disks", format!("{d}{summary}{z}")));
+    }
+
+    // Boxes — the aggregate of what kern is running.
     let total_mem: u64 = rows.iter().filter_map(|r| r.mem).sum();
-    let total_cpu: f64 = rows.iter().map(|r| r.cpu_pct).sum();
+    // `pct()` normalises a stray `-0.0` (float rounding on an idle host) to a clean `0.0`.
+    let total_cpu: f64 = pct(rows.iter().map(|r| r.cpu_pct).sum());
     let total_tasks: u64 = rows.iter().filter_map(|r| r.tasks).sum();
     let cap = if rows.iter().any(|r| r.mem.is_some()) {
         "yes (systemd cgroup scope)"
     } else {
         "no dedicated cgroup"
     };
-    let mut s = String::from("\n");
-    let row = |k: &str, v: String| format!("  {b}{:<16}{z}{v}\n", k);
-    s.push_str(&row("Boxes running", format!("{}", rows.len())));
-    s.push_str(&row("Total memory", human_bytes(total_mem)));
-    s.push_str(&row("Total CPU", format!("{total_cpu:.1} %")));
-    s.push_str(&row("Total tasks", format!("{total_tasks}")));
+    s.push_str(&format!("\n  {b}BOXES{z}\n"));
+    s.push_str(&row("Running", format!("{}", rows.len())));
+    s.push_str(&row("Memory", human_bytes(total_mem)));
+    s.push_str(&row("CPU", format!("{total_cpu:.1} %")));
+    s.push_str(&row("Tasks", format!("{total_tasks}")));
     s.push_str(&row("Resource cap", format!("{d}{cap}{z}")));
     if rows.is_empty() {
         s.push_str(&format!(
@@ -270,12 +1519,13 @@ fn overview(p: &Palette, rows: &[Row]) -> String {
     s
 }
 
-/// The Boxes tab: a per-box table, capped to `max_rows` so it never overflows the screen.
-fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize) -> String {
-    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
+/// The Boxes tab: a per-box table, capped to `max_rows` so it never overflows the screen. `sel` is the
+/// highlighted row (the target of the lifecycle keys), marked with a `›` and reverse-video.
+fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String {
+    let (b, d, g, z) = (p.b, p.d, p.g, p.z);
     let mut s = String::new();
     s.push_str(&format!(
-        "  {b}{:<16}  {:>7}  {:>9}  {:>9}  {:>6}  {:>5}  STATUS{z}\n",
+        "    {b}{:<16}  {:>7}  {:>9}  {:>9}  {:>6}  {:>5}  STATUS{z}\n",
         "NAME", "PID", "UPTIME", "MEM", "CPU%", "PIDS"
     ));
     if rows.is_empty() {
@@ -283,16 +1533,22 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize) -> String {
         return s;
     }
     let shown = rows.len().min(max_rows);
-    for r in &rows[..shown] {
+    for (i, r) in rows[..shown].iter().enumerate() {
         let mem = r.mem.map_or("-".into(), human_bytes);
         let tasks = r.tasks.map_or("-".into(), |n| n.to_string());
+        let status = if r.paused {
+            format!("{d}paused{z}")
+        } else {
+            format!("{g}running{z}")
+        };
+        let (lead, name_col) = sel_marker(p, i == sel);
         s.push_str(&format!(
-            "  {c}{:<16}{z}  {:>7}  {:>9}  {:>9}  {:>5.0}%  {:>5}  {g}running{z}\n",
+            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>9}  {:>9}  {:>5.0}%  {:>5}  {status}\n",
             trunc(&r.name, 16),
             r.pid,
             fmt_uptime(r.uptime),
             mem,
-            r.cpu_pct,
+            pct(r.cpu_pct),
             tasks
         ));
     }
@@ -302,11 +1558,273 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize) -> String {
     s
 }
 
+/// Normalise a CPU% for display: clamp to ≥ 0 and collapse a signed zero (`-0.0`) to a clean `0.0`.
+/// (`f64::max(-0.0, 0.0)` may keep the sign, which then prints as "-0" — an idle-host eyesore.)
+fn pct(v: f64) -> f64 {
+    let v = v.max(0.0);
+    if v == 0.0 {
+        0.0
+    } else {
+        v
+    }
+}
+
 /// Truncate to `max` chars (char-safe).
 fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain() -> Palette {
+        Palette {
+            b: "",
+            c: "",
+            d: "",
+            g: "",
+            y: "",
+            r: "",
+            z: "",
+        }
+    }
+
+    fn row(name: &str, paused: bool) -> Row {
+        Row {
+            name: name.into(),
+            pid: 100,
+            uptime: 5,
+            mem: Some(1024 * 1024),
+            cpu_pct: 1.0,
+            tasks: Some(3),
+            paused,
+        }
+    }
+
+    #[test]
+    fn selected_row_gets_a_caret() {
+        let rows = [row("web", false), row("db", false)];
+        let out = boxes_table(&plain(), &rows, 10, 1); // db selected
+        let line = out.lines().find(|l| l.contains("db")).unwrap();
+        assert!(line.contains('›'), "selected row should show the caret");
+        let web = out.lines().find(|l| l.contains("web")).unwrap();
+        assert!(!web.contains('›'), "unselected row must not show the caret");
+    }
+
+    #[test]
+    fn out_of_range_selection_highlights_nothing() {
+        let rows = [row("web", false)];
+        let out = boxes_table(&plain(), &rows, 10, usize::MAX); // snapshot mode
+        assert!(!out.contains('›'));
+    }
+
+    #[test]
+    fn negative_zero_cpu_renders_as_zero() {
+        let mut rows = [row("web", false)];
+        rows[0].cpu_pct = -0.0;
+        let out = boxes_table(&plain(), &rows, 10, usize::MAX);
+        assert!(out.contains("0%"), "cpu% should render 0");
+        assert!(!out.contains("-0"), "a stray -0.0 must be normalised to 0");
+    }
+
+    #[test]
+    fn text_pane_titles_strips_control_bytes_and_tails() {
+        // First line is the (bold) title; the body is sanitized and tail-clipped to the pane.
+        let text = "logs: web\nl1\nl2\x1b[2J\x07\nl3\nl4\nl5";
+        let out = text_pane(&plain(), text, 5, 40); // take = 3 body lines
+        assert!(out.contains("logs: web"), "title shown");
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\x07'));
+        assert!(out.contains("l5"));
+        assert!(!out.contains("l1"), "old lines beyond the tail are dropped");
+    }
+
+    /// A text field pre-filled with a value (test helper).
+    fn tf(label: &'static str, value: &str) -> Field {
+        let mut f = Field::text(label, "");
+        f.value = value.into();
+        f
+    }
+
+    #[test]
+    fn form_body_serialises_and_validates() {
+        let fields = vec![
+            tf("name", "heavy"),
+            tf("vcpus", "4"),
+            tf("cpus", "0-3"),
+            tf("memory", ""), // empty → skipped
+            tf("priority", "10"),
+        ];
+        let (name, body) = form_to_body(&fields).unwrap();
+        assert_eq!(name, "heavy");
+        assert!(body.contains(&"name = \"heavy\"".to_string()));
+        assert!(body.contains(&"vcpus = 4".to_string()));
+        assert!(body.contains(&"cpus = \"0-3\"".to_string()));
+        assert!(body.contains(&"priority = 10".to_string()));
+        assert!(
+            !body.iter().any(|l| l.starts_with("memory")),
+            "empty field skipped"
+        );
+
+        // A bad number is rejected with a message, not silently written.
+        let bad = vec![tf("name", "x"), tf("vcpus", "abc")];
+        assert!(form_to_body(&bad).is_err());
+
+        // A missing name is rejected.
+        let noname = vec![tf("name", "  ")];
+        assert!(form_to_body(&noname).is_err());
+    }
+
+    #[test]
+    fn persistent_is_a_toggle_not_free_text() {
+        // Space flips it; typing letters never lands in it; on → `persistent = true`, off → omitted.
+        let mut form = new_profile_form("vdisk");
+        set_field(&mut form.fields, "name", "scratch".into()); // form_to_body needs a name
+        let pi = form
+            .fields
+            .iter()
+            .position(|f| f.label == "persistent")
+            .unwrap();
+        assert!(form.fields[pi].toggle, "persistent must be a toggle");
+        form.active = pi;
+        // A letter does NOT type into a toggle.
+        form = match handle_form_key(form, b"x") {
+            FormOutcome::Stay(f) => f,
+            _ => panic!(),
+        };
+        assert_eq!(form.fields[pi].value, "", "typing must not fill a toggle");
+        // Space turns it on.
+        form = match handle_form_key(form, b" ") {
+            FormOutcome::Stay(f) => f,
+            _ => panic!(),
+        };
+        assert_eq!(form.fields[pi].value, "yes");
+        let (_n, body) = form_to_body(&form.fields).unwrap();
+        assert!(
+            body.iter().any(|l| l == "persistent = true"),
+            "on → persistent = true: {body:?}"
+        );
+        // Space again turns it off → the key is omitted (cleared).
+        form = match handle_form_key(form, b" ") {
+            FormOutcome::Stay(f) => f,
+            _ => panic!(),
+        };
+        assert_eq!(form.fields[pi].value, "");
+        let (_n, body2) = form_to_body(&form.fields).unwrap();
+        assert!(!body2.iter().any(|l| l.starts_with("persistent")));
+    }
+
+    #[test]
+    fn bytes_to_size_str_is_exact_and_reparseable() {
+        // Pre-fill values for the volume-edit form must round-trip through config::size_to_bytes.
+        for (bytes, want) in [
+            (2 * 1024 * 1024 * 1024, "2g"),
+            (512 * 1024 * 1024, "512m"),
+            (4 * 1024, "4k"),
+            (1, "1"),
+            (0, "0"),
+        ] {
+            let s = bytes_to_size_str(bytes);
+            assert_eq!(s, want);
+            if bytes > 0 {
+                assert_eq!(crate::config::size_to_bytes(&s), Some(bytes), "reparse {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn tui_form_and_config_add_emit_the_same_block() {
+        // The Profiles form and `kern config add` must produce byte-identical kern.toml: both go
+        // through config::profile_block. This pins that the two paths can never drift.
+        let fields = vec![
+            tf("name", "heavy"),
+            tf("vcpus", "4"),
+            tf("cpus", "0-3"),
+            tf("memory", "512m"),
+            tf("priority", "10"),
+        ];
+        let (_name, from_form) = form_to_body(&fields).unwrap();
+        let from_cli = crate::config::profile_block(
+            "heavy",
+            &[
+                ("vcpus", "4"),
+                ("cpus", "0-3"),
+                ("memory", "512m"),
+                ("priority", "10"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(from_form, from_cli);
+    }
+
+    #[test]
+    fn edit_form_round_trips_every_field_losslessly() {
+        // A profile hand-written with the full field set, loaded into the edit form and re-serialised,
+        // must reproduce every field — no CLI-only / hand-edit-only field is dropped by an edit cycle.
+        let raw = "\
+[[vgpio]]
+name = \"full\"
+backend = \"gpio:0\"
+pins = [17, 27]
+pwm = [12]
+i2c = [\"/dev/i2c-1\", \"/dev/i2c-2\"]
+spi = [\"/dev/spidev0.0\"]
+leds = [\"led0\"]
+";
+        let cfg = crate::config::parse(raw).unwrap();
+        let form = edit_profile_form("vgpio", "full", &cfg);
+        let (name, body) = form_to_body(&form.fields).unwrap();
+        assert_eq!(name, "full");
+        for expect in [
+            "backend = \"gpio:0\"",
+            "pins = [17, 27]",
+            "pwm = [12]",
+            "i2c = [\"/dev/i2c-1\", \"/dev/i2c-2\"]",
+            "spi = [\"/dev/spidev0.0\"]",
+            "leds = [\"led0\"]",
+        ] {
+            assert!(
+                body.iter().any(|l| l == expect),
+                "lost/changed on edit round-trip: {expect}\n got {body:?}"
+            );
+        }
+
+        // Same for a vcpu carrying its advanced fields.
+        let cfg2 = crate::config::parse(
+            "[[vcpu]]\nname=\"h\"\nvcpus=4\nnuma=1\nnice=-5\nextends=\"base\"\n",
+        )
+        .unwrap();
+        let (_n, b2) = form_to_body(&edit_profile_form("vcpu", "h", &cfg2).fields).unwrap();
+        for e in ["vcpus = 4", "numa = 1", "nice = -5", "extends = \"base\""] {
+            assert!(b2.iter().any(|l| l == e), "vcpu lost {e}: {b2:?}");
+        }
+    }
+
+    #[test]
+    fn active_field_cursor_sits_at_the_insertion_point() {
+        let p = plain();
+        let mut form = new_profile_form("vcpu");
+        // Empty active field: cursor is immediately before the placeholder ("▏e.g. heavy").
+        let out = form_pane(&p, &form, 80, 24);
+        let name_line = out.lines().find(|l| l.contains("name")).unwrap();
+        assert!(name_line.contains("▏"), "active field shows a cursor");
+        let ci = name_line.find('▏').unwrap();
+        let hi = name_line.find("e.g. heavy").unwrap();
+        assert!(ci < hi, "cursor precedes the placeholder when empty");
+        // Typed value: cursor sits right AFTER the value, not at the far right.
+        form.fields[0].value = "heavy".into();
+        let out2 = form_pane(&p, &form, 80, 24);
+        let l2 = out2.lines().find(|l| l.contains("name")).unwrap();
+        let vi = l2.find("heavy").unwrap();
+        let cu = l2.find('▏').unwrap();
+        assert!(
+            cu > vi && cu <= vi + "heavy".len() + 1,
+            "cursor follows the value"
+        );
     }
 }

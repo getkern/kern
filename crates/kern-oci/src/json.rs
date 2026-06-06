@@ -31,12 +31,58 @@ pub(crate) fn matching_bracket(s: &str, open_idx: usize, open: u8, close: u8) ->
     None
 }
 
+/// The `open..=close` bracketed span (inclusive) following `"key"` — one implementation of
+/// "find key → find opener → match its close" so the array and object walkers can't drift.
+fn bracketed_after<'a>(json: &'a str, key: &str, open: u8, close: u8) -> Option<&'a str> {
+    let k = json.find(&format!("\"{key}\""))?;
+    let open_idx = json[k..].find(open as char)? + k;
+    let close_idx = matching_bracket(json, open_idx, open, close)?;
+    Some(&json[open_idx..=close_idx])
+}
+
 /// The `[...]` array (inclusive) following `"key"`.
 pub(crate) fn array_after<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let k = json.find(&format!("\"{key}\""))?;
-    let open = json[k..].find('[')? + k;
-    let close = matching_bracket(json, open, b'[', b']')?;
-    Some(&json[open..=close])
+    bracketed_after(json, key, b'[', b']')
+}
+
+/// The `{...}` object (inclusive) following `"key"` — e.g. an OCI image config's `"config": {…}`.
+pub(crate) fn object_after<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    bracketed_after(json, key, b'{', b'}')
+}
+
+/// The string ELEMENTS of the `[...]` array following `"key"` (a JSON string array like an OCI
+/// config's `Env`/`Cmd`/`Entrypoint`). Escape-aware; empty if the key/array is absent. Non-BMP
+/// `\uXXXX` escapes are dropped (not the common case for image configs).
+pub(crate) fn str_array_after(json: &str, key: &str) -> Vec<String> {
+    let Some(arr) = array_after(json, key) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut in_str, mut esc) = (false, false);
+    for c in arr.chars() {
+        if in_str {
+            if esc {
+                cur.push(match c {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    other => other, // covers `"`, `\`, `/`, and the rest
+                });
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                out.push(std::mem::take(&mut cur));
+                in_str = false;
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' {
+            in_str = true;
+        }
+    }
+    out
 }
 
 /// Split a `[...]` array into its top-level `{...}` objects.
@@ -162,6 +208,30 @@ mod tests {
         // A bracket inside a string value must not break object splitting.
         let tricky = r#"[{"d":"a [b] c"},{"d":"x"}]"#;
         assert_eq!(split_objects(tricky).len(), 2);
+    }
+
+    #[test]
+    fn object_and_string_array() {
+        // An OCI-image-config-shaped blob: pull the inner `config` object, then its string arrays.
+        let blob = r#"{"architecture":"amd64","config":{"Env":["PATH=/bin","REDIS_VERSION=8.8.0"],"Entrypoint":["docker-entrypoint.sh"],"Cmd":["redis-server"],"WorkingDir":"/data","User":"redis"},"os":"linux"}"#;
+        let cfg = object_after(blob, "config").unwrap();
+        assert_eq!(
+            str_array_after(cfg, "Env"),
+            vec!["PATH=/bin", "REDIS_VERSION=8.8.0"]
+        );
+        assert_eq!(
+            str_array_after(cfg, "Entrypoint"),
+            vec!["docker-entrypoint.sh"]
+        );
+        assert_eq!(str_array_after(cfg, "Cmd"), vec!["redis-server"]);
+        assert_eq!(first_str(cfg, "WorkingDir").as_deref(), Some("/data"));
+        assert_eq!(first_str(cfg, "User").as_deref(), Some("redis"));
+        // Absent array → empty; a bracket inside a value doesn't break it.
+        assert!(str_array_after(cfg, "Volumes").is_empty());
+        assert_eq!(
+            str_array_after(r#"{"a":["x [y]","z\tw"]}"#, "a"),
+            vec!["x [y]", "z\tw"]
+        );
     }
 
     #[test]

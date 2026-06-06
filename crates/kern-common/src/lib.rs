@@ -6,6 +6,9 @@
 /// The kern version, sourced from the workspace `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Registry credentials shared by `kern login`/`logout` and the OCI pull path.
+pub mod registry_auth;
+
 /// A validated sandbox / box name. Newtype so a raw `String` can't be passed where a vetted
 /// name is required.
 ///

@@ -4,7 +4,7 @@ mod json;
 mod net;
 mod pull;
 mod search;
-pub use pull::{pull, OciError};
+pub use pull::{pull, ImageConfig, OciError};
 pub use search::{search, SearchResult};
 
 use std::path::PathBuf;

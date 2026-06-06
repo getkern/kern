@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 472" width="800" height="472" font-family="ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace" role="img" aria-label="Terminal demo of kern as a virtual resource manager: a ~/.config/kern/kern.toml defines reusable vcpu, vdisk and vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in 5.5 ms (docker run takes about 308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI. CPU, memory, disk and devices, sliced per box, in one ~1 MB static binary with no daemon.">
+  <style>
+    text { font-size: 14px; }
+    .l { opacity: 0; animation: fade .28s ease forwards; }
+    @keyframes fade { to { opacity: 1; } }
+    .prompt { fill: #3fb950; }
+    .cmd    { fill: #e6edf3; }
+    .flag   { fill: #79c0ff; }
+    .prof   { fill: #ffa657; }
+    .key    { fill: #d2a8ff; }
+    .str    { fill: #a5d6ff; }
+    .dim    { fill: #7d8590; }
+    .ok     { fill: #3fb950; }
+    .cyan   { fill: #56d4dd; }
+    .cur    { fill: #3fb950; animation: blink 1.06s steps(1) infinite; }
+    @keyframes blink { 0%,49% { opacity: 1; } 50%,100% { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .l { opacity: 1; animation: none; }
+      .cur { animation: none; }
+    }
+  </style>
+
+  <!-- window -->
+  <rect x="1" y="1" width="798" height="470" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <rect x="1" y="1" width="798" height="40" rx="12" fill="#161b22"/>
+  <rect x="1" y="28" width="798" height="13" fill="#161b22"/>
+  <circle cx="24" cy="21" r="6" fill="#ff5f56"/>
+  <circle cx="46" cy="21" r="6" fill="#ffbd2e"/>
+  <circle cx="68" cy="21" r="6" fill="#27c93f"/>
+  <text x="400" y="26" text-anchor="middle" class="dim" font-size="13">kern — virtual resources for any workload</text>
+
+  <g>
+    <!-- reusable profiles: CPU, disk AND devices, in one config file -->
+    <text x="22" y="70"  class="l" style="animation-delay:.2s"><tspan class="dim"># ~/.config/kern/kern.toml — CPU, disk &amp; device profiles, reusable</tspan></text>
+    <text x="22" y="93"  class="l" style="animation-delay:.4s"><tspan class="key">  [[vcpu]]</tspan>  <tspan class="cmd">name =</tspan> <tspan class="str">"heavy"</tspan>    <tspan class="cmd">vcpus =</tspan> <tspan class="str">4</tspan>   <tspan class="cmd">memory =</tspan> <tspan class="str">"2G"</tspan></text>
+    <text x="22" y="116" class="l" style="animation-delay:.6s"><tspan class="key">  [[vdisk]]</tspan> <tspan class="cmd">name =</tspan> <tspan class="str">"scratch"</tspan>  <tspan class="cmd">size =</tspan> <tspan class="str">"8G"</tspan></text>
+    <text x="22" y="139" class="l" style="animation-delay:.8s"><tspan class="key">  [[vgpio]]</tspan> <tspan class="cmd">name =</tspan> <tspan class="str">"sensor"</tspan>   <tspan class="cmd">i2c =</tspan> <tspan class="str">["/dev/i2c-1"]</tspan></text>
+
+    <!-- attach a resource slice to an isolated box -->
+    <text x="22" y="181" class="l" style="animation-delay:1.4s"><tspan class="prompt">$</tspan> <tspan class="cmd">kern box train </tspan><tspan class="flag">--image</tspan><tspan class="cmd"> alpine </tspan><tspan class="prof">vcpu:heavy vdisk:scratch</tspan><tspan class="cmd"> -- ./train.sh</tspan></text>
+    <text x="22" y="204" class="l" style="animation-delay:2.0s"><tspan class="ok">  ✓</tspan> <tspan class="cmd">box "train" ready in </tspan><tspan class="ok">5.5 ms</tspan>          <tspan class="dim">docker run: ~308 ms</tspan></text>
+    <text x="22" y="227" class="l" style="animation-delay:2.4s"><tspan class="cyan">    4 vCPU · 2 GB RAM · /vdisk/scratch (8 GB) · rootless &amp; isolated</tspan></text>
+
+    <!-- govern a transcode · expose one device · a fresh box per request · a stack · a live UI -->
+    <text x="22" y="269" class="l" style="animation-delay:3.0s"><tspan class="prompt">$</tspan> <tspan class="cmd">kern run </tspan><tspan class="prof">vcpu:heavy</tspan><tspan class="cmd"> -- ffmpeg </tspan><tspan class="flag">-i</tspan><tspan class="cmd"> in.mov out.mp4</tspan>   <tspan class="dim"># cap a heavy transcode, no sandbox</tspan></text>
+    <text x="22" y="292" class="l" style="animation-delay:3.4s"><tspan class="prompt">$</tspan> <tspan class="cmd">kern box iot </tspan><tspan class="flag">--image</tspan><tspan class="cmd"> alpine </tspan><tspan class="prof">vgpio:sensor</tspan><tspan class="cmd"> -- ./read.py</tspan>  <tspan class="dim"># only /dev/i2c-1, nothing else</tspan></text>
+    <text x="22" y="315" class="l" style="animation-delay:3.8s"><tspan class="prompt">$</tspan> <tspan class="cmd">echo </tspan><tspan class="str">'{"n":42}'</tspan> <tspan class="dim">|</tspan> <tspan class="cmd">kern box fn </tspan><tspan class="flag">--image</tspan><tspan class="cmd"> python -- handler.py</tspan>  <tspan class="dim"># fresh box per request</tspan></text>
+    <text x="22" y="338" class="l" style="animation-delay:4.2s"><tspan class="prompt">$</tspan> <tspan class="cmd">kern compose stack.toml </tspan><tspan class="flag">up</tspan>            <tspan class="dim"># a whole stack, one command</tspan></text>
+    <text x="22" y="361" class="l" style="animation-delay:4.5s"><tspan class="dim">  compose up: 3 boxes started · track with </tspan><tspan class="cmd">kern ps</tspan></text>
+    <text x="22" y="384" class="l" style="animation-delay:4.9s"><tspan class="prompt">$</tspan> <tspan class="cmd">kern top</tspan>                                 <tspan class="dim"># live TUI: boxes · profiles · volumes</tspan></text>
+
+    <text x="22" y="426" class="l" style="animation-delay:5.5s"><tspan class="cyan"># containers · resource slices · per-request sandboxes — one ~1 MB binary, no daemon</tspan></text>
+    <text x="22" y="453" class="l" style="animation-delay:6.0s"><tspan class="prompt">$</tspan> <tspan class="cur">▋</tspan></text>
+  </g>
+</svg>

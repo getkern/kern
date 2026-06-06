@@ -6,19 +6,20 @@
 use crate::commands;
 use crate::error::Error;
 
-/// Global runtime options that apply to any command.
+/// Global runtime options that apply to any command. Reserved for future global flags (none today).
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct GlobalOpts {
-    /// `--no-gpu`: never load any GPU driver interposer. Decouples the sandbox trust decision
-    /// from the driver-interposition trust decision; any GPU support is opt-in and off by
-    /// default. The runtime itself is GPU-free.
-    pub no_gpu: bool,
-}
+pub struct GlobalOpts;
 
 /// The parsed subcommand.
+// `BoxRun` carries every `kern box` flag, so it dwarfs the unit variants — but a `Command` is built
+// exactly once per process on the cold parse path, so boxing it would only add indirection for no
+// runtime benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Version,
+    /// Bare `kern`: a short logo + tagline + the most-used commands (full list via `--help`).
+    Banner,
     Help,
     /// `kern box <name> --plan`: print the ordered isolation step sequence (no privileges).
     BoxPlan {
@@ -40,32 +41,98 @@ pub enum Command {
         workdir: Option<String>,
         /// `--net`: share the host network namespace (outbound networking; no net isolation).
         share_net: bool,
+        /// `--pod <name>`: join a pod's shared loopback network (reach peers by name).
+        pod: Option<String>,
         /// `--uid-range`: map a sub-uid/gid range (apt/dpkg, www-data). Default maps only the caller.
         uid_range: bool,
         /// `--bind-rootfs`: bind the rootfs directly instead of an overlay (faster on slow-overlay
         /// kernels; source becomes mutable & shared).
         bind_rootfs: bool,
+        /// INTERNAL (used by `kern build`): explicit overlay lower dir(s), colon-joined, used as the
+        /// read-only base instead of `--rootfs`/`--image`. Paired with `--overlay-upper`.
+        overlay_lower: Option<String>,
+        /// INTERNAL (used by `kern build`): a PERSISTENT overlay upper dir (the build layer) instead
+        /// of the ephemeral scratch upper — so a build's writes accumulate across RUN steps.
+        overlay_upper: Option<String>,
         /// `--memory`/`-m`: hard memory ceiling in bytes (default cap if `None`).
         memory: Option<u64>,
+        /// `--memory-swap-max`: swap allowance in bytes → `memory.swap.max` (v2, separate from
+        /// `memory.max`; NOT Docker's combined mem+swap total). `None` → `0` (swap off).
+        memory_swap_max: Option<u64>,
         /// `--cpus`: CPU cap in cores, K8s semantics (1.5 = 1½ cores; uncapped if `None`).
         cpus: Option<f64>,
+        /// `--cpuset-cpus`: pin to specific CPUs (e.g. `"0-3"`, `"0,2,4"`). `None` → no pinning.
+        cpuset: Option<String>,
         /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
         tty: bool,
         /// `-p host:box` (repeatable): publish a box TCP port on a host port.
         ports: Vec<(u32, u16, u16)>,
-        /// `--restart`: restart a detached box on non-zero exit (on-failure policy).
-        restart: bool,
+        /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret to the box
+        /// as `/run/secrets/NAME` (mode 0400) without it touching the image or the workload env.
+        secrets: Vec<String>,
+        /// `--ssh PORT`: run an in-box sshd, published on host `PORT` (→ box `:22`).
+        ssh_port: Option<u16>,
+        /// `--ssh-key FILE`: authorize this public key instead of generating a throwaway keypair.
+        ssh_key: Option<String>,
+        /// `--hostname NAME`: the box's UTS hostname (default: the box name).
+        hostname: Option<String>,
+        /// `--tun`: expose `/dev/net/tun` in the box (WireGuard / userspace VPN).
+        tun: bool,
+        /// `--pids-limit N`: cap the box's process/thread count (`pids.max`) — fork-bomb containment.
+        pids_limit: Option<u64>,
+        /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
+        tmpfs: Vec<String>,
+        /// `--user UID[:GID]` / `-u`: drop to this uid/gid inside the box before the command runs.
+        run_as: Option<String>,
+        /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
+        cap_add: Vec<String>,
+        /// `--cap-drop CAP` (repeatable): drop an extra capability (or `ALL`).
+        cap_drop: Vec<String>,
+        /// `--restart [policy]`: restart policy for a detached box (see `commands::RestartPolicy`).
+        restart: commands::RestartPolicy,
         /// `--health-cmd <cmd>`: shell command run periodically in the box (exit 0 = healthy).
         health_cmd: Option<String>,
         /// `--health-interval <sec>`: seconds between health checks (default 30).
         health_interval: u64,
+        /// `--health-retries <n>`: consecutive failures before a box is marked unhealthy (default 3).
+        health_retries: u32,
+        /// `--health-start-period <sec>`: initial grace where a failing check keeps "starting" (0).
+        health_start_period: u64,
+        /// `--health-timeout <sec>`: kill a single check that runs longer than this (0 = no timeout).
+        health_timeout: u64,
+        /// `--health-action <restart|stop|none>`: what to do when a box turns unhealthy.
+        health_action: Option<String>,
+        /// `--env-file <file>` (repeatable): read `K=V` lines from a file into the box's environment.
+        env_file: Vec<String>,
+        /// `--timeout <sec>`: stop the box automatically after this many seconds (0 = no timeout).
+        timeout: u64,
+        /// `--nice <n>`: scheduling niceness (-20..19) for the box workload.
+        nice: Option<i64>,
+        /// `--io-weight <n>`: cgroup v2 `io.weight` (1..10000) — relative I/O priority.
+        io_weight: Option<u64>,
+        /// `--config <path>`: a specific `kern.toml` for this invocation (else the default / `KERN_CONFIG`).
+        config: Option<String>,
+        /// `--show-config`: print the resolved box configuration and exit (no run).
+        show_config: bool,
+        /// `--quiet` / `-q`: suppress the foreground status panel.
+        quiet: bool,
+        /// `--verbose`: expand the one-line summary into the full isolation posture panel.
+        verbose: bool,
+        /// Resource-profile tokens (`vcpu:name` …) given before the command; applied to the box's
+        /// caps (see `kern.toml`). Empty when none.
+        profiles: Vec<String>,
     },
-    /// `kern run [--memory M] [--cpus N] [--] <cmd...>`: run a command under cgroup CPU/memory
-    /// caps WITHOUT a full sandbox — the resource-governor verb (composes with `box`'s isolation).
+    /// `kern run [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--] <cmd...>`:
+    /// run a command under cgroup CPU/memory caps WITHOUT a full sandbox — the resource-governor
+    /// verb (composes with `box`'s isolation). Takes the same resource flags as `kern box`.
     Run {
         command: Vec<String>,
         memory: Option<u64>,
+        memory_swap_max: Option<u64>,
         cpus: Option<f64>,
+        cpuset: Option<String>,
+        /// `--config <path>`: a specific `kern.toml` for the profile tokens (parity with `box`).
+        config: Option<String>,
     },
     /// `kern exec <name> [-it] [--env K=V] [--workdir <dir>] [-- cmd...]`: run a command in a box.
     Exec {
@@ -81,11 +148,46 @@ pub enum Command {
         names: Vec<String>,
         all: bool,
     },
+    /// `kern pause <name>... | --all` / `kern unpause …`: freeze / thaw running box(es).
+    Pause {
+        names: Vec<String>,
+        all: bool,
+        freeze: bool,
+    },
+    /// `kern attach <name>`: stream a detached box's output live (Ctrl-C detaches).
+    Attach {
+        name: String,
+    },
+    /// `kern cp <src> <dst>`: copy a file between the host and a box (one side is `<box>:<path>`).
+    Cp {
+        src: String,
+        dst: String,
+    },
     /// `kern pull <image> [--dest <dir>]`: download an OCI image into a rootfs.
     Pull {
         image: String,
         dest: Option<String>,
     },
+    /// `kern build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image
+    /// from a Dockerfile subset.
+    Build {
+        tag: Option<String>,
+        file: Option<String>,
+        context: String,
+        build_args: Vec<String>,
+        quiet: bool,
+    },
+    /// `kern pod create <name> [--no-outbound]` / `pod ls` / `pod rm <name>`: shared-network pods.
+    PodCreate {
+        name: String,
+        outbound: bool,
+    },
+    PodList,
+    PodRemove {
+        names: Vec<String>,
+    },
+    /// Hidden: the pod namespace holder process (spawned by `pod create`, not user-facing).
+    PodHolder,
     /// `kern search <query> [--json]`: search Docker Hub for images.
     Search {
         query: String,
@@ -99,34 +201,108 @@ pub enum Command {
     Ps {
         json: bool,
     },
-    /// `kern stats [--json]`: per-box memory + CPU.
+    /// `kern stats [--json] [name...]`: per-box memory + CPU (all boxes, or just the named ones).
     Stats {
         json: bool,
+        names: Vec<String>,
     },
     /// `kern logs <name>`: print a box's captured output.
     Logs {
         name: String,
     },
+    /// `kern inspect <name> [--json]`: full detail for one running box (identity + resources).
+    Inspect {
+        name: String,
+        json: bool,
+    },
+    /// `kern prune`: garbage-collect leftover logs/health/registry files of boxes no longer running.
+    Prune,
+    /// `kern gc [--images]`: `prune` + optionally reclaim the pulled-image cache.
+    Gc {
+        images: bool,
+    },
+    /// `kern doctor`: preflight — will boxes run here, and which optional features are available?
+    Doctor,
+    /// `kern info`: compact runtime + host snapshot.
+    Info,
+    /// `kern bench [--rootfs R] [-n N]`: time N box start→exit cycles.
+    Bench {
+        rootfs: Option<String>,
+        count: u32,
+    },
+    /// `kern recover`: clean up stale registry entries / orphaned scratch of dead boxes.
+    Recover,
+    /// `kern history [-n N]`: recent boxes (from their captured logs).
+    History {
+        count: usize,
+    },
+    /// `kern login [registry] [--username U]`: store registry credentials for private-image pulls.
+    Login {
+        registry: Option<String>,
+        username: Option<String>,
+    },
+    /// `kern logout [registry]`: remove stored registry credentials.
+    Logout {
+        registry: Option<String>,
+    },
+    /// `kern completions <bash|zsh|fish>`: print a shell-completion script.
+    Completions {
+        shell: String,
+    },
     /// `kern top`: live auto-refreshing box monitor.
     Top,
-    /// `kern compose <file>`: bring up a stack of boxes in dependency order.
+    /// `kern compose <file> [up|down] [--no-pod]`: bring up (or tear down) a stack of boxes in
+    /// dependency order. `up` auto-creates a pod so services reach each other by name (`--no-pod`
+    /// opts out); `down` stops the boxes and removes the pod.
     Compose {
         file: String,
+        down: bool,
+        no_pod: bool,
+    },
+    /// `kern config [edit|setup|probe|clear]`: manage `kern.toml` (default: list its profiles).
+    Config {
+        sub: String,
+        force: bool,
+    },
+    /// `kern config add <kind:name> [--flags]`: create/replace a resource profile non-interactively —
+    /// the CLI twin of `kern top`'s profile forms (same validation + surgical write).
+    ConfigAdd {
+        args: Vec<String>,
+    },
+    /// `kern config rm <kind:name>`: delete a resource profile.
+    ConfigRm {
+        args: Vec<String>,
+    },
+    /// `kern validate [path]`: parse a `kern.toml` and report OK or the offending line.
+    Validate {
+        path: Option<String>,
+    },
+    /// `kern examples`: print an example `kern.toml` to stdout.
+    Examples,
+    /// `kern volume <create|ls|rm|inspect|prune> …`: manage named volumes.
+    Volume {
+        args: Vec<String>,
     },
 }
 
+// Usage/rejection strings shared by the `box` and `run` resource-flag arms, so the two parsers
+// can never drift out of sync (they take the same flags with identical semantics).
+const USAGE_MEMORY: &str = "--memory <size> (e.g. 512m, 1g, 268435456)";
+const USAGE_CPUS: &str = "--cpus <n> (e.g. 1.5 = 1½ cores, 2)";
+const USAGE_CPUSET: &str = "--cpuset-cpus <list> (e.g. 0-3, 0,2,4)";
+const USAGE_SWAP_MAX: &str = "--memory-swap-max <size> (e.g. 1g, 512m)";
+const REJECT_MEMORY_SWAP: &str =
+    "--memory-swap is not supported (Docker's mem+swap total, ambiguous on cgroup v2); \
+     use --memory-swap-max <size> = the swap allowance (memory.swap.max)";
+
 /// Split argv into global options and a subcommand.
 pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
-    let mut opts = GlobalOpts::default();
-    let mut rest: Vec<&str> = Vec::new();
-    for a in args {
-        match a.as_str() {
-            "--no-gpu" => opts.no_gpu = true,
-            other => rest.push(other),
-        }
-    }
+    let opts = GlobalOpts;
+    let rest: Vec<&str> = args.iter().map(String::as_str).collect();
     let cmd = match rest.first().copied() {
-        None | Some("--help" | "-h" | "help") => Command::Help,
+        // Bare `kern` → the short banner; `--help`/`-h`/`help` → the full command reference.
+        None => Command::Banner,
+        Some("--help" | "-h" | "help") => Command::Help,
         Some("--version" | "-V" | "version") => Command::Version,
         // `box`: `--plan` previews; `--rootfs <dir>`/`--image <ref>` [-d] [-- cmd] runs it.
         Some("box") => parse_box(&rest)?,
@@ -140,14 +316,21 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             },
             None => return Err(Error::Usage("search <query> [--json]")),
         },
+        // `pod create <name> [-p …]` / `pod ls` / `pod rm <name>…`: shared-network pods.
+        Some("pod") => parse_pod(&rest)?,
+        // Hidden: the pod namespace holder (spawned by `pod create`).
+        Some("__pod-holder") => Command::PodHolder,
+        // `build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image.
+        Some("build") => parse_build(&rest)?,
         // `pull <image> [--dest <dir>]`: download an OCI image.
         Some("pull") => parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?,
         // `images`: list pulled (cached) images.
         Some("images") => Command::Images {
             json: rest.contains(&"--json"),
         },
-        // `stop <name>`: stop running box(es).
-        Some("stop") => {
+        // `stop <name>` / `kill <name>`: stop running box(es). kern's `stop` already SIGKILLs the
+        // box's process group, so `kill` is a Docker-parity alias. `killall` = `stop --all`.
+        Some("stop" | "kill") => {
             let all = rest.iter().any(|a| *a == "--all" || *a == "-a");
             let names: Vec<String> = rest
                 .iter()
@@ -160,6 +343,54 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
             Command::Stop { names, all }
         }
+        Some("killall") => Command::Stop {
+            names: Vec::new(),
+            all: true,
+        },
+        // `pause`/`unpause` (aka `freeze`/`unfreeze`): freeze/thaw box(es) via the cgroup freezer.
+        Some(v @ ("pause" | "freeze" | "unpause" | "unfreeze" | "resume")) => {
+            let freeze = matches!(v, "pause" | "freeze");
+            let all = rest.iter().any(|a| *a == "--all" || *a == "-a");
+            let names: Vec<String> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if !all && names.is_empty() {
+                return Err(Error::Usage(
+                    "pause <name>... | pause --all (also: unpause)",
+                ));
+            }
+            Command::Pause { names, all, freeze }
+        }
+        // `attach <name>`: follow a detached box's output live.
+        Some("attach") => match rest.get(1) {
+            Some(n) if !n.starts_with('-') => Command::Attach {
+                name: (*n).to_string(),
+            },
+            _ => return Err(Error::Usage("attach <name>")),
+        },
+        // `cp <src> <dst>`: copy a file host<->box (one side is `<box>:<path>`).
+        Some("cp") => {
+            let pos: Vec<&str> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .copied()
+                .collect();
+            match pos.as_slice() {
+                [src, dst] => Command::Cp {
+                    src: (*src).to_string(),
+                    dst: (*dst).to_string(),
+                },
+                _ => {
+                    return Err(Error::Usage(
+                        "cp <box>:<src> <hostdst>  |  cp <hostsrc> <box>:<dst>",
+                    ))
+                }
+            }
+        }
         // `ps`: list running boxes.
         Some("ps") => Command::Ps {
             json: rest.contains(&"--json"),
@@ -167,6 +398,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `stats`: per-box memory + CPU.
         Some("stats") => Command::Stats {
             json: rest.contains(&"--json"),
+            names: rest[1..]
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect(),
         },
         // `logs <name>`: a box's captured output.
         Some("logs") => match rest.get(1) {
@@ -175,14 +411,119 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             },
             _ => return Err(Error::Usage("logs <name>")),
         },
+        // `inspect <name> [--json]`: full detail for one box.
+        Some("inspect") => match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
+            Some(n) => Command::Inspect {
+                name: (*n).to_string(),
+                json: rest.contains(&"--json"),
+            },
+            None => return Err(Error::Usage("inspect <name> [--json]")),
+        },
+        // `prune`: GC leftover logs/health/registry files of boxes no longer running.
+        Some("prune") => Command::Prune,
+        // `gc [--images]`: prune dead-box leftovers (+ the image cache with `--images`).
+        Some("gc") => Command::Gc {
+            images: rest.contains(&"--images"),
+        },
+        // `doctor`: environment preflight. `info`: runtime snapshot.
+        Some("doctor") => Command::Doctor,
+        Some("info") => Command::Info,
+        // `probe`: a top-level alias for `config probe` — the short form a newcomer reaches for first.
+        Some("probe") => Command::Config {
+            sub: "probe".into(),
+            force: false,
+        },
+        // `bench [--rootfs R] [-n N]`: measure box start→exit latency.
+        Some("bench") => Command::Bench {
+            rootfs: flag_value(&rest, "--rootfs"),
+            count: flag_value(&rest, "-n")
+                .or_else(|| flag_value(&rest, "--count"))
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(20),
+        },
+        Some("recover") => Command::Recover,
+        Some("history") => Command::History {
+            count: flag_value(&rest, "-n")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(20),
+        },
+        // `login [registry] [--username U]` / `logout [registry]`: registry credentials.
+        Some("login") => {
+            let username = flag_value(&rest, "--username").or_else(|| flag_value(&rest, "-u"));
+            // The positional registry is the first bare token that ISN'T the value of `--username`/`-u`.
+            let registry = positional_after_flags(&rest, &["--username", "-u"]);
+            Command::Login { registry, username }
+        }
+        Some("logout") => Command::Logout {
+            registry: positional_after_flags(&rest, &[]),
+        },
+        // `completions <bash|zsh|fish>`: print a shell-completion script.
+        Some("completions") => match rest.get(1) {
+            Some(s) if !s.starts_with('-') => Command::Completions {
+                shell: (*s).to_string(),
+            },
+            _ => return Err(Error::Usage("completions <bash|zsh|fish>")),
+        },
         // `top`: live box monitor.
         Some("top") => Command::Top,
-        // `compose <file>`: bring up a stack.
-        Some("compose") => match rest.get(1) {
-            Some(f) if !f.starts_with('-') => Command::Compose {
-                file: (*f).to_string(),
-            },
-            _ => return Err(Error::Usage("compose <file>")),
+        // `compose <file> [up|down] [--no-pod]`: bring up / tear down a stack.
+        Some("compose") => {
+            let mut file: Option<String> = None;
+            let mut down = false;
+            let mut no_pod = false;
+            for a in rest.iter().skip(1) {
+                match *a {
+                    "up" => {}
+                    "down" | "stop" => down = true,
+                    "--no-pod" => no_pod = true,
+                    f if !f.starts_with('-') && file.is_none() => file = Some(f.to_string()),
+                    _ => return Err(Error::Usage("compose <file> [up|down] [--no-pod]")),
+                }
+            }
+            Command::Compose {
+                file: file.ok_or(Error::Usage("compose <file> [up|down] [--no-pod]"))?,
+                down,
+                no_pod,
+            }
+        }
+        // `config`: list resource profiles from kern.toml.
+        Some("config" | "cfg") => {
+            let sub = rest
+                .get(1)
+                .filter(|s| !s.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .unwrap_or_else(|| "list".into());
+            match sub.as_str() {
+                "list" | "edit" | "setup" | "probe" | "clear" => Command::Config {
+                    force: rest
+                        .iter()
+                        .any(|a| *a == "--force" || *a == "--yes" || *a == "-y"),
+                    sub,
+                },
+                "add" => Command::ConfigAdd {
+                    args: rest.iter().skip(2).map(|s| (*s).to_string()).collect(),
+                },
+                "rm" | "remove" | "delete" => Command::ConfigRm {
+                    args: rest.iter().skip(2).map(|s| (*s).to_string()).collect(),
+                },
+                _ => return Err(Error::Usage("config [list|add|rm|edit|setup|probe|clear]")),
+            }
+        }
+        // `validate [path]`: parse a kern.toml and report OK or the offending line.
+        Some("validate") => Command::Validate {
+            path: rest
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string()),
+        },
+        // `examples`: print an example kern.toml.
+        Some("examples" | "example") => Command::Examples,
+        // `volume <sub> …`: manage named volumes.
+        Some("volume" | "vol") => Command::Volume {
+            args: rest.iter().skip(1).map(|s| (*s).to_string()).collect(),
         },
         // `run [--memory M] [--cpus N] [--] <cmd...>`: cap a command without a full sandbox.
         Some("run") => parse_run(&rest)?,
@@ -203,19 +544,47 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut detached = false;
     let mut read_only = false;
     let mut share_net = false;
+    let mut pod: Option<String> = None;
     let mut uid_range = false;
     let mut bind_rootfs = false;
+    let mut overlay_lower: Option<String> = None;
+    let mut overlay_upper: Option<String> = None;
     let mut tty = false;
-    let mut restart = false;
+    let mut restart = commands::RestartPolicy::No;
     let mut health_cmd: Option<String> = None;
     let mut health_interval = 30u64;
+    let mut health_retries = 3u32;
+    let mut health_start_period = 0u64;
+    let mut health_timeout = 0u64;
+    let mut health_action: Option<String> = None;
+    let mut env_file: Vec<String> = Vec::new();
+    let mut timeout = 0u64;
+    let mut nice: Option<i64> = None;
+    let mut io_weight: Option<u64> = None;
+    let mut config: Option<String> = None;
+    let mut show_config = false;
+    let mut quiet = false;
+    let mut verbose = false;
     let mut ports: Vec<(u32, u16, u16)> = Vec::new();
+    let mut secrets: Vec<String> = Vec::new();
+    let mut ssh_port: Option<u16> = None;
+    let mut ssh_key: Option<String> = None;
+    let mut hostname: Option<String> = None;
+    let mut tun = false;
+    let mut pids_limit: Option<u64> = None;
+    let mut tmpfs: Vec<String> = Vec::new();
+    let mut run_as: Option<String> = None;
+    let mut cap_add: Vec<String> = Vec::new();
+    let mut cap_drop: Vec<String> = Vec::new();
     let mut memory: Option<u64> = None;
+    let mut memory_swap_max: Option<u64> = None;
     let mut cpus: Option<f64> = None;
+    let mut cpuset: Option<String> = None;
     let mut volumes: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
+    let mut profiles: Vec<String> = Vec::new();
     let mut after_dd = false;
     let mut i = 1; // rest[0] == "box"
     while i < rest.len() {
@@ -229,10 +598,119 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "-d" | "--detach" => detached = true,
                 "--read-only" | "--ro" => read_only = true,
                 "--net" => share_net = true,
+                "--pod" => {
+                    i += 1;
+                    pod = Some(rest.get(i).ok_or(Error::Usage("--pod <name>"))?.to_string());
+                }
+                // `--network host|none`: the Docker-style spelling. `host` shares the host network
+                // (= `--net`); `none` is the default isolated loopback-only namespace, made explicit.
+                "--network" => {
+                    i += 1;
+                    match rest.get(i).copied() {
+                        Some("host") => share_net = true,
+                        Some("none") => share_net = false,
+                        _ => {
+                            return Err(Error::Usage(
+                                "--network <host|none> (host = share host net; none = isolated)",
+                            ))
+                        }
+                    }
+                }
+                // `--tun`: expose /dev/net/tun so a WireGuard / userspace-VPN workload can create a
+                // tunnel inside the box's own network namespace.
+                "--tun" => tun = true,
+                // `--hostname NAME`: override the box's UTS hostname (default: the box name).
+                "--hostname" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => hostname = Some((*v).to_string()),
+                        None => return Err(Error::Usage("--hostname <name>")),
+                    }
+                }
+                // `--pids-limit N`: cap the box's task count (`pids.max`) — fork-bomb containment.
+                "--pids-limit" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|n| *n >= 1)
+                    {
+                        Some(n) => pids_limit = Some(n),
+                        None => return Err(Error::Usage("--pids-limit <N> (>= 1, e.g. 256)")),
+                    }
+                }
+                // `--tmpfs PATH[:size]`: mount a fresh tmpfs inside the box (repeatable).
+                "--tmpfs" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => tmpfs.push((*v).to_string()),
+                        None => return Err(Error::Usage("--tmpfs /path[:size] (e.g. /tmp:64m)")),
+                    }
+                }
+                // `--user UID[:GID]` / `-u`: run the box command as this uid/gid.
+                "--user" | "-u" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => run_as = Some((*v).to_string()),
+                        None => {
+                            return Err(Error::Usage("--user <uid[:gid]> (e.g. 1000 or 1000:1000)"))
+                        }
+                    }
+                }
+                // `--cap-add CAP` / `--cap-drop CAP` (repeatable; CAP name or ALL).
+                "--cap-add" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => cap_add.push((*v).to_string()),
+                        None => {
+                            return Err(Error::Usage("--cap-add <CAP> (e.g. NET_ADMIN, or ALL)"))
+                        }
+                    }
+                }
+                "--cap-drop" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => cap_drop.push((*v).to_string()),
+                        None => {
+                            return Err(Error::Usage("--cap-drop <CAP> (e.g. NET_RAW, or ALL)"))
+                        }
+                    }
+                }
                 "--uid-range" => uid_range = true,
                 "--bind-rootfs" => bind_rootfs = true,
-                // `--restart`: restart a detached box if it exits non-zero (on-failure policy).
-                "--restart" => restart = true,
+                // Internal build-layer flags (see the Command::BoxRun docs) — take a value.
+                "--overlay-lower" => {
+                    i += 1;
+                    overlay_lower = Some(
+                        rest.get(i)
+                            .ok_or(Error::Usage("--overlay-lower <dir>"))?
+                            .to_string(),
+                    );
+                }
+                "--overlay-upper" => {
+                    i += 1;
+                    overlay_upper = Some(
+                        rest.get(i)
+                            .ok_or(Error::Usage("--overlay-upper <dir>"))?
+                            .to_string(),
+                    );
+                }
+                // `--restart [policy]`: no | on-failure | always | unless-stopped. `always`/
+                // `unless-stopped` persist via a systemd user unit (survive reboot); `on-failure`
+                // uses kern's in-process supervisor. A bare `--restart` = on-failure (back-compat) —
+                // an unrecognized next token is left for the parser, not swallowed.
+                "--restart" => {
+                    match rest
+                        .get(i + 1)
+                        .and_then(|v| commands::RestartPolicy::parse(v))
+                    {
+                        Some(p) => {
+                            restart = p;
+                            i += 1;
+                        }
+                        None => restart = commands::RestartPolicy::OnFailure,
+                    }
+                }
                 // `--health-cmd <cmd>`: shell command run periodically in the box; exit 0 = healthy.
                 "--health-cmd" => {
                     i += 1;
@@ -253,6 +731,97 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => return Err(Error::Usage("--health-interval <seconds> (e.g. 10)")),
                     }
                 }
+                // `--health-retries <n>`: consecutive failures before "unhealthy" (default 3).
+                "--health-retries" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|n| *n >= 1)
+                    {
+                        Some(n) => health_retries = n,
+                        None => return Err(Error::Usage("--health-retries <n> (>= 1, e.g. 3)")),
+                    }
+                }
+                // `--health-start-period <sec>`: grace period where failures keep "starting".
+                "--health-start-period" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                        Some(s) => health_start_period = s,
+                        None => {
+                            return Err(Error::Usage("--health-start-period <seconds> (e.g. 5)"))
+                        }
+                    }
+                }
+                // `--health-timeout <sec>`: kill a single check that exceeds this (0 = no timeout).
+                "--health-timeout" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                        Some(s) => health_timeout = s,
+                        None => return Err(Error::Usage("--health-timeout <seconds> (e.g. 5)")),
+                    }
+                }
+                // `--health-action <restart|stop|none>`: action when the box turns unhealthy.
+                "--health-action" => {
+                    i += 1;
+                    match rest.get(i).copied() {
+                        Some(a @ ("restart" | "stop" | "none")) => {
+                            health_action = Some(a.to_string())
+                        }
+                        _ => return Err(Error::Usage("--health-action <restart|stop|none>")),
+                    }
+                }
+                // `--env-file <file>` (repeatable): read K=V lines into the environment.
+                "--env-file" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => env_file.push((*v).to_string()),
+                        None => return Err(Error::Usage("--env-file <file>")),
+                    }
+                }
+                // `--timeout <sec>`: auto-stop the box after N seconds.
+                "--timeout" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                        Some(s) => timeout = s,
+                        None => return Err(Error::Usage("--timeout <seconds> (e.g. 60)")),
+                    }
+                }
+                // `--nice <n>`: scheduling niceness (-20..19).
+                "--nice" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .filter(|n| (-20..=19).contains(n))
+                    {
+                        Some(n) => nice = Some(n),
+                        None => return Err(Error::Usage("--nice <n> (-20..19)")),
+                    }
+                }
+                // `--io-weight <n>`: cgroup io.weight (1..10000).
+                "--io-weight" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|n| (1..=10000).contains(n))
+                    {
+                        Some(n) => io_weight = Some(n),
+                        None => return Err(Error::Usage("--io-weight <n> (1..10000)")),
+                    }
+                }
+                // `--config <path>`: a specific kern.toml for this invocation.
+                "--config" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => config = Some((*v).to_string()),
+                        None => return Err(Error::Usage("--config <path-to-kern.toml>")),
+                    }
+                }
+                "--show-config" => show_config = true,
+                "-q" | "--quiet" => quiet = true,
+                "--verbose" => verbose = true,
                 // `-it`/`-ti`/`-t`/`-i`: allocate an interactive PTY for the box (shells, REPLs).
                 "-it" | "-ti" | "-t" | "-i" | "--tty" | "--interactive" => tty = true,
                 "--rootfs" => {
@@ -286,13 +855,40 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => return Err(Error::Usage("-p <hostport>:<boxport> (e.g. 8080:80)")),
                     }
                 }
+                "--secret" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => secrets.push((*v).to_string()),
+                        None => {
+                            return Err(Error::Usage(
+                                "--secret SRC[:NAME] | NAME=value | NAME=- (from stdin)",
+                            ))
+                        }
+                    }
+                }
+                "--ssh" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<u16>().ok())
+                        .filter(|p| *p > 0)
+                    {
+                        Some(p) => ssh_port = Some(p),
+                        None => return Err(Error::Usage("--ssh <host-port> (1-65535, e.g. 2222)")),
+                    }
+                }
+                "--ssh-key" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => ssh_key = Some((*v).to_string()),
+                        None => return Err(Error::Usage("--ssh-key <public-key-file>")),
+                    }
+                }
                 "-m" | "--memory" => {
                     i += 1;
                     match rest.get(i).and_then(|v| parse_size(v)) {
                         Some(b) => memory = Some(b),
-                        None => {
-                            return Err(Error::Usage("--memory <size> (e.g. 512m, 1g, 268435456)"))
-                        }
+                        None => return Err(Error::Usage(USAGE_MEMORY)),
                     }
                 }
                 "--cpus" => {
@@ -303,19 +899,50 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         .filter(|c| *c > 0.0 && c.is_finite())
                     {
                         Some(c) => cpus = Some(c),
-                        None => return Err(Error::Usage("--cpus <n> (e.g. 1.5 = 1½ cores, 2)")),
+                        None => return Err(Error::Usage(USAGE_CPUS)),
                     }
                 }
+                "--cpuset-cpus" => {
+                    i += 1;
+                    match rest.get(i).filter(|v| is_cpu_list(v)) {
+                        Some(v) => cpuset = Some((*v).to_string()),
+                        None => return Err(Error::Usage(USAGE_CPUSET)),
+                    }
+                }
+                "--memory-swap-max" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| parse_size_z(v)) {
+                        Some(b) => memory_swap_max = Some(b),
+                        None => return Err(Error::Usage(USAGE_SWAP_MAX)),
+                    }
+                }
+                // Reject Docker's `--memory-swap` explicitly (don't alias it): on pure cgroup v2 the
+                // swap limit is a SEPARATE knob (`memory.swap.max`), not Docker's combined mem+swap
+                // total — aliasing would silently mean something different. Point to the honest flag.
+                "--memory-swap" => return Err(Error::Usage(REJECT_MEMORY_SWAP)),
                 // Reject an unknown flag rather than silently ignoring it: a typo'd `--read-only`
                 // must NOT quietly run a writable box. (Flags after `--` are part of the command.)
                 s if s.starts_with('-') => {
                     return Err(Error::Usage("box: unknown flag (see --help)"))
                 }
+                // A `vcpu:`/`vgpio:`/`vdisk:`/`vgpu:` token is a resource profile, not the box name.
+                s if crate::config::classify(s).is_some() => profiles.push(s.to_string()),
                 s if name.is_none() => name = Some(s),
                 _ => {}
             }
         }
         i += 1;
+    }
+    // Two `-p` mappings can't share the same host address+port (one host port → one box port). Catch
+    // this impossible config here rather than let the second forwarder silently fail to bind.
+    for a in 0..ports.len() {
+        for b in (a + 1)..ports.len() {
+            if ports[a].0 == ports[b].0 && ports[a].1 == ports[b].1 {
+                return Err(Error::Usage(
+                    "duplicate -p host port (one host port maps to a single box port)",
+                ));
+            }
+        }
     }
     // Always route to the real command; missing name → BoxName rejects it, missing rootfs/image
     // → box_run reports it. `--plan` wins (non-destructive preview).
@@ -325,7 +952,11 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
         }
     } else {
         Command::BoxRun {
-            name: name.unwrap_or_default().to_string(),
+            // The name is optional (Docker-style): omit it and kern assigns `box-<pid>`, so a quick
+            // `kern box --image alpine -- sh` needs no invented name.
+            name: name
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("box-{}", std::process::id())),
             rootfs,
             image,
             command,
@@ -335,15 +966,43 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             env,
             workdir,
             share_net,
+            pod,
             uid_range,
             bind_rootfs,
+            overlay_lower,
+            overlay_upper,
             memory,
+            memory_swap_max,
             cpus,
+            cpuset,
             tty,
             ports,
+            secrets,
+            ssh_port,
+            ssh_key,
+            hostname,
+            tun,
+            pids_limit,
+            tmpfs,
+            run_as,
+            cap_add,
+            cap_drop,
             restart,
             health_cmd,
             health_interval,
+            health_retries,
+            health_start_period,
+            health_timeout,
+            health_action,
+            env_file,
+            timeout,
+            nice,
+            io_weight,
+            config,
+            show_config,
+            quiet,
+            verbose,
+            profiles,
         }
     };
     Ok(cmd)
@@ -354,7 +1013,10 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
 /// command is a usage error.
 fn parse_run(rest: &[&str]) -> Result<Command, Error> {
     let mut memory: Option<u64> = None;
+    let mut memory_swap_max: Option<u64> = None;
     let mut cpus: Option<f64> = None;
+    let mut cpuset: Option<String> = None;
+    let mut config: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
     let mut i = 1; // rest[0] == "run"
     while i < rest.len() {
@@ -363,13 +1025,28 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
                 command.extend(rest[i + 1..].iter().map(|s| (*s).to_string()));
                 break;
             }
+            "--config" => {
+                i += 1;
+                match rest.get(i) {
+                    Some(v) => config = Some((*v).to_string()),
+                    None => return Err(Error::Usage("--config <path/to/kern.toml>")),
+                }
+            }
             "-m" | "--memory" => {
                 i += 1;
                 match rest.get(i).and_then(|v| parse_size(v)) {
                     Some(b) => memory = Some(b),
-                    None => return Err(Error::Usage("--memory <size> (e.g. 512m, 1g)")),
+                    None => return Err(Error::Usage(USAGE_MEMORY)),
                 }
             }
+            "--memory-swap-max" => {
+                i += 1;
+                match rest.get(i).and_then(|v| parse_size_z(v)) {
+                    Some(b) => memory_swap_max = Some(b),
+                    None => return Err(Error::Usage(USAGE_SWAP_MAX)),
+                }
+            }
+            "--memory-swap" => return Err(Error::Usage(REJECT_MEMORY_SWAP)),
             "--cpus" => {
                 i += 1;
                 match rest
@@ -378,7 +1055,14 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
                     .filter(|c| *c > 0.0 && c.is_finite())
                 {
                     Some(c) => cpus = Some(c),
-                    None => return Err(Error::Usage("--cpus <n> (e.g. 1.5, 2)")),
+                    None => return Err(Error::Usage(USAGE_CPUS)),
+                }
+            }
+            "--cpuset-cpus" => {
+                i += 1;
+                match rest.get(i).filter(|v| is_cpu_list(v)) {
+                    Some(v) => cpuset = Some((*v).to_string()),
+                    None => return Err(Error::Usage(USAGE_CPUSET)),
                 }
             }
             s if s.starts_with('-') => {
@@ -395,13 +1079,28 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
         i += 1;
     }
     if command.is_empty() {
-        return Err(Error::Usage("run [--memory M] [--cpus N] [--] <cmd...>"));
+        return Err(Error::Usage(
+            "run [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--config F] [vcpu:PROFILE] [--] <cmd...>",
+        ));
     }
     Ok(Command::Run {
         command,
         memory,
+        memory_swap_max,
         cpus,
+        cpuset,
+        config,
     })
+}
+
+/// Like [`parse_size`] but accepts an explicit `0`. Used for `--memory-swap-max`, where `0` is a
+/// meaningful, valid value (zero swap allowance = swap off — the default) rather than a nonsense cap.
+fn parse_size_z(s: &str) -> Option<u64> {
+    if s.trim() == "0" {
+        Some(0)
+    } else {
+        parse_size(s)
+    }
 }
 
 /// Parse a memory size like `512m`, `1g`, `512mb`, or a bare `268435456` (= bytes) into bytes.
@@ -432,6 +1131,14 @@ fn parse_size(s: &str) -> Option<u64> {
         .ok()
         .and_then(|n| n.checked_mul(mult))
         .filter(|b| *b > 0)
+}
+
+/// A valid `--cpuset-cpus` list (`0-3`, `0,2,4`, `1-2,5`): the SAME rule the profile `cpus` field
+/// uses, so the flag and the profiles can't disagree. See [`crate::config::is_cpu_list`]. Validating
+/// at the parse boundary means a typo can't silently produce an *unpinned* box, and only digits/`,`/`-`
+/// survive the numeric parse — no arbitrary string reaches the kernel's `cpuset.cpus`.
+fn is_cpu_list(s: &str) -> bool {
+    crate::config::is_cpu_list(s)
 }
 
 /// Parse `exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]`. Missing name → usage error.
@@ -483,6 +1190,33 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
 }
 
 /// Parse `pull <image> [--dest <dir>]`. `None` if no image was given.
+/// Value following a `--flag` token in `rest` (e.g. `--username alice`), or `None`.
+fn flag_value(rest: &[&str], flag: &str) -> Option<String> {
+    rest.iter()
+        .position(|a| *a == flag)
+        .and_then(|i| rest.get(i + 1))
+        .map(|s| (*s).to_string())
+}
+
+/// The first bare positional token in `rest[1..]` that is neither an option nor the *value* consumed
+/// by one of `value_flags` (so `login --username alice` doesn't read `alice` as the registry).
+fn positional_after_flags(rest: &[&str], value_flags: &[&str]) -> Option<String> {
+    let mut i = 1; // rest[0] == the verb
+    while i < rest.len() {
+        let a = rest[i];
+        if value_flags.contains(&a) {
+            i += 2; // skip the flag and its value
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(a.to_string());
+    }
+    None
+}
+
 fn parse_pull(rest: &[&str]) -> Option<Command> {
     let mut image: Option<&str> = None;
     let mut dest: Option<String> = None;
@@ -505,13 +1239,95 @@ fn parse_pull(rest: &[&str]) -> Option<Command> {
     })
 }
 
+/// `kern pod create <name> [-p [ip:]host:pod]…` | `pod ls` | `pod rm <name>…`.
+fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
+    match rest.get(1).copied() {
+        Some("create" | "new" | "up") => {
+            let name = rest
+                .iter()
+                .skip(2)
+                .find(|a| !a.starts_with('-'))
+                .ok_or(Error::Usage("pod create <name> [--no-outbound]"))?;
+            Ok(Command::PodCreate {
+                name: name.to_string(),
+                outbound: !rest.contains(&"--no-outbound"),
+            })
+        }
+        Some("ls" | "list" | "ps") => Ok(Command::PodList),
+        Some("rm" | "remove" | "down") => {
+            let names: Vec<String> = rest
+                .iter()
+                .skip(2)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if names.is_empty() {
+                return Err(Error::Usage("pod rm <name>..."));
+            }
+            Ok(Command::PodRemove { names })
+        }
+        _ => Err(Error::Usage(
+            "pod create <name> [-p …] | pod ls | pod rm <name>",
+        )),
+    }
+}
+
+/// `kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [-q] [<context>]`.
+fn parse_build(rest: &[&str]) -> Result<Command, Error> {
+    let mut tag: Option<String> = None;
+    let mut file: Option<String> = None;
+    let mut context: Option<String> = None;
+    let mut build_args: Vec<String> = Vec::new();
+    let mut quiet = false;
+    let mut i = 1; // rest[0] == "build"
+    while i < rest.len() {
+        match rest[i] {
+            "-t" | "--tag" => {
+                i += 1;
+                tag = Some(
+                    rest.get(i)
+                        .ok_or(Error::Usage("-t <name[:tag]>"))?
+                        .to_string(),
+                );
+            }
+            "-f" | "--file" => {
+                i += 1;
+                file = Some(
+                    rest.get(i)
+                        .ok_or(Error::Usage("-f <Dockerfile>"))?
+                        .to_string(),
+                );
+            }
+            "--build-arg" => {
+                i += 1;
+                build_args.push(
+                    rest.get(i)
+                        .ok_or(Error::Usage("--build-arg K=V"))?
+                        .to_string(),
+                );
+            }
+            "-q" | "--quiet" => quiet = true,
+            s if s.starts_with('-') => return Err(Error::Usage("unknown build flag")),
+            s if context.is_none() => context = Some(s.to_string()),
+            _ => return Err(Error::Usage("build takes a single context directory")),
+        }
+        i += 1;
+    }
+    Ok(Command::Build {
+        tag,
+        file,
+        context: context.unwrap_or_else(|| ".".to_string()),
+        build_args,
+        quiet,
+    })
+}
+
 /// Parse and run.
 pub fn run(args: &[String]) -> Result<(), Error> {
-    // `--no-gpu` is parsed into `opts` (the runtime is GPU-free, so it's a forward-compat no-op for
-    // now); no dispatch arm consumes it yet.
     let (_opts, cmd) = parse(args)?;
     match cmd {
         Command::Version => commands::version(),
+        Command::Banner => commands::banner(),
         Command::Help => commands::help(),
         Command::BoxPlan { name } => commands::box_plan(&name),
         Command::BoxRun {
@@ -525,15 +1341,43 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env,
             workdir,
             share_net,
+            pod,
             uid_range,
             bind_rootfs,
+            overlay_lower,
+            overlay_upper,
             memory,
+            memory_swap_max,
             cpus,
+            cpuset,
             tty,
             ports,
+            secrets,
+            ssh_port,
+            ssh_key,
+            hostname,
+            tun,
+            pids_limit,
+            tmpfs,
+            run_as,
+            cap_add,
+            cap_drop,
             restart,
             health_cmd,
             health_interval,
+            health_retries,
+            health_start_period,
+            health_timeout,
+            health_action,
+            env_file,
+            timeout,
+            nice,
+            io_weight,
+            config,
+            show_config,
+            quiet,
+            verbose,
+            profiles,
         } => commands::box_run(commands::BoxRunArgs {
             name: &name,
             rootfs: rootfs.as_deref(),
@@ -545,21 +1389,59 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env: &env,
             workdir: workdir.as_deref(),
             share_net,
+            pod: pod.as_deref(),
             uid_range,
             bind_rootfs,
+            overlay_lower: overlay_lower.as_deref(),
+            overlay_upper: overlay_upper.as_deref(),
             memory,
+            memory_swap_max,
             cpus,
+            cpuset: cpuset.as_deref(),
             tty,
             ports: &ports,
+            secrets: &secrets,
+            ssh_port,
+            ssh_key: ssh_key.as_deref(),
+            hostname: hostname.as_deref(),
+            tun,
+            pids_limit,
+            tmpfs: &tmpfs,
+            run_as: run_as.as_deref(),
+            cap_add: &cap_add,
+            cap_drop: &cap_drop,
             restart,
             health_cmd: health_cmd.as_deref(),
             health_interval,
+            health_retries,
+            health_start_period,
+            health_timeout,
+            health_action: health_action.as_deref(),
+            env_file: &env_file,
+            timeout,
+            nice,
+            io_weight,
+            config: config.as_deref(),
+            show_config,
+            quiet,
+            verbose,
+            profiles: &profiles,
         }),
         Command::Run {
             command,
             memory,
+            memory_swap_max,
             cpus,
-        } => commands::run(&command, memory, cpus),
+            cpuset,
+            config,
+        } => commands::run(
+            &command,
+            memory,
+            memory_swap_max,
+            cpus,
+            cpuset.as_deref(),
+            config.as_deref(),
+        ),
         Command::Exec {
             name,
             command,
@@ -567,15 +1449,54 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             workdir,
             tty,
         } => commands::exec(&name, &command, &env, workdir.as_deref(), tty),
+        Command::Build {
+            tag,
+            file,
+            context,
+            build_args,
+            quiet,
+        } => commands::build(commands::BuildArgs {
+            tag: tag.as_deref(),
+            file: file.as_deref(),
+            context: &context,
+            build_args: &build_args,
+            quiet,
+        }),
+        Command::PodCreate { name, outbound } => crate::pod::create(&name, outbound),
+        Command::PodList => crate::pod::list(),
+        Command::PodRemove { names } => crate::pod::remove(&names),
+        Command::PodHolder => crate::pod::run_holder(),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
         Command::Pull { image, dest } => commands::pull(&image, dest.as_deref()),
         Command::Stop { names, all } => commands::stop(&names, all),
+        Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
+        Command::Attach { name } => commands::attach(&name),
+        Command::Cp { src, dst } => crate::boxcp::cp(&src, &dst),
         Command::Ps { json } => commands::ps(json),
-        Command::Stats { json } => commands::stats(json),
+        Command::Stats { json, names } => commands::stats(json, &names),
         Command::Logs { name } => commands::logs(&name),
+        Command::Inspect { name, json } => commands::inspect(&name, json),
+        Command::Prune => commands::prune(),
+        Command::Gc { images } => commands::gc(images),
+        Command::Doctor => crate::doctor::doctor(),
+        Command::Info => crate::doctor::info(),
+        Command::Bench { rootfs, count } => commands::bench(rootfs.as_deref(), count),
+        Command::Recover => commands::recover(),
+        Command::History { count } => commands::history(count),
+        Command::Login { registry, username } => {
+            crate::auth::login(registry.as_deref(), username.as_deref())
+        }
+        Command::Logout { registry } => crate::auth::logout(registry.as_deref()),
+        Command::Completions { shell } => crate::completions::completions(&shell),
         Command::Top => commands::top(),
-        Command::Compose { file } => commands::compose(&file),
+        Command::Compose { file, down, no_pod } => commands::compose(&file, down, no_pod),
+        Command::Config { sub, force } => commands::config_cmd(&sub, force),
+        Command::ConfigAdd { args } => commands::config_add(&args),
+        Command::ConfigRm { args } => commands::config_rm(&args),
+        Command::Validate { path } => commands::validate(path.as_deref()),
+        Command::Examples => commands::examples(),
+        Command::Volume { args } => crate::volume::run(&args),
     }
 }
 
@@ -584,17 +1505,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_gpu_flag_is_parsed_and_default_off() {
-        let (o, _) = parse(&["box".into()]).unwrap();
-        assert!(!o.no_gpu, "GPU interposition is off by default");
-        let (o, _) = parse(&["--no-gpu".into(), "box".into()]).unwrap();
-        assert!(o.no_gpu);
-    }
-
-    #[test]
-    fn version_and_help_resolve() {
+    fn version_help_and_banner_resolve() {
         assert_eq!(parse(&["--version".into()]).unwrap().1, Command::Version);
-        assert_eq!(parse(&[]).unwrap().1, Command::Help);
+        assert_eq!(parse(&["--help".into()]).unwrap().1, Command::Help);
+        assert_eq!(parse(&["help".into()]).unwrap().1, Command::Help);
+        // Bare `kern` → the short banner, not the full help.
+        assert_eq!(parse(&[]).unwrap().1, Command::Banner);
     }
 
     #[test]
@@ -622,6 +1538,11 @@ mod tests {
         assert_eq!(parse_size("0"), None); // zero is not a useful cap
         assert_eq!(parse_size("pippo"), None);
         assert_eq!(parse_size(""), None);
+        // `--memory-swap-max` accepts an explicit 0 (swap off), unlike `--memory`.
+        assert_eq!(parse_size_z("0"), Some(0));
+        assert_eq!(parse_size_z(" 0 "), Some(0));
+        assert_eq!(parse_size_z("512m"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_size_z("bad"), None);
     }
 
     #[test]
@@ -677,6 +1598,28 @@ mod tests {
                 "-p {bad}"
             );
         }
+        // The same host address+port can't map to two box ports (would silently fail to bind twice).
+        assert!(matches!(
+            parse(&[
+                "box".into(),
+                "x".into(),
+                "-p".into(),
+                "19000:80".into(),
+                "-p".into(),
+                "19000:81".into(),
+            ]),
+            Err(Error::Usage(_))
+        ));
+        // …but the same port on DIFFERENT bind addresses is fine.
+        assert!(parse(&[
+            "box".into(),
+            "x".into(),
+            "-p".into(),
+            "127.0.0.1:19000:80".into(),
+            "-p".into(),
+            "0.0.0.0:19000:81".into(),
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -707,6 +1650,7 @@ mod tests {
             command,
             memory,
             cpus,
+            ..
         } = cmd
         else {
             panic!("expected Run")
@@ -727,6 +1671,135 @@ mod tests {
         ));
         // Empty command → usage error.
         assert!(matches!(parse(&["run".into()]), Err(Error::Usage(_))));
+    }
+
+    // The 0.5 CPU/RAM knob set is frozen: `--cpuset-cpus` (pinning) and `--memory-swap-max` (swap
+    // allowance) parse on both `run` and `box`, and Docker's `--memory-swap` (mem+swap total,
+    // ambiguous on pure v2) is REJECTED, not silently aliased. These assert the surface stays put.
+    #[test]
+    fn cpu_ram_flag_freeze() {
+        // `run --cpuset-cpus --memory-swap-max` populate the Run fields.
+        let (_, cmd) = parse(&[
+            "run".into(),
+            "--cpuset-cpus".into(),
+            "0-3".into(),
+            "--memory-swap-max".into(),
+            "1g".into(),
+            "true".into(),
+        ])
+        .unwrap();
+        let Command::Run {
+            cpuset,
+            memory_swap_max,
+            ..
+        } = cmd
+        else {
+            panic!("expected Run")
+        };
+        assert_eq!(cpuset.as_deref(), Some("0-3"));
+        assert_eq!(memory_swap_max, Some(1024 * 1024 * 1024));
+
+        // Same flags on `box`.
+        let (_, cmd) = parse(&[
+            "box".into(),
+            "x".into(),
+            "--cpuset-cpus".into(),
+            "0,2,4".into(),
+            "--memory-swap-max".into(),
+            "512m".into(),
+        ])
+        .unwrap();
+        let Command::BoxRun {
+            cpuset,
+            memory_swap_max,
+            ..
+        } = cmd
+        else {
+            panic!("expected BoxRun")
+        };
+        assert_eq!(cpuset.as_deref(), Some("0,2,4"));
+        assert_eq!(memory_swap_max, Some(512 * 1024 * 1024));
+
+        // A cpuset list must be structurally valid: injection chars, non-numeric tokens, empty
+        // tokens, dangling/reversed ranges are all refused at the parse boundary — so a typo can't
+        // silently yield an unpinned box (and nothing arbitrary reaches the kernel's cpuset file).
+        for bad in ["0;rm", "bad", "0-", "-", "1,,2", "3-1", "", "0-3-5", " 0"] {
+            assert!(
+                matches!(
+                    parse(&[
+                        "run".into(),
+                        "--cpuset-cpus".into(),
+                        bad.into(),
+                        "true".into()
+                    ]),
+                    Err(Error::Usage(_))
+                ),
+                "cpuset {bad:?} must be rejected"
+            );
+        }
+        // ...while the well-formed forms are accepted.
+        for good in ["0", "0-3", "0,2,4", "1-2,5", "7"] {
+            let (_, cmd) = parse(&[
+                "run".into(),
+                "--cpuset-cpus".into(),
+                good.into(),
+                "true".into(),
+            ])
+            .unwrap();
+            assert!(
+                matches!(cmd, Command::Run { cpuset: Some(c), .. } if c == good),
+                "cpuset {good:?} must parse"
+            );
+        }
+
+        // Docker's `--memory-swap` is explicitly rejected on both verbs (not aliased).
+        assert!(matches!(
+            parse(&[
+                "run".into(),
+                "--memory-swap".into(),
+                "1g".into(),
+                "true".into()
+            ]),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&[
+                "box".into(),
+                "x".into(),
+                "--memory-swap".into(),
+                "1g".into()
+            ]),
+            Err(Error::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn inspect_and_prune_parse() {
+        // `inspect <name>` captures the name; `--json` is picked up regardless of position.
+        assert_eq!(
+            parse(&["inspect".into(), "web".into()]).unwrap().1,
+            Command::Inspect {
+                name: "web".into(),
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&["inspect".into(), "--json".into(), "web".into()])
+                .unwrap()
+                .1,
+            Command::Inspect {
+                name: "web".into(),
+                json: true
+            }
+        );
+        // Missing name → usage error (a lone `--json` is not a name).
+        assert!(matches!(parse(&["inspect".into()]), Err(Error::Usage(_))));
+        assert!(matches!(
+            parse(&["inspect".into(), "--json".into()]),
+            Err(Error::Usage(_))
+        ));
+        // `prune` takes no args.
+        assert_eq!(parse(&["prune".into()]).unwrap().1, Command::Prune);
     }
 
     #[test]
@@ -801,5 +1874,26 @@ mod tests {
             parse(&argv).unwrap().1,
             Command::Exec { tty: false, .. }
         ));
+    }
+
+    #[test]
+    fn stats_captures_names_and_json() {
+        // Regression: `stats <name>` used to drop the name and print every box.
+        let p = |a: &[&str]| {
+            parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap()
+                .1
+        };
+        assert!(
+            matches!(p(&["stats"]), Command::Stats { json: false, ref names } if names.is_empty())
+        );
+        match p(&["stats", "web", "db"]) {
+            Command::Stats { json: false, names } => assert_eq!(names, vec!["web", "db"]),
+            other => panic!("expected Stats, got {other:?}"),
+        }
+        match p(&["stats", "--json", "web"]) {
+            Command::Stats { json: true, names } => assert_eq!(names, vec!["web"]),
+            other => panic!("expected Stats, got {other:?}"),
+        }
     }
 }

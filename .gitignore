@@ -2,7 +2,18 @@
 **/*.rs.bk
 .DS_Store
 
-# Pulled OCI rootfs / scratch — kern fetches images on demand; never commit a rootfs.
+# Pulled/built OCI rootfs — `kern pull`/`kern build` with no --dest writes into the CWD as
+# `<name>_<tag>-<hash>/` plus `.image`/`.lock`/`.layers`/`.base`/`.diff` sidecars. Never commit a
+# rootfs; match the hash-suffixed names (anchored to the repo root so real files are untouched).
+/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*/
+/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.image
+/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.lock
+/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.layers
+/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.base
+/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.diff
+# Legacy/plain rootfs dirs some docs use.
 /alpine/
 /ubuntu/
 /*-rootfs/
+/kern-final-prompt*
+/kern-review-packet*

@@ -14,8 +14,16 @@ const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+#[cfg(target_arch = "x86_64")] // only the x32-ABI kill uses JSET (x86_64-only)
+const BPF_JSET: u16 = 0x40;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
+
+// `__X32_SYSCALL_BIT` (`<asm/unistd.h>`). On x86_64 the x32 ABI reuses the x86_64 `AUDIT_ARCH`
+// token but sets this bit on the syscall number — so a plain number-equality denylist can be
+// bypassed by calling the x32 variant of a blocked syscall. Kill anything with the bit set.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 // seccomp return actions (`<linux/seccomp.h>`).
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
@@ -118,6 +126,14 @@ pub fn install() -> Result<(), Error> {
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
     ];
+    // 2b. x86_64 only: kill any x32-ABI syscall (the `__X32_SYSCALL_BIT` is set on `nr`). Without
+    // this, the number-equality denylist below is bypassable by invoking the x32 variant of a
+    // blocked syscall (same `AUDIT_ARCH`, different number). The `nr` is already loaded above.
+    #[cfg(target_arch = "x86_64")]
+    {
+        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1)); // bit set → next (kill)
+        prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    }
     // 3. Each denied number: ==nr → kill.
     for nr in denylist() {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (kill); else skip

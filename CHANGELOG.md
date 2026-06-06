@@ -2,7 +2,219 @@
 
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to SemVer.
-Pre-1.0: the CLI and config surface are NOT frozen; minor versions may break them.
+Pre-1.0: the CLI and config surface are NOT frozen; minor versions may change them.
+
+**Deprecation policy (pre-1.0).** "Not frozen" does not mean "breaks without warning". When a
+flag or config key changes:
+
+- **Same meaning, new name** → the old name keeps working as a **deprecated alias** that prints a
+  one-line warning to stderr, for **at least 2 minor releases** before it is removed. Your scripts
+  keep running; you get a heads-up to update them.
+- **Different meaning** → the old name is **rejected with an error** that explains the change and
+  names the replacement (never silently reinterpreted, which would corrupt behaviour). Example:
+  `--memory-swap` (Docker's mem+swap *total*) is refused with a pointer to `--memory-swap-max`
+  (the cgroup-v2 swap *allowance*) — the two mean different things, so aliasing would lie.
+
+Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
+
+## [0.5.7] — 2026-07-03
+
+**The full 0.5 launch.** kern grows from a fast sandbox/OCI runtime into a **feature-complete
+daemonless container + resource runtime** — the entire private feature set minus GPU/intelligence.
+Every slice was built dev → test → clean-code → security-audit → perf; no stubs ship. 214 tests,
+clippy/`cargo-deny`-clean, security-audited. (Image registry **push** and GPU slices are
+deliberately out — see the README roadmap.)
+
+### Added
+- **Full volume system** — `-v src:dst[:ro]` bind mounts (symlink-safe), **named volumes**
+  (`-v data:/work`, auto-created; `kern volume create/ls/rm/inspect/prune`) with an optional
+  **per-volume quota** (`--size`, ext4-on-loop when privileged / honest fallback otherwise), and
+  **network volumes** (`nfs://`/`smb://`/`sshfs://`) mounted rootless via FUSE/GVFS.
+- **`--secret NAME=value` / `NAME=-` / `SRC[:NAME]`** — deliver a secret as `/run/secrets/NAME`
+  (mode `0400`) on a RAM tmpfs; never in the image, argv (stdin form), or the workload's env.
+- **`--ssh <port>` / `--ssh-key`** — a throwaway `sshd` inside the box (auto-generated ed25519 keypair
+  or your pubkey), published on the host port — a ready-to-`ssh` workspace.
+- **Networking & identity** — `--network host|none` (unifies `--net`), `--hostname`, **`--tun`**
+  (`/dev/net/tun` for WireGuard/VPN), `--user UID[:GID]` (drops privilege, fails closed if unmapped).
+- **`--pids-limit`, `--tmpfs PATH[:size]`** — fork-bomb cap and a fresh `nosuid,nodev` box tmpfs.
+- **`--cap-add` / `--cap-drop CAP|ALL`** — configure capabilities on the always-dropped baseline.
+- **Box operations** — **`kern cp <box>:<src> <dst>`** (symlink-confined via `openat2 RESOLVE_IN_ROOT`,
+  CVE-2019-14271-safe), **`kern pause`/`unpause`** (cgroup freezer), **`kern attach`** (live output).
+- **Advanced health** — `--health-retries` / `--health-start-period` / `--health-timeout`, and
+  **`--health-action <restart|stop|none>`** (act when a box turns unhealthy — `restart` implies the
+  on-failure policy; `stop` tears the box down).
+- **`--timeout <sec>`** — auto-stop a box after N seconds (foreground, `-it`, and detached). The
+  watchdog runs in the host namespace so it can reliably terminate the box's PID-namespace init.
+- **`--env-file <file>`** (repeatable, `K=V` lines, `#` comments) — layered under `--env` (explicit
+  wins); **`--nice <n>`** (-20..19); **`--io-weight <n>`** (cgroup-v2 `io.weight`, best-effort);
+  **`--config <path>`** (a specific `kern.toml` for `vcpu:`/`vgpio:`/`vdisk:` profile tokens);
+  **`--show-config`** (print the resolved configuration and exit — a dry run); **`-q`/`--quiet`**
+  (suppress the foreground status panel).
+- **`vdisk:` / `vgpio:` profiles** — a size-capped disk at `/vdisk/<name>` (tmpfs / ext4-loop, with
+  `--iops`/`--bandwidth` → `io.max`) and per-peripheral GPIO/I2C/SPI/LED passthrough (deny-by-default).
+- **Operations** — `kern doctor` (host preflight), `info`, `bench`, `history`, `recover`, `gc`,
+  `kill`/`killall`, `completions <bash|zsh|fish>`; registry **`login`/`logout`** (private-image pulls,
+  credentials `0600`, passed to `curl` off-argv); `config [edit|setup|probe|clear]`.
+- **Any-registry image pulls** — auth now follows the standard registry-v2 `WWW-Authenticate`
+  challenge (Bearer token or HTTP Basic), so `--image ghcr.io/…`, GitLab, quay, Harbor and
+  self-hosted registries work, not just Docker Hub. Every request is TLS-pinned (`--proto =https`,
+  https-only redirects, `--` URL terminator); credentials go to the token endpoint / registry
+  off-argv via a `curl -K` STDIN config.
+- **`--image` now honors the image's OCI config** — `Entrypoint`/`Cmd`/`Env`/`WorkingDir`/`User` are
+  applied as defaults, so `kern box --image redis` runs the image's real entrypoint (like
+  `docker run`), not a bare shell — with the image's env and workdir. Explicit flags always win:
+  `-- CMD` replaces `Cmd` (kept under `Entrypoint`, docker-style), `--env`/`--env-file` override the
+  image env, `--workdir`/`--user` override theirs. The (sha256-verified) config blob is cached
+  alongside the rootfs so a cache hit reapplies it without re-pulling.
+- **`--restart always` / `--restart unless-stopped`** — a persistent, reboot-surviving box **without a
+  kern daemon**: kern writes a `systemd --user` unit (`~/.config/systemd/user/kern-<name>.service`),
+  enables it, and turns on linger, so systemd — already running — restarts the box on any exit and
+  brings it back at boot. Resource caps (`--memory`/`--memory-swap-max`/`--cpus`/`--pids-limit`) are
+  enforced by the unit's own service cgroup. The box still shows in `kern ps`/`logs`/`exec`; `kern
+  stop` (and `stop --all`) disable and remove the unit so it neither restarts nor returns at reboot.
+  `--restart` also now takes a **policy** (`no` | `on-failure` | `always` | `unless-stopped`, Docker
+  names); bare `--restart` stays `on-failure` (kern's in-process supervisor, unchanged). Command args
+  are systemd-quoted and control-char-rejected so the unit can't be injected into.
+- **`kern pod`** — shared-network **pods** for multi-service stacks: boxes in a pod reach each other
+  **by name** on `127.0.0.1` (like a Kubernetes pod). `kern pod create <name>` spawns a holder that
+  owns the pod's user+net namespace; `kern box <n> --pod <name>` joins it (its own mount/pid/uts/ipc
+  ns stay private — only user+net are shared, so pod members are co-trusted) and is registered in a
+  shared `/etc/hosts` mapping every member → `127.0.0.1`. Publish a pod service to the host with `-p`
+  on its box. `kern pod ls` / `kern pod rm`. Daemonless; pod join is ~6 ms (a `setns`, cheaper than a
+  fresh box) and a reused holder PID is rejected via its net-ns inode identity. **Outbound**: if
+  `pasta`/`passt` is installed, `kern pod create` attaches it to the pod (rootless userspace NAT) so
+  pod services also reach the internet, with DNS wired up automatically — no config; if it isn't, the
+  pod is loopback-only (inter-service only) and says so. The dependency is **optional** (kern needs
+  nothing extra to run — pasta only unlocks outbound). **`kern compose <file>` auto-pods**: a
+  multi-service stack is put in a pod named after the file, so services reach each other **by name
+  with zero config** (`--no-pod` opts out); `kern compose <file> down` stops the stack and removes the
+  pod. `compose up` of a 2-service stack (pod + NAT + both boxes) is ~38 ms.
+- **`kern build`** — build a local image from a **Dockerfile subset**, daemonless
+  (curl/tar/cp): `kern build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`. `RUN` executes
+  inside a real `kern box` (host net, full userns/seccomp/cap isolation); `COPY`/`ADD` copy from the
+  context; `ENV`/`WORKDIR`/`USER`/`CMD`/`ENTRYPOINT`/`EXPOSE`/`ARG`/`LABEL` accumulate into the image
+  config. Builds are **layered**: the base is a shared read-only overlay lower and only the *diff* is
+  stored (KB, not a full base copy) — so a build's time and disk are independent of the base size, and
+  a rebuilt/derived image is prune-safe (the base is re-resolved by ref). Where unprivileged overlay
+  isn't available it transparently falls back to a flat copy build (`KERN_BUILD_FLAT=1` forces it).
+  The result lands in the image cache so `kern box --image <name>` runs it with **no pull** (it reuses
+  the OCI-config sidecar).
+  Supported instructions are honoured with Docker semantics (ENTRYPOINT resets the base CMD; RUN/CMD/
+  ENTRYPOINT are left for the shell, only ARG/ENV substitute); unsupported ones (multi-stage,
+  `VOLUME`/`HEALTHCHECK`/`ADD <url>`/`COPY --from`) are **rejected with a clear error**, never
+  silently ignored. COPY/WORKDIR destinations are `..`- and symlink-escape-proof (can't write outside
+  the image rootfs). Consecutive `RUN` steps are **batched into one box** (each still in its own
+  `/bin/sh -c`, `&&`-chained for fail-fast + per-RUN cwd reset) and build boxes skip the transient
+  systemd scope — so a 10-`RUN` build is ~25 ms instead of ~160 ms, and build time is independent of
+  the base image size. Builds are **layer-cached** (Docker-style): every unit (a RUN batch, a COPY, a
+  WORKDIR) is a content-addressed layer keyed by everything before it + its own inputs (a COPY folds
+  in the copied file contents), so an unchanged rebuild reuses cached layers and re-runs nothing —
+  and a code change reuses the expensive dependency layers before it. An unchanged rebuild is ~13 ms
+  and the cache is shared across images.
+- **`--cpuset-cpus <list>`** (on `box` and `run`) — pin a box to specific CPUs (`0-3`, `0,2,4`).
+  Applied via **`sched_setaffinity`** (the workload inherits the affinity across `exec`), so it
+  **works rootless with no cgroup `cpuset` delegation** — which is frequently unavailable on a user
+  session even when `cpu`/`memory` are. On hosts where the `cpuset` controller *is* delegated, the
+  cgroup `cpuset.cpus` / systemd `AllowedCPUs` write also applies as the harder, unwidenable path.
+  The list is structurally validated (`N` or `N-M`, `N<=M`, no empty tokens) so a typo can't
+  silently yield an unpinned box and nothing arbitrary reaches the kernel file. (Cooperative for the
+  trust model — a hostile workload could widen its own affinity; `--memory`/`--cpus` are the hard,
+  cgroup-enforced governance.)
+- **`--memory-swap-max <size>`** (on `box` and `run`) — swap allowance, mapped 1:1 to cgroup-v2
+  `memory.swap.max` (a *separate* limit from `--memory`; default `0` = swap off). This is the
+  honest v2-native knob, **not** Docker's combined mem+swap total. Accepts an explicit `0` (swap off).
+- **`kern run --config <kern.toml>`** — a specific config for `run`'s profile tokens (`vcpu:`/…),
+  matching `kern box --config` so the two verbs share one profile surface.
+- **I/O limits are feedback-first** — a `--iops`/`--bandwidth`/`--io-weight` request that the host's
+  cgroup `io` controller isn't delegated to enforce now prints a clear "not enforced" note instead of
+  silently doing nothing.
+- **`kern inspect <name> [--json]`** — full detail for one running box (pid/pid1, rootfs, command,
+  uptime, ports, health, and live mem/cpu/tasks). Untrusted fields are escape-scrubbed.
+- **`kern prune`** — garbage-collect the leftover log/health sidecars of boxes that are no longer
+  running; reports what it reclaimed (or "nothing to prune"). Live boxes are never touched.
+- **Frozen TOML box schema** ([docs/CONFIG.md](docs/CONFIG.md)) — `[box.NAME]` tables mirror the
+  full `kern box` CLI (was only `image`/`rootfs`/`command`/`depends_on`): `memory`/`cpus`/`cpuset`/
+  `swap_max`/`pids_limit`/`io_weight`/`nice`/`timeout`, `workdir`/`read_only`/`uid_range`/
+  `bind_rootfs`/`hostname`/`user`/`tmpfs`, `net`/`tun`/`ports`/`ssh`/`ssh_key`,
+  `env`/`env_file`/`secrets`, `cap_add`/`cap_drop`, and the full
+  `restart`/`timeout`/`health_*` supervision set. One rule — **TOML mirrors the CLI** — so the same
+  table is what a future `--profile` will reuse; the key names and array-vs-table shape (including
+  the remaining reserved keys for later slices) are frozen from 0.5.0. Unknown keys are still
+  rejected with the offending line.
+
+### Security
+Each feature slice was adversarially audited; highlights:
+- **seccomp x32-ABI kill** — on x86_64, x32 syscalls (which share the x86_64 arch token) are killed,
+  closing the classic bypass where the x32 alias of a denied syscall slipped past a number-only denylist.
+- **`kern cp` is symlink-confined** — the in-box path resolves under `openat2(RESOLVE_IN_ROOT |
+  RESOLVE_NO_MAGICLINKS)` on `/proc/<pid1>/root`, so a hostile image can't redirect a copy to a host
+  file (the CVE-2019-14271 class). Regular files only, size-capped.
+- **`--user` fails closed** — if the requested uid can't be mapped, the box refuses to start rather
+  than silently running as in-box root.
+- **`--user` + `--cap-drop ALL` compose correctly** — the capability drop is now split around the
+  user switch (drop the *bounding* set → `setgid`/`setuid` → clear the *effective* set), so the
+  canonical hardened profile (`--user 1000 --cap-drop ALL --read-only …`, e.g. for running untrusted
+  code) no longer fails with a spurious "gid isn't mapped" from `CAP_SETGID` being dropped too early.
+- **In-box PTYs** — the box now mounts a private `devpts` at `/dev/pts` (+ a `/dev/ptmx`
+  multiplexer, `nosuid,noexec,newinstance`), so programs *inside* the box can allocate a controlling
+  terminal. Interactive `ssh` into an `--ssh` box (and `screen`/`tmux`/`script`) work instead of
+  failing "PTY allocation request failed". (`kern box -it` was unaffected — it uses a host PTY.)
+- **Box root is `nosuid,nodev`**; `--secret` never touches the image/argv/env; registry credentials
+  are `0600` and passed to `curl` via stdin config, never `/proc/<pid>/cmdline`.
+- **Device access is deny-by-default** and covered by an adversarial test: a box's `/dev` is a fresh
+  tmpfs with only a safe allowlist (`null/zero/full/random/urandom`); a raw disk / `/dev/mem` is
+  absent and a fabricated device node is inert (userns `SB_I_NODEV`). See SECURITY.md.
+
+### Rejected (not aliased)
+- **`--memory-swap`** — refused with an error pointing to `--memory-swap-max` (different meaning on
+  cgroup v2; silently aliasing it would lie). Per the deprecation policy above.
+
+### Fixed
+- **Duplicate box names are refused.** Starting a box whose name is already held by a *running* box
+  now errors (`a box named '<n>' is already running`) instead of silently stacking a second box that
+  made `stop`/`logs`/`exec` ambiguous. A repeated `kern compose … up` no longer accumulates
+  duplicate services. A stopped box's name is immediately reusable.
+- **Pod teardown no longer leaks its NAT daemon.** `pasta`/`passt` re-execs into an ISA-optimised
+  variant (`pasta.avx2`, …), so the identity check that guards against PID reuse never matched and
+  the outbound daemon survived every `kern pod rm` / `kern compose … down`. It is now matched by
+  process-name family and reliably reaped.
+- **Concurrent `kern pod create <same-name>` can no longer orphan a holder.** The mkdir loser used to
+  reclaim the winner's still-initialising pod directory and spawn a second namespace holder; it now
+  detects the in-progress claim (with a bounded wait so a slow host can't race the marker) and backs
+  off, so exactly one holder is ever created.
+- **A `[[vcpu]]` `extends` cycle no longer crashes kern.** A `kern.toml` where a profile extends
+  itself (directly or through a chain) sent `resolve_vcpu` into unbounded recursion and aborted the
+  process with a stack overflow; cycles are now detected and reported (`[[vcpu]] 'extends' cycle: a
+  -> b -> a`).
+- **`KERN_CONFIG` is now honoured.** The documented `KERN_CONFIG` environment variable (an explicit
+  `kern.toml` path, overridden only by `--config`) was ignored — the default location was always
+  used. It now works, and a missing/malformed file named that way is a clear error, not a silent
+  fallback.
+- **`--secret NAME=value` now warns that the inline value is visible in `ps`.** The value sits in the
+  process's argv, so for a detached box it stayed readable in `/proc/<pid>/cmdline` for the box's
+  whole lifetime; the warning steers to the non-leaking forms (`NAME=-` stdin, or a `SRC:NAME` file),
+  which were already leak-free.
+- **`kern stats <name>...` now filters to the named boxes** (Docker-parity) instead of silently
+  ignoring the argument and printing every box; a requested name that isn't running is reported.
+- **A paused box now shows as `paused`** in `kern ps` (HEALTH) and `kern top` (STATUS) — previously a
+  frozen box (`kern pause`) looked identical to a running one, even though the freeze was real.
+- **A `-p` host port already in use now fails fast with a clear error** ("cannot publish host port
+  N: … — already in use") instead of the box printing "✔ started" while its forwarder silently
+  failed to bind (its error was swallowed for detached boxes). The port is pre-flighted before the
+  box starts.
+- **`--memory` / `--cpus` now warn honestly when the host can't enforce them.** On a rootless host
+  whose user slice lacks a delegated `memory`/`cpu` controller (e.g. some Raspberry Pi setups), the
+  cap was silently ignored — the box looked capped but wasn't. kern now checks the *effective* limit
+  up the whole cgroup tree (so it never false-warns on a host where the systemd scope is the real
+  enforcer) and prints a one-line "not enforced" note only when nothing in the chain caps it.
+- **A non-root `--user` now actually works in the default (overlay) box.** Previously any
+  `--user <non-zero-uid>` failed with `execvp: Permission denied`: overlayfs presents the merged
+  root's mode as the private upper dir's, which was `0700`, so a dropped, capability-less uid
+  couldn't even traverse `/`. The box root is now `0755` (a normal root fs) when a non-root `--user`
+  is requested — still private on the host (its `0700` parent scratch dir is unchanged), so only the
+  in-box view changes. Default boxes (running as the box's root) are untouched. For a `--bind-rootfs`
+  tree you still control the perms; the exec-failure hint now names the uid/rootfs cause instead of
+  the misleading "command must exist … loader" message.
 
 ## [0.4.0] — 2026-06-28
 

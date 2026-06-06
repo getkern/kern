@@ -22,18 +22,21 @@ fn help_lists_commands() {
     let out = kern().arg("--help").output().expect("run kern");
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    for verb in ["box", "run", "pull", "compose", "--no-gpu"] {
+    for verb in ["box", "run", "pull", "compose"] {
         assert!(s.contains(verb), "help missing {verb}");
     }
 }
 
 #[test]
-fn no_gpu_is_accepted_on_any_command() {
-    // `--no-gpu` must be a real, accepted code path (not just a README bullet).
-    let out = kern().args(["--no-gpu", "box"]).output().expect("run kern");
-    // box isn't implemented at 0.1, but the flag must parse (no "unknown" error).
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!err.contains("unknown"), "--no-gpu should parse: {err}");
+fn bare_kern_shows_the_short_banner() {
+    // Bare `kern` → the concise banner, not the full command dump.
+    let out = kern().output().expect("run kern");
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("kern box"), "banner should mention `kern box`");
+    assert!(s.contains("--help"), "banner should point to --help");
+    // The long OPTIONS-for-box reference belongs to `--help`, not the bare banner.
+    assert!(!s.contains("--cpuset-cpus"), "bare banner must stay short");
 }
 
 #[test]

@@ -47,6 +47,12 @@ pub struct SandboxSpec {
     /// Share the host network namespace instead of an isolated (loopback-only) one (`--net`).
     /// Opt-in: gives the box outbound networking at the cost of network isolation.
     pub share_net: bool,
+    /// `--pod <name>`: JOIN this pod holder's user + net namespace instead of creating a fresh one,
+    /// so every box in the pod shares one loopback network (they reach each other on `127.0.0.1`,
+    /// resolved by name via a shared `/etc/hosts`). The value is the holder process's PID; the box
+    /// still gets its own mount/pid/uts/ipc namespaces. Pod members are co-trusted (they share the
+    /// pod's user+net ns) — the pod is the network trust unit, like a Kubernetes pod.
+    pub pod_holder: Option<i32>,
     /// Map a subordinate uid/gid *range* into the box (`--uid-range`) instead of just the caller.
     /// Opt-in because it (a) costs two `newuidmap`/`newgidmap` subprocesses at start and (b) maps
     /// 65k extra ids into the namespace; the default single-uid map is both faster and more
@@ -55,6 +61,13 @@ pub struct SandboxSpec {
     pub uid_range: bool,
     /// Hard memory ceiling in bytes for the box's cgroup (`--memory`). `None` → the default cap.
     pub memory_max: Option<u64>,
+    /// Swap allowance in bytes (`--memory-swap-max` → `memory.swap.max`). `None` → `0` (swap off, so
+    /// `memory_max` is a hard total). This is the v2 swap limit, NOT a combined mem+swap total.
+    pub memory_swap_max: Option<u64>,
+    /// CPU pinning list (`--cpuset-cpus`, e.g. `"0-3"` / `"0,2,4"`). `None` → no pinning. Applied via
+    /// `sched_setaffinity` (rootless, no cgroup delegation needed) AND, where the `cpuset` controller
+    /// is delegated, the cgroup `cpuset.cpus` write for the harder path.
+    pub cpuset: Option<String>,
     /// CPU cap in cores (`--cpus`, K8s semantics: 1.5 = 1½ cores). `None` → uncapped. Best-effort:
     /// silently skipped where the cgroup CPU controller isn't delegated (e.g. some Android kernels).
     pub cpus: Option<f64>,
@@ -63,6 +76,50 @@ pub struct SandboxSpec {
     /// it onto stdin/out/err. `None` → the box inherits kern's stdio. The parent pumps the matching
     /// master (see `run_in_sandbox_with`'s `tty_master`).
     pub tty_slave: Option<i32>,
+    /// vGPIO device nodes (host `/dev/*` paths) to expose in the box's `/dev` — from a `vgpio:`
+    /// profile. Bound before pivot like the base device allowlist.
+    pub vgpio_devs: Vec<String>,
+    /// vGPIO sysfs directories (host `/sys/*` paths) to expose in the box's `/sys` (pwm/adc/1-wire/
+    /// leds). Bound before pivot.
+    pub vgpio_sysfs: Vec<String>,
+    /// vDisk profiles to mount at `/vdisk/<name>` in the box (from `vdisk:` profiles).
+    pub vdisks: Vec<VdiskMount>,
+    /// Secrets to expose as `/run/secrets/<name>` (mode 0400), from `--secret`. The bytes were read
+    /// on the host before the fork; the box writes them into a RAM-backed tmpfs so they never touch
+    /// the persisted overlay upper and are gone when the box exits.
+    pub secrets: Vec<(String, Vec<u8>)>,
+    /// `--ssh`: stand up an in-box `sshd` (authorized to the given public key). `None` → no SSH. The
+    /// caller also wires a `-p HOST:22` forwarder; sshd is forked just before the box execs PID 1.
+    pub ssh: Option<crate::ssh::SshSetup>,
+    /// `--tun`: expose `/dev/net/tun` in the box's `/dev` (WireGuard / userspace VPN). The box owns
+    /// its network namespace, so it can create the tunnel; the node is bound like the base allowlist.
+    pub tun: bool,
+    /// `--tmpfs PATH[:size]`: extra fresh tmpfs mounts inside the box (`(path, size_option)` — size is
+    /// a tmpfs `size=` string like `"64m"`, or empty for the default). Blocked over hardened mounts.
+    pub tmpfs: Vec<(String, String)>,
+    /// `--user UID[:GID]`: drop to this uid/gid just before exec (after all privileged setup). `None`
+    /// → keep the namespace root. Only ids mapped into the box's userns work (see `--uid-range`).
+    pub run_as: Option<(u32, u32)>,
+    /// `--pids-limit N`: the box's `pids.max` (task ceiling). `None` → the default. Fork-bomb cap.
+    pub pids_max: Option<u64>,
+    /// `--cap-add`/`--cap-drop` policy on top of the always-dropped dangerous caps. Default drops
+    /// exactly the dangerous set.
+    pub caps: CapSpec,
+    /// cgroup v2 `io.max` lines (`MAJ:MIN riops=… wbps=…`) for a vdisk's `--iops`/`--bandwidth`.
+    /// Written into the box's cgroup best-effort (needs the `io` controller delegated).
+    pub io_max: Vec<String>,
+    /// cgroup v2 `io.weight` (`--io-weight`, 1..=10000): relative I/O priority for the box. `None`
+    /// leaves the default. Best-effort like `io_max` (needs the `io` controller delegated).
+    pub io_weight: Option<u64>,
+}
+
+/// A resolved vDisk to mount in the box at `/vdisk/<name>`. When `host_dir` is set, the host prepared
+/// an ext4-on-loop mount (privileged path) that is bind-mounted in; otherwise a `size=`-capped
+/// `tmpfs` is mounted (rootless fallback — RAM-backed, ephemeral).
+pub struct VdiskMount {
+    pub name: String,
+    pub size: Option<u64>,
+    pub host_dir: Option<String>,
 }
 
 /// overlayfs directories. `lower` is the read-only image; `upper`/`work` are the writable layer.
@@ -193,12 +250,18 @@ fn mount_overlay(lower: &str, upper: &str, work: &str, merged: &str) -> Result<(
     let ty = cstr("overlay")?;
     let merged_c = cstr(merged)?;
     let opts = cstr(&format!("lowerdir={lower},upperdir={upper},workdir={work}"))?;
+    // `NODEV|NOSUID` on the box root: a device node on the rootfs is inert and a setuid binary can't
+    // elevate. Both are already assured (userns superblocks are `SB_I_NODEV`; the workload runs under
+    // `NO_NEW_PRIVS` + the bounding-set cap drop), so this is defense-in-depth that doesn't rely on
+    // that implicit kernel behaviour. Device nodes the box legitimately uses live on the separate
+    // `/dev` tmpfs, not here.
+    let hardening = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
     let r = unsafe {
         libc::mount(
             ty.as_ptr(),
             merged_c.as_ptr(),
             ty.as_ptr(),
-            0,
+            hardening,
             opts.as_ptr() as *const libc::c_void,
         )
     };
@@ -326,9 +389,21 @@ fn child_setup_and_exec(spec: &SandboxSpec, argv: &[CString]) -> Result<Infallib
     // Set up `<root>/dev` and bind `-v` volumes BEFORE pivot, while the host source paths are
     // reachable. Device nodes must be bound by real host path to stay writable from the user
     // namespace; volume targets are resolved symlink-safely, confined to the new root.
-    setup_dev(&spec.root)?;
+    setup_dev(&spec.root, spec.tun)?;
+    setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
     setup_volumes(&spec.root, &spec.volumes)?;
+    setup_vdisk(&spec.root, &spec.vdisks)?;
+    setup_tmpfs(&spec.root, &spec.tmpfs)?;
+    // `--ssh` needs a box-owned tmpfs over ALL of `/run` (so `/run/sshd` is namespace-root-owned for
+    // sshd's privsep check). Mount it once here, up front, so secrets write `/run/secrets` INTO it
+    // rather than under a `/run` that sshd will later shadow. Without `--ssh`, secrets mount their own
+    // narrow `/run/secrets` tmpfs (keeps the image's `/run` otherwise intact).
+    let run_tmpfs = spec.ssh.is_some();
+    if run_tmpfs {
+        make_box_tmpfs(&spec.root, "run")?;
+    }
+    setup_secrets(&spec.root, &spec.secrets, run_tmpfs)?;
     t.mark("volumes");
     // Self-pivot into the new root. The old root is left stacked at "/"; mount a fresh `proc`
     // (cwd-relative, while the old root still provides the visible proc instance the kernel
@@ -362,9 +437,17 @@ fn child_setup_and_exec(spec: &SandboxSpec, argv: &[CString]) -> Result<Infallib
     }
 
     // Bring the box's own loopback up so 127.0.0.1 works inside an isolated net namespace (a fresh
-    // net ns has `lo` present but DOWN). Skipped when `--net` shares the host's already-up loopback.
-    if !spec.share_net {
+    // net ns has `lo` present but DOWN). Skipped when `--net` shares the host's already-up loopback,
+    // and for a `--pod` box whose shared loopback the pod holder already brought up.
+    if !spec.share_net && spec.pod_holder.is_none() {
         bring_loopback_up();
+    }
+
+    // `--ssh`: stand up the in-box sshd (mounts /run tmpfs, writes keys/config, forks sshd). Done
+    // here — after loopback (sshd binds 127.0.0.1) and pivot (privileged mounts), before seccomp
+    // (the filter would block the mounts, and the forked sshd must predate the filter).
+    if let Some(ssh) = &spec.ssh {
+        crate::ssh::setup(ssh);
     }
 
     // `-it`: adopt the PTY slave as the controlling terminal (done before seccomp — these are setup
@@ -374,15 +457,111 @@ fn child_setup_and_exec(spec: &SandboxSpec, argv: &[CString]) -> Result<Infallib
         adopt_controlling_tty(slave);
     }
 
-    // Least-privilege: drop never-needed dangerous capabilities just before locking down — after all
-    // privileged setup (mount/pivot/loopback) is done, so it only affects the workload.
-    drop_dangerous_caps();
+    // Pin to `--cpuset-cpus` via CPU affinity. This is the rootless-portable path: unlike the
+    // cgroup `cpuset` controller (frequently NOT delegated to a user session), `sched_setaffinity`
+    // needs no privilege and no delegation, and the affinity is inherited across the exec — so the
+    // box command actually runs pinned even where the cgroup write is skipped. Done before seccomp
+    // (a setup syscall).
+    set_cpu_affinity(spec.cpuset.as_deref());
+
+    // Least-privilege, in three ordered steps so `--user` + `--cap-drop ALL` (the canonical hardened
+    // profile) composes correctly. All run after privileged setup (mount/pivot/loopback), so they
+    // only affect the workload.
+    let cap_mask = cap_drop_mask(&spec.caps);
+    // 1. Bounding set — needs effective `CAP_SETPCAP` (still present here); stops a file-cap binary
+    //    re-adding a dropped cap. Dropping a cap from the *bounding* set does NOT block using it from
+    //    the effective set, so the `setuid`/`setgid` below still work even under `--cap-drop ALL`.
+    drop_cap_bounding(cap_mask);
+    // 2. `--user UID[:GID]`: drop to the workload's uid/gid — needs `CAP_SETUID`/`CAP_SETGID` in the
+    //    *effective* set, which are still present (we haven't cleared effective yet). setgid before
+    //    setuid (once uid is non-root you can't change gid); setuid to a non-root uid then sheds the
+    //    effective caps itself. Only mapped ids succeed; a failure fails closed (refuses to exec).
+    if let Some((uid, gid)) = spec.run_as {
+        set_user(uid, gid)?;
+    }
+    // 3. Clear the dropped caps from effective/permitted/inheritable. For a non-root `--user` step 2
+    //    already emptied them; this covers a root box and is otherwise a harmless no-op.
+    clear_caps_from_sets(cap_mask);
 
     // Install the seccomp filter LAST — after all setup syscalls (mount/pivot) are done, so it
     // only constrains the workload. Then exec.
     crate::seccomp::install()?;
     t.mark("seccomp");
     Err(exec(argv))
+}
+
+/// `--user`: drop to `uid`/`gid` for the workload. Order matters — `setgroups` (clear supplementary
+/// groups) then `setgid` then `setuid`, because once the uid is non-root you can no longer change
+/// gid. Only ids mapped into the box's user namespace succeed (see `--uid-range`).
+///
+/// **Fails CLOSED**: if a non-root target `setgid`/`setuid` fails (the id isn't mapped — e.g. a host
+/// without `newuidmap`/`newgidmap` fell back to the single-uid map), return `Err` so the box
+/// **refuses to exec** rather than silently running the workload as in-box root. Dropping privilege
+/// must never *grant* it. `--user 0` (explicitly root) is a successful no-op.
+fn set_user(uid: u32, gid: u32) -> Result<(), Error> {
+    unsafe {
+        // Best-effort: setgroups may be EPERM under `/proc/self/setgroups=deny` (single-uid box); the
+        // single mapped group is already the whole set, so a failure here is harmless.
+        libc::setgroups(0, std::ptr::null());
+        if libc::setgid(gid as libc::gid_t) != 0 && gid != 0 {
+            return Err(Error::Unsupported(
+                "--user: setgid failed — the gid isn't mapped into the box (add newuidmap/newgidmap \
+                 + an /etc/subgid allocation, or use --uid-range)",
+            ));
+        }
+        if libc::setuid(uid as libc::uid_t) != 0 && uid != 0 {
+            return Err(Error::Unsupported(
+                "--user: setuid failed — the uid isn't mapped into the box (add newuidmap/newgidmap \
+                 + an /etc/subuid allocation, or use --uid-range)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pin the workload to the CPUs named in `--cpuset-cpus` (`"0-3"`, `"0,2,4"`) with
+/// `sched_setaffinity`. Portable and rootless — needs neither a delegated `cpuset` cgroup nor any
+/// capability — and inherited across `exec`. Best-effort: a parse or syscall failure leaves the box
+/// unpinned rather than failing it. Cooperative for this trust model (a hostile workload could widen
+/// its own affinity; `--memory`/`--cpus` are the hard, cgroup-enforced governance). Complements the
+/// cgroup `cpuset.cpus` write, which stays authoritative on hosts where that controller IS delegated.
+pub fn set_cpu_affinity(cpuset: Option<&str>) {
+    let Some(list) = cpuset else { return };
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_ZERO(&mut set) };
+    let mut any = false;
+    for cpu in expand_cpu_list(list) {
+        if cpu < libc::CPU_SETSIZE as usize {
+            unsafe { libc::CPU_SET(cpu, &mut set) };
+            any = true;
+        }
+    }
+    if any {
+        unsafe {
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+}
+
+/// Expand a validated cpuset list (`"0-3,5"`) into CPU indices. The CLI already restricts the string
+/// to `N` / `N-M` tokens (`is_cpu_list`), so a malformed token here simply contributes nothing.
+fn expand_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for tok in s.split(',') {
+        match tok.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(lo), Ok(hi)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    out.extend(lo..=hi);
+                }
+            }
+            None => {
+                if let Ok(c) = tok.parse::<usize>() {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Bind each `-v` host path into the new root BEFORE pivot (while the host source is reachable at
@@ -585,7 +764,7 @@ const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 /// device binds all resolve to a directory we own *inside* the new root — never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
-fn setup_dev(root: &str) -> Result<(), Error> {
+fn setup_dev(root: &str, tun: bool) -> Result<(), Error> {
     let dev_path = format!("{root}/dev");
     let dp = cstr(&dev_path)?;
     // Neutralize a hostile `/dev` symlink before any path resolves through it.
@@ -641,6 +820,396 @@ fn setup_dev(root: &str) -> Result<(), Error> {
                 )
             };
         }
+    }
+    // devpts: a PRIVATE pty instance at `/dev/pts` + a `/dev/ptmx` multiplexer, so programs INSIDE
+    // the box can allocate a controlling terminal — most importantly the in-box sshd for `--ssh`
+    // (interactive `ssh box` otherwise fails "PTY allocation request failed"), plus screen/tmux/script.
+    // A user namespace is allowed to mount devpts. `newinstance` = a pty namespace private to this box;
+    // `ptmxmode=0666` lets the unprivileged workload open the multiplexer. NOSUID|NOEXEC harden it; no
+    // `gid=` (group 5 isn't mapped in a single-uid box, which would EINVAL the mount). Best-effort — a
+    // host/kernel that refuses it just leaves the box without in-box PTYs (kern's own `-it` uses a HOST
+    // pty and is unaffected).
+    {
+        let ptsdir = format!("{root}/dev/pts");
+        if let Ok(pd) = cstr(&ptsdir) {
+            unsafe { libc::mkdir(pd.as_ptr(), 0o755) };
+            if let (Ok(ty), Ok(opts)) = (cstr("devpts"), cstr("newinstance,ptmxmode=0666")) {
+                let ok = unsafe {
+                    libc::mount(
+                        ty.as_ptr(),
+                        pd.as_ptr(),
+                        ty.as_ptr(),
+                        (libc::MS_NOSUID | libc::MS_NOEXEC) as libc::c_ulong,
+                        opts.as_ptr() as *const libc::c_void,
+                    )
+                } == 0;
+                // `/dev/ptmx` → `pts/ptmx`: `openpty()`/sshd open `/dev/ptmx` to get a new pty pair.
+                if ok {
+                    if let (Ok(px), Ok(tgt)) = (cstr(&format!("{root}/dev/ptmx")), cstr("pts/ptmx"))
+                    {
+                        unsafe { libc::symlink(tgt.as_ptr(), px.as_ptr()) };
+                    }
+                }
+            }
+        }
+    }
+    // `--tun`: bind `/dev/net/tun` into the box (WireGuard / userspace VPN). The box owns its network
+    // namespace, so a workload can create the tunnel interface; the `/dev/net` dir is created on the
+    // box-owned `/dev` tmpfs so the bind can't be redirected by a hostile image symlink. Best-effort:
+    // a host without the `tun` module simply leaves the node absent.
+    if tun {
+        let netdir = format!("{root}/dev/net");
+        if let Ok(nd) = cstr(&netdir) {
+            unsafe { libc::mkdir(nd.as_ptr(), 0o755) };
+        }
+        let target = format!("{root}/dev/net/tun");
+        if let (Ok(t), Ok(s)) = (cstr(&target), cstr("/dev/net/tun")) {
+            let f = unsafe {
+                libc::open(
+                    t.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0o666,
+                )
+            };
+            if f >= 0 {
+                unsafe { libc::close(f) };
+            }
+            unsafe {
+                libc::mount(
+                    s.as_ptr(),
+                    t.as_ptr(),
+                    ptr::null(),
+                    libc::MS_BIND as libc::c_ulong,
+                    ptr::null(),
+                )
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Expose a `vgpio:` profile's host devices in the box. Device nodes are bound into the box's own
+/// `/dev` tmpfs (created by `setup_dev` — box-owned, so binding into it can't be redirected by a
+/// hostile image symlink). If the profile needs sysfs peripherals (pwm/adc/1-wire/leds), a fresh
+/// box-owned `/sys` tmpfs is created (shadowing any image `/sys`, deny-by-default) and only the
+/// requested directories are bound in. Runs BEFORE pivot while the host sources are reachable.
+/// Best-effort per entry: a device absent on this host is simply skipped.
+fn setup_vgpio(root: &str, devs: &[String], sysfs: &[String]) -> Result<(), Error> {
+    for dev in devs {
+        if let Some(rel) = dev.strip_prefix("/dev/") {
+            bind_into(root, "dev", rel, dev, false);
+        }
+    }
+    if sysfs.is_empty() {
+        return Ok(());
+    }
+    make_box_tmpfs(root, "sys")?;
+    for s in sysfs {
+        if let Some(rel) = s.strip_prefix("/sys/") {
+            bind_into(root, "sys", rel, s, true);
+        }
+    }
+    Ok(())
+}
+
+/// If `path` is a symlink, remove it — so a hostile image can't redirect a mkdir/mount we're about to
+/// perform on it (used pre-pivot, where paths still resolve through the host root). Best-effort.
+fn unlink_if_symlink(path: &str) {
+    if let Ok(p) = cstr(path) {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(p.as_ptr(), &mut st) } == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+        {
+            unsafe { libc::unlink(p.as_ptr()) };
+        }
+    }
+}
+
+/// Create a fresh box-owned tmpfs at `<root>/<leaf>`, neutralising a hostile symlink first (mirrors
+/// `setup_dev`'s `/dev` handling). Used for `/sys` when a vGPIO profile needs sysfs peripherals, and
+/// for the wide `/run` tmpfs the `--ssh` path needs. `NOSUID|NODEV`: a box tmpfs never hosts a setuid
+/// binary or a device node (parity with the vdisk/secrets mounts).
+fn make_box_tmpfs(root: &str, leaf: &str) -> Result<(), Error> {
+    let path = format!("{root}/{leaf}");
+    let p = cstr(&path)?;
+    unlink_if_symlink(&path);
+    unsafe { libc::mkdir(p.as_ptr(), 0o755) };
+    let ty = cstr("tmpfs")?;
+    let opts = cstr("mode=755")?;
+    if unsafe {
+        libc::mount(
+            ty.as_ptr(),
+            p.as_ptr(),
+            ty.as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+            opts.as_ptr() as *const libc::c_void,
+        )
+    } != 0
+    {
+        return Err(Error::last("mount(vgpio /sys tmpfs)"));
+    }
+    Ok(())
+}
+
+/// Bind host `src` onto `<root>/<base>/<rel>`, creating the parent chain and leaf target inside the
+/// box-owned `<base>` tmpfs (so target creation can't be redirected by a hostile symlink). `is_dir`
+/// selects a recursive directory bind vs a device-node file bind. Best-effort; a `..`/empty
+/// component in `rel` is refused (defence-in-depth — sources are already sanitised).
+fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
+    let comps: Vec<&str> = rel.split('/').collect();
+    if comps.iter().any(|c| *c == ".." || c.is_empty()) {
+        return;
+    }
+    // mkdir -p the parents under <root>/<base>.
+    let mut cur = format!("{root}/{base}");
+    for c in &comps[..comps.len() - 1] {
+        cur.push('/');
+        cur.push_str(c);
+        if let Ok(cp) = cstr(&cur) {
+            unsafe { libc::mkdir(cp.as_ptr(), 0o755) };
+        }
+    }
+    let target = format!("{root}/{base}/{rel}");
+    let (Ok(t), Ok(s)) = (cstr(&target), cstr(src)) else {
+        return;
+    };
+    if is_dir {
+        unsafe { libc::mkdir(t.as_ptr(), 0o755) };
+        unsafe {
+            libc::mount(
+                s.as_ptr(),
+                t.as_ptr(),
+                ptr::null(),
+                (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+                ptr::null(),
+            )
+        };
+    } else {
+        let f = unsafe {
+            libc::open(
+                t.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o666,
+            )
+        };
+        if f >= 0 {
+            unsafe { libc::close(f) };
+        }
+        unsafe {
+            libc::mount(
+                s.as_ptr(),
+                t.as_ptr(),
+                ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                ptr::null(),
+            )
+        };
+    }
+}
+
+/// Mount each `vdisk:` profile at `/vdisk/<name>` in the box. A privileged ext4-on-loop mount, when
+/// the host prepared one (`host_dir`), is bind-mounted in; otherwise a `size=`-capped `tmpfs` is
+/// mounted (rootless — RAM-backed, ephemeral). Runs before pivot. The mount is a *separate* mount,
+/// so a vdisk stays writable even under `--read-only` (a vdisk is scratch space by design).
+/// Best-effort per entry.
+fn setup_vdisk(root: &str, vdisks: &[VdiskMount]) -> Result<(), Error> {
+    if vdisks.is_empty() {
+        return Ok(());
+    }
+    // A fresh box-owned `/vdisk` tmpfs (symlink-neutralized) so every per-disk mkdir/mount target is
+    // created inside a filesystem we own — a hostile image shipping `/vdisk` (or `/vdisk/<name>`) as
+    // a symlink can't redirect a vdisk mount to a host path. Mirrors `setup_dev`'s `/dev` handling.
+    make_box_tmpfs(root, "vdisk")?;
+    for vd in vdisks {
+        // The name is a single path component (validated at the CLI); guard defensively.
+        if vd.name.is_empty() || vd.name.contains('/') || vd.name.contains("..") {
+            continue;
+        }
+        let Ok(t) = cstr(&format!("{root}/vdisk/{}", vd.name)) else {
+            continue;
+        };
+        unsafe { libc::mkdir(t.as_ptr(), 0o755) };
+        // A vdisk is untrusted scratch: never honour a device node or setuid binary living on it.
+        let hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+        match &vd.host_dir {
+            // Privileged ext4-loop mount prepared on the host → bind it in, then remount to LOCK
+            // nosuid/nodev on the bind (a first bind ignores those flags — they need MS_REMOUNT).
+            Some(src) => {
+                if let Ok(s) = cstr(src) {
+                    unsafe {
+                        libc::mount(
+                            s.as_ptr(),
+                            t.as_ptr(),
+                            ptr::null(),
+                            (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+                            ptr::null(),
+                        );
+                        libc::mount(
+                            ptr::null(),
+                            t.as_ptr(),
+                            ptr::null(),
+                            (libc::MS_REMOUNT | libc::MS_BIND) as libc::c_ulong | hardening,
+                            ptr::null(),
+                        );
+                    }
+                }
+            }
+            // Rootless: a size-capped tmpfs.
+            None => {
+                let opts = match vd.size {
+                    Some(n) => format!("size={n},mode=0755"),
+                    None => "mode=0755".to_string(),
+                };
+                let ty = cstr("tmpfs")?;
+                if let Ok(o) = cstr(&opts) {
+                    unsafe {
+                        libc::mount(
+                            ty.as_ptr(),
+                            t.as_ptr(),
+                            ty.as_ptr(),
+                            hardening,
+                            o.as_ptr() as *const libc::c_void,
+                        )
+                    };
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mount each `--tmpfs PATH[:size]` as a fresh tmpfs inside the box (pre-pivot, `<root>/PATH`).
+/// `NOSUID|NODEV` — a scratch tmpfs never hosts a device node or setuid binary. The CLI already
+/// blocked the hardened mounts (`/proc`, `/sys`, `/dev`) and validated the path/size. Best-effort per
+/// entry; the mountpoint's parents are created on the way in.
+fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
+    for (path, size) in entries {
+        // Defence-in-depth: the CLI guarantees an absolute, `..`-free path, but re-check before it
+        // becomes a host-resolved (pre-pivot) mount target.
+        if !path.starts_with('/') || path.split('/').any(|c| c == "..") {
+            continue;
+        }
+        let full = format!("{root}{path}");
+        // mkdir -p the target chain inside the new root — pre-pivot, so paths resolve through the
+        // HOST root. Neutralize a symlink at EACH component first: a hostile image shipping an
+        // intermediate dir (or the leaf) as a symlink could otherwise redirect the mkdir/mount out of
+        // the rootfs. Same discipline as `setup_dev`/`setup_secrets`.
+        let mut cur = root.to_string();
+        for comp in path.split('/').filter(|c| !c.is_empty()) {
+            cur.push('/');
+            cur.push_str(comp);
+            unlink_if_symlink(&cur);
+            if let Ok(c) = cstr(&cur) {
+                unsafe { libc::mkdir(c.as_ptr(), 0o755) };
+            }
+        }
+        let opts = if size.is_empty() {
+            "mode=1777".to_string()
+        } else {
+            format!("size={size},mode=1777")
+        };
+        let hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+        if let (Ok(t), Ok(ty), Ok(o)) = (cstr(&full), cstr("tmpfs"), cstr(&opts)) {
+            unsafe {
+                libc::mount(
+                    ty.as_ptr(),
+                    t.as_ptr(),
+                    ty.as_ptr(),
+                    hardening,
+                    o.as_ptr() as *const libc::c_void,
+                )
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Expose `--secret` values as `/run/secrets/<name>` (mode 0400) inside the box. The bytes were read
+/// on the host before the fork; here we mount a fresh, box-owned, RAM-backed `tmpfs` at
+/// `/run/secrets` (so a secret never lands in the persisted overlay upper) and write each file. Runs
+/// before pivot. A hostile image shipping `/run/secrets` as a symlink is neutralised, and each file
+/// is created `O_NOFOLLOW | O_EXCL` inside the tmpfs we own — the write can't be redirected out.
+fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> Result<(), Error> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    // `/run` may not exist in a minimal rootfs; create the chain. When a wide `/run` tmpfs is already
+    // mounted (the `--ssh` path), `/run/secrets` is just a subdir on it — still RAM-backed and off the
+    // overlay upper. Otherwise mount a narrow box-owned tmpfs on `/run/secrets` (0700, NOSUID|NODEV)
+    // so the rest of the image's `/run` is left intact.
+    //
+    // This runs pre-pivot, so paths still resolve through the HOST root: a hostile image shipping
+    // `/run` (or `/run/secrets`) as a symlink would redirect these mkdir/mount calls. Neutralize a
+    // symlink at BOTH components before touching them — same discipline as `setup_dev`/`make_box_tmpfs`
+    // (the `--ssh` path already got a fresh `/run` via `make_box_tmpfs`, so this is a no-op there).
+    unlink_if_symlink(&format!("{root}/run"));
+    if let Ok(runp) = cstr(&format!("{root}/run")) {
+        unsafe { libc::mkdir(runp.as_ptr(), 0o755) };
+    }
+    let dir = format!("{root}/run/secrets");
+    let dp = cstr(&dir)?;
+    unlink_if_symlink(&dir);
+    unsafe { libc::mkdir(dp.as_ptr(), 0o700) };
+    if !run_tmpfs {
+        let ty = cstr("tmpfs")?;
+        let opts = cstr("mode=0700")?;
+        let hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+        if unsafe {
+            libc::mount(
+                ty.as_ptr(),
+                dp.as_ptr(),
+                ty.as_ptr(),
+                hardening,
+                opts.as_ptr() as *const libc::c_void,
+            )
+        } != 0
+        {
+            return Err(Error::last("mount(/run/secrets tmpfs)"));
+        }
+    }
+    for (name, bytes) in secrets {
+        // Name is a validated single component at the CLI; guard defensively before it hits a path.
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            continue;
+        }
+        let path = format!("{dir}/{name}");
+        let cp = match cstr(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // O_EXCL: the tmpfs is freshly ours, so a pre-existing entry would be an anomaly; O_NOFOLLOW:
+        // never traverse a symlink out of the tmpfs. Mode 0400 — read-only to the owner.
+        let fd = unsafe {
+            libc::open(
+                cp.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o400,
+            )
+        };
+        if fd < 0 {
+            // The tmpfs is freshly box-owned, so this shouldn't happen — but never let a secret go
+            // missing *silently* (an app would fall back to a weaker default). Say so.
+            eprintln!(
+                "kern: warning: could not materialise secret '{name}' at /run/secrets ({})",
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    bytes[off..].as_ptr() as *const libc::c_void,
+                    bytes.len() - off,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            off += n as usize;
+        }
+        unsafe { libc::close(fd) };
     }
     Ok(())
 }
@@ -948,52 +1517,102 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
 
     // Best-effort cgroup v2 cap (memory + PIDs) BEFORE namespacing, so the forked workload
     // inherits it. Degrades gracefully where the hierarchy isn't delegated.
-    let _cg = crate::cgroup::apply_limits(&spec.hostname, spec.memory_max, spec.cpus);
+    let _cg = crate::cgroup::apply_limits(
+        &spec.hostname,
+        spec.memory_max,
+        spec.memory_swap_max,
+        spec.cpuset.as_deref(),
+        spec.cpus,
+        spec.pids_max,
+        &spec.io_max,
+        spec.io_weight,
+    );
 
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
 
-    // Full namespace set: user + PID + UTS (hostname) + IPC, and — unless `--net` shares the host
-    // network — an isolated (loopback-only) network namespace. The mount namespace is unshared in
-    // the child (so its pivot doesn't touch the parent). With CLONE_NEWPID the *next* fork becomes
-    // PID 1.
-    let mut ns_flags =
-        libc::CLONE_NEWUSER | libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
-    if !spec.share_net {
-        ns_flags |= libc::CLONE_NEWNET;
-    }
-    // Map the user namespace. The DEFAULT is the dependency-free single-uid identity map (box uid
-    // 0 = caller) — no subprocess, one extra id in the namespace: the fastest and most isolated
-    // option. `--uid-range` opts into a FULL subordinate range (box uid 0 → caller, uids 1..N →
-    // the caller's `/etc/subuid` range) so software that drops to or `chown`s *other* uids works
-    // (`apt`/`dpkg`, daemons that drop to `www-data`, …); it needs the setuid `newuidmap`/
-    // `newgidmap` helpers and costs two subprocesses at start.
-    let range = if spec.uid_range {
-        let r = detect_id_range(euid, egid);
-        if r.is_none() {
-            // Requested but unavailable — don't silently behave as if mapped: tell the user, then
-            // fall through to the safe single-uid map (apt-style workloads just won't have extra uids).
-            eprintln!(
-                "kern: --uid-range requested but unavailable (need newuidmap/newgidmap + an /etc/subuid+/etc/subgid allocation) — using single-uid map"
-            );
-        }
-        r
-    } else {
-        None
-    };
-    match range {
-        Some(range) => apply_userns_range(ns_flags, euid, egid, &range)?,
-        None => {
-            if unsafe { libc::unshare(ns_flags) } != 0 {
-                let e = std::io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EPERM) {
-                    return Err(Error::Unsupported(
-                        "unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)",
-                    ));
-                }
-                return Err(Error::Syscall("unshare(namespaces)", e));
+    // `--pod`: JOIN the pod holder's existing user + net namespace (created by `kern pod create`)
+    // instead of unsharing our own — so every box in the pod shares one loopback network. We start
+    // in the host user ns, where we are privileged over our descendant holder, so we can `setns`
+    // into it; then we unshare only pid/uts/ipc (mount is unshared in the child). No uid map — the
+    // holder already mapped the pod user ns. This branch is fully separate from the normal one, so a
+    // non-pod box is byte-for-byte unaffected.
+    if let Some(holder) = spec.pod_holder {
+        let open_ns = |kind: &str| -> i32 {
+            let p = format!("/proc/{holder}/ns/{kind}\0");
+            unsafe {
+                libc::open(
+                    p.as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
             }
-            write_single_uid_map(euid, egid)?;
+        };
+        let (user, net) = (open_ns("user"), open_ns("net"));
+        if user < 0 || net < 0 {
+            return Err(Error::Unsupported(
+                "pod holder is gone (create the pod first with `kern pod create`)",
+            ));
+        }
+        if unsafe { libc::setns(user, libc::CLONE_NEWUSER) } != 0
+            || unsafe { libc::setns(net, libc::CLONE_NEWNET) } != 0
+        {
+            let e = std::io::Error::last_os_error();
+            return Err(Error::Syscall("setns(pod user+net)", e));
+        }
+        unsafe {
+            libc::close(user);
+            libc::close(net);
+        }
+        let rest = libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        if unsafe { libc::unshare(rest) } != 0 {
+            return Err(Error::Syscall(
+                "unshare(pid+uts+ipc)",
+                std::io::Error::last_os_error(),
+            ));
+        }
+    } else {
+        // Full namespace set: user + PID + UTS (hostname) + IPC, and — unless `--net` shares the host
+        // network — an isolated (loopback-only) network namespace. The mount namespace is unshared in
+        // the child (so its pivot doesn't touch the parent). With CLONE_NEWPID the *next* fork
+        // becomes PID 1.
+        let mut ns_flags =
+            libc::CLONE_NEWUSER | libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        if !spec.share_net {
+            ns_flags |= libc::CLONE_NEWNET;
+        }
+        // Map the user namespace. The DEFAULT is the dependency-free single-uid identity map (box uid
+        // 0 = caller) — no subprocess, one extra id in the namespace: the fastest and most isolated
+        // option. `--uid-range` opts into a FULL subordinate range (box uid 0 → caller, uids 1..N →
+        // the caller's `/etc/subuid` range) so software that drops to or `chown`s *other* uids works
+        // (`apt`/`dpkg`, daemons that drop to `www-data`, …); it needs the setuid `newuidmap`/
+        // `newgidmap` helpers and costs two subprocesses at start.
+        let range = if spec.uid_range {
+            let r = detect_id_range(euid, egid);
+            if r.is_none() {
+                // Requested but unavailable — don't silently behave as if mapped: tell the user, then
+                // fall through to the safe single-uid map (apt-style workloads just lack extra uids).
+                eprintln!(
+                    "kern: --uid-range requested but unavailable (need newuidmap/newgidmap + an /etc/subuid+/etc/subgid allocation) — using single-uid map"
+                );
+            }
+            r
+        } else {
+            None
+        };
+        match range {
+            Some(range) => apply_userns_range(ns_flags, euid, egid, &range)?,
+            None => {
+                if unsafe { libc::unshare(ns_flags) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::EPERM) {
+                        return Err(Error::Unsupported(
+                            "unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)",
+                        ));
+                    }
+                    return Err(Error::Syscall("unshare(namespaces)", e));
+                }
+                write_single_uid_map(euid, egid)?;
+            }
         }
     }
 
@@ -1023,12 +1642,27 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                 // than leaking a bare `execvp failed: ... (os error 2)`.
                 if let Error::Syscall("execvp", io) = &e {
                     let cmd = spec.command.first().map(String::as_str).unwrap_or("?");
-                    eprintln!(
-                        "kern: cannot start '{cmd}' in box: {io}\n\
-                         hint: the command must exist inside the box (try a full path like \
-                         /bin/sh) and, if dynamically linked, its libraries/loader must be \
-                         present in the rootfs"
-                    );
+                    // A permission-denied exec while dropped to a non-root `--user` is almost always
+                    // the uid, not a missing command: in a rootless box the overlay rootfs is owned
+                    // by the box's root uid and a dropped uid can't traverse/exec it. Name the real
+                    // cause instead of sending the user to check paths and loaders.
+                    let dropped = matches!(spec.run_as, Some((u, _)) if u != 0);
+                    if io.kind() == std::io::ErrorKind::PermissionDenied && dropped {
+                        let uid = spec.run_as.map(|(u, _)| u).unwrap_or(0);
+                        eprintln!(
+                            "kern: cannot start '{cmd}' as uid {uid} in box: {io}\n\
+                             hint: a rootless box's rootfs is owned by the box's root uid, so a \
+                             non-root --user often can't exec it — drop --user (runs as the box's \
+                             root) or provide a rootfs owned by uid {uid}"
+                        );
+                    } else {
+                        eprintln!(
+                            "kern: cannot start '{cmd}' in box: {io}\n\
+                             hint: the command must exist inside the box (try a full path like \
+                             /bin/sh) and, if dynamically linked, its libraries/loader must be \
+                             present in the rootfs"
+                        );
+                    }
                 } else {
                     eprintln!("kern: sandbox setup failed: {e}");
                 }
@@ -1161,32 +1795,94 @@ fn write_all(fd: i32, mut data: &[u8]) {
 /// FSETID, KILL, SETUID, SETGID, SETPCAP, NET_BIND_SERVICE, NET_RAW, NET_ADMIN (also used for `lo`),
 /// SYS_CHROOT, MKNOD, SETFCAP, IPC_*, SYS_NICE/RESOURCE/PTRACE, … Best-effort; an unknown cap number
 /// on an older kernel just fails harmlessly.
-fn drop_dangerous_caps() {
-    // Kernel-stable cap numbers (used directly so we don't depend on newer libc constants).
-    const DROP: &[u32] = &[
-        16, // SYS_MODULE     load kernel modules
-        17, // SYS_RAWIO      raw I/O ports, /dev/mem, ioperm
-        20, // SYS_PACCT      process accounting
-        22, // SYS_BOOT       reboot / kexec_load
-        25, // SYS_TIME       set system / RTC clock
-        30, // AUDIT_CONTROL
-        32, // MAC_OVERRIDE   bypass MAC (SELinux/AppArmor)
-        33, // MAC_ADMIN
-        34, // SYSLOG         syslog(2) / kernel pointers
-        35, // WAKE_ALARM
-        37, // AUDIT_READ
-        38, // PERFMON        perf_event_open
-        39, // BPF            load BPF programs
-    ];
-    let lo: u32 = DROP
-        .iter()
-        .filter(|&&c| c < 32)
-        .fold(0, |m, &c| m | (1 << c));
-    let hi: u32 = DROP
-        .iter()
-        .filter(|&&c| c >= 32)
-        .fold(0, |m, &c| m | (1 << (c - 32)));
+/// The default set of never-needed dangerous caps kern always drops (kernel-stable numbers, used
+/// directly so we don't depend on newer libc constants).
+const DEFAULT_DROP: &[u32] = &[
+    16, // SYS_MODULE     load kernel modules
+    17, // SYS_RAWIO      raw I/O ports, /dev/mem, ioperm
+    20, // SYS_PACCT      process accounting
+    22, // SYS_BOOT       reboot / kexec_load
+    25, // SYS_TIME       set system / RTC clock
+    30, // AUDIT_CONTROL
+    32, // MAC_OVERRIDE   bypass MAC (SELinux/AppArmor)
+    33, // MAC_ADMIN
+    34, // SYSLOG         syslog(2) / kernel pointers
+    35, // WAKE_ALARM
+    37, // AUDIT_READ
+    38, // PERFMON        perf_event_open
+    39, // BPF            load BPF programs
+];
 
+/// `--cap-add`/`--cap-drop` policy layered on top of the always-dropped [`DEFAULT_DROP`] set. Cap
+/// numbers (not names) — the CLI resolves names and rejects unknown ones before the fork. Default
+/// (`Default::default()`) drops exactly the dangerous set. All cap numbers are < 64 (the current
+/// `CAP_LAST_CAP` is 40), so a single `u64` bitmask covers the whole set.
+#[derive(Default, Clone)]
+pub struct CapSpec {
+    /// `--cap-drop ALL`: drop every capability up to `CAP_LAST_CAP` (minus `adds`).
+    pub drop_all: bool,
+    /// Extra caps to drop beyond the default dangerous set.
+    pub drops: Vec<u32>,
+    /// Caps to KEEP — removed from the computed drop set (so `--cap-add` wins over a drop).
+    pub adds: Vec<u32>,
+}
+
+/// The kernel's `CAP_LAST_CAP`, read from procfs (so a newer kernel's caps are covered by
+/// `--cap-drop ALL`); falls back to 40 (`CAP_CHECKPOINT_RESTORE`) where the file is unreadable.
+fn cap_last_cap() -> u32 {
+    std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n < 64) // our bitmask is 64-bit; guard against a pathological value
+        .unwrap_or(40)
+}
+
+/// The capability drop set as a u64 bitmask (every cap number is < 64): always the dangerous
+/// [`DEFAULT_DROP`] set, plus whatever `--cap-drop` adds (or *everything* for `--cap-drop ALL`),
+/// minus whatever `--cap-add` keeps.
+fn cap_drop_mask(spec: &CapSpec) -> u64 {
+    let mut mask: u64 = if spec.drop_all {
+        let last = cap_last_cap();
+        // bits 0..=last
+        if last >= 63 {
+            u64::MAX
+        } else {
+            (1u64 << (last + 1)) - 1
+        }
+    } else {
+        DEFAULT_DROP.iter().fold(0u64, |m, &c| m | (1u64 << c))
+    };
+    for &c in &spec.drops {
+        if c < 64 {
+            mask |= 1u64 << c;
+        }
+    }
+    // `--cap-add` wins: keep these even if the default set / ALL would drop them.
+    for &c in &spec.adds {
+        if c < 64 {
+            mask &= !(1u64 << c);
+        }
+    }
+    mask
+}
+
+/// Drop the masked capabilities from the **bounding** set (`PR_CAPBSET_DROP`), so a file-cap binary
+/// can't re-add them later. Needs `CAP_SETPCAP` in the *effective* set, so it must run BEFORE the
+/// effective set is cleared and BEFORE any `setuid` to a non-root user (which sheds effective caps).
+fn drop_cap_bounding(mask: u64) {
+    for c in 0..64u32 {
+        if mask & (1u64 << c) != 0 {
+            unsafe { libc::prctl(libc::PR_CAPBSET_DROP, c as libc::c_ulong, 0, 0, 0) };
+        }
+    }
+}
+
+/// Clear the masked capabilities from the live effective/permitted/inheritable sets (the workload
+/// won't hold them after exec). For a non-root `--user`, `setuid` has already emptied these; this
+/// still matters for a root box and is a harmless no-op otherwise.
+fn clear_caps_from_sets(mask: u64) {
+    let lo = (mask & 0xffff_ffff) as u32;
+    let hi = (mask >> 32) as u32;
     #[repr(C)]
     struct CapHeader {
         version: u32,
@@ -1209,7 +1905,6 @@ fn drop_dangerous_caps() {
         inheritable: 0,
     }; 2];
     unsafe {
-        // Clear the dangerous caps from the live sets (the workload won't hold them after exec).
         if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) == 0 {
             data[0].effective &= !lo;
             data[0].permitted &= !lo;
@@ -1219,11 +1914,18 @@ fn drop_dangerous_caps() {
             data[1].inheritable &= !hi;
             libc::syscall(libc::SYS_capset, &hdr as *const _, data.as_ptr());
         }
-        // Drop them from the bounding set too, so a file-cap binary can't re-add them.
-        for &c in DROP {
-            libc::prctl(libc::PR_CAPBSET_DROP, c as libc::c_ulong, 0, 0, 0);
-        }
     }
+}
+
+/// Drop capabilities for the workload: always the dangerous [`DEFAULT_DROP`] set, plus `--cap-drop`
+/// (or *everything* for `--cap-drop ALL`), minus `--cap-add`. Clears the effective/permitted/
+/// inheritable sets AND the bounding set. Used where NO `--user` switch follows (e.g. `kern exec`);
+/// the box workload path splits this around `set_user` (bounding drop → setuid → effective clear) so
+/// that `--cap-drop ALL` doesn't strip `CAP_SETUID`/`SETGID` before the user switch needs them.
+fn drop_dangerous_caps(spec: &CapSpec) {
+    let mask = cap_drop_mask(spec);
+    drop_cap_bounding(mask);
+    clear_caps_from_sets(mask);
 }
 
 /// After `fork()`, close every inherited fd in `3..1024` except `keep` (pass `-1` to keep none).
@@ -1261,6 +1963,42 @@ fn bring_loopback_up() {
     }
 }
 
+/// Create and HOLD a pod's shared user + net namespace, then block forever. `kern pod create` forks
+/// this as a detached holder process; `--pod` boxes `setns` into `/proc/<holder>/ns/{user,net}` to
+/// share its loopback network. Unshares a fresh user ns (single-uid map: pod-root = the caller) + a
+/// fresh net ns, brings its loopback up, then `pause()`s so the namespaces stay alive until the
+/// holder is killed (`kern pod rm`). Never returns.
+pub fn run_pod_holder() -> ! {
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EPERM) {
+            eprintln!(
+                "kern: pod: unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)"
+            );
+        } else {
+            eprintln!("kern: pod: unshare(user+net) failed: {e}");
+        }
+        unsafe { libc::_exit(1) };
+    }
+    // Single-uid self-map (pod-root = caller). A pod is the network trust unit; members share this
+    // user ns, so per-member uid ranges aren't offered here.
+    if write_single_uid_map(euid, egid).is_err() {
+        eprintln!("kern: pod: could not map the pod user namespace");
+        unsafe { libc::_exit(1) };
+    }
+    bring_loopback_up();
+    // Signal readiness (the parent waits for this line on our stdout) so `kern pod create` only
+    // records the holder once its namespaces are actually set up.
+    println!("pod-ready");
+    unsafe {
+        libc::close(libc::STDOUT_FILENO);
+    }
+    loop {
+        unsafe { libc::pause() };
+    }
+}
+
 /// Decode a `waitpid` status into a shell-style exit code (128+signal if killed).
 fn wait_code(status: i32) -> i32 {
     if libc::WIFEXITED(status) {
@@ -1288,6 +2026,7 @@ pub fn exec_in_box(
     workdir: Option<&str>,
     tty_slave: Option<i32>,
     tty_master: Option<i32>,
+    timeout_secs: Option<u64>,
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -1352,6 +2091,24 @@ pub fn exec_in_box(
         return Err(Error::last("fork"));
     }
     if pid == 0 {
+        // For a `--health-timeout` probe: become a **session leader** (`setsid`) so this grandchild is
+        // a new process-group/session leader inside the box's pid namespace whose host-visible id is
+        // `pid` — the probe and everything it forks then live in that group, so the parent can
+        // `kill(-pid)` the whole subtree on timeout. Also arm `PR_SET_PDEATHSIG(SIGKILL)` so if the
+        // waiting stub dies for any reason the probe is torn down too. Skip under a tty (the terminal
+        // pump owns the session).
+        if tty_slave.is_none() && timeout_secs.is_some() {
+            unsafe {
+                libc::setsid();
+                libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
         set_clean_env("", env);
         // `-it`: adopt the PTY slave as the controlling terminal (before seccomp — a setup syscall).
         if let Some(slave) = tty_slave {
@@ -1366,7 +2123,17 @@ pub fn exec_in_box(
                 unsafe { libc::_exit(127) };
             }
         }
-        let _ = crate::seccomp::install();
+        // Parity with a box's own workload: drop the always-dropped dangerous caps here too, so an
+        // `exec`'d command isn't more privileged than the box's PID 1 (which ran `drop_dangerous_caps`
+        // + seccomp before its own exec). The box's *custom* `--cap-drop`/`--user` aren't reapplied —
+        // they aren't recorded per box — but the dangerous baseline + seccomp match.
+        drop_dangerous_caps(&CapSpec::default());
+        // Fail CLOSED if seccomp can't install — never run the exec'd command unfiltered (the box's
+        // PID 1 fails closed on this same call; `exec` must match, not fall through unprotected).
+        if crate::seccomp::install().is_err() {
+            eprintln!("kern: exec: seccomp filter could not be installed — refusing to run");
+            unsafe { libc::_exit(126) };
+        }
         eprintln!("kern: exec failed: {}", exec(&argv));
         unsafe { libc::_exit(127) };
     }
@@ -1379,10 +2146,41 @@ pub fn exec_in_box(
         return Ok(pty_pump_and_wait(master, pid));
     }
     let mut status = 0i32;
-    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-        return Err(Error::last("waitpid"));
+    match timeout_secs {
+        // `--health-timeout`: poll, and on expiry SIGKILL the whole probe group (the in-box grandchild
+        // and anything it spawned), then reap — so a hung probe can't leak a live process into the box
+        // every interval. Returns 124 (the `timeout(1)` convention) on expiry.
+        Some(secs) if secs > 0 => {
+            let mut waited_ms = 0u64;
+            loop {
+                let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if r == pid {
+                    return Ok(wait_code(status));
+                }
+                if r < 0 {
+                    return Err(Error::last("waitpid"));
+                }
+                if waited_ms >= secs * 1000 {
+                    // Kill the probe's whole session/group (the grandchild made itself the leader), so
+                    // a probe that forked helpers is fully torn down — not just its top process; then
+                    // reap the grandchild. `kill(-pid)` is the load-bearing one; the direct `kill(pid)`
+                    // covers the (skipped-setsid) edge.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    return Ok(124);
+                }
+                unsafe { libc::usleep(100_000) }; // 100 ms
+                waited_ms += 100;
+            }
+        }
+        _ => {
+            if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+                return Err(Error::last("waitpid"));
+            }
+            Ok(wait_code(status))
+        }
     }
-    Ok(wait_code(status))
 }
 
 #[cfg(test)]
