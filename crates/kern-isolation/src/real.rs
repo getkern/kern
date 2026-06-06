@@ -1442,11 +1442,12 @@ fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
     if let Err(e) = std::fs::write("/proc/self/setgroups", b"deny") {
         // Denying setgroups is the kernel's prerequisite for an unprivileged `gid_map`. Ubuntu's
         // `apparmor_restrict_unprivileged_userns` policy can let a userns be created (full caps, empty
-        // maps) yet still EPERM *this* write — the environment permits the namespace but not a rootless
-        // id map, so a box genuinely can't run here. Report it as unsupported (and name user namespaces)
-        // so foreground and detached fail identically and the skip-graceful tests skip either way,
-        // rather than leaking a bare "setgroups: Permission denied".
-        if e.raw_os_error() == Some(libc::EPERM) {
+        // maps) yet still refuse *this* write with EACCES (the AppArmor mediation) or EPERM (a plain
+        // kernel denial) — the environment permits the namespace but not a rootless id map, so a box
+        // genuinely can't run here. Report it as unsupported (and name user namespaces) so foreground
+        // and detached fail identically and the skip-graceful tests skip either way, rather than
+        // leaking a bare "setgroups: Permission denied".
+        if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
             return Err(Error::Unsupported(
                 "unprivileged user namespaces are restricted here — an AppArmor \
                  apparmor_restrict_unprivileged_userns policy allows the namespace but blocks \
