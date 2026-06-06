@@ -1439,7 +1439,28 @@ fn apply_userns_range(
 /// unprivileged `gid_map`), then the one-row uid/gid maps. Shared by the no-range default and the
 /// `--uid-range` fallback for when the id-mapping helpers can't apply a range.
 fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
-    std::fs::write("/proc/self/setgroups", b"deny").map_err(|e| Error::Syscall("setgroups", e))?;
+    if let Err(e) = std::fs::write("/proc/self/setgroups", b"deny") {
+        // DIAG (temporary): setgroups=deny is EPERM'ing on the CI runner for detached boxes but not
+        // foreground ones. Dump the process/userns state — in a detached box stderr IS the per-box
+        // log, so `await_box_started` surfaces this tail and we can read it from the CI log.
+        let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{e}>"));
+        let status = rd("/proc/self/status");
+        let grep = |k: &str| {
+            status
+                .lines()
+                .find(|l| l.starts_with(k))
+                .unwrap_or("<none>")
+        };
+        eprintln!(
+            "DIAG setgroups=deny failed: {e} | euid={euid} egid={egid} | {} | {} | setgroups='{}' uid_map='{}' gid_map='{}'",
+            grep("Threads:"),
+            grep("CapEff:"),
+            rd("/proc/self/setgroups").trim(),
+            rd("/proc/self/uid_map").trim(),
+            rd("/proc/self/gid_map").trim(),
+        );
+        return Err(Error::Syscall("setgroups", e));
+    }
     std::fs::write("/proc/self/uid_map", format!("0 {euid} 1"))
         .map_err(|e| Error::Syscall("uid_map", e))?;
     std::fs::write("/proc/self/gid_map", format!("0 {egid} 1"))
