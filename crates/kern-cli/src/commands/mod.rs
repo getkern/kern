@@ -2097,6 +2097,18 @@ fn ports_summary(ports: &[(u32, u16, u16)]) -> String {
         .join(", ")
 }
 
+/// Read the last `max` bytes of `path`, trimmed, or `None` if the file is missing/empty. Used to
+/// surface a failed detached box's reason inline (the box logged it to its own stderr sink). Reads
+/// the whole file — a box that "exited before starting" has only a few lines — and keeps the tail
+/// lossily so non-UTF-8 output can't hide the reason.
+fn read_log_tail(path: &std::path::Path, max: usize) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let start = data.len().saturating_sub(max);
+    let tail = String::from_utf8_lossy(&data[start..]);
+    let t = tail.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// Foreground-launcher side of a detached start: block on the readiness pipe until the box `exec`s
 /// (EOF = up) or signals failure (one byte → reap the supervisor and report why), then print the
 /// "started" line. With no pipe it just announces. Retries the read on `EINTR` so a stray signal
@@ -2122,11 +2134,25 @@ fn await_box_started(
         if n > 0 {
             let mut st = 0i32;
             unsafe { libc::waitpid(child, &mut st, 0) };
-            return Err(Error::Sandbox(format!(
-                "box '{}' exited before starting — run `kern logs {}` for the reason",
-                name.as_str(),
-                name.as_str()
-            )));
+            // The box's own error went to its per-box log (its stderr was detached there), so the
+            // launcher only knows it died. `waitpid` above has reaped the supervisor, so the log is
+            // now fully written — surface its tail inline. This turns the failure from an opaque
+            // "run `kern logs`" round-trip into a reason the user (and a skip-graceful test) can act
+            // on immediately, e.g. "unprivileged user namespaces are unavailable" on a locked host.
+            // The log is named `<name>-<supervisor pid>.log`, and `child` IS that supervisor pid.
+            let n = name.as_str();
+            let reason = registry::logs_dir()
+                .ok()
+                .map(|d| d.join(format!("{n}-{child}.log")))
+                .and_then(|p| read_log_tail(&p, 1024));
+            return Err(Error::Sandbox(match reason {
+                Some(r) => format!(
+                    "box '{n}' exited before starting:\n{r}\n(run `kern logs {n}` for the full log)"
+                ),
+                None => {
+                    format!("box '{n}' exited before starting — run `kern logs {n}` for the reason")
+                }
+            }));
         }
     }
     let p = crate::ui::Palette::detect();
