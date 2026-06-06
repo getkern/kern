@@ -127,6 +127,33 @@ pub struct OldRootReady;
 pub struct ReadOnly;
 
 /// A sandbox root filesystem tracked through its setup states.
+///
+/// The setup order — mount → pivot → remount read-only — is encoded in the type: each step consumes
+/// the previous state and returns the next, and [`into_readonly`](Rootfs::into_readonly) is
+/// implemented only for `Rootfs<OldRootReady>`. Remounting the root read-only *before* the pivot — a
+/// classic sandbox-escape shape — is therefore a compile error, not a test you hope you wrote:
+///
+/// ```compile_fail
+/// use kern_isolation::{MountMode, Recorder, Rootfs};
+/// let mut ops = Recorder::default();
+/// // `into_readonly` doesn't exist on `Rootfs<Mounted>` (before the pivot) — this fails to compile.
+/// let _ = Rootfs::mount(&mut ops, MountMode::Bind, "/r")
+///     .unwrap()
+///     .into_readonly(&mut ops);
+/// ```
+///
+/// The legal order compiles and runs:
+///
+/// ```
+/// use kern_isolation::{MountMode, Recorder, Rootfs};
+/// let mut ops = Recorder::default();
+/// let _ro = Rootfs::mount(&mut ops, MountMode::Bind, "/r")
+///     .unwrap()
+///     .create_old_root(&mut ops)
+///     .unwrap()
+///     .into_readonly(&mut ops)
+///     .unwrap();
+/// ```
 pub struct Rootfs<S> {
     root: String,
     _state: PhantomData<S>,
