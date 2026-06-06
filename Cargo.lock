@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "getkern"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "kern-common",
  "kern-isolation",
@@ -14,18 +14,18 @@ dependencies = [
 
 [[package]]
 name = "kern-common"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "kern-isolation"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "kern-oci"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "libc"
