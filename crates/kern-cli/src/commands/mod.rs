@@ -3155,7 +3155,7 @@ pub fn history(count: usize) -> Result<(), Error> {
             rows.push((name.to_string(), pid, mtime, alive));
         }
     }
-    rows.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
+    rows.sort_by_key(|b| std::cmp::Reverse(b.2)); // newest first
     rows.truncate(count);
     let p = crate::ui::Palette::detect();
     if rows.is_empty() {
