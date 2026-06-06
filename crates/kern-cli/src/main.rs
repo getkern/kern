@@ -11,6 +11,8 @@ mod cli;
 mod commands;
 mod compose;
 mod error;
+mod ports;
+mod pty;
 mod registry;
 mod sandbox;
 mod tui;

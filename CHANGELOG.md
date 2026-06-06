@@ -4,14 +4,90 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to SemVer.
 Pre-1.0: the CLI and config surface are NOT frozen; minor versions may break them.
 
-## [Unreleased] — 0.4 (in progress)
+## [0.4.0] — 2026-06-28
+
+The resource-governor verb (`kern run`), tunable CPU/memory caps, interactive PTY, port
+publishing, restart/health supervision, and a defense-in-depth hardening pass (least-privilege
+capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adversarial pentest.
 
 ### Added
+- **`kern box` status panel** — a foreground box now prints an aligned, colour-coded posture summary
+  (cmd · fs · net · seccomp/caps/userns guard · limits · mounts; `-it` adds an exit hint) with an
+  **actionable warning block** for
+  the deliberately-open choices (`--net`, `--bind-rootfs`), each with a one-line fix. Colour is
+  semantic (green = isolated, yellow = open-but-chosen), the seccomp count is read live (never
+  drifts), untrusted fields (image ref, command) are **stripped of terminal-escape sequences**
+  before display (no ANSI/title/cursor spoofing), and it degrades cleanly: ASCII glyphs when the
+  locale isn't UTF-8, width from
+  `TIOCGWINSZ`/`$COLUMNS`, **plain when `NO_COLOR`** is set. Printed to **stderr only when stderr is
+  a TTY**, so pipes, scripts and `kern logs` stay clean; a detached box prints a one-line
+  `✔ started <name>` with the next-step commands instead.
+- **Unified table styling** — `kern ps`/`stats`/`images`/`search` now share the panel's visual
+  standard on a TTY: a **dim header**, **bold-cyan NAME**, **semantic colour** for status (green
+  `healthy` / red `unhealthy` in `ps`, a green ✓ for an official image in `search`), and `ps`
+  truncates a long `COMMAND` to the terminal width with a dynamically-sized `PORTS` column so the
+  table never wraps. All of it is **gated to a TTY** — piped/`NO_COLOR` output stays plain and
+  full-width for scripts, and column alignment is computed on the uncoloured cells.
+- **`kern box … -p [ip:]host:box` (port publishing)** — reach a service inside an isolated box from
+  the host. A rootless userspace TCP forwarder is forked **before** the sandbox `unshare` (so it
+  stays in the host network namespace, binding the host port); per connection it forks a
+  single-threaded connector that joins the box's user+net namespaces (as `kern exec` does) and
+  connects to the box's `127.0.0.1:<box>`. The optional bind IP **defaults to `127.0.0.1`**
+  (loopback-only); pass `-p 0.0.0.0:H:B` to expose on all interfaces (a warning is printed).
+  Repeatable; foreground + detached; torn down when the box exits.
+- **`kern box -d --restart`** — restart a detached box if it exits non-zero (on-failure policy),
+  up to a cap (10) with a 1 s backoff so a box that crashes on every start eventually gives up.
+  Each attempt runs in a fresh child (the sandbox `unshare` mutates its caller, so it can't be
+  re-run in place).
+- **`kern box -d --health-cmd <cmd> [--health-interval N]`** — a sidecar process probes the box
+  (`/bin/sh -c <cmd>` via `kern exec`, exit 0 = healthy) every N seconds (default 30) and records
+  `healthy`/`unhealthy` for `kern ps`. It follows `--restart`s (re-reads the box's PID 1 each round).
+- **`kern ps` shows `HEALTH` and `PORTS` columns** (and the same fields in `--json`): the current
+  health status and the published `-p` mappings (e.g. `8080->80, 127.0.0.1:443->443`). The `PORTS`
+  column sizes to its widest value and, on a TTY, `COMMAND` is truncated to the terminal width so a
+  long command never wraps the table (like `docker ps`); piped output prints the full command.
+- **`kern box … -it` and `kern exec … -it` (interactive PTY)** — allocate a pseudo-terminal so a
+  box (or a command exec'd into a running box) runs a real interactive shell/REPL: it gets a
+  controlling tty (`isatty` true), the host terminal goes raw, the window size is copied in and
+  `SIGWINCH` resizes are forwarded, and the exit code propagates. `box -it` is foreground only
+  (rejects `-d`). The byte pump is single-threaded by design — the sandbox fork must run in a
+  single-threaded process — so there's no fork-in-thread hazard. (`exec -it` shares the same
+  PTY plumbing as `box -it` via a common `adopt_controlling_tty` helper.)
+- **`kern run [--memory M] [--cpus N] [--] <cmd...>`** — the resource-governor verb: run a command
+  under cgroup CPU/memory caps **without** a sandbox (no namespaces/seccomp). It `exec`s the command
+  (no fork) so it's the leanest path — a transient capped cgroup + `exec` — and propagates the
+  command's exit code. `--cpus` is clamped once to the host's physical CPU count (consistent across
+  the systemd scope and the in-namespace cgroup).
 - **`--memory`/`-m` and `--cpus` per box** — tunable resource caps (previously a fixed 512 MiB /
   uncapped CPU). `--memory 512m|1g|<bytes>` sets a hard memory ceiling (the box is OOM-killed at the
   limit); `--cpus 1.5` caps CPU to 1½ cores (K8s semantics, clamped to the host's CPU count). Both
   the transient systemd scope and the best-effort in-namespace cgroup honor them; the CPU cap is
   best-effort where the cgroup CPU controller isn't delegated (e.g. some Android kernels).
+
+### Security (defense-in-depth, from an adversarial pentest of the box)
+- **`-p` binds `127.0.0.1` by default** (was `0.0.0.0`) — a published service is no longer
+  accidentally exposed to the LAN. Use `-p 0.0.0.0:H:B` to bind all interfaces deliberately (a
+  warning is printed when you do). `kern ps` now shows the bind address per mapping.
+- **Least-privilege capabilities**: the box drops never-needed dangerous caps (SYS_MODULE,
+  SYS_RAWIO, SYS_BOOT, SYS_TIME, SYSLOG, MAC_ADMIN/OVERRIDE, AUDIT_CONTROL/READ, WAKE_ALARM,
+  PERFMON, BPF, SYS_PACCT) from its effective/permitted/inheritable **and** bounding sets just
+  before exec, so neither the workload nor a setuid/file-cap binary can wield them. Workload caps
+  (CHOWN, DAC_*, SETUID/SETGID, NET_BIND/RAW/ADMIN, SYS_CHROOT, MKNOD, …) are kept — `apk`/`apt`,
+  `chown`, and privilege-drop still work. (These caps are namespaced, i.e. already grant no host
+  power; this shrinks the surface against cap-gated kernel bugs.) Pentest confirmed the box blocks
+  mount/pivot/setns/unshare (seccomp), device/kernel-memory access, the classic container escapes
+  (core_pattern, cgroup release_agent CVE-2022-0492, sysrq), fork-bomb (pids cap), and cross-box
+  FS/PID/net access.
+
+### Fixed
+- **A box's loopback (`lo`) is now brought up** in its isolated network namespace, so `127.0.0.1`
+  works inside the box (a fresh net ns leaves `lo` DOWN). `--net` boxes keep the host's loopback.
+
+### Changed
+- **Release profile is now `opt-level = "z"` (size-optimised).** The new 0.4 features grew the
+  binary; since kern's cold start is syscall-bound (`unshare`/`mount`/`exec`), not CPU-bound, size
+  codegen shrinks it ~14% (musl x86_64 804 → **688 KB**, glibc **594 KB**) with **no** latency cost
+  — measured a hair faster (better I-cache). There is no hot CPU path to slow down.
 
 ## [0.3.3] — contextual hint for box-not-running errors
 
@@ -294,6 +370,7 @@ Pre-1.0: the CLI and config surface are NOT frozen; minor versions may break the
 - Project docs: README, SECURITY, ARCHITECTURE, CONTRIBUTING, CLA, CODE_OF_CONDUCT.
 - CI: build + test + clippy + fmt + cargo-audit + cargo-deny on x86 (skip-graceful for HW).
 
-[0.3.0]: https://github.com/getkern/kern/commits/main
+[0.4.0]: https://github.com/getkern/kern/releases/tag/v0.4.0
+[0.3.0]: https://github.com/getkern/kern/releases/tag/v0.3.0
 [0.2.0]: https://github.com/getkern/kern/releases/tag/v0.2.0
 [0.1.0]: https://github.com/getkern/kern/releases/tag/v0.1.0

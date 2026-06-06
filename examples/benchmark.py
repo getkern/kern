@@ -6,11 +6,15 @@ whatever runtimes are installed (kern, bubblewrap, crun, runc, podman, docker). 
 reported as **total time / N** over N sequential runs — at sub-millisecond scale a per-call
 timer (its own fork+exec) would dominate, so we never time a single run on its own.
 
-    python3 examples/benchmark.py                 # auto-detect everything, 200 runs
+    python3 examples/benchmark.py                 # auto-detect everything, 200 runs + 200 parallel
     python3 examples/benchmark.py --runs 500
+    python3 examples/benchmark.py --conc 50       # lighter concurrency (e.g. on an edge board)
     KERN=./target/release/kern python3 examples/benchmark.py
 
-Stdlib only, no dependencies. Honest caveat: the top tier sits within a couple ms of each
+It prints the same three tables as BENCHMARKS.md — cold-start (median/min/max), throughput
+(runs/s, same data), and concurrency (N parallel, wall-clock) — for whatever runtimes are
+installed, so anyone can reproduce the published numbers on their own machine. Stdlib only,
+no dependencies. Honest caveat: the top tier sits within a couple ms of each
 other and of run-to-run noise — nobody "wins" single-shot latency outright. The real gap is to
 the engines (podman/docker), which fork conmon / round-trip a daemon every run.
 """
@@ -83,6 +87,7 @@ def main():
     ap = argparse.ArgumentParser(description="Reproduce the kern Performance benchmark.")
     ap.add_argument("--runs", type=int, default=200, help="runs per batch (default 200)")
     ap.add_argument("--repeat", type=int, default=5, help="batches per runtime, for min/median/max (default 5)")
+    ap.add_argument("--conc", type=int, default=200, help="parallel starts for the concurrency test (0 = skip; default 200)")
     ap.add_argument("--rootfs", help="an existing Alpine rootfs dir (else pulled with kern)")
     args = ap.parse_args()
 
@@ -167,6 +172,23 @@ def main():
         print(f"\n  Not runnable on this machine (kern is — that's the point):")
         for s in skipped:
             print(f"    ✗ {s}")
+
+    # Concurrency — fan out `conc` isolated starts in parallel (all at once), wall-clock + success
+    # count. This is the daemonless, lock-free win: kern forks each box independently, while the
+    # engines serialize through a daemon. Engines spawn `conc` client processes at once, so this is
+    # deliberately heavy — `--conc 0` skips it.
+    if args.conc:
+        c = args.conc
+        print(f"\nConcurrency — {c} isolated /bin/true in parallel (wall-clock, succeeded/total):")
+        for label, cmd_for, env in rows:
+            sh(cmd_for(next(uid)), env=env)  # warm
+            start = time.perf_counter_ns()
+            procs = [subprocess.Popen(cmd_for(next(uid)), stdout=DEVNULL, stderr=DEVNULL, env=env)
+                     for _ in range(c)]
+            ok = sum(p.wait() == 0 for p in procs)
+            wall = (time.perf_counter_ns() - start) / 1e9
+            print(f"  {label.ljust(width)}   {wall:6.2f} s   {ok}/{c}")
+
     print("\nTop tier sits within a couple ms (= noise) — nobody 'wins' single-shot latency")
     print("outright. The real gap is to the engines. Full method + table: BENCHMARKS.md\n")
 

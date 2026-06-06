@@ -55,18 +55,10 @@ pub fn apply_limits(tag: &str, memory_max: Option<u64>, cpus: Option<f64>) -> Op
     // quota/period. Clamp to the host CPU count. Best-effort: a write failure (no CPU controller,
     // e.g. some Android kernels) is ignored — isolation still holds, only the CPU cap is skipped.
     if let Some(c) = cpus {
-        let host = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1) as f64;
-        let eff = if c > host {
-            eprintln!(
-                "kern: --cpus {c} exceeds the {host:.0} available CPUs — clamping to {host:.0}"
-            );
-            host
-        } else {
-            c
-        };
-        let quota = (eff * CPU_PERIOD_US as f64).round().max(1.0) as u64;
+        // `c` is already clamped to the host CPU count by the CLI (the single place that can warn);
+        // an over-large quota would be harmless anyway (the kernel never grants more than the
+        // physical cores), so we don't re-read /proc/cpuinfo on this hot path.
+        let quota = (c * CPU_PERIOD_US as f64).round().max(1.0) as u64;
         let _ = fs::write(child.join("cpu.max"), format!("{quota} {CPU_PERIOD_US}"));
     }
 

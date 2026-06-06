@@ -58,6 +58,11 @@ pub struct SandboxSpec {
     /// CPU cap in cores (`--cpus`, K8s semantics: 1.5 = 1½ cores). `None` → uncapped. Best-effort:
     /// silently skipped where the cgroup CPU controller isn't delegated (e.g. some Android kernels).
     pub cpus: Option<f64>,
+    /// `-it`: a PTY slave fd (opened by the CLI on the host) for the box to use as its controlling
+    /// terminal. When set, the box child `setsid`s, makes the slave its controlling tty, and dup2s
+    /// it onto stdin/out/err. `None` → the box inherits kern's stdio. The parent pumps the matching
+    /// master (see `run_in_sandbox_with`'s `tty_master`).
+    pub tty_slave: Option<i32>,
 }
 
 /// overlayfs directories. `lower` is the read-only image; `upper`/`work` are the writable layer.
@@ -355,6 +360,23 @@ fn child_setup_and_exec(spec: &SandboxSpec, argv: &[CString]) -> Result<Infallib
             return Err(Error::last("chdir(workdir)"));
         }
     }
+
+    // Bring the box's own loopback up so 127.0.0.1 works inside an isolated net namespace (a fresh
+    // net ns has `lo` present but DOWN). Skipped when `--net` shares the host's already-up loopback.
+    if !spec.share_net {
+        bring_loopback_up();
+    }
+
+    // `-it`: adopt the PTY slave as the controlling terminal (done before seccomp — these are setup
+    // syscalls, not the workload's). The slave fd was opened on the host and inherited across the
+    // unshare/pivot (it's just an fd).
+    if let Some(slave) = spec.tty_slave {
+        adopt_controlling_tty(slave);
+    }
+
+    // Least-privilege: drop never-needed dangerous capabilities just before locking down — after all
+    // privileged setup (mount/pivot/loopback) is done, so it only affects the workload.
+    drop_dangerous_caps();
 
     // Install the seccomp filter LAST — after all setup syscalls (mount/pivot) are done, so it
     // only constrains the workload. Then exec.
@@ -859,7 +881,7 @@ fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
 /// Run `spec.command` inside a fresh user + PID + mount namespace sandbox. Returns the child's
 /// exit code. Requires unprivileged user namespaces.
 pub fn run_in_sandbox(spec: &SandboxSpec) -> Result<i32, Error> {
-    run_in_sandbox_with(spec, None, |_| {})
+    run_in_sandbox_with(spec, None, |_| {}, None, &[])
 }
 
 /// Owns the readiness-pipe write end and *fails closed*: if dropped while still armed (i.e. before
@@ -902,6 +924,8 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     spec: &SandboxSpec,
     ready_fd: Option<i32>,
     on_started: F,
+    tty_master: Option<i32>,
+    ports: &[(u32, u16, u16)],
 ) -> Result<i32, Error> {
     // Armed until the box child takes ownership (post-fork) or the parent disarms it: a drop on
     // any error path before then writes the failure byte, so a pre-fork failure is never reported
@@ -916,6 +940,11 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         .iter()
         .map(|s| cstr(s))
         .collect::<Result<_, _>>()?;
+
+    // `-p` forwarders: fork them NOW, BEFORE the cgroup join and the `unshare`, so they stay in the
+    // host network + user namespace (and out of the box's cgroup). Each blocks until we send it the
+    // box's PID 1 after the fork below. (Empty `ports` → no forwarders.)
+    let forwarders = crate::ports::fork_forwarders(ports);
 
     // Best-effort cgroup v2 cap (memory + PIDs) BEFORE namespacing, so the forked workload
     // inherits it. Degrades gracefully where the hierarchy isn't delegated.
@@ -1014,13 +1043,222 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     if let Some(fd) = ready.disarm() {
         unsafe { libc::close(fd) };
     }
-    // Report PID 1 (for `kern exec`), then wait for the sandbox.
+    // Report PID 1 (for `kern exec`) and start the `-p` forwarders now that the box's net ns exists.
     on_started(pid);
+    for f in &forwarders {
+        f.activate(pid);
+    }
+    // `-it`: hand the terminal to the box. Drop our copy of the slave so the master sees EOF when
+    // the box exits, then pump host stdio <-> master until then. Single-threaded by design — the
+    // fork above must run in a single-threaded process (the child does non-async-signal-safe setup),
+    // so we never spawn a pump thread.
+    if let Some(master) = tty_master {
+        if let Some(slave) = spec.tty_slave {
+            unsafe { libc::close(slave) };
+        }
+        let code = pty_pump_and_wait(master, pid);
+        forwarders.iter().for_each(|f| f.stop());
+        return Ok(code);
+    }
     let mut status = 0i32;
-    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+    let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+    forwarders.iter().for_each(|f| f.stop());
+    if rc < 0 {
         return Err(Error::last("waitpid"));
     }
     Ok(wait_code(status))
+}
+
+/// Pump the host's stdin/stdout against a PTY `master` while the box (`pid`) runs, returning its
+/// exit code. Single-threaded poll loop: host stdin → master, master → host stdout. A master EOF
+/// (the box closed its slave) ends it; then we reap the box. The host terminal's raw mode + window
+/// size are the CLI's responsibility (set before this call, restored after).
+/// `-it`: adopt the PTY `slave` as the controlling terminal — a new session (so we may claim a
+/// controlling tty), make the slave it, then dup it onto stdio. Shared by the `box` child and the
+/// `exec` child so both get an identical interactive terminal.
+fn adopt_controlling_tty(slave: i32) {
+    unsafe {
+        libc::setsid();
+        libc::ioctl(slave, libc::TIOCSCTTY, 0);
+        libc::dup2(slave, 0);
+        libc::dup2(slave, 1);
+        libc::dup2(slave, 2);
+        if slave > 2 {
+            libc::close(slave);
+        }
+    }
+}
+
+fn pty_pump_and_wait(master: i32, pid: i32) -> i32 {
+    let mut buf = [0u8; 16384];
+    let mut stdin_fd = 0i32; // set to -1 (ignored by poll) once host stdin hits EOF
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // SIGWINCH/SIGCHLD etc. — re-poll
+            }
+            break;
+        }
+        // master → host stdout first, so the box's final output is drained before we notice EOF.
+        if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let r = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if r <= 0 {
+                break; // box closed its slave
+            }
+            write_all(1, &buf[..r as usize]);
+        }
+        // host stdin → master
+        if stdin_fd >= 0 && fds[0].revents & libc::POLLIN != 0 {
+            let r = unsafe { libc::read(stdin_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if r <= 0 {
+                stdin_fd = -1; // host stdin EOF: stop forwarding, keep relaying box output
+            } else {
+                write_all(master, &buf[..r as usize]);
+            }
+        }
+        if fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            stdin_fd = -1;
+        }
+    }
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    wait_code(status)
+}
+
+/// Write all of `data` to `fd`, retrying short and `EINTR` writes; best-effort (a closed peer
+/// simply ends the transfer).
+fn write_all(fd: i32, mut data: &[u8]) {
+    while !data.is_empty() {
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if n <= 0 {
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        data = &data[n as usize..];
+    }
+}
+
+/// Defense-in-depth (least privilege): strip capabilities the box never legitimately needs from
+/// the workload's effective/permitted/inheritable sets AND its bounding set, so neither the
+/// workload nor a setuid/file-cap binary inside it can ever wield them. These are namespaced (they
+/// grant no power over host-owned resources — verified) and several are already seccomp-blocked;
+/// dropping them shrinks the attack surface against kernel bugs reachable only with the cap.
+/// KEPT (so apt/apk, chown, and privilege-drop to non-root keep working): CHOWN, DAC_*, FOWNER,
+/// FSETID, KILL, SETUID, SETGID, SETPCAP, NET_BIND_SERVICE, NET_RAW, NET_ADMIN (also used for `lo`),
+/// SYS_CHROOT, MKNOD, SETFCAP, IPC_*, SYS_NICE/RESOURCE/PTRACE, … Best-effort; an unknown cap number
+/// on an older kernel just fails harmlessly.
+fn drop_dangerous_caps() {
+    // Kernel-stable cap numbers (used directly so we don't depend on newer libc constants).
+    const DROP: &[u32] = &[
+        16, // SYS_MODULE     load kernel modules
+        17, // SYS_RAWIO      raw I/O ports, /dev/mem, ioperm
+        20, // SYS_PACCT      process accounting
+        22, // SYS_BOOT       reboot / kexec_load
+        25, // SYS_TIME       set system / RTC clock
+        30, // AUDIT_CONTROL
+        32, // MAC_OVERRIDE   bypass MAC (SELinux/AppArmor)
+        33, // MAC_ADMIN
+        34, // SYSLOG         syslog(2) / kernel pointers
+        35, // WAKE_ALARM
+        37, // AUDIT_READ
+        38, // PERFMON        perf_event_open
+        39, // BPF            load BPF programs
+    ];
+    let lo: u32 = DROP
+        .iter()
+        .filter(|&&c| c < 32)
+        .fold(0, |m, &c| m | (1 << c));
+    let hi: u32 = DROP
+        .iter()
+        .filter(|&&c| c >= 32)
+        .fold(0, |m, &c| m | (1 << (c - 32)));
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut hdr = CapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    unsafe {
+        // Clear the dangerous caps from the live sets (the workload won't hold them after exec).
+        if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) == 0 {
+            data[0].effective &= !lo;
+            data[0].permitted &= !lo;
+            data[0].inheritable &= !lo;
+            data[1].effective &= !hi;
+            data[1].permitted &= !hi;
+            data[1].inheritable &= !hi;
+            libc::syscall(libc::SYS_capset, &hdr as *const _, data.as_ptr());
+        }
+        // Drop them from the bounding set too, so a file-cap binary can't re-add them.
+        for &c in DROP {
+            libc::prctl(libc::PR_CAPBSET_DROP, c as libc::c_ulong, 0, 0, 0);
+        }
+    }
+}
+
+/// After `fork()`, close every inherited fd in `3..1024` except `keep` (pass `-1` to keep none).
+/// A long-lived helper child (a `-p` forwarder, a health-checker) must shed the parent's fds —
+/// most importantly a detached box's readiness-pipe write end, whose lingering copy would stop the
+/// launcher from ever seeing EOF and hang `kern box -d`. Best-effort: closing an unopened fd is a
+/// harmless EBADF. 1024 covers the low fds that matter (pipes/sockets the parent just created).
+pub fn shed_inherited_fds(keep: i32) {
+    for fd in 3..1024 {
+        if fd != keep {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Bring the loopback interface (`lo`) up in the current network namespace via `SIOCSIFFLAGS`, so
+/// `127.0.0.1` works inside an otherwise-isolated box. Best-effort (a fresh net ns owned by our
+/// user namespace grants CAP_NET_ADMIN, so this normally succeeds; failures leave `lo` down).
+fn bring_loopback_up() {
+    unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sock < 0 {
+            return;
+        }
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        ifr.ifr_name[0] = b'l' as libc::c_char;
+        ifr.ifr_name[1] = b'o' as libc::c_char;
+        // `ioctl`'s request arg is `c_ulong` on x86_64 but `c_int` on aarch64 — `as _` casts the
+        // SIOC* constant to whatever this target expects, so this compiles on every arch.
+        if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0 {
+            ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
+            libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr);
+        }
+        libc::close(sock);
+    }
 }
 
 /// Decode a `waitpid` status into a shell-style exit code (128+signal if killed).
@@ -1048,6 +1286,8 @@ pub fn exec_in_box(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    tty_slave: Option<i32>,
+    tty_master: Option<i32>,
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -1113,6 +1353,10 @@ pub fn exec_in_box(
     }
     if pid == 0 {
         set_clean_env("", env);
+        // `-it`: adopt the PTY slave as the controlling terminal (before seccomp — a setup syscall).
+        if let Some(slave) = tty_slave {
+            adopt_controlling_tty(slave);
+        }
         // Honor `--workdir` — fatal if it can't be entered (consistent with `kern box -w`, so a
         // typo'd dir is an error, not a silent run in `/`).
         if let Some(wd) = workdir {
@@ -1125,6 +1369,14 @@ pub fn exec_in_box(
         let _ = crate::seccomp::install();
         eprintln!("kern: exec failed: {}", exec(&argv));
         unsafe { libc::_exit(127) };
+    }
+    // `-it` parent: drop our copy of the slave so the master sees EOF when the exec'd process exits,
+    // then pump host stdio <-> master until then (single-threaded, like the box path).
+    if let Some(master) = tty_master {
+        if let Some(slave) = tty_slave {
+            unsafe { libc::close(slave) };
+        }
+        return Ok(pty_pump_and_wait(master, pid));
     }
     let mut status = 0i32;
     if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {

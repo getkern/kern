@@ -13,11 +13,17 @@
 use std::marker::PhantomData;
 
 mod cgroup;
+mod ports;
 mod real;
 mod seccomp;
+/// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
+/// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
+pub use cgroup::apply_limits as apply_cgroup_limits;
 pub use real::{
-    exec_in_box, run_in_sandbox, run_in_sandbox_with, OverlayDirs, RealMounts, SandboxSpec, Volume,
+    exec_in_box, run_in_sandbox, run_in_sandbox_with, shed_inherited_fds, OverlayDirs, RealMounts,
+    SandboxSpec, Volume,
 };
+pub use seccomp::denied_syscall_count;
 
 /// `MS_BIND` from `<sys/mount.h>` — bind-mount an existing tree at a new location.
 pub(crate) const MS_BIND: u64 = 0x1000;
