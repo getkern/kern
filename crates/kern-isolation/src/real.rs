@@ -1440,25 +1440,19 @@ fn apply_userns_range(
 /// `--uid-range` fallback for when the id-mapping helpers can't apply a range.
 fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
     if let Err(e) = std::fs::write("/proc/self/setgroups", b"deny") {
-        // DIAG (temporary): setgroups=deny is EPERM'ing on the CI runner for detached boxes but not
-        // foreground ones. Dump the process/userns state — in a detached box stderr IS the per-box
-        // log, so `await_box_started` surfaces this tail and we can read it from the CI log.
-        let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{e}>"));
-        let status = rd("/proc/self/status");
-        let grep = |k: &str| {
-            status
-                .lines()
-                .find(|l| l.starts_with(k))
-                .unwrap_or("<none>")
-        };
-        eprintln!(
-            "DIAG setgroups=deny failed: {e} | euid={euid} egid={egid} | {} | {} | setgroups='{}' uid_map='{}' gid_map='{}'",
-            grep("Threads:"),
-            grep("CapEff:"),
-            rd("/proc/self/setgroups").trim(),
-            rd("/proc/self/uid_map").trim(),
-            rd("/proc/self/gid_map").trim(),
-        );
+        // Denying setgroups is the kernel's prerequisite for an unprivileged `gid_map`. Ubuntu's
+        // `apparmor_restrict_unprivileged_userns` policy can let a userns be created (full caps, empty
+        // maps) yet still EPERM *this* write — the environment permits the namespace but not a rootless
+        // id map, so a box genuinely can't run here. Report it as unsupported (and name user namespaces)
+        // so foreground and detached fail identically and the skip-graceful tests skip either way,
+        // rather than leaking a bare "setgroups: Permission denied".
+        if e.raw_os_error() == Some(libc::EPERM) {
+            return Err(Error::Unsupported(
+                "unprivileged user namespaces are restricted here — an AppArmor \
+                 apparmor_restrict_unprivileged_userns policy allows the namespace but blocks \
+                 denying setgroups for the rootless uid map",
+            ));
+        }
         return Err(Error::Syscall("setgroups", e));
     }
     std::fs::write("/proc/self/uid_map", format!("0 {euid} 1"))
