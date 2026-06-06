@@ -350,7 +350,7 @@ pub fn exec(
     let inst = registry::list()
         .into_iter()
         .find(|i| i.name == name.as_str())
-        .ok_or_else(|| Error::Sandbox(format!("no running box named '{}'", name.as_str())))?;
+        .ok_or_else(|| Error::NotRunning(format!("no running box named '{}'", name.as_str())))?;
     // PID 1 of the box. Older entries (or a race before the supervisor recorded it) → fall back
     // to the supervisor's sole child.
     let pid1 = if inst.pid1 > 0 {
@@ -817,7 +817,7 @@ pub fn logs(name: &str) -> Result<(), Error> {
             print!("{body}");
             Ok(())
         }
-        None => Err(Error::Sandbox(format!("no logs for box '{name}'"))),
+        None => Err(Error::NotRunning(format!("no logs for box '{name}'"))),
     }
 }
 
@@ -955,7 +955,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             .collect()
     };
     if targets.is_empty() {
-        return Err(Error::Sandbox(if all {
+        return Err(Error::NotRunning(if all {
             "no running boxes to stop".to_string()
         } else {
             let listed = names

@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to SemVer.
 Pre-1.0: the CLI and config surface are NOT frozen; minor versions may break them.
 
+## [0.3.3] — contextual hint for box-not-running errors
+
+### Fixed
+- **`stop`/`exec`/`logs` on a box that isn't running now show the right hint** ("run `kern ps` to
+  see running boxes") instead of the generic sandbox-setup hint ("needs unprivileged user
+  namespaces and a valid --rootfs directory"), which was misleading for a simple lookup miss. New
+  `Error::NotRunning` variant separates a lookup miss from a sandbox-setup failure.
+
 ## [0.3.2] — `kern stop` takes multiple names + `--all`
 
 ### Added

@@ -12,6 +12,8 @@ pub enum Error {
     InvalidBox(&'static str),
     /// The sandbox could not be set up or run (namespaces, mounts, exec).
     Sandbox(String),
+    /// A named box isn't running (or has no logs) — a lookup miss, not a setup failure.
+    NotRunning(String),
     /// An OCI image pull/extract failed.
     Oci(String),
     /// A compose file could not be parsed or brought up.
@@ -34,6 +36,7 @@ impl Error {
             Error::Sandbox(_) => {
                 Some("needs unprivileged user namespaces and a valid --rootfs directory".into())
             }
+            Error::NotRunning(_) => Some("run `kern ps` to see running boxes".into()),
             Error::Oci(_) => {
                 Some("needs `curl` and GNU `tar`; check the image name and network".into())
             }
@@ -52,6 +55,7 @@ impl std::fmt::Display for Error {
             Error::NotYetImplemented(c) => write!(f, "'{c}' is not implemented yet"),
             Error::InvalidBox(why) => write!(f, "invalid box name: {why}"),
             Error::Sandbox(why) => write!(f, "sandbox: {why}"),
+            Error::NotRunning(why) => write!(f, "{why}"),
             Error::Oci(why) => write!(f, "pull: {why}"),
             Error::Compose(why) => write!(f, "compose: {why}"),
             Error::Usage(u) => write!(f, "usage: kern {u}"),
