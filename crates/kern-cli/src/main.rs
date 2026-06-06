@@ -1,11 +1,11 @@
-//! kern — a fast, lightweight OCI container / sandbox runtime.
+//! kern — a fast, lightweight sandbox & virtual resource manager.
 //!
 //! This binary is intentionally THIN: it parses argv into a [`cli::Command`] and dispatches.
 //! Real subcommand logic lives in `commands/`, and the sandbox in `sandbox/`. There is NO
 //! `include!()` mega-module — every file is a real `mod` with `pub(crate)` boundaries.
 //!
-//! 0.1 scaffold (see README.md / ARCHITECTURE.md for the roadmap). The CLI/config surface is
-//! NOT frozen until 1.0.
+//! See README.md / ARCHITECTURE.md for the roadmap. The CLI/config surface is NOT frozen
+//! until 1.0.
 
 mod cli;
 mod commands;
