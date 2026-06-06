@@ -1,0 +1,30 @@
+# Its own workspace (the empty [workspace] below) so the nightly + sanitizer + libfuzzer-sys deps
+# never touch the main build. Run with `cargo +nightly fuzz run <target>`.
+[package]
+name = "kern-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kern-oci = { path = "../crates/kern-oci" }
+
+[[bin]]
+name = "oci_json"
+path = "fuzz_targets/oci_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_member_path"
+path = "fuzz_targets/tar_member_path.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

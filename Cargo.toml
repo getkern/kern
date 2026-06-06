@@ -6,6 +6,8 @@ members = [
     "crates/kern-oci",
     "crates/kern-isolation",
 ]
+# The fuzz harness is its own (nightly + sanitizer) workspace — never built by the normal `cargo build`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.5.7"

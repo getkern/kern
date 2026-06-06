@@ -658,7 +658,7 @@ fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
 }
 
 /// A tar member path that would escape the rootfs: absolute, `..`-traversing, or NUL-bearing.
-fn unsafe_member_path(p: &str) -> bool {
+pub(crate) fn unsafe_member_path(p: &str) -> bool {
     p.starts_with('/') || p.split('/').any(|c| c == "..") || p.contains('\0')
 }
 
