@@ -16,20 +16,10 @@
 use crate::error::Error;
 use std::io::Read;
 
-/// A secret's in-box file name: a single path component, so it can't escape `/run/secrets`.
-/// Same rule set as a volume name (letters/digits/`_`/`.`/`-`, no leading `-`/`.`, not `.`/`..`, no
-/// embedded `..`, ≤ 64) — kept local so the two validators can't drift.
+/// A secret's in-box file name: a single path component, so it can't escape `/run/secrets`. The
+/// shared [`kern_common::valid_resource_name`] rule (one definition for volumes, secrets, pods, profiles).
 fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name != "."
-        && name != ".."
-        && !name.contains("..")
-        && !name.starts_with('-')
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+    kern_common::valid_resource_name(name)
 }
 
 fn name_err(name: &str) -> Error {

@@ -30,17 +30,7 @@ pub fn is_named(source: &str) -> bool {
 /// A valid volume name: non-empty, `[A-Za-z0-9_.-]` only, no leading `-`/`.`, not `.`/`..`, ≤ 64.
 /// Guarantees the name is a single path component that can't climb out of the volumes dir.
 fn validate(name: &str) -> Result<(), Error> {
-    let ok = !name.is_empty()
-        && name.len() <= 64
-        && name != "."
-        && name != ".."
-        && !name.contains("..")
-        && !name.starts_with('-')
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-');
-    if ok {
+    if kern_common::valid_resource_name(name) {
         Ok(())
     } else {
         Err(Error::Volume(format!(

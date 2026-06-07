@@ -889,24 +889,21 @@ pub(crate) const MAX_GPIO_PIN: u32 = 1024;
 /// (it would split the token) and no path separators. Enforced by the TUI form, `kern config add`
 /// AND the resolve path, so all three agree.
 pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
+    // Keep the specific empty/length messages (better UX in the TUI form), delegate the charset +
+    // traversal + leading-char rule to the shared [`kern_common::valid_resource_name`] so a profile/
+    // vdisk name obeys exactly the same rule as a volume/secret/pod name. In particular `..` is
+    // rejected so `vdisk:..` fails at create-time (a persistent vdisk interpolates the name into an
+    // image path) — no "created ok" then "fails".
     if name.is_empty() {
         return Err("name is required".into());
     }
     if name.chars().count() > 64 {
         return Err("name: 64 characters max".into());
     }
-    // Reject `..` up front so `vdisk:..` fails at create-time, matching vdisk.rs's use-site guard
-    // (a persistent vdisk interpolates the name into an image path) — no "created ok" then "fails".
-    if name.contains("..") {
-        return Err("name: '..' is not allowed".into());
-    }
-    if name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    {
+    if kern_common::valid_resource_name(name) {
         Ok(())
     } else {
-        Err("name: letters, digits, _ - . only (no ':' or '/')".into())
+        Err("name: letters, digits, _ - . only, no leading '-'/'.' or '..' (no ':' or '/')".into())
     }
 }
 
