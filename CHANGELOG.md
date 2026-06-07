@@ -60,6 +60,10 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   now ignores `command` (Docker semantics) instead of appending it as shell positional params (which
   silently dropped the command); an **exec-form** (list) entrypoint still composes `entrypoint ++
   command`.
+- **push: pushed layers are root-owned (0:0)** — the layer tar previously carried the invoking
+  user's UID/GID (e.g. `1000`), so a pulled image had host-UID-owned files. Now normalized to `0:0`
+  with `--owner=0 --group=0`, matching real Docker layers. Verified: push → pull-back yields
+  root-owned files and stays `docker pull`-compatible.
 
 ### Changed
 - `kern_common::toml_lite::strip_comment` is now **escape-aware** (a `\"` no longer closes a string,

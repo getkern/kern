@@ -349,27 +349,11 @@ fn after_seq_markers(s: &str) -> &str {
     rest
 }
 
-/// Rough comment strip for the prescreen: cut at the first `#` that is preceded by whitespace or at BOL
-/// and not inside quotes. The real lexer does the precise job; this only needs to avoid tripping on a
-/// `#` in a trailing comment.
+/// The code part of `line` with any trailing `#` comment removed (quote-aware, `#` at BOL or after
+/// whitespace). A thin wrapper over the one comment scanner, [`split_at_comment`], so the prescreen,
+/// the lexer, and the interpolation pass can never drift on where a comment starts.
 fn strip_comment_rough(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut q = 0u8;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if q != 0 {
-            if c == q {
-                q = 0;
-            }
-        } else if c == b'"' || c == b'\'' {
-            q = c;
-        } else if c == b'#' && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
-            return &line[..i];
-        }
-        i += 1;
-    }
-    line
+    split_at_comment(line).0
 }
 
 /// One lexed line: its indentation (in spaces) and content (comment-stripped, right-trimmed).
@@ -401,26 +385,10 @@ fn lex(text: &str) -> Result<Vec<Line>, String> {
     Ok(out)
 }
 
-/// Precise comment strip (quote-aware): remove a `#` comment that starts at BOL or after whitespace and
-/// is not inside single/double quotes. Preserves leading indentation (we measure it after).
+/// The code part of `line` (comment removed), owned, with leading indentation preserved (the lexer
+/// measures indent after). A thin wrapper over the one comment scanner, [`split_at_comment`].
 fn strip_comment_precise(line: &str) -> String {
-    let bytes = line.as_bytes();
-    let mut q = 0u8;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if q != 0 {
-            if c == q {
-                q = 0;
-            }
-        } else if c == b'"' || c == b'\'' {
-            q = c;
-        } else if c == b'#' && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
-            return line[..i].to_string();
-        }
-        i += 1;
-    }
-    line.to_string()
+    split_at_comment(line).0.to_string()
 }
 
 /// A parsed node: a scalar value and/or child mappings and/or list items. YAML is a tree; we model the
@@ -797,7 +765,7 @@ fn service_to_box(
                 entrypoint = ep;
                 entrypoint_is_shell_form = shell_form;
             }
-            "environment" => b.env = environment_value(node, name),
+            "environment" => b.env = kv_pairs(node),
             "env_file" => b.env_file = list_value(node),
             "ports" => b.ports = ports_value(node, name),
             "volumes" => b.volumes = volumes_value(node),
@@ -914,15 +882,15 @@ fn command_argv(node: &Node) -> (Vec<String>, bool) {
     (Vec::new(), false)
 }
 
-/// `environment`: map (`K: v`) or list (`- K=v`). `${VAR}` is already substituted document-wide (see
-/// `interpolate_document`), so values are used verbatim here.
-fn environment_value(node: &Node, _svc: &str) -> Vec<String> {
+/// A `K=v` collection written in either compose shape — a list of `- K=v` (or bare `- KEY`, passed
+/// through like Docker) and/or a map of `K: v` — flattened to `["K=v", …]`. Shared by `environment`
+/// and `build.args`, which have the identical YAML shape, so the two can't drift. `${VAR}` is already
+/// substituted document-wide (see `interpolate_document`), so values are used verbatim here.
+fn kv_pairs(node: &Node) -> Vec<String> {
     let mut out = Vec::new();
-    // List form: `- KEY=value` (or bare `- KEY` → pass the host's value through, like Docker).
     for it in &node.items {
         out.push(scalar_str(it));
     }
-    // Map form: `KEY: value`
     for (k, v) in &node.children {
         let raw = v.scalar.as_deref().map(scalar_str).unwrap_or_default();
         out.push(format!("{k}={raw}"));
@@ -1371,17 +1339,8 @@ fn build_value(node: &Node) -> BuildDirective {
         .child("dockerfile")
         .and_then(|n| n.scalar.as_deref())
         .map(scalar_str);
-    let mut args = Vec::new();
-    if let Some(an) = node.child("args") {
-        // args as list `- K=v` or map `K: v`. `${VAR}` is already document-substituted, so verbatim.
-        for it in &an.items {
-            args.push(scalar_str(it));
-        }
-        for (k, v) in &an.children {
-            let raw = v.scalar.as_deref().map(scalar_str).unwrap_or_default();
-            args.push(format!("{k}={raw}"));
-        }
-    }
+    // `args` is the same `- K=v` list / `K: v` map shape as `environment`.
+    let args = node.child("args").map(kv_pairs).unwrap_or_default();
     BuildDirective {
         context,
         dockerfile,
