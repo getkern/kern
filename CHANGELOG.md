@@ -36,6 +36,13 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   "treat empty like unset". Previously only `${VAR:-default}` (unset-only) was handled, so an
   `:+` replacement or an empty-value default silently produced the wrong string. Verified identical
   to `docker compose` on the same file.
+- **nested `${VAR}` interpolation** — `${A:-${B:-default}}` now resolves the inner expression first,
+  then the outer (Docker parity), via a balanced-brace scan; previously the whole thing passed through
+  verbatim. Depth-capped (16) so an adversarial `${${${…}}}` can't drive unbounded recursion
+  (fuzzed: 800k+ runs, terminates).
+- **compose `tmpfs` with options** — Docker's `- /scratch:size=10M,mode=1770,uid=1000` was forwarded
+  whole to `--tmpfs`, which took the entire option string as the size and **aborted the service**.
+  Now the `size=` option is kept (`--tmpfs /scratch:10M`) and the rest is dropped with a warning.
 - **`kern push`** — publish a cached image (rootfs + config) to an OCI registry v2 (schema-2
   manifest), `docker pull`-compatible. WRITE-scoped auth via `kern login`; all requests HTTPS-pinned.
   Verified end-to-end against a local `registry:2`: push → pull-back reproduces an identical rootfs
