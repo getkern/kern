@@ -17,10 +17,10 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [Unreleased]
+## [0.6.1] — 2026-07-08
 
-Toward 0.6. **docker-compose YAML compatibility**, **image registry `push`**, and a split-out,
-fuzzed compose parser — each built dev → test → clean-code → security-audit.
+**docker-compose YAML compatibility**, **image registry `push`**, and a split-out, fuzzed compose
+parser — each built dev → test → clean-code → security-audit (multi-agent, adversarially verified).
 
 ### Added
 - **docker-compose YAML support** — `kern compose` now reads a `docker-compose.yml` (not only the
@@ -42,14 +42,14 @@ fuzzed compose parser — each built dev → test → clean-code → security-au
 - **push: refuse a cross-host upload redirect** — an untrusted registry answering the blob-upload
   `POST` with an absolute `Location:` on another host could exfiltrate the auth token / `kern login`
   credentials and the private layer to that host (CVE-2020-15157 class). The Location is now required
-  to be the **same host** as the registry; an HTTPS→http downgrade or a loopback→internal-IP bounce
-  (SSRF) is rejected.
+  to be the **same host and port** as the registry; an HTTPS→http downgrade, a loopback→internal-IP
+  bounce (SSRF), or a same-host **different-port** bounce (a distinct internal service) is rejected.
 - **compose parser panic-hardening** — an untrusted `healthcheck.interval` with a huge digit-run
   (`6000000000000000h`) no longer overflow-panics (debug) or wraps to a nonsense value (release);
-  `parse_duration_secs` uses checked arithmetic and falls back to the box default. An anchor/alias in
-  **list-item** position (`- *alias`) is now refused like one in value position (it previously reached
-  the box as a literal). `${A${B}}` no longer leaks a stray `}`, and `${VAR}` inside a comment no
-  longer raises a spurious unset-var warning.
+  `parse_duration_secs` uses checked arithmetic and falls back to the box default. An anchor/alias is
+  now refused in **every** position — value (`k: *a`), **list-item** (`- *a`), and **inline collection**
+  (`[*a]`, `{k: *a}`) — where it previously reached the box as the literal `*a`. `${A${B}}` no longer
+  leaks a stray `}`, and `${VAR}` inside a comment no longer raises a spurious unset-var warning.
 
 ### Fixed
 - **compose `entrypoint` + `command` composition** — a **shell-form** entrypoint (`entrypoint: /x`)
