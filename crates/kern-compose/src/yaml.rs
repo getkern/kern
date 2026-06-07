@@ -1204,14 +1204,35 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
         b.health_interval = parse_duration_secs(&scalar_str(v));
     }
     if let Some(v) = node.child("retries").and_then(|n| n.scalar.as_deref()) {
+        // `retries` is a plain count (`--health-retries <n>`), no duration suffix.
         b.health_retries = Some(scalar_str(v));
     }
+    // `timeout`/`start_period` map to `--health-{timeout,start-period} <seconds>` — an INTEGER count of
+    // seconds. Docker writes them as durations (`30s`, `1m30s`, `0s`), so we must convert, not pass the
+    // raw string: `--health-timeout 30s` fails the CLI's `u64` parse. Route them through the same
+    // `parse_duration_secs` as `interval`; an unparseable/overflowing value is dropped (box default)
+    // rather than forwarded to fail the child. (Found by an extreme test: `start_period: 0s` / any
+    // `timeout: 30s`, the standard Docker form, aborted the box.)
     if let Some(v) = node.child("timeout").and_then(|n| n.scalar.as_deref()) {
-        b.health_timeout = Some(scalar_str(v));
+        b.health_timeout = parse_duration_secs(&scalar_str(v)).map(|s| s.to_string());
     }
     if let Some(v) = node.child("start_period").and_then(|n| n.scalar.as_deref()) {
-        b.health_start_period = Some(scalar_str(v));
+        // `0s` is a legitimate value (no grace), and `parse_duration_secs` returns `None` for 0 (its
+        // `total > 0` gate) — but `--health-start-period 0` is valid and meaningful, so map a parsed-
+        // or-zero duration explicitly: only a truly unparseable value is dropped.
+        let raw = scalar_str(v);
+        b.health_start_period = duration_secs_allowing_zero(&raw).map(|s| s.to_string());
     }
+}
+
+/// Like [`parse_duration_secs`] but 0 is a valid result (not `None`). `interval`/`timeout` treat 0 as
+/// "unset → default", but `start_period: 0s` means "no grace" and must reach the box as `0`.
+fn duration_secs_allowing_zero(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t == "0" || t == "0s" {
+        return Some(0);
+    }
+    parse_duration_secs(t)
 }
 
 /// Convert a healthcheck `test` to a health command, or `None` if not faithfully convertible.
@@ -1526,6 +1547,22 @@ mod tests {
         assert!(b.env.contains(&"BAZ=qux".to_string()));
         assert_eq!(b.health_cmd.as_deref(), Some("true"));
         assert_eq!(b.health_interval, Some(2));
+    }
+
+    #[test]
+    fn healthcheck_durations_convert_to_bare_seconds() {
+        // Extreme-test regression: `--health-timeout`/`--health-start-period` are integer SECONDS in
+        // the CLI, but Docker writes them as durations (`30s`, `1m`, `0s`). Passing the raw `"30s"`
+        // aborted the box ("usage: --health-start-period <seconds>"). They must convert like `interval`.
+        let y = "services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      interval: 2s\n      timeout: 30s\n      start_period: 1m30s\n      retries: 4\n";
+        let b = &boxes(y)[0];
+        assert_eq!(b.health_interval, Some(2));
+        assert_eq!(b.health_timeout.as_deref(), Some("30")); // 30s → "30", not "30s"
+        assert_eq!(b.health_start_period.as_deref(), Some("90")); // 1m30s → 90
+        assert_eq!(b.health_retries.as_deref(), Some("4")); // a plain count, unchanged
+                                                            // `start_period: 0s` (no grace) is legitimate and must reach the box as `0`, not be dropped.
+        let y0 = "services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      start_period: 0s\n";
+        assert_eq!(boxes(y0)[0].health_start_period.as_deref(), Some("0"));
     }
 
     #[test]
