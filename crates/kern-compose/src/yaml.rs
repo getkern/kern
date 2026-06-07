@@ -994,23 +994,90 @@ fn interpolate_fragment(text: &str) -> String {
             rest = &inner[end + 1..];
             continue;
         }
-        let (var, default) = match expr.split_once(":-") {
-            Some((v, d)) => (v, Some(d)),
-            None => (expr, None),
-        };
-        match std::env::var(var)
-            .ok()
-            .or_else(|| default.map(String::from))
-        {
-            Some(val) => out.push_str(&val),
-            None => warn(&format!(
-                "${{{var}}} is not set (no default) — substituted empty (set it in your shell, like Docker)"
-            )),
-        }
+        out.push_str(&interpolate_expr(expr));
         rest = &inner[end + 1..];
     }
     out.push_str(rest);
     out
+}
+
+/// Evaluate the inside of a `${…}` against the host env, with Docker's full modifier set:
+///   `${VAR}`            → the value, or empty + a warning if unset
+///   `${VAR:-default}`   → default if VAR is unset OR empty; `${VAR-default}` → only if unset
+///   `${VAR:+replace}`   → replace if VAR is set AND non-empty; `${VAR+replace}` → if set (even empty)
+///   `${VAR:?message}`   → the value, else warn with message (VAR empty-or-unset); `${VAR?message}` → unset only
+/// The `:` prefix means "treat empty like unset" (Docker semantics). Operators are matched longest-
+/// first (`:-` before `-`) so the colon variant isn't shadowed.
+fn interpolate_expr(expr: &str) -> String {
+    // Find the operator: the first of `:-`, `-`, `:+`, `+`, `:?`, `?` (a `:` binds to the following op).
+    let ops: [(&str, char, bool); 6] = [
+        (":-", '-', true),
+        (":+", '+', true),
+        (":?", '?', true),
+        ("-", '-', false),
+        ("+", '+', false),
+        ("?", '?', false),
+    ];
+    let (var, op, arg, colon) = {
+        let mut found = None;
+        // Scan for the earliest operator position; among ops at the same position, the 2-char (colon)
+        // form wins because we test it first in `ops`.
+        for (tok, kind, is_colon) in ops {
+            if let Some(pos) = expr.find(tok) {
+                let better = match found {
+                    None => true,
+                    Some((_, p, _, _)) => pos < p || (pos == p && is_colon),
+                };
+                if better {
+                    found = Some((kind, pos, is_colon, tok.len()));
+                }
+            }
+        }
+        match found {
+            Some((kind, pos, is_colon, toklen)) => {
+                (&expr[..pos], Some(kind), &expr[pos + toklen..], is_colon)
+            }
+            None => (expr, None, "", false),
+        }
+    };
+
+    let val = std::env::var(var).ok();
+    // "present" per the colon rule: with `:` an empty value counts as absent.
+    let present = match &val {
+        Some(v) => !(colon && v.is_empty()),
+        None => false,
+    };
+    match op {
+        Some('-') => {
+            if present {
+                val.unwrap_or_default()
+            } else {
+                arg.to_string()
+            }
+        }
+        Some('+') => {
+            if present {
+                arg.to_string()
+            } else {
+                String::new()
+            }
+        }
+        Some('?') => val.filter(|_| present).unwrap_or_else(|| {
+            let msg = if arg.is_empty() {
+                "required but not set".to_string()
+            } else {
+                arg.to_string()
+            };
+            warn(&format!("${{{var}}}: {msg} — substituted empty"));
+            String::new()
+        }),
+        _ => val.unwrap_or_else(|| {
+            warn(&format!(
+                "${{{var}}} is not set (no default) — substituted empty (set it in your shell, like Docker)"
+            ));
+            String::new()
+        }),
+    }
 }
 
 /// `ports`: each entry → a `--publish` string, RAW (no numeric coercion → the sexagesimal trap can't
@@ -1500,6 +1567,38 @@ mod tests {
         assert_eq!(interpolate_document("x=${A${B}}"), "x=${A${B}}");
         // A normal `${VAR:-def}` still works.
         assert_eq!(interpolate_document("x=${UNSET_XYZ_KERN:-def}"), "x=def");
+    }
+
+    #[test]
+    fn interpolation_full_modifier_set_matches_docker() {
+        // Docker's modifier set (found missing by an extreme vs-Docker test): `:-`/`-` default,
+        // `:+`/`+` replacement, `:?`/`?` required, with the `:` meaning "treat empty like unset".
+        // Use process-unique var names so the test is deterministic regardless of the ambient env.
+        std::env::set_var("KERN_T_SET", "val");
+        std::env::set_var("KERN_T_EMPTY", "");
+        std::env::remove_var("KERN_T_UNSET");
+        let i = interpolate_expr;
+        // default `:-` : applies on unset OR empty
+        assert_eq!(i("KERN_T_SET:-def"), "val");
+        assert_eq!(i("KERN_T_EMPTY:-def"), "def"); // empty → default (the `:` rule)
+        assert_eq!(i("KERN_T_UNSET:-def"), "def");
+        // default `-` : applies only on unset (empty is kept)
+        assert_eq!(i("KERN_T_EMPTY-def"), ""); // empty is "set" → kept
+        assert_eq!(i("KERN_T_UNSET-def"), "def");
+        // replace `:+` : replaces when set AND non-empty
+        assert_eq!(i("KERN_T_SET:+rep"), "rep");
+        assert_eq!(i("KERN_T_EMPTY:+rep"), ""); // empty → not replaced
+        assert_eq!(i("KERN_T_UNSET:+rep"), "");
+        // replace `+` : replaces when set (even empty)
+        assert_eq!(i("KERN_T_EMPTY+rep"), "rep");
+        assert_eq!(i("KERN_T_UNSET+rep"), "");
+        // required `:?` : value if present, else empty (+warning)
+        assert_eq!(i("KERN_T_SET:?needed"), "val");
+        assert_eq!(i("KERN_T_UNSET:?needed"), "");
+        // plain `${VAR}` unchanged
+        assert_eq!(i("KERN_T_SET"), "val");
+        std::env::remove_var("KERN_T_SET");
+        std::env::remove_var("KERN_T_EMPTY");
     }
 
     #[test]

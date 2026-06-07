@@ -31,6 +31,11 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   rather than silently mis-converting. Structural YAML we don't support (anchors/aliases →
   billion-laughs, tab indent, block scalars, multi-doc, tags) is **refused up front** with a precise
   line.
+- **full `${VAR}` interpolation modifier set** — Docker's `${VAR:-default}` / `${VAR-default}`,
+  `${VAR:+replace}` / `${VAR+replace}`, and `${VAR:?msg}` / `${VAR?msg}`, with the `:` meaning
+  "treat empty like unset". Previously only `${VAR:-default}` (unset-only) was handled, so an
+  `:+` replacement or an empty-value default silently produced the wrong string. Verified identical
+  to `docker compose` on the same file.
 - **`kern push`** — publish a cached image (rootfs + config) to an OCI registry v2 (schema-2
   manifest), `docker pull`-compatible. WRITE-scoped auth via `kern login`; all requests HTTPS-pinned.
   Verified end-to-end against a local `registry:2`: push → pull-back reproduces an identical rootfs
