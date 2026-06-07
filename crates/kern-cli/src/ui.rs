@@ -138,21 +138,10 @@ pub struct BoxStatus<'a> {
     pub seccomp_syscalls: usize,
 }
 
-/// Human-readable byte size: `512M`, `1.5G`, `256K`, or the raw count.
+/// Human-readable byte size (`512M`, `1.5G`, `256K`, `0 B`) — the shared [`kern_common::fmt_bytes`]
+/// convention, so the banner, `ps`/`stats`, `top` and volume sizes all render bytes the same way.
 fn fmt_size(bytes: u64) -> String {
-    const K: u64 = 1024;
-    let (g, m, k) = (K * K * K, K * K, K);
-    if bytes >= g && bytes % g == 0 {
-        format!("{}G", bytes / g)
-    } else if bytes >= g {
-        format!("{:.1}G", bytes as f64 / g as f64)
-    } else if bytes >= m && bytes % m == 0 {
-        format!("{}M", bytes / m)
-    } else if bytes >= k {
-        format!("{}K", bytes / k)
-    } else {
-        bytes.to_string()
-    }
+    kern_common::fmt_bytes(bytes)
 }
 
 /// A ONE-LINE box summary — the default for a foreground run, so a beginner who just wants their

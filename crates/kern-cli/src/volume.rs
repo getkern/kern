@@ -607,23 +607,12 @@ fn json_u64(s: &str, key: &str) -> Option<u64> {
     None
 }
 
-/// Parse a binary size (`512m`, `2g`, `1048576`) into bytes. `k`/`m`/`g`/`t`, optional trailing `b`.
+/// Parse a binary size (`512m`, `2g`, `1048576`) into bytes, capped at [`MAX_VDISK_BYTES`]. Shares
+/// the parse with the rest of kern ([`kern_common::parse_binary_size`]); this layers the volume cap
+/// and the `--size` usage error on top.
 fn parse_size(s: &str) -> Result<u64, Error> {
-    let t = s.trim().to_ascii_lowercase();
-    let t = t.strip_suffix('b').unwrap_or(&t);
-    let (num, mult) = match t.chars().last() {
-        Some('k') => (&t[..t.len() - 1], 1024u64),
-        Some('m') => (&t[..t.len() - 1], 1024 * 1024),
-        Some('g') => (&t[..t.len() - 1], 1024 * 1024 * 1024),
-        Some('t') => (&t[..t.len() - 1], 1024u64.pow(4)),
-        Some('0'..='9') => (t, 1),
-        _ => return Err(Error::Usage("--size <N>[k|m|g|t] (e.g. 512m, 2g)")),
-    };
-    num.trim()
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(mult))
-        .filter(|b| *b > 0 && *b <= MAX_VDISK_BYTES)
+    kern_common::parse_binary_size(s)
+        .filter(|b| *b <= MAX_VDISK_BYTES)
         .ok_or(Error::Usage(
             "--size <N>[k|m|g|t] (e.g. 512m, 2g), up to 64t",
         ))
@@ -842,18 +831,9 @@ fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
+/// Human-readable byte size — the shared [`kern_common::fmt_bytes`] convention (one for the whole CLI).
 fn human_bytes(b: u64) -> String {
-    const U: [&str; 5] = ["B", "K", "M", "G", "T"];
-    let (mut v, mut i) = (b as f64, 0);
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{b} B")
-    } else {
-        format!("{v:.1}{}", U[i])
-    }
+    kern_common::fmt_bytes(b)
 }
 
 #[cfg(test)]

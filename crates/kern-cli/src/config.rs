@@ -868,25 +868,10 @@ fn numa_cpulist(node: i32) -> Option<String> {
 }
 
 /// Parse a memory/disk size for the profile schema: binary units up to terabytes, tolerant of a space
-/// and a trailing `b` (`"2g"`, `"512m"`, `"16 GB"`, `"16t"`, or bare bytes). `checked_mul` rejects an
-/// overflowing value (e.g. `99999999999g`).
+/// and a trailing `b` (`"2g"`, `"512m"`, `"16 GB"`, `"16t"`, or bare bytes). The shared
+/// [`kern_common::parse_binary_size`] — one definition for the whole tree.
 pub(crate) fn size_to_bytes(s: &str) -> Option<u64> {
-    const K: u64 = 1024;
-    let t = s.trim().to_ascii_lowercase();
-    let t = t.strip_suffix('b').unwrap_or(&t).trim_end(); // drop a trailing 'b' ("gb"→"g")
-    let (num, mult) = match t.chars().last()? {
-        'k' => (&t[..t.len() - 1], K),
-        'm' => (&t[..t.len() - 1], K * K),
-        'g' => (&t[..t.len() - 1], K * K * K),
-        't' => (&t[..t.len() - 1], K * K * K * K),
-        '0'..='9' => (t, 1),
-        _ => return None,
-    };
-    num.trim()
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(mult))
-        .filter(|b| *b > 0)
+    kern_common::parse_binary_size(s)
 }
 
 // ═══════════════════ profile field validation + emission (the shared schema) ═══════════════════
