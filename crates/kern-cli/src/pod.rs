@@ -353,6 +353,13 @@ fn is_pasta_comm(comm: &str) -> bool {
 /// and `compose down` can each say the right thing. Member boxes keep their own (already-joined)
 /// namespaces until they exit; only the holder is freed.
 pub fn teardown(name: &str) -> (bool, usize) {
+    // Validate BEFORE building the path: `pod_dir` is `pods/<name>`, and an unvalidated `name` like
+    // `../../x` would make `remove_dir_all` escape the pod store and wipe an unrelated directory. Only
+    // `create` validated before; `pod rm` / `compose down` reach here with raw input, so guard here
+    // too (all callers). An invalid name simply matches no pod.
+    if validate_name(name).is_err() {
+        return (false, 0);
+    }
     let dir = pod_dir(name);
     if !dir.is_dir() {
         return (false, 0);

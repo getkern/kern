@@ -167,13 +167,9 @@ fn curl_authed(base: &[&str], url: &str, auth: &Auth) -> Result<Vec<u8>, OciErro
 /// Quietly download a small blob (the config JSON) to `tmp` — no progress bar (unlike a layer), size-
 /// and time-capped, https-pinned, with the same off-argv auth as every other request.
 fn download_blob_quiet(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
-    let args = vec![
-        "-sS",
-        "-L",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
+    let mut args = vec!["-sS", "-L"];
+    args.extend_from_slice(TLS_PIN);
+    args.extend_from_slice(&[
         "--max-redirs",
         "10",
         "--max-filesize",
@@ -184,7 +180,7 @@ fn download_blob_quiet(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError
         "120",
         "-o",
         tmp,
-    ];
+    ]);
     curl_authed(&args, url, auth)?;
     Ok(())
 }
@@ -258,20 +254,19 @@ fn current_arch() -> &'static str {
 /// blob to `http://`/`file://`. Bearer creds go in a header; Basic creds go via `-K` STDIN (off-argv).
 fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
     let mut cmd = Command::new("curl");
-    cmd.args([
-        "-#",
-        "-S",
-        "-L",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
+    cmd.args(["-#", "-S", "-L"]).args(TLS_PIN).args([
         "--max-redirs",
         "10",
         "--connect-timeout",
         "10",
         "--max-time",
         "600",
+        // Bound the download itself: a hostile registry could otherwise stream an arbitrarily large
+        // body for the whole `--max-time` window and fill the disk before any size check runs. The
+        // uncompressed layer is separately capped in `check_layer_safe`; this bounds the compressed
+        // fetch. Generous enough for any realistic layer.
+        "--max-filesize",
+        MAX_LAYER_DOWNLOAD_BYTES,
         "-o",
         tmp,
     ]);
@@ -382,12 +377,9 @@ fn discover_auth(registry: &str, repo: &str) -> Result<Auth, OciError> {
             let scope = format!("repository:{repo}:pull");
             let sep = if realm.contains('?') { '&' } else { '?' };
             let url = format!("{realm}{sep}service={service}&scope={scope}");
-            let base = [
-                "-sSL",
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
+            let mut base = vec!["-sSL"];
+            base.extend_from_slice(TLS_PIN);
+            base.extend_from_slice(&[
                 "--max-redirs",
                 "5",
                 "--max-filesize",
@@ -397,8 +389,8 @@ fn discover_auth(registry: &str, repo: &str) -> Result<Auth, OciError> {
                 "--max-time",
                 "60",
                 "--",
-                &url,
-            ];
+                url.as_str(),
+            ]);
             // CREDENTIAL SAFETY (CVE-2020-15157 class): only send the stored credentials to the token
             // endpoint if its host belongs to the SAME registry (same host, or a subdomain of the
             // registry's parent domain — e.g. Docker Hub's registry-1.docker.io ↔ auth.docker.io). A
@@ -548,12 +540,9 @@ fn fetch_manifest(
         application/vnd.oci.image.manifest.v1+json,\
         application/vnd.docker.distribution.manifest.list.v2+json,\
         application/vnd.docker.distribution.manifest.v2+json";
-    let args = vec![
-        "-sSL",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
+    let mut args = vec!["-sSL"];
+    args.extend_from_slice(TLS_PIN);
+    args.extend_from_slice(&[
         "--max-redirs",
         "5",
         // A manifest is small (KBs); cap the body so a hostile registry can't stream GBs into memory
@@ -566,7 +555,7 @@ fn fetch_manifest(
         "60",
         "-H",
         accept,
-    ];
+    ]);
     let body = curl_authed(&args, &url, auth)?;
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
@@ -664,6 +653,32 @@ pub(crate) fn unsafe_member_path(p: &str) -> bool {
 
 /// Max uncompressed bytes per layer — a decompression-bomb ceiling (2 GiB).
 const MAX_LAYER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Max entries per layer — a dir/empty-file *inode* bomb has ~0 byte total but still exhausts the fs.
+const MAX_LAYER_ENTRIES: u64 = 2_000_000;
+/// Max COMPRESSED bytes for a single layer download (curl `--max-filesize`), as a string for the argv.
+/// Bounds a disk-fill DoS from a hostile registry; generous enough for any realistic layer (8 GB).
+const MAX_LAYER_DOWNLOAD_BYTES: &str = "8000000000";
+
+/// The TLS-pinning flags EVERY registry fetch must carry: HTTPS-only on the initial request AND on
+/// every redirect hop (registries hand blobs to a CDN), with a bounded redirect count. Single-sourced
+/// so a copy can't silently drop `--proto-redir =https` and let a hostile registry downgrade a hop to
+/// `http://` or `file://`. (`--max-redirs` stays per-call — the count legitimately differs.)
+const TLS_PIN: &[&str] = &["--proto", "=https", "--proto-redir", "=https"];
+
+/// Is the system `tar` GNU tar? GNU tar refuses to extract THROUGH a planted symlink (the secure
+/// default); BusyBox tar historically follows it, so on a non-GNU tar we must reject escaping symlink
+/// targets in a layer ourselves. Probed once.
+fn tar_is_gnu() -> bool {
+    use std::sync::OnceLock;
+    static GNU: OnceLock<bool> = OnceLock::new();
+    *GNU.get_or_init(|| {
+        Command::new("tar")
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
+            .unwrap_or(false)
+    })
+}
 
 /// Vet a downloaded layer tarball before extraction. Lists entries with `tar -tzv` and rejects:
 /// absolute paths, `..` traversal, device/special nodes, and a total uncompressed size over the
@@ -681,14 +696,31 @@ fn check_layer_safe(tar_path: &Path) -> Result<(), OciError> {
         )));
     }
     let listing = String::from_utf8_lossy(&out.stdout);
+    let gnu_tar = tar_is_gnu();
     let mut total: u64 = 0;
+    let mut entries: u64 = 0;
     for line in listing.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() < 6 {
             continue; // not an entry line
         }
+        // Cap the entry COUNT, not just the byte total: a layer of millions of empty files/dirs sums
+        // to ~0 bytes yet exhausts inodes/disk on extraction.
+        entries += 1;
+        if entries > MAX_LAYER_ENTRIES {
+            return Err(OciError::Extract(
+                "layer has too many entries (possible inode bomb)".into(),
+            ));
+        }
         let typ = cols[0].as_bytes().first().copied().unwrap_or(b'-');
-        let size: u64 = cols[2].parse().unwrap_or(0);
+        // `tar -tzv`'s size column is always numeric; an unparseable value means the columns are
+        // desynced (e.g. a crafted uname/name with spaces) — refuse rather than silently count it as
+        // 0, which would let a decompression bomb slip under the size cap.
+        let Ok(size) = cols[2].parse::<u64>() else {
+            return Err(OciError::Extract(format!(
+                "unparseable layer listing (bad size column): {line}"
+            )));
+        };
         // The name (cols[5..]) may be `path -> target` (symlink or hardlink).
         let name = cols[5..].join(" ");
         let mut halves = name.split(" -> ");
@@ -703,16 +735,19 @@ fn check_layer_safe(tar_path: &Path) -> Result<(), OciError> {
         if unsafe_member_path(path) {
             return Err(OciError::Extract(format!("unsafe path in layer: {path}")));
         }
-        // A HARDLINK's target is a real path into the rootfs — it must stay inside it (an
-        // absolute or `..` target could hardlink a host inode into the image). Symlink targets
-        // are fine: the no-follow merge never traverses them.
-        if typ == b'h' {
-            if let Some(t) = link_target {
-                if unsafe_member_path(t) {
-                    return Err(OciError::Extract(format!(
-                        "layer hardlink escapes the rootfs: {path} -> {t}"
-                    )));
-                }
+        // A HARDLINK target is a real path into the rootfs and must stay inside it (an absolute/`..`
+        // target could hardlink a host inode into the image). A SYMLINK target is normally fine — the
+        // no-follow merge never traverses it, and legit images carry absolute symlinks
+        // (`/usr/lib/x -> /lib/x`). That safety, though, assumes `tar -xzf` doesn't itself follow a
+        // planted symlink WITHIN one layer's extraction: GNU tar doesn't, BusyBox tar historically
+        // does. So on a non-GNU tar, reject an escaping symlink target too.
+        if let Some(t) = link_target {
+            let escapes = unsafe_member_path(t);
+            if (typ == b'h' && escapes) || (typ == b'l' && escapes && !gnu_tar) {
+                return Err(OciError::Extract(format!(
+                    "layer {} target escapes the rootfs: {path} -> {t}",
+                    if typ == b'h' { "hardlink" } else { "symlink" }
+                )));
             }
         }
         total = total.saturating_add(size);
@@ -766,7 +801,16 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
         let target = dest.join(rel);
 
         if let Some(victim_name) = fname.strip_prefix(".wh.") {
-            if fname.as_ref() != ".wh..wh..opq" {
+            // A whiteout deletes a sibling in THIS directory, so the victim must be a plain file
+            // name. Reject `.`/`..`/empty/`<sep>`: a crafted `.wh...` strips to `..`, and
+            // `with_file_name("..")` then points at the rootfs's PARENT — `remove_no_follow` would
+            // `remove_dir_all` files OUTSIDE the image (other pulled images / the store). `..` is a
+            // real dir, so the no-follow symlink guard does not stop it. (Opaque marker handled above.)
+            let plain_victim = !victim_name.is_empty()
+                && victim_name != "."
+                && victim_name != ".."
+                && !victim_name.contains('/');
+            if fname.as_ref() != ".wh..wh..opq" && plain_victim {
                 remove_no_follow(&target.with_file_name(victim_name));
             }
             continue; // never materialise a whiteout marker
@@ -1100,6 +1144,32 @@ mod tests {
         assert!(
             !md.file_type().is_symlink(),
             "the planted symlink must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SECURITY (regression): an OCI whiteout whose victim strips to `..` (member name `.wh...`) must
+    /// NOT delete the rootfs's PARENT. Without the guard, `with_file_name("..")` → `<dest>/..` and
+    /// `remove_no_follow` would `remove_dir_all` files OUTSIDE the image (other pulled images / store).
+    #[test]
+    fn whiteout_dotdot_cannot_escape_the_rootfs() {
+        let base = std::env::temp_dir().join(format!("kern-oci-wh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dest = base.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        // A sibling of `dest` — i.e. living under `dest/..` (== base) — that an escape would wipe.
+        let outside = base.join("outside_sibling.txt");
+        std::fs::write(&outside, b"keep me").unwrap();
+        // A layer (staging) carrying a single member `.wh...`: `.wh.` + `..` → victim name "..".
+        let staging = base.join("stg");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(".wh..."), b"").unwrap();
+
+        let _ = merge_layer(&staging, &dest);
+
+        assert!(
+            outside.exists(),
+            "a `.wh...` whiteout must not delete the rootfs's parent (escape)"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
