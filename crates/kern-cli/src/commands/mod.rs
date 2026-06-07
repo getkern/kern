@@ -2787,6 +2787,12 @@ fn json_str(s: &str) -> String {
     o
 }
 
+/// A JSON number field, or `null` when the value is absent (`stats`/`inspect`). One definition so the
+/// two emitters render a missing metric the same way.
+fn json_num(v: Option<u64>) -> String {
+    v.map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
 /// Human-readable byte size — the shared [`kern_common::fmt_bytes`] convention (`ps`/`stats` columns).
 pub(crate) fn human_bytes(b: u64) -> String {
     kern_common::fmt_bytes(b)
@@ -2812,7 +2818,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
                 out.push(',');
             }
             // `null` (not 0) when the box has no dedicated cgroup to read — "unknown", not "zero".
-            let num = |v: Option<u64>| v.map_or("null".to_string(), |n| n.to_string());
+            let num = json_num;
             out.push_str(&format!(
                 "{{\"name\":{},\"pid\":{},\"mem_bytes\":{},\"cpu_usec\":{}}}",
                 json_str(&b.name),
@@ -2863,7 +2869,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     let up = registry::now_unix().saturating_sub(b.started);
     if json {
         // `null` (not 0) for a resource the box has no dedicated cgroup to read — "unknown".
-        let num = |v: Option<u64>| v.map_or("null".to_string(), |n| n.to_string());
+        let num = json_num;
         println!(
             "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{}}}",
             json_str(&b.name),
