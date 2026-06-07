@@ -55,7 +55,9 @@ kern box dev --image alpine -- sh        # a throwaway, isolated Alpine shell �
   read-only *before* pivoting into it doesn't compile — a whole class of sandbox-escape bug is
   unrepresentable, not just untested.
 - **Honest about its boundaries.** Filesystem / process / namespace isolation is a real kernel
-  boundary. Where a guarantee is cooperative or opt-in, [SECURITY.md](SECURITY.md) says so.
+  boundary — the right tool for your own or semi-trusted code (CI, dev, edge, your agents' code).
+  For actively hostile multi-tenant code, reach for a microVM; [SECURITY.md](SECURITY.md) says
+  exactly when to use which, and where a guarantee is cooperative or opt-in.
 
 ## The model: two verbs
 
