@@ -32,6 +32,14 @@ pub mod __fuzz {
     pub fn unsafe_member_path(p: &str) -> bool {
         crate::pull::unsafe_member_path(p)
     }
+
+    /// Drive the in-process tar-header vetter over arbitrary bytes — it parses untrusted, decompressed
+    /// layer bytes at fixed offsets and must never panic (no OOB slice, no unbounded read) however
+    /// malformed the input.
+    pub fn tar_vet(data: &[u8]) {
+        let _ = crate::pull::vet_tar_stream(&mut std::io::Cursor::new(data), true);
+        let _ = crate::pull::vet_tar_stream(&mut std::io::Cursor::new(data), false);
+    }
 }
 
 use std::path::PathBuf;

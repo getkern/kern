@@ -27,4 +27,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "tar_vet"
+path = "fuzz_targets/tar_vet.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
