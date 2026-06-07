@@ -16,8 +16,7 @@
 //! login` first. All requests are HTTPS-pinned (`TLS_PIN`).
 
 use crate::pull::{
-    curl_authed, discover_auth_scoped, host_from_authority, is_loopback_registry, parse_ref,
-    reg_base, Auth, TLS_PIN,
+    curl_authed, discover_auth_scoped, is_loopback_registry, parse_ref, reg_base, Auth, TLS_PIN,
 };
 use crate::OciError;
 use std::path::Path;
@@ -100,9 +99,11 @@ impl Endpoint {
         }
     }
 
-    /// This endpoint's host, as curl would dial it (no scheme/userinfo/port, lowercased).
-    fn host(&self) -> String {
-        host_from_authority(authority_of(&self.base))
+    /// This endpoint's authority as curl would dial it — host **and port** (no scheme/userinfo),
+    /// lowercased. We compare host+port (not host alone) so a compromised registry can't bounce the
+    /// upload to a DIFFERENT PORT on the same host (a distinct service, e.g. an internal admin port).
+    fn authority(&self) -> String {
+        authority_no_userinfo(authority_of(&self.base))
     }
 
     /// Vet a registry-supplied upload `Location` before we PUT the blob (with credentials) to it.
@@ -120,12 +121,12 @@ impl Endpoint {
             // Relative → same host by construction.
             return Ok(format!("{}{location}", self.base));
         }
-        let loc_host = host_from_authority(authority_of(location));
-        if loc_host != self.host() || loc_host.is_empty() {
+        let loc_auth = authority_no_userinfo(authority_of(location));
+        if loc_auth != self.authority() || loc_auth.is_empty() {
             return Err(OciError::Registry(format!(
-                "registry redirected the blob upload to a different host ('{loc_host}' != '{}') — \
+                "registry redirected the blob upload to a different host ('{loc_auth}' != '{}') — \
                  refusing to send credentials off-registry",
-                self.host()
+                self.authority()
             )));
         }
         // Same host, but a pinned (HTTPS) endpoint must not be downgraded to http:// by the Location.
@@ -138,9 +139,20 @@ impl Endpoint {
     }
 }
 
+/// A URL authority with any `userinfo@` dropped and lowercased, KEEPING the `:port` (curl dials the
+/// host after the LAST `@`, so `trusted@evil.com` connects to `evil.com`). Used to compare a
+/// registry-supplied Location against our endpoint by host+port.
+fn authority_no_userinfo(authority: &str) -> String {
+    authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .to_ascii_lowercase()
+}
+
 /// The bare authority of a URL: drop a leading `scheme://`, then keep only the part before the first
-/// `/`, `?` or `#` (so [`host_from_authority`] sees `host[:port]`, not the path). Feeding the path in
-/// would make `https://ghcr.io/upload` look like the host `ghcr.io/upload` and never match.
+/// `/`, `?` or `#` (so the caller sees `host[:port]`, not the path). Feeding the path in would make
+/// `https://ghcr.io/upload` look like the host `ghcr.io/upload` and never match.
 fn authority_of(url: &str) -> &str {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     after_scheme
@@ -519,6 +531,30 @@ mod tests {
             .is_err());
         // HTTPS→http downgrade on the same host → refused (don't drop TLS mid-upload).
         assert!(ep.resolve_upload_location("http://ghcr.io/upload").is_err());
+        // Uppercase host → allowed (DNS is case-insensitive; curl dials the same host).
+        assert!(ep.resolve_upload_location("https://GHCR.IO/up").is_ok());
+    }
+
+    #[test]
+    fn upload_location_is_port_aware() {
+        // A compromised registry must not be able to bounce the upload to a DIFFERENT PORT on the same
+        // host — that's a distinct service (e.g. an internal admin API) and the creds would still leak.
+        let ep = Endpoint {
+            base: "https://reg.example.com:5000".into(),
+            pin: true,
+        };
+        // Same host:port → ok.
+        assert!(ep
+            .resolve_upload_location("https://reg.example.com:5000/up")
+            .is_ok());
+        // Same host, DIFFERENT port → refused.
+        assert!(ep
+            .resolve_upload_location("https://reg.example.com:9999/up")
+            .is_err());
+        // Same host, no port on the Location while the base has one → refused (5000 != <none>).
+        assert!(ep
+            .resolve_upload_location("https://reg.example.com/up")
+            .is_err());
     }
 
     #[test]
