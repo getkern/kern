@@ -1,0 +1,15 @@
+# The compose-file parser (docker-compose YAML + kern TOML → `ComposeBox`es), split out of the CLI so
+# it is CLI-free and can be fuzzed in isolation (`fuzz/compose_yaml`). Pure parsing only — the
+# orchestration that shells out to `kern box` stays in the CLI (`commands/`).
+[package]
+name = "kern-compose"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The kern compose-file parser (docker-compose YAML + kern TOML) — internal."
+publish = false
+
+[dependencies]
+kern-common = { path = "../kern-common", version = "0.5.7" }

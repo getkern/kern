@@ -12,7 +12,9 @@ mod caps;
 mod cli;
 mod commands;
 mod completions;
-mod compose;
+// The compose-file parser now lives in its own CLI-free crate (so it can be fuzzed in isolation).
+// Aliased so the existing `crate::compose::` call sites (orchestration in `commands/`) stay unchanged.
+use kern_compose as compose;
 mod config;
 mod dockerfile;
 mod doctor;
@@ -23,7 +25,6 @@ mod pty;
 mod registry;
 mod sandbox;
 mod secret;
-mod toml_lite;
 mod toml_surgery;
 mod tui;
 mod ui;

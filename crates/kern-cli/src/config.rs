@@ -429,7 +429,7 @@ fn apply_vdisk(e: &mut VDiskEntry, key: &str, v: &str) -> Result<(), String> {
 
 /// Drop a `#` comment outside a quoted string.
 fn strip_comment(line: &str) -> &str {
-    crate::toml_lite::strip_comment(line)
+    kern_common::toml_lite::strip_comment(line)
 }
 
 /// `[x]` → `(false, "x")`, `[[x]]` → `(true, "x")`; `None` if not a header. Inner is trimmed.
@@ -444,11 +444,11 @@ fn section_header(line: &str) -> Option<(bool, &str)> {
 }
 
 fn value_string(v: &str) -> Result<String, String> {
-    crate::toml_lite::quoted_string(v)
+    kern_common::toml_lite::quoted_string(v)
 }
 
 fn value_bool(v: &str) -> Result<bool, String> {
-    crate::toml_lite::parse_bool(v)
+    kern_common::toml_lite::parse_bool(v)
 }
 
 fn value_f64(v: &str) -> Result<f64, String> {
@@ -484,7 +484,7 @@ fn array_items(v: &str) -> Result<Vec<String>, String> {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .ok_or_else(|| format!("expected an array `[...]`, got `{v}`"))?;
-    Ok(crate::toml_lite::split_top_commas(inner))
+    Ok(kern_common::toml_lite::split_top_commas(inner))
 }
 
 fn value_str_array(v: &str) -> Result<Vec<String>, String> {

@@ -125,7 +125,7 @@ fn fetch_config(
     };
     let tmp = dest.join(".kern-image-config.json");
     let tmp_s = tmp.to_string_lossy().into_owned();
-    let url = format!("https://{registry}/v2/{repo}/blobs/{digest}");
+    let url = format!("{}/v2/{repo}/blobs/{digest}", reg_base(registry));
     // Independent size guard checked AFTER the download, BEFORE we read the blob into memory: curl's
     // `--max-filesize` only aborts a transfer whose length is known in advance, so a hostile registry
     // could stream a huge Content-Length-less body. A real config blob is a few KB; refuse over 4 MB.
@@ -151,7 +151,7 @@ fn fetch_config(
 /// STDIN config) exactly like every other request — the ONE place the "Basic creds never in argv"
 /// decision is made for GET-style fetches (manifest + config blob). Returns curl's stdout (empty
 /// when `base` already redirects the body to a file with `-o`).
-fn curl_authed(base: &[&str], url: &str, auth: &Auth) -> Result<Vec<u8>, OciError> {
+pub(crate) fn curl_authed(base: &[&str], url: &str, auth: &Auth) -> Result<Vec<u8>, OciError> {
     let bearer = auth.bearer_header();
     let mut args: Vec<&str> = base.to_vec();
     if let Some(b) = &bearer {
@@ -170,7 +170,7 @@ fn curl_authed(base: &[&str], url: &str, auth: &Auth) -> Result<Vec<u8>, OciErro
 /// and time-capped, https-pinned, with the same off-argv auth as every other request.
 fn download_blob_quiet(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
     let mut args = vec!["-sS", "-L"];
-    args.extend_from_slice(TLS_PIN);
+    args.extend_from_slice(pin_for_url(url));
     args.extend_from_slice(&[
         "--max-redirs",
         "10",
@@ -204,7 +204,7 @@ fn parse_image_config(blob: &str) -> ImageConfig {
 
 /// `[registry/]repo[:tag]` → `(registry, repo, reference)`. Bare names get `library/` +
 /// `registry-1.docker.io`; the first path segment is a registry only if it looks like a host.
-fn parse_ref(image: &str) -> Result<(String, String, String), OciError> {
+pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciError> {
     if image.is_empty() {
         return Err(OciError::Ref("empty".into()));
     }
@@ -250,39 +250,43 @@ fn current_arch() -> &'static str {
     }
 }
 
-/// Download a blob to `tmp` showing curl's live progress bar (`-#`, stderr inherited) so a big
-/// layer never looks frozen. `-S` surfaces errors; `-L` follows redirects (registries hand blobs off
-/// to a CDN) but `--proto-redir =https` keeps every hop on TLS — a hostile registry can't redirect a
-/// blob to `http://`/`file://`. Bearer creds go in a header; Basic creds go via `-K` STDIN (off-argv).
+/// Download a blob to `tmp`. curl runs with `--no-progress-meter` — its built-in bar is a mess for a
+/// redirected CDN blob (it re-emits the `#=#=#O` connection meter on every hop), so kern prints its
+/// own clean per-layer line instead (see `extract_layer`). `-S` still surfaces errors; `-L` follows
+/// redirects (registries hand blobs off to a CDN) but `--proto-redir =https` (in `TLS_PIN`) keeps
+/// every hop on TLS — a hostile registry can't redirect a blob to `http://`/`file://`. Bearer creds
+/// go in a header; Basic creds go via `-K` STDIN (off-argv).
 fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
     let mut cmd = Command::new("curl");
-    cmd.args(["-#", "-S", "-L"]).args(TLS_PIN).args([
-        "--max-redirs",
-        "10",
-        "--connect-timeout",
-        "10",
-        "--max-time",
-        "600",
-        // Bound the download itself: a hostile registry could otherwise stream an arbitrarily large
-        // body for the whole `--max-time` window and fill the disk before any size check runs. The
-        // uncompressed layer is separately capped in `check_layer_safe`; this bounds the compressed
-        // fetch. Generous enough for any realistic layer.
-        "--max-filesize",
-        MAX_LAYER_DOWNLOAD_BYTES,
-        "-o",
-        tmp,
-    ]);
+    cmd.args(["--no-progress-meter", "-S", "-L"])
+        .args(pin_for_url(url))
+        .args([
+            "--max-redirs",
+            "10",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "600",
+            // Bound the download itself: a hostile registry could otherwise stream an arbitrarily large
+            // body for the whole `--max-time` window and fill the disk before any size check runs. The
+            // uncompressed layer is separately capped in `check_layer_safe`; this bounds the compressed
+            // fetch. Generous enough for any realistic layer.
+            "--max-filesize",
+            MAX_LAYER_DOWNLOAD_BYTES,
+            "-o",
+            tmp,
+        ]);
     if let Some(h) = auth.bearer_header() {
         cmd.args(["-H", &h]);
     }
     // This re-hand-rolls the `-K -` STDIN plumbing that `net::curl_with_config` owns because it needs
-    // a different I/O shape: stream to `-o tmp` and INHERIT stderr for the live progress bar, rather
-    // than capturing stdout — so it can't reuse that helper.
+    // a different I/O shape: stream to `-o tmp` and INHERIT stderr (only `-S` errors reach it now —
+    // the progress meter is off) rather than capturing stdout — so it can't reuse that helper.
     let basic_cfg = auth.basic_config();
     if basic_cfg.is_some() {
         cmd.args(["-K", "-"]).stdin(Stdio::piped());
     }
-    cmd.arg("--").arg(url).stderr(Stdio::inherit()); // live progress bar to the terminal
+    cmd.arg("--").arg(url).stderr(Stdio::inherit()); // curl's `-S` errors (if any) to the terminal
     let mut child = cmd
         .spawn()
         .map_err(|e| OciError::Tool("curl", e.to_string()))?;
@@ -316,7 +320,7 @@ fn curl_cfg_escape(s: &str) -> String {
 }
 
 /// How to authenticate requests to a registry, discovered from its `WWW-Authenticate` challenge.
-enum Auth {
+pub(crate) enum Auth {
     /// Open (or already-satisfied) — no `Authorization` header.
     None,
     /// A short-lived Bearer token from the registry's token endpoint (Docker Hub, GHCR, GitLab,
@@ -362,7 +366,18 @@ fn curl_user_config(user: &str, pass: &str) -> String {
 /// for a `Basic` challenge we carry the credentials directly. Credentials always travel to curl via a
 /// `-K` STDIN config, never argv, so another same-uid process can't read them from `/proc/<pid>/cmdline`.
 fn discover_auth(registry: &str, repo: &str) -> Result<Auth, OciError> {
-    let headers = match crate::net::head_headers(&format!("https://{registry}/v2/")) {
+    discover_auth_scoped(registry, repo, "pull")
+}
+
+/// Like [`discover_auth`] but for an explicit `action` scope — `"pull"` for reads, `"push,pull"` for
+/// an upload (`kern push`). Push needs a write-scoped token; everything else in the challenge dance
+/// (realm/service parsing, credential-host trust, off-argv creds) is identical, so it's shared here.
+pub(crate) fn discover_auth_scoped(
+    registry: &str,
+    repo: &str,
+    action: &str,
+) -> Result<Auth, OciError> {
+    let headers = match crate::net::head_headers(&format!("{}/v2/", reg_base(registry))) {
         Ok(h) => h,
         // A registry that won't answer the ping (older/odd) — fall back to anonymous and let the
         // manifest fetch surface a clear error if auth turns out to be required.
@@ -374,13 +389,13 @@ fn discover_auth(registry: &str, repo: &str) -> Result<Auth, OciError> {
     let creds = kern_common::registry_auth::lookup(registry);
     match parse_www_authenticate(&headers) {
         Some(Challenge::Bearer { realm, service }) => {
-            // Ask the token endpoint for a pull-scoped token for this repo. The realm/service come
+            // Ask the token endpoint for a token scoped to this repo + action. The realm/service come
             // from the (TLS-authenticated) challenge; the scope we request ourselves.
-            let scope = format!("repository:{repo}:pull");
+            let scope = format!("repository:{repo}:{action}");
             let sep = if realm.contains('?') { '&' } else { '?' };
             let url = format!("{realm}{sep}service={service}&scope={scope}");
             let mut base = vec!["-sSL"];
-            base.extend_from_slice(TLS_PIN);
+            base.extend_from_slice(reg_pin(registry));
             base.extend_from_slice(&[
                 "--max-redirs",
                 "5",
@@ -471,7 +486,7 @@ fn realm_host_trusted(realm: &str, registry: &str) -> bool {
 /// the LAST `@` as the host — a `realm="https://trusted:0@evil.com/…"` connects to `evil.com`, NOT
 /// `trusted`) and any `:port`, lowercased (DNS is case-insensitive). Parsing the host the same way
 /// curl resolves it is what keeps [`realm_host_trusted`] sound.
-fn host_from_authority(authority: &str) -> String {
+pub(crate) fn host_from_authority(authority: &str) -> String {
     let host = authority.rsplit('@').next().unwrap_or(authority);
     host.split(':').next().unwrap_or(host).to_ascii_lowercase()
 }
@@ -537,13 +552,13 @@ fn fetch_manifest(
     reference: &str,
     auth: &Auth,
 ) -> Result<String, OciError> {
-    let url = format!("https://{registry}/v2/{repo}/manifests/{reference}");
+    let url = format!("{}/v2/{repo}/manifests/{reference}", reg_base(registry));
     let accept = "Accept: application/vnd.oci.image.index.v1+json,\
         application/vnd.oci.image.manifest.v1+json,\
         application/vnd.docker.distribution.manifest.list.v2+json,\
         application/vnd.docker.distribution.manifest.v2+json";
     let mut args = vec!["-sSL"];
-    args.extend_from_slice(TLS_PIN);
+    args.extend_from_slice(reg_pin(registry));
     args.extend_from_slice(&[
         "--max-redirs",
         "5",
@@ -576,7 +591,7 @@ fn extract_layer(
         .map(|h| &h[..h.len().min(12)])
         .unwrap_or(digest);
     eprintln!("→ layer {idx}/{total}  {short}  downloading…");
-    let url = format!("https://{registry}/v2/{repo}/blobs/{digest}");
+    let url = format!("{}/v2/{repo}/blobs/{digest}", reg_base(registry));
     let tmp = dest.join(format!(
         ".kern-layer-{}.tar.gz",
         digest.replace([':', '/'], "_")
@@ -585,8 +600,14 @@ fn extract_layer(
     curl_download(&url, &tmp_s, auth)?;
 
     // INTEGRITY: the blob's content must hash to its digest — defends against a compromised or
-    // MITM'd registry (TLS only protects the transport), and against a corrupt download.
-    eprintln!("  layer {idx}/{total}  {short}  verifying + extracting…");
+    // MITM'd registry (TLS only protects the transport), and against a corrupt download. Report the
+    // downloaded size on the same line so a big multi-hundred-MB image shows real progress per layer
+    // (curl's own meter is off — it's noise over a redirected CDN blob).
+    let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "  layer {idx}/{total}  {short}  {}  verifying + extracting…",
+        kern_common::fmt_bytes(size)
+    );
     if let Err(e) = verify_digest(&tmp, digest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -607,8 +628,22 @@ fn extract_layer(
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| OciError::Extract(e.to_string()))?;
     let staging_s = staging.to_string_lossy().into_owned();
+    // `--same-permissions`: preserve the image's EXACT modes, including the sticky bit and world-write
+    // on `/tmp` (1777) that many images rely on — without it, tar as a non-root user applies the umask
+    // (022) and drops world-write + sticky, so a workload that drops to a non-root uid can't write
+    // `/tmp` (e.g. mariadb InnoDB temp files fail EACCES). Docker/podman extract with `-p` for the same
+    // reason. `--no-same-owner` still maps ownership to the extracting user (we don't want the image's
+    // raw uids on the host); the tar vetter already rejected setuid/device nodes, so preserving modes is
+    // safe (a setuid bit on a rootfs file is inert anyway — the box root mount is MS_NOSUID).
     let status = Command::new("tar")
-        .args(["-xzf", &tmp_s, "-C", &staging_s, "--no-same-owner"])
+        .args([
+            "-xzf",
+            &tmp_s,
+            "-C",
+            &staging_s,
+            "--no-same-owner",
+            "--same-permissions",
+        ])
         .status()
         .map_err(|e| OciError::Tool("tar", e.to_string()))?;
     let _ = std::fs::remove_file(&tmp);
@@ -665,7 +700,76 @@ const MAX_LAYER_DOWNLOAD_BYTES: &str = "8000000000";
 /// every redirect hop (registries hand blobs to a CDN), with a bounded redirect count. Single-sourced
 /// so a copy can't silently drop `--proto-redir =https` and let a hostile registry downgrade a hop to
 /// `http://` or `file://`. (`--max-redirs` stays per-call — the count legitimately differs.)
-const TLS_PIN: &[&str] = &["--proto", "=https", "--proto-redir", "=https"];
+pub(crate) const TLS_PIN: &[&str] = &["--proto", "=https", "--proto-redir", "=https"];
+
+/// Is `registry` a loopback host (`localhost` / `127.x.y.z` / `[::1]`)? Loopback registries speak plain
+/// HTTP (the local-dev / `registry:2` case) and are insecure-OK by default, like Docker — there's no
+/// MITM to pin against over the loopback interface. Single source of truth, shared by pull AND push so
+/// the two can't drift on which registries are treated as insecure.
+///
+/// SECURITY: the match must be EXACT, never a prefix. A naive `starts_with("127.")` would treat
+/// `127.0.0.1.evil.com` (a real public domain an attacker controls) as loopback → HTTP + no TLS pin on
+/// a REAL push/pull = MITM / credential leak. So a `127.` host is loopback only if it's a valid dotted
+/// IPv4 in 127/8 (four numeric octets), and `localhost`/`::1` are exact-string matches.
+pub(crate) fn is_loopback_registry(registry: &str) -> bool {
+    // `localhost` is a NAME, not an IP — exact match, never a prefix (`localhost.evil.com` is NOT
+    // loopback). NOTE (documented residual, per review): this trusts that `localhost` resolves to
+    // loopback — the default, but not guaranteed if `/etc/hosts` is tampered. The decision is on the
+    // STRING, never on DNS resolution: we never treat "an arbitrary host that resolves to 127.0.0.1"
+    // as a reason for http (which would let `attacker.com`→127.0.0.1 bypass pinning).
+    if registry == "localhost" || registry.starts_with("localhost:") {
+        return true;
+    }
+    // A bare IPv6 loopback (`::1`, no port) — matched before the `:`-split, since it's all colons.
+    if registry == "::1" {
+        return true;
+    }
+    // Everything else: parse the HOST as a canonical IP and ask the stdlib. `IpAddr::is_loopback()` is
+    // the DEFINITION of loopback (all of 127.0.0.0/8 and ::1). This closes the whole "form I forgot"
+    // class BY CONSTRUCTION instead of enumerating: `127.0.0.1.evil.com` (not an IP → parse fails),
+    // `127.999.0.1` / `127.0x1.0.1` (invalid octet → parse fails), `::ffff:127.0.0.1` (an IPv4-mapped
+    // address whose `is_loopback()` is false) — ALL fall to NOT-loopback → https + TLS pin. A real
+    // domain also fails to parse → pinned. Fail-closed in the safe direction for every non-IP host.
+    let host = if let Some(rest) = registry.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest) // `[::1]` / `[::1]:port`
+    } else {
+        registry.split(':').next().unwrap_or(registry) // IPv4 host before `:port`
+    };
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// `<scheme>://<registry>` — `http` for a loopback registry, `https` otherwise.
+pub(crate) fn reg_base(registry: &str) -> String {
+    let scheme = if is_loopback_registry(registry) {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{registry}")
+}
+
+/// The HTTPS-pin curl args for `registry` — `TLS_PIN` for a real registry, empty for loopback HTTP.
+pub(crate) fn reg_pin(registry: &str) -> &'static [&'static str] {
+    if is_loopback_registry(registry) {
+        &[]
+    } else {
+        TLS_PIN
+    }
+}
+
+/// The HTTPS-pin curl args for a URL, by its scheme: an `http://` URL (only ever produced by
+/// `reg_base` for a loopback registry) needs no pin; anything else is pinned. Deriving from the URL
+/// keeps `download_blob_quiet`/`curl_download` (which take a URL, not a registry) consistent with the
+/// scheme `reg_base` already chose.
+pub(crate) fn pin_for_url(url: &str) -> &'static [&'static str] {
+    if url.starts_with("http://") {
+        &[]
+    } else {
+        TLS_PIN
+    }
+}
 
 /// Is the system `tar` GNU tar? GNU tar refuses to extract THROUGH a planted symlink (the secure
 /// default); BusyBox tar historically follows it, so on a non-GNU tar we must reject escaping symlink
@@ -1133,6 +1237,19 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
                     std::fs::create_dir(&target).map_err(|e| OciError::Extract(e.to_string()))?;
                 }
             }
+            // Copy the source dir's EXACT mode onto the merged dir — `create_dir` uses 0777&umask
+            // (0755), which drops the sticky bit + world-write that images set on `/tmp` (1777). Without
+            // this, a workload that drops to a non-root uid can't write `/tmp` (mariadb/mysql InnoDB temp
+            // files fail EACCES). The staging was extracted with `--same-permissions`, so `src` carries
+            // the image's real mode. (setuid/setgid bits on a rootfs dir are inert — the box root mount
+            // is MS_NOSUID — so copying the full mode is safe.)
+            if let Ok(m) = std::fs::metadata(&src) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &target,
+                    std::fs::Permissions::from_mode(m.permissions().mode()),
+                );
+            }
             merge_dir(base, &src, dest, dest_s)?;
         } else if ft.is_symlink() {
             let link = std::fs::read_link(&src).map_err(|e| OciError::Extract(e.to_string()))?;
@@ -1209,6 +1326,35 @@ fn layer_digests(m: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_match_is_exact_not_prefix() {
+        // Real loopback → http-insecure OK.
+        assert!(is_loopback_registry("localhost"));
+        assert!(is_loopback_registry("localhost:5000"));
+        assert!(is_loopback_registry("127.0.0.1"));
+        assert!(is_loopback_registry("127.0.0.1:5000"));
+        assert!(is_loopback_registry("127.5.6.7"));
+        assert!(is_loopback_registry("::1"));
+        assert!(is_loopback_registry("[::1]:5000"));
+        // SECURITY: an attacker domain that merely LOOKS loopback must NOT be treated as insecure —
+        // else a real push/pull to it runs over http with no TLS pin (MITM / credential leak).
+        assert!(!is_loopback_registry("127.0.0.1.evil.com")); // 5 parts, not an IPv4
+        assert!(!is_loopback_registry("127x.evil.com"));
+        assert!(!is_loopback_registry("localhost.evil.com"));
+        assert!(!is_loopback_registry("127.0.0.1evil.com"));
+        assert!(!is_loopback_registry("::1.evil.com"));
+        assert!(!is_loopback_registry("ghcr.io"));
+        assert!(!is_loopback_registry("registry-1.docker.io"));
+        // Canonical-IP edge forms the stdlib parser rules on (review §A):
+        assert!(!is_loopback_registry("127.999.0.1")); // invalid octet → not a valid IP → pinned
+        assert!(!is_loopback_registry("::ffff:127.0.0.1")); // IPv4-mapped → is_loopback()==false → pinned
+        assert!(is_loopback_registry("127.255.255.254")); // still 127/8 → loopback
+                                                          // reg_base reflects the decision.
+        assert_eq!(reg_base("localhost:5000"), "http://localhost:5000");
+        assert_eq!(reg_base("ghcr.io"), "https://ghcr.io");
+        assert_eq!(reg_base("127.0.0.1.evil.com"), "https://127.0.0.1.evil.com");
+    }
 
     #[test]
     fn parse_ref_defaults_and_registries() {

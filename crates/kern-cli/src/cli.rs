@@ -168,6 +168,11 @@ pub enum Command {
         image: String,
         dest: Option<String>,
     },
+    /// `kern push <local-ref> [as <remote-ref>]`: publish a cached image to a registry.
+    Push {
+        local: String,
+        remote: Option<String>,
+    },
     /// `kern build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image
     /// from a Dockerfile subset.
     Build {
@@ -324,6 +329,26 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("build") => parse_build(&rest)?,
         // `pull <image> [--dest <dir>]`: download an OCI image.
         Some("pull") => parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?,
+        // `push <local-ref> [as <remote-ref>]` — publish a cached image. `as` lets you retag on push
+        // (e.g. `kern push myapp as ghcr.io/me/myapp:1.0`).
+        Some("push") => {
+            let args: Vec<&&str> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .collect();
+            let local = args
+                .first()
+                .map(|s| s.to_string())
+                .ok_or(Error::Usage("push <local-ref> [as <remote-ref>]"))?;
+            // Optional `as <remote>` (or just a second positional).
+            let remote = match args.get(1) {
+                Some(s) if **s == "as" => args.get(2).map(|s| s.to_string()),
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            Command::Push { local, remote }
+        }
         // `images`: list pulled (cached) images.
         Some("images") => Command::Images {
             json: rest.contains(&"--json"),
@@ -487,6 +512,19 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 down,
                 no_pod,
             }
+        }
+        // `up [--no-pod]` / `down`: Docker-familiar shorthands that DISCOVER a compose file in the CWD
+        // (`docker-compose.yml`/`compose.yml`/…) and bring it up / tear it down. The whole point of the
+        // compat surface: land in a dir with a compose file, type `kern up`, it just works.
+        Some("up") | Some("down") => {
+            let down = rest.first().copied() == Some("down");
+            let no_pod = rest.contains(&"--no-pod");
+            let file = discover_compose_file().ok_or_else(|| {
+                Error::Compose(
+                    "no compose file in this directory (looked for docker-compose.yml, compose.yml, compose.yaml, kern.toml)".to_string(),
+                )
+            })?;
+            Command::Compose { file, down, no_pod }
         }
         // `config`: list resource profiles from kern.toml.
         Some("config" | "cfg") => {
@@ -1250,6 +1288,23 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
     }
 }
 
+/// Discover a compose file in the current directory for `kern up`/`down`. Prefers Docker's canonical
+/// names (so an existing project just works), then kern's own. Returns the first that exists.
+fn discover_compose_file() -> Option<String> {
+    for name in [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        "kern.toml",
+    ] {
+        if std::path::Path::new(name).is_file() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 /// `kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [-q] [<context>]`.
 fn parse_build(rest: &[&str]) -> Result<Command, Error> {
     let mut tag: Option<String> = None;
@@ -1447,6 +1502,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
         Command::Pull { image, dest } => commands::pull(&image, dest.as_deref()),
+        Command::Push { local, remote } => commands::push(&local, remote.as_deref()),
         Command::Stop { names, all } => commands::stop(&names, all),
         Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
         Command::Attach { name } => commands::attach(&name),

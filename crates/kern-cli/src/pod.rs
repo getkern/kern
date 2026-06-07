@@ -102,6 +102,14 @@ fn starter_alive(dir: &std::path::Path) -> bool {
 /// (unless `--no-outbound`, and if pasta is installed) attach pasta for internet egress. Publish a
 /// service with `-p` on its member box.
 pub fn create(name: &str, want_outbound: bool) -> Result<(), Error> {
+    create_with_range(name, want_outbound, false)
+}
+
+/// As [`create`], but `uid_range` maps a subordinate uid RANGE into the pod's shared user namespace
+/// (via the holder) instead of the single-uid self-map — needed when the pod hosts OCI images that
+/// drop privilege in their entrypoint (postgres/redis/…). `kern compose` passes `true` when the stack
+/// has image boxes; a pod of root-only services stays single-uid (faster, more isolated).
+pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Result<(), Error> {
     validate_name(name)?;
     let dir = pod_dir(name);
     let _ = std::fs::create_dir_all(pods_root()); // ensure the parent exists (recursive)
@@ -162,12 +170,17 @@ pub fn create(name: &str, want_outbound: bool) -> Result<(), Error> {
     // prints `pod-ready` once its namespaces are set up. We read that line, then record its PID.
     let self_exe = std::env::current_exe()
         .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
-    let mut child = std::process::Command::new(self_exe)
-        .arg("__pod-holder")
+    let mut cmd = std::process::Command::new(self_exe);
+    cmd.arg("__pod-holder")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .process_group(0) // its own session/group so it survives this command exiting
+        .process_group(0); // its own session/group so it survives this command exiting
+    if uid_range {
+        // Tell the holder to map a subordinate uid range (so member OCI images can drop privilege).
+        cmd.env("KERN_POD_UID_RANGE", "1");
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| Error::Sandbox(format!("pod holder: {e}")))?;
     let pid = child.id() as i32;

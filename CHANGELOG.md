@@ -17,6 +17,52 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [Unreleased]
+
+Toward 0.6. **docker-compose YAML compatibility**, **image registry `push`**, and a split-out,
+fuzzed compose parser — each built dev → test → clean-code → security-audit.
+
+### Added
+- **docker-compose YAML support** — `kern compose` now reads a `docker-compose.yml` (not only the
+  native kern TOML stack): services, `image`/`build`, `command`/`entrypoint`, `environment`/
+  `env_file`, `ports`, `volumes`, `depends_on` (incl. `condition: service_healthy` /
+  `service_completed_successfully`), `healthcheck`, `secrets`, resource/cap/hardening keys. The
+  parser is hand-rolled and **dependency-free**; the unmappable long tail **degrades with a warning**
+  rather than silently mis-converting. Structural YAML we don't support (anchors/aliases →
+  billion-laughs, tab indent, block scalars, multi-doc, tags) is **refused up front** with a precise
+  line.
+- **`kern push`** — publish a local rootfs + image config to an OCI registry v2 (schema-2 manifest),
+  `docker pull`-compatible. WRITE-scoped auth via `kern login`; all requests HTTPS-pinned.
+- **`kern-compose` crate** — the compose parser is now its own CLI-free library crate, **fuzzed in
+  isolation** (`fuzz/compose_yaml`, property: parse never panics + a parse is always
+  topo-orderable-or-cycle). `toml_lite` (the shared quoted-string/bool/array/comment scanners) moved
+  to `kern-common`.
+
+### Security
+- **push: refuse a cross-host upload redirect** — an untrusted registry answering the blob-upload
+  `POST` with an absolute `Location:` on another host could exfiltrate the auth token / `kern login`
+  credentials and the private layer to that host (CVE-2020-15157 class). The Location is now required
+  to be the **same host** as the registry; an HTTPS→http downgrade or a loopback→internal-IP bounce
+  (SSRF) is rejected.
+- **compose parser panic-hardening** — an untrusted `healthcheck.interval` with a huge digit-run
+  (`6000000000000000h`) no longer overflow-panics (debug) or wraps to a nonsense value (release);
+  `parse_duration_secs` uses checked arithmetic and falls back to the box default. An anchor/alias in
+  **list-item** position (`- *alias`) is now refused like one in value position (it previously reached
+  the box as a literal). `${A${B}}` no longer leaks a stray `}`, and `${VAR}` inside a comment no
+  longer raises a spurious unset-var warning.
+
+### Fixed
+- **compose `entrypoint` + `command` composition** — a **shell-form** entrypoint (`entrypoint: /x`)
+  now ignores `command` (Docker semantics) instead of appending it as shell positional params (which
+  silently dropped the command); an **exec-form** (list) entrypoint still composes `entrypoint ++
+  command`.
+
+### Changed
+- `kern_common::toml_lite::strip_comment` is now **escape-aware** (a `\"` no longer closes a string,
+  so a `#` after it stays in the value). This is a **bug-fix** bundled with the `toml_lite` move — it
+  affects both the compose parser and the `kern.toml` profile loader, and only changes output for the
+  rare line with an escaped quote before an unquoted-looking `#` (previously that value was truncated).
+
 ## [0.5.7] — 2026-07-03
 
 **The full 0.5 launch.** kern grows from a fast sandbox/OCI runtime into a **feature-complete

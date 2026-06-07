@@ -67,10 +67,17 @@ pub(crate) fn curl_with_config(args: &[&str], config: &str) -> Result<Vec<u8>, O
 /// redirects (`-L` absent) — the `401` challenge is on the direct response, and a non-2xx status is
 /// still a successful curl run (no `-f`), so it's returned rather than raised as an error.
 pub(crate) fn head_headers(url: &str) -> Result<String, OciError> {
-    let body = curl(&[
-        "-sS",
-        "--proto",
-        "=https",
+    // Pin to HTTPS for a real registry; allow plain HTTP only for a loopback `http://` URL (the
+    // local-dev / `registry:2` case — the same insecure-OK-on-loopback rule the pull/push URLs use).
+    // A non-loopback `http://` never reaches here: `reg_base` only emits `http://` for loopback hosts.
+    let proto: &[&str] = if url.starts_with("http://") {
+        &["--proto", "=http"]
+    } else {
+        &["--proto", "=https"]
+    };
+    let mut args = vec!["-sS"];
+    args.extend_from_slice(proto);
+    args.extend_from_slice(&[
         "--max-filesize",
         "1000000", // headers only — cap so a hostile registry can't stream an endless body at us
         "--connect-timeout",
@@ -83,7 +90,8 @@ pub(crate) fn head_headers(url: &str) -> Result<String, OciError> {
         "-", // dump response headers to stdout
         "--",
         url,
-    ])?;
+    ]);
+    let body = curl(&args)?;
     String::from_utf8(body).map_err(|_| OciError::Registry("non-UTF-8 headers".into()))
 }
 

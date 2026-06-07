@@ -68,9 +68,11 @@ What is **enforced now** by `kern box`:
   `--cap-add SYS_ADMIN`) is held only over the box's **own** user namespace and the always-on seccomp
   denylist still blocks the escape syscalls it would otherwise unlock — so `--cap-add` cannot breach
   the host, and an unknown cap name is a hard error (a typo can't silently leave a cap in place);
-- always-on **seccomp** denylist (~25 syscalls: kexec(+`_file_load`) / module load-unload /
-  ptrace + `process_vm_readv`/`writev` / reboot / swap / the classic **and** new mount API /
-  `pivot_root` / `setns` / `unshare` / `bpf` / `perf_event_open` / `userfaultfd` / `syslog`),
+- always-on **seccomp** denylist (~27 syscalls: kexec(+`_file_load`) / module load-unload /
+  ptrace + `process_vm_readv`/`writev` / reboot / swap / the classic **and** new mount API — including
+  the whole reconfiguration family `mount_setattr` / `fspick` / `fsopen`/`fsconfig`/`fsmount` /
+  `open_tree`/`move_mount`, so a box cannot re-mount its own root writable / `pivot_root` / `setns` /
+  `unshare` / `bpf` / `perf_event_open` / `userfaultfd` / `syslog`),
   wrong-arch syscalls killed, and on x86_64 every **x32-ABI** syscall (the `__X32_SYSCALL_BIT`
   variant, which shares the x86_64 arch token) is killed too — closing the classic bypass where the
   x32 alias of a denied syscall number would otherwise slip past a number-only denylist;
@@ -85,6 +87,19 @@ What is **enforced now** by `kern box`:
   boundary is the namespace + the allowlist, so no eBPF device-cgroup filter is needed (and none would
   load unprivileged); GPIO device nodes (via a `vgpio:` profile) are added to this allowlist
   explicitly today, and GPU nodes will be at 0.9 — never by opening `/dev` up.
+
+**Read-only and cgroup-mask integrity.** A `--read-only` box's root, and the masks over the host
+cgroup tree, are protected by two independent layers. The always-on seccomp filter blocks the
+mount-reconfiguration family (`mount`, `mount_setattr`, `open_tree`/`move_mount`/`fsopen`/`fsconfig`/
+`fsmount`/`fspick`), so a box cannot re-mount its root writable; and the default capability drop removes
+`CAP_SYS_ADMIN`, so a box cannot `umount` the cgroup masks to reach the host hierarchy. Both hold in the
+default configuration. A box *explicitly* granted `CAP_SYS_ADMIN` (`--cap-add SYS_ADMIN`) or run with
+`--no-seccomp` waives one of these layers by choice. A third, belt-and-suspenders hardening — locking
+the mounts with `MNT_LOCKED` via a second user-namespace crossing, so the guarantees hold even for those
+opt-in configurations — is tracked for a dedicated, runtime-validated release; it is deferred rather
+than shipped untested because it reorders capability-sensitive setup that must be verified on real
+namespaces. `--uid-range` boxes remain covered by the seccomp + capability layers (the mount-lock is
+single-uid by construction).
 
 Resource caps (memory + tasks): when a systemd **user** manager is present, `kern box` re-execs
 inside a transient `systemd-run --user --scope` with `MemoryMax`/`TasksMax`, so fork-bomb / OOM
@@ -126,7 +141,12 @@ Opt-in flags that **relax** isolation (off by default — you ask for them):
   `CAP_NET_ADMIN`/`CAP_SYS_ADMIN` in the box's userns safe (the escape syscalls are blocked).
 - **`-v src:dst`** binds a host path into the box. A writable volume is a hole through the
   sandbox by design — the box can modify those host files (use `:ro` for read-only). `kern`
-  rejects a non-existent source and resolves it to an absolute, symlink-free path first.
+  rejects a non-existent source and resolves it to an absolute, symlink-free path first. The bind is
+  **non-recursive**: if the source has other filesystems mounted *underneath* it (e.g. `/mnt` with a
+  separate `/mnt/usb`), those submounts are **not** propagated into the box — mount them explicitly as
+  their own `-v` if you need them. This is deliberate: a recursive bind would clone host submounts, and
+  a `:ro` volume could then leave them writable (the read-only remount is per-mount) — so we bind only
+  the directory tree, matching the `--rootfs` bind's rationale.
 - **`kern exec`** joins a running box's namespaces; it is restricted to the user who started the
   box (joining its user namespace requires being that namespace's owner). The exec'd process gets
   the same always-on **seccomp** filter (**fail-closed** — it won't run if the filter can't install)
@@ -192,6 +212,15 @@ OCI pull (`kern pull` / `--image`):
   because extraction is single-threaded (no concurrency across the image's own layers) and the
   cache/scratch dirs are created **mode 0700 and owned by the user**, so no other local user can
   race a symlink into the paths. Whiteouts (incl. opaque dirs) are applied under the same guard.
+- **Image file modes are preserved as-is** (extracted with `--same-permissions`, and the merge copies
+  each dir's real mode) — so an image's `/tmp` keeps its sticky world-writable `1777`, which a workload
+  that drops to a non-root uid needs. Consequence, stated plainly: a mode the image sets is what the box
+  sees, so an image that ships a world-writable system dir (e.g. `/etc` at `0777`) leaves it
+  world-writable **inside the box**. This is **contained** — it's the box's own rootfs (a private
+  overlay upper on a 0700 host scratch), never the host, and a setuid/setgid bit on a rootfs file is
+  **inert** because the box root is `MS_NOSUID`. It's the semi-trusted posture (the boundary is the
+  namespace, not a normalized mode), the exact dual of the box root being `0755`: kern presents the
+  image faithfully rather than silently rewriting its permissions.
 - **Registry credentials** (`kern login`/`logout`, for private images): stored in an owner-only
   (`0600`) file under `~/.config/kern/`, base64-encoded (obfuscation — the `0600` mode is the real
   protection, not the encoding). The password is read from the terminal **with echo off** (or piped

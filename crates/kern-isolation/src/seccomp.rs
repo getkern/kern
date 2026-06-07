@@ -69,6 +69,15 @@ fn denylist() -> Vec<libc::c_long> {
         libc::SYS_fsopen,
         libc::SYS_fsconfig,
         libc::SYS_fsmount,
+        // `fspick(2)` opens an fs-context on an existing mount to reconfigure it. It's inert on its own
+        // (the reconfigure only commits via `fsconfig(FSCONFIG_CMD_RECONFIGURE)`, already denied above),
+        // but block the whole reconfiguration family so the guarantee doesn't rest on that one coupling
+        // — a future edit to the fsconfig handling can't silently re-open an RO-clear path.
+        libc::SYS_fspick,
+        // `mount_setattr(2)` changes attributes of an existing mount — with CAP_SYS_ADMIN in the box's
+        // own userns it could clear `MS_RDONLY` and strip a `--read-only` box (or a `:ro` volume). Same
+        // family as the mount API above; deny it outright so the read-only contract can't be undone.
+        libc::SYS_mount_setattr,
         // Namespace entry / creation (nested userns → CAP_SYS_ADMIN escape).
         libc::SYS_setns,
         libc::SYS_unshare,
