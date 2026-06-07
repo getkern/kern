@@ -416,7 +416,19 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
         }
     }
     if order.len() != boxes.len() {
-        return Err("dependency cycle detected".into());
+        // Name the services still in the cycle (indegree never reached 0) — like Docker's
+        // "dependency cycle detected: a -> b -> a", this points the user at the offending set instead
+        // of just "there's a cycle somewhere". File order, so it's deterministic.
+        let mut stuck: Vec<&str> = boxes
+            .iter()
+            .map(|b| b.name.as_str())
+            .filter(|n| indeg[n] > 0)
+            .collect();
+        stuck.sort_by_key(|n| boxes.iter().position(|b| b.name == *n));
+        return Err(format!(
+            "dependency cycle detected among: {}",
+            stuck.join(", ")
+        ));
     }
     Ok(order)
 }
