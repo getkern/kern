@@ -25,7 +25,25 @@ profile. You'll get an acknowledgement and a coordinated-disclosure timeline.
   only on AMD/Intel via the `dmem` cgroup controller. Do not treat the GPU cap as a security
   boundary or a multi-tenant billing mechanism on consumer NVIDIA.
 
-## Current status (0.4 — honest)
+## kern vs a microVM — when to use what
+
+kern isolates with Linux **namespaces + seccomp + a read-only pivot**: microsecond-to-millisecond
+start, ~1 MB, no VM, no daemon. That shared-kernel boundary is real, but its attack surface is the
+host **kernel** — a kernel privilege-escalation bug is an escape.
+
+- **Reach for kern** when the code is **yours or semi-trusted** and you want speed, density and
+  simplicity: CI jobs, build steps, dev sandboxes, edge services you operate, and running your
+  **own** agents' tool-calls / LLM-generated code under your supervision. Thousands of short-lived,
+  cheap, kernel-isolated boxes.
+- **Reach for a microVM** (Firecracker / Kata) or a **gVisor**-style user-space kernel when you run
+  **actively hostile, multi-tenant** code — arbitrary programs from strangers sharing one host — and
+  a hardware-virtualization (or syscall-intercepted) boundary is worth the extra startup cost and
+  footprint. That is **not** where kern competes.
+
+kern's bet is startup latency, footprint and daemonless simplicity — not being a hypervisor. Pick
+the boundary your threat model needs; kern is honest about which one it is.
+
+## Current status (0.5.7 — honest)
 
 What is **enforced now** by `kern box`:
 - user + PID + network (loopback-only) + UTS + IPC + mount namespaces;
