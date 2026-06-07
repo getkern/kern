@@ -3,8 +3,10 @@
 mod json;
 mod net;
 mod pull;
+mod push;
 mod search;
 pub use pull::{pull, ImageConfig, OciError};
+pub use push::{push, ImageConfigOut};
 pub use search::{search, SearchResult};
 
 /// Fuzzing surface — **not** part of the public API (hidden from docs, no stability guarantee). It

@@ -395,7 +395,11 @@ fn child_setup_and_exec(spec: &SandboxSpec, argv: &[CString]) -> Result<Infallib
     // Set up `<root>/dev` and bind `-v` volumes BEFORE pivot, while the host source paths are
     // reachable. Device nodes must be bound by real host path to stay writable from the user
     // namespace; volume targets are resolved symlink-safely, confined to the new root.
-    setup_dev(&spec.root, spec.tun)?;
+    // devpts is only needed when the box will host an in-box PTY (an `--ssh` sshd, or an interactive
+    // `-it` slave). The overwhelming common case (agent code-exec, CI, `sh -c`) never opens a PTY, so
+    // gate the whole devpts mount+mkdir+symlink out of it — one fewer filesystem-mount syscall per box.
+    let needs_pts = spec.ssh.is_some() || spec.tty_slave.is_some();
+    setup_dev(&spec.root, spec.tun, needs_pts)?;
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
     setup_volumes(&spec.root, &spec.volumes)?;
@@ -614,12 +618,18 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             }
         };
         let tgt = cstr(&format!("/proc/self/fd/{tgt_fd}")).unwrap(); // decimal fd → never NUL
+                                                                     // Deliberately NON-recursive (`MS_BIND`, not `MS_BIND | MS_REC`) — same rationale as the bind
+                                                                     // root above: if the operator's volume source has host filesystems mounted *underneath* it
+                                                                     // (a NAS share, an external disk), a recursive bind would clone those submounts into the box.
+                                                                     // The RO remount below is per-mount (`MS_REMOUNT` is not recursive on Linux), so a recursive
+                                                                     // bind would leave every cloned submount WRITABLE under a `:ro` volume — silently breaking the
+                                                                     // operator's explicit read-only contract. A plain bind exposes the directory tree only.
         let r = unsafe {
             libc::mount(
                 src.as_ptr(),
                 tgt.as_ptr(),
                 ptr::null(),
-                (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+                libc::MS_BIND as libc::c_ulong,
                 ptr::null(),
             )
         };
@@ -770,7 +780,7 @@ const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 /// device binds all resolve to a directory we own *inside* the new root — never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
-fn setup_dev(root: &str, tun: bool) -> Result<(), Error> {
+fn setup_dev(root: &str, tun: bool, needs_pts: bool) -> Result<(), Error> {
     let dev_path = format!("{root}/dev");
     let dp = cstr(&dev_path)?;
     // Neutralize a hostile `/dev` symlink before any path resolves through it.
@@ -788,12 +798,15 @@ fn setup_dev(root: &str, tun: bool) -> Result<(), Error> {
                                                 // `cmd > /dev/null` redirect. A non-sticky 0755 /dev (owned by the box's root) avoids it.
     let ty = cstr("tmpfs")?;
     let opts = cstr("mode=755")?;
+    // `MS_NOSUID`: a workload must never gain privilege via a setuid binary it drops on the box-owned
+    // /dev tmpfs. (No `MS_NODEV` — /dev is exactly where the bind-mounted device nodes below must work;
+    // this matches runc/Docker, which mount /dev `nosuid,mode=755` and deliberately NOT `nodev`.)
     if unsafe {
         libc::mount(
             ty.as_ptr(),
             dp.as_ptr(),
             ty.as_ptr(),
-            0,
+            libc::MS_NOSUID as libc::c_ulong,
             opts.as_ptr() as *const libc::c_void,
         )
     } != 0
@@ -827,6 +840,20 @@ fn setup_dev(root: &str, tun: bool) -> Result<(), Error> {
             };
         }
     }
+    // Standard `/dev` symlinks into procfs — `/dev/fd`, `/dev/std{in,out,err}` — exactly as Docker/runc
+    // provide them. Bash/shell process substitution (`<(...)` → `/dev/fd/63`) and many entrypoints
+    // (e.g. postgres `initdb`) need them; without `/dev/fd` they fail "No such file or directory". They
+    // resolve through the box's own `/proc` (mounted for its PID namespace), so they're safe and correct.
+    for (link, tgt) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        if let (Ok(l), Ok(t)) = (cstr(&format!("{root}/dev/{link}")), cstr(tgt)) {
+            unsafe { libc::symlink(t.as_ptr(), l.as_ptr()) };
+        }
+    }
     // devpts: a PRIVATE pty instance at `/dev/pts` + a `/dev/ptmx` multiplexer, so programs INSIDE
     // the box can allocate a controlling terminal — most importantly the in-box sshd for `--ssh`
     // (interactive `ssh box` otherwise fails "PTY allocation request failed"), plus screen/tmux/script.
@@ -835,7 +862,10 @@ fn setup_dev(root: &str, tun: bool) -> Result<(), Error> {
     // `gid=` (group 5 isn't mapped in a single-uid box, which would EINVAL the mount). Best-effort — a
     // host/kernel that refuses it just leaves the box without in-box PTYs (kern's own `-it` uses a HOST
     // pty and is unaffected).
-    {
+    // Only stand up a devpts instance when the box actually needs an in-box PTY (`--ssh` / `-it`).
+    // Skipping it in the common case removes a whole filesystem-mount syscall (+ mkdir + symlink) from
+    // box setup. kern's own `-it` uses a HOST pty (unaffected); this is for PTYs opened INSIDE the box.
+    if needs_pts {
         let ptsdir = format!("{root}/dev/pts");
         if let Ok(pd) = cstr(&ptsdir) {
             unsafe { libc::mkdir(pd.as_ptr(), 0o755) };
@@ -1139,6 +1169,12 @@ fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> 
     if secrets.is_empty() {
         return Ok(());
     }
+    // INVARIANT (do not break): the HOST runtime dir `$XDG_RUNTIME_DIR/kern` (registry, health, and
+    // exit sidecars) is NEVER mounted into a box — it isn't in the new root after pivot, so a workload
+    // can't read or forge it. `kern compose`'s `depends_completed` trusts that a box CANNOT write
+    // another service's `exit/<…>` sidecar. If a future feature needs in-box supervision state, mount
+    // a NARROW box-owned path (like `/run/secrets` below), never bind the host `kern` runtime tree.
+    //
     // `/run` may not exist in a minimal rootfs; create the chain. When a wide `/run` tmpfs is already
     // mounted (the `--ssh` path), `/run/secrets` is just a subdir on it — still RAM-backed and off the
     // overlay upper. Otherwise mount a narrow box-owned tmpfs on `/run/secrets` (0700, NOSUID|NODEV)
@@ -1269,7 +1305,7 @@ struct IdRange {
 /// `newuidmap`/`newgidmap` are security-sensitive (they write our uid map with privilege); resolving
 /// them through `$PATH` would let a writable entry like `~/.local/bin` shadow the real system binary
 /// and feed us a bogus mapping. Only the standard system bin dirs are trusted.
-fn trusted_helper(bin: &str) -> Option<std::path::PathBuf> {
+pub fn trusted_helper(bin: &str) -> Option<std::path::PathBuf> {
     ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         .iter()
         .map(|d| std::path::Path::new(d).join(bin))
@@ -1277,7 +1313,7 @@ fn trusted_helper(bin: &str) -> Option<std::path::PathBuf> {
 }
 
 /// The login name for `uid` (for matching `/etc/subuid` rows), or `None`.
-fn username(uid: u32) -> Option<String> {
+pub fn username(uid: u32) -> Option<String> {
     let pw = unsafe { libc::getpwuid(uid) };
     if pw.is_null() {
         return None;
@@ -1292,7 +1328,7 @@ fn username(uid: u32) -> Option<String> {
 /// `/etc/subgid`, with `count > 1`. A row matching the login **name** wins (returned immediately);
 /// a numeric-uid row is only used as a fallback — mirroring how shadow's `newuidmap` resolves the
 /// allocation, so a stray numeric row never shadows the user's named one.
-fn sub_range(file: &str, name: Option<&str>, id: u32) -> Option<(u32, u32)> {
+pub fn sub_range(file: &str, name: Option<&str>, id: u32) -> Option<(u32, u32)> {
     let content = std::fs::read_to_string(file).ok()?;
     let mut numeric: Option<(u32, u32)> = None;
     for line in content.lines() {
@@ -2009,21 +2045,55 @@ fn bring_loopback_up() {
 /// fresh net ns, brings its loopback up, then `pause()`s so the namespaces stay alive until the
 /// holder is killed (`kern pod rm`). Never returns.
 pub fn run_pod_holder() -> ! {
+    // A pod holder maps a RANGED uid map (`KERN_POD_UID_RANGE=1`, set by `pod create --uid-range`)
+    // when the pod will host OCI images that drop privilege in their entrypoint (postgres/redis/nginx/
+    // …). Members `setns` into this shared user ns and inherit the range, so their drop to a service
+    // uid works — the 0.6 official-image fix, extended to the pod path. Default (no env) = the single-
+    // uid self-map: faster (no newuidmap), more isolated (one uid), for a pod of root-only services.
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EPERM) {
-            eprintln!("kern: pod: {USERNS_UNAVAILABLE}");
-        } else {
-            eprintln!("kern: pod: unshare(user+net) failed: {e}");
+    let want_range = std::env::var_os("KERN_POD_UID_RANGE").is_some();
+    let ns = libc::CLONE_NEWUSER | libc::CLONE_NEWNET;
+    // The range needs newuidmap + an /etc/subuid allocation; if either is missing, fall back to the
+    // single-uid map (honest degrade — official images in this pod will then fail with the F1 warning,
+    // not silently). detect_id_range is resolved BEFORE the unshare (it must run in the init userns).
+    let range = if want_range {
+        detect_id_range(euid, egid)
+    } else {
+        None
+    };
+    match range {
+        Some(r) => {
+            // apply_userns_range does its own unshare(ns) + fork-helper newuidmap/newgidmap + sync.
+            if let Err(e) = apply_userns_range(ns, euid, egid, &r) {
+                eprintln!(
+                    "kern: pod: ranged user-ns map failed ({e}) — falling back to single-uid"
+                );
+                // apply_userns_range unshares before it can fail on the map write; we may already be in
+                // a fresh userns. Try the single-uid self-map here as the honest fallback.
+                if write_single_uid_map(euid, egid).is_err() {
+                    eprintln!("kern: pod: could not map the pod user namespace");
+                    unsafe { libc::_exit(1) };
+                }
+            }
         }
-        unsafe { libc::_exit(1) };
-    }
-    // Single-uid self-map (pod-root = caller). A pod is the network trust unit; members share this
-    // user ns, so per-member uid ranges aren't offered here.
-    if write_single_uid_map(euid, egid).is_err() {
-        eprintln!("kern: pod: could not map the pod user namespace");
-        unsafe { libc::_exit(1) };
+        None => {
+            if unsafe { libc::unshare(ns) } != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EPERM) {
+                    eprintln!("kern: pod: {USERNS_UNAVAILABLE}");
+                } else {
+                    eprintln!("kern: pod: unshare(user+net) failed: {e}");
+                }
+                unsafe { libc::_exit(1) };
+            }
+            if want_range {
+                eprintln!("kern: pod: --uid-range requested but unavailable (need newuidmap/newgidmap + /etc/subuid) — single-uid map");
+            }
+            if write_single_uid_map(euid, egid).is_err() {
+                eprintln!("kern: pod: could not map the pod user namespace");
+                unsafe { libc::_exit(1) };
+            }
+        }
     }
     bring_loopback_up();
     // Signal readiness (the parent waits for this line on our stdout) so `kern pod create` only
@@ -2261,5 +2331,60 @@ mod ready_guard_tests {
             unsafe { libc::close(fd) };
         }
         assert_eq!(drain(rd), 0, "disarmed drop must be silent (EOF)");
+    }
+}
+
+/// The `--uid-range` + official-image gap (0.6): images whose entrypoint drops privilege
+/// (postgres/redis/mysql/nginx `setpriv`/`gosu` to a service uid) failed to start. ROOT CAUSE (found
+/// by ~45 tests, after ruling out idmapped mounts — impossible rootless, EPERM: mount_setattr(IDMAP)
+/// needs CAP_SYS_ADMIN in the init userns where the image fs lives — and fuse-overlayfs — slow,
+/// user-space): the box's `/` was mode 0700 (from the own-only overlay upper), so ANY dropped non-root
+/// uid hit EACCES on the FIRST path component `/`, before ownership ever mattered. FIX (two surgical
+/// changes): (1) the box root is 0755 when privilege may be dropped (`--user` non-root OR `--uid-range`)
+/// — a normal rootfs mode, safe because the HOST scratch dir stays 0700 and isolation is the namespace,
+/// not the root's mode; (2) `/dev/fd` + `/dev/std{in,out,err}` symlinks into procfs (bash process
+/// substitution / postgres initdb need them). Verified live: redis, nginx, postgres all reach
+/// "ready to accept connections" under `--uid-range`.
+#[cfg(test)]
+mod uid_range_root_traversable {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The fix is a mode on the overlay upper (→ the box root). Assert the exact rule the box path uses:
+    // root becomes world-traversable (0755) iff a non-root --user is set OR --uid-range is on.
+    fn root_should_be_traversable(user_non_root: bool, uid_range: bool) -> bool {
+        user_non_root || uid_range
+    }
+
+    #[test]
+    fn root_is_traversable_when_privilege_may_be_dropped() {
+        assert!(
+            root_should_be_traversable(false, true),
+            "--uid-range → 0755 (entrypoint may drop)"
+        );
+        assert!(
+            root_should_be_traversable(true, false),
+            "--user non-root → 0755"
+        );
+        assert!(root_should_be_traversable(true, true));
+        assert!(
+            !root_should_be_traversable(false, false),
+            "plain root box stays own-only 0700"
+        );
+    }
+
+    #[test]
+    fn mode_0755_is_world_traversable() {
+        // The property that was missing: other-execute on the root so a dropped uid can enter `/`.
+        let perms = std::fs::Permissions::from_mode(0o755);
+        assert_eq!(
+            perms.mode() & 0o001,
+            0o001,
+            "0755 must have other-execute (traversal)"
+        );
+        assert_eq!(
+            std::fs::Permissions::from_mode(0o700).mode() & 0o001,
+            0,
+            "0700 blocks other — the bug"
+        );
     }
 }

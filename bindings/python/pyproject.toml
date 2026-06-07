@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kern-sandbox"
+version = "0.1.0"
+description = "Run code in a fast, local, daemonless kernel sandbox — no cloud, no account, no KVM."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "getkern" }]
+keywords = ["sandbox", "isolation", "namespaces", "seccomp", "agent", "code-execution", "edge", "ci"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/getkern/kern"
+Source = "https://github.com/getkern/kern/tree/main/bindings/python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kern_sandbox"]

@@ -44,11 +44,16 @@ pub fn apply_limits(
     let parent = PathBuf::from("/sys/fs/cgroup").join(rel);
     let child = parent.join(format!("kern-box-{tag}-{}", std::process::id()));
 
-    // Make the controllers available to children, one at a time so an unavailable one (e.g. no
-    // `cpu` controller on some Android-derived kernels) doesn't block enabling the others. (May
-    // already be on, or be denied by the no-internal-process rule when the parent has members.)
-    for ctrl in ["+memory", "+pids", "+cpu", "+cpuset", "+io"] {
-        let _ = fs::write(parent.join("cgroup.subtree_control"), ctrl);
+    // Make the controllers available to children. cgroup-v2 accepts several tokens in one write, so
+    // try them all at once (1 syscall). Only if that fails do we fall back to enabling them one at a
+    // time — so an unavailable controller (e.g. no `cpu` on some Android-derived kernels) still can't
+    // block the others. (Controllers may already be on, or be denied by the no-internal-process rule
+    // when the parent has members — all best-effort either way.)
+    let subtree = parent.join("cgroup.subtree_control");
+    if fs::write(&subtree, "+memory +pids +cpu +cpuset +io").is_err() {
+        for ctrl in ["+memory", "+pids", "+cpu", "+cpuset", "+io"] {
+            let _ = fs::write(&subtree, ctrl);
+        }
     }
     fs::create_dir(&child).ok()?;
 

@@ -88,6 +88,86 @@ pub fn clear_health(name: &str, pid: i32) {
     }
 }
 
+/// The exit directory — a sidecar per box that has RUN TO COMPLETION, holding its `<code>` as decimal
+/// text. Written by the detached supervisor when a box's main process exits for good (no `--restart`
+/// left). Consumed by `kern compose`'s `depends_completed` (Docker's `service_completed_successfully`):
+/// the box has left `list()`, and this tells us whether it finished cleanly (0) or failed.
+///
+/// The sidecar filename is an opaque compose-supplied KEY that encodes BOTH the stack AND the `up`
+/// epoch: `<pod>-<token>-<name>` (adversarial review, rounds 1-2):
+///  * **`<pod>`** namespaces by stack, so two different stacks that each contain a `db` never collide
+///    on one `exit/db` — one stack could otherwise read the OTHER's `db` exit.
+///  * **`<token>`** (a fresh per-`up` epoch) namespaces by RUN. This is the round-2 fix: with the
+///    token only INSIDE the file, two concurrent `up`s of the same stack shared the filename, so one
+///    `up`'s `clear`-before-spawn would DELETE the other's real completion — a healthy stack failing
+///    because a peer `up` wiped its state, not fail-closed. With the token in the KEY, each run owns
+///    its own files; a concurrent run's clear/write can't touch them. Isolation is structural.
+///
+/// Because a separate `down` invocation doesn't know the `up`'s token, it reaps each box's sidecar by
+/// pod-prefix AND box-name-suffix (`<pod>-*-<name>`, see `clear_exit_matching`) — NOT a blind `<pod>-`
+/// prefix, which would delete a concurrent same-stack run's in-flight files. Kept SEPARATE from
+/// `instances/` so `list()` never mistakes it for a live box. The runtime dir is NOT in a box's mount
+/// namespace (verified), so a workload can't forge another service's exit.
+fn exit_dir() -> io::Result<PathBuf> {
+    runtime_subdir("exit")
+}
+
+/// Record a completed box's final exit code under compose's stack+run-scoped `key`
+/// (`<pod>-<token>-<name>`). Best-effort.
+pub fn set_exit(key: &str, code: i32) {
+    if let Ok(d) = exit_dir() {
+        let _ = fs::write(d.join(key), code.to_string());
+    }
+}
+
+/// A completed box's recorded exit code for `key`, or `None` if it hasn't completed here or the
+/// sidecar is malformed. The key already carries the run's token, so any file that exists for it
+/// belongs to THIS run — no separate token check needed. `Some(0)` = finished successfully.
+pub fn exit_of(key: &str) -> Option<i32> {
+    exit_dir()
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join(key)).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Remove a box's exit sidecar for the exact `key` — compose calls this BEFORE (re)launching the box.
+/// Best-effort.
+pub fn clear_exit(key: &str) {
+    if let Ok(d) = exit_dir() {
+        let _ = fs::remove_file(d.join(key));
+    }
+}
+
+/// Remove every exit sidecar whose filename starts with `prefix` (compose passes `<pod>-`). Used by
+/// `compose down`, which — being a separate invocation — doesn't know the `up`'s token and so can't
+/// name the exact per-run key. Reaping is scoped to BOTH ends — `<prefix>…<suffix>` — so `compose
+/// down` clears `<pod>-<*any-token*>-<name>` only for the box `<name>` it is actually stopping. A
+/// blind `<pod>-` prefix would ALSO delete `<pod>-<otherToken>-<name>` of a DIFFERENT run of the same
+/// stack that is still in flight — re-opening, from the GC side, the exact cross-run deletion the
+/// token-in-key fix closed for clear/write (adversarial review, final round). Anchoring the suffix to
+/// the box name keeps GC safe: the only run that can own `<pod>-*-<name>` is the one whose `<name>`
+/// box exists, and duplicate live box names are refused, so down can't wipe a concurrent run's box.
+/// Best-effort.
+pub fn clear_exit_matching(prefix: &str, suffix: &str) {
+    if let Ok(d) = exit_dir() {
+        if let Ok(entries) = fs::read_dir(&d) {
+            for e in entries.flatten() {
+                if exit_key_bracketed(&e.file_name().to_string_lossy(), prefix, suffix) {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+}
+
+/// Does `name` start with `prefix` AND end with `suffix`, with the two NOT overlapping? The length
+/// guard is the subtle part: without it, `prefix` and `suffix` could match the same bytes on a short
+/// filename (e.g. prefix `p-` and suffix `-p` both matching `-p-`), reaping a file that isn't really
+/// `<prefix><token><suffix>`. Pure so it's unit-tested without touching the filesystem.
+fn exit_key_bracketed(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.len() >= prefix.len() + suffix.len() && name.starts_with(prefix) && name.ends_with(suffix)
+}
+
 /// Create and return `<runtime>/kern/<leaf>`, with graceful fallbacks.
 fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
     let uid = unsafe { libc::getuid() };
@@ -485,6 +565,24 @@ mod tests {
         assert!(!well_formed_entry(OsStr::new("web-abc")));
         assert!(!well_formed_entry(OsStr::new("-42")));
         assert!(!well_formed_entry(OsStr::new("evil.tmp")));
+    }
+
+    #[test]
+    fn exit_key_bracketed_matches_pod_and_name_across_tokens() {
+        // `compose down` reaps `<pod>-<*any token*>-<name>` for a box it stops. It must match every
+        // token of THAT box, and NOT a different box of the same stack (the concurrent-run leak the
+        // final review flagged).
+        let p = "myapp-"; // pod prefix
+        let s = "-migrate"; // -<name>
+        assert!(exit_key_bracketed("myapp-tokenA-migrate", p, s));
+        assert!(exit_key_bracketed("myapp-99-123456789-migrate", p, s)); // real token shape
+                                                                         // A DIFFERENT box of the same stack must NOT match — this is the fix.
+        assert!(!exit_key_bracketed("myapp-tokenA-other", p, s));
+        // A different stack must not match.
+        assert!(!exit_key_bracketed("otherapp-tokenA-migrate", p, s));
+        // Length guard: prefix and suffix must not overlap on a too-short name.
+        assert!(!exit_key_bracketed("myapp-migrate", "myapp-", "-migrate")); // no token between → too short to bracket
+        assert!(!exit_key_bracketed("x", "myapp-", "-migrate"));
     }
 
     #[test]

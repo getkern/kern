@@ -9,6 +9,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Registry credentials shared by `kern login`/`logout` and the OCI pull path.
 pub mod registry_auth;
 
+/// The tiny TOML-ish value readers (quoted string / bool / `[...]` array / `#` comment) shared by the
+/// `kern.toml` profile loader and the `kern-compose` file parser.
+pub mod toml_lite;
+
 /// A validated sandbox / box name. Newtype so a raw `String` can't be passed where a vetted
 /// name is required.
 ///

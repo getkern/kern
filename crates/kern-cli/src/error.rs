@@ -82,7 +82,8 @@ fn oci_hint(msg: &str) -> String {
         "image refs look like `alpine`, `alpine:3.19`, or `ghcr.io/user/app:tag`".into()
     } else if msg.contains("curl failed") || msg.contains("tar failed") || msg.contains("sha256sum")
     {
-        "pull needs `curl` and GNU `tar` on PATH, plus a working network".into()
+        "pull/push need `curl`, GNU `tar`, `gzip` and `sha256sum` on PATH, plus a working network"
+            .into()
     } else {
         // Registry / manifest / not-found: the name or tag is the likely culprit.
         "check the image name and tag exist; private images need `kern login` first".into()
@@ -99,7 +100,10 @@ impl std::fmt::Display for Error {
             Error::NotRunning(why) => write!(f, "{why}"),
             Error::AlreadyRunning(why) => write!(f, "{why}"),
             Error::Volume(why) => write!(f, "{why}"),
-            Error::Oci(why) => write!(f, "pull: {why}"),
+            // The OCI error already carries its own kind prefix (`registry:`/`extract:`/`ref:` from
+            // `OciError`'s Display), so we don't add another — a doubled "registry: registry:" was the
+            // symptom. A local cache error (no OCI prefix) still reads fine on its own.
+            Error::Oci(why) => write!(f, "{why}"),
             Error::Compose(why) => write!(f, "compose: {why}"),
             Error::Build(why) => write!(f, "build: {why}"),
             Error::Config(why) => write!(f, "config: {why}"),

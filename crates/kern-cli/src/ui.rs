@@ -412,7 +412,7 @@ mod tests {
             cpus: None,
             volumes: 0,
             tty: false,
-            seccomp_syscalls: 25,
+            seccomp_syscalls: 27,
         }
     }
 
@@ -439,7 +439,7 @@ mod tests {
         assert!(out.contains("alpine"));
         assert!(out.contains("overlay"));
         assert!(out.contains("isolated"));
-        assert!(out.contains("seccomp 25 syscalls"));
+        assert!(out.contains("seccomp 27 syscalls"));
         // No deliberately-open choice → no warning block.
         assert!(!out.contains("no network isolation"));
         // Optional rows are omitted when empty.

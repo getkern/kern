@@ -40,6 +40,7 @@ pub fn help() -> Result<(), Error> {
   {d}Images{z}
     {c}search{z} <query> [--json]                                        Search Docker Hub for images
     {c}pull{z} <image> [--dest <dir>]                                    Download an OCI image
+    {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
 
@@ -58,7 +59,8 @@ pub fn help() -> Result<(), Error> {
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
-    {c}compose{z} <file>                                                 Bring up a stack (TOML)
+    {c}compose{z} <file>                                                 Bring up a stack (kern TOML or docker-compose.yml)
+    {c}up{z} [--no-pod] / {c}down{z}                                          Bring up / tear down the compose file in this dir
     {c}pod{z} create <name> / pod ls / pod rm <name>                     Shared-network pod (boxes reach each other by name)
 
   {d}Config & storage{z}
@@ -342,6 +344,23 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             "a box named '{}' is already running",
             name.as_str()
         )));
+    }
+    // `--ssh` PREFLIGHT: sshd's privilege separation calls `setgroups()`, which a single-uid userns
+    // forbids (`/proc/self/setgroups=deny`). It works only with a real uid RANGE via newuidmap/subuid.
+    // On a host without those (common on edge boards), `--ssh` would leave a listening port whose auth
+    // silently closes with a confusing "Connection closed" — so say it up front instead of at handshake.
+    if args.ssh_port.is_some() {
+        let uid = unsafe { libc::getuid() };
+        let uname = kern_isolation::username(uid);
+        let have_range = kern_isolation::trusted_helper("newuidmap").is_some()
+            && kern_isolation::sub_range("/etc/subuid", uname.as_deref(), uid).is_some();
+        if !have_range {
+            eprintln!(
+                "kern: warning: --ssh needs a uid range (newuidmap + /etc/subuid) for sshd's privsep; \
+                 this host has none, so sshd will refuse the login (setgroups denied). Install \
+                 newuidmap/uidmap + add a subuid allocation, or use `kern exec` instead of ssh."
+            );
+        }
     }
     // (The effective command is resolved AFTER the image is pulled, so an `--image`'s Entrypoint/Cmd
     // can supply the default — see `resolve_image_command` below.)
@@ -630,6 +649,41 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         _ => None,
     };
     let run_as = parse_user(args.run_as.or(image_user))?;
+    // COMPAT HEADS-UP (not a security check; not parsing the entrypoint — only the image's own declared
+    // `User`). An OCI image that drops privilege to a non-root user (postgres/redis/nginx via `User` or
+    // an entrypoint `setpriv`/`gosu`) needs uids beyond box-root. Two honest cases:
+    //  - WITHOUT --uid-range (single-uid box): the drop's uid isn't mapped → the entrypoint's
+    //    `chown`/`setuid` fails EINVAL. Tell the user to add --uid-range (which now makes these images
+    //    work — the box root is world-traversable and the range maps the service uid).
+    //  - WITH --uid-range but the image declares a numeric `User` >= the mapped range size: the drop is
+    //    to a uid the range doesn't cover → still fails. Tell the user to widen /etc/subuid. We NEVER
+    //    silently clamp the uid into range (that would run the service as a DIFFERENT uid than the image
+    //    intends — a silent lie); we surface it and let the user fix the range.
+    let declared_user = image_config
+        .user
+        .as_deref()
+        .filter(|u| !u.is_empty() && *u != "0" && *u != "root");
+    if let Some(u) = declared_user {
+        if !args.uid_range {
+            eprintln!(
+                "kern: heads-up: image runs as non-root user '{u}' — under kern's rootless model a \
+                 single-uid box can't map that uid, so the entrypoint may fail (chown/setuid EINVAL). \
+                 Add --uid-range to run it (maps a subordinate uid range so the drop works)."
+            );
+        } else if let Ok(n) = u.split(':').next().unwrap_or(u).parse::<u32>() {
+            // Numeric User declared AND --uid-range: warn only if it exceeds the range we can map.
+            // (A name like `postgres` we can't resolve pre-pivot; the range covers the usual 0..65535.)
+            let range = mapped_uid_count(); // best-effort: the caller's /etc/subuid range size
+            if range != 0 && n >= range {
+                eprintln!(
+                    "kern: heads-up: image runs as uid {n}, but --uid-range maps only {range} uids \
+                     (0..{}). The drop to {n} will fail; widen the caller's /etc/subuid allocation to \
+                     cover it. kern will NOT remap it to a different uid.",
+                    range - 1
+                );
+            }
+        }
+    }
     // `--cap-add`/`--cap-drop`: resolve names to a CapSpec (unknown name → error) layered on the
     // always-dropped dangerous baseline.
     let caps = crate::caps::resolve(args.cap_add, args.cap_drop)?;
@@ -1167,7 +1221,15 @@ fn prepare_ssh(
         Some(path) => {
             let key = std::fs::read_to_string(path)
                 .map_err(|e| Error::Sandbox(format!("--ssh-key '{path}': {e}")))?;
-            if !key.contains("ssh-") {
+            // Validate the key TYPE token (first whitespace-delimited field), not a bare `ssh-`
+            // substring — that wrongly rejected valid ECDSA keys (`ecdsa-sha2-nistp256`,
+            // `sk-ecdsa-sha2-nistp256@openssh.com`), which contain no `ssh-`.
+            let ktype = key.split_whitespace().next().unwrap_or("");
+            let ok = ktype.starts_with("ssh-")
+                || ktype.starts_with("ecdsa-")
+                || ktype.starts_with("sk-ssh-")
+                || ktype.starts_with("sk-ecdsa-");
+            if !ok {
                 return Err(Error::Sandbox(format!(
                     "--ssh-key '{path}' does not look like an OpenSSH public key"
                 )));
@@ -1387,6 +1449,10 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         // on the SAME filesystem, so in build mode BOTH live under the build tree (work is cleared each
         // step — overlay wants a fresh workdir); only `merged` (a bare mountpoint) stays ephemeral.
         let eph = scratch_dir().join(format!("{}-{}", b.name.as_str(), std::process::id()));
+        // Create the ephemeral parent once (0700) so the per-leaf creates below (`upper`/`work`/`merged`,
+        // all under `eph` in the common case) are a single bare mkdir each instead of each re-walking
+        // and re-stat-ing the shared parent chain — a few fewer serial pre-fork syscalls per box.
+        own_only_dir(&eph).map_err(|e| Error::Sandbox(format!("overlay scratch: {e}")))?;
         let merged = eph.join("merged");
         let (upper, work) = match &b.overlay_upper {
             Some(dir) => {
@@ -1399,11 +1465,18 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         };
         own_only_dir(&upper).map_err(|e| Error::Sandbox(format!("overlay upper: {e}")))?;
         // overlayfs presents the merged root's mode as the UPPER dir's mode. The upper is 0700 (own-only)
-        // by default, which makes the box's `/` un-traversable by a dropped, cap-less `--user` uid → any
-        // exec fails EACCES. A non-root `--user` therefore needs a normal, world-traversable `/` (0755,
-        // exactly like a real root fs). This stays private on the HOST — the 0700 parent scratch dir
-        // still blocks other users — so it only affects the in-box view.
-        if matches!(b.run_as, Some((u, _)) if u != 0) {
+        // by default, which makes the box's `/` un-traversable by ANY dropped, cap-less non-root uid →
+        // exec/read fails EACCES on `/` itself (the first path component). A `--user` uid hits this, but
+        // so does the far more common case: an OCI image whose ENTRYPOINT drops privilege internally
+        // (postgres/redis/mysql/nginx `setpriv`/`gosu` to a service uid) — there is no `--user`, yet the
+        // workload still ends up non-root and needs a world-traversable `/`. So give the box a normal
+        // 0755 root (exactly like a real rootfs) whenever privilege MIGHT be dropped: an explicit
+        // non-root `--user`, OR a `--uid-range` box (which exists precisely to run such images). This is
+        // the fix for the "official images don't start" gap. It's safe: the HOST scratch dir is still
+        // 0700 (no other host user can enter), and root=0755 is the norm for every real filesystem —
+        // it's the in-box view only, and the box's isolation is the namespace, not the root's mode.
+        let root_traversable = matches!(b.run_as, Some((u, _)) if u != 0) || b.uid_range;
+        if root_traversable {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o755))
                 .map_err(|e| Error::Sandbox(format!("overlay upper perms: {e}")))?;
@@ -1500,12 +1573,19 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
         }
         // Refuse to shadow the box's own essential mounts: a `-v` exactly over `/`, `/proc`, `/sys` or
         // `/dev` would hide the sandbox's isolation setup (masked proc/sys, minimal dev). A SUBPATH
-        // (e.g. `/dev/foo`, `/data`) is fine — only these exact roots are protected.
-        let norm = target.trim_end_matches('/');
-        if norm.is_empty() || matches!(norm, "/proc" | "/sys" | "/dev") {
+        // (e.g. `/dev/foo`, `/data`) is fine — only these exact roots are protected. Normalize the way
+        // the mount actually resolves it (`open_in_root` splits on '/' and drops empty components), so
+        // a leading-double-slash target like `//dev` — which trims to a non-matching string but still
+        // resolves to `/dev` at mount time — can't slip past this guard.
+        let comps: Vec<&str> = target.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.is_empty() || matches!(comps.as_slice(), ["proc"] | ["sys"] | ["dev"]) {
+            let shown = if comps.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", comps.join("/"))
+            };
             return Err(Error::Sandbox(format!(
-                "-v '{s}': cannot mount over {} (a box essential mount)",
-                if norm.is_empty() { "/" } else { norm }
+                "-v '{s}': cannot mount over {shown} (a box essential mount)"
             )));
         }
         // The source is either a NAMED volume (a bare name — resolved to its data dir, auto-created
@@ -1684,9 +1764,6 @@ fn validate_hostname(h: Option<&str>) -> Result<Option<String>, Error> {
     }
 }
 
-/// tmpfs paths that would punch through the sandbox's own hardening if a fresh tmpfs shadowed them.
-const BLOCKED_TMPFS: &[&str] = &["/proc", "/sys", "/dev"];
-
 /// Parse `--tmpfs PATH[:size]` specs into `(path, size)` — `size` a tmpfs `size=` token (`"64m"`),
 /// empty for the kernel default. The path must be absolute, `.`/`..`/NUL-free, and not shadow a
 /// hardened mount (`/proc`, `/sys`, `/dev`). A bad size (not digits + optional k/m/g/t) is rejected.
@@ -1705,10 +1782,11 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
                 "--tmpfs '{s}': path must be absolute, without '.'/'..'/NUL"
             )));
         }
-        if BLOCKED_TMPFS
-            .iter()
-            .any(|b| path == *b || path.starts_with(&format!("{b}/")))
-        {
+        // Normalize like the mount resolves it (drop empty components) so a leading-double-slash path
+        // (`//proc`) can't slip past. Block the hardened roots AND anything under them: the first real
+        // path component being proc/sys/dev is the test.
+        let first = path.split('/').find(|c| !c.is_empty());
+        if matches!(first, Some("proc") | Some("sys") | Some("dev")) {
             return Err(Error::Sandbox(format!(
                 "--tmpfs '{path}' is refused (it would shadow the sandbox's hardened /proc, /sys or /dev)"
             )));
@@ -1805,11 +1883,165 @@ pub fn exec(
     }
 }
 
-/// Remove a box's writable scratch tree (best-effort).
+// Subuid/subgid range resolution and the trusted id-map helper lookup are the ONE authoritative
+// implementation in kern-isolation (`sub_range` / `trusted_helper` / `username`), reused here so the
+// cleanup path can't drift from the box-start path.
+
+/// Remove a box's writable scratch tree (best-effort), with a ranged fallback for subuid-owned files.
 fn cleanup_scratch(scratch: Option<&std::path::Path>) {
     if let Some(s) = scratch {
-        let _ = std::fs::remove_dir_all(s);
+        if std::fs::remove_dir_all(s).is_ok() || !s.exists() {
+            return;
+        }
+        // remove_dir_all failed and the dir is still there: a `--uid-range` box (or a pod member) can
+        // leave files owned by SUBORDINATE uids (an image that dropped to e.g. uid 472 → host subuid
+        // 100471) that we — as the plain host user, outside any userns — can't unlink (they sit under
+        // subuid-owned dirs). Retry inside a `newuidmap`-mapped user namespace where those subuids map
+        // back to ns-root, so the remove succeeds. This is what `podman unshare rm` does for the same
+        // reason. Best-effort: if the range isn't available, we've already tried the plain remove.
+        //
+        // TOCTOU (the ranged remove is PRIVILEGED — subuids map to ns-root — and descends a tree a box
+        // wrote): a box process surviving teardown could plant a symlink mid-descent to steer the
+        // recursive remove outside the scratch tree. Two layers close it: (1) `remove_dir_all` is
+        // no-follow at every level (openat+O_NOFOLLOW since Rust 1.26; our MSRV is 1.82, so guaranteed,
+        // not toolchain-luck); (2) BEFORE removing, we re-open the target under kern's scratch-root with
+        // `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)` — a kernel-level check that no component is a
+        // symlink or escapes the root. If that open is refused, we do NOT run the ranged remove.
+        if !scratch_path_is_confined(s) {
+            return;
+        }
+        remove_dir_all_ranged(s);
     }
+}
+
+/// True iff `dir` opens cleanly under kern's scratch-root with `openat2(RESOLVE_BENEATH |
+/// RESOLVE_NO_SYMLINKS)` — i.e. every path component stays beneath the root and none is a symlink.
+/// Kernel-enforced (Linux 5.6+ for openat2 / 5.3 for the resolve flags); if openat2 is unavailable the
+/// no-follow `remove_dir_all` + the canonicalized parent check are the fallback confinement.
+fn scratch_path_is_confined(dir: &std::path::Path) -> bool {
+    const SYS_OPENAT2: libc::c_long = 437;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let root = scratch_dir();
+    let Ok(root_c) = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return false;
+    }
+    // The path RELATIVE to the scratch root (RESOLVE_BENEATH interprets it from root_fd).
+    let rel = dir.strip_prefix(&root).unwrap_or(dir);
+    let Ok(rel_c) = std::ffi::CString::new(rel.as_os_str().as_encoded_bytes()) else {
+        unsafe { libc::close(root_fd) };
+        return false;
+    };
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT2,
+            root_fd,
+            rel_c.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    unsafe { libc::close(root_fd) };
+    if fd >= 0 {
+        unsafe { libc::close(fd as libc::c_int) };
+        true // confined: no symlink component, stays beneath the scratch root
+    } else {
+        // ENOSYS (no openat2) → fall back to the no-follow remove + canonical-parent check (still safe
+        // on our MSRV); any other error (ELOOP/EXDEV = a symlink/escape component) → refuse.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+    }
+}
+
+/// Remove `dir` from inside a user namespace mapped to the caller's full subordinate range, so files
+/// owned by subordinate uids (left by a `--uid-range` / pod box whose workload dropped privilege) are
+/// unlinkable (they appear owned by ns-root under the map). Forks a child that unshares a user ns and
+/// blocks; the parent maps it with `newuidmap`/`newgidmap`; the child then `remove_dir_all`s as ns-root.
+fn remove_dir_all_ranged(dir: &std::path::Path) {
+    let (uid, gid) = (unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    // Resolve the range + trusted helpers via the ONE authoritative kern-isolation impl (same as the
+    // box-start path), so cleanup can't drift; no allocation → give up.
+    let name = kern_isolation::username(uid);
+    let (Some(newuidmap), Some(newgidmap)) = (
+        kern_isolation::trusted_helper("newuidmap"),
+        kern_isolation::trusted_helper("newgidmap"),
+    ) else {
+        return;
+    };
+    let (Some((sub_uid, uc)), Some((sub_gid, gc))) = (
+        kern_isolation::sub_range("/etc/subuid", name.as_deref(), uid),
+        kern_isolation::sub_range("/etc/subgid", name.as_deref(), gid),
+    ) else {
+        return;
+    };
+    let mut c2p = [0i32; 2];
+    let mut p2c = [0i32; 2];
+    if unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0 || unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0
+    {
+        return;
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return;
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(c2p[0]);
+            libc::close(p2c[1])
+        };
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        let _ = unsafe { libc::write(c2p[1], b"1".as_ptr().cast(), 1) };
+        let mut b = [0u8; 1];
+        let _ = unsafe { libc::read(p2c[0], b.as_mut_ptr().cast(), 1) };
+        // ns-root over the whole range now: the subuid-owned files map to ids we own here → removable.
+        let _ = std::fs::remove_dir_all(dir);
+        unsafe { libc::_exit(0) };
+    }
+    unsafe {
+        libc::close(c2p[1]);
+        libc::close(p2c[0])
+    };
+    let mut b = [0u8; 1];
+    let _ = unsafe { libc::read(c2p[0], b.as_mut_ptr().cast(), 1) };
+    let map = |bin: &std::path::Path, own: u32, sub: u32, count: u32| {
+        let _ = std::process::Command::new(bin)
+            .args([
+                pid.to_string(),
+                "0".into(),
+                own.to_string(),
+                "1".into(),
+                "1".into(),
+                sub.to_string(),
+                count.to_string(),
+            ])
+            .status();
+    };
+    map(&newuidmap, uid, sub_uid, uc);
+    map(&newgidmap, gid, sub_gid, gc);
+    let _ = unsafe { libc::write(p2c[1], b"1".as_ptr().cast(), 1) };
+    let mut st = 0;
+    unsafe { libc::waitpid(pid, &mut st, 0) };
 }
 
 /// Fork a health-checker for a detached box: every `interval` s it runs `health_cmd` (via
@@ -2166,8 +2398,17 @@ fn supervise_box(
     inst: &mut registry::Instance,
 ) {
     const MAX_RESTARTS: u32 = 10;
+    // `compose` hands a box that is a `depends_completed` target an exit KEY via env `KERN_EXIT_KEY`.
+    // The key is `<pod>-<token>-<name>` — it encodes both the stack AND the `up` epoch, so recording
+    // the final code under it can't collide with a same-named service in another stack, nor with the
+    // SAME stack under a concurrent `up` (that run has a different token → a different filename). Absent
+    // for a plain `kern box` — no sidecar is written. Read ONCE at start; the box's own workload can't
+    // change our env.
+    let exit_key = std::env::var("KERN_EXIT_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
     let mut attempt = 0u32;
-    loop {
+    let final_code = loop {
         let ready = if attempt == 0 {
             have_pipe.then_some(wr)
         } else {
@@ -2218,7 +2459,13 @@ fn supervise_box(
             unsafe { libc::sleep(1) }; // brief backoff so a crash loop can't spin
             continue;
         }
-        break;
+        break code;
+    };
+    // The box has finished for good (no restart left). If compose is waiting on our completion, record
+    // the final exit code under its stack+run-scoped key. Written LAST, after the box is truly gone
+    // from the run, so a reader that sees the sidecar knows the box is done.
+    if let Some(key) = &exit_key {
+        registry::set_exit(key, final_code);
     }
 }
 
@@ -2576,6 +2823,14 @@ fn reexec_in_scope_if_possible(
     if std::env::var_os("KERN_SCOPE").is_some() {
         return; // already inside our scope
     }
+    if std::env::var_os("KERN_NO_SCOPE").is_some() {
+        // Opt-out fast path: skip the systemd transient scope (which costs a `systemd-run` spawn +
+        // a D-Bus round-trip + a second kern re-exec — several ms). Resource caps then fall through
+        // to the best-effort cgroup path (same as when no user systemd is present). For latency-
+        // critical callers (e.g. an agent dev loop firing many short boxes) that accept best-effort
+        // instead of hard-delegated caps. Safe: it's the already-exercised no-user-systemd branch.
+        return;
+    }
     // Gate on a running user manager (so the exec can't strand us in a broken systemd-run).
     let has_user_systemd = std::env::var_os("XDG_RUNTIME_DIR")
         .map(|d| std::path::Path::new(&d).join("systemd").exists())
@@ -2621,7 +2876,13 @@ fn reexec_in_scope_if_possible(
         props.push("-p".into());
         props.push(format!("AllowedCPUs={set}"));
     }
-    let mut cmd = std::process::Command::new("systemd-run");
+    // Resolve `systemd-run` by trusted absolute path, NOT via `$PATH`: on a box start this spawn is on
+    // the critical path, and a long user `$PATH` (cargo/nvm/local/…) makes the kernel try execve in each
+    // dir until it finds it — several failed execves per box. The absolute path is one execve. (Same
+    // trusted-bin policy as the id-map helpers.)
+    let systemd_run = kern_isolation::trusted_helper("systemd-run")
+        .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
+    let mut cmd = std::process::Command::new(systemd_run);
     cmd.args(["--user", "--scope", "--quiet", "--collect"])
         .args(&props)
         .arg("--")
@@ -2973,15 +3234,21 @@ pub fn gc(images: bool) -> Result<(), Error> {
 fn sweep_orphan_layers() -> (usize, u64) {
     let cache = cache_dir();
     let lc = layer_cache_dir();
-    // Collect every layer key still referenced by some image's `.layers` manifest.
+    // Collect every layer key still referenced by some image's `.layers` manifest. This set is used
+    // to decide what to DELETE, so it must be COMPLETE: if we can't read a manifest (transient IO /
+    // permission error), a layer referenced only by it would look orphaned and be wrongly deleted.
+    // Fail closed — abort the whole sweep (delete nothing) rather than sweep on a partial set.
     let mut referenced = std::collections::HashSet::new();
     if let Ok(rd) = std::fs::read_dir(&cache) {
         for e in rd.flatten() {
             if e.path().extension().and_then(|s| s.to_str()) == Some("layers") {
-                if let Ok(body) = std::fs::read_to_string(e.path()) {
-                    for k in body.lines().skip(1).map(str::trim) {
-                        referenced.insert(k.to_string());
+                match std::fs::read_to_string(e.path()) {
+                    Ok(body) => {
+                        for k in body.lines().skip(1).map(str::trim) {
+                            referenced.insert(k.to_string());
+                        }
                     }
+                    Err(_) => return (0, 0), // incomplete reference set → don't risk deleting live layers
                 }
             }
         }
@@ -3396,7 +3663,15 @@ fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
         for e in rd.flatten() {
             let fname = e.file_name();
             let fname = fname.to_string_lossy();
-            if fname.starts_with(&prefix) && fname.ends_with(".log") {
+            // Require exactly `<name>-<digits>.log`: strip the prefix and `.log`, then the middle must
+            // be an all-digit PID. A bare `starts_with(prefix)` would let box `foo` match `foo-bar`'s
+            // log file `foo-bar-<pid>.log` (box names may legally contain '-'), leaking another box's
+            // output through `kern logs`/`attach`.
+            let is_ours = fname
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".log"))
+                .is_some_and(|mid| !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()));
+            if is_ours {
                 if let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
                     if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
                         newest = Some((mtime, e.path()));
@@ -3494,6 +3769,201 @@ pub fn pull(image: &str, dest: Option<&str>) -> Result<(), Error> {
         dest.display()
     );
     Ok(())
+}
+
+/// `kern push <local-ref> [as <remote-ref>]` — publish a locally-cached image to a registry as a
+/// single-layer OCI image. The image must be present in the cache (pull/build it first). A push to a
+/// private repo needs `kern login`. The rootfs is materialized (flat cache dir, or the overlay chain
+/// squashed) and packed into one layer.
+pub fn push(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
+    let remote = remote_ref.unwrap_or(local_ref);
+    // Materialize the image to a single rootfs directory. A flat pulled image IS a cache dir; a
+    // layered/built image is squashed into a temp dir via its overlay chain so we push one layer.
+    let (rootfs, config, cleanup) = materialize_image(local_ref)?;
+    let cfg = kern_oci::ImageConfigOut {
+        entrypoint: config.entrypoint,
+        cmd: config.cmd,
+        env: config.env,
+        workdir: config.workdir,
+        user: config.user,
+    };
+    // Scratch dir for the layer/config blobs, cleaned up on exit.
+    let work = cache_dir().join(format!(".push-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("push work dir: {e}")))?;
+
+    let result =
+        kern_oci::push(remote, &rootfs, &cfg, &work).map_err(|e| Error::Oci(e.to_string()));
+
+    let _ = std::fs::remove_dir_all(&work);
+    if let Some(tmp) = cleanup {
+        remove_build_tree(&tmp); // squashed rootfs (overlay merge) → force-clean mode-000 dirs
+    }
+    result
+}
+
+/// Materialize an image reference to `(rootfs_dir, config, cleanup)`. `cleanup` is `Some(tmp)` when we
+/// created a temporary squashed rootfs (layered image) that the caller must remove; `None` when the
+/// rootfs is the persistent flat cache dir (do NOT delete it). Errors if the image isn't cached.
+fn materialize_image(
+    image: &str,
+) -> Result<(PathBuf, kern_oci::ImageConfig, Option<PathBuf>), Error> {
+    let cache = cache_dir();
+    let safe = sanitize_ref(image);
+    let flat = cache.join(&safe);
+    // Flat pulled image: the cache dir is the rootfs, pushed in place (no copy).
+    if flat.is_dir()
+        && !cache.join(format!("{safe}.layers")).exists()
+        && !cache.join(format!("{safe}.base")).exists()
+    {
+        let config = read_image_config(&cache.join(format!("{safe}.image")));
+        return Ok((flat, config, None));
+    }
+    // Layered/built image: squash the overlay chain into a fresh temp rootfs so we push one layer.
+    //
+    // WHITEOUT INVARIANT (review §C — a leak-of-deleted-secrets if broken): a naive `cp -a` bottom-up
+    // squash of RAW OCI layers would re-include a file that a higher layer DELETED via a `.wh.` whiteout
+    // — e.g. a secret `rm`'d in a cleanup layer would reappear in the pushed image. kern's layers are
+    // safe from this by construction: (a) a PULLED base is already the MERGED rootfs — the pull RESOLVES
+    // `.wh.`/`.wh..wh..opq` during extraction (see kern_oci::pull), leaving no whiteout files; (b) a
+    // BUILT image is base + a SINGLE upper diff where RUN `rm` deletes for real (one shared upper, no
+    // per-step whiteout). So the chain here never contains whiteout files, and `cp -a` is correct.
+    // Belt-and-braces AND future-proofing (if kern ever gains per-RUN whiteout layers): after the copy
+    // we STRIP any `.wh.*` that somehow survived, so a whiteout can never be pushed as a literal file.
+    let (lower, config) = resolve_image(image)?;
+    let tmp = cache.join(format!(".push-squash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| Error::Oci(format!("squash dir: {e}")))?;
+    // The overlay chain is `top:...:base` (colon-joined). Copy each layer bottom-up into `tmp` so the
+    // top layers shadow the base — a simple squash. `cp -a` preserves symlinks (no host-follow).
+    let mut layers: Vec<&str> = lower.split(':').collect();
+    layers.reverse(); // apply base first, then higher layers overwrite
+    for layer in layers {
+        let ok = std::process::Command::new("cp")
+            .arg("-a")
+            .arg("--")
+            .arg(format!("{layer}/."))
+            .arg(&tmp)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            remove_build_tree(&tmp);
+            return Err(Error::Oci(format!("squashing image '{image}' failed")));
+        }
+    }
+    // Defence-in-depth: strip any surviving OCI whiteout markers so a `.wh.<name>` can never be pushed
+    // as a literal file (which a registry/Docker would then materialize as a real file named `.wh.…`).
+    strip_whiteout_markers(&tmp);
+    Ok((tmp.clone(), config, Some(tmp)))
+}
+
+/// Rewrite each service's RELATIVE bind-mount source to an absolute path under the compose file's
+/// directory (Docker's rule), so kern's `-v` — which wants an absolute path or a named volume —
+/// accepts the common `./dir:/dst` / `.:/app` compose form. A source that is already absolute (`/…`),
+/// or a bare NAME (a named volume, no `/` and no leading `.`), is left untouched. The resolved path is
+/// CONFINED under the compose dir (canonicalize + starts_with, same traversal guard as a build
+/// context) so a `../../../etc:/x` can't escape the project tree.
+fn resolve_relative_binds(
+    boxes: &mut [crate::compose::ComposeBox],
+    file: &str,
+) -> Result<(), Error> {
+    let compose_dir = std::path::Path::new(file)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let base = std::fs::canonicalize(&compose_dir)
+        .map_err(|e| Error::Compose(format!("resolving compose dir: {e}")))?;
+
+    for b in boxes.iter_mut() {
+        for v in b.volumes.iter_mut() {
+            // Split `src:dst[:opts]`. The source is the first segment; dst/opts follow.
+            let (src, rest) = match v.split_once(':') {
+                Some((s, r)) => (s, r),
+                None => continue, // malformed spec — let `kern box` report it precisely
+            };
+            // Absolute source or a bare named volume → leave as-is.
+            let is_relative =
+                src.starts_with("./") || src.starts_with("../") || src == "." || src == "..";
+            if !is_relative {
+                continue;
+            }
+            let abs = std::fs::canonicalize(base.join(src)).map_err(|e| {
+                Error::Compose(format!("service '{}': bind source '{src}': {e}", b.name))
+            })?;
+            if !abs.starts_with(&base) {
+                return Err(Error::Compose(format!(
+                    "service '{}': bind source '{src}' escapes the compose directory (refused)",
+                    b.name
+                )));
+            }
+            *v = format!("{}:{rest}", abs.to_string_lossy());
+        }
+        // Compose `secrets:` map to `--secret <file>:<name>`; `<file>` came from a top-level `file: ./x`
+        // and is relative → resolve against the compose dir, same traversal guard as a bind.
+        for s in b.secrets.iter_mut() {
+            let Some((file, nm)) = s.split_once(':') else {
+                continue;
+            };
+            if file.starts_with('/') {
+                continue; // already absolute
+            }
+            let abs = std::fs::canonicalize(base.join(file)).map_err(|e| {
+                Error::Compose(format!("service '{}': secret file '{file}': {e}", b.name))
+            })?;
+            if !abs.starts_with(&base) {
+                return Err(Error::Compose(format!(
+                    "service '{}': secret file '{file}' escapes the compose directory (refused)",
+                    b.name
+                )));
+            }
+            *s = format!("{}:{nm}", abs.to_string_lossy());
+        }
+    }
+    Ok(())
+}
+
+/// Walk a squashed rootfs and honour any OCI whiteout marker that survived the merge: `.wh.<name>`
+/// deletes its sibling `<name>` (and itself), `.wh..wh..opq` clears its directory's contents. In
+/// kern's model the chain has none (see the invariant at the call site), so this is a no-op belt —
+/// but if a future layer format leaves whiteouts, this keeps a deleted file from being republished.
+/// Best-effort, non-following (never descends a symlink), depth-first.
+fn strip_whiteout_markers(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let ft = match e.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if name == ".wh..wh..opq" {
+            // Opaque dir marker: drop it (its "hide everything below" is already reflected in the
+            // merged view we squashed; the marker itself must not ship).
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        if let Some(victim) = name.strip_prefix(".wh.") {
+            // Whiteout: remove the shadowed sibling (if it somehow got copied) and the marker.
+            if !victim.is_empty() && !victim.contains('/') {
+                let sib = root.join(victim);
+                if sib.is_dir() {
+                    let _ = std::fs::remove_dir_all(&sib);
+                } else {
+                    let _ = std::fs::remove_file(&sib);
+                }
+            }
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        // Recurse into real subdirectories (not symlinks — no-follow).
+        if ft.is_dir() {
+            strip_whiteout_markers(&e.path());
+        }
+    }
 }
 
 /// Resolve `--image <ref>` to an overlay `(lowerdir, config)`. A pulled (flat) image is a single
@@ -3727,6 +4197,21 @@ fn chain_has_dir(chain: &[String], rel: &str) -> bool {
 
 /// Create `dir` (and parents) private to this user (mode 0700). Mitigates a local-user symlink/
 /// clobber attack on a predictable cache path: another user can't pre-create or enter it.
+/// Size of the caller's subordinate-uid range from `/etc/subuid` (box uids 1..count map here, so the
+/// box can use uids 0..count-1). `0` if there's no allocation (single-uid only). Best-effort, matching
+/// how `newuidmap` resolves the row — a name match wins, else a numeric-uid row. Used only to warn (F1)
+/// when an image's declared uid exceeds what `--uid-range` can map; never to clamp.
+/// Size of the caller's `/etc/subuid` range (box uids 0..count usable), or 0 if none. Delegates to the
+/// ONE authoritative parser in kern-isolation (`sub_range`: `count>1`, name-row-wins) so the box path,
+/// the cleanup path, and this F1 warning can't drift apart.
+fn mapped_uid_count() -> u32 {
+    let uid = unsafe { libc::getuid() };
+    let name = kern_isolation::username(uid);
+    kern_isolation::sub_range("/etc/subuid", name.as_deref(), uid)
+        .map(|(_start, count)| count)
+        .unwrap_or(0)
+}
+
 fn own_only_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -4446,6 +4931,14 @@ fn copy_into_rootfs(
     } else {
         src.to_string_lossy().into_owned()
     };
+    // SECURITY INVARIANT (do not break): `cp -a` implies `--no-dereference` — it PRESERVES symlinks in
+    // the copied tree rather than following them. This is load-bearing for the build-context confinement
+    // (the "duale-di-Z2" note in `resolve_builds`): the COPY source root is confined by canonicalize +
+    // starts_with, and because the recursive descent here does NOT follow inner symlinks, a symlink
+    // buried in the context lands in the image verbatim (dangling in the pivoted rootfs) and its host
+    // target is never read at build time. If this `cp -a` is ever replaced (e.g. a Rust `walkdir` copy
+    // for portability), that replacement MUST be no-follow too, or a `leak -> /host/secret` inside a
+    // build context would leak the host file into the image. Verified live: it does not, today.
     let ok = std::process::Command::new("cp")
         .arg("-a")
         .arg("--") // src/target are absolute, but never let cp parse them as flags
@@ -4791,13 +5284,286 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
 /// (`<cache>/scratch/<name>-<pid>/merged`).
 fn cleanup_box_scratch(rootfs: &str) {
     let p = std::path::Path::new(rootfs);
-    if p.file_name().is_some_and(|n| n == "merged") {
-        if let Some(scratch) = p.parent() {
-            if scratch.to_string_lossy().contains("/scratch/") {
-                let _ = std::fs::remove_dir_all(scratch);
+    if p.file_name().is_none_or(|n| n != "merged") {
+        return;
+    }
+    let Some(scratch) = p.parent() else { return };
+    // CONFINEMENT (the ranged fallback below runs a privileged newuidmap'd remove_dir_all, so the path
+    // must be provably ours): require `scratch`'s parent to be kern's own scratch root — not a weak
+    // `.contains("/scratch/")` (which `/tmp/scratch/../../etc` would pass). Canonicalize both sides so
+    // no `..`/symlink in the registry-derived rootfs can steer the remove outside kern's scratch tree.
+    let root = scratch_dir();
+    let canon_root = std::fs::canonicalize(&root).unwrap_or(root);
+    let parent_ok = scratch.parent().is_some_and(|par| {
+        std::fs::canonicalize(par)
+            .map(|c| c == canon_root)
+            .unwrap_or(false)
+    });
+    if !parent_ok {
+        return;
+    }
+    // Route through cleanup_scratch's ranged fallback: a `--uid-range`/pod box whose image dropped
+    // privilege leaves subordinate-uid-owned files (e.g. grafana's /var/lib/grafana owned by subuid
+    // 100471) that a plain remove_dir_all can't unlink from the host — the fallback retries inside a
+    // newuidmap'd user ns where they're removable.
+    cleanup_scratch(Some(scratch));
+}
+
+/// How long `compose up` waits for a `depends_healthy` / `depends_completed` condition before it
+/// gives up and aborts the bring-up. Docker's default `--wait` has no ceiling; we cap it so a stuck
+/// dependency fails loudly instead of hanging a scripted `up` forever. Generous enough for a cold
+/// database (postgres init + first health pass is a few seconds).
+const COMPOSE_CONDITION_TIMEOUT_SECS: u64 = 120;
+
+/// The exit-sidecar key for a box: `<pod>-<token>-<name>`. `<pod>` namespaces by STACK (two stacks
+/// with a `db` don't collide — review 1b); `<token>` namespaces by this `up`'s RUN (two concurrent
+/// `up`s of the SAME stack own separate files, so one's clear/write can't clobber the other's real
+/// completion — review round 2, the round-1 "token only inside the file" left the filename shared).
+/// `compose_pod_name(file)` is stable per compose file even for a `--no-pod` stack (no live pod), so
+/// the prefix is well-defined in both modes. `compose down` doesn't know the `up`'s token, so it reaps
+/// each box's sidecar by `exit_key_prefix(pod)` ++ `-<name>` (pod-prefix AND name-suffix) — NOT a
+/// blind pod prefix, which would wipe a concurrent same-stack run's in-flight files.
+fn exit_key(pod: &str, token: &str, name: &str) -> String {
+    format!("{pod}-{token}-{name}")
+}
+
+/// The `<pod>-` prefix shared by every exit key of a stack — the LEADING anchor for `compose down`'s
+/// reap; the box name (`-<name>`) is the trailing anchor, so together they bracket any token.
+fn exit_key_prefix(pod: &str) -> String {
+    format!("{pod}-")
+}
+
+/// Resolve every service's compose `build:` into a built image via `kern build`, mutating the box's
+/// `image` to the built tag. See the call site for the four hardenings; this enforces them.
+fn resolve_builds(
+    boxes: &mut [crate::compose::ComposeBox],
+    file: &str,
+    self_exe: &std::path::Path,
+) -> Result<(), Error> {
+    // The directory that a `build.context` is confined under: the compose file's parent (canonical).
+    let compose_dir = std::path::Path::new(file)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let base = std::fs::canonicalize(&compose_dir).map_err(|e| {
+        Error::Compose(format!(
+            "resolving compose dir '{}': {e}",
+            compose_dir.display()
+        ))
+    })?;
+
+    for b in boxes.iter_mut() {
+        let Some(bd) = b.build.clone() else { continue };
+        // Guard 1 — CONFINE context under the compose dir. Canonicalize `base/context` and require the
+        // result stays beneath `base`, so a `context: ../../../etc` in a third-party compose can't
+        // escape the project tree. (Same traversal class as image/volume/pod names in the saga.)
+        // NOTE (duale-di-Z2): confining the context ROOT here is not enough on its own — `kern build`
+        // then DESCENDS the context (COPY). That descent is itself confined: `copy_into_rootfs`
+        // canonicalizes each COPY source and requires `starts_with(ctx)` (a source symlink pointing out
+        // is rejected), and `cp -a` PRESERVES inner symlinks rather than following them (so a symlink
+        // buried in the tree lands in the image verbatim — dangling inside the pivoted rootfs — never
+        // read at build time). Verified live: a `leak -> /host/secret` inside the context does not leak
+        // the host file into the image. So root-confine here + no-follow descent in build = closed.
+        let ctx_abs = std::fs::canonicalize(base.join(&bd.context)).map_err(|e| {
+            Error::Compose(format!(
+                "service '{}': build context '{}': {e}",
+                b.name, bd.context
+            ))
+        })?;
+        if !ctx_abs.starts_with(&base) {
+            return Err(Error::Compose(format!(
+                "service '{}': build context '{}' escapes the compose directory (refused)",
+                b.name, bd.context
+            )));
+        }
+        // Guard 1 (dockerfile) — if given, confine it under the CONTEXT (Docker resolves `dockerfile`
+        // relative to the context). Reject an escaping dockerfile path.
+        let dfile = match &bd.dockerfile {
+            Some(df) => {
+                let df_abs = std::fs::canonicalize(ctx_abs.join(df)).map_err(|e| {
+                    Error::Compose(format!("service '{}': dockerfile '{df}': {e}", b.name))
+                })?;
+                if !df_abs.starts_with(&ctx_abs) {
+                    return Err(Error::Compose(format!(
+                        "service '{}': dockerfile '{df}' escapes the build context (refused)",
+                        b.name
+                    )));
+                }
+                Some(df_abs)
+            }
+            None => None,
+        };
+
+        // Guard 4 — `image:` + `build:` = build AND tag as `image`; `build:` alone → synthesized tag.
+        // Either way the box RUNS the freshly built image, never a stale registry one.
+        let tag = b
+            .image
+            .clone()
+            .unwrap_or_else(|| format!("kern-compose-{}:latest", b.name));
+
+        eprintln!("→ building '{}' from {}", b.name, bd.context);
+        let mut cmd = std::process::Command::new(self_exe);
+        cmd.arg("build").arg("-t").arg(&tag);
+        if let Some(df) = &dfile {
+            cmd.arg("-f").arg(df);
+        }
+        for a in &bd.args {
+            cmd.arg("--build-arg").arg(a); // already ${VAR}-interpolated by the parser (guard 2)
+        }
+        cmd.arg(&ctx_abs);
+        // Guard 3 — a build failure fails the whole `up` with a linked, service-named message.
+        let status = cmd.status().map_err(|e| {
+            Error::Compose(format!("service '{}': running `kern build`: {e}", b.name))
+        })?;
+        if !status.success() {
+            return Err(Error::Compose(format!(
+                "service '{}': build failed — run `kern build -t {tag} {}` to see why",
+                b.name,
+                ctx_abs.display()
+            )));
+        }
+        b.image = Some(tag);
+    }
+    Ok(())
+}
+
+/// Reject conditional dependencies that can NEVER be satisfied, at bring-up time rather than after a
+/// two-minute timeout (adversarial-review 2d). `topo_order` (called before this) already rejects
+/// cycles and unknown deps; this adds the one statically-impossible case:
+///   * `depends_healthy` on a box with no `health_cmd` — it can never report healthy.
+///
+/// NOTE on `depends_completed` + `restart`: the review suggested rejecting it, but in kern's compose
+/// `restart = true` means ON-FAILURE (a bare `--restart`), NOT always-respawn — the supervisor re-runs
+/// the box ONLY on a non-zero exit. So a `depends_completed` target that exits 0 completes normally,
+/// and one that keeps failing crash-loops to the restart cap and then records its final non-zero exit,
+/// which fails the wait cleanly. `restart = true` + `depends_completed` is therefore COHERENT, not
+/// impossible — we must NOT reject it. (Were compose ever to gain an `always`/`unless-stopped` policy,
+/// THAT would be the never-completes case to reject here.)
+fn validate_conditions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error> {
+    let find = |n: &str| boxes.iter().find(|x| x.name == n);
+    for b in boxes {
+        for dep in &b.depends_healthy {
+            if find(dep).is_some_and(|x| x.health_cmd.is_none()) {
+                return Err(Error::Compose(format!(
+                    "box '{}' waits for '{dep}' to be healthy, but '{dep}' declares no `health_cmd` \
+                     (add one, or use `depends_on`/`depends_completed`)",
+                    b.name
+                )));
             }
         }
     }
+    Ok(())
+}
+
+/// Block until every conditional dependency of `b` is satisfied, or fail with a precise reason.
+/// `depends_healthy[dep]` waits until `dep`'s health check reports `healthy`; `depends_completed[dep]`
+/// waits until `dep` has run to completion (exit 0), keyed by `pod`+`token` so a same-named service in
+/// another stack, or a previous run's sidecar, can't satisfy it. Driven off the registry sidecars the
+/// box machinery already writes — no IPC of our own. Polled at 100 ms so a fast dep adds only a
+/// sub-100 ms tail, not Docker's whole-second-per-health-interval granularity.
+///
+/// A dependency that DIES before satisfying its condition aborts immediately (adversarial-review 2a) —
+/// we don't burn the full timeout on an already-decided outcome. The registry's liveness (a dep no
+/// longer in `list()` and with no completion recorded) is the death signal.
+fn wait_for_conditions(
+    b: &crate::compose::ComposeBox,
+    pod: &str,
+    token: &str,
+) -> Result<(), Error> {
+    use std::time::{Duration, Instant};
+    if b.depends_healthy.is_empty() && b.depends_completed.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(COMPOSE_CONDITION_TIMEOUT_SECS);
+    let key_of = |dep: &str| exit_key(pod, token, dep);
+
+    // `depends_healthy`: poll each dep's health sidecar until healthy. Abort on unhealthy, on the dep
+    // dying, or on timeout.
+    for dep in &b.depends_healthy {
+        eprintln!(
+            "  ⋯ waiting for '{dep}' to become healthy (for '{}')",
+            b.name
+        );
+        loop {
+            let status = current_health(dep);
+            if status == "healthy" {
+                break;
+            }
+            if status == "unhealthy" {
+                return Err(Error::Compose(format!(
+                    "box '{}': dependency '{dep}' is unhealthy (its health check keeps failing)",
+                    b.name
+                )));
+            }
+            // Dead before healthy — decided; don't wait out the timeout. Prefer the POSITIVE death
+            // signal (a written exit sidecar) over the prune-timing one (absence from `list()`): a box
+            // targeted by a `depends_completed` writes its exit on death, so a completion sidecar for
+            // this dep is proof it's gone. Fall back to registry liveness for a dep that ISN'T a
+            // completion target (no sidecar), where absence-from-`list()` is the only death signal —
+            // there the timeout backstops the ≤1-poll prune lag (review 2a).
+            let died = registry::exit_of(&key_of(dep)).is_some() || !is_box_alive(dep);
+            if died {
+                return Err(Error::Compose(format!(
+                    "box '{}': dependency '{dep}' exited before becoming healthy — run `kern logs \
+                     {dep}` for the reason (a crash, or e.g. a port already bound by a pod peer)",
+                    b.name
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Compose(format!(
+                    "box '{}': timed out after {COMPOSE_CONDITION_TIMEOUT_SECS}s waiting for '{dep}' \
+                     to become healthy (last status: '{}')",
+                    b.name,
+                    if status.is_empty() { "none yet" } else { &status }
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // `depends_completed`: poll each dep's stack+run-scoped exit sidecar until it completes; require 0.
+    for dep in &b.depends_completed {
+        eprintln!("  ⋯ waiting for '{dep}' to complete (for '{}')", b.name);
+        loop {
+            if let Some(code) = registry::exit_of(&key_of(dep)) {
+                if code == 0 {
+                    break;
+                }
+                return Err(Error::Compose(format!(
+                    "box '{}': dependency '{dep}' did not complete successfully (exit {code}) — \
+                     run `kern logs {dep}` for the reason",
+                    b.name
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Compose(format!(
+                    "box '{}': timed out after {COMPOSE_CONDITION_TIMEOUT_SECS}s waiting for '{dep}' \
+                     to complete",
+                    b.name
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Ok(())
+}
+
+/// A running box's current health status by NAME (`healthy`/`unhealthy`/`starting`/empty). The
+/// sidecar is keyed `name-pid`, so resolve the pid via the registry first; a box that has already
+/// left the registry reads as empty (which the caller treats as "not yet healthy").
+fn current_health(name: &str) -> String {
+    registry::list()
+        .into_iter()
+        .find(|i| i.name == name)
+        .map(|i| registry::health_of(name, i.pid))
+        .unwrap_or_default()
+}
+
+/// Is a box with this name currently in the registry (i.e. still running)? `list()` prunes dead
+/// entries, so presence == alive. Used to fail a `depends_healthy` wait fast when the dep has died.
+fn is_box_alive(name: &str) -> bool {
+    registry::list().iter().any(|i| i.name == name)
 }
 
 /// `kern compose <file>` — bring up a stack of boxes (detached) in `depends_on` order. Each
@@ -4806,7 +5572,7 @@ fn cleanup_box_scratch(rootfs: &str) {
 pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
     let text = std::fs::read_to_string(file)
         .map_err(|e| Error::Compose(format!("reading {file}: {e}")))?;
-    let boxes = crate::compose::parse(&text).map_err(Error::Compose)?;
+    let mut boxes = crate::compose::parse(&text).map_err(Error::Compose)?;
     // The stack's pod is named after the compose file (Docker's project-name idea) — one shared
     // network so services reach each other by name.
     let pod = compose_pod_name(file);
@@ -4816,6 +5582,22 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
     if down {
         let names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
         let _ = stop(&names, false); // best-effort — some may already be gone
+                                     // Reap this stack's exit sidecars. Keys are `<pod>-<token>-<name>`; `down` doesn't know the
+                                     // `up`'s token, so it clears `<pod>-*-<name>` per box it stopped — NOT a blind `<pod>-*` (that
+                                     // would wipe a concurrent same-stack run's OTHER boxes). There's no shared state-file and no
+                                     // read-modify-write, so no lost-update: each `remove_file` is atomic and ENOENT-safe, so two
+                                     // concurrent `down`s just no-op over each other.
+                                     //
+                                     // The one race left by pure name-scoping: `down A` stops A's `migrate`, then a concurrent
+                                     // `up B` re-creates a `migrate` box (allowed once A's is gone), then A's reap fires and would
+                                     // delete B's fresh `<pod>-<tokenB>-migrate`. Close it BY CONSTRUCTION: reap a box's sidecars
+                                     // ONLY if that box is no longer alive. If B brought `migrate` back, it's alive again → we skip
+                                     // it → B's sidecar survives. `down` legitimately reaps only what it actually tore down.
+        for n in &names {
+            if !is_box_alive(n) {
+                registry::clear_exit_matching(&exit_key_prefix(&pod), &format!("-{n}"));
+            }
+        }
         let (pod_existed, _) = crate::pod::teardown(&pod);
         // Only claim the pod was removed if one actually existed (a `--no-pod` stack has none).
         if pod_existed {
@@ -4830,15 +5612,59 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
     }
 
     let order = crate::compose::topo_order(&boxes).map_err(Error::Compose)?;
+    // Static rejection of conditions that can NEVER be satisfied — caught here, not left to time out
+    // at runtime (adversarial-review 2d). `topo_order` above already rejects cycles and unknown deps.
+    validate_conditions(&boxes)?;
     let self_exe =
         std::env::current_exe().map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
+
+    // Compose `build:` — build each service's image via `kern build` BEFORE the launch loop, so a box
+    // with `build:` gets a real image to run. Four hardenings the adversarial review demanded, because
+    // `build:` is the first place the YAML parser drives a privileged operation on host paths:
+    //  1. `context`/`dockerfile` are CONFINED under the compose file's directory (traversal guard).
+    //  2. `build.args` are already `${VAR}`-interpolated by the parser (never literal `${VAR}`).
+    //  3. a build failure fails the WHOLE `up` with a linked message ("service X: build failed …"),
+    //     since a box whose image never built can't start (and its depends_completed/healthy peers
+    //     would hang) — fail-fast beats a half-up stack.
+    //  4. `image:` + `build:` together = build AND tag as `image` (compose semantics); a `build:` with
+    //     no `image:` gets a synthesized tag. We never silently use a stale registry image for a box
+    //     the user meant to build locally.
+    resolve_builds(&mut boxes, file, &self_exe)?;
+    // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
+    // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
+    // to absolute (confined under the compose dir — traversal guard, like a build context). A `named:`
+    // source or an already-absolute `/host:/dst` passes through untouched.
+    resolve_relative_binds(&mut boxes, file)?;
+
+    // A fresh epoch token for THIS `up`. Stamped into every `depends_completed` target's exit sidecar
+    // and required to match on read, so a sidecar left by a previous `up` of the same stack can't
+    // satisfy this run's wait (adversarial-review 1a). Uniqueness only needs to hold within this
+    // process's lifetime; our pid + a monotonic-ish clock read is plenty and needs no rng/new deps.
+    let up_token = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
 
     // Auto-pod: a multi-service stack gets a shared network (name resolution + outbound) unless the
     // user opts out or every box already shares the host net (`--net`). Reuse an existing pod so
     // `up` is idempotent.
     let use_pod = !no_pod && boxes.len() >= 2 && boxes.iter().any(|b| !b.net);
     if use_pod && crate::pod::holder_pid(&pod).is_none() {
-        crate::pod::create(&pod, true)?;
+        // Map a uid RANGE into the pod's shared user ns when ANY member needs it: an OCI-image box
+        // (official images drop privilege in their entrypoint) OR a box that explicitly set
+        // `uid_range = true`. A pod member setns's into the holder's user ns and writes NO map of its
+        // own, so the holder's map is authoritative — `--uid-range` on the member alone is a no-op. This
+        // MUST match `push_box_flags`'s per-box rule exactly (`uid_range || image-and-not-opted-out`),
+        // decided HERE, before the holder is created (it writes its map at unshare). A pod of only
+        // single-uid rootfs services stays single-uid (faster).
+        let pod_needs_range = boxes
+            .iter()
+            .any(|b| b.uid_range || (b.image.is_some() && !b.uid_range_explicit_false));
+        crate::pod::create_with_range(&pod, true, pod_needs_range)?;
     }
     // Feedback-first: a `--net` (host-network) service in a podded stack is NOT on the pod net, so its
     // peers can't reach it by name — say so rather than let it silently not resolve.
@@ -4858,6 +5684,12 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
     );
     for (i, name) in order.iter().enumerate() {
         let b = boxes.iter().find(|b| &b.name == name).unwrap();
+        // Docker's `depends_on: {condition: ...}`. Before starting this box, WAIT for each dependency
+        // it named with a condition: `depends_healthy` → the dep's health check must pass;
+        // `depends_completed` → the dep must have run to exit 0. Topo order guarantees those deps are
+        // already started. A timeout, a dead dependency, or a failed completion aborts with a reason.
+        wait_for_conditions(b, &pod, &up_token)?;
+
         let dep = if b.depends_on.is_empty() {
             String::new()
         } else {
@@ -4879,6 +5711,20 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
         // A box that isn't on the host net joins the stack pod → reachable by name from its peers.
         if use_pod && !b.net {
             cmd.arg("--pod").arg(&pod);
+        }
+        // If any peer waits on THIS box's completion, hand it the stack+run-scoped exit KEY
+        // (`<pod>-<token>-<name>`) via env, and CLEAR that exact key BEFORE the spawn (the clear
+        // causally precedes the launch and every later poll). Because the key carries this `up`'s
+        // token, a concurrent `up` of the same stack uses a DIFFERENT key — its clear/write can't
+        // touch ours (review round 2). Env, not a flag, so the security-reviewed `kern box` arg
+        // surface is untouched.
+        let is_completion_target = boxes
+            .iter()
+            .any(|other| other.depends_completed.iter().any(|d| d == &b.name));
+        if is_completion_target {
+            let key = exit_key(&pod, &up_token, &b.name);
+            registry::clear_exit(&key);
+            cmd.env("KERN_EXIT_KEY", &key);
         }
         cmd.arg("-d");
         if !b.command.is_empty() {
@@ -5514,8 +6360,13 @@ mod net_resource_tests {
             "data:/proc",      // shadows the box's proc
             "data:/sys",
             "data:/dev",
-            "data:/",    // over the whole rootfs
-            "data:/./x", // dot component
+            "data:/",      // over the whole rootfs
+            "data:/./x",   // dot component
+            "data://proc", // leading-double-slash bypass — resolves to /proc at mount time
+            "data://sys",
+            "data://dev",
+            "data:///dev", // triple slash too
+            "data://dev/", // trailing slash after the bypass
         ] {
             assert!(
                 parse_volumes(&[bad.into()]).is_err(),
@@ -5528,6 +6379,28 @@ mod net_resource_tests {
             "a subpath like /dev/foo must be allowed"
         );
         assert!(parse_volumes(&["/tmp:/data".into()]).is_ok());
+    }
+
+    #[test]
+    fn parse_tmpfs_guards_hardened_mounts_incl_double_slash() {
+        for bad in [
+            "/proc",
+            "/sys",
+            "/dev",      // exact hardened roots
+            "/proc/foo", // under a hardened root
+            "//proc",
+            "//sys",
+            "//dev", // leading-double-slash bypass
+            "///dev/x",
+        ] {
+            assert!(
+                parse_tmpfs(&[bad.into()]).is_err(),
+                "should reject --tmpfs {bad}"
+            );
+        }
+        // A normal tmpfs path is fine.
+        assert!(parse_tmpfs(&["/scratch".into()]).is_ok());
+        assert!(parse_tmpfs(&["/var/cache:64m".into()]).is_ok());
     }
 
     #[test]

@@ -37,6 +37,14 @@ rootfs     = "/var/lib/rootfs"    # --rootfs   (mutually: image OR rootfs)
 # command & ordering
 command    = ["/bin/sh", "-c", "exec app"]   # -- <command...>
 depends_on = ["db"]               # compose-only: start after these boxes
+# conditional dependencies (compose-only) — up WAITS for the condition before starting this box:
+depends_healthy   = ["db"]        # wait until each named box's health_cmd reports healthy
+depends_completed = ["migrate"]   # wait until each named box exits 0 (init-container / migration job)
+# Docker long-syntax is accepted verbatim too, so a docker-compose.yml block pastes in as-is:
+#   depends_on = { db = { condition = "service_healthy" }, migrate = { condition = "service_completed_successfully" } }
+# Constraints (rejected at bring-up, not left to time out): a `depends_healthy` target must declare
+# `health_cmd`; a `depends_completed` target must NOT set `restart = true` (it would never complete).
+# `up` waits up to 120s per condition, and aborts early if a dependency dies or fails.
 
 # filesystem / runtime
 workdir    = "/srv"               # --workdir / -w

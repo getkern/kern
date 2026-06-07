@@ -12,6 +12,14 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 kern-oci = { path = "../crates/kern-oci" }
+kern-compose = { path = "../crates/kern-compose" }
+
+[[bin]]
+name = "compose_yaml"
+path = "fuzz_targets/compose_yaml.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "oci_json"
