@@ -1217,22 +1217,11 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
         b.health_timeout = parse_duration_secs(&scalar_str(v)).map(|s| s.to_string());
     }
     if let Some(v) = node.child("start_period").and_then(|n| n.scalar.as_deref()) {
-        // `0s` is a legitimate value (no grace), and `parse_duration_secs` returns `None` for 0 (its
-        // `total > 0` gate) — but `--health-start-period 0` is valid and meaningful, so map a parsed-
-        // or-zero duration explicitly: only a truly unparseable value is dropped.
-        let raw = scalar_str(v);
-        b.health_start_period = duration_secs_allowing_zero(&raw).map(|s| s.to_string());
+        // `start_period` reaches `--health-start-period <seconds>`, where 0 is MEANINGFUL ("no startup
+        // grace") — so allow_zero=true, handling every zero spelling (`0s`, `0m`, `0h0m0s`) uniformly.
+        b.health_start_period =
+            parse_duration_secs_opt(&scalar_str(v), true).map(|s| s.to_string());
     }
-}
-
-/// Like [`parse_duration_secs`] but 0 is a valid result (not `None`). `interval`/`timeout` treat 0 as
-/// "unset → default", but `start_period: 0s` means "no grace" and must reach the box as `0`.
-fn duration_secs_allowing_zero(s: &str) -> Option<i64> {
-    let t = s.trim();
-    if t == "0" || t == "0s" {
-        return Some(0);
-    }
-    parse_duration_secs(t)
 }
 
 /// Convert a healthcheck `test` to a health command, or `None` if not faithfully convertible.
@@ -1287,31 +1276,48 @@ fn healthcheck_test(node: &Node) -> Option<String> {
 /// compose field routed through here. (Found by the extreme audit; the older randomized fuzz never
 /// emitted a long digit-run after `interval:`.)
 fn parse_duration_secs(s: &str) -> Option<i64> {
+    // Default policy: 0 means "unset -> box default" (used by `interval`/`timeout`, where a zero value
+    // is meaningless).
+    parse_duration_secs_opt(s, false)
+}
+
+/// The one duration parser. `allow_zero` selects the zero-policy AT THE COMPUTED TOTAL - so EVERY zero
+/// spelling (`0`, `0s`, `0m`, `0h`, `0m0s`, `00s`) is treated identically, instead of a whitelist of
+/// literal strings. `false` -> 0 collapses to `None` (unset -> default), for `interval`/`timeout`.
+/// `true` -> 0 is a real value, for `start_period: 0s` ("no startup grace"). Closing the policy by
+/// construction here (not by a maintained list of zero spellings) mirrors the anchor-guard rewrite.
+fn parse_duration_secs_opt(s: &str, allow_zero: bool) -> Option<i64> {
     let s = s.trim();
-    if let Ok(n) = s.parse::<i64>() {
-        return Some(n);
-    }
-    let mut total: i64 = 0;
-    let mut num = String::new();
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            num.push(c);
-        } else {
-            let n: i64 = num.parse().ok()?; // >19 digits → parse Err → None (no panic)
-            num.clear();
-            let secs = match c {
-                's' => n,
-                'm' => n.checked_mul(60)?,
-                'h' => n.checked_mul(3600)?,
-                _ => return None,
-            };
-            total = total.checked_add(secs)?;
+    let total = if let Ok(n) = s.parse::<i64>() {
+        n
+    } else {
+        let mut total: i64 = 0;
+        let mut num = String::new();
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+            } else {
+                let n: i64 = num.parse().ok()?; // >19 digits -> parse Err -> None (no panic)
+                num.clear();
+                let secs = match c {
+                    's' => n,
+                    'm' => n.checked_mul(60)?,
+                    'h' => n.checked_mul(3600)?,
+                    _ => return None,
+                };
+                total = total.checked_add(secs)?;
+            }
         }
+        if !num.is_empty() {
+            total = total.checked_add(num.parse::<i64>().ok()?)?;
+        }
+        total
+    };
+    if allow_zero || total > 0 {
+        Some(total)
+    } else {
+        None
     }
-    if !num.is_empty() {
-        total = total.checked_add(num.parse::<i64>().ok()?)?;
-    }
-    (total > 0).then_some(total)
 }
 
 /// `restart`: `no`→off; `on-failure`→on; `always`/`unless-stopped`→on + warn (kern has on-failure only).
@@ -1560,9 +1566,20 @@ mod tests {
         assert_eq!(b.health_timeout.as_deref(), Some("30")); // 30s → "30", not "30s"
         assert_eq!(b.health_start_period.as_deref(), Some("90")); // 1m30s → 90
         assert_eq!(b.health_retries.as_deref(), Some("4")); // a plain count, unchanged
-                                                            // `start_period: 0s` (no grace) is legitimate and must reach the box as `0`, not be dropped.
-        let y0 = "services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      start_period: 0s\n";
-        assert_eq!(boxes(y0)[0].health_start_period.as_deref(), Some("0"));
+                                                            // `start_period` 0 (no grace) is legitimate and must reach the box as `0`, not be dropped —
+                                                            // for EVERY zero spelling, not just `0s` (the old literal whitelist dropped `0m`/`0h`).
+        for zero in ["0s", "0m", "0h", "0", "0h0m0s"] {
+            let y0 = format!("services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      start_period: {zero}\n");
+            assert_eq!(
+                boxes(&y0)[0].health_start_period.as_deref(),
+                Some("0"),
+                "start_period: {zero}"
+            );
+        }
+        // interval/timeout keep the opposite policy: a zero duration is "unset -> default" (dropped).
+        let yt =
+            "services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      timeout: 0m\n";
+        assert_eq!(boxes(yt)[0].health_timeout, None);
     }
 
     #[test]
