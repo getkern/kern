@@ -69,6 +69,10 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   user's UID/GID (e.g. `1000`), so a pulled image had host-UID-owned files. Now normalized to `0:0`
   with `--owner=0 --group=0`, matching real Docker layers. Verified: push → pull-back yields
   root-owned files and stays `docker pull`-compatible.
+- **compose list-form env host pass-through** — a `environment: [- API_KEY]` entry with no `=` is
+  Docker's host pass-through (inherit `API_KEY` from the host env). The bare `API_KEY` was forwarded
+  to the box's `--env K=V` parser, which rejected it and **aborted the whole service**. Now: present
+  in the host → `API_KEY=<value>`; absent → omitted (Docker semantics), never a malformed `--env`.
 - **compose `healthcheck.timeout` / `start_period` durations** — these map to `--health-{timeout,
   start-period}`, which take integer **seconds**, but Docker writes them as durations (`30s`, `1m30s`,
   `0s`). The raw string was forwarded verbatim, so a standard `timeout: 30s` aborted the box
