@@ -7,6 +7,8 @@
 Give any workload its own governed slice of the machine — process, filesystem, network, devices,
 CPU and memory — kernel-enforced, with no daemon and a ~1 MB binary.
 
+**5.5 ms** to start an isolated box (vs **~308 ms** `docker run`) · **~1 MB** single static binary · **0 RAM at rest**, no daemon · **rootless**
+
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-informational.svg)](#install)
