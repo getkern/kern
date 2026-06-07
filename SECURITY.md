@@ -156,15 +156,36 @@ Opt-in flags that **relax** isolation (off by default — you ask for them):
 
 OCI pull (`kern pull` / `--image`):
 - **Integrity**: each blob is verified to hash to its `sha256:` digest (via `sha256sum`) before
-  use — defends against a compromised/MITM registry and corrupt downloads, beyond TLS.
-- **Layer vetting (in-process, host-tar-independent)**: absolute / `..` paths, device nodes,
-  hardlink targets that escape the rootfs, escaping symlink targets (on a non-GNU tar), a 2 GiB
-  decompression-bomb cap and an entry-count (inode-bomb) cap are all rejected before anything is
-  written. The decision is read from the **raw tar headers in-process** (fixed-offset
+  use — defends against a compromised/MITM registry and corrupt downloads, beyond TLS. Because this
+  digest check runs **before** both the vetter and the extractor, and both read the *same* verified
+  file, the two see byte-identical input — so any disagreement between them can only be *interpretive*
+  (which the vetter fails closed on, below), never a difference in the bytes themselves.
+- **Layer vetting (in-process; refuses ambiguity rather than out-guessing the extractor)**: absolute /
+  `..` paths, device nodes, hardlink targets that escape the rootfs, escaping symlink targets (on a
+  non-GNU tar), a 2 GiB decompression-bomb cap and an entry-count (inode-bomb) cap are all rejected
+  before anything is written. The decision is read from the **raw tar headers in-process** (fixed-offset
   name/prefix/linkname/typeflag, resolving ustar prefix + GNU long-name/link + PAX), with `gzip -dc`
   doing only the decompression — **not** by parsing `tar -tv`'s locale-dependent, delimiter-desyncable
-  text. So the guarantee holds identically on GNU tar and on a BusyBox/edge tar. The parser is bounded
-  and fuzzed.
+  text (a member name containing ` -> ` / ` link to ` could otherwise hide an escaping link target).
+  Because the vetter and the extractor (`tar -xzf`) are two separate parsers, the design principle is
+  **fail-closed on any construct where they could disagree**, rather than trying to replicate a
+  version-specific tar precedence rule: a member whose path/linkname is set from **two sources** (a GNU
+  `L`/`K` *and* a PAX `path=`/`linkpath=`) is refused; a **PAX global (`g`) `path`/`linkpath` override**
+  is refused; a **GNU sparse (`'S'`) / multivolume (`'M'`) member, or a `GNU.sparse.*` PAX record**, is
+  refused (a sparse member's `size` header is the *stored* length, not the real data layout — skipping
+  it would desync the vetter's cursor from the extractor and under-count a bomb); a base-256 size field
+  too large for a `u64` is refused (never silently wrapped); and the scan requires an all-zero tail so a
+  member hidden after a stray zero block cannot slip past — while **capping** that tail so a multi-MiB
+  zero flood can't turn the check itself into a DoS. This keeps the decision sound on GNU tar and on a
+  BusyBox/edge tar without claiming to predict a hostile archive's every quirk. The member set is an
+  explicit allow-list (regular / directory / symlink / hardlink); an **unknown/vendor typeflag is
+  refused** rather than treated as a regular file. The trade is deliberate: a *legit* image built with
+  an exotic-but-safe construct (sparse files, a global path record) is **refused rather than
+  extracted** — we fail closed. A **FIFO (`'6'`) is refused by documented policy** too: it is inert
+  toward the host (it isn't a device node), so this is a compatibility choice, not a security boundary —
+  a rootfs baked with a named pipe won't pull, and that's intentional for an ephemeral sandbox. The
+  header/PAX parser operates on raw bytes (no panic on a crafted char boundary), is bounded, and is
+  fuzzed.
 - **Isolated-staging, no-follow merge**: each layer extracts into a fresh staging dir, then
   merges into the rootfs refusing to traverse any symlink — the cross-layer escape class is
   closed structurally (not by trusting tar). The guard is a lexical check, which is sound here
@@ -345,9 +366,12 @@ box access, not a hardened bastion — grant it only to workloads you'd trust wi
   disable-able with `--no-gpu`.
 - Layer contents are vetted **in-process from the raw tar headers** before extraction (no `..`/
   absolute paths, no device nodes, no escaping hardlink targets, size + entry-count caps) — the
-  security decision does not depend on the host `tar`'s version or text output, so it is sound on GNU
-  and BusyBox alike; the parser is fuzzed. Extraction itself still runs the host `tar` into an
-  isolated staging dir, then a no-follow merge.
+  security decision reads fixed-offset header fields, never the host `tar`'s locale-dependent text
+  output, and **fails closed on any construct where the vetter and the extractor could disagree**
+  (two path sources for one member, a PAX global path override, an over-wide size field), so it is
+  sound on GNU and BusyBox alike without pretending to predict every extractor quirk; the byte-level
+  parser is fuzzed. Extraction itself still runs the host `tar` into an isolated staging dir, then a
+  no-follow merge.
 - Always-on seccomp blocks the dangerous syscall set regardless of flags.
 
 ## Supported versions

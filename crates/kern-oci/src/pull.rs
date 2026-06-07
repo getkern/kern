@@ -734,13 +734,20 @@ fn tar_field(b: &[u8]) -> String {
 }
 
 /// A tar numeric field: octal (space/NUL-terminated), or GNU base-256 (high bit of the first byte).
+/// Base-256 magnitude is accumulated in `u128` and rejected (returns `None`) if it doesn't fit in a
+/// `u64` — `checked_shl(8)` on a `u64` only fails when the shift is ≥ 64, so it would SILENTLY WRAP a
+/// large value, desyncing our byte-skip from what tar extracts. (A field this large exceeds our layer
+/// caps anyway; refusing it is fail-closed.)
 fn tar_num(field: &[u8]) -> Option<u64> {
     if field.first().is_some_and(|&b| b & 0x80 != 0) {
-        let mut v: u64 = (field[0] & 0x7f) as u64;
+        let mut v: u128 = (field[0] & 0x7f) as u128;
         for &b in &field[1..] {
-            v = v.checked_shl(8)?.checked_add(b as u64)?;
+            v = (v << 8) | (b as u128);
+            if v > u64::MAX as u128 {
+                return None;
+            }
         }
-        return Some(v);
+        return Some(v as u64);
     }
     let s: String = field
         .iter()
@@ -779,33 +786,60 @@ fn take_data(r: &mut impl std::io::Read, len: u64, keep: usize) -> Result<Vec<u8
     Ok(out)
 }
 
-/// Parse the PAX records we care about (`<len> key=value\n`…) → (`path`, `linkpath`). Malformed input
-/// stops the scan rather than panicking.
-fn parse_pax(data: &[u8]) -> (Option<String>, Option<String>) {
-    let (mut path, mut linkpath) = (None, None);
-    let text = String::from_utf8_lossy(data);
-    let mut rest: &str = &text;
+/// What `parse_pax` extracted from a PAX record set: the overriding `path`/`linkpath`, and whether any
+/// `GNU.sparse.*` key was present (the PAX-encoded new-GNU sparse-file variant — a divergence surface we
+/// refuse, same as a raw `'S'` typeflag).
+struct PaxInfo {
+    path: Option<String>,
+    linkpath: Option<String>,
+    sparse: bool,
+}
+
+/// Parse the PAX records we care about (`<len> key=value\n`…). Operates on the RAW bytes — never on a
+/// lossy `&str` — so a `len` that an attacker tuned to fall inside a multi-byte UTF-8 sequence can't
+/// panic on a char-boundary slice; malformed input just stops the scan. Only the final value is decoded
+/// (lossily) to a `String`.
+fn parse_pax(data: &[u8]) -> PaxInfo {
+    let mut info = PaxInfo {
+        path: None,
+        linkpath: None,
+        sparse: false,
+    };
+    let mut rest: &[u8] = data;
     while !rest.is_empty() {
-        let Some(sp) = rest.find(' ') else { break };
-        let Ok(len) = rest[..sp].parse::<usize>() else {
+        // `<len>` is ASCII digits up to the first space; `len` counts the whole "<len> k=v\n" record.
+        let Some(sp) = rest.iter().position(|&b| b == b' ') else {
+            break;
+        };
+        let Ok(len_str) = std::str::from_utf8(&rest[..sp]) else {
+            break;
+        };
+        let Ok(len) = len_str.parse::<usize>() else {
             break;
         };
         if len <= sp || len > rest.len() {
             break;
         }
-        let record = rest[sp + 1..len]
-            .strip_suffix('\n')
-            .unwrap_or(&rest[sp + 1..len]);
-        if let Some((k, v)) = record.split_once('=') {
+        // Byte-slice the record body (no char-boundary hazard), then decode only the value lossily.
+        let mut body = &rest[sp + 1..len];
+        if body.last() == Some(&b'\n') {
+            body = &body[..body.len() - 1];
+        }
+        if let Some(eq) = body.iter().position(|&b| b == b'=') {
+            let k = &body[..eq];
             match k {
-                "path" => path = Some(v.to_string()),
-                "linkpath" => linkpath = Some(v.to_string()),
+                b"path" => info.path = Some(String::from_utf8_lossy(&body[eq + 1..]).into_owned()),
+                b"linkpath" => {
+                    info.linkpath = Some(String::from_utf8_lossy(&body[eq + 1..]).into_owned())
+                }
+                // Any GNU.sparse.* record marks a PAX-encoded sparse member → refuse (see the 'S' branch).
+                _ if k.starts_with(b"GNU.sparse.") => info.sparse = true,
                 _ => {}
             }
         }
         rest = &rest[len..];
     }
-    (path, linkpath)
+    info
 }
 
 /// Vet the raw (decompressed) tar stream `r` block by block. Resolves the effective path/linkname
@@ -830,7 +864,37 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
             return Err(bad("truncated tar header"));
         }
         if header.iter().all(|&b| b == 0) {
-            return Ok(()); // end-of-archive marker — fully vetted
+            // A zero block STARTS the end-of-archive marker (POSIX wants two). Do NOT return here: a
+            // single stray zero block followed by more members would let us stop vetting while the host
+            // tar reads on and extracts them. Require the tail to be all-zero — any non-zero byte after
+            // the marker is a hidden trailing member → reject. But do NOT drain to EOF unboundedly: a
+            // hostile image can append gigabytes of zero blocks (a zero-bomb DoS). A legitimate tail is
+            // a couple of zero blocks plus at most one blocking-factor of record padding (GNU default 20
+            // blocks); cap generously and, once past the cap, stop reading — the extractor's own output
+            // is already bounded by MAX_LAYER_BYTES, and a multi-MiB all-zero tail carries no member.
+            const MAX_TAIL_BLOCKS: usize = 4096; // 2 MiB of trailing zero padding — absurdly generous
+            let mut pad = [0u8; TAR_BLOCK];
+            let mut tail_blocks = 0usize;
+            loop {
+                let m =
+                    read_block(r, &mut pad).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+                if m == 0 {
+                    return Ok(()); // clean EOF after the zero marker — fully vetted
+                }
+                if pad[..m].iter().any(|&b| b != 0) {
+                    return Err(bad(
+                        "data after the end-of-archive marker (hidden trailing member)",
+                    ));
+                }
+                tail_blocks += 1;
+                if tail_blocks > MAX_TAIL_BLOCKS {
+                    // All-zero so far, but an unbounded zero tail is a DoS. Everything we've read is
+                    // padding (no member), and any real member would have shown a non-zero byte by now.
+                    return Err(bad(
+                        "excessive zero padding after end-of-archive marker (zero-bomb)",
+                    ));
+                }
+            }
         }
 
         let typeflag = header[156];
@@ -838,6 +902,21 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
 
         // GNU long-name/link and PAX headers carry the real path/linkname in their DATA, for the NEXT
         // entry — read (capped) and stash; they aren't entries themselves.
+        //
+        // FAIL-CLOSED ON AMBIGUITY: if two sources try to set the SAME field for one member (a GNU `L`
+        // *and* a PAX `path=`, or `K` *and* a PAX `linkpath=`), we do NOT guess which one the host tar
+        // will honour — GNU tar prefers PAX regardless of physical order, others differ, so any choice
+        // we make can diverge from extraction. Legit images never mix two sources for one member, so we
+        // simply reject. `set_once` enforces this: a second setter on an already-set slot is an error.
+        fn set_once(slot: &mut Option<String>, val: String, what: &str) -> Result<(), OciError> {
+            if slot.is_some() {
+                return Err(OciError::Extract(format!(
+                    "layer sets {what} for one member from two sources (ambiguous — refusing)"
+                )));
+            }
+            *slot = Some(val);
+            Ok(())
+        }
         match typeflag {
             b'L' | b'K' => {
                 if size > TAR_MAX_LONG {
@@ -845,26 +924,88 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
                 }
                 let s = tar_field(&take_data(r, size, size as usize)?);
                 if typeflag == b'L' {
-                    next_name = Some(s);
+                    set_once(&mut next_name, s, "the path")?;
                 } else {
-                    next_link = Some(s);
+                    set_once(&mut next_link, s, "the link target")?;
                 }
                 continue;
             }
-            b'x' | b'g' => {
+            b'x' => {
                 if size > TAR_MAX_LONG {
                     return Err(bad("oversized PAX record"));
                 }
-                let (p, lp) = parse_pax(&take_data(r, size, size as usize)?);
-                if p.is_some() {
-                    next_name = p;
+                let info = parse_pax(&take_data(r, size, size as usize)?);
+                if info.sparse {
+                    return Err(bad(
+                        "layer has a PAX-encoded sparse member (unsupported — refusing)",
+                    ));
                 }
-                if lp.is_some() {
-                    next_link = lp;
+                if let Some(p) = info.path {
+                    set_once(&mut next_name, p, "the path")?;
+                }
+                if let Some(lp) = info.linkpath {
+                    set_once(&mut next_link, lp, "the link target")?;
                 }
                 continue;
             }
-            _ => {}
+            b'g' => {
+                // A PAX GLOBAL header is sticky across all following members, and most tars ignore
+                // `path`/`linkpath` inside it entirely — so trusting it here would vet a name that
+                // extraction never uses. A legit OCI layer never carries a global `path`/`linkpath`;
+                // refuse the archive rather than guess. (Global records without those keys are benign
+                // and simply skipped.)
+                if size > TAR_MAX_LONG {
+                    return Err(bad("oversized PAX record"));
+                }
+                let info = parse_pax(&take_data(r, size, size as usize)?);
+                if info.sparse {
+                    return Err(bad(
+                        "layer has a PAX-encoded sparse member (unsupported — refusing)",
+                    ));
+                }
+                if info.path.is_some() || info.linkpath.is_some() {
+                    return Err(bad(
+                        "layer carries a PAX global path/linkpath override (ambiguous — refusing)",
+                    ));
+                }
+                continue;
+            }
+            // GNU SPARSE ('S') and MULTIVOLUME ('M') members are a hard divergence surface: the `size`
+            // header field is the STORED (sparse) length, not the real extracted layout — the data does
+            // NOT occupy `size` contiguous bytes, so skipping `size` bytes here desyncs our cursor from
+            // what tar reads (→ a fake "next header" parsed from mid-data), and a sparse member also lets
+            // `size` under-count the real file (a bomb the byte-cap can't see). An OCI layer never needs
+            // either; refuse rather than emulate the sparse map. (The `GNU.sparse.*` PAX-encoded variant
+            // is caught in `parse_pax` → the 'x' branch's set_once/`is_err`.)
+            b'S' | b'M' => {
+                return Err(bad(
+                    "layer has a sparse or multivolume member (unsupported — refusing)",
+                ));
+            }
+            // A FIFO ('6') is INERT toward the host (unlike a device node it reaches no hardware — it's
+            // just a filesystem object in the staging rootfs), so accepting it would be safe. We refuse
+            // it anyway, as a DELIBERATE, DOCUMENTED policy: an ephemeral sandbox rootfs has no
+            // legitimate use for a named pipe baked into an image layer, and refusing keeps the member
+            // set to the types kern actually models. This is an explicit choice with a clear message —
+            // not the accidental "unsupported type" fallthrough — so a maintainer can flip it to accept
+            // by moving `b'6'` into the allow-list on the line below.
+            b'6' => {
+                return Err(bad(
+                    "layer has a FIFO member — refused by policy (not needed in a sandbox rootfs)",
+                ));
+            }
+            // Known member typeflags that fall through to be vetted as a real entry below: regular
+            // (`0`, NUL, and pre-POSIX `7` contiguous ≈ regular), directory (`5`), hardlink (`1`),
+            // symlink (`2`), and device (`3`/`4`, rejected just below). Anything else is a typeflag we
+            // don't model — fail CLOSED (don't silently treat an unknown vendor type as a regular file
+            // and skip `size` bytes on a possibly-different-meaning field). Every other divergence class
+            // in this vetter already fails closed; this keeps the last fallthrough consistent.
+            b'0' | 0 | b'7' | b'5' | b'1' | b'2' | b'3' | b'4' => {}
+            other => {
+                return Err(bad(&format!(
+                    "layer has an unsupported tar member type (0x{other:02x}) — refusing"
+                )));
+            }
         }
 
         entries += 1;
@@ -909,13 +1050,16 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
             }
         }
 
-        take_data(r, size, 0)?; // skip the member's file data (links/dirs have size 0)
+        // Cap BEFORE consuming the data: a single member with a huge size would otherwise stream its
+        // entire (decompressed) body from gzip before the running total tripped the cap — a per-member
+        // DoS. Checking the declared size up front bounds the work to one block.
         total = total.saturating_add(size);
-        if total > MAX_LAYER_BYTES {
+        if size > MAX_LAYER_BYTES || total > MAX_LAYER_BYTES {
             return Err(bad(
                 "layer exceeds the size cap (possible decompression bomb)",
             ));
         }
+        take_data(r, size, 0)?; // skip the member's file data (links/dirs have size 0)
     }
 }
 
@@ -1331,6 +1475,273 @@ mod tests {
             "a `.wh...` whiteout must not delete the rootfs's parent (escape)"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- Raw tar-header vetter unit tests (no external tar; craft bytes in memory) ----
+
+    const BLK: usize = 512;
+
+    /// Build one 512-byte tar header with the given name, typeflag, size, and linkname.
+    fn hdr(name: &[u8], typeflag: u8, size: u64, linkname: &[u8]) -> [u8; BLK] {
+        let mut h = [0u8; BLK];
+        let n = name.len().min(100);
+        h[..n].copy_from_slice(&name[..n]);
+        // size: 11 octal digits + NUL at [124..136]
+        let s = format!("{size:011o}");
+        h[124..124 + 11].copy_from_slice(s.as_bytes());
+        h[156] = typeflag;
+        let l = linkname.len().min(100);
+        h[157..157 + l].copy_from_slice(&linkname[..l]);
+        h
+    }
+
+    /// A data block padded to 512.
+    fn data_block(bytes: &[u8]) -> Vec<u8> {
+        let mut v = bytes.to_vec();
+        let pad = (BLK - v.len() % BLK) % BLK;
+        v.extend(vec![0u8; pad]);
+        v
+    }
+
+    fn end_marker() -> Vec<u8> {
+        vec![0u8; BLK * 2]
+    }
+
+    /// REGRESSION (panic): a PAX record whose `<len>` falls INSIDE a multi-byte UTF-8 sequence must not
+    /// panic on a char-boundary slice. `parse_pax` operates on bytes, so this just parses harmlessly.
+    #[test]
+    fn parse_pax_does_not_panic_on_midchar_len() {
+        // "8 path=é" — bytes: 38 20 70 61 74 68 3d c3 a9 ; len=8 lands between the two bytes of 'é'.
+        let payload = b"8 path=\xc3\xa9";
+        let info = parse_pax(payload); // must not panic
+                                       // The declared length truncates the value mid-char; lossy decode yields a replacement — fine,
+                                       // the point is it does not crash `kern pull`.
+        let _ = info.path;
+    }
+
+    /// REGRESSION (GNU sparse, raw): a `typeflag 'S'` member desyncs the vetter from the extractor (its
+    /// `size` is the STORED length, not the real data layout) → must be refused, not skipped as regular.
+    #[test]
+    fn rejects_gnu_sparse_typeflag() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"sparsefile", b'S', 0, b""));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        assert!(
+            err.contains("sparse"),
+            "a GNU sparse ('S') member must be refused, got: {err}"
+        );
+    }
+
+    /// REGRESSION (multivolume): a `typeflag 'M'` continuation member is likewise a divergence surface.
+    #[test]
+    fn rejects_multivolume_typeflag() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"contd", b'M', 0, b""));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r, true).is_err(),
+            "a multivolume ('M') member must be refused"
+        );
+    }
+
+    /// REGRESSION (GNU sparse, PAX-encoded): a `GNU.sparse.*` PAX record marks a sparse member even with
+    /// a regular typeflag — must be refused via `parse_pax`'s sparse flag.
+    #[test]
+    fn rejects_pax_encoded_sparse() {
+        let mut stream = Vec::new();
+        let pax = b"22 GNU.sparse.major=1\n"; // "22" + " " + "GNU.sparse.major=1\n"(19) = 22 bytes
+        stream.extend_from_slice(&hdr(b"pax", b'x', pax.len() as u64, b""));
+        stream.extend_from_slice(&data_block(pax));
+        stream.extend_from_slice(&hdr(b"regular/file", b'0', 0, b""));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        assert!(
+            err.contains("sparse"),
+            "a PAX-encoded sparse member must be refused, got: {err}"
+        );
+    }
+
+    /// REGRESSION (zero-bomb): an all-zero tail far larger than any legit padding must be REFUSED, not
+    /// drained forever (the fix for the early-return bug must not itself become a DoS).
+    #[test]
+    fn rejects_excessive_zero_padding() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"safe/file", b'0', 0, b""));
+        stream.extend_from_slice(&vec![0u8; BLK * 5000]); // 5000 zero blocks » the 4096 cap
+        let mut r: &[u8] = &stream;
+        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        assert!(
+            err.contains("zero-bomb"),
+            "an unbounded zero tail must be refused, got: {err}"
+        );
+    }
+
+    /// HARDENING (fail-closed): an unknown/vendor tar typeflag must be refused, not silently treated as
+    /// a regular file (whose `size` field we'd then trust and skip).
+    #[test]
+    fn rejects_unknown_typeflag() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"weird", b'Z', 0, b"")); // 'Z' is not a modelled member type
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        assert!(
+            err.contains("unsupported tar member type"),
+            "unknown typeflag must be refused: {err}"
+        );
+    }
+
+    /// POLICY (documented): a FIFO ('6') is inert toward the host but refused by deliberate policy —
+    /// with a SPECIFIC message, not the generic "unsupported type" fallthrough. This test pins the
+    /// decision: flipping the policy to accept must be a conscious change that updates this test.
+    #[test]
+    fn rejects_fifo_by_policy() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"var/run/pipe", b'6', 0, b""));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        assert!(
+            err.contains("FIFO"),
+            "a FIFO must be refused with a specific policy message: {err}"
+        );
+    }
+
+    /// The modelled member types (dir '5', regular '0', contiguous '7') still pass.
+    #[test]
+    fn accepts_known_member_typeflags() {
+        for tf in [b'0', b'5', b'7'] {
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&hdr(b"usr/lib/thing", tf, 0, b""));
+            stream.extend(end_marker());
+            let mut r: &[u8] = &stream;
+            assert!(
+                vet_tar_stream(&mut r, true).is_ok(),
+                "member typeflag {:?} should be accepted",
+                tf as char
+            );
+        }
+    }
+
+    /// A normal short zero-padded tail (a couple of blocks) still passes — no false positive.
+    #[test]
+    fn accepts_normal_zero_padding() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"safe/file", b'0', 0, b""));
+        stream.extend(end_marker()); // two zero blocks — the canonical end marker
+        stream.extend_from_slice(&vec![0u8; BLK * 18]); // GNU pads to a 20-block record — legit
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r, true).is_ok(),
+            "normal trailing zero padding must pass"
+        );
+    }
+
+    /// REGRESSION (base-256 wrap): an 11-byte-magnitude base-256 size must be REJECTED, not silently
+    /// wrapped to a small u64 (which would desync the byte-skip from extraction).
+    #[test]
+    fn tar_num_rejects_oversized_base256() {
+        let mut f = [0u8; 12];
+        f[0] = 0x80; // base-256 flag, magnitude follows
+        for b in f.iter_mut().skip(1) {
+            *b = 0xff; // huge — far beyond u64
+        }
+        assert_eq!(
+            tar_num(&f),
+            None,
+            "an oversized base-256 field must be refused, not wrapped"
+        );
+    }
+
+    /// REGRESSION (L + PAX for one member): setting the path from two sources is ambiguous → reject.
+    #[test]
+    fn rejects_ambiguous_double_path_source() {
+        let mut stream = Vec::new();
+        // PAX 'x' with path="../../evil"
+        let pax = b"18 path=../../evil\n"; // "18 " + "path=../../evil\n" = 18 bytes
+        stream.extend_from_slice(&hdr(b"pax", b'x', pax.len() as u64, b""));
+        stream.extend_from_slice(&data_block(pax));
+        // GNU 'L' longname="safe" for the SAME member
+        let long = b"safe\0";
+        stream.extend_from_slice(&hdr(b"long", b'L', long.len() as u64, b""));
+        stream.extend_from_slice(&data_block(long));
+        // the real member
+        stream.extend_from_slice(&hdr(b"placeholder", b'0', 0, b""));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r, true).is_err(),
+            "two path sources for one member must be refused, not resolved to the wrong one"
+        );
+    }
+
+    /// REGRESSION (PAX global path): a sticky global `path`/`linkpath` override is refused ON ITS OWN —
+    /// the following member's header name is SAFE, so the ONLY thing that can trip the vetter is the
+    /// global override itself (host tar would ignore it and extract the safe header name; a different
+    /// tar might honour it — we don't guess, we refuse the archive).
+    #[test]
+    fn rejects_pax_global_path_override() {
+        let mut stream = Vec::new();
+        let g = b"13 path=safe\n"; // "13" + " " + "path=safe\n"(10) = 13 bytes total
+        stream.extend_from_slice(&hdr(b"pax_global", b'g', g.len() as u64, b""));
+        stream.extend_from_slice(&data_block(g));
+        stream.extend_from_slice(&hdr(b"usr/bin/app", b'0', 0, b"")); // SAFE header name
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        let err = vet_tar_stream(&mut r, true).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("global"),
+            "must be refused specifically for the global override, got: {msg}"
+        );
+    }
+
+    /// REGRESSION (early zero-block): a member HIDDEN after a single stray zero block must still be
+    /// vetted — we must not stop at the first zero block.
+    #[test]
+    fn rejects_member_hidden_after_a_zero_block() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"safe/file", b'0', 0, b""));
+        stream.extend_from_slice(&[0u8; BLK]); // ONE stray zero block
+        stream.extend_from_slice(&hdr(b"../../evil", b'0', 0, b"")); // hidden member after it
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r, true).is_err(),
+            "a member after a stray zero block must not slip past the vetter"
+        );
+    }
+
+    /// An absolute hardlink target hardlinks a host inode into the image → always rejected.
+    #[test]
+    fn rejects_absolute_hardlink_target_raw() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"x link to y", b'1', 0, b"/etc/shadow"));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r, true).is_err(),
+            "an absolute hardlink target must be refused (delimiter-in-name class stays dead)"
+        );
+    }
+
+    /// A plain, well-formed member stream is accepted.
+    #[test]
+    fn accepts_a_clean_raw_stream() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"usr/bin/app", b'0', 5, b""));
+        stream.extend_from_slice(&data_block(b"hello"));
+        stream.extend_from_slice(&hdr(b"etc/ssl/cert.pem", b'2', 0, b"/etc/ssl/real.pem"));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r, true).is_ok(),
+            "a normal member stream (incl. an absolute symlink target) should pass"
+        );
     }
 
     /// A normal, well-formed layer passes the check.
