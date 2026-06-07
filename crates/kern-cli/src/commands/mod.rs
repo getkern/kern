@@ -2806,22 +2806,9 @@ fn json_str(s: &str) -> String {
     o
 }
 
-/// Human-readable byte size (K/M/G).
+/// Human-readable byte size — the shared [`kern_common::fmt_bytes`] convention (`ps`/`stats` columns).
 pub(crate) fn human_bytes(b: u64) -> String {
-    const K: u64 = 1 << 10;
-    const M: u64 = 1 << 20;
-    const G: u64 = 1 << 30;
-    if b >= G {
-        format!("{:.1}G", b as f64 / G as f64)
-    } else if b >= M {
-        format!("{:.0}M", b as f64 / M as f64)
-    } else if b >= K {
-        format!("{}K", b / K)
-    } else {
-        // Below 1 KiB show bytes, so an empty volume reads `0 B` (not a confusing `0K`) and a tiny
-        // quota like 1 byte reads `1 B` instead of rounding to `0K`.
-        format!("{b} B")
-    }
+    kern_common::fmt_bytes(b)
 }
 
 /// `kern stats [--json]` — current memory + cumulative CPU time per running box (from cgroup).

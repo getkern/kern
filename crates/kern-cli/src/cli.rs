@@ -1103,34 +1103,12 @@ fn parse_size_z(s: &str) -> Option<u64> {
     }
 }
 
-/// Parse a memory size like `512m`, `1g`, `512mb`, or a bare `268435456` (= bytes) into bytes.
+/// Parse a memory size like `512m`, `1g`, `512mb`, `2t`, or a bare `268435456` (= bytes) into bytes.
 /// Units are binary (k = 1024). Returns `None` on a malformed value — the caller turns that into a
-/// usage error.
+/// usage error. Delegates to the shared [`kern_common::parse_binary_size`] so `--memory`, `--size`
+/// and profile size fields can never disagree on what `512m` means.
 fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let last = s.chars().last()?.to_ascii_lowercase();
-    let (num, mult): (&str, u64) = match last {
-        '0'..='9' => (s, 1),
-        // accept a trailing 'b' on a unit ("mb"/"gb") or on its own (bytes)
-        'b' => {
-            let body = &s[..s.len() - 1];
-            match body.chars().last().map(|c| c.to_ascii_lowercase()) {
-                Some('k') => (&body[..body.len() - 1], 1024),
-                Some('m') => (&body[..body.len() - 1], 1024 * 1024),
-                Some('g') => (&body[..body.len() - 1], 1024 * 1024 * 1024),
-                _ => (body, 1),
-            }
-        }
-        'k' => (&s[..s.len() - 1], 1024),
-        'm' => (&s[..s.len() - 1], 1024 * 1024),
-        'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        _ => return None,
-    };
-    num.trim()
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(mult))
-        .filter(|b| *b > 0)
+    kern_common::parse_binary_size(s)
 }
 
 /// A valid `--cpuset-cpus` list (`0-3`, `0,2,4`, `1-2,5`): the SAME rule the profile `cpus` field

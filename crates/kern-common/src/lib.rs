@@ -51,9 +51,77 @@ impl BoxName {
     }
 }
 
+/// Parse a binary size like `512m`, `1g`, `512mb`, `2t`, or a bare byte count (`268435456`) into
+/// bytes. Units are binary (`k`=1024). An optional trailing `b` is accepted (`mb`==`m`), as is
+/// surrounding whitespace. Returns `None` on a malformed, zero, or overflowing value — callers layer
+/// their own upper cap / `Result` / error message. One source of truth for `--memory`, `--size`,
+/// vdisk sizes and profile size fields, so they can never disagree on what `512m` means.
+pub fn parse_binary_size(s: &str) -> Option<u64> {
+    const K: u64 = 1024;
+    let lower = s.trim().to_ascii_lowercase();
+    let t = lower.strip_suffix('b').unwrap_or(&lower).trim_end(); // "gb"→"g", "512 b"→"512"
+    let (num, mult) = match t.chars().last()? {
+        'k' => (&t[..t.len() - 1], K),
+        'm' => (&t[..t.len() - 1], K * K),
+        'g' => (&t[..t.len() - 1], K * K * K),
+        't' => (&t[..t.len() - 1], K * K * K * K),
+        '0'..='9' => (t, 1),
+        _ => return None,
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .filter(|b| *b > 0)
+}
+
+/// Format a byte count for display with binary units: an exact multiple prints as an integer
+/// (`512M`, `2G`), otherwise one decimal (`1.5G`), and anything below 1 KiB as `N B` (so `0` reads
+/// `0 B`, not `0K`). One convention for the box banner, `ps`/`stats`, `top` and volume sizes, so the
+/// same `512 MiB` never renders three different ways.
+pub fn fmt_bytes(b: u64) -> String {
+    const K: u64 = 1024;
+    for (unit, sz) in [("T", K.pow(4)), ("G", K.pow(3)), ("M", K.pow(2)), ("K", K)] {
+        if b >= sz {
+            return if b % sz == 0 {
+                format!("{}{unit}", b / sz)
+            } else {
+                format!("{:.1}{unit}", b as f64 / sz as f64)
+            };
+        }
+    }
+    format!("{b} B")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_bytes_convention() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(256 * 1024), "256K");
+        assert_eq!(fmt_bytes(512 * 1024 * 1024), "512M");
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1G");
+        assert_eq!(fmt_bytes(1536 * 1024 * 1024), "1.5G"); // non-exact → one decimal
+        assert_eq!(fmt_bytes(2 * 1024u64.pow(4)), "2T");
+    }
+
+    #[test]
+    fn parse_binary_size_units_and_forms() {
+        assert_eq!(parse_binary_size("512"), Some(512));
+        assert_eq!(parse_binary_size("1k"), Some(1024));
+        assert_eq!(parse_binary_size("512m"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_binary_size("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_binary_size("64t"), Some(64 * 1024u64.pow(4)));
+        assert_eq!(parse_binary_size("512mb"), parse_binary_size("512m")); // trailing 'b' allowed
+        assert_eq!(parse_binary_size(" 1G "), Some(1024 * 1024 * 1024)); // whitespace tolerant
+        assert_eq!(parse_binary_size("0"), None); // zero rejected
+        assert_eq!(parse_binary_size("abc"), None);
+        assert_eq!(parse_binary_size(""), None);
+        assert_eq!(parse_binary_size("b"), None);
+    }
 
     #[test]
     fn box_name_accepts_sane_identifiers() {

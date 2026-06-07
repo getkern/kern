@@ -20,6 +20,12 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
+/// The one message for "this host won't let an unprivileged user namespace be created" — reused by
+/// every unshare site (box + pod) so they can't drift. Callers requiring a `&str` (the pod
+/// `eprintln`) use it directly; the sandbox path wraps it in [`Error::Unsupported`].
+const USERNS_UNAVAILABLE: &str =
+    "unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)";
+
 /// What to run, and how to provide its root filesystem.
 pub struct SandboxSpec {
     /// New-root path the box pivots into. For `Overlay` (what the CLI builds) it's the empty
@@ -1396,9 +1402,7 @@ fn apply_userns_range(
             libc::waitpid(helper, ptr::null_mut(), 0);
         }
         if e.raw_os_error() == Some(libc::EPERM) {
-            return Err(Error::Unsupported(
-                "unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)",
-            ));
+            return Err(Error::Unsupported(USERNS_UNAVAILABLE));
         }
         return Err(Error::Syscall("unshare(namespaces)", e));
     }
@@ -1621,9 +1625,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                 if unsafe { libc::unshare(ns_flags) } != 0 {
                     let e = std::io::Error::last_os_error();
                     if e.raw_os_error() == Some(libc::EPERM) {
-                        return Err(Error::Unsupported(
-                            "unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)",
-                        ));
+                        return Err(Error::Unsupported(USERNS_UNAVAILABLE));
                     }
                     return Err(Error::Syscall("unshare(namespaces)", e));
                 }
@@ -2011,9 +2013,7 @@ pub fn run_pod_holder() -> ! {
     if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() == Some(libc::EPERM) {
-            eprintln!(
-                "kern: pod: unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)"
-            );
+            eprintln!("kern: pod: {USERNS_UNAVAILABLE}");
         } else {
             eprintln!("kern: pod: unshare(user+net) failed: {e}");
         }
