@@ -1201,9 +1201,59 @@ fn reconstruct_port_item(item: &str, svc: &str) -> String {
     spec
 }
 
-/// `volumes`: each `src:dst[:ro]` entry verbatim (kern's `-v` grammar matches compose's short form).
+/// `volumes`: a short-form `src:dst[:ro]` entry passes through (kern's `-v` grammar matches compose's
+/// short form); a LONG-form entry (`{type:, source:, target:, read_only:}`, which `build_tree` folds to
+/// an inline `{…}` scalar) is reconstructed into `source:target[:ro]`. Passing the raw `{…}` to `-v`
+/// was a bug — the box rejected it and the whole service failed to start.
 fn volumes_value(node: &Node) -> Vec<String> {
     list_value(node)
+        .into_iter()
+        .filter_map(|item| {
+            if item.trim_start().starts_with('{') {
+                reconstruct_volume_item(&item)
+            } else {
+                Some(item)
+            }
+        })
+        .collect()
+}
+
+/// A compose long-form volume `{type: bind|volume, source: S, target: T, read_only: true}` → kern's
+/// `S:T[:ro]`. An anonymous volume (no `source`) or an unsupported shape is dropped with a warning
+/// rather than forwarded as a malformed `-v`. `type: tmpfs` has no `source`; we don't map it here
+/// (kern has `--tmpfs`), so it's warned-and-skipped.
+fn reconstruct_volume_item(item: &str) -> Option<String> {
+    let inner = item.trim().trim_start_matches('{').trim_end_matches('}');
+    let (mut source, mut target, mut read_only, mut vtype) =
+        (String::new(), String::new(), false, String::new());
+    for field in split_top_commas(inner) {
+        if let Some((k, v)) = field.split_once(':') {
+            let (k, v) = (k.trim(), scalar_str(v));
+            match k {
+                "source" => source = v,
+                "target" => target = v,
+                "type" => vtype = v,
+                "read_only" => read_only = v == "true",
+                _ => {} // bind/volume sub-options (bind:, volume:, consistency:) — ignored
+            }
+        }
+    }
+    if target.is_empty() || source.is_empty() {
+        warn(&format!(
+            "service volume long-form {{{inner}}} has no usable source+target ({}) — skipped",
+            if vtype == "tmpfs" {
+                "tmpfs: use kern --tmpfs"
+            } else {
+                "anonymous/unsupported"
+            }
+        ));
+        return None;
+    }
+    Some(if read_only {
+        format!("{source}:{target}:ro")
+    } else {
+        format!("{source}:{target}")
+    })
 }
 
 /// `depends_on`: short list → start-order; long-form map with `condition:` → healthy/completed buckets.
@@ -1733,6 +1783,25 @@ mod tests {
             "absent passthrough must be omitted, not a bare/malformed entry: {env:?}"
         );
         std::env::remove_var("KERN_T_PASS");
+    }
+
+    #[test]
+    fn volume_long_form_reconstructs_to_src_dst() {
+        // Extreme vs-Docker regression: a long-form volume (`{type,source,target,read_only}`) was
+        // passed to the box's `-v` verbatim as `{…}`, which was rejected → the whole service failed.
+        // Now reconstructed to `source:target[:ro]`.
+        let y = "services:\n  a:\n    image: x\n    volumes:\n      - type: bind\n        source: ./data\n        target: /data\n        read_only: true\n";
+        assert_eq!(boxes(y)[0].volumes, ["./data:/data:ro"]);
+        // Without read_only → no :ro suffix.
+        let y2 = "services:\n  a:\n    image: x\n    volumes:\n      - type: volume\n        source: myvol\n        target: /store\n";
+        assert_eq!(boxes(y2)[0].volumes, ["myvol:/store"]);
+        // Short form still passes through untouched.
+        let y3 = "services:\n  a:\n    image: x\n    volumes:\n      - ./h:/c:ro\n";
+        assert_eq!(boxes(y3)[0].volumes, ["./h:/c:ro"]);
+        // A long-form with no source (anonymous/tmpfs) is dropped, not forwarded as a bad `-v`.
+        let y4 =
+            "services:\n  a:\n    image: x\n    volumes:\n      - {type: tmpfs, target: /tmp}\n";
+        assert!(boxes(y4)[0].volumes.is_empty());
     }
 
     #[test]

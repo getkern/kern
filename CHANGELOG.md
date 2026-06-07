@@ -73,6 +73,10 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   Docker's host pass-through (inherit `API_KEY` from the host env). The bare `API_KEY` was forwarded
   to the box's `--env K=V` parser, which rejected it and **aborted the whole service**. Now: present
   in the host → `API_KEY=<value>`; absent → omitted (Docker semantics), never a malformed `--env`.
+- **compose long-form volumes** — a `volumes: [{type: bind, source: S, target: T, read_only: true}]`
+  entry was forwarded to the box's `-v` as the raw `{…}` and **aborted the service**. Now reconstructed
+  to `S:T[:ro]` (verified: the bind mounts and `read_only` is kernel-enforced). An anonymous/tmpfs
+  long-form (no `source`) is warned-and-skipped, not forwarded as a malformed `-v`.
 - **compose `healthcheck.timeout` / `start_period` durations** — these map to `--health-{timeout,
   start-period}`, which take integer **seconds**, but Docker writes them as durations (`30s`, `1m30s`,
   `0s`). The raw string was forwarded verbatim, so a standard `timeout: 30s` aborted the box
