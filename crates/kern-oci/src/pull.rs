@@ -10,12 +10,14 @@
 //! with `kern login` credentials (sent off-argv). All requests are https-pinned.
 //!
 //! Hardening (adversarial images): every blob is verified to hash to its `sha256:` digest
-//! ([`verify_digest`]) before use. Each layer is then vetted ([`check_layer_safe`]: no
-//! absolute/`..` paths, no device nodes, no escaping hardlink target, a 2 GiB decompression-bomb
-//! cap), extracted into an ISOLATED staging dir, and merged into the rootfs with **no-follow**
-//! semantics ([`merge_layer`]) — a symlink planted by an earlier layer can never be traversed by
-//! a later layer's writes, so the cross-layer escape class is closed structurally, not by
-//! trusting tar.
+//! ([`verify_digest`]) before use. Each layer is then vetted ([`check_layer_safe`]) by reading the
+//! RAW tar headers IN-PROCESS (`gzip -dc` only decompresses) — name/prefix/linkname/typeflag at fixed
+//! offsets, resolving GNU long-name/link and PAX overrides — so the escape decision (no absolute/`..`
+//! path, no device node, no escaping hardlink target, a 2 GiB bomb cap, an entry-count cap) never
+//! depends on parsing `tar -tv`'s locale-dependent, delimiter-desyncable text. The layer is then
+//! extracted into an ISOLATED staging dir and merged into the rootfs with **no-follow** semantics
+//! ([`merge_layer`]) — a symlink planted by an earlier layer can never be traversed by a later
+//! layer's writes, so the cross-layer escape class is closed structurally, not by trusting tar.
 
 use crate::json::{
     all_str_values, array_after, first_str, object_after, split_objects, str_array_after,
@@ -680,111 +682,240 @@ fn tar_is_gnu() -> bool {
     })
 }
 
-/// Vet a downloaded layer tarball before extraction. Lists entries with `tar -tzv` and rejects:
-/// absolute paths, `..` traversal, device/special nodes, and a total uncompressed size over the
-/// bomb cap. (Cross-layer symlink escapes are handled structurally by isolated staging +
-/// no-follow merge in [`merge_layer`].)
+/// Vet a downloaded layer tarball before extraction by reading its RAW tar headers in-process
+/// (`gzip -dc` does ONLY the decompression). We deliberately do NOT parse `tar -tv`'s human-readable
+/// text: it is locale-dependent and can be desynced by a member name that contains the ` -> ` /
+/// ` link to ` delimiter, hiding an escaping link target — a real BusyBox-tar escape. Header fields
+/// (name / prefix / linkname / typeflag) live at FIXED offsets, so this decision is sound on GNU and
+/// BusyBox alike. Rejects: absolute / `..` paths, an escaping hardlink target (always) or symlink
+/// target (on non-GNU tar), device/special nodes, a total uncompressed size over the 2 GiB bomb cap,
+/// and an entry count over the inode cap. (Cross-layer symlink escapes are additionally handled
+/// structurally by isolated staging + no-follow merge in [`merge_layer`].)
 fn check_layer_safe(tar_path: &Path) -> Result<(), OciError> {
-    use std::io::BufRead;
-    // `LC_ALL=C` pins tar's `-v` output to the stable English form we parse — `x -> y` for a symlink,
-    // `x link to y` for a HARDLINK. A localized listing (`collegamento a`, …) would otherwise hide a
-    // hardlink target from the escape check below. STREAM stdout line-by-line so the entry/size caps
-    // abort EARLY with bounded memory instead of buffering the whole (attacker-sized) listing in RAM.
-    let mut child = Command::new("tar")
-        .args(["-tzvf", &tar_path.to_string_lossy()])
-        .env("LC_ALL", "C")
+    let mut child = Command::new("gzip")
+        .args(["-dc", &tar_path.to_string_lossy()])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| OciError::Tool("tar", e.to_string()))?;
-    let stdout = child.stdout.take().expect("stdout piped");
-    let gnu_tar = tar_is_gnu();
-    let mut total: u64 = 0;
-    let mut entries: u64 = 0;
+        .map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let res = vet_tar_stream(&mut stdout, tar_is_gnu());
+    // We stop reading at the end-of-archive marker (or on rejection), so gzip may take a SIGPIPE — its
+    // exit status isn't meaningful here. Truncation/corruption is caught inside `vet_tar_stream` (a
+    // short read before the end-of-archive marker is an error), so a cut-off unsafe member can't slip.
+    let _ = child.kill();
+    let _ = child.wait();
+    res
+}
 
-    let scan = || -> Result<(), OciError> {
-        for line in std::io::BufReader::new(stdout).lines() {
-            let line = line.map_err(|e| OciError::Tool("tar", e.to_string()))?;
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 6 {
-                continue; // not an entry line
-            }
-            // Cap the entry COUNT, not just the byte total: a layer of millions of empty files/dirs
-            // sums to ~0 bytes yet exhausts inodes/disk on extraction.
-            entries += 1;
-            if entries > MAX_LAYER_ENTRIES {
-                return Err(OciError::Extract(
-                    "layer has too many entries (possible inode bomb)".into(),
-                ));
-            }
-            let typ = cols[0].as_bytes().first().copied().unwrap_or(b'-');
-            // The size column is always numeric; an unparseable value means the columns are desynced
-            // (e.g. a crafted uname with spaces) — refuse rather than silently count it as 0, which
-            // would let a decompression bomb slip under the size cap.
-            let Ok(size) = cols[2].parse::<u64>() else {
-                return Err(OciError::Extract(format!(
-                    "unparseable layer listing (bad size column): {line}"
-                )));
-            };
-            // Split the entry name from its optional link target: `-> ` for a symlink, `link to ` for
-            // a hardlink (both in the C locale forced above).
-            let name = cols[5..].join(" ");
-            let (path, link_target) = match typ {
-                b'l' => name
-                    .split_once(" -> ")
-                    .map_or((name.as_str(), None), |(p, t)| (p, Some(t))),
-                b'h' => name
-                    .split_once(" link to ")
-                    .map_or((name.as_str(), None), |(p, t)| (p, Some(t))),
-                _ => (name.as_str(), None),
-            };
+const TAR_BLOCK: usize = 512;
+/// Cap on a GNU long-name / long-link / PAX record set — a real one is a few KB; refuse the absurd.
+const TAR_MAX_LONG: u64 = 1 << 20;
 
-            if typ == b'c' || typ == b'b' {
-                return Err(OciError::Extract(format!(
-                    "layer has a device node: {path}"
-                )));
-            }
-            if unsafe_member_path(path) {
-                return Err(OciError::Extract(format!("unsafe path in layer: {path}")));
-            }
-            // A HARDLINK target is a real path into the rootfs and must stay inside it (an absolute/
-            // `..` target hardlinks a HOST inode into the image — a confidentiality escape). A SYMLINK
-            // target is normally fine — the no-follow merge never traverses it, and legit images carry
-            // absolute symlinks (`/usr/lib/x -> /lib/x`) — UNLESS `tar -xzf` itself follows a planted
-            // symlink within one layer's extraction: GNU tar doesn't, BusyBox tar historically does.
-            // So reject an escaping hardlink target always, and an escaping symlink target on non-GNU tar.
-            if let Some(t) = link_target {
-                let escapes = unsafe_member_path(t);
-                if (typ == b'h' && escapes) || (typ == b'l' && escapes && !gnu_tar) {
-                    return Err(OciError::Extract(format!(
-                        "layer {} target escapes the rootfs: {path} -> {t}",
-                        if typ == b'h' { "hardlink" } else { "symlink" }
-                    )));
-                }
-            }
-            total = total.saturating_add(size);
-            if total > MAX_LAYER_BYTES {
-                return Err(OciError::Extract(
-                    "layer exceeds the size cap (possible decompression bomb)".into(),
-                ));
+/// Read up to `buf.len()` bytes (retrying on EINTR). Returns the count: `0` = clean EOF, `< len` = a
+/// short final read.
+fn read_block(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+/// A NUL-terminated tar header string field → an owned (lossy) String.
+fn tar_field(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).into_owned()
+}
+
+/// A tar numeric field: octal (space/NUL-terminated), or GNU base-256 (high bit of the first byte).
+fn tar_num(field: &[u8]) -> Option<u64> {
+    if field.first().is_some_and(|&b| b & 0x80 != 0) {
+        let mut v: u64 = (field[0] & 0x7f) as u64;
+        for &b in &field[1..] {
+            v = v.checked_shl(8)?.checked_add(b as u64)?;
+        }
+        return Some(v);
+    }
+    let s: String = field
+        .iter()
+        .take_while(|&&b| b != 0 && b != b' ')
+        .map(|&b| b as char)
+        .collect();
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(s, 8).ok()
+}
+
+/// Consume `len` bytes of member data plus its zero-padding to the next 512-block boundary, keeping
+/// (returning) at most the first `keep` real bytes. Bounded memory regardless of `len`.
+fn take_data(r: &mut impl std::io::Read, len: u64, keep: usize) -> Result<Vec<u8>, OciError> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut left = len.div_ceil(TAR_BLOCK as u64) * TAR_BLOCK as u64;
+    let mut real = len;
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n =
+            read_block(r, &mut buf[..want]).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+        if n == 0 {
+            return Err(OciError::Extract("truncated layer data".into()));
+        }
+        let real_here = (n as u64).min(real) as usize; // real bytes precede any padding in this chunk
+        if out.len() < keep {
+            let room = keep - out.len();
+            out.extend_from_slice(&buf[..real_here.min(room)]);
+        }
+        real = real.saturating_sub(n as u64);
+        left -= n as u64;
+    }
+    Ok(out)
+}
+
+/// Parse the PAX records we care about (`<len> key=value\n`…) → (`path`, `linkpath`). Malformed input
+/// stops the scan rather than panicking.
+fn parse_pax(data: &[u8]) -> (Option<String>, Option<String>) {
+    let (mut path, mut linkpath) = (None, None);
+    let text = String::from_utf8_lossy(data);
+    let mut rest: &str = &text;
+    while !rest.is_empty() {
+        let Some(sp) = rest.find(' ') else { break };
+        let Ok(len) = rest[..sp].parse::<usize>() else {
+            break;
+        };
+        if len <= sp || len > rest.len() {
+            break;
+        }
+        let record = rest[sp + 1..len]
+            .strip_suffix('\n')
+            .unwrap_or(&rest[sp + 1..len]);
+        if let Some((k, v)) = record.split_once('=') {
+            match k {
+                "path" => path = Some(v.to_string()),
+                "linkpath" => linkpath = Some(v.to_string()),
+                _ => {}
             }
         }
-        Ok(())
-    };
-    let scanned = scan();
-
-    // A scan error (cap tripped / unsafe entry) means we bailed early — kill tar so it can't keep
-    // decompressing; otherwise wait and require a clean exit (a corrupt gzip fails here).
-    if scanned.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return scanned;
+        rest = &rest[len..];
     }
-    match child.wait() {
-        Ok(s) if s.success() => Ok(()),
-        _ => Err(OciError::Extract(
-            "could not list layer (corrupt or unsupported archive)".into(),
-        )),
+    (path, linkpath)
+}
+
+/// Vet the raw (decompressed) tar stream `r` block by block. Resolves the effective path/linkname
+/// through ustar `prefix`, GNU `L`/`K` long name/link, and PAX `x`/`g` `path=`/`linkpath=`, so what we
+/// check is what tar will actually create — never a truncated or text-desynced approximation.
+pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Result<(), OciError> {
+    let bad = |m: &str| OciError::Extract(m.to_string());
+    let mut header = [0u8; TAR_BLOCK];
+    let mut total: u64 = 0;
+    let mut entries: u64 = 0;
+    let mut next_name: Option<String> = None; // override carried by a preceding L / PAX block
+    let mut next_link: Option<String> = None; // …K / PAX linkpath
+
+    loop {
+        let n = read_block(r, &mut header).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+        if n == 0 {
+            // Clean EOF with no end-of-archive zero block = truncated (an unsafe member could have
+            // been cut off) → reject.
+            return Err(bad("truncated layer archive (no end-of-archive marker)"));
+        }
+        if n < TAR_BLOCK {
+            return Err(bad("truncated tar header"));
+        }
+        if header.iter().all(|&b| b == 0) {
+            return Ok(()); // end-of-archive marker — fully vetted
+        }
+
+        let typeflag = header[156];
+        let size = tar_num(&header[124..136]).ok_or_else(|| bad("bad tar size field"))?;
+
+        // GNU long-name/link and PAX headers carry the real path/linkname in their DATA, for the NEXT
+        // entry — read (capped) and stash; they aren't entries themselves.
+        match typeflag {
+            b'L' | b'K' => {
+                if size > TAR_MAX_LONG {
+                    return Err(bad("oversized tar long-name record"));
+                }
+                let s = tar_field(&take_data(r, size, size as usize)?);
+                if typeflag == b'L' {
+                    next_name = Some(s);
+                } else {
+                    next_link = Some(s);
+                }
+                continue;
+            }
+            b'x' | b'g' => {
+                if size > TAR_MAX_LONG {
+                    return Err(bad("oversized PAX record"));
+                }
+                let (p, lp) = parse_pax(&take_data(r, size, size as usize)?);
+                if p.is_some() {
+                    next_name = p;
+                }
+                if lp.is_some() {
+                    next_link = lp;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        entries += 1;
+        if entries > MAX_LAYER_ENTRIES {
+            return Err(bad("layer has too many entries (possible inode bomb)"));
+        }
+
+        let path = next_name.take().unwrap_or_else(|| {
+            let name = tar_field(&header[0..100]);
+            let prefix = tar_field(&header[345..500]);
+            if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            }
+        });
+        let link = next_link.take().or_else(|| {
+            let l = tar_field(&header[157..257]);
+            (!l.is_empty()).then_some(l)
+        });
+
+        if typeflag == b'3' || typeflag == b'4' {
+            return Err(bad("layer has a device node"));
+        }
+        if unsafe_member_path(&path) {
+            return Err(OciError::Extract(format!("unsafe path in layer: {path}")));
+        }
+        // '1' HARDLINK target is a real rootfs path — an absolute/`..` target hardlinks a HOST inode
+        // into the image (confidentiality escape) → always reject. '2' SYMLINK target is fine unless a
+        // non-GNU `tar -xzf` follows it during this layer's own extraction (GNU tar doesn't).
+        if let Some(t) = &link {
+            let escapes = unsafe_member_path(t);
+            if (typeflag == b'1' && escapes) || (typeflag == b'2' && escapes && !gnu_tar) {
+                return Err(OciError::Extract(format!(
+                    "layer {} target escapes the rootfs: {path} -> {t}",
+                    if typeflag == b'1' {
+                        "hardlink"
+                    } else {
+                        "symlink"
+                    }
+                )));
+            }
+        }
+
+        take_data(r, size, 0)?; // skip the member's file data (links/dirs have size 0)
+        total = total.saturating_add(size);
+        if total > MAX_LAYER_BYTES {
+            return Err(bad(
+                "layer exceeds the size cap (possible decompression bomb)",
+            ));
+        }
     }
 }
 
