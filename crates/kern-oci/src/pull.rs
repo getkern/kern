@@ -685,79 +685,107 @@ fn tar_is_gnu() -> bool {
 /// bomb cap. (Cross-layer symlink escapes are handled structurally by isolated staging +
 /// no-follow merge in [`merge_layer`].)
 fn check_layer_safe(tar_path: &Path) -> Result<(), OciError> {
-    let out = Command::new("tar")
+    use std::io::BufRead;
+    // `LC_ALL=C` pins tar's `-v` output to the stable English form we parse — `x -> y` for a symlink,
+    // `x link to y` for a HARDLINK. A localized listing (`collegamento a`, …) would otherwise hide a
+    // hardlink target from the escape check below. STREAM stdout line-by-line so the entry/size caps
+    // abort EARLY with bounded memory instead of buffering the whole (attacker-sized) listing in RAM.
+    let mut child = Command::new("tar")
         .args(["-tzvf", &tar_path.to_string_lossy()])
-        .output()
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| OciError::Tool("tar", e.to_string()))?;
-    if !out.status.success() {
-        return Err(OciError::Extract(format!(
-            "could not list layer: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    let listing = String::from_utf8_lossy(&out.stdout);
+    let stdout = child.stdout.take().expect("stdout piped");
     let gnu_tar = tar_is_gnu();
     let mut total: u64 = 0;
     let mut entries: u64 = 0;
-    for line in listing.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 6 {
-            continue; // not an entry line
-        }
-        // Cap the entry COUNT, not just the byte total: a layer of millions of empty files/dirs sums
-        // to ~0 bytes yet exhausts inodes/disk on extraction.
-        entries += 1;
-        if entries > MAX_LAYER_ENTRIES {
-            return Err(OciError::Extract(
-                "layer has too many entries (possible inode bomb)".into(),
-            ));
-        }
-        let typ = cols[0].as_bytes().first().copied().unwrap_or(b'-');
-        // `tar -tzv`'s size column is always numeric; an unparseable value means the columns are
-        // desynced (e.g. a crafted uname/name with spaces) — refuse rather than silently count it as
-        // 0, which would let a decompression bomb slip under the size cap.
-        let Ok(size) = cols[2].parse::<u64>() else {
-            return Err(OciError::Extract(format!(
-                "unparseable layer listing (bad size column): {line}"
-            )));
-        };
-        // The name (cols[5..]) may be `path -> target` (symlink or hardlink).
-        let name = cols[5..].join(" ");
-        let mut halves = name.split(" -> ");
-        let path = halves.next().unwrap_or(&name);
-        let link_target = halves.next();
 
-        if typ == b'c' || typ == b'b' {
-            return Err(OciError::Extract(format!(
-                "layer has a device node: {path}"
-            )));
-        }
-        if unsafe_member_path(path) {
-            return Err(OciError::Extract(format!("unsafe path in layer: {path}")));
-        }
-        // A HARDLINK target is a real path into the rootfs and must stay inside it (an absolute/`..`
-        // target could hardlink a host inode into the image). A SYMLINK target is normally fine — the
-        // no-follow merge never traverses it, and legit images carry absolute symlinks
-        // (`/usr/lib/x -> /lib/x`). That safety, though, assumes `tar -xzf` doesn't itself follow a
-        // planted symlink WITHIN one layer's extraction: GNU tar doesn't, BusyBox tar historically
-        // does. So on a non-GNU tar, reject an escaping symlink target too.
-        if let Some(t) = link_target {
-            let escapes = unsafe_member_path(t);
-            if (typ == b'h' && escapes) || (typ == b'l' && escapes && !gnu_tar) {
+    let scan = || -> Result<(), OciError> {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let line = line.map_err(|e| OciError::Tool("tar", e.to_string()))?;
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 6 {
+                continue; // not an entry line
+            }
+            // Cap the entry COUNT, not just the byte total: a layer of millions of empty files/dirs
+            // sums to ~0 bytes yet exhausts inodes/disk on extraction.
+            entries += 1;
+            if entries > MAX_LAYER_ENTRIES {
+                return Err(OciError::Extract(
+                    "layer has too many entries (possible inode bomb)".into(),
+                ));
+            }
+            let typ = cols[0].as_bytes().first().copied().unwrap_or(b'-');
+            // The size column is always numeric; an unparseable value means the columns are desynced
+            // (e.g. a crafted uname with spaces) — refuse rather than silently count it as 0, which
+            // would let a decompression bomb slip under the size cap.
+            let Ok(size) = cols[2].parse::<u64>() else {
                 return Err(OciError::Extract(format!(
-                    "layer {} target escapes the rootfs: {path} -> {t}",
-                    if typ == b'h' { "hardlink" } else { "symlink" }
+                    "unparseable layer listing (bad size column): {line}"
+                )));
+            };
+            // Split the entry name from its optional link target: `-> ` for a symlink, `link to ` for
+            // a hardlink (both in the C locale forced above).
+            let name = cols[5..].join(" ");
+            let (path, link_target) = match typ {
+                b'l' => name
+                    .split_once(" -> ")
+                    .map_or((name.as_str(), None), |(p, t)| (p, Some(t))),
+                b'h' => name
+                    .split_once(" link to ")
+                    .map_or((name.as_str(), None), |(p, t)| (p, Some(t))),
+                _ => (name.as_str(), None),
+            };
+
+            if typ == b'c' || typ == b'b' {
+                return Err(OciError::Extract(format!(
+                    "layer has a device node: {path}"
                 )));
             }
+            if unsafe_member_path(path) {
+                return Err(OciError::Extract(format!("unsafe path in layer: {path}")));
+            }
+            // A HARDLINK target is a real path into the rootfs and must stay inside it (an absolute/
+            // `..` target hardlinks a HOST inode into the image — a confidentiality escape). A SYMLINK
+            // target is normally fine — the no-follow merge never traverses it, and legit images carry
+            // absolute symlinks (`/usr/lib/x -> /lib/x`) — UNLESS `tar -xzf` itself follows a planted
+            // symlink within one layer's extraction: GNU tar doesn't, BusyBox tar historically does.
+            // So reject an escaping hardlink target always, and an escaping symlink target on non-GNU tar.
+            if let Some(t) = link_target {
+                let escapes = unsafe_member_path(t);
+                if (typ == b'h' && escapes) || (typ == b'l' && escapes && !gnu_tar) {
+                    return Err(OciError::Extract(format!(
+                        "layer {} target escapes the rootfs: {path} -> {t}",
+                        if typ == b'h' { "hardlink" } else { "symlink" }
+                    )));
+                }
+            }
+            total = total.saturating_add(size);
+            if total > MAX_LAYER_BYTES {
+                return Err(OciError::Extract(
+                    "layer exceeds the size cap (possible decompression bomb)".into(),
+                ));
+            }
         }
-        total = total.saturating_add(size);
-        if total > MAX_LAYER_BYTES {
-            return Err(OciError::Extract(
-                "layer exceeds the size cap (possible decompression bomb)".into(),
-            ));
-        }
+        Ok(())
+    };
+    let scanned = scan();
+
+    // A scan error (cap tripped / unsafe entry) means we bailed early — kill tar so it can't keep
+    // decompressing; otherwise wait and require a clean exit (a corrupt gzip fails here).
+    if scanned.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return scanned;
     }
-    Ok(())
+    match child.wait() {
+        Ok(s) if s.success() => Ok(()),
+        _ => Err(OciError::Extract(
+            "could not list layer (corrupt or unsupported archive)".into(),
+        )),
+    }
 }
 
 /// Merge an isolated layer staging tree into `dest` with **no-follow** semantics. Before writing
