@@ -23,6 +23,7 @@ mod pty;
 mod registry;
 mod sandbox;
 mod secret;
+mod toml_lite;
 mod toml_surgery;
 mod tui;
 mod ui;

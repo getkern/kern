@@ -318,17 +318,10 @@ fn line_err(i: usize, e: &str) -> String {
     format!("line {}: {e}", i + 1)
 }
 
+use crate::toml_lite;
+
 fn strip_comment(line: &str) -> &str {
-    // `#` outside a string starts a comment. (Values are quoted, so a `#` inside quotes is safe.)
-    let mut in_str = false;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => in_str = !in_str,
-            '#' if !in_str => return &line[..i],
-            _ => {}
-        }
-    }
-    line
+    toml_lite::strip_comment(line)
 }
 
 fn parse_box_header(line: &str) -> Option<String> {
@@ -341,20 +334,11 @@ fn parse_box_header(line: &str) -> Option<String> {
 }
 
 fn parse_string(v: &str) -> Result<String, String> {
-    let v = v.trim();
-    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        Ok(v[1..v.len() - 1].to_string())
-    } else {
-        Err(format!("expected a quoted string, got `{v}`"))
-    }
+    toml_lite::quoted_string(v)
 }
 
 fn parse_bool(v: &str) -> Result<bool, String> {
-    match v.trim() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(format!("expected `true` or `false`, got `{other}`")),
-    }
+    toml_lite::parse_bool(v)
 }
 
 /// A positive integer (the only int key, `health_interval`, is seconds — 0/negative is nonsense).
@@ -368,51 +352,11 @@ fn parse_positive_int(v: &str) -> Result<i64, String> {
 }
 
 fn parse_string_array(v: &str) -> Result<Vec<String>, String> {
-    let v = v.trim();
-    let inner = v
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| format!("expected an array `[...]`, got `{v}`"))?;
-    let mut out = Vec::new();
-    for part in split_top_commas(inner) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        out.push(parse_string(part)?);
-    }
-    Ok(out)
+    toml_lite::string_array(v)
 }
 
-/// Split on commas that are not inside a quoted string.
-fn split_top_commas(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let (mut in_str, mut esc) = (false, false);
-    for c in s.chars() {
-        if in_str {
-            cur.push(c);
-            if esc {
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-        } else if c == '"' {
-            in_str = true;
-            cur.push(c);
-        } else if c == ',' {
-            out.push(std::mem::take(&mut cur));
-        } else {
-            cur.push(c);
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
-}
+// (comment stripping, quoted strings, bools and string arrays now live in `crate::toml_lite`,
+//  shared with the profile loader so the two parsers can't drift.)
 
 #[cfg(test)]
 mod tests {

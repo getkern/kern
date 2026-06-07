@@ -429,15 +429,7 @@ fn apply_vdisk(e: &mut VDiskEntry, key: &str, v: &str) -> Result<(), String> {
 
 /// Drop a `#` comment outside a quoted string.
 fn strip_comment(line: &str) -> &str {
-    let mut in_str = false;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => in_str = !in_str,
-            '#' if !in_str => return &line[..i],
-            _ => {}
-        }
-    }
-    line
+    crate::toml_lite::strip_comment(line)
 }
 
 /// `[x]` → `(false, "x")`, `[[x]]` → `(true, "x")`; `None` if not a header. Inner is trimmed.
@@ -452,20 +444,11 @@ fn section_header(line: &str) -> Option<(bool, &str)> {
 }
 
 fn value_string(v: &str) -> Result<String, String> {
-    let v = v.trim();
-    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        Ok(v[1..v.len() - 1].to_string())
-    } else {
-        Err(format!("expected a quoted string, got `{v}`"))
-    }
+    crate::toml_lite::quoted_string(v)
 }
 
 fn value_bool(v: &str) -> Result<bool, String> {
-    match v.trim() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        o => Err(format!("expected true/false, got `{o}`")),
-    }
+    crate::toml_lite::parse_bool(v)
 }
 
 fn value_f64(v: &str) -> Result<f64, String> {
@@ -501,32 +484,7 @@ fn array_items(v: &str) -> Result<Vec<String>, String> {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .ok_or_else(|| format!("expected an array `[...]`, got `{v}`"))?;
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let (mut in_str, mut esc) = (false, false);
-    for c in inner.chars() {
-        if in_str {
-            cur.push(c);
-            if esc {
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-        } else if c == '"' {
-            in_str = true;
-            cur.push(c);
-        } else if c == ',' {
-            out.push(std::mem::take(&mut cur));
-        } else {
-            cur.push(c);
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    Ok(out)
+    Ok(crate::toml_lite::split_top_commas(inner))
 }
 
 fn value_str_array(v: &str) -> Result<Vec<String>, String> {
