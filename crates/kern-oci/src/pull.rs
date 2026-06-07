@@ -486,7 +486,7 @@ fn realm_host_trusted(realm: &str, registry: &str) -> bool {
 /// the LAST `@` as the host — a `realm="https://trusted:0@evil.com/…"` connects to `evil.com`, NOT
 /// `trusted`) and any `:port`, lowercased (DNS is case-insensitive). Parsing the host the same way
 /// curl resolves it is what keeps [`realm_host_trusted`] sound.
-pub(crate) fn host_from_authority(authority: &str) -> String {
+fn host_from_authority(authority: &str) -> String {
     let host = authority.rsplit('@').next().unwrap_or(authority);
     host.split(':').next().unwrap_or(host).to_ascii_lowercase()
 }

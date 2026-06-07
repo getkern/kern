@@ -205,6 +205,16 @@ fn prescreen(text: &str) -> Result<(), String> {
                 ));
             }
         }
+        // An anchor/alias as a TOKEN inside an inline collection — `[*x]`, `[a, *x]`, `{k: *x}`. The
+        // two checks above only see the START of the line or the char right after the key `:`; an alias
+        // nested inside `[…]`/`{…}` would slip through and reach the box as the literal `*x` (same silent
+        // mis-conversion as the list-item case). Scan the whole line (outside quotes) for a `&`/`*` that
+        // opens a token: preceded by `[`, `{`, `,` or `:` (with optional spaces).
+        if line_has_inline_anchor(line) {
+            return Err(format!(
+                "line {ln}: YAML anchors/aliases not supported (rewrite the value inline)"
+            ));
+        }
         // Explicit type tags.
         if t.contains("!!") {
             return Err(format!("line {ln}: YAML type tags (`!!`) not supported"));
@@ -277,6 +287,40 @@ fn colon_index(line: &str) -> Option<usize> {
 /// The substring of `line` after the key-terminating `:` (see [`colon_index`]), or `None` if none.
 fn value_after_colon(line: &str) -> Option<&str> {
     colon_index(line).map(|i| &line[i + 1..])
+}
+
+/// True if `line` contains a YAML anchor (`&x`) or alias (`*x`) as a TOKEN inside an inline collection
+/// — i.e. a `&`/`*` (outside quotes) that opens a value: preceded, ignoring spaces, by `[`, `{`, `,` or
+/// `:`. Catches `[*x]`, `[a, *x]`, `{k: *x}`, `{k: &a v}`. A `*`/`&` used as normal text (e.g. inside a
+/// quoted string, or a `2*2` arithmetic value) is NOT flagged: it must sit at a token boundary. This is
+/// the billion-laughs / silent-mis-conversion guard for the inline forms the two positional checks miss.
+fn line_has_inline_anchor(line: &str) -> bool {
+    let mut q = 0u8; // active quote char, else 0
+    let mut prev_significant = b'\0'; // last non-space byte outside quotes
+    let bytes = line.as_bytes();
+    for &c in bytes {
+        if q != 0 {
+            if c == q {
+                q = 0;
+            }
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => {
+                q = c;
+                prev_significant = c;
+            }
+            b' ' | b'\t' => {} // spaces don't reset the "opener" context
+            b'&' | b'*' => {
+                if matches!(prev_significant, b'[' | b'{' | b',' | b':') {
+                    return true;
+                }
+                prev_significant = c;
+            }
+            other => prev_significant = other,
+        }
+    }
+    false
 }
 
 /// Strip leading YAML block-sequence markers (`- `, possibly nested `- - `) and surrounding spaces,
@@ -1651,6 +1695,18 @@ mod tests {
         assert!(
             parse("services:\n  a:\n    image: alpine\n    command:\n      - --version\n").is_ok()
         );
+        // Audit follow-up: an anchor/alias as a TOKEN inside an inline collection (`[*x]`, `{k: *x}`,
+        // `{k: &a v}`) must be refused too — the two positional checks only see line-start / after-`:`.
+        assert!(parse("services:\n  a:\n    image: alpine\n    command: [*boom, x]\n").is_err());
+        assert!(
+            parse("services:\n  a:\n    image: alpine\n    healthcheck: {test: *boom}\n").is_err()
+        );
+        assert!(parse("services:\n  a:\n    image: alpine\n    environment: {K: &a v}\n").is_err());
+        // No FALSE POSITIVES: a `*`/`&` as ordinary text (a glob, arithmetic, inside quotes, or in a
+        // repo name) is NOT a token-opening anchor and must still parse.
+        assert!(parse("services:\n  a:\n    image: my*repo/x\n").is_ok());
+        assert!(parse("services:\n  a:\n    image: x\n    command: [\"echo\", \"2*2\"]\n").is_ok());
+        assert!(parse("services:\n  a:\n    image: x\n    environment: {K: \"v*v\"}\n").is_ok());
     }
 
     #[test]
