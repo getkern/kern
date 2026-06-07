@@ -1944,15 +1944,37 @@ fn drop_dangerous_caps(spec: &CapSpec) {
     clear_caps_from_sets(mask);
 }
 
-/// After `fork()`, close every inherited fd in `3..1024` except `keep` (pass `-1` to keep none).
-/// A long-lived helper child (a `-p` forwarder, a health-checker) must shed the parent's fds —
-/// most importantly a detached box's readiness-pipe write end, whose lingering copy would stop the
-/// launcher from ever seeing EOF and hang `kern box -d`. Best-effort: closing an unopened fd is a
-/// harmless EBADF. 1024 covers the low fds that matter (pipes/sockets the parent just created).
+/// After `fork()`, close every inherited fd `>= 3` except `keep` (pass `-1` to keep none). A
+/// long-lived helper child (a `-p` forwarder, a health-checker) must shed the parent's fds — most
+/// importantly a detached box's readiness-pipe write end, whose lingering copy would stop the
+/// launcher from ever seeing EOF and hang `kern box -d`.
+///
+/// One `close_range(2)` syscall replaces the old ~1021-iteration `close()` loop; to preserve `keep`
+/// we close the two ranges around it. Falls back to the per-fd loop on a kernel without close_range
+/// (< 5.9 → ENOSYS). Best-effort throughout: closing an unopened fd is a harmless EBADF.
 pub fn shed_inherited_fds(keep: i32) {
-    for fd in 3..1024 {
-        if fd != keep {
-            unsafe { libc::close(fd) };
+    let close_range = |lo: u32, hi: u32| -> i64 {
+        unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                lo as libc::c_uint,
+                hi as libc::c_uint,
+                0,
+            )
+        }
+    };
+    const HI: u32 = u32::MAX; // "up to the highest fd"
+    let ok = if keep < 3 {
+        close_range(3, HI) == 0
+    } else {
+        let k = keep as u32;
+        close_range(3, k - 1) == 0 && close_range(k + 1, HI) == 0
+    };
+    if !ok {
+        for fd in 3..1024 {
+            if fd != keep {
+                unsafe { libc::close(fd) };
+            }
         }
     }
 }
