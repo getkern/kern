@@ -64,6 +64,12 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   user's UID/GID (e.g. `1000`), so a pulled image had host-UID-owned files. Now normalized to `0:0`
   with `--owner=0 --group=0`, matching real Docker layers. Verified: push → pull-back yields
   root-owned files and stays `docker pull`-compatible.
+- **compose `healthcheck.timeout` / `start_period` durations** — these map to `--health-{timeout,
+  start-period}`, which take integer **seconds**, but Docker writes them as durations (`30s`, `1m30s`,
+  `0s`). The raw string was forwarded verbatim, so a standard `timeout: 30s` aborted the box
+  (`usage: --health-start-period <seconds>`). They now convert through the same `parse_duration_secs`
+  as `interval`; `start_period: 0s` (no grace) correctly reaches the box as `0`. (Found by an extreme
+  vs-Docker test.)
 
 ### Changed
 - `kern_common::toml_lite::strip_comment` is now **escape-aware** (a `\"` no longer closes a string,
