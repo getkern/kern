@@ -180,13 +180,16 @@ fn pack_layer(
     work: &Path,
 ) -> Result<(std::path::PathBuf, String, String, u64), OciError> {
     let tar_path = work.join("layer.tar");
-    // Deterministic-ish, ownership-neutralized tar of the rootfs contents (`.`), like an image layer.
-    // `--numeric-owner` + no xattrs keeps it portable; we don't need reproducibility here, only a
-    // valid layer. Fail loudly if tar errors.
+    // Tar the rootfs contents (`.`) as an image layer, NORMALIZING ownership to root (0:0). The rootfs
+    // on disk is owned by the invoking (unprivileged) user; without `--owner=0 --group=0` every file in
+    // the pushed layer would carry that host UID/GID (e.g. 1000), which surprises anyone who then pulls
+    // and runs the image — real Docker layers are root-owned. `--numeric-owner` keeps it portable (no
+    // /etc/passwd name resolution). We don't need bit-for-bit reproducibility, only a valid, sane layer.
+    // Fail loudly if tar errors.
     let ok = Command::new("tar")
         .args(["-C"])
         .arg(rootfs)
-        .args(["--numeric-owner", "-cf"])
+        .args(["--numeric-owner", "--owner=0", "--group=0", "-cf"])
         .arg(&tar_path)
         .arg(".")
         .status()
