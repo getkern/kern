@@ -386,11 +386,14 @@ The whole mount sequence flows through a **typestate** (`Rootfs<Mounted> → Old
 ReadOnly`): the read-only remount is only reachable *after* the pivot, so getting the order wrong
 is a compile error. The same sequence drives `--plan`, which prints it without privileges.
 
-OCI images are pulled with `curl` + GNU `tar` (registry v2, `WWW-Authenticate` challenge auth for
-any registry, multi-arch selection), each blob **sha256-verified**, each layer vetted (absolute /
-`..` paths, device nodes, a decompression-bomb cap) and merged from isolated staging with no-follow
-semantics — so a hostile image can't escape extraction. Every request is TLS-pinned
-(`--proto =https`, https-only redirects); credentials travel to `curl` off-argv.
+OCI images are pulled with `curl` + `tar` (registry v2, `WWW-Authenticate` challenge auth for any
+registry, multi-arch selection), each blob **sha256-verified**, and each layer **vetted in-process
+from its raw tar headers** (absolute / `..` paths, device nodes, escaping hardlink/symlink targets,
+decompression- and inode-bomb caps) before it extracts into isolated staging and merges with
+no-follow semantics — the extraction escape classes are closed by *parsing* the layer, not by
+trusting the host tar's version or text output, so the guarantee holds on GNU tar and on an edge
+board's BusyBox tar alike. Every request is TLS-pinned (`--proto =https`, https-only redirects);
+credentials travel to `curl` off-argv.
 
 ## Performance
 

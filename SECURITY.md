@@ -25,6 +25,15 @@ profile. You'll get an acknowledgement and a coordinated-disclosure timeline.
   only on AMD/Intel via the `dmem` cgroup controller. Do not treat the GPU cap as a security
   boundary or a multi-tenant billing mechanism on consumer NVIDIA.
 
+**A caveat we state plainly — an unprivileged user namespace is itself kernel attack surface.**
+kern's isolation is *built on* an unprivileged user namespace, and userns has historically been a
+fertile source of kernel privilege-escalation CVEs. Running untrusted code in a box hands that code
+the in-kernel namespace/userns surface to probe. A kernel LPE is out of scope above (kern is not a
+hypervisor) — but be honest about the exposure: where you must assume the workload is *actively
+hostile* **and** the kernel may be behind on patches, put a microVM (a real hardware-virtualization
+boundary) between it and you (see below). kern's sweet spot is your own or semi-trusted code, where
+that surface is an accepted, patched risk — not an adversary's playground.
+
 ## kern vs a microVM — when to use what
 
 kern isolates with Linux **namespaces + seccomp + a read-only pivot**: microsecond-to-millisecond
@@ -148,8 +157,14 @@ Opt-in flags that **relax** isolation (off by default — you ask for them):
 OCI pull (`kern pull` / `--image`):
 - **Integrity**: each blob is verified to hash to its `sha256:` digest (via `sha256sum`) before
   use — defends against a compromised/MITM registry and corrupt downloads, beyond TLS.
-- **Layer vetting**: absolute paths, `..` traversal, device nodes, hardlink targets that escape
-  the rootfs, and a 2 GiB decompression-bomb cap are all rejected before anything is written.
+- **Layer vetting (in-process, host-tar-independent)**: absolute / `..` paths, device nodes,
+  hardlink targets that escape the rootfs, escaping symlink targets (on a non-GNU tar), a 2 GiB
+  decompression-bomb cap and an entry-count (inode-bomb) cap are all rejected before anything is
+  written. The decision is read from the **raw tar headers in-process** (fixed-offset
+  name/prefix/linkname/typeflag, resolving ustar prefix + GNU long-name/link + PAX), with `gzip -dc`
+  doing only the decompression — **not** by parsing `tar -tv`'s locale-dependent, delimiter-desyncable
+  text. So the guarantee holds identically on GNU tar and on a BusyBox/edge tar. The parser is bounded
+  and fuzzed.
 - **Isolated-staging, no-follow merge**: each layer extracts into a fresh staging dir, then
   merges into the rootfs refusing to traverse any symlink — the cross-layer escape class is
   closed structurally (not by trusting tar). The guard is a lexical check, which is sound here
@@ -328,8 +343,11 @@ box access, not a hardened bastion — grant it only to workloads you'd trust wi
 
 - Zero vendor-binary modification; the GPU shim uses only the public driver API and is
   disable-able with `--no-gpu`.
-- GNU tar >= 1.27 enforced for layer extraction; tar layers validated before extraction
-  (no `..`, no absolute paths, size caps); escaping symlinks sanitized.
+- Layer contents are vetted **in-process from the raw tar headers** before extraction (no `..`/
+  absolute paths, no device nodes, no escaping hardlink targets, size + entry-count caps) — the
+  security decision does not depend on the host `tar`'s version or text output, so it is sound on GNU
+  and BusyBox alike; the parser is fuzzed. Extraction itself still runs the host `tar` into an
+  isolated staging dir, then a no-follow merge.
 - Always-on seccomp blocks the dangerous syscall set regardless of flags.
 
 ## Supported versions
