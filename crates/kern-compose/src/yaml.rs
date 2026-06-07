@@ -789,7 +789,7 @@ fn service_to_box(
             "hostname" => b.hostname = node.scalar.as_deref().map(scalar_str),
             "cap_add" => b.cap_add = list_value(node),
             "cap_drop" => b.cap_drop = list_value(node),
-            "tmpfs" => b.tmpfs = list_value(node),
+            "tmpfs" => b.tmpfs = tmpfs_value(node, name),
             "read_only" => b.read_only = scalar_is_true(node),
             // `privileged: true` has no kern equivalent (rootless by design) — warn, don't silently
             // pretend. The box runs UNprivileged; a workload needing real privilege will notice.
@@ -968,7 +968,40 @@ fn split_at_comment(line: &str) -> (&str, &str) {
 /// Interpolate `${VAR}`/`${VAR:-default}`/`$$` in a single comment-free fragment. Slices are at
 /// `${`/`}`/`$$` ASCII offsets, so multibyte values in the document are never sliced mid-char.
 fn interpolate_fragment(text: &str) -> String {
+    interpolate_depth(text, 0)
+}
+
+/// Max nesting depth for `${A:-${B:-…}}` — a hard cap so an adversarial input can't drive unbounded
+/// recursion. Real nesting is 1-2 deep; anything past this leaves the inner `${…}` un-substituted.
+const MAX_INTERP_DEPTH: usize = 16;
+
+/// The balanced-`}` index for a `${…}` body (the `inner` slice starts right after `${`). Counts nested
+/// `${` so `${A:-${B}}` closes at the OUTER `}`, not the first. Returns `None` if unbalanced.
+fn matching_brace_end(inner: &str) -> Option<usize> {
+    let bytes = inner.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'}' if depth == 0 => return Some(i),
+            b'}' => depth -= 1,
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+                depth += 1;
+                i += 1; // skip the '{'
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn interpolate_depth(text: &str, depth: usize) -> String {
     if !text.contains('$') {
+        return text.to_string();
+    }
+    if depth >= MAX_INTERP_DEPTH {
+        // Too deep — stop resolving and return the text as-is (bounded work, no leaked fragment).
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
@@ -988,7 +1021,7 @@ fn interpolate_fragment(text: &str) -> String {
             rest = after;
             continue;
         };
-        let Some(end) = inner.find('}') else {
+        let Some(end) = matching_brace_end(inner) else {
             // Unterminated `${` — leave it literal (the prescreen doesn't reject it here); a downstream
             // parse error will surface if it matters. Don't loop forever.
             out.push_str("${");
@@ -996,17 +1029,15 @@ fn interpolate_fragment(text: &str) -> String {
             continue;
         };
         let expr = &inner[..end];
-        // Nested/odd interpolation like `${A${B}}` (Docker doesn't support it either): the first `}`
-        // closes at `A${B`, which would substitute empty and leak a stray `}` downstream. If the expr
-        // contains a `$` or `{`, pass the WHOLE `${expr}` through verbatim — never emit a fragment.
-        if expr.contains('$') || expr.contains('{') {
-            out.push_str("${");
-            out.push_str(expr);
-            out.push('}');
-            rest = &inner[end + 1..];
-            continue;
-        }
-        out.push_str(&interpolate_expr(expr));
+        // Nested interpolation `${A:-${B:-c}}` (Docker supports it): resolve any inner `${…}` in the
+        // expression FIRST (bounded recursion, depth-capped), then evaluate the outer expression on the
+        // resolved text. `matching_brace_end` found the BALANCED `}`, so `expr` holds the whole inner.
+        let resolved = if expr.contains("${") {
+            interpolate_depth(expr, depth + 1)
+        } else {
+            expr.to_string()
+        };
+        out.push_str(&interpolate_expr(&resolved));
         rest = &inner[end + 1..];
     }
     out.push_str(rest);
@@ -1199,6 +1230,43 @@ fn reconstruct_port_item(item: &str, svc: &str) -> String {
         spec.push_str(&proto);
     }
     spec
+}
+
+/// `tmpfs`: kern's `--tmpfs` grammar is `PATH[:size]`, but Docker allows a comma-separated option list
+/// `PATH:size=10M,mode=1770,uid=1000`. We keep the `size=` option (kern supports a size cap) and
+/// DROP the rest with a warning, rather than forwarding the whole option string to `--tmpfs` (which
+/// rejected it → the whole service failed to start). A plain `PATH` or `PATH:64m` passes through.
+fn tmpfs_value(node: &Node, svc: &str) -> Vec<String> {
+    list_value(node)
+        .into_iter()
+        .map(|entry| {
+            let Some((path, opts)) = entry.split_once(':') else {
+                return entry; // bare `PATH`
+            };
+            // If `opts` isn't Docker option syntax (no `=`, e.g. a bare `64m`), keep it as the size.
+            if !opts.contains('=') {
+                return entry;
+            }
+            let mut size = None;
+            let mut dropped = Vec::new();
+            for opt in opts.split(',') {
+                match opt.split_once('=') {
+                    Some(("size", v)) => size = Some(v.to_string()),
+                    _ => dropped.push(opt.to_string()),
+                }
+            }
+            if !dropped.is_empty() {
+                warn(&format!(
+                    "service '{svc}': tmpfs '{path}' options {} not supported by kern --tmpfs (size only) — dropped",
+                    dropped.join(",")
+                ));
+            }
+            match size {
+                Some(s) => format!("{path}:{s}"),
+                None => path.to_string(),
+            }
+        })
+        .collect()
 }
 
 /// `volumes`: a short-form `src:dst[:ro]` entry passes through (kern's `-v` grammar matches compose's
@@ -1623,12 +1691,22 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_nested_brace_does_not_leak_a_literal() {
-        // Audit regression: `${A${B}}` must NOT substitute `A${B` and leave a stray `}` — the whole
-        // odd expression is passed through verbatim (Docker doesn't support nested interpolation).
-        assert_eq!(interpolate_document("x=${A${B}}"), "x=${A${B}}");
+    fn interpolation_nested_resolves_like_docker() {
+        std::env::remove_var("KERN_NX_A");
+        std::env::remove_var("KERN_NX_B");
+        // Nested default `${A:-${B:-c}}` resolves the inner first, then the outer (Docker parity).
+        assert_eq!(
+            interpolate_document("x=${KERN_NX_A:-${KERN_NX_B:-deep}}"),
+            "x=deep"
+        );
+        // `${A${B}}`: the inner `${B}` resolves (unset -> empty), leaving `${A}` -> empty. No stray `}`
+        // leaks (the balanced-brace scan closes at the OUTER `}`).
+        assert_eq!(interpolate_document("x=${A${B}}"), "x=");
         // A normal `${VAR:-def}` still works.
         assert_eq!(interpolate_document("x=${UNSET_XYZ_KERN:-def}"), "x=def");
+        // Adversarial deep nesting terminates (depth cap), never hangs.
+        let deep = "${".repeat(100) + "X" + &"}".repeat(100);
+        let _ = interpolate_document(&deep);
     }
 
     #[test]
@@ -1802,6 +1880,30 @@ mod tests {
         let y4 =
             "services:\n  a:\n    image: x\n    volumes:\n      - {type: tmpfs, target: /tmp}\n";
         assert!(boxes(y4)[0].volumes.is_empty());
+    }
+
+    #[test]
+    fn tmpfs_options_keep_size_drop_the_rest() {
+        // Extreme vs-Docker regression: Docker's `- /scratch:size=10M,mode=1770,uid=1000` option list
+        // was passed whole to `--tmpfs`, which took the entire `size=10M,mode=...` as the size and
+        // aborted the box. Now we keep `size=` and drop the rest with a warning.
+        let y = "services:\n  a:\n    image: x\n    tmpfs:\n      - /scratch:size=10M,mode=1770,uid=1000\n";
+        assert_eq!(boxes(y)[0].tmpfs, ["/scratch:10M"]);
+        // A bare path passes through.
+        assert_eq!(
+            boxes("services:\n  a:\n    image: x\n    tmpfs: /run\n")[0].tmpfs,
+            ["/run"]
+        );
+        // The kern-native `PATH:64m` (size without `key=`) is untouched.
+        assert_eq!(
+            boxes("services:\n  a:\n    image: x\n    tmpfs:\n      - /t:64m\n")[0].tmpfs,
+            ["/t:64m"]
+        );
+        // Options with NO size → just the path.
+        assert_eq!(
+            boxes("services:\n  a:\n    image: x\n    tmpfs:\n      - /t:mode=1777\n")[0].tmpfs,
+            ["/t"]
+        );
     }
 
     #[test]
