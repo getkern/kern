@@ -882,14 +882,26 @@ fn command_argv(node: &Node) -> (Vec<String>, bool) {
     (Vec::new(), false)
 }
 
-/// A `K=v` collection written in either compose shape — a list of `- K=v` (or bare `- KEY`, passed
-/// through like Docker) and/or a map of `K: v` — flattened to `["K=v", …]`. Shared by `environment`
-/// and `build.args`, which have the identical YAML shape, so the two can't drift. `${VAR}` is already
-/// substituted document-wide (see `interpolate_document`), so values are used verbatim here.
+/// A `K=v` collection written in either compose shape — a list of `- K=v` and/or a map of `K: v` —
+/// flattened to `["K=v", …]`. Shared by `environment` and `build.args`, which have the identical YAML
+/// shape, so the two can't drift. `${VAR}` is already substituted document-wide (see
+/// `interpolate_document`), so values are used verbatim here.
+///
+/// A list item with NO `=` (`- API_KEY`) is Docker's **host pass-through**: the value is taken from the
+/// host environment. If the host has it, we emit `API_KEY=<host value>`; if not, we OMIT it (Docker
+/// does too). Passing the bare `API_KEY` straight through was a bug — the box's `--env K=V` parser
+/// rejected it and the whole service failed to start.
 fn kv_pairs(node: &Node) -> Vec<String> {
     let mut out = Vec::new();
     for it in &node.items {
-        out.push(scalar_str(it));
+        let entry = scalar_str(it);
+        if entry.contains('=') {
+            out.push(entry);
+        } else if let Ok(val) = std::env::var(&entry) {
+            // bare `- KEY` present in the host env → pass its value through.
+            out.push(format!("{entry}={val}"));
+        }
+        // bare `- KEY` absent from the host env → omit (Docker semantics).
     }
     for (k, v) in &node.children {
         let raw = v.scalar.as_deref().map(scalar_str).unwrap_or_default();
@@ -1702,6 +1714,25 @@ mod tests {
         let y2 = "services:\n  db:\n    image: r\n    healthcheck:\n      test: [\"CMD\",\"true\"]\n  app:\n    image: a\n    depends_on: {db: {condition: service_healthy}}\n";
         let app = boxes(y2).into_iter().find(|b| b.name == "app").unwrap();
         assert_eq!(app.depends_healthy, ["db"]);
+    }
+
+    #[test]
+    fn env_list_form_host_passthrough() {
+        // Extreme vs-Docker regression: a list-form env with a bare `- KEY` (no `=`) is Docker's host
+        // pass-through. Passing the bare `KEY` to `--env K=V` aborted the whole box. Now: present in
+        // the host → `KEY=<value>`; absent → omitted (never a malformed `--env`).
+        std::env::set_var("KERN_T_PASS", "host_val");
+        std::env::remove_var("KERN_T_ABSENT");
+        let y = "services:\n  a:\n    image: x\n    environment:\n      - PLAIN=v\n      - EQ=a=b=c\n      - KERN_T_PASS\n      - KERN_T_ABSENT\n";
+        let env = &boxes(y)[0].env;
+        assert!(env.contains(&"PLAIN=v".to_string()), "{env:?}");
+        assert!(env.contains(&"EQ=a=b=c".to_string()), "{env:?}"); // only the FIRST `=` splits K/V
+        assert!(env.contains(&"KERN_T_PASS=host_val".to_string()), "{env:?}");
+        assert!(
+            !env.iter().any(|e| e.starts_with("KERN_T_ABSENT")),
+            "absent passthrough must be omitted, not a bare/malformed entry: {env:?}"
+        );
+        std::env::remove_var("KERN_T_PASS");
     }
 
     #[test]
