@@ -289,35 +289,47 @@ fn value_after_colon(line: &str) -> Option<&str> {
     colon_index(line).map(|i| &line[i + 1..])
 }
 
-/// True if `line` contains a YAML anchor (`&x`) or alias (`*x`) as a TOKEN inside an inline collection
-/// — i.e. a `&`/`*` (outside quotes) that opens a value: preceded, ignoring spaces, by `[`, `{`, `,` or
-/// `:`. Catches `[*x]`, `[a, *x]`, `{k: *x}`, `{k: &a v}`. A `*`/`&` used as normal text (e.g. inside a
-/// quoted string, or a `2*2` arithmetic value) is NOT flagged: it must sit at a token boundary. This is
-/// the billion-laughs / silent-mis-conversion guard for the inline forms the two positional checks miss.
+/// True if `line` contains a YAML anchor (`&x`) or alias (`*x`) as a structural TOKEN (`[*x]`,
+/// `[a, *x]`, `{k: *x}`, `{&a k: v}`) — as opposed to a `&`/`*` that is ordinary scalar text
+/// (`my*repo`, `2*2`, `a&b`, or anything inside quotes).
+///
+/// Closed BY CONSTRUCTION, not by enumerating openers. A `&`/`*` outside quotes starts a token — and
+/// is therefore an anchor/alias — iff it is NOT preceded (ignoring spaces) by *scalar content*. The
+/// complement is the whole trick: if the previous significant byte is scalar content (alphanumeric or
+/// the plain-scalar punctuation `_ - . / %% @ + ~`), the `&`/`*` is part of a value; otherwise it opens
+/// one — after a separator/opener (`[ { , :`), a `-` list marker, at line start, whatever. Defining
+/// "starts a token" (rather than listing the openers that can precede one) means any present-or-future
+/// flow separator is covered, and the fuzz can PROVE completeness (no unflagged token-opening `&`/`*`)
+/// instead of trusting a hand-kept opener list — the same move as `IpAddr::is_loopback()` for the push
+/// loopback check: a canonical definition, not a maintained enumeration.
 fn line_has_inline_anchor(line: &str) -> bool {
+    fn is_scalar_content(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(b, b'_' | b'-' | b'.' | b'/' | b'%' | b'@' | b'+' | b'~')
+    }
     let mut q = 0u8; // active quote char, else 0
-    let mut prev_significant = b'\0'; // last non-space byte outside quotes
-    let bytes = line.as_bytes();
-    for &c in bytes {
+    let mut prev_content = false; // was the last non-space significant byte scalar content?
+    for &c in line.as_bytes() {
         if q != 0 {
             if c == q {
                 q = 0;
+                prev_content = false; // a closing quote ends a scalar; the quote is not content
             }
             continue;
         }
         match c {
             b'"' | b'\'' => {
                 q = c;
-                prev_significant = c;
+                prev_content = false; // an opening quote starts a NEW scalar, not a continuation
             }
-            b' ' | b'\t' => {} // spaces don't reset the "opener" context
+            b' ' | b'\t' => {} // spaces don't change whether the last token was content
             b'&' | b'*' => {
-                if matches!(prev_significant, b'[' | b'{' | b',' | b':') {
-                    return true;
+                if !prev_content {
+                    return true; // token-opening & / * outside quotes → anchor/alias
                 }
-                prev_significant = c;
+                prev_content = true; // part of a scalar value (e.g. `a*b`)
             }
-            other => prev_significant = other,
+            other => prev_content = is_scalar_content(other),
         }
     }
     false
@@ -1695,18 +1707,108 @@ mod tests {
         assert!(
             parse("services:\n  a:\n    image: alpine\n    command:\n      - --version\n").is_ok()
         );
-        // Audit follow-up: an anchor/alias as a TOKEN inside an inline collection (`[*x]`, `{k: *x}`,
-        // `{k: &a v}`) must be refused too — the two positional checks only see line-start / after-`:`.
+        // An anchor/alias as a structural token must be refused in EVERY inline position — the two
+        // positional checks only see line-start / after-`:`. `line_has_inline_anchor` closes this by
+        // construction (a token-opening `&`/`*` outside quotes), not by an opener list, so a value
+        // (`[*x]`), a nested value (`{test: [*x]}`), AND a KEY (`{&a k: v}`) are all caught.
         assert!(parse("services:\n  a:\n    image: alpine\n    command: [*boom, x]\n").is_err());
         assert!(
             parse("services:\n  a:\n    image: alpine\n    healthcheck: {test: *boom}\n").is_err()
         );
         assert!(parse("services:\n  a:\n    image: alpine\n    environment: {K: &a v}\n").is_err());
-        // No FALSE POSITIVES: a `*`/`&` as ordinary text (a glob, arithmetic, inside quotes, or in a
-        // repo name) is NOT a token-opening anchor and must still parse.
+        // Anchor as a MAP KEY, and alias NESTED inside a `{…}`-wrapped `[…]` — the cases an opener
+        // list ("preceded by `[{,:`") had to reason about; the token-start definition covers them.
+        assert!(parse("services:\n  a:\n    image: x\n    environment: {&a k: v}\n").is_err());
+        assert!(parse("services:\n  a:\n    image: x\n    healthcheck: {test: [*a]}\n").is_err());
+        // No FALSE POSITIVES: a `*`/`&` preceded by scalar content (a glob, arithmetic, an `&` in a
+        // value, or anything inside quotes) is NOT a token-opening anchor and must still parse.
         assert!(parse("services:\n  a:\n    image: my*repo/x\n").is_ok());
         assert!(parse("services:\n  a:\n    image: x\n    command: [\"echo\", \"2*2\"]\n").is_ok());
         assert!(parse("services:\n  a:\n    image: x\n    environment: {K: \"v*v\"}\n").is_ok());
+        assert!(
+            parse("services:\n  a:\n    image: x\n    environment: {URL: \"a&b=c\"}\n").is_ok()
+        );
+    }
+
+    #[test]
+    fn inline_anchor_detection_matches_an_independent_oracle() {
+        // Completeness PROOF (not enumeration): generate lines with `&`/`*` in every position among a
+        // small alphabet, and check `line_has_inline_anchor` against an INDEPENDENT oracle written a
+        // different way — a right-to-left scan that, for each unquoted `&`/`*`, walks back over spaces
+        // and asks "is the previous significant char scalar content?". If the two ever disagree, either
+        // the guard misses a token-opening anchor (a hole) or over-flags a scalar (a false positive).
+        fn oracle(line: &str) -> bool {
+            let b = line.as_bytes();
+            // Mark which byte offsets are inside quotes (single OR double, no escapes in YAML flow).
+            let mut inq = vec![false; b.len()];
+            let (mut q, mut i) = (0u8, 0usize);
+            while i < b.len() {
+                if q != 0 {
+                    inq[i] = true; // the closing quote itself counts as "in quote" for this mark
+                    if b[i] == q {
+                        q = 0;
+                    }
+                } else if b[i] == b'"' || b[i] == b'\'' {
+                    q = b[i];
+                    inq[i] = true;
+                }
+                i += 1;
+            }
+            let is_content = |c: u8| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, b'_' | b'-' | b'.' | b'/' | b'%' | b'@' | b'+' | b'~')
+            };
+            for (idx, &c) in b.iter().enumerate() {
+                if (c == b'&' || c == b'*') && !inq[idx] {
+                    // Walk left over spaces to the previous significant, non-quoted byte. A `&`/`*` is
+                    // itself "already inside a value" if IT was preceded by content, so we treat a
+                    // preceding `&`/`*` as content too (skip past it and keep looking) — a `b&*` run is
+                    // one plain scalar, not two anchors. This mirrors the guard's forward `prev_content`
+                    // latch; writing the walk L→R-independently (here R→L) is what makes it a check.
+                    let mut j = idx;
+                    let prev_is_content = loop {
+                        if j == 0 {
+                            break false; // line start → opens a token
+                        }
+                        j -= 1;
+                        if b[j] == b' ' || b[j] == b'\t' {
+                            continue;
+                        }
+                        if inq[j] && (b[j] == b'"' || b[j] == b'\'') {
+                            break false; // a quote is a scalar boundary, not content
+                        }
+                        if b[j] == b'&' || b[j] == b'*' {
+                            continue; // part of the same scalar run — keep walking back
+                        }
+                        break !inq[j] && is_content(b[j]);
+                    };
+                    if !prev_is_content {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        let alphabet: [u8; 14] = *b"&* \t[]{}:,\"'ab";
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_1234;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..50_000 {
+            let len = next() % 14;
+            let mut line = String::new();
+            for _ in 0..len {
+                line.push(alphabet[next() % alphabet.len()] as char);
+            }
+            assert_eq!(
+                line_has_inline_anchor(&line),
+                oracle(&line),
+                "guard vs oracle disagree on {line:?}"
+            );
+        }
     }
 
     #[test]

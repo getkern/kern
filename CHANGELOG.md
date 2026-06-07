@@ -31,8 +31,10 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   rather than silently mis-converting. Structural YAML we don't support (anchors/aliases →
   billion-laughs, tab indent, block scalars, multi-doc, tags) is **refused up front** with a precise
   line.
-- **`kern push`** — publish a local rootfs + image config to an OCI registry v2 (schema-2 manifest),
-  `docker pull`-compatible. WRITE-scoped auth via `kern login`; all requests HTTPS-pinned.
+- **`kern push`** — publish a cached image (rootfs + config) to an OCI registry v2 (schema-2
+  manifest), `docker pull`-compatible. WRITE-scoped auth via `kern login`; all requests HTTPS-pinned.
+  Verified end-to-end against a local `registry:2`: push → pull-back reproduces an identical rootfs
+  (byte-for-byte file set) that boots a box.
 - **`kern-compose` crate** — the compose parser is now its own CLI-free library crate, **fuzzed in
   isolation** (`fuzz/compose_yaml`, property: parse never panics + a parse is always
   topo-orderable-or-cycle). `toml_lite` (the shared quoted-string/bool/array/comment scanners) moved
@@ -47,9 +49,11 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
 - **compose parser panic-hardening** — an untrusted `healthcheck.interval` with a huge digit-run
   (`6000000000000000h`) no longer overflow-panics (debug) or wraps to a nonsense value (release);
   `parse_duration_secs` uses checked arithmetic and falls back to the box default. An anchor/alias is
-  now refused in **every** position — value (`k: *a`), **list-item** (`- *a`), and **inline collection**
-  (`[*a]`, `{k: *a}`) — where it previously reached the box as the literal `*a`. `${A${B}}` no longer
-  leaks a stray `}`, and `${VAR}` inside a comment no longer raises a spurious unset-var warning.
+  now refused in **every** position — value (`k: *a`), list-item (`- *a`), inline collection (`[*a]`,
+  `{k: *a}`), and inline **map key** (`{&a k: v}`) — where it previously reached the box as the literal
+  `*a`. The guard is defined by construction (a `&`/`*` that starts a token outside quotes, not a
+  hand-kept opener list) and a 50k-case property test proves it against an independent oracle. `${A${B}}`
+  no longer leaks a stray `}`, and `${VAR}` inside a comment no longer raises a spurious unset-var warning.
 
 ### Fixed
 - **compose `entrypoint` + `command` composition** — a **shell-form** entrypoint (`entrypoint: /x`)
