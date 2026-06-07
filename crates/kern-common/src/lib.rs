@@ -75,6 +75,22 @@ pub fn parse_binary_size(s: &str) -> Option<u64> {
         .filter(|b| *b > 0)
 }
 
+/// The shared rule for a kern resource name — volume, secret, pod, profile/vdisk. Each becomes a
+/// filesystem path component and/or a `kind:name` attach token, so: non-empty, ≤64 bytes, charset
+/// `[A-Za-z0-9_.-]`, no `..` substring (path escape), no leading `-` (argument injection) or `.`
+/// (dotfiles / `.`/`..`). One definition so the four callers can't drift into subtly different rules
+/// (a name valid for a pod but not a volume, etc.). Callers layer their own error message / type.
+pub fn valid_resource_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.contains("..")
+        && !name.starts_with('-')
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
 /// Format a byte count for display with binary units: an exact multiple prints as an integer
 /// (`512M`, `2G`), otherwise one decimal (`1.5G`), and anything below 1 KiB as `N B` (so `0` reads
 /// `0 B`, not `0K`). One convention for the box banner, `ps`/`stats`, `top` and volume sizes, so the

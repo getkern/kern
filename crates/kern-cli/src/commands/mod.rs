@@ -1373,91 +1373,74 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
     // symlink there (e.g. `/etc/resolv.conf -> ../../host/file`) would make it clobber a file
     // *outside* the rootfs. A bind-mode box uses whatever `/etc/resolv.conf` its rootfs already
     // ships (`--net` still gives outbound networking; add a resolv.conf to the rootfs if needed).
-    if b.bind_rootfs {
-        let spec = SandboxSpec {
-            root: b.lower,
-            mode: MountMode::Bind,
-            overlay: None,
-            read_only: b.read_only,
-            command: b.cmd,
-            hostname,
-            volumes: b.volumes,
-            env: b.env,
-            workdir: b.workdir,
-            share_net: b.share_net,
-            pod_holder: b.pod_holder,
-            uid_range: b.uid_range,
-            memory_max: b.memory,
-            memory_swap_max: b.memory_swap_max,
-            cpuset: b.cpuset,
-            cpus: b.cpus,
-            tty_slave: None,
-            vgpio_devs: b.vgpio_devs,
-            vgpio_sysfs: b.vgpio_sysfs,
-            vdisks: b.vdisks,
-            secrets: b.secrets,
-            ssh: b.ssh,
-            tun: b.tun,
-            tmpfs: b.tmpfs,
-            run_as: b.run_as,
-            pids_max: b.pids_max,
-            caps: b.caps,
-            io_max: b.io_max,
-            io_weight: b.io_weight,
+    // The rootfs strategy is the ONLY thing that differs between bind and overlay: pick
+    // `(root, mode, overlay, cleanup)` here, then build the one shared SandboxSpec below (its ~27
+    // other fields were duplicated field-for-field in both branches — a silent-drift hazard).
+    let (root, mode, overlay, eph): (String, MountMode, Option<OverlayDirs>, Option<PathBuf>) = if b
+        .bind_rootfs
+    {
+        (b.lower, MountMode::Bind, None, None)
+    } else {
+        // The writable overlay upper. Normally an ephemeral scratch (discarded on exit). For a `kern
+        // build` RUN step (`overlay_upper` set) the UPPER persists in the build tree so successive RUN/
+        // COPY steps accumulate into it (the "diff" layer). overlayfs requires upperdir and workdir to be
+        // on the SAME filesystem, so in build mode BOTH live under the build tree (work is cleared each
+        // step — overlay wants a fresh workdir); only `merged` (a bare mountpoint) stays ephemeral.
+        let eph = scratch_dir().join(format!("{}-{}", b.name.as_str(), std::process::id()));
+        let merged = eph.join("merged");
+        let (upper, work) = match &b.overlay_upper {
+            Some(dir) => {
+                let root = PathBuf::from(dir);
+                let w = root.join("work");
+                let _ = std::fs::remove_dir_all(&w); // fresh workdir per RUN (overlay requirement)
+                (build_upper_dir(&root), w)
+            }
+            None => (eph.join("upper"), eph.join("work")),
         };
-        return Ok((spec, None));
-    }
-
-    // The writable overlay upper. Normally an ephemeral scratch (discarded on exit). For a `kern
-    // build` RUN step (`overlay_upper` set) the UPPER persists in the build tree so successive RUN/
-    // COPY steps accumulate into it (the "diff" layer). overlayfs requires upperdir and workdir to be
-    // on the SAME filesystem, so in build mode BOTH live under the build tree (work is cleared each
-    // step — overlay wants a fresh workdir); only `merged` (a bare mountpoint) stays ephemeral.
-    let eph = scratch_dir().join(format!("{}-{}", b.name.as_str(), std::process::id()));
-    let merged = eph.join("merged");
-    let (upper, work) = match &b.overlay_upper {
-        Some(dir) => {
-            let root = PathBuf::from(dir);
-            let w = root.join("work");
-            let _ = std::fs::remove_dir_all(&w); // fresh workdir per RUN (overlay requirement)
-            (build_upper_dir(&root), w)
+        own_only_dir(&upper).map_err(|e| Error::Sandbox(format!("overlay upper: {e}")))?;
+        // overlayfs presents the merged root's mode as the UPPER dir's mode. The upper is 0700 (own-only)
+        // by default, which makes the box's `/` un-traversable by a dropped, cap-less `--user` uid → any
+        // exec fails EACCES. A non-root `--user` therefore needs a normal, world-traversable `/` (0755,
+        // exactly like a real root fs). This stays private on the HOST — the 0700 parent scratch dir
+        // still blocks other users — so it only affects the in-box view.
+        if matches!(b.run_as, Some((u, _)) if u != 0) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| Error::Sandbox(format!("overlay upper perms: {e}")))?;
         }
-        None => (eph.join("upper"), eph.join("work")),
-    };
-    own_only_dir(&upper).map_err(|e| Error::Sandbox(format!("overlay upper: {e}")))?;
-    // overlayfs presents the merged root's mode as the UPPER dir's mode. The upper is 0700 (own-only)
-    // by default, which makes the box's `/` un-traversable by a dropped, cap-less `--user` uid → any
-    // exec fails EACCES. A non-root `--user` therefore needs a normal, world-traversable `/` (0755,
-    // exactly like a real root fs). This stays private on the HOST — the 0700 parent scratch dir
-    // still blocks other users — so it only affects the in-box view.
-    if matches!(b.run_as, Some((u, _)) if u != 0) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| Error::Sandbox(format!("overlay upper perms: {e}")))?;
-    }
-    for d in [&work, &merged] {
-        std::fs::create_dir_all(d).map_err(|e| Error::Sandbox(format!("scratch dir: {e}")))?;
-    }
-    // With `--net` sharing the host network, copy the host's resolv.conf into the upper so DNS
-    // resolves inside the box. A private copy → the box can't touch the host's file, and it's
-    // removed with the scratch. (Best-effort: no host resolv.conf → IPs still work.)
-    if b.share_net {
-        if let Ok(conf) = std::fs::read("/etc/resolv.conf") {
-            let etc = upper.join("etc");
-            if std::fs::create_dir_all(&etc).is_ok() {
-                let _ = std::fs::write(etc.join("resolv.conf"), conf);
+        for d in [&work, &merged] {
+            std::fs::create_dir_all(d).map_err(|e| Error::Sandbox(format!("scratch dir: {e}")))?;
+        }
+        // With `--net` sharing the host network, copy the host's resolv.conf into the upper so DNS
+        // resolves inside the box. A private copy → the box can't touch the host's file, and it's
+        // removed with the scratch. (Best-effort: no host resolv.conf → IPs still work.)
+        if b.share_net {
+            if let Ok(conf) = std::fs::read("/etc/resolv.conf") {
+                let etc = upper.join("etc");
+                if std::fs::create_dir_all(&etc).is_ok() {
+                    let _ = std::fs::write(etc.join("resolv.conf"), conf);
+                }
             }
         }
-    }
+        (
+            merged.to_string_lossy().into_owned(),
+            MountMode::Overlay,
+            Some(OverlayDirs {
+                lower: b.lower,
+                upper: upper.to_string_lossy().into_owned(),
+                work: work.to_string_lossy().into_owned(),
+            }),
+            // Clean up work/merged (and, when the upper is ephemeral, the upper too) after the box
+            // exits; a build's persistent upper lives outside `eph`, owned by the build driver.
+            Some(eph),
+        )
+    };
+
     let spec = SandboxSpec {
-        root: merged.to_string_lossy().into_owned(),
-        mode: MountMode::Overlay,
-        overlay: Some(OverlayDirs {
-            lower: b.lower,
-            upper: upper.to_string_lossy().into_owned(),
-            work: work.to_string_lossy().into_owned(),
-        }),
-        read_only: b.read_only, // remount the overlay read-only after pivot
+        root,
+        mode,
+        overlay,
+        read_only: b.read_only,
         command: b.cmd,
         hostname,
         volumes: b.volumes,
@@ -1484,9 +1467,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         io_max: b.io_max,
         io_weight: b.io_weight,
     };
-    // Clean up work/merged (and, when the upper is ephemeral, the upper too) after the box exits; a
-    // build's persistent upper lives outside `eph` and is owned by the build driver.
-    Ok((spec, Some(eph)))
+    Ok((spec, eph))
 }
 
 /// Parse `-v src:dst[:ro]` specs into [`Volume`]s. Both paths must be absolute; the source must

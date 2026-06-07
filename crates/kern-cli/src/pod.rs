@@ -423,18 +423,15 @@ pub fn run_holder() -> ! {
 /// Pod names share the box-name charset (used as a directory + hostnames): `[A-Za-z0-9_.-]`, ≤64,
 /// no traversal. Rejects anything that could escape `pods/` or corrupt `/etc/hosts`.
 fn validate_name(name: &str) -> Result<(), Error> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
-        || name.starts_with('.')
-    {
-        return Err(Error::Sandbox(format!(
-            "invalid pod name '{name}' (use letters, digits, '_', '-', '.'; max 64)"
-        )));
+    // The shared [`kern_common::valid_resource_name`] rule (one definition for volumes/secrets/pods/
+    // profiles): also rejects a leading `-` and any `..` substring, which the old local rule missed.
+    if kern_common::valid_resource_name(name) {
+        Ok(())
+    } else {
+        Err(Error::Sandbox(format!(
+            "invalid pod name '{name}' (use letters, digits, '_', '-', '.'; no leading '-'/'.' or '..'; max 64)"
+        )))
     }
-    Ok(())
 }
 
 #[cfg(test)]
