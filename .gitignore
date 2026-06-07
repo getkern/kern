@@ -17,3 +17,6 @@
 /*-rootfs/
 /kern-final-prompt*
 /kern-review-packet*
+
+# Reviewer prompts / working notes — never in the repo
+/REVISORE-*.md
