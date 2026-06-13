@@ -7,6 +7,9 @@
 //! concrete data layer — physical disks read-only + named volumes you create). Host stats come straight
 //! from `/proc`. Pure `libc` termios + ANSI, no curses/ratatui dependency.
 //!
+//! A `?` from any tab opens a full-keymap help overlay (the footer always advertises it), so the whole
+//! interface is discoverable without docs.
+//!
 //! Interaction is a small [`Mode`] state machine — `Nav` plus three modals (`Overlay` read-only pane,
 //! `Form` input, `Confirm` for destructive actions). Profile edits are written **surgically** (see
 //! [`crate::toml_surgery`]) so a single edit never rewrites the whole file and drop the user's other
@@ -391,6 +394,12 @@ fn handle_nav(
             b'D' => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
             _ => {}
         }
+        return false;
+    }
+    // `?` opens the full-key help overlay from ANY tab — the discoverable safety net every good TUI
+    // has (htop/k9s/lazydocker). The footer always advertises `?` so a first-time user knows it exists.
+    if key[0] == b'?' {
+        *mode = Mode::Overlay(help_text());
         return false;
     }
     match key[0] {
@@ -1182,6 +1191,37 @@ fn render(
     s
 }
 
+/// The `?` help overlay: the complete keymap + what each tab is for, in plain language. Rendered in the
+/// read-only [`Mode::Overlay`] pane (any key closes it). First line is the bold title (see `text_pane`).
+fn help_text() -> String {
+    "kern top — keyboard help  (press any key to close)\n\
+     \n\
+     MOVE\n\
+       Tab / → / l      next tab            ← / h      previous tab\n\
+       1 2 3 4          jump to a tab       ↑ ↓ / j k  select a row\n\
+       q  or  Ctrl-C    quit\n\
+     \n\
+     TABS — what each one shows\n\
+       1 Overview   host CPU / RAM / load, and the totals across all boxes\n\
+       2 Boxes      every running box: MEM, CPU%, PIDS, HEALTH, PORTS\n\
+       3 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
+       4 Storage    physical disks (read-only) and your named volumes\n\
+     \n\
+     BOXES tab — act on the selected box\n\
+       s  stop        p  pause        u  unpause        k  kill\n\
+       Enter          view its logs (a box's own output)\n\
+     \n\
+     PROFILES tab\n\
+       n  new         e  edit         d  delete\n\
+     \n\
+     STORAGE tab\n\
+       n  new         e  edit         d  delete        Enter  details        p  prune unused\n\
+     \n\
+     HEALTH colors:  green = healthy   red = unhealthy   dim = starting or no check\n\
+     Destructive actions (delete / kill / prune) ask y / n first."
+        .to_string()
+}
+
 /// The per-tab footer hint bar in normal navigation.
 fn nav_footer(
     p: &Palette,
@@ -1191,13 +1231,16 @@ fn nav_footer(
     vols: &[crate::volume::VolInfo],
 ) -> String {
     let (d, z) = (p.d, p.z);
+    // Every footer ends with a permanent `[?] help` — a first-time user doesn't know `?` exists until
+    // it's shown, and `?` is where they find everything else. The hint to `?` is what discovers `?`.
+    let help = format!("   [{z}?{d}] help{z}");
     match tab {
         TAB_BOXES if !rows.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}p{d}]ause [{z}u{d}]npause [{z}k{d}]ill [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{z}"
+            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}p{d}]ause [{z}u{d}]npause [{z}k{d}]ill [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_PROFILES => {
             let edit = if profs.is_empty() { "" } else { " [e]dit [d]elete" };
-            format!("{d}[{z}↑↓{d}] select   [{z}n{d}]ew{edit}   [{z}Tab{d}] next   [{z}q{d}] quit{z}")
+            format!("{d}[{z}↑↓{d}] select   [{z}n{d}]ew{edit}   [{z}Tab{d}] next   [{z}q{d}] quit{help}")
         }
         TAB_STORAGE => {
             let ops = if vols.is_empty() {
@@ -1206,11 +1249,11 @@ fn nav_footer(
                 " [e]dit [d]elete [⏎]info"
             };
             format!(
-                "{d}[{z}↑↓{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}Tab{d}] next   [{z}q{d}] quit{z}"
+                "{d}[{z}↑↓{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
             )
         }
         _ => format!(
-            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}4{d}] jump{z}"
+            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}4{d}] jump{help}"
         ),
     }
 }
@@ -1654,6 +1697,44 @@ mod tests {
         let out2 = boxes_table(&plain(), &[row("db", false)], 10, 0);
         let dbrow = out2.lines().find(|l| l.contains("db")).unwrap();
         assert!(dbrow.contains('-'), "no-health/no-ports row shows a dash");
+    }
+
+    #[test]
+    fn question_mark_opens_help_and_footer_advertises_it() {
+        // `?` from any tab opens the help overlay (discoverable safety net).
+        let mut tab = TAB_BOXES;
+        let mut sel = 0;
+        let mut mode = Mode::Nav;
+        handle_nav(
+            b"?",
+            &mut tab,
+            &mut sel,
+            0,
+            &[],
+            &[],
+            &[],
+            &crate::config::KernConfig::default(),
+            &mut mode,
+        );
+        assert!(
+            matches!(mode, Mode::Overlay(_)),
+            "`?` must open the help overlay"
+        );
+        if let Mode::Overlay(t) = &mode {
+            assert!(t.contains("keyboard help"), "overlay is the help text");
+            assert!(
+                t.contains("Overview") && t.contains("Boxes"),
+                "help explains the tabs"
+            );
+        }
+        // Every footer advertises `?` so a first-time user knows it exists.
+        for t in [TAB_OVERVIEW, TAB_BOXES, TAB_PROFILES, TAB_STORAGE] {
+            let f = nav_footer(&plain(), t, &[row("x", false)], &[], &[]);
+            assert!(
+                f.contains("?] help"),
+                "footer for tab {t} must advertise [?] help"
+            );
+        }
     }
 
     #[test]
