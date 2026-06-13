@@ -414,9 +414,11 @@ pub fn remove(names: &[String]) -> Result<(), Error> {
     if names.is_empty() {
         return Err(Error::Usage("pod rm <name>..."));
     }
+    let mut missing = Vec::new();
     for name in names {
         let (existed, members) = teardown(name);
         if !existed {
+            missing.push(name.clone());
             eprintln!("kern: no pod named '{name}'");
             continue;
         }
@@ -424,6 +426,14 @@ pub fn remove(names: &[String]) -> Result<(), Error> {
         if members > 0 {
             println!("  ({members} member box(es) keep running until they exit; `kern stop` them)");
         }
+    }
+    // A `pod rm <name>` that removed NOTHING (every name was missing) must exit non-zero, so a script
+    // can tell the removal failed — parity with `config rm` / `volume rm` on an unknown name.
+    if missing.len() == names.len() {
+        return Err(Error::NotRunning(format!(
+            "no pod named '{}'",
+            missing.join("', '")
+        )));
     }
     Ok(())
 }
