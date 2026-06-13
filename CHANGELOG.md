@@ -68,6 +68,22 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   output) when the parser warned about it. All warnings now escape control chars to `\xNN`
   (centralized in `warn`, so every call is covered). Build-context and bind-source `../` traversal were
   already refused; service names that look like flags (`--privileged`) were already rejected.
+- **OCI: reject a tar link/dir header with a non-zero size (extractor-desync escape)** — a hostile
+  layer could set a false `size` on a symlink/hardlink/directory header (which carry no data). The
+  in-process vetter skipped `size` bytes trusting the lie, but a non-GNU `tar` (**BusyBox**, on the
+  musl/edge boards kern targets) reads those bytes as the NEXT header — so an escaping symlink
+  (`esc → /etc/shadow`) hidden in the "data" slipped past the escape guard and was extracted. The
+  vetter now rejects a non-zero size on typeflags `1`/`2`/`5`, so it and every extractor agree on where
+  each header ends. (**Critical**; found in a hacker-mode audit.)
+- **OCI push: don't send credentials to a same-parent-domain sibling auth realm** — the push
+  credential-leak fix covered the blob-upload redirect but not the auth challenge: `realm_host_trusted`
+  trusted **any** subdomain of the registry's parent domain, so on shared hosting a hostile
+  `registry.acme.com` could point its token realm at an attacker-controlled `attacker.acme.com` and
+  harvest the long-lived write password. Trust is now the exact host or a **hardcoded** known
+  registry↔auth pair (Docker Hub) — never a generic parent-domain rule. (**High**.)
+- **cpuset huge-range memory-exhaustion DoS** — `cpuset: 0-999999999` (accepted by the format check)
+  expanded to a ~8 GB `Vec` before the per-index bound ran. The range is now clamped to `CPU_SETSIZE`
+  before expansion. (**High**.)
 - **compose parser panic-hardening** — an untrusted `healthcheck.interval` with a huge digit-run
   (`6000000000000000h`) no longer overflow-panics (debug) or wraps to a nonsense value (release);
   `parse_duration_secs` uses checked arithmetic and falls back to the box default. An anchor/alias is
