@@ -304,6 +304,26 @@ const REJECT_MEMORY_SWAP: &str =
 pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
     let opts = GlobalOpts;
     let rest: Vec<&str> = args.iter().map(String::as_str).collect();
+    // `kern <cmd> --help` / `-h` / `help` anywhere in the args → show the full reference, instead of
+    // letting the per-command parser reject `--help` as an "unknown flag" (a bad first impression: the
+    // universal `<tool> <cmd> --help` habit must not error). The bare/first-arg forms are handled below;
+    // this catches the second-and-later positions for every command. `--` ends option scanning so a
+    // `-- --help` inside a box/run command is NOT treated as a help request.
+    if rest.len() > 1 {
+        let mut saw_help = false;
+        for a in &rest[1..] {
+            if *a == "--" {
+                break;
+            }
+            if matches!(*a, "--help" | "-h") {
+                saw_help = true;
+                break;
+            }
+        }
+        if saw_help {
+            return Ok((opts, Command::Help));
+        }
+    }
     let cmd = match rest.first().copied() {
         // Bare `kern` → the short banner; `--help`/`-h`/`help` → the full command reference.
         None => Command::Banner,
@@ -1550,6 +1570,33 @@ mod tests {
         assert_eq!(parse(&["help".into()]).unwrap().1, Command::Help);
         // Bare `kern` → the short banner, not the full help.
         assert_eq!(parse(&[]).unwrap().1, Command::Banner);
+        // `kern <cmd> --help` / `-h` (any command, any position before `--`) → the full reference,
+        // NOT an "unknown flag" error. This is the universal `<tool> <cmd> --help` habit.
+        for c in [
+            vec!["box", "--help"],
+            vec!["run", "-h"],
+            vec!["pull", "--help"],
+            vec!["push", "--help"],
+            vec!["compose", "f.yml", "--help"],
+            vec!["exec", "name", "-h"],
+        ] {
+            let argv: Vec<String> = c.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                parse(&argv).unwrap().1,
+                Command::Help,
+                "`kern {}` should show help",
+                c.join(" ")
+            );
+        }
+        // But a `--help` AFTER `--` is part of the box command, not a help request.
+        let argv: Vec<String> = ["box", "n", "--rootfs", "/r", "--", "prog", "--help"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            !matches!(parse(&argv).map(|(_, c)| c), Ok(Command::Help)),
+            "`--help` after `--` is the command's arg, not a help request"
+        );
     }
 
     #[test]

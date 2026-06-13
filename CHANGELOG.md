@@ -116,6 +116,10 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   no longer leaks a stray `}`, and `${VAR}` inside a comment no longer raises a spurious unset-var warning.
 
 ### Fixed
+- **`kern <cmd> --help` shows the help** — every subcommand (`box`, `run`, `pull`, `push`, `compose`,
+  `exec`, …) rejected `--help`/`-h` as an "unknown flag" error; only the first-position `kern --help`
+  worked. The universal `<tool> <cmd> --help` habit now prints the full reference instead of an error.
+  A `--help` after `--` (part of the box/run command) is still passed through to the workload.
 - **compose `entrypoint` + `command` composition** — a **shell-form** entrypoint (`entrypoint: /x`)
   now ignores `command` (Docker semantics) instead of appending it as shell positional params (which
   silently dropped the command); an **exec-form** (list) entrypoint still composes `entrypoint ++
