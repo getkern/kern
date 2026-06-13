@@ -113,6 +113,16 @@ pub fn fmt_bytes(b: u64) -> String {
     format!("{b} B")
 }
 
+/// Right-pad `text` to `width` VISIBLE columns (Unicode scalar count), returning `pad + text`. Use this
+/// instead of `{:>width}` when the cell may contain a multi-byte glyph like `∞` (1 column, 3 bytes):
+/// the `{:>N}` formatter counts bytes, so it would misalign the column. Apply any colour AFTER padding
+/// (colour codes are zero-width and must not count toward the field). One helper for the volume QUOTA
+/// cell in `kern volume ls` and the `kern top` Storage tab, so the two can't drift.
+pub fn pad_visible(text: &str, width: usize) -> String {
+    let pad = width.saturating_sub(text.chars().count());
+    format!("{}{}", " ".repeat(pad), text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +136,17 @@ mod tests {
         assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1G");
         assert_eq!(fmt_bytes(1536 * 1024 * 1024), "1.5G"); // non-exact → one decimal
         assert_eq!(fmt_bytes(2 * 1024u64.pow(4)), "2T");
+    }
+
+    #[test]
+    fn pad_visible_counts_columns_not_bytes() {
+        // A 3-byte 1-column glyph pads by COLUMN width, so the field is 10 columns wide (not 8).
+        assert_eq!(pad_visible("∞", 10), "         ∞"); // 9 spaces + ∞ = 10 columns
+        assert_eq!(pad_visible("∞", 10).chars().count(), 10);
+        assert_eq!(pad_visible("2G", 10), "        2G");
+        // Text already at/over width isn't truncated (saturating pad = 0).
+        assert_eq!(pad_visible("1234567890", 10), "1234567890");
+        assert_eq!(pad_visible("overlong", 3), "overlong");
     }
 
     #[test]

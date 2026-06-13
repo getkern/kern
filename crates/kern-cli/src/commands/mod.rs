@@ -6284,6 +6284,23 @@ pub fn config_show() -> Result<(), Error> {
 
 /// `kern validate [path]` — parse a `kern.toml` (the given path, or the default location) and report
 /// success with profile counts, or the offending line. Exits non-zero on a parse error.
+/// Count `[` and `]` in `line` that are OUTSIDE single/double quotes — so a bracket inside a string
+/// value doesn't fool the multi-line-array tracking in `validate`. Escape-agnostic (TOML basic strings
+/// use `\\`, but for bracket-balance the simple quote toggle is sufficient for a best-effort linter).
+fn brackets_outside_quotes(line: &str) -> (usize, usize) {
+    let (mut opens, mut closes, mut q) = (0usize, 0usize, 0u8);
+    for b in line.bytes() {
+        match b {
+            b'"' | b'\'' if q == 0 => q = b,
+            _ if b == q => q = 0,
+            b'[' if q == 0 => opens += 1,
+            b']' if q == 0 => closes += 1,
+            _ => {}
+        }
+    }
+    (opens, closes)
+}
+
 pub fn validate(path: Option<&str>) -> Result<(), Error> {
     let target = match path {
         Some(p) => std::path::PathBuf::from(p),
@@ -6292,6 +6309,9 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
     };
     let text = std::fs::read_to_string(&target)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
+    // Strip a UTF-8 BOM (editors on Windows add it): it's a legal file marker, not content, and would
+    // otherwise make the first line fail the strict check below.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     // `validate` must be STRICTER than `load`: the config parser deliberately SKIPS lines it can't
     // model (forward-compat with foreign TOML), so a garbage file would otherwise pass as "valid, 0
     // profiles". A validator's whole job is to catch broken syntax, so here we reject any non-blank,
@@ -6306,8 +6326,9 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         // Track a multi-line array by net bracket balance across lines: a `key = [` with more `[` than
         // `]` opens it; a line that closes the balance ends it. While open, continuation lines (values,
         // inline tables `{…}`, a closing `]`) are legitimate and not checked as top-level statements.
-        let opens = line.matches('[').count();
-        let closes = line.matches(']').count();
+        // Count only brackets OUTSIDE quotes, so a `name = "has ] bracket"` value doesn't spuriously
+        // open/close an array (which would make the validator silently skip the following lines).
+        let (opens, closes) = brackets_outside_quotes(line);
         if in_array {
             if closes >= opens && line.contains(']') {
                 in_array = false;
@@ -6315,7 +6336,11 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
             continue;
         }
         let is_section = line.starts_with('[') && line.ends_with(']') && !line.contains('=');
-        let is_kv = line.contains('=');
+        // A `key = value` line must have a NON-EMPTY key before the first `=`. `= orphan` (empty key)
+        // is not valid TOML — the bare `contains('=')` check let it slip through.
+        let is_kv = line
+            .split_once('=')
+            .is_some_and(|(k, _)| !k.trim().is_empty());
         if is_kv && opens > closes {
             in_array = true; // `key = [` (array not closed on this line)
             continue;
@@ -6329,7 +6354,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
             )));
         }
     }
-    let cfg = crate::config::parse(&text)
+    let cfg = crate::config::parse(text)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
     let p = crate::ui::Palette::detect();
     println!(
@@ -6342,9 +6367,9 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         d = p.d,
         z = p.z
     );
-    // Warn about a `[[vcpu]]` that carries NO limit at all (no vcpus/cpus/numa/nice/memory): it parses
-    // fine but has zero effect — attaching it is a silent no-op, exactly the "looks configured, does
-    // nothing" trap. The file is still valid (parses), so this is a warning, not an error.
+    // Warn about a `[[vcpu]]` that carries NO limit at all (none of vcpus/cpus/numa/nice/priority/
+    // memory): it parses fine but has zero effect — attaching it is a silent no-op, exactly the "looks
+    // configured, does nothing" trap. The file is still valid (parses), so this is a warning, not error.
     for e in &cfg.vcpu {
         let has_effect = e.vcpus.is_some()
             || e.cpus.is_some()
@@ -6354,7 +6379,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
             || e.memory.is_some();
         if !has_effect {
             eprintln!(
-                "{y}warning{z}: vcpu profile '{}' sets no limit (vcpus/cpus/nice/memory) — attaching it does nothing",
+                "{y}warning{z}: vcpu profile '{}' sets no limit (vcpus/cpus/numa/nice/priority/memory) — attaching it does nothing",
                 e.name,
                 y = p.y,
                 z = p.z
@@ -6422,6 +6447,19 @@ size = "2g"
 #[cfg(test)]
 mod net_resource_tests {
     use super::*;
+
+    #[test]
+    fn brackets_outside_quotes_ignores_strings() {
+        // Deep validate audit: a `[`/`]` inside a string value must NOT count toward the multi-line
+        // array balance — else `name = "has ] bracket"` would spuriously open/close an array and make
+        // the validator silently skip the following lines.
+        assert_eq!(brackets_outside_quotes("pins = [1, 2, 3]"), (1, 1)); // real array
+        assert_eq!(brackets_outside_quotes(r#"name = "has ] bracket""#), (0, 0)); // ] in string
+        assert_eq!(brackets_outside_quotes(r#"x = "[ open only""#), (0, 0)); // [ in string
+        assert_eq!(brackets_outside_quotes("pins = ["), (1, 0)); // multi-line array open
+        assert_eq!(brackets_outside_quotes("]"), (0, 1)); // multi-line array close
+        assert_eq!(brackets_outside_quotes(r#"a = '][' single"#), (0, 0)); // single-quoted
+    }
 
     #[test]
     fn run_leading_dashdash_is_not_reclassified_as_a_profile() {
