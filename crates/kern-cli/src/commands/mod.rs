@@ -6301,6 +6301,25 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         d = p.d,
         z = p.z
     );
+    // Warn about a `[[vcpu]]` that carries NO limit at all (no vcpus/cpus/numa/nice/memory): it parses
+    // fine but has zero effect — attaching it is a silent no-op, exactly the "looks configured, does
+    // nothing" trap. The file is still valid (parses), so this is a warning, not an error.
+    for e in &cfg.vcpu {
+        let has_effect = e.vcpus.is_some()
+            || e.cpus.is_some()
+            || e.numa.is_some()
+            || e.nice != 0
+            || e.priority.is_some()
+            || e.memory.is_some();
+        if !has_effect {
+            eprintln!(
+                "{y}warning{z}: vcpu profile '{}' sets no limit (vcpus/cpus/nice/memory) — attaching it does nothing",
+                e.name,
+                y = p.y,
+                z = p.z
+            );
+        }
+    }
     Ok(())
 }
 
