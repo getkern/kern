@@ -1060,6 +1060,11 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
     while i < rest.len() {
         match rest[i] {
             "--" => {
+                // Preserve the `--` as the first command token so `peel_run_profiles` knows the command
+                // was EXPLICITLY delimited and must NOT re-classify a leading `vcpu:`/`vgpio:`/`vdisk:`
+                // token as a profile. Without this, `kern run -- vcpu:heavy prog` would strip `vcpu:heavy`
+                // as a profile (violating the `--` end-of-options contract, and diverging from `box`).
+                command.push("--".to_string());
                 command.extend(rest[i + 1..].iter().map(|s| (*s).to_string()));
                 break;
             }
@@ -1692,12 +1697,14 @@ mod tests {
         assert_eq!(command, ["echo", "hi"]);
         assert_eq!(memory, Some(256 * 1024 * 1024));
         assert_eq!(cpus, Some(2.0));
-        // `--` form; flags after it belong to the command.
+        // `--` form; flags after it belong to the command. The leading `--` is PRESERVED in the parsed
+        // command (so the run profile-peeler knows the command was explicitly delimited and won't
+        // re-classify a `vcpu:`-looking first token); `peel_run_profiles` then strips it before exec.
         let (_, cmd) = parse(&["run".into(), "--".into(), "ls".into(), "-la".into()]).unwrap();
         let Command::Run { command, .. } = cmd else {
             panic!()
         };
-        assert_eq!(command, ["ls", "-la"]);
+        assert_eq!(command, ["--", "ls", "-la"]);
         // An unknown flag before the command is a usage error (catches typos), not a silent run.
         assert!(matches!(
             parse(&["run".into(), "--bogus".into()]),

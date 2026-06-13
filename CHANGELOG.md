@@ -57,6 +57,17 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   to `kern-common`.
 
 ### Security
+- **Python binding: workload env goes via a private `--env-file`, not argv** — `Sandbox(env={...})`
+  passed each value as `--env K=V` on the `kern box` argv, visible in `ps` / `/proc/<pid>/cmdline` to
+  any local user (a credential leak for a component whose job is running untrusted code beside secrets).
+  The env is now written to a `0600` file in the binding's own `0700` workspace and passed as
+  `--env-file`; a newline/NUL in a key or value is rejected. Verified: env still reaches the box, the
+  value no longer appears in any `kern`/box process argv.
+- **`kern run --` honors end-of-options for profile tokens** — `kern run -- vcpu:heavy prog` peeled
+  `vcpu:heavy` as a `[[vcpu]]` profile despite the `--`, replacing the pinned program with its own first
+  argument (a `--`-contract violation, and divergent from the `box` path). `run` now preserves the
+  leading `--` so the profile-peeler treats everything after it as the literal command. No escape (run
+  is unsandboxed and execs argv directly), but the arg-parsing confusion is fixed.
 - **seccomp: deny io_uring and the kernel keyring** — `io_uring_setup/enter/register` (a large,
   historically bug-rich async-I/O surface behind real container-escape CVEs) and
   `add_key/request_key/keyctl` are now in the always-on box denylist, matching Docker's default

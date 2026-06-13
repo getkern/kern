@@ -1184,6 +1184,13 @@ fn peel_run_profiles(
     config: Option<&str>,
     out: &mut AppliedProfiles,
 ) -> Result<usize, Error> {
+    // A LEADING `--` means the command was explicitly delimited (`kern run -- vcpu:heavy prog`): the
+    // `--` end-of-options contract says the following tokens are the literal command, so we must NOT
+    // peel a `vcpu:`/`vgpio:`/`vdisk:`-looking token as a profile. Skip the `--` and stop. (Matches the
+    // `box` path, which never re-classifies past `--`.)
+    if command.first().map(String::as_str) == Some("--") {
+        return Ok(1);
+    }
     let mut i = 0;
     while i < command.len() && crate::config::classify(&command[i]).is_some() {
         i += 1;
@@ -6353,6 +6360,35 @@ size = "2g"
 #[cfg(test)]
 mod net_resource_tests {
     use super::*;
+
+    #[test]
+    fn run_leading_dashdash_is_not_reclassified_as_a_profile() {
+        // Hacker-mode regression: `kern run -- vcpu:heavy prog` — the `--` end-of-options contract means
+        // `vcpu:heavy` is the literal command, NOT a profile to peel. peel_run_profiles must skip the
+        // leading `--` and return start=1 without applying any profile.
+        fn empty() -> AppliedProfiles {
+            AppliedProfiles {
+                memory: None,
+                cpus: None,
+                cpuset: None,
+                nice: None,
+                vgpio: Vec::new(),
+                vdisk: Vec::new(),
+            }
+        }
+        let cmd = vec![
+            "--".to_string(),
+            "vcpu:heavy".to_string(),
+            "prog".to_string(),
+        ];
+        let mut out = empty();
+        // Must NOT error on a (possibly non-existent) profile name, and must start the command at 1
+        // (right after the `--`), leaving `vcpu:heavy prog` as the literal argv.
+        let start = peel_run_profiles(&cmd, None, &mut out).unwrap();
+        assert_eq!(start, 1);
+        assert!(out.cpuset.is_none() && out.cpus.is_none() && out.memory.is_none());
+        assert_eq!(&cmd[start..], ["vcpu:heavy", "prog"]);
+    }
 
     #[test]
     fn parse_volumes_guards_targets() {
