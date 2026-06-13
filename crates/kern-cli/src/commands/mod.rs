@@ -3883,10 +3883,13 @@ fn resolve_relative_binds(
                 Some((s, r)) => (s, r),
                 None => continue, // malformed spec — let `kern box` report it precisely
             };
-            // Absolute source or a bare named volume → leave as-is.
-            let is_relative =
-                src.starts_with("./") || src.starts_with("../") || src == "." || src == "..";
-            if !is_relative {
+            // Classify the source. A leading `/` is absolute (left as-is). A bare NAME with no `/` is a
+            // named volume (left as-is; the box validates it). ANYTHING ELSE containing `/` is a
+            // relative PATH and must be confined — not just the `./`/`../` forms: a source like
+            // `foo/../../../etc` is relative but doesn't start with `./`, and the old check let it skip
+            // the guard (the box's name-validator caught it as a backstop, but defense-in-depth wants
+            // the compose layer to confine every relative path itself). (Hacker-mode audit, MEDIUM.)
+            if src.starts_with('/') || !src.contains('/') {
                 continue;
             }
             let abs = std::fs::canonicalize(base.join(src)).map_err(|e| {
