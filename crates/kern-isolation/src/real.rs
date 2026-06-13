@@ -555,18 +555,32 @@ pub fn set_cpu_affinity(cpuset: Option<&str>) {
 
 /// Expand a validated cpuset list (`"0-3,5"`) into CPU indices. The CLI already restricts the string
 /// to `N` / `N-M` tokens (`is_cpu_list`), so a malformed token here simply contributes nothing.
+///
+/// SECURITY: a CPU index past `CPU_SETSIZE` can never be set in a `cpu_set_t`, so we CLAMP each range
+/// to it BEFORE expanding. Without this a hostile `cpuset: 0-999999999` (which `is_cpu_list` accepts —
+/// it only checks the `u32` format, not the magnitude) would `extend(0..=999999999)` and allocate a
+/// ~8 GB `Vec` before the per-element bound in the caller ever ran — a memory-exhaustion DoS. (Found
+/// in a hacker-mode audit.)
 fn expand_cpu_list(s: &str) -> Vec<usize> {
+    const MAX: usize = libc::CPU_SETSIZE as usize;
     let mut out = Vec::new();
     for tok in s.split(',') {
         match tok.split_once('-') {
             Some((a, b)) => {
                 if let (Ok(lo), Ok(hi)) = (a.parse::<usize>(), b.parse::<usize>()) {
-                    out.extend(lo..=hi);
+                    // Clamp the upper bound: indices >= CPU_SETSIZE are unsettable, so expanding to them
+                    // only wastes memory. `lo > MAX` yields an empty range (lo..=MAX-1 skipped).
+                    let hi = hi.min(MAX.saturating_sub(1));
+                    if lo <= hi {
+                        out.extend(lo..=hi);
+                    }
                 }
             }
             None => {
                 if let Ok(c) = tok.parse::<usize>() {
-                    out.push(c);
+                    if c < MAX {
+                        out.push(c);
+                    }
                 }
             }
         }
@@ -2386,5 +2400,26 @@ mod uid_range_root_traversable {
             0,
             "0700 blocks other — the bug"
         );
+    }
+}
+
+#[cfg(test)]
+mod cpuset_expand_tests {
+    use super::expand_cpu_list;
+
+    /// REGRESSION (HIGH, hacker-mode audit): a huge cpuset range must NOT allocate a giant Vec. Indices
+    /// past CPU_SETSIZE are unsettable, so the range is clamped before expansion — `0-999999999` yields
+    /// at most CPU_SETSIZE entries, not a billion (which would be ~8 GB → memory-exhaustion DoS).
+    #[test]
+    fn huge_cpuset_range_is_clamped_not_exploded() {
+        let max = libc::CPU_SETSIZE as usize;
+        let v = expand_cpu_list("0-999999999");
+        assert!(v.len() <= max, "expanded {} entries, cap is {max}", v.len());
+        assert_eq!(v.first(), Some(&0));
+        assert_eq!(v.last(), Some(&(max - 1)));
+        // A bare index past the cap contributes nothing.
+        assert!(expand_cpu_list("999999999").is_empty());
+        // Normal small lists are unaffected.
+        assert_eq!(expand_cpu_list("0-3,5"), vec![0, 1, 2, 3, 5]);
     }
 }

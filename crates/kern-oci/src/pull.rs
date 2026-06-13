@@ -465,21 +465,32 @@ fn realm_host_trusted(realm: &str, registry: &str) -> bool {
     if realm_host.is_empty() {
         return false;
     }
+    // EXACT host match is always trusted.
     if realm_host == reg_host {
         return true;
     }
-    // Parent domain = registry host minus its first label (registry-1.docker.io → docker.io). Guards:
-    // it must have a dot and >3 chars (so a single-label TLD `io`/`com` is never a trusted parent),
-    // and must not be a known multi-label public suffix (so two unrelated `*.co.uk` registries can't
-    // cross-trust).
-    match reg_host.split_once('.') {
-        Some((_, parent))
-            if parent.len() > 3 && parent.contains('.') && !is_public_suffix(parent) =>
-        {
-            realm_host == parent || realm_host.ends_with(&format!(".{parent}"))
-        }
-        _ => false,
-    }
+    // Otherwise, trust ONLY a known, hardcoded registry↔auth mapping. The old rule trusted ANY sibling
+    // under the registry's parent domain (`realm_host.ends_with(".{parent}")`) — but on shared PaaS /
+    // hosting / a delegated-subdomain org, an attacker who controls a sibling subdomain (say
+    // `attacker.acme.com`) could make a hostile `registry.acme.com` point its auth realm there and
+    // harvest the user's long-lived, WRITE-scoped `kern login` password. Credentials must never go to a
+    // host the user didn't log into unless it's a real, known auth endpoint. (Hacker-mode audit.)
+    known_auth_pair(&reg_host, &realm_host)
+}
+
+/// The hardcoded registry-host ↔ auth-realm-host pairs kern trusts for sending stored credentials to a
+/// DIFFERENT host than the one the user logged into. Only well-known public registries whose auth lives
+/// on a sibling host belong here — never a generic parent-domain rule (which a hostile sibling abuses).
+fn known_auth_pair(reg_host: &str, realm_host: &str) -> bool {
+    const PAIRS: &[(&str, &str)] = &[
+        // Docker Hub: the registry is registry-1.docker.io, its token realm is auth.docker.io.
+        ("registry-1.docker.io", "auth.docker.io"),
+        ("docker.io", "auth.docker.io"),
+        ("index.docker.io", "auth.docker.io"),
+    ];
+    PAIRS
+        .iter()
+        .any(|(r, a)| *r == reg_host && *a == realm_host)
 }
 
 /// The host of a URL authority as curl would dial it: drop any `userinfo@` (curl uses the part after
@@ -489,19 +500,6 @@ fn realm_host_trusted(realm: &str, registry: &str) -> bool {
 fn host_from_authority(authority: &str) -> String {
     let host = authority.rsplit('@').next().unwrap_or(authority);
     host.split(':').next().unwrap_or(host).to_ascii_lowercase()
-}
-
-/// A registrable-domain check without a full public-suffix list (out of scope for a dependency-free
-/// build): the common multi-label public suffixes that must never count as a trustable parent domain
-/// in [`realm_host_trusted`]. Not exhaustive — it closes the realistic ccTLD second-levels; a full
-/// PSL would be the complete fix.
-fn is_public_suffix(d: &str) -> bool {
-    const SUFFIXES: &[&str] = &[
-        "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "co.jp", "ne.jp", "or.jp", "com.au",
-        "net.au", "org.au", "co.nz", "co.in", "co.za", "com.br", "com.cn", "com.mx", "com.tr",
-        "com.sg", "com.hk", "co.kr", "com.ar", "com.pl", "co.il",
-    ];
-    SUFFIXES.contains(&d)
 }
 
 /// The auth scheme advertised in a registry's `WWW-Authenticate` challenge header.
@@ -1154,6 +1152,19 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
             }
         }
 
+        // A symlink('2'), hardlink('1') or directory('5') header carries NO data — its `size` MUST be
+        // 0. A hostile layer that puts a NON-ZERO size on one of these desyncs the vetter from the
+        // extractor: WE skip `size` bytes (trusting the lie), but a non-GNU `tar` (BusyBox on the
+        // musl/edge boards kern targets) does NOT skip data for these types — it reads the skipped block
+        // as the NEXT header. So the attacker hides an escaping member (esc -> /etc/shadow) in the
+        // "data" of a lying symlink: the vetter never sees it, BusyBox extracts it -> full escape-guard
+        // bypass. Reject a non-zero size on these types BEFORE consuming, so the vetter and every
+        // extractor agree on where the next header starts. (Found in a hacker-mode audit.)
+        if matches!(typeflag, b'1' | b'2' | b'5') && size != 0 {
+            return Err(bad(
+                "layer has a symlink/hardlink/directory header with non-zero size (tar desync attack)",
+            ));
+        }
         // Cap BEFORE consuming the data: a single member with a huge size would otherwise stream its
         // entire (decompressed) body from gzip before the running total tripped the cap — a per-member
         // DoS. Checking the declared size up front bounds the work to one block.
@@ -1163,7 +1174,7 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
                 "layer exceeds the size cap (possible decompression bomb)",
             ));
         }
-        take_data(r, size, 0)?; // skip the member's file data (links/dirs have size 0)
+        take_data(r, size, 0)?; // skip the member data (regular files only; links/dirs are size 0)
     }
 }
 
@@ -1417,7 +1428,7 @@ mod tests {
 
     #[test]
     fn realm_trust_pins_creds_to_the_registry() {
-        // Docker Hub: registry-1.docker.io must trust auth.docker.io (shared parent docker.io).
+        // Docker Hub: registry-1.docker.io must trust auth.docker.io (a known, hardcoded pair).
         assert!(realm_host_trusted(
             "https://auth.docker.io/token",
             "registry-1.docker.io"
@@ -1458,15 +1469,21 @@ mod tests {
             "https://ghcr.io:0@evil.com#x",
             "ghcr.io"
         ));
-        // Public-suffix parent: a `label.co.uk` registry must NOT cross-trust another `*.co.uk`.
+        // HACKER-MODE FIX: a same-parent SIBLING is NO LONGER trusted. The old parent-domain rule
+        // trusted any `*.acme.com` for a `registry.acme.com` login — a hostile registry on shared
+        // hosting could point its realm at an attacker-controlled sibling and harvest the write creds.
+        assert!(!realm_host_trusted(
+            "https://attacker.acme.com/token",
+            "registry.acme.com"
+        ));
+        assert!(!realm_host_trusted(
+            "https://auth.company.co.uk/token",
+            "registry.company.co.uk"
+        ));
+        // A `label.co.uk` registry still must NOT cross-trust another `*.co.uk`.
         assert!(!realm_host_trusted(
             "https://attacker.co.uk/token",
             "myreg.co.uk"
-        ));
-        // …but a real registrable domain under a ccTLD still trusts its own subdomains.
-        assert!(realm_host_trusted(
-            "https://auth.company.co.uk/token",
-            "registry.company.co.uk"
         ));
         // Case-insensitive host comparison (DNS is case-insensitive).
         assert!(realm_host_trusted(
@@ -1651,6 +1668,40 @@ mod tests {
 
     fn end_marker() -> Vec<u8> {
         vec![0u8; BLK * 2]
+    }
+
+    /// REGRESSION (CRITICAL, hacker-mode audit): a symlink/hardlink/directory header with a LYING
+    /// non-zero size desyncs the vetter from a non-GNU (BusyBox) extractor. The vetter skips `size`
+    /// bytes trusting the lie; BusyBox reads them as the next header. So a hidden escaping symlink
+    /// (`esc -> /etc/shadow`) rides in the "data" of a size-512 symlink and slips past the escape guard.
+    /// The vetter must REJECT a non-zero size on typeflags '1'/'2'/'5' before consuming.
+    #[test]
+    fn tar_link_or_dir_with_nonzero_size_is_rejected() {
+        // Symlink header (typeflag '2', harmless linkname 'safe') with a FALSE size=512, followed by a
+        // hidden second symlink header `esc -> /etc/shadow`. Pre-fix the vetter returned Ok (skipping
+        // the hidden header); now it must reject the desync.
+        for carrier in [b'2', b'1', b'5'] {
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&hdr(b"safe_looking", carrier, 512, b"safe"));
+            stream.extend_from_slice(&hdr(b"esc", b'2', 0, b"/etc/shadow")); // the hidden escaper
+            stream.extend(end_marker());
+            // On the BusyBox target (gnu_tar=false) the desync is exploitable; reject regardless.
+            for gnu in [false, true] {
+                let mut r: &[u8] = &stream;
+                let res = vet_tar_stream(&mut r, gnu);
+                assert!(
+                    res.is_err(),
+                    "carrier {} size!=0 must be rejected (gnu_tar={gnu})",
+                    carrier as char
+                );
+            }
+        }
+        // A legit symlink (size 0) with a safe target still passes.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&hdr(b"link", b'2', 0, b"target"));
+        ok.extend(end_marker());
+        let mut r: &[u8] = &ok;
+        assert!(vet_tar_stream(&mut r, false).is_ok());
     }
 
     /// REGRESSION (panic): a PAX record whose `<len>` falls INSIDE a multi-byte UTF-8 sequence must not
