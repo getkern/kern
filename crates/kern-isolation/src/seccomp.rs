@@ -86,6 +86,19 @@ fn denylist() -> Vec<libc::c_long> {
         libc::SYS_bpf,
         libc::SYS_userfaultfd,
         libc::SYS_perf_event_open,
+        // io_uring: a large, historically bug-rich async-I/O subsystem (multiple LPE CVEs used in real
+        // container escapes). A sandboxed workload never needs it; Docker default profile, gVisor and
+        // the hardening guides all block/gate it. Deny the whole family. (Hacker-mode audit.)
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        // Kernel keyring: add_key/request_key/keyctl reach the keyring subsystem (keyring LPE-CVE
+        // history, and unswappable-memory pinning). The box own user-ns already namespaces the keyring
+        // and its quota, so this is defense-in-depth / Docker-default parity, not a live escape — but a
+        // sandboxed workload has no legitimate use for it, so deny it.
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
         // `syslog(2)` / klogctl — reads the kernel ring buffer (dmesg): kernel pointers + host
         // activity, an info leak. CAP_SYSLOG is already dropped, but on a host with
         // `kernel.dmesg_restrict=0` (e.g. some Android-derived kernels) no cap is needed — so deny
@@ -168,4 +181,42 @@ pub fn install() -> Result<(), Error> {
         return Err(Error::last("prctl(SET_SECCOMP)"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::denylist;
+
+    /// The always-on denylist must include the high-value escape/DoS syscalls a sandboxed workload
+    /// never needs — a regression here (someone dropping an entry) silently reopens a kernel surface.
+    #[test]
+    fn denylist_covers_the_critical_syscalls() {
+        let d = denylist();
+        let must = [
+            libc::SYS_ptrace,
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_pivot_root,
+            libc::SYS_unshare,
+            libc::SYS_setns,
+            libc::SYS_bpf,
+            libc::SYS_userfaultfd,
+            libc::SYS_perf_event_open,
+            // Mount API v2 (would bypass the classic mount denial).
+            libc::SYS_open_tree,
+            libc::SYS_move_mount,
+            libc::SYS_fsopen,
+            libc::SYS_mount_setattr,
+            // io_uring family + keyring (hacker-mode audit additions).
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+            libc::SYS_add_key,
+            libc::SYS_request_key,
+            libc::SYS_keyctl,
+        ];
+        for nr in must {
+            assert!(d.contains(&nr), "denylist is missing syscall nr {nr}");
+        }
+    }
 }
