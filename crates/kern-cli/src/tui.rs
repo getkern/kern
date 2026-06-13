@@ -1,5 +1,5 @@
 //! `kern top` — a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
-//! keyboard nav). Four tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
+//! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Four tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
 //! per-box table — MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) — with lifecycle
 //! actions: stop/pause/unpause/kill/logs), **Profiles** (the reusable
 //! specs you attach by prefix — vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
@@ -1147,13 +1147,20 @@ fn render(
         rows.len()
     ));
 
-    // Tab bar — active tab inverted.
+    // Tab bar — active tab inverted, each data tab showing a LIVE count of its rows so you can see how
+    // many boxes/profiles/volumes exist without entering the tab. Overview is an aggregate → no count.
     s.push(' ');
     for (i, name) in TABS.iter().enumerate() {
+        let label = match i {
+            TAB_BOXES => format!("{name} ({})", rows.len()),
+            TAB_PROFILES => format!("{name} ({})", profs.len()),
+            TAB_STORAGE => format!("{name} ({})", vols.len()),
+            _ => name.to_string(),
+        };
         if i == tab {
-            s.push_str(&format!("{b}\x1b[7m {name} \x1b[27m{z} "));
+            s.push_str(&format!("{b}\x1b[7m {label} \x1b[27m{z} "));
         } else {
-            s.push_str(&format!("{d} {name} {z} "));
+            s.push_str(&format!("{d} {label} {z} "));
         }
     }
     s.push('\n');
@@ -1697,6 +1704,44 @@ mod tests {
         let out2 = boxes_table(&plain(), &[row("db", false)], 10, 0);
         let dbrow = out2.lines().find(|l| l.contains("db")).unwrap();
         assert!(dbrow.contains('-'), "no-health/no-ports row shows a dash");
+    }
+
+    #[test]
+    fn tab_bar_shows_live_counts() {
+        // The tab bar shows a live count per data tab (Boxes/Profiles/Storage) so you see how many
+        // items exist without entering — Overview (an aggregate) has no count.
+        let host = HostStats {
+            mem_used: 0,
+            mem_total: 1,
+            cpu_pct: 0.0,
+            cores: 1,
+            load1: 0.0,
+        };
+        let boxes = [row("a", false), row("b", false), row("c", false)];
+        let out = render(
+            &plain(),
+            TAB_BOXES,
+            &boxes,
+            &host,
+            &[],
+            &[],
+            80,
+            24,
+            0,
+            &Mode::Nav,
+        );
+        // 3 boxes, 0 profiles, 0 volumes.
+        assert!(
+            out.contains("Boxes (3)"),
+            "Boxes tab shows its count: {out}"
+        );
+        assert!(out.contains("Profiles (0)"), "Profiles tab shows 0");
+        assert!(out.contains("Storage (0)"), "Storage tab shows 0");
+        assert!(out.contains("Overview"), "Overview stays uncounted");
+        assert!(
+            !out.contains("Overview ("),
+            "Overview must NOT carry a count"
+        );
     }
 
     #[test]
