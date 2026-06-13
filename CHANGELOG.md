@@ -43,6 +43,10 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
 - **compose `tmpfs` with options** — Docker's `- /scratch:size=10M,mode=1770,uid=1000` was forwarded
   whole to `--tmpfs`, which took the entire option string as the size and **aborted the service**.
   Now the `size=` option is kept (`--tmpfs /scratch:10M`) and the rest is dropped with a warning.
+- **compose `profiles`** — a `profiles:`-tagged service was warn-and-ignored but **still started** —
+  a service meant to be OFF ran on a plain `up`. Now it is inactive unless one of its profiles is
+  enabled via `COMPOSE_PROFILES` (Docker semantics; `*` enables all), and a `depends_on` toward a
+  dropped profiled service is pruned rather than failing the topo sort.
 - **`kern push`** — publish a cached image (rootfs + config) to an OCI registry v2 (schema-2
   manifest), `docker pull`-compatible. WRITE-scoped auth via `kern login`; all requests HTTPS-pinned.
   Verified end-to-end against a local `registry:2`: push → pull-back reproduces an identical rootfs

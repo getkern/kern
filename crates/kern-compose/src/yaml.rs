@@ -69,7 +69,20 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
                     if boxes.iter().any(|b: &ComposeBox| b.name == *name) {
                         return Err(format!("duplicate service '{name}'"));
                     }
-                    boxes.push(service_to_box(name, svc, &secret_files)?);
+                    let b = service_to_box(name, svc, &secret_files)?;
+                    // Docker profiles: a service with a non-empty profile list is INACTIVE unless one
+                    // of its profiles is enabled via COMPOSE_PROFILES. A plain `up` starts only the
+                    // profile-less services — so we SKIP an inactive one (never start it by accident),
+                    // warning how to enable it. (kern has no `--profile` flag yet; COMPOSE_PROFILES is
+                    // the env kern honors, matching Docker's env of the same name.)
+                    if !b.profiles.is_empty() && !any_profile_active(&b.profiles) {
+                        warn(&format!(
+                            "service '{name}': skipped — profile(s) [{}] not active (set COMPOSE_PROFILES to enable)",
+                            b.profiles.join(", ")
+                        ));
+                        continue;
+                    }
+                    boxes.push(b);
                 }
             }
             "volumes" | "networks" | "version" | "name" | "configs" | "secrets" => {
@@ -87,6 +100,28 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     }
     if boxes.is_empty() {
         return Err("`services:` is empty".to_string());
+    }
+    // A `depends_on` toward a service that was dropped as profile-inactive must not fail the topo sort
+    // with "unknown box". Docker treats a dependency on an inactive-profile service as an error only
+    // when the dependent is itself active; here we DROP the dangling edge with a warning (the depended
+    // service simply isn't part of this run). Only prune names that vanished — a truly unknown name
+    // still errors later in `topo_order`.
+    let present: std::collections::HashSet<String> = boxes.iter().map(|b| b.name.clone()).collect();
+    for b in boxes.iter_mut() {
+        let mut dropped = false;
+        let n0 = b.depends_on.len() + b.depends_healthy.len() + b.depends_completed.len();
+        b.depends_on.retain(|d| present.contains(d));
+        b.depends_healthy.retain(|d| present.contains(d));
+        b.depends_completed.retain(|d| present.contains(d));
+        if b.depends_on.len() + b.depends_healthy.len() + b.depends_completed.len() != n0 {
+            dropped = true;
+        }
+        if dropped {
+            warn(&format!(
+                "service '{}': a dependency was dropped (target not active in this run — e.g. a profiled service)",
+                b.name
+            ));
+        }
     }
     // A service must resolve to something runnable: an `image` (or a `build:` that produces one). Catch
     // it HERE with a precise message, not later as an opaque "need --rootfs or --image" from the box —
@@ -135,6 +170,24 @@ fn degrade_orphan_health_gates(boxes: &mut [ComposeBox]) {
         }
         b.depends_healthy = kept;
     }
+}
+
+/// True if any of a service's `profiles` is enabled via `COMPOSE_PROFILES` (comma/space-separated,
+/// Docker's env). The special profile `*` enables all. No env / empty → nothing profiled is active.
+fn any_profile_active(profiles: &[String]) -> bool {
+    let active = std::env::var("COMPOSE_PROFILES").unwrap_or_default();
+    if active.trim().is_empty() {
+        return false;
+    }
+    let set: Vec<&str> = active
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if set.contains(&"*") {
+        return true;
+    }
+    profiles.iter().any(|p| set.contains(&p.as_str()))
 }
 
 /// Reject structural YAML we don't support, up front, with a precise reason. This is the billion-laughs
@@ -814,8 +867,9 @@ fn service_to_box(
                     }
                 }
             }
-            "networks" | "deploy" | "configs" | "labels" | "logging" | "profiles" | "expose"
-            | "extends" | "init" | "stdin_open" | "tty" | "domainname" => {
+            "profiles" => b.profiles = list_value(node),
+            "networks" | "deploy" | "configs" | "labels" | "logging" | "expose" | "extends"
+            | "init" | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
             other => warn(&format!(
@@ -1904,6 +1958,32 @@ mod tests {
             boxes("services:\n  a:\n    image: x\n    tmpfs:\n      - /t:mode=1777\n")[0].tmpfs,
             ["/t"]
         );
+    }
+
+    #[test]
+    fn profiled_service_is_inactive_unless_enabled() {
+        // Extreme vs-Docker regression: a `profiles:`-tagged service was warn-and-ignored but STILL
+        // STARTED — a service that should be OFF ran. Now it is dropped from the run unless one of its
+        // profiles is active via COMPOSE_PROFILES (Docker semantics: a plain `up` = profile-less only).
+        let y = "services:\n  always:\n    image: x\n  dbg:\n    image: x\n    profiles: [debug]\n";
+        // Ensure no ambient profile leaks in.
+        std::env::remove_var("COMPOSE_PROFILES");
+        let names: Vec<String> = parse(y).unwrap().into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["always"], "profiled 'dbg' must be dropped");
+        // Enable it.
+        std::env::set_var("COMPOSE_PROFILES", "debug");
+        let names2: Vec<String> = parse(y).unwrap().into_iter().map(|b| b.name).collect();
+        assert!(
+            names2.contains(&"dbg".to_string()),
+            "profile active → dbg present"
+        );
+        // A depends_on toward a dropped profiled service must NOT fail the topo — the edge is pruned.
+        std::env::remove_var("COMPOSE_PROFILES");
+        let y2 = "services:\n  app:\n    image: x\n    depends_on: [dbg]\n  dbg:\n    image: x\n    profiles: [debug]\n";
+        let parsed = parse(y2).expect("dangling profiled dependency must be pruned, not error");
+        let app = parsed.iter().find(|b| b.name == "app").unwrap();
+        assert!(app.depends_on.is_empty(), "edge to dropped 'dbg' pruned");
+        std::env::remove_var("COMPOSE_PROFILES");
     }
 
     #[test]

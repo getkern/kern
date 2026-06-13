@@ -94,6 +94,11 @@ pub struct ComposeBox {
     pub tmpfs: Vec<String>,
     pub cap_add: Vec<String>,
     pub cap_drop: Vec<String>,
+    /// Compose `profiles: [...]`. A service with a non-empty profile list is INACTIVE unless one of
+    /// its profiles is enabled (via `COMPOSE_PROFILES`), exactly like Docker: a plain `up` starts only
+    /// the profile-less services. Empty = always active. `parse` drops inactive services from the
+    /// returned set (with a warning) so a profiled service can never be started by accident.
+    pub profiles: Vec<String>,
 }
 
 impl ComposeBox {
