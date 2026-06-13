@@ -1,6 +1,7 @@
 //! `kern top` — a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
 //! keyboard nav). Four tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
-//! per-box table with lifecycle actions — stop/pause/unpause/kill/logs), **Profiles** (the reusable
+//! per-box table — MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) — with lifecycle
+//! actions: stop/pause/unpause/kill/logs), **Profiles** (the reusable
 //! specs you attach by prefix — vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
 //! disks, and its `[[disk]]` is materialised from that choice, never hand-created) and **Storage** (the
 //! concrete data layer — physical disks read-only + named volumes you create). Host stats come straight
@@ -123,6 +124,11 @@ struct Row {
     cpu_pct: f64,
     tasks: Option<u64>,
     paused: bool,
+    /// Health-check state (`healthy`/`unhealthy`/`starting`, empty if the box has no `--health-cmd`) —
+    /// the same signal `kern ps` shows, so a compose stack's readiness is visible in the TUI too.
+    health: String,
+    /// Published-ports summary (e.g. `8080->80`), empty if none — parity with `kern ps`.
+    ports: String,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -987,12 +993,15 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
             None => 0.0,
         };
         seen.insert(b.pid, (cpu_now, now_t));
+        let health = registry::health_of(&b.name, b.pid);
         rows.push(Row {
             uptime: now_u.saturating_sub(b.started),
             mem: st.mem,
             tasks: st.tasks,
             paused: st.paused,
             cpu_pct,
+            health,
+            ports: b.ports,
             name: b.name,
             pid: b.pid,
         });
@@ -1525,8 +1534,8 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
     let (b, d, g, z) = (p.b, p.d, p.g, p.z);
     let mut s = String::new();
     s.push_str(&format!(
-        "    {b}{:<16}  {:>7}  {:>9}  {:>9}  {:>6}  {:>5}  STATUS{z}\n",
-        "NAME", "PID", "UPTIME", "MEM", "CPU%", "PIDS"
+        "    {b}{:<16}  {:>7}  {:>8}  {:>8}  {:>5}  {:>4}  {:<9}  {:<14}  STATUS{z}\n",
+        "NAME", "PID", "UPTIME", "MEM", "CPU%", "PIDS", "HEALTH", "PORTS"
     ));
     if rows.is_empty() {
         s.push_str(&format!("  {d}no running boxes{z}\n"));
@@ -1541,9 +1550,21 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
         } else {
             format!("{g}running{z}")
         };
+        // HEALTH colored like `kern ps`: green healthy, red unhealthy, dim starting/none.
+        let health = match r.health.as_str() {
+            "healthy" => format!("{g}{:<9}{z}", "healthy"),
+            "unhealthy" => format!("{}{:<9}{z}", p.r, "unhealthy"),
+            "starting" => format!("{d}{:<9}{z}", "starting"),
+            _ => format!("{d}{:<9}{z}", "-"),
+        };
+        let ports = if r.ports.is_empty() {
+            format!("{d}{:<14}{z}", "-")
+        } else {
+            format!("{:<14}", trunc(&r.ports, 14))
+        };
         let (lead, name_col) = sel_marker(p, i == sel);
         s.push_str(&format!(
-            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>9}  {:>9}  {:>5.0}%  {:>5}  {status}\n",
+            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}\n",
             trunc(&r.name, 16),
             r.pid,
             fmt_uptime(r.uptime),
@@ -1603,6 +1624,8 @@ mod tests {
             cpu_pct: 1.0,
             tasks: Some(3),
             paused,
+            health: String::new(),
+            ports: String::new(),
         }
     }
 
@@ -1614,6 +1637,23 @@ mod tests {
         assert!(line.contains('›'), "selected row should show the caret");
         let web = out.lines().find(|l| l.contains("web")).unwrap();
         assert!(!web.contains('›'), "unselected row must not show the caret");
+    }
+
+    #[test]
+    fn boxes_table_shows_health_and_ports_like_ps() {
+        // A box with a healthcheck + published port must surface both in the TUI, matching `kern ps`.
+        let mut r = row("web", false);
+        r.health = "healthy".into();
+        r.ports = "8080->80".into();
+        let out = boxes_table(&plain(), &[r], 10, 0);
+        assert!(out.contains("HEALTH"), "header must include HEALTH");
+        assert!(out.contains("PORTS"), "header must include PORTS");
+        assert!(out.contains("healthy"), "row must show the health state");
+        assert!(out.contains("8080->80"), "row must show the ports");
+        // A box with no healthcheck / no ports shows a dim `-`, never an empty gap.
+        let out2 = boxes_table(&plain(), &[row("db", false)], 10, 0);
+        let dbrow = out2.lines().find(|l| l.contains("db")).unwrap();
+        assert!(dbrow.contains('-'), "no-health/no-ports row shows a dash");
     }
 
     #[test]
