@@ -361,9 +361,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .first()
                 .map(|s| s.to_string())
                 .ok_or(Error::Usage("push <local-ref> [as <remote-ref>]"))?;
-            // Optional `as <remote>` (or just a second positional).
+            // Optional `as <remote>` (or just a second positional). A DANGLING `as` with no ref after
+            // it is a usage error, NOT a silent fall-through to the local ref — otherwise
+            // `kern push myimg as` would push to Docker Hub as `library/myimg` unintentionally.
             let remote = match args.get(1) {
-                Some(s) if **s == "as" => args.get(2).map(|s| s.to_string()),
+                Some(s) if **s == "as" => Some(args.get(2).map(|s| s.to_string()).ok_or(
+                    Error::Usage("push <local-ref> as <remote-ref> (remote-ref missing)"),
+                )?),
                 Some(s) => Some(s.to_string()),
                 None => None,
             };
