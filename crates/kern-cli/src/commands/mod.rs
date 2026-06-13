@@ -2071,9 +2071,20 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
     let mut elapsed = 0u64; // seconds since the checker started
     let mut fails = 0u32; // consecutive failures
     let mut acted = false; // acted on the *current* unhealthy episode (reset when healthy again)
+    let mut first = true;
     loop {
-        unsafe { libc::sleep(hc.interval as libc::c_uint) };
-        elapsed = elapsed.saturating_add(hc.interval);
+        // The FIRST probe runs after a short fixed delay, NOT after a full `interval`: a dependent box
+        // gated on `service_healthy` should start as soon as the dependency is actually ready, not wait
+        // a whole interval for the first check. A service that boots in 50 ms was being held ~1 s just
+        // because `interval: 1s` slept before the first probe — a needless bottleneck in a `depends_on:
+        // condition: service_healthy` stack. Subsequent probes use the real interval.
+        if first {
+            unsafe { libc::usleep(100_000) }; // 100 ms — let the process exec before the first probe
+            first = false;
+        } else {
+            unsafe { libc::sleep(hc.interval as libc::c_uint) };
+            elapsed = elapsed.saturating_add(hc.interval);
+        }
         // Current box PID 1 (changes across `--restart`); read it from the registry by name.
         let pid1 = registry::list()
             .into_iter()
