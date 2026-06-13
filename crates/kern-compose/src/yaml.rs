@@ -1629,7 +1629,25 @@ fn build_value(node: &Node) -> BuildDirective {
 /// Emit a compat warning to stderr. Prefixed so it's clearly kern's compose-import voice, and so the
 /// user sees exactly which part of their compose didn't map 1:1.
 fn warn(msg: &str) {
-    eprintln!("kern compose: {msg}");
+    eprintln!("kern compose: {}", sanitize_for_terminal(msg));
+}
+
+/// Neutralize control characters in a string bound for the user's terminal. `warn` interpolates
+/// UNTRUSTED compose text (service names, keys, values, paths from a third-party file); without this a
+/// hostile compose could inject ANSI escapes / cursor moves / carriage returns into a warning to spoof
+/// or hide terminal output. Printable chars + space/tab pass; every other control char (incl. ESC
+/// `\x1b`, CR, and other C0/C1) becomes its literal `\xNN` form. Centralized so EVERY `warn` is covered
+/// by construction, not by escaping at each call site.
+fn sanitize_for_terminal(msg: &str) -> String {
+    msg.chars()
+        .flat_map(|c| {
+            if c == ' ' || c == '\t' || !c.is_control() {
+                vec![c]
+            } else {
+                format!("\\x{:02x}", c as u32).chars().collect()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1958,6 +1976,20 @@ mod tests {
             boxes("services:\n  a:\n    image: x\n    tmpfs:\n      - /t:mode=1777\n")[0].tmpfs,
             ["/t"]
         );
+    }
+
+    #[test]
+    fn warn_sanitizes_terminal_control_chars() {
+        // Hacker-mode regression: a hostile compose key/value must not inject ANSI escapes into a
+        // warning. ESC, CR, and other control chars are neutralized to `\xNN`; printable text passes.
+        assert_eq!(sanitize_for_terminal("evil\x1b[31mKEY"), "evil\\x1b[31mKEY");
+        assert_eq!(sanitize_for_terminal("a\rb\nc"), "a\\x0db\\x0ac");
+        assert_eq!(
+            sanitize_for_terminal("normal service 'x': ok"),
+            "normal service 'x': ok"
+        );
+        // A unicode value passes through (only CONTROL chars are escaped, not multibyte text).
+        assert_eq!(sanitize_for_terminal("café→🦀"), "café→🦀");
     }
 
     #[test]

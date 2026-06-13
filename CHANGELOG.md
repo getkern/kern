@@ -62,6 +62,12 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   credentials and the private layer to that host (CVE-2020-15157 class). The Location is now required
   to be the **same host and port** as the registry; an HTTPS→http downgrade, a loopback→internal-IP
   bounce (SSRF), or a same-host **different-port** bounce (a distinct internal service) is rejected.
+- **compose warnings sanitize terminal control characters** — a warning interpolates untrusted compose
+  text (service names, keys, values, paths); a hostile file could embed ANSI escapes / cursor moves /
+  carriage returns in, say, an unknown field name and inject them into your terminal (spoofed or hidden
+  output) when the parser warned about it. All warnings now escape control chars to `\xNN`
+  (centralized in `warn`, so every call is covered). Build-context and bind-source `../` traversal were
+  already refused; service names that look like flags (`--privileged`) were already rejected.
 - **compose parser panic-hardening** — an untrusted `healthcheck.interval` with a huge digit-run
   (`6000000000000000h`) no longer overflow-panics (debug) or wraps to a nonsense value (release);
   `parse_duration_secs` uses checked arithmetic and falls back to the box default. An anchor/alias is
