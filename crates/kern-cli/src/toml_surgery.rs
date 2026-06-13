@@ -12,11 +12,19 @@
 fn name_value(trimmed: &str) -> Option<&str> {
     let rest = trimmed.strip_prefix("name")?.trim_start();
     let rest = rest.strip_prefix('=')?.trim();
-    let rest = rest
-        .strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .or_else(|| rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))?;
-    Some(rest)
+    // The value may be followed by an inline comment (`name = "heavy"   # …`) — the starter config from
+    // `kern config setup` writes exactly that. Take the QUOTED span (up to the closing quote), not
+    // `strip_suffix('"')` on the whole line, which failed when a comment trailed the value → the block
+    // wasn't found → `config add` on an existing name created a DUPLICATE instead of erroring.
+    let (q, after) = if let Some(a) = rest.strip_prefix('"') {
+        ('"', a)
+    } else if let Some(a) = rest.strip_prefix('\'') {
+        ('\'', a)
+    } else {
+        return None;
+    };
+    let end = after.find(q)?;
+    Some(&after[..end])
 }
 
 /// Is this the array-of-tables header for `header` (e.g. `[[vcpu]]`)? Tolerates inner whitespace.
@@ -288,6 +296,27 @@ mode = \"auto\"
         assert!(block_exists(raw, "vdisk", "b"));
         assert!(!block_exists(raw, "vdisk", "a")); // right name, wrong section
         assert!(!block_exists(raw, "vcpu", "zzz"));
+    }
+
+    #[test]
+    fn name_value_handles_inline_comments_and_spacing() {
+        // Regression: `kern config setup` writes `name = "heavy"   # comment`. The old parser did
+        // `strip_suffix('"')` on the whole line, which failed when a comment trailed → block not found →
+        // `config add` created a DUPLICATE instead of erroring. Take the quoted span, ignore the rest.
+        assert_eq!(
+            name_value(r#"name = "heavy"   # ~half this host"#),
+            Some("heavy")
+        );
+        assert_eq!(name_value(r#"name="tight""#), Some("tight"));
+        assert_eq!(name_value(r#"name  =  'single'  # c"#), Some("single"));
+        assert_eq!(name_value(r#"name = "ok""#), Some("ok"));
+        assert_eq!(name_value("notname = \"x\""), None);
+        // And through block_exists on a setup-style commented line.
+        let raw = "[[vcpu]]\nname = \"heavy\"   # half the host\nvcpus = 4\n";
+        assert!(
+            block_exists(raw, "vcpu", "heavy"),
+            "commented name must be found"
+        );
     }
 
     #[test]
