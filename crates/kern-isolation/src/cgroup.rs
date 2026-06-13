@@ -8,6 +8,40 @@
 use std::fs;
 use std::path::PathBuf;
 
+/// RAII owner of the per-box cgroup directory. Its `Drop` removes the (now-empty) cgroup, so the
+/// `kern-box-<tag>-<pid>` dir never leaks. Without it the best-effort cgroup dir would only be cleaned
+/// up by an outer systemd `--scope`'s `--collect`; on any path without that (e.g. `KERN_NO_SCOPE`, or a
+/// host without systemd-user) every box start would leave an orphan dir behind. The guard is held by the
+/// supervisor until AFTER `waitpid`, by which point box PID 1 (and all its PID-namespace descendants) are
+/// dead, so the cgroup is empty and `rmdir` succeeds. The forked child never runs this `Drop` (it always
+/// `exec`s or `_exit`s), so only the supervisor cleans up — exactly once.
+pub struct CgroupGuard {
+    dir: PathBuf,
+}
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        // Best-effort: a non-empty cgroup (shouldn't happen post-`waitpid`) or an already-removed dir
+        // (ENOENT — e.g. an outer `--collect` beat us to it) are both fine to ignore.
+        let _ = fs::remove_dir(&self.dir);
+    }
+}
+
+/// The current process's cgroup v2 directory under `/sys/fs/cgroup`, from the `0::<path>` line of
+/// `/proc/self/cgroup`. cgroup v2 uses hierarchy id `0` with an empty controller field, so the line is
+/// literally `0::/some/path`; we match that prefix EXPLICITLY rather than `rsplit("::")` on the whole
+/// blob — on a hybrid (v1+v2) host `/proc/self/cgroup` has several lines and a blind `rsplit` could
+/// latch onto a v1 line's `::`-free tail and mis-resolve. Absent (v1-only host, unusual mount) → `None`,
+/// which every caller treats as "not delegated / best-effort" (fail-safe).
+fn current_v2_cgroup() -> Option<PathBuf> {
+    let cur = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = cur
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))?
+        .trim_start_matches('/');
+    Some(PathBuf::from("/sys/fs/cgroup").join(rel))
+}
+
 /// Default memory ceiling for a sandbox (512 MiB) — conservative but generous; `--memory` overrides.
 const DEFAULT_MEMORY_MAX: u64 = 536_870_912;
 /// Process-count ceiling — caps fork bombs.
@@ -33,15 +67,13 @@ pub fn apply_limits(
     pids_max: Option<u64>,
     io_max: &[String],
     io_weight: Option<u64>,
-) -> Option<PathBuf> {
+) -> Option<CgroupGuard> {
     // cgroup v2 presents a unified hierarchy with this file at the root.
     if !PathBuf::from("/sys/fs/cgroup/cgroup.controllers").exists() {
         return None;
     }
-    // The current cgroup path is the tail of the single `0::<path>` line in /proc/self/cgroup.
-    let cur = fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel = cur.trim().rsplit("::").next()?.trim_start_matches('/');
-    let parent = PathBuf::from("/sys/fs/cgroup").join(rel);
+    // The current cgroup dir (the `0::<path>` v2 line — matched explicitly, hybrid-host safe).
+    let parent = current_v2_cgroup()?;
     let child = parent.join(format!("kern-box-{tag}-{}", std::process::id()));
 
     // Make the controllers available to children. cgroup-v2 accepts several tokens in one write, so
@@ -152,7 +184,7 @@ pub fn apply_limits(
         let _ = fs::remove_dir(&child);
         return None;
     }
-    Some(child)
+    Some(CgroupGuard { dir: child })
 }
 
 /// Is a `memory.max`/`cpu.max`-style cap actually in force for the box — at THIS cgroup OR any
@@ -206,5 +238,44 @@ mod tests {
             "absent file = not capped"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cgroup_guard_removes_its_dir_on_drop() {
+        // The RAII cleanup: dropping the guard `rmdir`s the (empty) cgroup dir, so a box never leaks a
+        // `kern-box-*` cgroup. Use a real temp dir so `remove_dir` actually runs.
+        let d = std::env::temp_dir().join(format!("kern-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(d.exists());
+        {
+            let _g = CgroupGuard { dir: d.clone() };
+        } // guard dropped here
+        assert!(
+            !d.exists(),
+            "guard's Drop must remove the (empty) cgroup dir"
+        );
+    }
+
+    #[test]
+    fn cgroup_guard_drop_is_harmless_when_dir_is_gone() {
+        // An outer systemd `--collect` may remove the scope (and our dir) first — the guard's Drop must
+        // tolerate ENOENT, not panic.
+        let d = std::env::temp_dir().join(format!("kern-guard-gone-{}", std::process::id()));
+        let g = CgroupGuard { dir: d.clone() }; // dir never created
+        drop(g); // must not panic on ENOENT
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn current_v2_cgroup_is_read_from_the_0_prefixed_line() {
+        // Real host: a v2 or hybrid box has a `0::` line, so we resolve SOME dir under /sys/fs/cgroup;
+        // a pure-v1 host has none → None. Either way it must not panic and must never mis-resolve a v1
+        // line. (The parse is `strip_prefix("0::")` per line, not `rsplit("::")` on the whole blob.)
+        if let Some(p) = current_v2_cgroup() {
+            assert!(
+                p.starts_with("/sys/fs/cgroup"),
+                "must resolve under the cgroup root, got {p:?}"
+            );
+        }
     }
 }

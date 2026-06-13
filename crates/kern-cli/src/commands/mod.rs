@@ -1102,7 +1102,7 @@ pub fn run(
     // no-op and the best-effort in-process cgroup below applies the same caps.
     let cpus = clamp_cpus(cpus);
     reexec_in_scope_if_possible(memory, memory_swap_max, cpuset.as_deref(), cpus, None);
-    let _ = kern_isolation::apply_cgroup_limits(
+    let cg = kern_isolation::apply_cgroup_limits(
         "run",
         memory,
         memory_swap_max,
@@ -1112,6 +1112,12 @@ pub fn run(
         &[],  // no vdisk io limits in `kern run`
         None, // no --io-weight in `kern run`
     );
+    // `kern run` exec()s the workload IN PLACE — there is no supervisor left to reap it and drop the
+    // guard afterwards. The guard's Drop would `rmdir` the cgroup we're about to exec into, which is
+    // non-empty (we're in it) → EBUSY → a no-op anyway. Forget it so the intent is explicit: we do NOT
+    // tear down our own live cgroup here. (Same as the pre-guard behaviour — the `run` cgroup outlives
+    // this call; it's removed when the whole systemd scope / caller lifecycle is collected.)
+    std::mem::forget(cg);
     // Pin CPUs via affinity (works with no cgroup cpuset delegation), and apply a profile's `nice`.
     kern_isolation::set_cpu_affinity(cpuset.as_deref());
     if let Some(n) = nice {

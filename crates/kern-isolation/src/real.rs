@@ -1586,7 +1586,11 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     let forwarders = crate::ports::fork_forwarders(ports);
 
     // Best-effort cgroup v2 cap (memory + PIDs) BEFORE namespacing, so the forked workload
-    // inherits it. Degrades gracefully where the hierarchy isn't delegated.
+    // inherits it. Degrades gracefully where the hierarchy isn't delegated. The returned guard owns
+    // the cgroup dir and removes it on drop; we bind it to `_cg` so it lives until this function
+    // returns — which is AFTER the `waitpid` below, when the box (and its PID-namespace descendants)
+    // are dead and the cgroup is empty, so the `rmdir` in `Drop` succeeds. Without this the scope-less
+    // fast path (no systemd `--collect`) would leak one cgroup dir per box.
     let _cg = crate::cgroup::apply_limits(
         &spec.hostname,
         spec.memory_max,
@@ -1762,8 +1766,10 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         forwarders.iter().for_each(|f| f.stop());
         return Ok(code);
     }
+    // Reap the box (EINTR-robust, so a signal can't return early and drop the cgroup guard on a
+    // still-live box → EBUSY leak).
     let mut status = 0i32;
-    let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+    let rc = reap_retry_eintr(pid, &mut status);
     forwarders.iter().for_each(|f| f.stop());
     if rc < 0 {
         return Err(Error::last("waitpid"));
@@ -1835,7 +1841,7 @@ fn pty_pump_and_wait(master: i32, pid: i32) -> i32 {
         }
     }
     let mut status = 0i32;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+    reap_retry_eintr(pid, &mut status);
     wait_code(status)
 }
 
@@ -2121,6 +2127,21 @@ pub fn run_pod_holder() -> ! {
     }
 }
 
+/// Blocking `waitpid(pid)` that retries on `EINTR`, writing the status through `status` and returning
+/// the raw `waitpid` return (`>= 0` = reaped, `< 0` = a real, non-EINTR error). A signal
+/// (SIGCHLD/SIGWINCH/…) can interrupt a blocking `waitpid` with the child STILL ALIVE — returning early
+/// there would leave the box unreaped (a zombie, and for the supervisor path a cgroup guard dropped on a
+/// non-empty cgroup → EBUSY leak). Looping until the child is actually reaped, or a non-EINTR error,
+/// makes every foreground reap robust. One helper so all reap sites share the same discipline.
+fn reap_retry_eintr(pid: i32, status: &mut i32) -> i32 {
+    loop {
+        let rc = unsafe { libc::waitpid(pid, status, 0) };
+        if rc >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return rc;
+        }
+    }
+}
+
 /// Decode a `waitpid` status into a shell-style exit code (128+signal if killed).
 fn wait_code(status: i32) -> i32 {
     if libc::WIFEXITED(status) {
@@ -2289,7 +2310,7 @@ pub fn exec_in_box(
                     // covers the (skipped-setsid) edge.
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                     unsafe { libc::kill(pid, libc::SIGKILL) };
-                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    reap_retry_eintr(pid, &mut status); // reap the killed probe (EINTR-robust, no zombie)
                     return Ok(124);
                 }
                 unsafe { libc::usleep(100_000) }; // 100 ms
@@ -2297,7 +2318,7 @@ pub fn exec_in_box(
             }
         }
         _ => {
-            if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+            if reap_retry_eintr(pid, &mut status) < 0 {
                 return Err(Error::last("waitpid"));
             }
             Ok(wait_code(status))
