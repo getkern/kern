@@ -4286,7 +4286,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     let tag = args
         .tag
         .filter(|t| !t.is_empty())
-        .ok_or(Error::Usage("kern build needs -t <name[:tag]>"))?;
+        .ok_or(Error::Usage("build needs -t <name[:tag]>"))?;
     let ctx = std::fs::canonicalize(args.context)
         .map_err(|e| Error::Build(format!("build context '{}': {e}", args.context)))?;
     if !ctx.is_dir() {
@@ -6288,6 +6288,43 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
     };
     let text = std::fs::read_to_string(&target)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
+    // `validate` must be STRICTER than `load`: the config parser deliberately SKIPS lines it can't
+    // model (forward-compat with foreign TOML), so a garbage file would otherwise pass as "valid, 0
+    // profiles". A validator's whole job is to catch broken syntax, so here we reject any non-blank,
+    // non-comment line that is neither a `[section]` header nor a `key = value` — the same thing a real
+    // TOML parser (and `kern compose`) would flag. (Deep help/command audit.)
+    let mut in_array = false; // inside a multi-line `key = [ … ]` value (its continuation lines are ok)
+    for (i, raw) in text.lines().enumerate() {
+        let line = kern_common::toml_lite::strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Track a multi-line array by net bracket balance across lines: a `key = [` with more `[` than
+        // `]` opens it; a line that closes the balance ends it. While open, continuation lines (values,
+        // inline tables `{…}`, a closing `]`) are legitimate and not checked as top-level statements.
+        let opens = line.matches('[').count();
+        let closes = line.matches(']').count();
+        if in_array {
+            if closes >= opens && line.contains(']') {
+                in_array = false;
+            }
+            continue;
+        }
+        let is_section = line.starts_with('[') && line.ends_with(']') && !line.contains('=');
+        let is_kv = line.contains('=');
+        if is_kv && opens > closes {
+            in_array = true; // `key = [` (array not closed on this line)
+            continue;
+        }
+        if !is_section && !is_kv {
+            return Err(Error::Config(format!(
+                "{}: line {}: not valid TOML — expected `[section]` or `key = value`, got `{}`",
+                target.display(),
+                i + 1,
+                line.chars().take(40).collect::<String>()
+            )));
+        }
+    }
     let cfg = crate::config::parse(&text)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
     let p = crate::ui::Palette::detect();
