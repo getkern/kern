@@ -152,10 +152,11 @@ pub fn banner() -> Result<(), Error> {
   {b}kern {ver}{z} {d}— a fast, lightweight sandbox & virtual resource manager{z}
 
     {b}kern box{z} <name> --image alpine -- sh   {d}run a command in a sandbox{z}
+    {b}kern box{z} app vcpu:heavy vdisk:data -- … {d}attach reusable resource profiles (see {z}{b}config{z}{d}){z}
     {b}kern run{z} --memory 512m -- <cmd>         {d}govern a command's CPU/memory (no sandbox){z}
     {b}kern ps{z} {d}·{z} {b}logs{z} {d}·{z} {b}exec{z} {d}·{z} {b}stop{z}            {d}manage running boxes{z}
     {b}kern pull{z} {d}·{z} {b}build{z} {d}·{z} {b}push{z} {d}·{z} {b}images{z}       {d}work with OCI images{z}
-    {b}kern compose{z} stack.yml                 {d}bring up a stack (docker-compose.yml too){z}
+    {b}kern compose{z} stack.yml                  {d}bring up a stack (docker-compose.yml too){z}
 
   {b}kern --help{z} {d}all commands{z} {d}·{z} {b}kern top{z} {d}live TUI{z} {d}·{z} {b}kern doctor{z} {d}check this host{z}
   {d}{z}{c}https://github.com/getkern/kern{z}",
