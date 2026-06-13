@@ -57,6 +57,17 @@ parser — each built dev → test → clean-code → security-audit (multi-agen
   to `kern-common`.
 
 ### Security
+- **seccomp: deny io_uring and the kernel keyring** — `io_uring_setup/enter/register` (a large,
+  historically bug-rich async-I/O surface behind real container-escape CVEs) and
+  `add_key/request_key/keyctl` are now in the always-on box denylist, matching Docker's default
+  profile / gVisor. A sandboxed workload never needs them. A regression test pins the critical set.
+- **box `--ssh`: disable TCP/tunnel forwarding** — the throwaway sshd now sets `AllowTcpForwarding no`,
+  `PermitTunnel no`, `GatewayPorts no`, so a login can't port-forward out of the box (it already binds
+  loopback-only inside the box netns, uses pubkey-only auth, and modern ciphers).
+- **`--secret NAME=value` warning is honest about persistence** — the inline form is not only visible
+  in `ps` (ephemeral) but recorded in the systemd journal on the cgroup-scope re-exec, where it
+  outlives the box. The warning now says so and steers to `NAME=-` (stdin) or a file, which never hit
+  argv.
 - **push: refuse a cross-host upload redirect** — an untrusted registry answering the blob-upload
   `POST` with an absolute `Location:` on another host could exfiltrate the auth token / `kern login`
   credentials and the private layer to that host (CVE-2020-15157 class). The Location is now required

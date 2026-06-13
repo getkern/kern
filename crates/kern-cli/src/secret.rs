@@ -2,7 +2,8 @@
 //! writing it to the box's image or leaving it in the workload's environment.
 //!
 //! Three source forms (Docker-ish), disambiguated host-side:
-//! * `NAME=value` — an inline literal (handy, but visible in the host's `ps`; prefer a file/stdin for
+//! * `NAME=value` — an inline literal (handy, but visible in the host's `ps` AND recorded in the
+//!   systemd journal on the cgroup-scope re-exec, so it outlives the box; prefer a file/stdin for
 //!   real secrets);
 //! * `NAME=-` — read the value from kern's **stdin** (never hits `argv` or the process table);
 //! * `SRC[:NAME]` — read a host **file** (`NAME` defaults to the file's basename). A world-writable
@@ -36,54 +37,56 @@ pub fn parse_secrets(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>, Error> 
     for spec in specs {
         // A `NAME=…` form (inline or stdin) takes precedence over the file form, so a value that
         // happens to contain `:` is not misread as a filename. A leading `/` is always a file.
-        let (name, bytes) = if let Some((k, v)) =
-            spec.split_once('=').filter(|_| !spec.starts_with('/'))
-        {
-            if !valid_name(k) {
-                return Err(name_err(k));
-            }
-            if v == "-" {
-                if stdin_used {
-                    return Err(Error::Sandbox(
-                        "--secret: only one value can be read from stdin ('-')".into(),
-                    ));
+        let (name, bytes) =
+            if let Some((k, v)) = spec.split_once('=').filter(|_| !spec.starts_with('/')) {
+                if !valid_name(k) {
+                    return Err(name_err(k));
                 }
-                stdin_used = true;
-                let mut buf = Vec::new();
-                std::io::stdin()
-                    .read_to_end(&mut buf)
-                    .map_err(|e| Error::Sandbox(format!("--secret {k}=-: reading stdin: {e}")))?;
-                (k.to_string(), buf)
-            } else {
-                // Inline value: convenient, but it sits in THIS process's argv, so it is visible
-                // in `ps` / `/proc/<pid>/cmdline` — and a detached box's supervisor keeps it there
-                // for the box's whole lifetime. Warn and steer to the forms that never hit argv.
-                eprintln!(
-                        "kern: warning: --secret {k}=<value> is visible in `ps` for the box's lifetime; \
+                if v == "-" {
+                    if stdin_used {
+                        return Err(Error::Sandbox(
+                            "--secret: only one value can be read from stdin ('-')".into(),
+                        ));
+                    }
+                    stdin_used = true;
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf).map_err(|e| {
+                        Error::Sandbox(format!("--secret {k}=-: reading stdin: {e}"))
+                    })?;
+                    (k.to_string(), buf)
+                } else {
+                    // Inline value: convenient, but it sits in THIS process's argv, so it is visible in
+                    // `ps` / `/proc/<pid>/cmdline` for the box's lifetime — AND, when kern re-execs under a
+                    // systemd `--user` scope for cgroup caps, the argv is recorded in the systemd unit /
+                    // journal, where it PERSISTS after the box exits (a hacker-mode audit surfaced this
+                    // beyond the ephemeral `ps` exposure). Warn honestly and steer to the argv-free forms.
+                    eprintln!(
+                    "kern: warning: --secret {k}=<value> is visible in `ps` and recorded in the \
+                         systemd journal (persists after the box exits); \
                          prefer '{k}=-' (read from stdin) or a file ('SRC:{k}')"
-                    );
-                (k.to_string(), v.as_bytes().to_vec())
-            }
-        } else {
-            // File form `SRC[:NAME]`. `NAME` (if given) is the last `:`-segment; the rest is the path
-            // (so an absolute path keeps working — only a trailing `:name` is peeled off).
-            let (src, name) = match spec.rsplit_once(':') {
-                Some((s, n)) if valid_name(n) && !s.is_empty() => (s, n.to_string()),
-                _ => {
-                    let base = spec
-                        .rsplit('/')
-                        .next()
-                        .filter(|b| !b.is_empty())
-                        .unwrap_or("secret");
-                    (spec.as_str(), base.to_string())
+                );
+                    (k.to_string(), v.as_bytes().to_vec())
                 }
+            } else {
+                // File form `SRC[:NAME]`. `NAME` (if given) is the last `:`-segment; the rest is the path
+                // (so an absolute path keeps working — only a trailing `:name` is peeled off).
+                let (src, name) = match spec.rsplit_once(':') {
+                    Some((s, n)) if valid_name(n) && !s.is_empty() => (s, n.to_string()),
+                    _ => {
+                        let base = spec
+                            .rsplit('/')
+                            .next()
+                            .filter(|b| !b.is_empty())
+                            .unwrap_or("secret");
+                        (spec.as_str(), base.to_string())
+                    }
+                };
+                if !valid_name(&name) {
+                    return Err(name_err(&name));
+                }
+                let bytes = read_secret_file(src)?;
+                (name, bytes)
             };
-            if !valid_name(&name) {
-                return Err(name_err(&name));
-            }
-            let bytes = read_secret_file(src)?;
-            (name, bytes)
-        };
         if out.iter().any(|(n, _)| n == &name) {
             return Err(Error::Sandbox(format!("--secret: duplicate name '{name}'")));
         }

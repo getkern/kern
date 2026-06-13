@@ -108,6 +108,7 @@ pub fn setup(ssh: &SshSetup) {
          AuthorizedKeysFile /run/kern-ssh/authorized_keys\nPermitRootLogin yes\n\
          PasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n\
          PermitEmptyPasswords no\nX11Forwarding no\nAllowAgentForwarding no\nPrintMotd no\n\
+         AllowTcpForwarding no\nPermitTunnel no\nGatewayPorts no\n\
          StrictModes no\nUseDNS no\nLogLevel ERROR\nPidFile none\n\
          Ciphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\n\
          MACs hmac-sha2-256-etm@openssh.com\n",
