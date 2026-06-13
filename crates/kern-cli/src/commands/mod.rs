@@ -3378,7 +3378,11 @@ pub fn recover() -> Result<(), Error> {
             // A live box's `rootfs` is its `.../merged` dir; if none matches, this scratch is orphaned.
             if !live_scratch.contains(&merged.to_string_lossy().into_owned()) && path.is_dir() {
                 freed += dir_size(&path);
-                if std::fs::remove_dir_all(&path).is_ok() {
+                // Use the chmod-then-remove force cleaner: an overlay leaves a mode-000 `work/work`
+                // dir that plain `remove_dir_all` can't traverse (Permission denied) — the bug that made
+                // recover a silent no-op while orphans piled up. `gc`/`prune` already use this helper.
+                remove_build_tree(&path);
+                if !path.exists() {
                     recovered += 1;
                 }
             }
