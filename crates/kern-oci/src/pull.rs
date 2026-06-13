@@ -611,9 +611,13 @@ fn extract_layer(
         return Err(e);
     }
 
+    // Detect the codec from the verified bytes (gzip / zstd / uncompressed) ONCE, and reuse it for
+    // both the vet and the extract so they can never disagree.
+    let comp = detect_compression(&tmp);
+
     // HARDENING: vet the layer BEFORE writing anything to disk — reject path traversal, absolute
     // members, device nodes, and oversized (decompression-bomb) layers.
-    if let Err(e) = check_layer_safe(&tmp) {
+    if let Err(e) = check_layer_safe(&tmp, comp) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -633,21 +637,71 @@ fn extract_layer(
     // reason. `--no-same-owner` still maps ownership to the extracting user (we don't want the image's
     // raw uids on the host); the tar vetter already rejected setuid/device nodes, so preserving modes is
     // safe (a setuid bit on a rootfs file is inert anyway — the box root mount is MS_NOSUID).
-    let status = Command::new("tar")
-        .args([
-            "-xzf",
-            &tmp_s,
-            "-C",
-            &staging_s,
-            "--no-same-owner",
-            "--same-permissions",
-        ])
-        .status()
-        .map_err(|e| OciError::Tool("tar", e.to_string()))?;
-    let _ = std::fs::remove_file(&tmp);
-    if !status.success() {
+    // Extract with the codec detected above. gzip → tar's own `-z`; plain → no decompressor (`-xf`);
+    // zstd → pipe `zstd -dc` into `tar -xf -` rather than relying on `tar --zstd`, which BusyBox/musl
+    // edge builds often lack even when a standalone `zstd` is present. `--no-same-owner`
+    // `--same-permissions` are preserved on every path (see the mode-preservation note above).
+    let extract_err = |e: OciError| -> OciError {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(OciError::Extract(format!("tar exit {:?}", status.code())));
+        e
+    };
+    let ok = match comp {
+        Compression::Gzip | Compression::Plain => {
+            let flag = if matches!(comp, Compression::Gzip) {
+                "-xzf"
+            } else {
+                "-xf"
+            };
+            Command::new("tar")
+                .args([
+                    flag,
+                    &tmp_s,
+                    "-C",
+                    &staging_s,
+                    "--no-same-owner",
+                    "--same-permissions",
+                ])
+                .status()
+                .map_err(|e| OciError::Tool("tar", e.to_string()))
+                .map(|s| s.success())
+        }
+        Compression::Zstd => {
+            if !zstd_available() {
+                return Err(extract_err(zstd_missing()));
+            }
+            // zstd -dc <tmp>  |  tar -xf -  -C staging …
+            let mut z = Command::new("zstd")
+                .args(["-dc", &tmp_s])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| zstd_missing())
+                .map_err(extract_err)?;
+            let zout = z.stdout.take().expect("zstd stdout piped");
+            let tar_status = Command::new("tar")
+                .args([
+                    "-xf",
+                    "-",
+                    "-C",
+                    &staging_s,
+                    "--no-same-owner",
+                    "--same-permissions",
+                ])
+                .stdin(zout)
+                .status()
+                .map_err(|e| OciError::Tool("tar", e.to_string()));
+            let zcode = z.wait().map(|s| s.success()).unwrap_or(false);
+            tar_status.map(|s| s.success() && zcode)
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    let succeeded = match ok {
+        Ok(s) => s,
+        Err(e) => return Err(extract_err(e)),
+    };
+    if !succeeded {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(OciError::Extract("layer extraction failed".into()));
     }
     let merged = merge_layer(&staging, dest);
     let _ = std::fs::remove_dir_all(&staging);
@@ -784,6 +838,57 @@ fn tar_is_gnu() -> bool {
     })
 }
 
+/// How a layer blob is compressed. Detected from the blob's leading magic bytes (never from the
+/// manifest's declared media type, which can lie or be omitted), so the codec is decided by the
+/// actual, already-sha256-verified bytes. `Plain` is an uncompressed tar (`…tar`, no `+gzip`/`+zstd`)
+/// — accepting it also fixes a latent gap where uncompressed OCI layers failed the gzip-only path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Compression {
+    Gzip,
+    Zstd,
+    Plain,
+}
+
+/// Sniff a (verified, on-disk) layer blob's compression from its first bytes: gzip = `1f 8b`, zstd =
+/// `28 b5 2f fd`, anything else = an uncompressed tar. Reads at most 4 bytes; a short/empty read is
+/// treated as `Plain` (tar then errors cleanly). Called only AFTER `verify_digest`, so the content is
+/// authentic — sniffing adds no attack surface.
+fn detect_compression(path: &Path) -> Compression {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut buf))
+        .unwrap_or(0);
+    match &buf[..n] {
+        [0x1f, 0x8b, ..] => Compression::Gzip,
+        [0x28, 0xb5, 0x2f, 0xfd] => Compression::Zstd,
+        _ => Compression::Plain,
+    }
+}
+
+/// Is a `zstd` decompressor available? Probed once, mirroring [`tar_is_gnu`]. Used to give a specific
+/// "install zstd" error BEFORE spawning, rather than a cryptic spawn failure, when a zstd-compressed
+/// image is pulled on a host without it (common on BusyBox/musl edge boards).
+fn zstd_available() -> bool {
+    use std::sync::OnceLock;
+    static Z: OnceLock<bool> = OnceLock::new();
+    *Z.get_or_init(|| {
+        Command::new("zstd")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// The specific, actionable error when a zstd layer is pulled without `zstd` installed.
+fn zstd_missing() -> OciError {
+    OciError::Tool(
+        "zstd",
+        "this image uses zstd-compressed layers but `zstd` is not installed".into(),
+    )
+}
+
 /// Vet a downloaded layer tarball before extraction by reading its RAW tar headers in-process
 /// (`gzip -dc` does ONLY the decompression). We deliberately do NOT parse `tar -tv`'s human-readable
 /// text: it is locale-dependent and can be desynced by a member name that contains the ` -> ` /
@@ -793,18 +898,44 @@ fn tar_is_gnu() -> bool {
 /// target (on non-GNU tar), device/special nodes, a total uncompressed size over the 2 GiB bomb cap,
 /// and an entry count over the inode cap. (Cross-layer symlink escapes are additionally handled
 /// structurally by isolated staging + no-follow merge in [`merge_layer`].)
-fn check_layer_safe(tar_path: &Path) -> Result<(), OciError> {
-    let mut child = Command::new("gzip")
-        .args(["-dc", &tar_path.to_string_lossy()])
+fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(), OciError> {
+    let path = tar_path.to_string_lossy();
+    // Plain (uncompressed) tar: vet the file directly, no decompressor process.
+    if comp == Compression::Plain {
+        let mut f = std::fs::File::open(tar_path).map_err(|e| OciError::Extract(e.to_string()))?;
+        return vet_tar_stream(&mut f, tar_is_gnu());
+    }
+    // gzip / zstd: the decompressor does ONLY the decompression; `vet_tar_stream` (the fuzzed core)
+    // reads the DECOMPRESSED stream and is codec-agnostic — so the entire hardening surface (bomb
+    // caps, symlink/whiteout/device guards) is identical regardless of codec.
+    let (bin, args) = match comp {
+        Compression::Gzip => ("gzip", ["-dc", &path]),
+        Compression::Zstd => {
+            if !zstd_available() {
+                return Err(zstd_missing());
+            }
+            ("zstd", ["-dc", &path])
+        }
+        Compression::Plain => unreachable!(),
+    };
+    let mut child = Command::new(bin)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+        .map_err(|e| {
+            if bin == "zstd" {
+                zstd_missing()
+            } else {
+                OciError::Tool("gzip", e.to_string())
+            }
+        })?;
     let mut stdout = child.stdout.take().expect("stdout piped");
     let res = vet_tar_stream(&mut stdout, tar_is_gnu());
-    // We stop reading at the end-of-archive marker (or on rejection), so gzip may take a SIGPIPE — its
-    // exit status isn't meaningful here. Truncation/corruption is caught inside `vet_tar_stream` (a
-    // short read before the end-of-archive marker is an error), so a cut-off unsafe member can't slip.
+    // We stop reading at the end-of-archive marker (or on rejection), so the decompressor may take a
+    // SIGPIPE — its exit status isn't meaningful here. Truncation/corruption is caught inside
+    // `vet_tar_stream` (a short read before the end-of-archive marker is an error), so a cut-off unsafe
+    // member can't slip.
     let _ = child.kill();
     let _ = child.wait();
     res
@@ -1555,6 +1686,91 @@ mod tests {
         Command::new("tar").arg("--version").output().is_ok()
     }
 
+    #[test]
+    fn detect_compression_reads_magic_bytes() {
+        let d = std::env::temp_dir().join(format!("kern-comp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let write = |name: &str, bytes: &[u8]| {
+            let p = d.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        assert!(matches!(
+            detect_compression(&write("g", &[0x1f, 0x8b, 0x08, 0x00])),
+            Compression::Gzip
+        ));
+        assert!(matches!(
+            detect_compression(&write("z", &[0x28, 0xb5, 0x2f, 0xfd])),
+            Compression::Zstd
+        ));
+        // A ustar (uncompressed tar) or anything else → Plain, never a panic.
+        assert!(matches!(
+            detect_compression(&write("t", b"someth")),
+            Compression::Plain
+        ));
+        // A full 2-byte gzip magic is still detected even in a tiny file.
+        assert!(matches!(
+            detect_compression(&write("g2", &[0x1f, 0x8b])),
+            Compression::Gzip
+        ));
+        // A truncated (<2-byte) or empty file must not panic and falls to Plain.
+        assert!(matches!(
+            detect_compression(&write("s", &[0x1f])),
+            Compression::Plain
+        ));
+        assert!(matches!(
+            detect_compression(&write("e", &[])),
+            Compression::Plain
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn have_zstd() -> bool {
+        Command::new("zstd").arg("--version").output().is_ok()
+    }
+
+    /// A zstd-compressed layer must pass the SAME vetter as gzip (codec-agnostic hardening): build a
+    /// benign tar, zstd-compress it, and confirm `check_layer_safe` accepts it. Skips where `zstd` or
+    /// `tar` is absent (edge boards).
+    #[test]
+    fn zstd_layer_passes_the_vetter() {
+        if !have_tar() || !have_zstd() {
+            eprintln!("skip: no tar/zstd");
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("kern-zstd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        std::fs::write(d.join("hello.txt"), b"hi").unwrap();
+        // tar the benign file, then zstd it → layer.tar.zst
+        let tar_path = d.join("layer.tar");
+        assert!(Command::new("tar")
+            .args([
+                "-cf",
+                &tar_path.to_string_lossy(),
+                "-C",
+                &d.to_string_lossy(),
+                "hello.txt"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let zst_path = d.join("layer.tar.zst");
+        assert!(Command::new("zstd")
+            .args([
+                "-q",
+                "-f",
+                &tar_path.to_string_lossy(),
+                "-o",
+                &zst_path.to_string_lossy()
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(matches!(detect_compression(&zst_path), Compression::Zstd));
+        assert!(check_layer_safe(&zst_path, Compression::Zstd).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A layer whose member path is absolute (traversal class) must be rejected before extraction.
     #[test]
     fn rejects_absolute_path_layer() {
@@ -1575,7 +1791,7 @@ mod tests {
             .unwrap_or(false);
         if ok {
             assert!(
-                check_layer_safe(&evil).is_err(),
+                check_layer_safe(&evil, Compression::Gzip).is_err(),
                 "an absolute-path layer must be rejected"
             );
         }
@@ -1966,7 +2182,7 @@ mod tests {
             .unwrap_or(false);
         if ok {
             assert!(
-                check_layer_safe(&good).is_ok(),
+                check_layer_safe(&good, Compression::Gzip).is_ok(),
                 "a normal layer should pass"
             );
         }

@@ -80,9 +80,12 @@ impl Error {
 fn oci_hint(msg: &str) -> String {
     if msg.starts_with("bad image reference") {
         "image refs look like `alpine`, `alpine:3.19`, or `ghcr.io/user/app:tag`".into()
-    } else if msg.contains("curl failed") || msg.contains("tar failed") || msg.contains("sha256sum")
+    } else if msg.contains("curl failed")
+        || msg.contains("tar failed")
+        || msg.contains("sha256sum")
+        || msg.contains("zstd")
     {
-        "pull/push need `curl`, GNU `tar`, `gzip` and `sha256sum` on PATH, plus a working network"
+        "pull/push need `curl`, GNU `tar`, `gzip`, `sha256sum` (and `zstd` for zstd-compressed images) on PATH, plus a working network"
             .into()
     } else {
         // Registry / manifest / not-found: the name or tag is the likely culprit.
@@ -123,6 +126,11 @@ mod tests {
         // A tool failure → the tooling hint.
         assert!(oci_hint("curl failed: exit 6").contains("curl"));
         assert!(oci_hint("tar failed: bad header").contains("tar"));
+        // A zstd-compressed image without the `zstd` tool → the tooling hint names zstd.
+        assert!(oci_hint(
+            "zstd failed: this image uses zstd-compressed layers but `zstd` is not installed"
+        )
+        .contains("zstd"));
         // A bad reference → the ref-format hint, not tooling.
         let r = oci_hint("bad image reference: alpine::");
         assert!(r.contains("image refs"));
