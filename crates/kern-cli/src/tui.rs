@@ -727,7 +727,7 @@ fn new_volume_form() -> Form {
         title: "new volume".into(),
         fields: vec![
             Field::text("name", "e.g. data"),
-            Field::text("size", "optional quota, e.g. 2g"),
+            Field::text("size", "optional quota, e.g. 2g (blank = unlimited)"),
         ],
         active: 0,
         submit: Submit::CreateVolume,
@@ -740,7 +740,7 @@ fn edit_volume_form(v: &crate::volume::VolInfo) -> Form {
     let size = v.quota.map(bytes_to_size_str).unwrap_or_default();
     let mut fields = vec![
         Field::text("name", "volume name"),
-        Field::text("size", "quota, e.g. 2g (blank = none)"),
+        Field::text("size", "quota, e.g. 2g (blank = unlimited)"),
     ];
     set_field(&mut fields, "name", v.name.clone());
     set_field(&mut fields, "size", size);
@@ -917,7 +917,10 @@ fn delete_profile(section: &str, name: &str) -> Result<(), String> {
 
 /// The detail text shown in the Volumes inspect overlay.
 fn volume_detail(v: &crate::volume::VolInfo) -> String {
-    let quota = v.quota.map_or_else(|| "none".to_string(), human_bytes);
+    let quota = v.quota.map_or_else(
+        || "∞ (unlimited — grows until the disk is full)".to_string(),
+        human_bytes,
+    );
     format!(
         "volume '{}'\n\n  data used   {}\n  quota       {}\n  mount with  -v {}:/path[:ro]",
         v.name,
@@ -1510,12 +1513,24 @@ fn storage_table(
     let shown = vols.len().min(max_rows);
     for (i, v) in vols[..shown].iter().enumerate() {
         let (lead, col) = sel_marker(p, i == sel);
-        let quota = v.quota.map_or("-".into(), human_bytes);
+        // No quota = UNLIMITED (the volume can grow until the disk is full). A bare `-` read as
+        // "unset/error"; `∞` says "no cap" at a glance (the `?` help and the create form spell it out).
+        // `∞` is one glyph but 3 bytes, and the `{d}…{z}` colour codes add more — so pad to a fixed
+        // 10-col field BY HAND (visible width), since `{:>10}` would count bytes and misalign.
+        let (quota_txt, quota_render) = match v.quota {
+            Some(q) => {
+                let t = human_bytes(q);
+                (t.clone(), t)
+            }
+            None => ("∞".to_string(), format!("{d}∞{z}")),
+        };
+        let pad = 10usize.saturating_sub(quota_txt.chars().count());
         s.push_str(&format!(
-            "  {lead}{col}{:<24}{z}  {:>10}  {:>10}\n",
+            "  {lead}{col}{:<24}{z}  {:>10}  {}{}\n",
             trunc(&v.name, 24),
             human_bytes(v.size),
-            quota
+            " ".repeat(pad),
+            quota_render
         ));
     }
     if shown < vols.len() {
@@ -1742,6 +1757,28 @@ mod tests {
             !out.contains("Overview ("),
             "Overview must NOT carry a count"
         );
+    }
+
+    #[test]
+    fn storage_shows_infinity_for_unlimited_quota() {
+        // A volume with no quota is UNLIMITED — show `∞`, not an ambiguous `-`. A capped one shows the
+        // human size. (The bug: `-` read as "unset/error" instead of "no cap".)
+        let vols = [
+            crate::volume::VolInfo {
+                name: "boundless".into(),
+                size: 11,
+                quota: None,
+            },
+            crate::volume::VolInfo {
+                name: "capped".into(),
+                size: 0,
+                quota: Some(2 * 1024 * 1024 * 1024),
+            },
+        ];
+        let out = storage_table(&plain(), &vols, 10, 0);
+        assert!(out.contains('∞'), "unlimited quota shows ∞: {out}");
+        assert!(!out.contains(" - "), "no bare dash for the quota column");
+        assert!(out.contains("2G"), "a capped quota shows its size");
     }
 
     #[test]

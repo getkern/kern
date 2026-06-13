@@ -659,11 +659,15 @@ fn list() -> Result<(), Error> {
         z = p.z
     );
     for v in entries() {
-        let quota = v.quota.map_or_else(|| "-".to_string(), human_bytes);
+        // No quota = UNLIMITED → `∞` (not a bare `-`, which reads as unset/error). `∞` is 1 glyph but
+        // 3 bytes, so right-pad to 10 columns by VISIBLE width (chars), not `{:>10}` (bytes).
+        let quota = v.quota.map_or_else(|| "∞".to_string(), human_bytes);
+        let qpad = 10usize.saturating_sub(quota.chars().count());
         println!(
-            "{b}{c}{:<28}{z} {:>10} {d}{:>10}{z}",
+            "{b}{c}{:<28}{z} {:>10} {d}{}{}{z}",
             v.name,
             human_bytes(v.size),
+            " ".repeat(qpad),
             quota,
             b = p.b,
             c = p.c,
