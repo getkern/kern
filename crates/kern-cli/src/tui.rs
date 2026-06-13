@@ -1515,22 +1515,20 @@ fn storage_table(
         let (lead, col) = sel_marker(p, i == sel);
         // No quota = UNLIMITED (the volume can grow until the disk is full). A bare `-` read as
         // "unset/error"; `∞` says "no cap" at a glance (the `?` help and the create form spell it out).
-        // `∞` is one glyph but 3 bytes, and the `{d}…{z}` colour codes add more — so pad to a fixed
-        // 10-col field BY HAND (visible width), since `{:>10}` would count bytes and misalign.
-        let (quota_txt, quota_render) = match v.quota {
-            Some(q) => {
-                let t = human_bytes(q);
-                (t.clone(), t)
-            }
-            None => ("∞".to_string(), format!("{d}∞{z}")),
+        // `kern_common::pad_visible` right-pads by COLUMN width (`∞` is 1 col / 3 bytes) — the colour is
+        // applied AFTER padding so the zero-width codes don't count. Same helper as `kern volume ls`.
+        let quota_plain = v.quota.map_or_else(|| "∞".to_string(), human_bytes);
+        let padded = kern_common::pad_visible(&quota_plain, 10);
+        let quota_cell = if v.quota.is_none() {
+            padded.replace('∞', &format!("{d}∞{z}")) // colour the glyph, keep the pad
+        } else {
+            padded
         };
-        let pad = 10usize.saturating_sub(quota_txt.chars().count());
         s.push_str(&format!(
-            "  {lead}{col}{:<24}{z}  {:>10}  {}{}\n",
+            "  {lead}{col}{:<24}{z}  {:>10}  {}\n",
             trunc(&v.name, 24),
             human_bytes(v.size),
-            " ".repeat(pad),
-            quota_render
+            quota_cell
         ));
     }
     if shown < vols.len() {

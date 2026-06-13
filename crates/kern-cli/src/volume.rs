@@ -660,15 +660,14 @@ fn list() -> Result<(), Error> {
     );
     for v in entries() {
         // No quota = UNLIMITED → `∞` (not a bare `-`, which reads as unset/error). `∞` is 1 glyph but
-        // 3 bytes, so right-pad to 10 columns by VISIBLE width (chars), not `{:>10}` (bytes).
+        // 3 bytes; `kern_common::pad_visible` right-pads to 10 COLUMNS (not `{:>10}`, which counts bytes
+        // and would misalign). Same helper as the `kern top` Storage tab, so the two can't drift.
         let quota = v.quota.map_or_else(|| "∞".to_string(), human_bytes);
-        let qpad = 10usize.saturating_sub(quota.chars().count());
         println!(
-            "{b}{c}{:<28}{z} {:>10} {d}{}{}{z}",
+            "{b}{c}{:<28}{z} {:>10} {d}{}{z}",
             v.name,
             human_bytes(v.size),
-            " ".repeat(qpad),
-            quota,
+            kern_common::pad_visible(&quota, 10),
             b = p.b,
             c = p.c,
             d = p.d,
