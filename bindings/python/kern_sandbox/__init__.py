@@ -64,6 +64,7 @@ _DEFAULT_IMAGE = "python:3.12-slim"
 
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
 _DEPS_DIR = ".deps"  # pip --target dir inside the workspace (added to PYTHONPATH for run_code)
+_ENV_FILE = ".kern-env"  # host-side 0600 env file (kept out of argv so values don't show in `ps`)
 
 # Host paths a `-v` mount must never target — mounting the host's real root/config/secrets into a
 # sandbox defeats the point; the docker socket is the classic escape. A footgun guard: refused even
@@ -334,8 +335,26 @@ class Sandbox:
         merged_env = dict(self.env or {})
         # Deps installed by `setup` live in <workspace>/.deps — put them on PYTHONPATH for run_code.
         merged_env.setdefault("PYTHONPATH", f"{_WORKSPACE}/{_DEPS_DIR}")
-        for k, v in merged_env.items():
-            argv += ["--env", f"{k}={v}"]
+        # Pass the workload env via a private --env-file, NOT `--env K=V` on argv: an argv value is
+        # visible in `ps` / /proc/<pid>/cmdline to any local user for the box's lifetime, and this
+        # component's whole point is running untrusted code beside sensitive data (a credential in
+        # `env=` would leak). The file lives in our own 0700 mkdtemp workspace, written 0600, so it is
+        # not readable by other users; kern reads it before the box's env is set up. (Hacker-mode audit.)
+        if merged_env:
+            env_path = os.path.join(self._ws, _ENV_FILE)
+            fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                # K=V lines; values are single-line by construction (a NUL is rejected in _spawn, and a
+                # newline in a value would split the record — reject it here so it can't smuggle a var).
+                lines = []
+                for k, v in merged_env.items():
+                    if "\n" in k or "\n" in v or "\0" in k or "\0" in v:
+                        raise SandboxError(f"env var {k!r} must not contain a newline or NUL")
+                    lines.append(f"{k}={v}\n")
+                os.write(fd, "".join(lines).encode())
+            finally:
+                os.close(fd)
+            argv += ["--env-file", env_path]
         return argv
 
     def _spawn(self, command: Sequence[str], *, network: bool, timeout_s: int, is_setup: bool = False) -> ExecutionResult:
