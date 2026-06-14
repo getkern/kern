@@ -74,15 +74,34 @@ pub struct ImageConfig {
 /// Pull `image` into `dest` (created if needed), producing a usable rootfs, and return its OCI
 /// runtime config (entrypoint/cmd/env/workdir/user). Progress is reported to **stderr** (so stdout
 /// stays clean) — the user always sees what's happening, never a silent hang.
-pub fn pull(image: &str, dest: &Path) -> Result<ImageConfig, OciError> {
-    eprintln!("→ resolving {image} ({})", current_arch());
+pub fn pull(
+    image: &str,
+    dest: &Path,
+    platform: Option<&Platform>,
+) -> Result<ImageConfig, OciError> {
+    let host = Platform::host();
+    let want = platform.unwrap_or(&host);
+    eprintln!("→ resolving {image} ({}/{})", want.os, want.arch);
     let (registry, repo, reference) = parse_ref(image)?;
     let auth = discover_auth(&registry, &repo)?;
 
     let manifest = fetch_manifest(&registry, &repo, &reference, &auth)?;
     let manifest = if is_manifest_list(&manifest) {
-        let digest = select_arch_digest(&manifest)
-            .ok_or_else(|| OciError::Registry(format!("no manifest for {}", current_arch())))?;
+        // Select the requested arch EXACTLY — no wrong-arch fallback. Under an explicit `--platform`
+        // that would silently pull the wrong image; even by default it's safer to error with the list
+        // of available arches than to hand back a mismatched rootfs.
+        let digest = select_arch_digest(&manifest, want).ok_or_else(|| {
+            let avail = available_arches(&manifest);
+            OciError::Registry(if avail.is_empty() {
+                format!("no linux/{} manifest in the index", want.arch)
+            } else {
+                format!(
+                    "no linux/{} manifest — available: {}",
+                    want.arch,
+                    avail.join(", ")
+                )
+            })
+        })?;
         fetch_manifest(&registry, &repo, &digest, &auth)?
     } else {
         manifest
@@ -242,11 +261,69 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     }
 }
 
-fn current_arch() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "amd64"
+/// A target platform for an image (`os/arch`), used to select a manifest from a multi-arch index and
+/// to stamp the arch on push. kern models the two arches it runs on (amd64/arm64) and OS `linux`;
+/// arm variants (v7/v8) are not selected (a documented limitation). One type so the host default, the
+/// `--platform` override, and the push stamp can't drift into three different notions of "arch".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Platform {
+    pub os: String,
+    pub arch: String,
+}
+
+impl Platform {
+    /// This host's platform: `linux` + the compile-time arch (arm64 on aarch64, else amd64).
+    pub fn host() -> Self {
+        Platform {
+            os: "linux".into(),
+            arch: if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "amd64"
+            }
+            .into(),
+        }
+    }
+
+    /// Parse a `--platform` string: `os/arch` or a bare `arch` (⇒ `linux/arch`). Arch aliases are
+    /// normalised (`x86_64`/`x86-64`→`amd64`, `aarch64`/`arm64v8`→`arm64`). A 3-part `os/arch/variant`
+    /// (e.g. `linux/arm/v7`) is rejected legibly — kern doesn't select variants. An unknown arch is
+    /// allowed through (the registry error then lists the available arches); a non-`linux` OS is rejected.
+    pub fn parse(s: &str) -> Result<Self, OciError> {
+        let s = s.trim().to_ascii_lowercase();
+        let parts: Vec<&str> = s.split('/').collect();
+        let (os, arch) = match parts.as_slice() {
+            [a] => ("linux", *a),
+            [o, a] => (*o, *a),
+            _ => {
+                return Err(OciError::Ref(format!(
+                    "platform '{s}': use os/arch (e.g. linux/arm64); variants (arm/v7) aren't supported"
+                )))
+            }
+        };
+        if os != "linux" {
+            return Err(OciError::Ref(format!(
+                "platform '{s}': only linux is supported"
+            )));
+        }
+        let arch = match arch {
+            "x86_64" | "x86-64" | "amd64" => "amd64",
+            "aarch64" | "arm64" | "arm64v8" => "arm64",
+            other => other,
+        };
+        Ok(Platform {
+            os: os.into(),
+            arch: arch.into(),
+        })
+    }
+
+    /// Is this the host platform? (A host-equal `--platform` is a no-op — the normal native pull.)
+    pub fn is_host(&self) -> bool {
+        *self == Platform::host()
+    }
+
+    pub fn as_oci_arch(&self) -> &str {
+        &self.arch
     }
 }
 
@@ -1435,11 +1512,11 @@ fn is_manifest_list(m: &str) -> bool {
     m.contains("\"manifests\"") || m.contains("manifest.list") || m.contains("image.index")
 }
 
-/// Pick the layer-bearing manifest digest for this host's arch from a manifest list / index.
-fn select_arch_digest(m: &str) -> Option<String> {
-    let arch = current_arch();
+/// Pick the layer-bearing manifest digest for `want.arch` (+ os linux) from a manifest list / index.
+/// EXACT match only — returns `None` if the requested arch isn't in the index (the caller then errors
+/// with the available arches), never a wrong-arch fallback.
+fn select_arch_digest(m: &str, want: &Platform) -> Option<String> {
     let manifests = array_after(m, "manifests")?;
-    let mut fallback = None;
     for obj in split_objects(manifests) {
         // Match on a whitespace-stripped copy so a pretty-printed index (`"architecture": "amd64"`)
         // works as well as Docker Hub's compact form. Digest extraction uses the original `obj`.
@@ -1447,15 +1524,33 @@ fn select_arch_digest(m: &str) -> Option<String> {
         if compact.contains("\"unknown\"") {
             continue; // attestation / provenance entries
         }
-        let is_arch = compact.contains(&format!("\"architecture\":\"{arch}\""));
+        let is_arch = compact.contains(&format!("\"architecture\":\"{}\"", want.arch));
         if is_arch && compact.contains("\"os\":\"linux\"") {
             return first_str(obj, "digest");
         }
-        if is_arch && fallback.is_none() {
-            fallback = first_str(obj, "digest");
+    }
+    None
+}
+
+/// The distinct linux arches offered by a manifest index (skipping `unknown` attestation entries), so a
+/// "no manifest for <arch>" error can list what IS available instead of leaving the user guessing.
+fn available_arches(m: &str) -> Vec<String> {
+    let Some(manifests) = array_after(m, "manifests") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for obj in split_objects(manifests) {
+        let compact: String = obj.split_whitespace().collect();
+        if compact.contains("\"unknown\"") || !compact.contains("\"os\":\"linux\"") {
+            continue;
+        }
+        if let Some(a) = first_str(obj, "architecture") {
+            if !out.contains(&a) {
+                out.push(a);
+            }
         }
     }
-    fallback
+    out
 }
 
 fn layer_digests(m: &str) -> Vec<String> {
@@ -1660,19 +1755,67 @@ mod tests {
         assert_eq!(auth_param(v, "scope"), None);
     }
 
+    const ARCH_LIST: &str = r#"{"manifests":[
+        {"digest":"sha256:aaa","platform":{"architecture":"amd64","os":"linux"}},
+        {"digest":"sha256:bbb","platform":{"architecture":"arm64","os":"linux"}},
+        {"digest":"sha256:ccc","platform":{"architecture":"unknown","os":"unknown"}}
+    ]}"#;
+
     #[test]
-    fn selects_arch_from_manifest_list() {
-        let list = r#"{"manifests":[
-            {"digest":"sha256:aaa","platform":{"architecture":"amd64","os":"linux"}},
-            {"digest":"sha256:bbb","platform":{"architecture":"arm64","os":"linux"}},
-            {"digest":"sha256:ccc","platform":{"architecture":"unknown","os":"unknown"}}
-        ]}"#;
-        let want = if current_arch() == "arm64" {
+    fn selects_host_arch_from_manifest_list() {
+        let want = if Platform::host().arch == "arm64" {
             "sha256:bbb"
         } else {
             "sha256:aaa"
         };
-        assert_eq!(select_arch_digest(list).as_deref(), Some(want));
+        assert_eq!(
+            select_arch_digest(ARCH_LIST, &Platform::host()).as_deref(),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn selects_explicit_arch_regardless_of_host() {
+        // An explicit platform picks THAT arch's digest, whatever the host is.
+        let arm = Platform::parse("linux/arm64").unwrap();
+        assert_eq!(
+            select_arch_digest(ARCH_LIST, &arm).as_deref(),
+            Some("sha256:bbb")
+        );
+        let x86 = Platform::parse("amd64").unwrap();
+        assert_eq!(
+            select_arch_digest(ARCH_LIST, &x86).as_deref(),
+            Some("sha256:aaa")
+        );
+    }
+
+    #[test]
+    fn no_matching_arch_returns_none_no_fallback() {
+        // A requested arch absent from the index yields None (NOT a wrong-arch fallback) — the pull
+        // then errors with the available list. Locks the reviewer-mandated dropped fallback.
+        let ppc = Platform {
+            os: "linux".into(),
+            arch: "ppc64le".into(),
+        };
+        assert_eq!(select_arch_digest(ARCH_LIST, &ppc), None);
+        let avail = available_arches(ARCH_LIST);
+        assert!(avail.contains(&"amd64".to_string()) && avail.contains(&"arm64".to_string()));
+        assert!(
+            !avail.contains(&"unknown".to_string()),
+            "unknown is filtered"
+        );
+    }
+
+    #[test]
+    fn platform_parse_forms_and_aliases() {
+        assert_eq!(Platform::parse("arm64").unwrap().arch, "arm64");
+        assert_eq!(Platform::parse("aarch64").unwrap().arch, "arm64");
+        assert_eq!(Platform::parse("linux/amd64").unwrap().arch, "amd64");
+        assert_eq!(Platform::parse("x86_64").unwrap().arch, "amd64");
+        assert_eq!(Platform::parse("LINUX/ARM64").unwrap().arch, "arm64");
+        // variants and non-linux are rejected legibly.
+        assert!(Platform::parse("linux/arm/v7").is_err());
+        assert!(Platform::parse("windows/amd64").is_err());
     }
 
     #[test]

@@ -5,7 +5,7 @@ mod net;
 mod pull;
 mod push;
 mod search;
-pub use pull::{pull, ImageConfig, OciError};
+pub use pull::{pull, ImageConfig, OciError, Platform};
 pub use push::{push, ImageConfigOut};
 pub use search::{search, SearchResult};
 

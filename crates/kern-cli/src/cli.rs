@@ -169,6 +169,8 @@ pub enum Command {
     Pull {
         image: String,
         dest: Option<String>,
+        /// `--platform os/arch`: fetch a specific arch from a multi-arch index (default: this host).
+        platform: Option<String>,
     },
     /// `kern push <local-ref> [as <remote-ref>]`: publish a cached image to a registry.
     Push {
@@ -1270,12 +1272,17 @@ fn positional_after_flags(rest: &[&str], value_flags: &[&str]) -> Option<String>
 fn parse_pull(rest: &[&str]) -> Option<Command> {
     let mut image: Option<&str> = None;
     let mut dest: Option<String> = None;
+    let mut platform: Option<String> = None;
     let mut i = 1; // rest[0] == "pull"
     while i < rest.len() {
         match rest[i] {
             "--dest" => {
                 i += 1;
                 dest = rest.get(i).map(|v| (*v).to_string());
+            }
+            "--platform" => {
+                i += 1;
+                platform = rest.get(i).map(|v| (*v).to_string());
             }
             s if s.starts_with('-') => {}
             s if image.is_none() => image = Some(s),
@@ -1286,6 +1293,7 @@ fn parse_pull(rest: &[&str]) -> Option<Command> {
     image.map(|img| Command::Pull {
         image: img.to_string(),
         dest,
+        platform,
     })
 }
 
@@ -1537,7 +1545,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodHolder => crate::pod::run_holder(),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
-        Command::Pull { image, dest } => commands::pull(&image, dest.as_deref()),
+        Command::Pull {
+            image,
+            dest,
+            platform,
+        } => commands::pull(&image, dest.as_deref(), platform.as_deref()),
         Command::Push { local, remote } => commands::push(&local, remote.as_deref()),
         Command::Stop { names, all } => commands::stop(&names, all),
         Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
