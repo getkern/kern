@@ -113,6 +113,7 @@ pub fn help() -> Result<(), Error> {
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
     --hostname <name>   Set the box's hostname (default: the box name)
     --tun               Expose /dev/net/tun in the box (WireGuard / userspace VPN)
+    --init              Run a built-in reaping init as PID 1 (no zombies; forwards SIGTERM)
     --pids-limit <N>    Cap the box's process count (pids.max) — fork-bomb containment
     --io-weight <N>     cgroup-v2 io.weight — relative I/O priority (1–10000; best-effort)
     --nice <n>          Scheduling niceness for the box workload (-20 high … 19 low)
@@ -267,6 +268,8 @@ pub struct BoxRunArgs<'a> {
     pub hostname: Option<&'a str>,
     /// `--tun`: expose `/dev/net/tun` in the box (WireGuard / userspace VPN).
     pub tun: bool,
+    /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
+    pub init: bool,
     /// `--pids-limit N`: cap the box's task count (`pids.max`) — fork-bomb containment.
     pub pids_limit: Option<u64>,
     /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
@@ -727,6 +730,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         ssh,
         hostname,
         tun: args.tun,
+        init: args.init,
         tmpfs,
         run_as,
         pids_max: args.pids_limit,
@@ -1411,6 +1415,7 @@ struct BuildSpec<'a> {
     ssh: Option<kern_isolation::SshSetup>,
     hostname: Option<String>,
     tun: bool,
+    init: bool,
     tmpfs: Vec<(String, String)>,
     run_as: Option<(u32, u32)>,
     pids_max: Option<u64>,
@@ -1548,6 +1553,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         secrets: b.secrets,
         ssh: b.ssh,
         tun: b.tun,
+        init: b.init,
         tmpfs: b.tmpfs,
         run_as: b.run_as,
         pids_max: b.pids_max,

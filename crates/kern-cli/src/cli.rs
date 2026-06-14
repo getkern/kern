@@ -78,6 +78,8 @@ pub enum Command {
         hostname: Option<String>,
         /// `--tun`: expose `/dev/net/tun` in the box (WireGuard / userspace VPN).
         tun: bool,
+        /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
+        init: bool,
         /// `--pids-limit N`: cap the box's process/thread count (`pids.max`) — fork-bomb containment.
         pids_limit: Option<u64>,
         /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
@@ -633,6 +635,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut ssh_key: Option<String> = None;
     let mut hostname: Option<String> = None;
     let mut tun = false;
+    let mut init = false;
     let mut pids_limit: Option<u64> = None;
     let mut tmpfs: Vec<String> = Vec::new();
     let mut run_as: Option<String> = None;
@@ -681,6 +684,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // `--tun`: expose /dev/net/tun so a WireGuard / userspace-VPN workload can create a
                 // tunnel inside the box's own network namespace.
                 "--tun" => tun = true,
+                "--init" => init = true,
                 // `--hostname NAME`: override the box's UTS hostname (default: the box name).
                 "--hostname" => {
                     i += 1;
@@ -1044,6 +1048,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             ssh_key,
             hostname,
             tun,
+            init,
             pids_limit,
             tmpfs,
             run_as,
@@ -1419,6 +1424,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ssh_key,
             hostname,
             tun,
+            init,
             pids_limit,
             tmpfs,
             run_as,
@@ -1467,6 +1473,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ssh_key: ssh_key.as_deref(),
             hostname: hostname.as_deref(),
             tun,
+            init,
             pids_limit,
             tmpfs: &tmpfs,
             run_as: run_as.as_deref(),
