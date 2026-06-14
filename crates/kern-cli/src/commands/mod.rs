@@ -3893,6 +3893,18 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     let flat = cache.join(&src_safe);
     let diff = cache.join(format!("{src_safe}.diff"));
     let layers = cache.join(format!("{src_safe}.layers"));
+    // Clear any PRIOR image at `dst` first (all forms) — otherwise re-tagging over an existing image
+    // would leave stale files from the old one (a hybrid rootfs) or a mismatched sidecar. Like Docker,
+    // a tag REPLACES the destination. The `.ok` marker is written LAST (below), so an interrupted
+    // re-tag can't leave a half-image that `images`/`push` treats as valid.
+    if src_safe != dst_safe {
+        let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.ok")));
+        for suffix in ["", ".diff", ".layers", ".base", ".image"] {
+            let p = cache.join(format!("{dst_safe}{suffix}"));
+            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
     if flat.is_dir() {
         copy_tree(&flat, &cache.join(&dst_safe))?;
     } else if layers.exists() {
@@ -3956,6 +3968,7 @@ fn materialize_image(
     for layer in layers {
         let ok = std::process::Command::new("cp")
             .arg("-a")
+            .arg("--reflink=auto") // CoW clone on btrfs/xfs (near-free); plain copy elsewhere
             .arg("--")
             .arg(format!("{layer}/."))
             .arg(&tmp)
@@ -4684,6 +4697,7 @@ fn copy_from_stage_rootfs(
     // `cp -a --` no-follow, preserving modes — same tool/flags as the rest of the builder.
     let ok = std::process::Command::new("cp")
         .arg("-a")
+        .arg("--reflink=auto") // CoW clone on btrfs/xfs (near-free); plain copy elsewhere
         .arg("--")
         .arg(&src)
         .arg(&target)
@@ -4709,6 +4723,7 @@ fn merge_context(from: &std::path::Path, into: &std::path::Path) -> Result<(), E
         let _ = std::fs::remove_file(&dst);
         let ok = std::process::Command::new("cp")
             .arg("-a")
+            .arg("--reflink=auto") // CoW clone on btrfs/xfs (near-free); plain copy elsewhere
             .arg("--")
             .arg(e.path())
             .arg(&dst)
