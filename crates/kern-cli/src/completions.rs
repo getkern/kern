@@ -24,6 +24,8 @@ const VERBS: &[&str] = &[
     "kill",
     "killall",
     "pull",
+    "push",
+    "tag",
     "build",
     "pod",
     "search",

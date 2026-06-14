@@ -41,6 +41,7 @@ pub fn help() -> Result<(), Error> {
     {c}search{z} <query> [--json]                                        Search Docker Hub for images
     {c}pull{z} <image> [--dest <dir>] [--platform os/arch]              Download an OCI image
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
+    {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
 
@@ -3853,6 +3854,65 @@ pub fn push(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
     result
 }
 
+/// `kern tag <src> <dst>` — give a cached image a second name, so `build -t x` then `tag x y:1.0` then
+/// `push y:1.0` works like Docker. Content-addressed: the shared `L/` build layers are NOT duplicated —
+/// a layered image's `.layers` manifest is copied and simply references the same layer keys (which `gc`
+/// keeps alive while ANY `.layers` names them). A flat/single-diff image's rootfs dir IS copied (it's the
+/// image's own bytes). Both names are `sanitize_ref`'d, so a `dst` like `../../etc` can't escape the cache
+/// (it maps to a safe key) — the same collision-free key rule as every other cache path.
+pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
+    let cache = cache_dir();
+    own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
+    let src_safe = sanitize_ref(src);
+    let dst_safe = sanitize_ref(dst);
+    if src_safe == dst_safe {
+        return Ok(()); // tagging to the same key is a no-op (not an error, like Docker)
+    }
+    // The `.ok` marker is the "this image exists" sentinel — its absence means not cached.
+    let src_ok = cache.join(format!("{src_safe}.ok"));
+    if !src_ok.exists() {
+        return Err(Error::Oci(format!(
+            "no such image '{src}' — `kern images` lists cached images"
+        )));
+    }
+    // Copy the config sidecar (best-effort: an old image may predate it).
+    let cp_file = |suffix: &str| -> Result<(), Error> {
+        let from = cache.join(format!("{src_safe}{suffix}"));
+        if from.exists() {
+            std::fs::copy(&from, cache.join(format!("{dst_safe}{suffix}")))
+                .map_err(|e| Error::Oci(format!("tag {suffix}: {e}")))?;
+        }
+        Ok(())
+    };
+    cp_file(".image")?;
+    // Copy the rootfs form. Exactly one of these exists per image (mirrors `materialize_image`):
+    //  - flat pulled image:  `<safe>/`         → copy the dir (the image's own bytes)
+    //  - single-diff build:  `<safe>.diff/`    → copy the dir
+    //  - multi-layer build:  `<safe>.layers` (+ `.base`) → copy the manifest files; `L/` layers are
+    //    shared/content-addressed and referenced, never duplicated.
+    let flat = cache.join(&src_safe);
+    let diff = cache.join(format!("{src_safe}.diff"));
+    let layers = cache.join(format!("{src_safe}.layers"));
+    if flat.is_dir() {
+        copy_tree(&flat, &cache.join(&dst_safe))?;
+    } else if layers.exists() {
+        cp_file(".layers")?;
+        cp_file(".base")?;
+    } else if diff.is_dir() {
+        copy_tree(&diff, &cache.join(format!("{dst_safe}.diff")))?;
+    } else {
+        return Err(Error::Oci(format!(
+            "image '{src}' is cached but has no rootfs form — try re-pulling"
+        )));
+    }
+    // Write the `.ok` marker LAST (so an interrupted tag leaves no half-image that `images`/`push` sees),
+    // storing the human `dst` ref as its content (what `kern images` displays).
+    std::fs::write(cache.join(format!("{dst_safe}.ok")), dst.as_bytes())
+        .map_err(|e| Error::Oci(format!("tag marker: {e}")))?;
+    println!("tagged '{src}' → '{dst}'");
+    Ok(())
+}
+
 /// Materialize an image reference to `(rootfs_dir, config, cleanup)`. `cleanup` is `Some(tmp)` when we
 /// created a temporary squashed rootfs (layered image) that the caller must remove; `None` when the
 /// rootfs is the persistent flat cache dir (do NOT delete it). Errors if the image isn't cached.
@@ -6821,6 +6881,34 @@ mod net_resource_tests {
         assert_eq!(parse_user(Some("1000:2000")).unwrap(), Some((1000, 2000)));
         for bad in ["alice", "1000:bob", ":5", "1000:"] {
             assert!(parse_user(Some(bad)).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn tag_ref_cannot_escape_the_cache() {
+        // `tag`'s path safety rests entirely on `sanitize_ref`: a traversal ref must map to a key with
+        // no `/` and no `..`, so `cache.join(key)` can never land outside the cache. Lock that here so a
+        // future edit to sanitize_ref can't silently reopen a `tag ../../etc/x` escape.
+        for evil in [
+            "../../etc/passwd",
+            "/etc/shadow",
+            "a/../../b",
+            "..",
+            ".",
+            "foo:../bar",
+        ] {
+            let key = sanitize_ref(evil);
+            assert!(
+                !key.contains('/'),
+                "key for {evil:?} has a separator: {key}"
+            );
+            assert!(!key.contains(".."), "key for {evil:?} has `..`: {key}");
+            // The join stays inside the cache root (no parent-dir component escapes it).
+            let joined = std::path::Path::new("/cache/kern").join(&key);
+            assert!(
+                joined.starts_with("/cache/kern"),
+                "{evil:?} → {joined:?} escaped the cache"
+            );
         }
     }
 }
