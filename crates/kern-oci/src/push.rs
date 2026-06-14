@@ -180,6 +180,29 @@ fn pack_layer(
     work: &Path,
 ) -> Result<(std::path::PathBuf, String, String, u64), OciError> {
     let tar_path = work.join("layer.tar");
+    // SECURITY (privilege-escalation via ownership normalization): we tar with `--owner=0 --group=0`
+    // (below), forcing every file root-owned. Correct for ownership (Docker layers are root-owned) but
+    // DANGEROUS combined with a preserved setuid bit: a `-rwsr-xr-x` binary owned by a NON-root uid means
+    // "run as that uid"; rewriting its owner to 0 turns it into **setuid-ROOT** in the pushed image — an
+    // escalation the original image never had, introduced by our push. So strip setuid/setgid from the
+    // rootfs (a throwaway temp squash) BEFORE tarring. Unconditional: kern's model treats in-image setuid
+    // as inert anyway (the box root mount is MS_NOSUID, and pull normalizes ownership via
+    // `--no-same-owner`), and a workload needing elevated privilege uses file-capabilities (preserved
+    // via the build copier's `security.capability` xattr handling), not setuid. So stripping removes the
+    // escalation vector without removing anything usable in kern's model.
+    let stripped = Command::new("find")
+        .arg(rootfs)
+        .args([
+            "-type", "f", "-perm", "/6000", "-exec", "chmod", "a-s", "{}", "+",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !stripped {
+        return Err(OciError::Extract(
+            "stripping setuid/setgid before push failed".into(),
+        ));
+    }
     // Tar the rootfs contents (`.`) as an image layer, NORMALIZING ownership to root (0:0). The rootfs
     // on disk is owned by the invoking (unprivileged) user; without `--owner=0 --group=0` every file in
     // the pushed layer would carry that host UID/GID (e.g. 1000), which surprises anyone who then pulls
