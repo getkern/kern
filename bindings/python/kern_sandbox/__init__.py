@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -550,7 +551,12 @@ class Sandbox:
         return self._walk(os.path.realpath(self._ws))
 
     def _walk(self, root: str) -> dict[str, tuple[int, int]]:
-        """Map workspace-relative path -> (mtime_ns, size), skipping the .deps install tree and symlinks."""
+        """Map WORKSPACE-relative path -> (mtime_ns, size), skipping .deps, our env-file, and symlinks.
+        `root` is where to walk (the workspace, or a subdir for `list_files(subdir)`); paths are ALWAYS
+        made relative to the workspace root so `list_files("sub")` returns `sub/a.txt`, composable with
+        `read_file` (that was a regression when `root` doubled as the base). One lstat per file: S_ISREG
+        excludes non-regular files AND symlinks in a single syscall (a symlink's lstat mode is never
+        S_ISREG) — no extra isfile()/islink() stats."""
         base = os.path.realpath(self._ws)
         out: dict[str, tuple[int, int]] = {}
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -561,9 +567,11 @@ class Sandbox:
                     st = os.lstat(fp)
                 except OSError:
                     continue
-                if not os.path.isfile(fp) or os.path.islink(fp):
+                if not stat.S_ISREG(st.st_mode):
                     continue
                 rel = os.path.relpath(fp, base)
+                if rel == _ENV_FILE:
+                    continue  # our private host-side --env-file, not a user artifact
                 out[rel] = (st.st_mtime_ns, st.st_size)
         return out
 
