@@ -121,8 +121,54 @@ pub fn pull(
         if total == 1 { "" } else { "s" }
     );
     std::fs::create_dir_all(dest).map_err(|e| OciError::Extract(e.to_string()))?;
-    for (i, digest) in layers.iter().enumerate() {
-        extract_layer(&registry, &repo, digest, &auth, dest, i + 1, total)?;
+    // PREFETCH: download layer K+1 concurrently while layer K is verified + extracted + merged. The
+    // per-layer download command is UNCHANGED (same TLS pin, auth, timeouts) — only the SCHEDULING
+    // overlaps the next layer's network with the current layer's CPU (decompress/extract). Extract +
+    // merge stay strictly ordered (overlay whiteout semantics demand it), so the result is byte-identical
+    // to the sequential path; security is untouched. Wall-clock ≈ slowest download + Σ extracts, not Σ both.
+    let spawn_dl = |i: usize| {
+        let (reg, rp, dig, dst, a) = (
+            registry.clone(),
+            repo.clone(),
+            layers[i].clone(),
+            dest.to_path_buf(),
+            auth.clone(),
+        );
+        // Pass the layer INDEX so the tmp blob name is unique per layer, not per digest: an OCI manifest
+        // may legally list the SAME digest for adjacent layers, and with prefetch two threads would else
+        // `curl -o` the same `.kern-layer-<digest>.tar.gz` at once → torn read / spurious digest mismatch.
+        std::thread::spawn(move || download_layer(i, &reg, &rp, &dig, &a, &dst))
+    };
+    // Escape hatch (like KERN_NO_SCOPE): KERN_NO_PREFETCH=1 → download strictly before extract, no
+    // overlap. Off by default; also used to A/B the speedup.
+    let prefetch = std::env::var_os("KERN_NO_PREFETCH").is_none();
+    let mut next = Some(spawn_dl(0));
+    // index loop, not `.enumerate()`: we need `i + 1` to prefetch the NEXT layer's download.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..total {
+        let tmp = next
+            .take()
+            .expect("download handle present each iteration")
+            .join()
+            .map_err(|_| OciError::Extract("layer download thread panicked".into()))??;
+        // Prefetch: start layer i+1's download BEFORE extracting i → its network overlaps i's CPU.
+        if prefetch && i + 1 < total {
+            next = Some(spawn_dl(i + 1));
+        }
+        // On error, don't just bail: an already-spawned prefetch thread would detach and keep writing its
+        // blob into `dest` after the pull failed. Wait for it and unlink its tmp before returning.
+        if let Err(e) = process_layer(&tmp, &layers[i], dest, i + 1, total) {
+            if let Some(h) = next.take() {
+                if let Ok(Ok(orphan)) = h.join() {
+                    let _ = std::fs::remove_file(orphan);
+                }
+            }
+            return Err(e);
+        }
+        // No-prefetch: only start i+1 AFTER i is fully extracted → strictly sequential (for A/B).
+        if !prefetch && i + 1 < total {
+            next = Some(spawn_dl(i + 1));
+        }
     }
     eprintln!("✓ pulled {image} → {} ({total} layers)", dest.display());
     Ok(config)
@@ -397,6 +443,8 @@ fn curl_cfg_escape(s: &str) -> String {
 }
 
 /// How to authenticate requests to a registry, discovered from its `WWW-Authenticate` challenge.
+/// `Clone` so a layer prefetch thread can carry its own copy (Bearer token / Basic creds are Strings).
+#[derive(Clone)]
 pub(crate) enum Auth {
     /// Open (or already-satisfied) — no `Authorization` header.
     None,
@@ -652,50 +700,74 @@ fn fetch_manifest(
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-fn extract_layer(
+/// First 12 hex of a `sha256:HEX` digest for progress lines (or the digest verbatim if not sha256).
+fn short_digest(digest: &str) -> &str {
+    digest
+        .strip_prefix("sha256:")
+        .map(|h| &h[..h.len().min(12)])
+        .unwrap_or(digest)
+}
+
+/// Download ONE layer blob to a tmp file, returning its path. The download command is IDENTICAL to the
+/// old inline one (same TLS pin, auth, redirects, timeouts) — split out only so the pull loop can
+/// PREFETCH the next layer concurrently. No security logic lives here (verify/vet/extract/merge do).
+fn download_layer(
+    idx: usize,
     registry: &str,
     repo: &str,
     digest: &str,
     auth: &Auth,
     dest: &Path,
-    idx: usize,
-    total: usize,
-) -> Result<(), OciError> {
-    let short = digest
-        .strip_prefix("sha256:")
-        .map(|h| &h[..h.len().min(12)])
-        .unwrap_or(digest);
-    eprintln!("→ layer {idx}/{total}  {short}  downloading…");
+) -> Result<std::path::PathBuf, OciError> {
+    let short = short_digest(digest);
+    eprintln!("→ layer  {short}  downloading…");
     let url = format!("{}/v2/{repo}/blobs/{digest}", reg_base(registry));
+    // Per-INDEX tmp name (not per-digest): adjacent layers may share a digest, and prefetch runs two
+    // downloads at once — a digest-only name would make them collide on one file.
     let tmp = dest.join(format!(
-        ".kern-layer-{}.tar.gz",
+        ".kern-layer-{idx}-{}.tar.gz",
         digest.replace([':', '/'], "_")
     ));
     let tmp_s = tmp.to_string_lossy().into_owned();
     curl_download(&url, &tmp_s, auth)?;
+    Ok(tmp)
+}
+
+/// Verify + vet + extract + merge ONE already-downloaded layer, strictly IN ORDER (never concurrent:
+/// overlay whiteout semantics require sequential merge). Every security gate is here, unchanged from the
+/// old `extract_layer`; only the download moved out (see `download_layer`). `tmp` is the downloaded blob.
+fn process_layer(
+    tmp: &Path,
+    digest: &str,
+    dest: &Path,
+    idx: usize,
+    total: usize,
+) -> Result<(), OciError> {
+    let short = short_digest(digest);
+    let tmp_s = tmp.to_string_lossy().into_owned();
 
     // INTEGRITY: the blob's content must hash to its digest — defends against a compromised or
     // MITM'd registry (TLS only protects the transport), and against a corrupt download. Report the
     // downloaded size on the same line so a big multi-hundred-MB image shows real progress per layer
     // (curl's own meter is off — it's noise over a redirected CDN blob).
-    let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    let size = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "  layer {idx}/{total}  {short}  {}  verifying + extracting…",
         kern_common::fmt_bytes(size)
     );
-    if let Err(e) = verify_digest(&tmp, digest) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = verify_digest(tmp, digest) {
+        let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
 
     // Detect the codec from the verified bytes (gzip / zstd / uncompressed) ONCE, and reuse it for
     // both the vet and the extract so they can never disagree.
-    let comp = detect_compression(&tmp);
+    let comp = detect_compression(tmp);
 
     // HARDENING: vet the layer BEFORE writing anything to disk — reject path traversal, absolute
     // members, device nodes, and oversized (decompression-bomb) layers.
-    if let Err(e) = check_layer_safe(&tmp, comp) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = check_layer_safe(tmp, comp) {
+        let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
 
@@ -791,7 +863,7 @@ fn extract_layer(
             tar_status.map(|s| s.success() && zcode)
         }
     };
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp);
     let succeeded = match ok {
         Ok(s) => s,
         Err(e) => return Err(extract_err(e)),
