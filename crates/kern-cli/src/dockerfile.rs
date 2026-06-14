@@ -3,8 +3,10 @@
 //! Supported instructions: `FROM RUN COPY ADD ENV WORKDIR USER CMD ENTRYPOINT EXPOSE ARG LABEL`.
 //! `VOLUME` and `HEALTHCHECK` are ACCEPTED (parsed, no build-time effect) so stock upstream Dockerfiles
 //! build instead of failing; `HEALTHCHECK` nudges the user to kern's runtime `--health-cmd`.
-//! Deliberately NOT supported (and rejected with a clear error, never silently ignored):
-//! multi-stage builds (`FROM … AS`, `COPY --from`), `SHELL`, `ONBUILD`,
+//! Multi-stage syntax (`FROM … AS <name>`, `COPY --from=<stage>`) is PARSED here (stage names tracked,
+//! `--from` validated against earlier stages via [`resolve_from`]) — the multi-stage *executor* is a
+//! separate change, so a Dockerfile that uses it currently parses but is refused at execution time.
+//! Deliberately NOT supported (rejected with a clear error, never silently ignored): `SHELL`, `ONBUILD`,
 //! `STOPSIGNAL`, `ADD <url>`, and `ADD` auto-extraction. Comments (`#`), blank lines and backslash
 //! line-continuations are handled; `ARG`/`ENV` values substitute into later `${VAR}`/`$VAR`.
 //!
@@ -18,9 +20,20 @@ use std::collections::HashMap;
 /// no instruction (they only affect variable substitution / are ignored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instr {
-    From(String),
+    /// `FROM <image> [AS <name>]`. `as_name` is `Some` only in a multi-stage build; a plain single-stage
+    /// `FROM` leaves it `None`, so the single-stage executor path is byte-for-byte unchanged.
+    From {
+        image: String,
+        as_name: Option<String>,
+    },
     Run(Vec<String>),
-    Copy { srcs: Vec<String>, dst: String },
+    /// `COPY [--from=<stage>] <srcs...> <dst>`. `from` is `Some(stage-name-or-index)` only for a
+    /// multi-stage `COPY --from`; a normal `COPY` from the build context leaves it `None`.
+    Copy {
+        srcs: Vec<String>,
+        dst: String,
+        from: Option<String>,
+    },
     Env(String, String),
     Workdir(String),
     User(String),
@@ -38,6 +51,9 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
     // instruction operands. `build_args` win over in-file `ARG` defaults (Docker semantics).
     let mut vars: HashMap<String, String> = HashMap::new();
     let mut saw_from = false;
+    // Stage names in parse order (one per FROM; `None` for an unnamed stage). Used to validate a
+    // `COPY --from=<name-or-index>` against EARLIER stages only (no forward-ref, no self-ref).
+    let mut stage_names: Vec<Option<String>> = Vec::new();
 
     for (lineno, logical) in logical_lines(text).into_iter() {
         let line = logical.trim();
@@ -51,26 +67,41 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
         let kw = kw_raw.to_ascii_uppercase();
         let err = |m: &str| Err(format!("Dockerfile line {lineno}: {m}"));
 
-        // Reject the multi-stage marker explicitly wherever it can appear.
-        if kw == "FROM"
-            && rest
-                .split_whitespace()
-                .any(|t| t.eq_ignore_ascii_case("as"))
-        {
-            return err("multi-stage builds (FROM … AS) aren't supported yet");
-        }
-
         match kw.as_str() {
             "FROM" => {
-                if saw_from {
-                    return err("multi-stage builds (multiple FROM) aren't supported yet");
-                }
-                let image = subst(rest, &vars);
+                // Substitute FIRST (a `FROM $BASE AS build` must expand `$BASE`), THEN split off a
+                // trailing `AS <name>` so the AS keyword/name can't come from a variable's contents.
+                let expanded = subst(rest, &vars);
+                let mut toks = expanded.split_whitespace();
+                let image = toks.next().unwrap_or("").to_string();
                 if image.is_empty() {
                     return err("FROM needs an image reference");
                 }
+                // Optional `AS <name>`: exactly `as <name>` (case-insensitive) after the image.
+                let as_name = match (toks.next(), toks.next(), toks.next()) {
+                    (None, _, _) => None,
+                    (Some(kw), Some(name), None) if kw.eq_ignore_ascii_case("as") => {
+                        let name = name.to_ascii_lowercase();
+                        if name.is_empty()
+                            || !name.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-'
+                            })
+                        {
+                            return err("FROM … AS <name>: name allows only letters/digits/_/./-");
+                        }
+                        if stage_names
+                            .iter()
+                            .any(|n| n.as_deref() == Some(name.as_str()))
+                        {
+                            return err(&format!("duplicate build-stage name '{name}'"));
+                        }
+                        Some(name)
+                    }
+                    _ => return err("FROM takes '<image>' or '<image> AS <name>'"),
+                };
                 saw_from = true;
-                out.push(Instr::From(image));
+                stage_names.push(as_name.clone());
+                out.push(Instr::From { image, as_name });
             }
             _ if !saw_from && kw != "ARG" => {
                 return err("the first instruction must be FROM (ARG may precede it)");
@@ -117,12 +148,29 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             }
             "COPY" | "ADD" => {
                 let mut toks = split_ws(&subst(rest, &vars));
-                // Reject build-only flags we don't implement rather than silently ignore them.
-                if let Some(f) = toks.iter().find(|t| t.starts_with("--")) {
-                    if f.starts_with("--from") {
-                        return err("COPY --from (multi-stage) isn't supported yet");
+                // `COPY --from=<stage>` (multi-stage) is the ONLY build flag we accept; capture and drop
+                // it. Any other `--flag` (or `--from` on `ADD`) is still rejected rather than ignored.
+                let mut from: Option<String> = None;
+                if let Some(pos) = toks.iter().position(|t| t.starts_with("--")) {
+                    let flag = toks[pos].clone();
+                    if kw == "COPY" && flag.starts_with("--from=") {
+                        let stage = flag["--from=".len()..].to_string();
+                        // Validate against EARLIER stages only: `upto` = index of the CURRENT stage (the
+                        // last FROM pushed), which excludes it → self-reference and forward-reference both
+                        // rejected for free. A numeric `--from=N` must index an already-built stage.
+                        let cur = stage_names.len().saturating_sub(1);
+                        if resolve_from(&stage, &stage_names, cur).is_none() {
+                            return err(
+                                "COPY --from must reference an earlier build stage (by name or index)",
+                            );
+                        }
+                        from = Some(stage);
+                        toks.remove(pos);
+                    } else if flag.starts_with("--from") {
+                        return err("--from is only supported on COPY (multi-stage)");
+                    } else {
+                        return err(&format!("{kw} flag {flag} isn't supported yet"));
                     }
-                    return err(&format!("{kw} flag {f} isn't supported yet"));
                 }
                 if kw == "ADD"
                     && toks
@@ -135,7 +183,11 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     return err(&format!("{kw} needs at least a source and a destination"));
                 }
                 let dst = toks.pop().unwrap();
-                out.push(Instr::Copy { srcs: toks, dst });
+                out.push(Instr::Copy {
+                    srcs: toks,
+                    dst,
+                    from,
+                });
             }
             "EXPOSE" => {
                 for p in split_ws(&subst(rest, &vars)) {
@@ -175,6 +227,22 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
         return Err("Dockerfile has no FROM instruction".to_string());
     }
     Ok(out)
+}
+
+/// Resolve a `COPY --from=<x>` reference to a 0-based stage index, considering ONLY stages `[0, upto)`
+/// (i.e. stages built BEFORE the current one). A numeric `<x>` must be a valid index `< upto`; otherwise
+/// `<x>` is matched (case-insensitively) against the stage names. `None` = not an earlier stage → the
+/// parser rejects it, and the executor treats a `None` here as an internal error. Shared by the parser
+/// (validation) and the executor (lookup) so they can't disagree on what a `--from` resolves to.
+pub fn resolve_from(from: &str, stage_names: &[Option<String>], upto: usize) -> Option<usize> {
+    let upto = upto.min(stage_names.len());
+    if let Ok(n) = from.parse::<usize>() {
+        return (n < upto).then_some(n);
+    }
+    let want = from.to_ascii_lowercase();
+    stage_names[..upto]
+        .iter()
+        .position(|n| n.as_deref() == Some(want.as_str()))
 }
 
 /// Fold physical lines into logical ones: drop full-line comments, honour a trailing `\`
@@ -408,11 +476,25 @@ mod tests {
         HashMap::new()
     }
 
+    /// A plain single-stage `FROM <image>` instruction (as_name None), for terse test assertions.
+    fn from(image: &str) -> Instr {
+        Instr::From {
+            image: image.into(),
+            as_name: None,
+        }
+    }
+
     #[test]
     fn minimal_from_run_cmd() {
         let df = "FROM alpine:3.19\nRUN echo hi\nCMD [\"/bin/sh\"]\n";
         let got = parse(df, &ba()).unwrap();
-        assert_eq!(got[0], Instr::From("alpine:3.19".into()));
+        assert_eq!(
+            got[0],
+            Instr::From {
+                image: "alpine:3.19".into(),
+                as_name: None
+            }
+        );
         assert_eq!(
             got[1],
             Instr::Run(vec!["/bin/sh".into(), "-c".into(), "echo hi".into()])
@@ -477,7 +559,8 @@ mod tests {
             got[1],
             Instr::Copy {
                 srcs: vec!["a.txt".into(), "b.txt".into()],
-                dst: "/dst/".into()
+                dst: "/dst/".into(),
+                from: None
             }
         );
     }
@@ -523,12 +606,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_and_malformed() {
-        assert!(parse("FROM alpine AS build\n", &ba())
+        // `COPY --from=<unknown>` (no such earlier stage) is rejected — but `FROM … AS` itself now parses.
+        assert!(parse("FROM a\nCOPY --from=nope /a /b\n", &ba())
             .unwrap_err()
-            .contains("multi-stage"));
-        assert!(parse("FROM a\nCOPY --from=x /a /b\n", &ba())
-            .unwrap_err()
-            .contains("multi-stage"));
+            .contains("earlier build stage"));
         // SHELL/ONBUILD/STOPSIGNAL are still genuinely unsupported → clear error.
         assert!(parse("FROM a\nONBUILD RUN x\n", &ba())
             .unwrap_err()
@@ -551,7 +632,7 @@ mod tests {
     #[test]
     fn arg_may_precede_from() {
         let df = "ARG BASE=alpine\nFROM $BASE\n";
-        assert_eq!(parse(df, &ba()).unwrap()[0], Instr::From("alpine".into()));
+        assert_eq!(parse(df, &ba()).unwrap()[0], from("alpine"));
     }
 
     #[test]
@@ -562,9 +643,81 @@ mod tests {
         let got = parse(df, &ba()).expect("VOLUME/HEALTHCHECK must not fail the build");
         // Only FROM + RUN survive as instructions; VOLUME/HEALTHCHECK emit none.
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0], Instr::From("alpine".into()));
+        assert_eq!(got[0], from("alpine"));
         assert!(matches!(got[1], Instr::Run(_)));
         // `HEALTHCHECK NONE` is also fine (disables — nothing to nudge).
         assert!(parse("FROM alpine\nHEALTHCHECK NONE\n", &ba()).is_ok());
+    }
+
+    #[test]
+    fn from_as_names_stages() {
+        let df = "FROM golang AS build\nRUN go build\nFROM alpine\nCOPY --from=build /app /app\n";
+        let got = parse(df, &ba()).unwrap();
+        assert_eq!(
+            got[0],
+            Instr::From {
+                image: "golang".into(),
+                as_name: Some("build".into())
+            }
+        );
+        assert_eq!(got[2], from("alpine"));
+        assert_eq!(
+            got[3],
+            Instr::Copy {
+                srcs: vec!["/app".into()],
+                dst: "/app".into(),
+                from: Some("build".into())
+            }
+        );
+    }
+
+    #[test]
+    fn copy_from_by_index_and_name() {
+        // Numeric --from=0 references the first stage; a $BASE in FROM still substitutes before AS-split.
+        let df = "FROM alpine AS base\nFROM alpine\nCOPY --from=0 /a /a\nCOPY --from=base /b /b\n";
+        let got = parse(df, &ba()).unwrap();
+        assert!(matches!(&got[2], Instr::Copy { from: Some(f), .. } if f == "0"));
+        assert!(matches!(&got[3], Instr::Copy { from: Some(f), .. } if f == "base"));
+    }
+
+    #[test]
+    fn multi_stage_reference_rules() {
+        // forward-ref (a stage defined LATER) → rejected.
+        assert!(parse(
+            "FROM alpine\nCOPY --from=later /a /a\nFROM alpine AS later\n",
+            &ba()
+        )
+        .unwrap_err()
+        .contains("earlier build stage"));
+        // self-ref (the current stage's own name) → rejected (upto excludes the current stage).
+        assert!(parse("FROM alpine AS me\nCOPY --from=me /a /a\n", &ba())
+            .unwrap_err()
+            .contains("earlier build stage"));
+        // numeric out-of-range → rejected.
+        assert!(parse("FROM alpine\nCOPY --from=5 /a /a\n", &ba())
+            .unwrap_err()
+            .contains("earlier build stage"));
+        // duplicate stage name → rejected.
+        assert!(parse("FROM alpine AS x\nFROM alpine AS x\n", &ba())
+            .unwrap_err()
+            .contains("duplicate build-stage name"));
+        // `--from` on ADD → rejected.
+        assert!(parse("FROM a AS s\nFROM a\nADD --from=s /x /y\n", &ba())
+            .unwrap_err()
+            .contains("--from is only supported on COPY"));
+    }
+
+    #[test]
+    fn resolve_from_numeric_and_named() {
+        let names = vec![Some("build".to_string()), None, Some("final".to_string())];
+        // upto excludes the current stage; only earlier stages resolve.
+        assert_eq!(resolve_from("build", &names, 3), Some(0));
+        assert_eq!(resolve_from("final", &names, 3), Some(2));
+        assert_eq!(resolve_from("0", &names, 3), Some(0));
+        assert_eq!(resolve_from("2", &names, 3), Some(2));
+        // out of `upto` range → None (forward/self reference).
+        assert_eq!(resolve_from("final", &names, 2), None); // final is index 2, not < upto=2
+        assert_eq!(resolve_from("3", &names, 3), None); // no such index
+        assert_eq!(resolve_from("nope", &names, 3), None);
     }
 }

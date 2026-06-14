@@ -4448,9 +4448,27 @@ fn build_run(
 
     // FROM is always the first instruction (the parser guarantees it). Resolve the base to an overlay
     // lower (a single dir, or a colon chain for a layered base).
-    let Some(Instr::From(base_ref)) = instrs.first() else {
+    let Some(Instr::From {
+        image: base_ref, ..
+    }) = instrs.first()
+    else {
         return Err(Error::Sandbox("internal: build has no FROM".into()));
     };
+    // Multi-stage executor is a separate, larger change; until it lands, a Dockerfile with a second
+    // stage (extra FROM) or a `COPY --from` is refused CLEANLY here — the parser accepts the syntax, but
+    // the single-stage build path below stays byte-for-byte unchanged for the common case.
+    if instrs
+        .iter()
+        .skip(1)
+        .any(|i| matches!(i, Instr::From { .. }))
+        || instrs
+            .iter()
+            .any(|i| matches!(i, Instr::Copy { from: Some(_), .. }))
+    {
+        return Err(Error::Build(
+            "multi-stage builds (multiple FROM / COPY --from) aren't executable yet — single-stage builds work".into(),
+        ));
+    }
     if !quiet {
         eprintln!("[1/{total}] FROM {base_ref}");
     }
@@ -4504,7 +4522,7 @@ fn build_run(
     while i < instrs.len() {
         let step = i + 1;
         match &instrs[i] {
-            Instr::From(_) => i += 1, // only one FROM (parser-enforced); ignore any stray defensively
+            Instr::From { .. } => i += 1, // only one FROM in single-stage (parser+guard enforced)
             Instr::Run(argv) => {
                 // Batch CONSECUTIVE shell-form RUNs into ONE box, so the per-box overhead (fork+exec
                 // + overlay mount) is paid once, not per step. Each original RUN still runs in its own
@@ -4540,7 +4558,7 @@ fn build_run(
                 )?;
                 i = next;
             }
-            Instr::Copy { srcs, dst } => {
+            Instr::Copy { srcs, dst, from: _ } => {
                 announce(step, format!("COPY {} {dst}", srcs.join(" ")));
                 // Copying multiple sources requires a directory destination (else each would clobber
                 // the same name) — error rather than silently keep only the last, like Docker.
@@ -4671,7 +4689,7 @@ fn build_layered_cached(
         }
         let step = i + 1;
         match &instrs[i] {
-            Instr::From(_) => i += 1,
+            Instr::From { .. } => i += 1,
             Instr::Run(argv) => {
                 // Batch consecutive shell-form RUNs (one box + one cache unit); an exec-form RUN or a
                 // non-RUN ends the batch.
@@ -4732,7 +4750,7 @@ fn build_layered_cached(
                 layer_keys.push(key.clone());
                 i = next;
             }
-            Instr::Copy { srcs, dst } => {
+            Instr::Copy { srcs, dst, from: _ } => {
                 let content: Vec<String> =
                     srcs.iter().map(|s| content_hash(&ctx.join(s))).collect();
                 key = layer_key(
