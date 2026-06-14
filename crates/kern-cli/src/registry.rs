@@ -431,6 +431,79 @@ pub fn name_taken(name: &str) -> bool {
     find(name).is_some()
 }
 
+/// The claims directory — one `<name>` file per IN-FLIGHT box start (see [`claim_name`]).
+fn claims_dir() -> io::Result<PathBuf> {
+    runtime_subdir("claims")
+}
+
+/// Take the claims-dir advisory lock (`flock`; the kernel releases it with the process, so it can't
+/// leak). ALL claim mutation — take, stale takeover, prune — happens under it, so two starters that
+/// both see the same stale claim can't both "take it over" (one would silently delete the other's
+/// fresh claim). Held for a handful of syscalls; contention cost is microseconds against a ~3 ms
+/// box start.
+fn lock_claims(d: &Path) -> io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+    // `.lock` can never collide with a claim: names are `BoxName`-vetted (no leading '.').
+    let f = fs::File::create(d.join(".lock"))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
+/// `(pid, starttime)` from a claim body (`"<pid> <starttime>"`), or `None` if malformed.
+fn parse_claim(body: &str) -> Option<(i32, u64)> {
+    let mut it = body.split_whitespace();
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+/// A held start-claim on a box name. Dropping it (in the process that took it) releases the name.
+/// A claim leaked by a crash is stale the moment its pid dies — the next same-name start takes it
+/// over, and [`prune`] sweeps the rest.
+pub struct NameClaim {
+    path: PathBuf,
+    owner: u32,
+}
+
+impl Drop for NameClaim {
+    fn drop(&mut self) {
+        // Only the claiming PROCESS releases: a forked child (the detached supervisor) inherits
+        // this struct and must not free the name from under its parent.
+        if std::process::id() == self.owner {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Atomically claim `name` for an in-flight box start — the other half of the start name-check.
+/// [`name_taken`] sees a box only once it's REGISTERED, so two concurrent same-name starts could
+/// both pass it and both come up (check-then-register TOCTOU). The claim closes that window:
+///
+/// * `Ok(Some(_))` — this process owns the name; hold the claim until the box is registered (the
+///   registry entry is authoritative from then on), then drop it.
+/// * `Ok(None)` — a LIVE process holds the claim: the name is already being started (or the starter
+///   is still alive supervising it).
+/// * `Err(_)` — no usable runtime dir. The registry itself is equally unavailable then, so callers
+///   proceed unclaimed (fail-open, exactly like `name_taken`).
+///
+/// A claim is a `<pid> <starttime>` file judged by the registry's own [`is_alive`] rule, and the
+/// whole check-and-take runs under the dir-wide flock — a stale claim (starter crashed before
+/// registering) is taken over exactly once, never raced.
+pub fn claim_name(name: &str) -> io::Result<Option<NameClaim>> {
+    let d = claims_dir()?;
+    let _lock = lock_claims(&d)?;
+    let path = d.join(name);
+    if let Ok(body) = fs::read_to_string(&path) {
+        if parse_claim(&body).is_some_and(|(p, t)| is_alive(p, t)) {
+            return Ok(None); // live claimant → name busy
+        }
+        // Dead claimant or malformed body → stale; fall through and take it over (we hold the lock).
+    }
+    let pid = std::process::id();
+    fs::write(&path, format!("{pid} {}\n", proc_starttime(pid as i32)))?;
+    Ok(Some(NameClaim { path, owner: pid }))
+}
+
 /// The set of named volumes any running box currently mounts (for `volume prune`'s in-use guard).
 pub fn volumes_in_use() -> std::collections::HashSet<String> {
     list()
@@ -512,6 +585,33 @@ pub fn prune() -> (usize, u64) {
     let inst = instances.as_deref();
     sweep_orphans(logs_dir(), ".log", &live, inst, &mut removed, &mut freed);
     sweep_orphans(health_dir(), "", &live, inst, &mut removed, &mut freed);
+    // Claims whose starter is gone (a crash between claim and register leaves one behind). Swept
+    // under the same dir-wide flock as `claim_name`, so a prune can never delete a claim that a
+    // concurrent starter is (re)taking right now.
+    if let Ok(d) = claims_dir() {
+        if let Ok(_lock) = lock_claims(&d) {
+            if let Ok(rd) = fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let fname = e.file_name();
+                    let Some(f) = fname.to_str() else { continue };
+                    if f.starts_with('.') {
+                        continue; // `.lock` — never a claim (BoxName forbids a leading '.')
+                    }
+                    let live_claim = fs::read_to_string(e.path())
+                        .ok()
+                        .and_then(|b| parse_claim(&b))
+                        .is_some_and(|(p, t)| is_alive(p, t));
+                    if !live_claim {
+                        let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
+                        if fs::remove_file(e.path()).is_ok() {
+                            removed += 1;
+                            freed += sz;
+                        }
+                    }
+                }
+            }
+        }
+    }
     (removed, freed)
 }
 
@@ -634,6 +734,50 @@ mod tests {
         // An impossible pid has no /proc/<pid>/cgroup → no box cgroup → not paused (safe default,
         // so a box whose freeze state can't be read never shows a spurious "paused").
         assert!(!is_paused(i32::MAX));
+    }
+
+    #[test]
+    fn claim_name_excludes_second_starter_and_releases_on_drop() {
+        let name = format!("clm-{}", std::process::id());
+        let c1 = claim_name(&name).unwrap();
+        assert!(c1.is_some(), "first claim must win");
+        // While held, a second start of the same name is refused.
+        assert!(claim_name(&name).unwrap().is_none());
+        drop(c1);
+        // Released → the name is claimable again (and the file is gone).
+        let c2 = claim_name(&name).unwrap();
+        assert!(c2.is_some(), "claim must be reusable after release");
+    }
+
+    #[test]
+    fn claim_name_takes_over_stale_and_malformed_claims() {
+        // A claimant pid that can't exist (> kernel pid_max) → dead → stale → taken over.
+        let name = format!("clm-stale-{}", std::process::id());
+        let d = claims_dir().unwrap();
+        fs::write(d.join(&name), "999999999 1\n").unwrap();
+        assert!(claim_name(&name).unwrap().is_some());
+        // A malformed body is treated as stale too (never wedges the name forever).
+        let name2 = format!("clm-junk-{}", std::process::id());
+        fs::write(d.join(&name2), "not a claim\n").unwrap();
+        assert!(claim_name(&name2).unwrap().is_some());
+    }
+
+    #[test]
+    fn claim_name_one_winner_under_contention() {
+        // The E5 race: N concurrent starts of the SAME name — exactly one may win. Threads each
+        // open their own lock fd (flock is per-open-file-description, so they do exclude each other).
+        let name = format!("clm-race-{}", std::process::id());
+        let wins: Vec<Option<NameClaim>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| s.spawn(|| claim_name(&name).ok().flatten()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            wins.iter().filter(|w| w.is_some()).count(),
+            1,
+            "exactly one of 16 concurrent same-name claims must win"
+        );
     }
 
     #[test]
