@@ -3929,6 +3929,566 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Copy from an image's KERNEL-MERGED overlay view into `out_dir`, honouring overlay opaque/whiteout
+/// semantics so a file DELETED in an upper layer (`rm -rf dir && mkdir dir` → an OPAQUE directory, or a
+/// per-file `.wh.` whiteout) can never resurface. This is the ONE correct reader for a ≥2-layer image:
+/// a hand-rolled top-first / bottom-up `cp -a` of the RAW layer dirs ignores the opaque xattr and leaks
+/// the deleted file (a real confidentiality bug — a secret `rm`'d in a build step reappearing in a
+/// `COPY --from` or a pushed image). Letting the KERNEL present the merged view is the only way that
+/// honours opaque + whiteout + redirect_dir + metacopy — the kernel is the authority, not our code.
+///
+/// HOW (no box, no `newuidmap`, no pseudo-fs, no external `cp`/`tar`): open an fd on `out_dir` (the copy
+/// DESTINATION) FIRST — on the host, before any namespace work — then fork a child that
+///   1. `unshare(CLONE_NEWUSER | CLONE_NEWNS)` and writes a SINGLE-UID self map (`0 <euid> 1`) — this
+///      alone grants CAP_SYS_ADMIN *inside the new userns*, enough to mount an overlay, WITHOUT the
+///      setuid `newuidmap` helper (that's only needed to map a *range* of subuids). No `/etc/subuid`.
+///   2. mounts the `chain` as a READ-ONLY overlay (`MS_RDONLY|MS_NODEV|MS_NOSUID`) on a private temp
+///      mountpoint. No `/proc`, `/dev`, `/sys` is mounted — so the merged view contains ONLY the image's
+///      files (the disk-filling `/proc/<pid>` copy of a box-based approach is not even representable).
+///   3. resolves every source path with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` rooted at the
+///      mount — so the untrusted `src_rel` is confined BY CONSTRUCTION: a `..` is kernel-clamped to the
+///      mount root, and an in-image symlink with an absolute target (`/app -> /etc`) resolves inside the
+///      IMAGE's `/etc`, never the host's. (Both `..`-escape and in-image-absolute-symlink-escape were
+///      verified to read host files with a naive `cp`; `RESOLVE_IN_ROOT` closes both — `cp`'s
+///      `--no-dereference` only guards the FINAL component, not parent components, so it is NOT enough.)
+///   4. copies with an in-process recursive copier (regular files via `copy_file_range` + read/write
+///      fallback, directories recursively, symlinks verbatim) into the pre-opened `out_fd` — no external
+///      binary, so it works even on a `scratch`/distroless image. `src_rel = None` copies the whole
+///      rootfs (push squash); `Some(p)` copies that one path by basename (a `COPY --from`).
+///
+/// On `_exit` the child's mount+user namespaces die, unmounting the overlay BY CONSTRUCTION (no umount
+/// bookkeeping, no leaked mount holding deleted lower files). Only called for a ≥2-layer chain (where
+/// cross-layer opaque is possible); a single-layer/flat image is already merged and copied directly.
+fn merged_view_extract(
+    chain: &[String],
+    src_rel: Option<&str>,
+    out_dir: &std::path::Path,
+) -> Result<(), Error> {
+    // `chain` is ALREADY top-first (the caller split `resolve_image`'s `top:…:base` on ':'), and
+    // overlayfs `lowerdir=` shadows left-to-right (leftmost wins) — so we join it AS-IS (no reverse).
+    // Getting this order wrong silently defeats the opaque (base would shadow top), re-leaking the
+    // deleted file. The RO mount needs only lowerdir. The opts CString outlives the fork.
+    let lower = chain.join(":"); // top:…:base, order-preserving
+    let opts = cstring(&format!("lowerdir={lower}"))?;
+    // Defence-in-depth (the kernel `openat2(RESOLVE_IN_ROOT)` already confines every component): reject a
+    // `..` path COMPONENT up front with a clear error. `None` = whole-rootfs push.
+    if let Some(p) = src_rel {
+        if p.trim_start_matches('/').split('/').any(|c| c == "..") {
+            return Err(Error::Build(format!(
+                "COPY --from source '{p}' contains a '..' component (refused)"
+            )));
+        }
+    }
+    // Open the DESTINATION as an fd on the host, BEFORE any namespace work. It stays valid in the child
+    // (an fd isn't re-resolved), giving it a handle to the out dir to copy INTO without ever naming a
+    // host path — the only host object reachable from the confined child.
+    let out_fd = {
+        use std::os::unix::io::IntoRawFd;
+        std::fs::File::open(out_dir)
+            .map_err(|e| Error::Oci(format!("merged-view: open out dir: {e}")))?
+            .into_raw_fd()
+    };
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+
+    // FORK SAFETY: the child allocates (the copier uses `format!`/`CString`), which is only safe after
+    // `fork()` when no OTHER thread could hold the allocator lock — i.e. the process is single-threaded.
+    // `kern build`/`push` run on a synchronous single-threaded `main` (background threads live only in the
+    // run/box paths), so this holds today. Assert it in debug builds so a future worker-pool/pre-fork
+    // thread trips the test suite here instead of a rare production malloc deadlock.
+    debug_assert!(
+        single_threaded(),
+        "merged_view_extract forks + allocates in the child; the caller must be single-threaded"
+    );
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::close(out_fd) };
+        return Err(Error::Oci("merged-view: fork failed".into()));
+    }
+    if pid == 0 {
+        // ---- CHILD: sets up the ns/mount and copies; never returns (always `_exit`). ----
+        merged_view_child(&opts, out_fd, src_rel, euid, egid);
+    }
+    // ---- PARENT: close our copy of the out fd, reap the child, map its exit code to a precise error. ----
+    unsafe { libc::close(out_fd) };
+    let mut status = 0i32;
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        return Err(Error::Oci("merged-view: waitpid failed".into()));
+    }
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        return Ok(());
+    }
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    };
+    // 107 = openat2 ENOSYS (kernel < 5.6); 108 = the source path doesn't exist in the MERGED view (e.g.
+    // an opaque dir correctly hid it); 120 = the tree is nested past MERGED_COPY_MAX_DEPTH. Each gets a
+    // precise message; everything else is a generic extract failure with the stage code for diagnosis.
+    match code {
+        107 => Err(Error::Oci(
+            "reading the image's merged view needs openat2 (Linux 5.6+); this kernel is older"
+                .into(),
+        )),
+        108 => Err(Error::Build(
+            "COPY --from source does not exist in the stage's final filesystem".into(),
+        )),
+        120 => Err(Error::Build(
+            "COPY --from source tree is nested too deeply (refused)".into(),
+        )),
+        _ => Err(Error::Oci(format!(
+            "reading the image's merged overlay view failed (extract stage {code})"
+        ))),
+    }
+}
+
+/// The forked child of [`merged_view_extract`]. Sets up the namespaces + RO overlay mount, opens the
+/// merged view as a dirfd, resolves the source path CONFINED to it via `openat2(RESOLVE_IN_ROOT)`, then
+/// copies it into the pre-opened `out_fd` with an in-process recursive copier — NO chroot, NO `/proc`,
+/// NO external `cp`/`tar` (so it works even on a `scratch`/distroless image with no binaries). Each
+/// failure `_exit`s a distinct code so the parent can pinpoint the stage.
+///
+/// The child is the only thread in this process after fork (a `kern build` is single-threaded here), so
+/// the copier may allocate; the map-writing that precedes it stays allocation-free out of habit and to
+/// keep it robust if that ever changes.
+fn merged_view_child(
+    opts: &std::ffi::CStr,
+    out_fd: libc::c_int,
+    src_rel: Option<&str>,
+    euid: libc::uid_t,
+    egid: libc::gid_t,
+) -> ! {
+    unsafe {
+        // 1. New user + mount namespace.
+        if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+            libc::_exit(101);
+        }
+        // Single-uid self map: `deny` setgroups (required before writing gid_map unprivileged), then
+        // `0 <euid> 1` / `0 <egid> 1`. Grants CAP_SYS_ADMIN in the new userns with no `newuidmap` helper.
+        if !write_proc_self(b"/proc/self/setgroups\0", b"deny")
+            || !write_proc_self_map(b"/proc/self/uid_map\0", euid)
+            || !write_proc_self_map(b"/proc/self/gid_map\0", egid)
+        {
+            libc::_exit(102);
+        }
+        // Make our mount namespace private so the overlay mount can't propagate back to the host.
+        if libc::mount(
+            c"none".as_ptr(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+        {
+            libc::_exit(103);
+        }
+        // 2. Mount the merged view RO on a private mountpoint (relative to CWD at fork time).
+        let mnt = c".kern-merged";
+        libc::mkdir(mnt.as_ptr(), 0o700);
+        if libc::mount(
+            c"overlay".as_ptr(),
+            mnt.as_ptr(),
+            c"overlay".as_ptr(),
+            (libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong,
+            opts.as_ptr() as *const libc::c_void,
+        ) != 0
+        {
+            libc::_exit(104);
+        }
+        // 3. Open the merged view as a dirfd — the ROOT for all confined source resolution.
+        let root_fd = libc::open(mnt.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        if root_fd < 0 {
+            libc::_exit(105);
+        }
+        // 4. Copy. `None` = whole rootfs (push): copy the root dir itself INTO out_fd. `Some(p)` = a
+        // single COPY --from path, resolved confined and copied by basename into out_fd.
+        let code = match src_rel {
+            None => copy_confined_tree(root_fd, ".", out_fd, None, 0),
+            Some(p) => {
+                let rel = p.trim_start_matches('/');
+                // The basename becomes the destination entry name (Docker's `COPY --from x/y .` → `./y`).
+                let name = std::path::Path::new(rel)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned());
+                copy_confined_tree(root_fd, rel, out_fd, name.as_deref(), 0)
+            }
+        };
+        libc::_exit(code);
+    }
+}
+
+/// Recursively copy `src_rel` (resolved CONFINED under `root_fd` via `openat2(RESOLVE_IN_ROOT)`) into
+/// `dst_fd`. `dst_name` is the destination entry name (COPY --from: the source's basename); `None` means
+/// copy the CONTENTS of a directory `src_rel` into `dst_fd` (the whole-rootfs push case, `src_rel="."`).
+/// Returns 0 on success or a small non-zero code identifying the failing operation. Preserves regular
+/// files (via `copy_file_range` with a read/write fallback), directories (recursive), and symlinks
+/// (verbatim, never dereferenced — matching `cp -a`); best-effort mode/owner/mtime; device/fifo are
+/// skipped gracefully (rootless can't `mknod`, and they don't appear in a COPY --from binary/tree).
+/// Maximum directory nesting the copier will descend. A hostile ≥2-layer image can author an arbitrarily
+/// deep tree (`a/a/a/…`); without a cap the recursion would overflow the child's native stack (SIGSEGV,
+/// an uncontrolled abort). This bound is far above any real image's depth, so it only ever trips on an
+/// adversarial tree, where it returns a clean error code instead of crashing.
+const MERGED_COPY_MAX_DEPTH: u32 = 256;
+
+unsafe fn copy_confined_tree(
+    root_fd: libc::c_int,
+    src_rel: &str,
+    dst_fd: libc::c_int,
+    dst_name: Option<&str>,
+    depth: u32,
+) -> i32 {
+    if depth > MERGED_COPY_MAX_DEPTH {
+        return 120; // too deep — refuse rather than overflow the stack (parent surfaces a clean error)
+    }
+    // Resolve the source CONFINED to root_fd: `openat2(RESOLVE_IN_ROOT)` clamps `..` to root_fd and
+    // reinterprets absolute in-image symlinks relative to it; `RESOLVE_NO_MAGICLINKS` blocks /proc-style
+    // magic-link escapes. First open O_PATH|O_NOFOLLOW to classify the entry WITHOUT following a final
+    // symlink; then reopen readable with a SECOND openat2 (files/dirs) — reopening an O_PATH fd readable
+    // needs /proc (absent here), so a fresh confined openat2 is the clean way.
+    let sfd = openat2_in_root(root_fd, src_rel, libc::O_PATH | libc::O_NOFOLLOW);
+    if sfd < 0 {
+        let e = *libc::__errno_location();
+        // ENOSYS → kernel < 5.6 (no openat2): 107 (parent maps to a precise hint). ENOENT / RESOLVE
+        // refusal → 108 (a confined "no such file" — e.g. an opaque dir correctly hid the source).
+        return if e == libc::ENOSYS { 107 } else { 108 };
+    }
+    let mut st: libc::stat = std::mem::zeroed();
+    if libc::fstatat(sfd, c"".as_ptr(), &mut st, libc::AT_EMPTY_PATH) != 0 {
+        libc::close(sfd);
+        return 109;
+    }
+    match st.st_mode & libc::S_IFMT {
+        // Read the symlink target straight off the O_PATH classify fd (AT_EMPTY_PATH) — confined by the
+        // same openat2 that opened it, so no bare `readlinkat(root_fd, path)` re-resolution is needed.
+        libc::S_IFLNK => {
+            let rc = copy_one_symlink(sfd, dst_fd, dst_name);
+            libc::close(sfd);
+            rc
+        }
+        libc::S_IFDIR => {
+            libc::close(sfd); // reopened readable inside copy_one_dir via a fresh confined openat2
+            copy_one_dir(root_fd, src_rel, dst_fd, dst_name, &st, depth)
+        }
+        libc::S_IFREG => {
+            libc::close(sfd);
+            copy_one_file(root_fd, src_rel, dst_fd, dst_name, &st)
+        }
+        _ => {
+            libc::close(sfd);
+            0 // device/fifo/socket: skip (rootless can't recreate; absent in a COPY --from tree)
+        }
+    }
+}
+
+/// `openat2(root_fd, path, flags | RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`. The confinement primitive:
+/// every component of `path` (incl. `..` and in-image absolute symlinks) is resolved with `root_fd` as
+/// the root, so nothing outside the merged view is reachable. Returns the fd or -1 (errno set).
+unsafe fn openat2_in_root(root_fd: libc::c_int, path: &str, flags: libc::c_int) -> libc::c_int {
+    let Ok(path_c) = std::ffi::CString::new(path) else {
+        *libc::__errno_location() = libc::EINVAL;
+        return -1;
+    };
+    let mut how: libc::open_how = std::mem::zeroed(); // #[non_exhaustive]: zero then set
+    how.flags = flags as u64;
+    how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
+    libc::syscall(
+        libc::SYS_openat2,
+        root_fd,
+        path_c.as_ptr(),
+        &how as *const libc::open_how,
+        std::mem::size_of::<libc::open_how>(),
+    ) as libc::c_int
+}
+
+/// Copy a symlink SOURCE verbatim (read its target off the already-confined O_PATH `src_fd`, recreate
+/// with `symlinkat`). Never dereferenced — identical to `cp -a`, and reads nothing at the target. Reading
+/// via `readlinkat(src_fd, "", AT_EMPTY_PATH)` keeps confinement BY CONSTRUCTION: `src_fd` came from
+/// `openat2(RESOLVE_IN_ROOT)`, so there is no bare path re-resolution that could follow a symlinked parent.
+unsafe fn copy_one_symlink(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    dst_name: Option<&str>,
+) -> i32 {
+    let Some(name) = dst_name else { return 0 }; // a symlink has no "contents" to splat into a dir
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let n = libc::readlinkat(
+        src_fd,
+        c"".as_ptr(),
+        buf.as_mut_ptr() as *mut libc::c_char,
+        buf.len() - 1,
+    );
+    if n < 0 {
+        return 110;
+    }
+    buf[n as usize] = 0;
+    let Ok(name_c) = std::ffi::CString::new(name) else {
+        return 111;
+    };
+    if libc::symlinkat(buf.as_ptr() as *const libc::c_char, dst_fd, name_c.as_ptr()) != 0 {
+        return 112;
+    }
+    0
+}
+
+/// Copy a directory: create it in `dst_fd` (or reuse `dst_fd` when `dst_name` is `None` — the whole-
+/// rootfs push copies contents in place), then recurse. The source is reopened readable via a fresh
+/// confined `openat2` (O_DIRECTORY); each child recurses via its path under the merged root, so every
+/// component stays confined by `RESOLVE_IN_ROOT`.
+unsafe fn copy_one_dir(
+    root_fd: libc::c_int,
+    src_rel: &str,
+    dst_fd: libc::c_int,
+    dst_name: Option<&str>,
+    st: &libc::stat,
+    depth: u32,
+) -> i32 {
+    // Destination dir fd: a freshly-created subdir, or `dst_fd` itself (contents-in-place).
+    let child_dst = match dst_name {
+        Some(name) => {
+            let Ok(name_c) = std::ffi::CString::new(name) else {
+                return 111;
+            };
+            libc::mkdirat(dst_fd, name_c.as_ptr(), st.st_mode & 0o7777);
+            let fd = libc::openat(
+                dst_fd,
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            );
+            if fd < 0 {
+                return 113;
+            }
+            fd
+        }
+        None => libc::dup(dst_fd),
+    };
+    // Reopen the source dir readable (confined). `.` resolves to the merged root itself for the push case.
+    let src_read = openat2_in_root(root_fd, src_rel, libc::O_RDONLY | libc::O_DIRECTORY);
+    if src_read < 0 {
+        libc::close(child_dst);
+        return 114;
+    }
+    let dirp = libc::fdopendir(src_read);
+    if dirp.is_null() {
+        libc::close(src_read);
+        libc::close(child_dst);
+        return 115;
+    }
+    let mut rc = 0;
+    loop {
+        let ent = libc::readdir(dirp);
+        if ent.is_null() {
+            break;
+        }
+        let name_ptr = (*ent).d_name.as_ptr();
+        // Skip "." and "..".
+        let b0 = *name_ptr as u8;
+        let b1 = *name_ptr.add(1) as u8;
+        if b0 == b'.' && (b1 == 0 || (b1 == b'.' && *name_ptr.add(2) as u8 == 0)) {
+            continue;
+        }
+        let name_bytes = std::ffi::CStr::from_ptr(name_ptr).to_bytes();
+        let Ok(child_name) = std::str::from_utf8(name_bytes) else {
+            rc = 116;
+            break;
+        };
+        // Child path under the merged root: `src_rel/child` (or just `child` when src_rel is ".").
+        let child_rel = if src_rel == "." {
+            child_name.to_string()
+        } else {
+            format!("{src_rel}/{child_name}")
+        };
+        let child_rc =
+            copy_confined_tree(root_fd, &child_rel, child_dst, Some(child_name), depth + 1);
+        if child_rc != 0 {
+            rc = child_rc;
+            break;
+        }
+    }
+    libc::closedir(dirp); // also closes src_read
+                          // Best-effort preserve dir mode/owner AFTER populating, so it isn't undone.
+    if let Some(name) = dst_name {
+        if let Ok(name_c) = std::ffi::CString::new(name) {
+            libc::fchmodat(dst_fd, name_c.as_ptr(), st.st_mode & 0o7777, 0);
+            libc::fchownat(
+                dst_fd,
+                name_c.as_ptr(),
+                st.st_uid,
+                st.st_gid,
+                libc::AT_SYMLINK_NOFOLLOW,
+            );
+        }
+    }
+    libc::close(child_dst);
+    rc
+}
+
+/// Copy a regular file: reopen the source readable (confined), create the dest, copy bytes with
+/// `copy_file_range` (reflink/fast path) falling back to read/write, then preserve owner/mtime.
+unsafe fn copy_one_file(
+    root_fd: libc::c_int,
+    src_rel: &str,
+    dst_fd: libc::c_int,
+    dst_name: Option<&str>,
+    st: &libc::stat,
+) -> i32 {
+    let Some(name) = dst_name else { return 0 };
+    let Ok(name_c) = std::ffi::CString::new(name) else {
+        return 111;
+    };
+    let rfd = openat2_in_root(root_fd, src_rel, libc::O_RDONLY | libc::O_NOFOLLOW);
+    if rfd < 0 {
+        return 117;
+    }
+    let dfd = libc::openat(
+        dst_fd,
+        name_c.as_ptr(),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+        (st.st_mode & 0o7777) as libc::c_uint,
+    );
+    if dfd < 0 {
+        libc::close(rfd);
+        return 118;
+    }
+    // copy_file_range (kernel reflink/fast copy); fall back to read/write on ENOSYS/EXDEV/short copy.
+    let mut remaining = st.st_size as usize;
+    let mut ok = true;
+    while remaining > 0 {
+        let n = libc::copy_file_range(
+            rfd,
+            std::ptr::null_mut(),
+            dfd,
+            std::ptr::null_mut(),
+            remaining,
+            0,
+        );
+        if n > 0 {
+            remaining -= n as usize;
+        } else if n == 0 {
+            break; // EOF
+        } else {
+            ok = false;
+            break;
+        }
+    }
+    if !ok {
+        // read/write fallback from the start.
+        libc::lseek(rfd, 0, libc::SEEK_SET);
+        libc::ftruncate(dfd, 0);
+        let mut buf = [0u8; 1 << 16];
+        loop {
+            let r = libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+            if r < 0 {
+                libc::close(rfd);
+                libc::close(dfd);
+                return 119;
+            }
+            if r == 0 {
+                break;
+            }
+            let mut off = 0isize;
+            while off < r {
+                let w = libc::write(
+                    dfd,
+                    buf.as_ptr().offset(off) as *const libc::c_void,
+                    (r - off) as usize,
+                );
+                if w <= 0 {
+                    libc::close(rfd);
+                    libc::close(dfd);
+                    return 119;
+                }
+                off += w;
+            }
+        }
+    }
+    // Preserve owner + mtime best-effort (mode was set at create time).
+    libc::fchown(dfd, st.st_uid, st.st_gid);
+    let times = [
+        libc::timespec {
+            tv_sec: st.st_atime,
+            tv_nsec: st.st_atime_nsec,
+        },
+        libc::timespec {
+            tv_sec: st.st_mtime,
+            tv_nsec: st.st_mtime_nsec,
+        },
+    ];
+    libc::futimens(dfd, times.as_ptr());
+    libc::close(rfd);
+    libc::close(dfd);
+    0
+}
+
+/// `write(open(path), val)` — async-signal-safe (no allocation). `true` on full write.
+unsafe fn write_proc_self(path: &[u8], val: &[u8]) -> bool {
+    let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY);
+    if fd < 0 {
+        return false;
+    }
+    let n = libc::write(fd, val.as_ptr() as *const libc::c_void, val.len());
+    libc::close(fd);
+    n == val.len() as isize
+}
+
+/// Write a single-uid map line `0 <id> 1` to `path` (uid_map/gid_map), async-signal-safe. Formats the
+/// number into a stack buffer (no allocation) to stay fork-safe.
+unsafe fn write_proc_self_map(path: &[u8], id: u32) -> bool {
+    let mut buf = [0u8; 32];
+    let mut i = 0;
+    buf[i] = b'0';
+    i += 1;
+    buf[i] = b' ';
+    i += 1;
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut v = id;
+    if v == 0 {
+        digits[d] = b'0';
+        d += 1;
+    }
+    while v > 0 {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+    }
+    while d > 0 {
+        d -= 1;
+        buf[i] = digits[d];
+        i += 1;
+    }
+    buf[i] = b' ';
+    i += 1;
+    buf[i] = b'1';
+    i += 1;
+    write_proc_self(path, &buf[..i])
+}
+
+/// `CString` from a `&str`, mapping interior-NUL to an OCI error (a path/opt with a NUL is invalid).
+fn cstring(s: &str) -> Result<std::ffi::CString, Error> {
+    std::ffi::CString::new(s).map_err(|_| Error::Oci("merged-view: NUL in path".into()))
+}
+
+/// `true` if this process has exactly one thread — read from `/proc/self/stat`'s `num_threads` field.
+/// Used only in a `debug_assert` to guard the fork-safety invariant of [`merged_view_extract`]. Best
+/// effort: if `/proc` is unreadable we assume single-threaded (don't fire a spurious assert).
+fn single_threaded() -> bool {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return true;
+    };
+    // Fields after the (possibly space/paren-bearing) comm are space-separated; num_threads is field 20
+    // (1-indexed), i.e. the 18th field AFTER the closing ')'. Parse from the last ')' to avoid comm spaces.
+    let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r.trim_start()) else {
+        return true;
+    };
+    rest.split_whitespace()
+        .nth(17) // state(1) … num_threads is the 18th token after comm
+        .and_then(|n| n.parse::<i64>().ok())
+        .map(|n| n <= 1)
+        .unwrap_or(true)
+}
+
 /// Materialize an image reference to `(rootfs_dir, config, cleanup)`. `cleanup` is `Some(tmp)` when we
 /// created a temporary squashed rootfs (layered image) that the caller must remove; `None` when the
 /// rootfs is the persistent flat cache dir (do NOT delete it). Errors if the image isn't cached.
@@ -3948,29 +4508,31 @@ fn materialize_image(
     }
     // Layered/built image: squash the overlay chain into a fresh temp rootfs so we push one layer.
     //
-    // WHITEOUT INVARIANT (review §C — a leak-of-deleted-secrets if broken): a naive `cp -a` bottom-up
-    // squash of RAW OCI layers would re-include a file that a higher layer DELETED via a `.wh.` whiteout
-    // — e.g. a secret `rm`'d in a cleanup layer would reappear in the pushed image. kern's layers are
-    // safe from this by construction: (a) a PULLED base is already the MERGED rootfs — the pull RESOLVES
-    // `.wh.`/`.wh..wh..opq` during extraction (see kern_oci::pull), leaving no whiteout files; (b) a
-    // BUILT image is base + a SINGLE upper diff where RUN `rm` deletes for real (one shared upper, no
-    // per-step whiteout). So the chain here never contains whiteout files, and `cp -a` is correct.
-    // Belt-and-braces AND future-proofing (if kern ever gains per-RUN whiteout layers): after the copy
-    // we STRIP any `.wh.*` that somehow survived, so a whiteout can never be pushed as a literal file.
+    // WHITEOUT/OPAQUE INVARIANT (a leak-of-deleted-secrets if broken): a hand-rolled bottom-up `cp -a`
+    // of the RAW layer dirs re-includes a file that a higher layer DELETED — a per-file `.wh.` whiteout
+    // OR (the case a naive squash misses) an OPAQUE directory (`rm -rf dir && mkdir dir`, marked by the
+    // `overlay.opaque` xattr, NOT a `.wh.` file). A secret `rm`'d in a build step then resurfaces in the
+    // pushed image. So we DON'T hand-roll the merge: we copy from the KERNEL-MERGED overlay view (see
+    // [`merged_view_extract`]), where the kernel has already applied opaque + whiteout + redirect_dir +
+    // metacopy — the only correct reader. The chain is `top:…:base`; a single-layer image can't have a
+    // cross-layer opaque, so it's copied directly (below); a ≥2-layer chain goes through the merged view.
     let (lower, config) = resolve_image(image)?;
+    let chain: Vec<String> = lower.split(':').map(str::to_string).collect();
     let tmp = cache.join(format!(".push-squash-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| Error::Oci(format!("squash dir: {e}")))?;
-    // The overlay chain is `top:...:base` (colon-joined). Copy each layer bottom-up into `tmp` so the
-    // top layers shadow the base — a simple squash. `cp -a` preserves symlinks (no host-follow).
-    let mut layers: Vec<&str> = lower.split(':').collect();
-    layers.reverse(); // apply base first, then higher layers overwrite
-    for layer in layers {
+    if chain.len() >= 2 {
+        // ≥2 stacked layers → cross-layer opaque is possible → read the kernel-merged view.
+        merged_view_extract(&chain, None, &tmp).inspect_err(|_| {
+            remove_build_tree(&tmp);
+        })?;
+    } else {
+        // A single layer is already its own merged rootfs — copy it directly (no opaque to honour).
         let ok = std::process::Command::new("cp")
             .arg("-a")
-            .arg("--reflink=auto") // CoW clone on btrfs/xfs (near-free); plain copy elsewhere
+            .arg("--reflink=auto")
             .arg("--")
-            .arg(format!("{layer}/."))
+            .arg(format!("{}/.", chain[0]))
             .arg(&tmp)
             .status()
             .map(|s| s.success())
@@ -3979,10 +4541,11 @@ fn materialize_image(
             remove_build_tree(&tmp);
             return Err(Error::Oci(format!("squashing image '{image}' failed")));
         }
+        // Defence-in-depth on the direct path: strip any surviving OCI whiteout marker file so a
+        // `.wh.<name>` can never be pushed as a literal file. (The merged-view path can't produce one —
+        // the kernel already resolved whiteouts — so it's only needed here.)
+        strip_whiteout_markers(&tmp);
     }
-    // Defence-in-depth: strip any surviving OCI whiteout markers so a `.wh.<name>` can never be pushed
-    // as a literal file (which a registry/Docker would then materialize as a real file named `.wh.…`).
-    strip_whiteout_markers(&tmp);
     Ok((tmp.clone(), config, Some(tmp)))
 }
 
@@ -4670,98 +5233,36 @@ fn prepare_stage(
 }
 
 /// Copy `src_rel` OUT of a source stage's overlay `chain` (top-first list of layer dirs) into `dest`,
-/// WITHOUT squashing the whole rootfs first. PERF: a `COPY --from=build /app/bin` used to squash the
-/// stage's entire base (e.g. all of alpine, ~8 MB) into a temp dir just to extract one path — the
-/// dominant cost of a multi-stage rebuild (measured: ~67 ms of fixed overhead vs Docker's ~42 ms). Here
-/// we resolve `src_rel` against the merged view of the chain and copy ONLY that path.
+/// honouring overlay opaque/whiteout semantics so a file DELETED in a build step never resurfaces.
 ///
-/// SECURITY (same guarantees as the squash path): each candidate is canonicalized under ITS layer dir
-/// and `starts_with`-confined, so a `..`/symlink escape is refused exactly like a context COPY, and
-/// `cp -a` is no-follow. Correctness for the two overlay subtleties: (a) a plain FILE lives in exactly
-/// one layer, so the FIRST (top-most) layer that has it is the merged value — top-first is correct;
-/// (b) a DIRECTORY whose contents span multiple layers can't be union-copied layer-by-layer without
-/// re-including whiteout-deleted entries — so for a dir source we fall back to the whiteout-safe
-/// `materialize_image` squash (rare; the common COPY --from is a file/binary). This never resurrects a
-/// deleted file and never reads a host path at build time.
+/// For a ≥2-layer chain this reads from the KERNEL-MERGED view ([`merged_view_extract`]) — the ONLY
+/// correct reader: a top-first walk of the RAW layers leaks a file whose PARENT directory was made
+/// OPAQUE in an upper layer (`rm -rf dir && mkdir dir`), because the walk finds the file in a lower
+/// layer that the opaque was meant to hide. (Verified live: a secret `rm`'d in a build step reappeared
+/// via `COPY --from`.) The merged view also confines an untrusted `src_rel` by CONSTRUCTION
+/// (`openat2(RESOLVE_IN_ROOT)`), so a `..`-escape and an in-image absolute-symlink-escape are both
+/// closed — see the primitive's doc. A single-layer chain has no cross-layer opaque possible, so it's
+/// copied directly (host-side canonicalize + `starts_with` confine).
 fn copy_from_stage_chain(
     chain: &[String],
     src_rel: &str,
     dest: &std::path::Path,
-    stage_tag: &str,
+    _stage_tag: &str,
 ) -> Result<(), Error> {
-    let clean = src_rel.trim_start_matches('/');
-    // Walk the chain TOP-FIRST; the first layer that contains a (confined) `src_rel` wins.
-    for layer in chain {
-        let layer_root = std::path::Path::new(layer);
-        let candidate = layer_root.join(clean);
-        // Existence check WITHOUT following the final component (a symlink still "exists" here).
-        let lmeta = match std::fs::symlink_metadata(&candidate) {
-            Ok(m) => m,
-            Err(_) => continue, // not in this layer — try the next lower one
-        };
-        // CONFINE the SOURCE PATH (not a followed target): canonicalize the PARENT dir (resolving any
-        // symlinked path components) and require the resolved parent to stay inside this layer. The
-        // final component is joined back on WITHOUT following it — so a symlink source is preserved
-        // verbatim (`cp -a` no-follow) rather than dereferenced. This refuses a `..`/symlinked-parent
-        // escape exactly like a context COPY, while matching Docker's "COPY a symlink as a symlink".
-        let parent = candidate.parent().unwrap_or(layer_root);
-        let name = candidate
-            .file_name()
-            .ok_or(Error::Build("COPY --from source has no file name".into()))?;
-        let real_parent = std::fs::canonicalize(parent)
-            .map_err(|e| Error::Build(format!("COPY --from source '{src_rel}': {e}")))?;
-        if !real_parent.starts_with(layer_root) {
-            return Err(Error::Build(format!(
-                "COPY --from source '{src_rel}' escapes the source stage"
-            )));
-        }
-        let src = real_parent.join(name);
-        // A DIRECTORY may have contents merged across lower layers (and whiteouts) — a per-layer copy
-        // would be wrong (could resurrect a whiteout-deleted entry). Fall back to the whiteout-safe
-        // `materialize_image` squash for the dir case only. `is_dir()` follows a symlink-to-dir, which
-        // is fine: a symlinked dir source is squash-materialized correctly too. A plain file or a
-        // symlink (of any kind) takes the fast direct-copy path.
-        if lmeta.is_dir() || (lmeta.file_type().is_symlink() && src.is_dir()) {
-            let (rootfs, _cfg, cleanup) = materialize_image(stage_tag)?;
-            let r = copy_from_stage_rootfs(&rootfs, src_rel, dest);
-            if let Some(t) = cleanup {
-                remove_build_tree(&t);
-            }
-            return r;
-        }
-        // A file or symlink: this layer's entry is the merged value. `cp -a` copies it verbatim
-        // (no-follow), so a symlink lands as a symlink and its target is never read at build time.
-        return copy_one(&src, &dest.join(name), src_rel);
+    if chain.len() >= 2 {
+        // ≥2 stacked layers → cross-layer opaque is possible → read the kernel-merged view (which also
+        // handles file AND directory sources uniformly, confining `src_rel` via `openat2(RESOLVE_IN_ROOT)`).
+        return merged_view_extract(chain, Some(src_rel), dest);
     }
-    Err(Error::Build(format!(
-        "COPY --from source '{src_rel}': No such file or directory"
-    )))
+    // Exactly one layer: it IS its own merged rootfs (no cross-layer opaque to honour). Copy directly
+    // through the shared single-rootfs confine helper (canonicalize + `starts_with`, `cp -a` no-follow).
+    copy_from_stage_rootfs(std::path::Path::new(&chain[0]), src_rel, dest)
 }
 
-/// `cp -a --reflink=auto --` a single resolved `src` to `target`, no-follow, preserving modes.
-fn copy_one(src: &std::path::Path, target: &std::path::Path, label: &str) -> Result<(), Error> {
-    let ok = std::process::Command::new("cp")
-        .arg("-a")
-        .arg("--reflink=auto")
-        .arg("--")
-        .arg(src)
-        .arg(target)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Build(format!(
-            "COPY --from could not copy '{label}'"
-        )))
-    }
-}
-
-/// Copy `src_rel` OUT of a source stage's materialized rootfs into `dest`, confined to the rootfs (the
-/// same canonicalize + `starts_with` escape check `copy_into_rootfs` applies to a context COPY). A
-/// `COPY --from=build /etc/../../host` therefore fails exactly like a hostile context COPY. Used as the
-/// whiteout-safe fallback for a DIRECTORY source (see [`copy_from_stage_chain`]).
+/// Copy `src_rel` OUT of a single source rootfs `src_rootfs` into `dest`, confined to it (canonicalize +
+/// `starts_with`, the same escape guard a context COPY uses) with a no-follow `cp -a`. Used for a
+/// SINGLE-layer `COPY --from` chain (a ≥2-layer chain goes through [`merged_view_extract`] instead,
+/// which honours cross-layer opaque).
 fn copy_from_stage_rootfs(
     src_rootfs: &std::path::Path,
     src_rel: &str,
@@ -7325,6 +7826,65 @@ mod net_resource_tests {
                 joined.starts_with("/cache/kern"),
                 "{evil:?} → {joined:?} escaped the cache"
             );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn merged_view_honours_opaque_no_secret_resurrection() {
+        // REGRESSION for the opaque-dir leak: two stacked layers where an UPPER layer made `/app` opaque
+        // (`rm -rf /app && mkdir /app`, marked by `user.overlay.opaque`) and a LOWER layer holds a secret
+        // `/app/token`. Reading the merged view (`merged_view_extract`) must NOT resurrect the secret —
+        // the kernel applies the opaque, so `/app/token` is gone and only the upper's `marker` remains.
+        // A naive raw-layer walk (the old fast-path) leaked the secret here.
+        let base = std::env::temp_dir().join(format!("kern-mvbase-{}", std::process::id()));
+        let top = std::env::temp_dir().join(format!("kern-mvtop-{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!("kern-mvout-{}", std::process::id()));
+        for d in [&base, &top, &out] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        std::fs::create_dir_all(base.join("app")).unwrap();
+        std::fs::write(base.join("app/token"), b"SECRET_MUST_NOT_RESURFACE").unwrap();
+        std::fs::create_dir_all(top.join("app")).unwrap();
+        std::fs::write(top.join("app/marker"), b"public").unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        // Mark the top's `/app` opaque. In a userns-owned overlay kern mounts WITHOUT `userxattr`, so the
+        // kernel reads `trusted.overlay.opaque`; but a plain test process can only set `user.overlay.*`.
+        // We therefore skip if we can't establish the opaque (CI without the privilege) rather than pass
+        // vacuously — the real guarantee is exercised end-to-end by the build tests.
+        let set_trusted = std::process::Command::new("setfattr")
+            .args(["-n", "trusted.overlay.opaque", "-v", "y"])
+            .arg(top.join("app"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !set_trusted {
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&top);
+            let _ = std::fs::remove_dir_all(&out);
+            eprintln!(
+                "skip: cannot set trusted.overlay.opaque (needs privilege); covered by build e2e"
+            );
+            return;
+        }
+        // chain is top-first: [top, base].
+        let chain = vec![
+            top.to_string_lossy().into_owned(),
+            base.to_string_lossy().into_owned(),
+        ];
+        let r = merged_view_extract(&chain, Some("/app"), &out);
+        // The copy of `/app` must succeed and contain ONLY `marker` — never the opaque-hidden `token`.
+        assert!(r.is_ok(), "merged_view_extract failed: {r:?}");
+        assert!(
+            out.join("app/marker").exists(),
+            "public marker should be copied"
+        );
+        assert!(
+            !out.join("app/token").exists(),
+            "SECRET RESURRECTED: the opaque-hidden token must not appear in the merged copy"
+        );
+        for d in [&base, &top, &out] {
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 
