@@ -3899,7 +3899,11 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
         cp_file(".layers")?;
         cp_file(".base")?;
     } else if diff.is_dir() {
+        // A single-diff image is `<safe>.diff/` stacked over its `<safe>.base` marker (the base ref) —
+        // `resolve_image` needs BOTH, so copy the diff dir AND the base marker, or the tag would fail to
+        // resolve (no `.base` → fall through to a re-pull).
         copy_tree(&diff, &cache.join(format!("{dst_safe}.diff")))?;
+        cp_file(".base")?;
     } else {
         return Err(Error::Oci(format!(
             "image '{src}' is cached but has no rootfs form — try re-pulling"
@@ -4494,13 +4498,21 @@ fn build_multi_stage(
         };
 
         // Build this stage's instruction slice, rewriting any `COPY --from=<stage>` into a plain COPY
-        // whose source is the referenced stage's materialized rootfs. Non-final `COPY --from` are the
-        // only cross-stage edge; a `COPY` from the context stays as-is.
+        // whose source is the referenced stage's materialized rootfs. A `COPY` from the context stays
+        // as-is; `stage_uses_context` tracks whether ANY such context COPY exists (perf: only then must
+        // we hand the builder the real build context).
         let mut stage_instrs: Vec<Instr> = Vec::with_capacity(end - start);
-        // Each materialized source stage keeps its temp dir alive until this stage finishes copying.
-        let mut mounts: Vec<PathBuf> = Vec::new();
-        // A per-stage sub-context dir holds copies pulled from source stages, so `copy_into_rootfs`
-        // (which takes ONE ctx) can reach them; the FROM/RUN/context-COPY still use the real ctx.
+        let mut stage_uses_context = false;
+        // Whether this stage pulled from any source stage (→ needs the sub-context grafted in).
+        let mut pulled_from_stage = false;
+        // The sub-context holding files pulled from source stages, so `copy_into_rootfs` (one ctx) can
+        // reach them. Created lazily on the first `COPY --from`.
+        let subctx = work.join(format!("from-{si}"));
+        // PERF: materialize each SOURCE STAGE at most once per stage, not once per `COPY --from` — N
+        // copies from the same builder stage then squash it once, not N times. Cleaned up after the loop.
+        let mut materialized: std::collections::HashMap<usize, (PathBuf, Option<PathBuf>)> =
+            std::collections::HashMap::new();
+        let mut fail = None;
         for ins in &instrs[start..end] {
             match ins {
                 Instr::Copy {
@@ -4510,31 +4522,44 @@ fn build_multi_stage(
                 } => {
                     // Resolve the referenced stage (earlier only — parser already validated).
                     let Some(src_idx) = resolve_from(fref, &stage_names, si) else {
-                        cleanup_stage_tags(&stage_tags);
-                        return Err(Error::Build(format!(
+                        fail = Some(Error::Build(format!(
                             "COPY --from='{fref}' does not name an earlier stage"
                         )));
+                        break;
                     };
-                    // Materialize the source stage to a merged rootfs dir (whiteout-safe). Copy each src
-                    // out of it into a fresh sub-context, through the SAME guards as a context COPY, so
-                    // the escape classes are closed identically.
-                    let (src_rootfs, _cfg, cleanup) = materialize_image(&stage_tags[src_idx])?;
-                    let subctx = work.join(format!("from-{si}-{}", mounts.len()));
-                    let _ = std::fs::create_dir_all(&subctx);
-                    for s in srcs {
-                        // Pull `s` out of the source stage rootfs into `subctx`, confined to src_rootfs.
-                        if let Err(e) = copy_from_stage_rootfs(&src_rootfs, s, &subctx) {
-                            if let Some(t) = cleanup {
-                                remove_build_tree(&t);
+                    // Materialize the source stage ONCE (whiteout-safe), cached for this stage.
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        materialized.entry(src_idx)
+                    {
+                        match materialize_image(&stage_tags[src_idx]) {
+                            Ok((rootfs, _cfg, cleanup)) => {
+                                slot.insert((rootfs, cleanup));
                             }
-                            cleanup_stage_tags(&stage_tags);
-                            return Err(e);
+                            Err(e) => {
+                                fail = Some(e);
+                                break;
+                            }
                         }
                     }
-                    if let Some(t) = cleanup {
-                        remove_build_tree(&t); // squashed rootfs no longer needed
+                    let src_rootfs = &materialized[&src_idx].0;
+                    if !pulled_from_stage {
+                        let _ = std::fs::create_dir_all(&subctx);
+                        pulled_from_stage = true;
                     }
-                    // Now a plain COPY from the sub-context: same dst-side guards, WORKDIR, dir semantics.
+                    // Pull each src out of the source stage rootfs into the sub-context, through the SAME
+                    // guards as a context COPY (canonicalize + confine + no-follow) — same escape classes.
+                    let mut copy_err = None;
+                    for s in srcs {
+                        if let Err(e) = copy_from_stage_rootfs(src_rootfs, s, &subctx) {
+                            copy_err = Some(e);
+                            break;
+                        }
+                    }
+                    if let Some(e) = copy_err {
+                        fail = Some(e);
+                        break;
+                    }
+                    // Rewrite to a plain COPY from the sub-context: same dst-side guards, WORKDIR, dirs.
                     let names: Vec<String> = srcs
                         .iter()
                         .map(|s| {
@@ -4549,27 +4574,44 @@ fn build_multi_stage(
                         dst: dst.clone(),
                         from: None,
                     });
-                    mounts.push(subctx);
+                }
+                // A context COPY (from: None) — the stage references the real build context.
+                Instr::Copy { .. } => {
+                    stage_uses_context = true;
+                    stage_instrs.push(ins.clone());
                 }
                 other => stage_instrs.push(other.clone()),
             }
         }
+        // Drop the materialized source rootfs squashes (one per distinct source stage) now we've copied.
+        for (_, (_, cleanup)) in materialized {
+            if let Some(t) = cleanup {
+                remove_build_tree(&t);
+            }
+        }
+        if let Some(e) = fail {
+            let _ = std::fs::remove_dir_all(&subctx);
+            cleanup_stage_tags(&stage_tags);
+            return Err(e);
+        }
 
-        // The stage's build context: if it pulled from other stages, it needs BOTH the real ctx (for
-        // context COPY) and the sub-contexts (for the rewritten --from COPY). We keep them separate by
-        // building the stage against a MERGED context dir only when there were --from copies; otherwise
-        // the real ctx is used directly (no copy, byte-identical to single-stage).
-        let stage_ctx = if mounts.is_empty() {
+        // Choose the stage's build context WITHOUT copying the (possibly huge) real context unless the
+        // stage actually COPYs from it (Finding B): the common `FROM alpine` + only `COPY --from` case
+        // builds against the small sub-context alone. Cases:
+        //  - no --from pull:            use the real ctx directly (byte-identical to single-stage).
+        //  - --from pull, no ctx COPY:  build against the sub-context only (no full-context copy).
+        //  - --from pull AND ctx COPY:  graft the sub-context onto a copy of the real ctx (rare).
+        let stage_ctx = if !pulled_from_stage {
             ctx.to_path_buf()
+        } else if !stage_uses_context {
+            subctx.clone()
         } else {
             let merged = work.join(format!("ctx-{si}"));
             let _ = std::fs::remove_dir_all(&merged);
             copy_tree(ctx, &merged)?;
-            for m in &mounts {
-                // Overlay the pulled files on top of the real context (same-name context files lose to
-                // the stage-copied ones, which is the intent of an explicit COPY --from).
-                merge_context(m, &merged)?;
-            }
+            // Overlay the pulled files on top of the real context (an explicit COPY --from wins on a
+            // name clash, which is the intent).
+            merge_context(&subctx, &merged)?;
             merged
         };
 
