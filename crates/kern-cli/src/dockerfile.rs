@@ -3,9 +3,10 @@
 //! Supported instructions: `FROM RUN COPY ADD ENV WORKDIR USER CMD ENTRYPOINT EXPOSE ARG LABEL`.
 //! `VOLUME` and `HEALTHCHECK` are ACCEPTED (parsed, no build-time effect) so stock upstream Dockerfiles
 //! build instead of failing; `HEALTHCHECK` nudges the user to kern's runtime `--health-cmd`.
-//! Multi-stage syntax (`FROM … AS <name>`, `COPY --from=<stage>`) is PARSED here (stage names tracked,
-//! `--from` validated against earlier stages via [`resolve_from`]) — the multi-stage *executor* is a
-//! separate change, so a Dockerfile that uses it currently parses but is refused at execution time.
+//! Multi-stage builds are supported: `FROM … AS <name>` and `COPY --from=<stage>` are parsed here
+//! (stage names tracked, `--from` validated against earlier stages via [`resolve_from`]) and executed by
+//! `commands::build_multi_stage`, which builds each stage through the single-stage path and copies
+//! artifacts across stages.
 //! Deliberately NOT supported (rejected with a clear error, never silently ignored): `SHELL`, `ONBUILD`,
 //! `STOPSIGNAL`, `ADD <url>`, and `ADD` auto-extraction. Comments (`#`), blank lines and backslash
 //! line-continuations are handled; `ARG`/`ENV` values substitute into later `${VAR}`/`$VAR`.
