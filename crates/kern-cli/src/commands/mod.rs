@@ -7276,4 +7276,67 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&dest);
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_from_stage_preserves_relative_symlink_no_host_read() {
+        // Reviewer 2a residual vector: a RELATIVE symlink inside a copied dir whose target ESCAPES the
+        // stage rootfs (many `..` → a host file). It must arrive as a verbatim symlink, its host target
+        // NEVER read at build time (canary check), and stay dangling once inside the box. This is the
+        // one case the absolute-symlink test didn't exercise; `cp -a` is no-follow so it's preserved.
+        let stage = std::env::temp_dir().join(format!("kern-rel-{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("kern-reldst-{}", std::process::id()));
+        let canary = std::env::temp_dir().join(format!("kern-rel-canary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(stage.join("sub")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(&canary, b"HOST-SECRET-DO-NOT-LEAK").unwrap();
+        // A relative symlink with enough `..` to reach the canary if it were ever followed.
+        let rel_target = format!("../../../../../../../../..{}", canary.display());
+        std::os::unix::fs::symlink(&rel_target, stage.join("sub/rellink")).unwrap();
+        assert!(copy_from_stage_rootfs(&stage, "/sub", &dest).is_ok());
+        let copied = dest.join("sub/rellink");
+        let meta = std::fs::symlink_metadata(&copied).expect("rellink should exist");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the relative symlink must be preserved, not dereferenced"
+        );
+        // The link target is verbatim (relative), and the canary's CONTENT never entered the copy tree.
+        assert_eq!(
+            std::fs::read_link(&copied).unwrap().to_string_lossy(),
+            rel_target
+        );
+        // Walk the whole copied tree: no file may contain the host secret's bytes (nothing dereferenced).
+        fn contains_secret(p: &std::path::Path) -> bool {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    let ep = e.path();
+                    let ft = match std::fs::symlink_metadata(&ep) {
+                        Ok(m) => m.file_type(),
+                        Err(_) => continue,
+                    };
+                    if ft.is_symlink() {
+                        continue; // never follow — the whole point
+                    } else if ft.is_dir() {
+                        if contains_secret(&ep) {
+                            return true;
+                        }
+                    } else if let Ok(b) = std::fs::read(&ep) {
+                        if b.windows(11).any(|w| w == b"HOST-SECRET") {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        assert!(
+            !contains_secret(&dest),
+            "the host canary's bytes must NEVER appear in the copied tree (no build-time deref)"
+        );
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_file(&canary);
+    }
 }
