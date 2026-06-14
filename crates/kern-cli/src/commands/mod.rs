@@ -39,7 +39,7 @@ pub fn help() -> Result<(), Error> {
 
   {d}Images{z}
     {c}search{z} <query> [--json]                                        Search Docker Hub for images
-    {c}pull{z} <image> [--dest <dir>]                                    Download an OCI image
+    {c}pull{z} <image> [--dest <dir>] [--platform os/arch]              Download an OCI image
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
@@ -3791,15 +3791,30 @@ pub(crate) fn fmt_uptime(s: u64) -> String {
 }
 
 /// `kern pull <image> [--dest <dir>]` — download an OCI image into a rootfs directory.
-pub fn pull(image: &str, dest: Option<&str>) -> Result<(), Error> {
+pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(), Error> {
     let dest = match dest {
         Some(d) => PathBuf::from(d),
         None => std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(sanitize_ref(image)),
     };
+    // `--platform os/arch`: fetch a specific arch from a multi-arch index (default = this host). A
+    // foreign arch pulls fine (for inspection/export); a heads-up if it can't run natively here.
+    let plat = match platform {
+        Some(p) => Some(kern_oci::Platform::parse(p).map_err(|e| Error::Oci(e.to_string()))?),
+        None => None,
+    };
     println!("pulling {image} -> {}", dest.display());
-    kern_oci::pull(image, &dest).map_err(|e| Error::Oci(e.to_string()))?;
+    kern_oci::pull(image, &dest, plat.as_ref()).map_err(|e| Error::Oci(e.to_string()))?;
+    if let Some(p) = &plat {
+        if !p.is_host() {
+            eprintln!(
+                "note: pulled linux/{} — it won't run natively on this {} host without a qemu-user + binfmt handler",
+                p.as_oci_arch(),
+                kern_oci::Platform::host().as_oci_arch()
+            );
+        }
+    }
     println!(
         "done. run it: kern box <name> --rootfs {} -- /bin/sh",
         dest.display()
@@ -4099,7 +4114,9 @@ fn pull_to_cache(image: &str) -> Result<(String, kern_oci::ImageConfig), Error> 
         eprintln!("→ image '{image}' not cached — pulling once (reused after)");
         let _ = std::fs::remove_dir_all(&dir); // clear any partial extraction
         std::fs::create_dir_all(&dir).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
-        let config = kern_oci::pull(image, &dir).map_err(|e| Error::Oci(e.to_string()))?;
+        // The `box --image` cache path pulls the host arch; `box --platform` (foreign-arch box) is
+        // Slice B, deferred with the multi-stage work — so no platform override here yet.
+        let config = kern_oci::pull(image, &dir, None).map_err(|e| Error::Oci(e.to_string()))?;
         write_image_config(&cfgfile, &config);
         let _ = std::fs::write(&sentinel, image.as_bytes());
     }

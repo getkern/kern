@@ -267,7 +267,7 @@ fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
     }
     format!(
         "{{\"architecture\":{},\"os\":\"linux\",\"config\":{{{}}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[{}]}}}}",
-        json_str(current_arch()),
+        json_str(crate::Platform::host().as_oci_arch()),
         config_fields.join(","),
         json_str(diff_id)
     )
@@ -442,15 +442,6 @@ fn short(digest: &str) -> String {
         .strip_prefix("sha256:")
         .map(|h| h[..h.len().min(12)].to_string())
         .unwrap_or_else(|| digest.to_string())
-}
-
-/// Host CPU architecture in OCI naming (`amd64`/`arm64`).
-fn current_arch() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "amd64"
-    }
 }
 
 #[cfg(test)]
