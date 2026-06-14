@@ -22,6 +22,13 @@ mod ssh;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 pub use cgroup::apply_limits as apply_cgroup_limits;
+/// True iff kern's delegated `kern.slice` is usable → the caller may SKIP the per-box systemd scope and
+/// cap directly (fast path). Ensures the slice as a side effect (idempotent one-time bootstrap).
+pub use cgroup::direct_caps_available;
+/// Canonical predicates for the direct cap path — shared so the scope-skip decision and the fail-closed
+/// gate can't drift. `env_claims_enforcer_but_none_real` detects a FORGED outer-enforcer env var (a
+/// caller trying to disarm the fail-closed) by verifying the claim against the real cgroup state. See `cgroup.rs`.
+pub use cgroup::{env_claims_enforcer_but_none_real, took_direct_cap_path, user_systemd_present};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::preflight as preflight_ports;
 pub use real::{
