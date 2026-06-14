@@ -486,6 +486,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             cpuset.as_deref(),
             cpus,
             args.pids_limit,
+            true, // `kern box` has a supervisor → may take the direct kern.slice path
         );
     }
     // A profile's `nice` set here is inherited by the forked box workload.
@@ -1106,8 +1107,11 @@ pub fn run(
     // re-execs once and returns here under KERN_SCOPE. Where systemd --user isn't present it's a
     // no-op and the best-effort in-process cgroup below applies the same caps.
     let cpus = clamp_cpus(cpus);
-    reexec_in_scope_if_possible(memory, memory_swap_max, cpuset.as_deref(), cpus, None);
+    // `kern run` exec()s in place (no supervisor to reap the cgroup) → `false`: it must use the systemd
+    // `--scope --collect` path (which auto-removes the cgroup on exit), never the direct kern.slice path.
+    reexec_in_scope_if_possible(memory, memory_swap_max, cpuset.as_deref(), cpus, None, false);
     let cg = kern_isolation::apply_cgroup_limits(
+        false, // allow_direct: `kern run` exec()s in place (no supervisor) → never relocate into kern.slice
         "run",
         memory,
         memory_swap_max,
@@ -1117,6 +1121,19 @@ pub fn run(
         &[],  // no vdisk io limits in `kern run`
         None, // no --io-weight in `kern run`
     );
+    // `kern run` is a cooperative GOVERNOR, not an isolation boundary — so unlike `kern box` it does NOT
+    // fail-closed when a cap can't be applied. But make the drop VISIBLE, not silent: if the user asked
+    // for a cap, no outer scope is enforcing it (`KERN_SCOPE` unset), and we couldn't apply it (`cg` None),
+    // say so rather than let the workload quietly exceed it (there is no isolation here; only the limit).
+    if cg.is_none()
+        && (memory.is_some() || cpus.is_some())
+        && std::env::var_os("KERN_SCOPE").is_none()
+    {
+        eprintln!(
+            "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
+             delegation unavailable) — the command runs UNCAPPED."
+        );
+    }
     // `kern run` exec()s the workload IN PLACE — there is no supervisor left to reap it and drop the
     // guard afterwards. The guard's Drop would `rmdir` the cgroup we're about to exec into, which is
     // non-empty (we're in it) → EBUSY → a no-op anyway. Forget it so the intent is explicit: we do NOT
@@ -2850,6 +2867,7 @@ fn reexec_in_scope_if_possible(
     cpuset: Option<&str>,
     cpus: Option<f64>,
     pids_max: Option<u64>,
+    allow_direct: bool,
 ) {
     use std::os::unix::process::CommandExt;
 
@@ -2865,10 +2883,15 @@ fn reexec_in_scope_if_possible(
         return;
     }
     // Gate on a running user manager (so the exec can't strand us in a broken systemd-run).
-    let has_user_systemd = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|d| std::path::Path::new(&d).join("systemd").exists())
-        .unwrap_or(false);
-    if !has_user_systemd {
+    if !kern_isolation::user_systemd_present() {
+        return;
+    }
+    // FAST PATH (box only): if kern's delegated `kern.slice` is usable, SKIP the per-box `systemd-run
+    // --scope` and let `apply_limits` cap DIRECTLY under it — ~4 ms less/box, same hard kernel caps; a
+    // downstream fail-closed refuses the box if the cap doesn't bite, so it never silently runs uncapped.
+    // NOT for `kern run` (`allow_direct=false`): it exec()s in place with no supervisor to run the guard's
+    // Drop, so without the scope's `--collect` its `kern.slice/kern-box-run-*` cgroup would leak forever.
+    if allow_direct && kern_isolation::direct_caps_available() {
         return;
     }
     let Ok(self_exe) = std::env::current_exe() else {

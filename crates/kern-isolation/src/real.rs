@@ -1724,7 +1724,8 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // returns — which is AFTER the `waitpid` below, when the box (and its PID-namespace descendants)
     // are dead and the cgroup is empty, so the `rmdir` in `Drop` succeeds. Without this the scope-less
     // fast path (no systemd `--collect`) would leak one cgroup dir per box.
-    let _cg = crate::cgroup::apply_limits(
+    let cg = crate::cgroup::apply_limits(
+        true, // allow_direct: `kern box` has a supervisor to hold the RAII guard and vacate on the direct path
         &spec.hostname,
         spec.memory_max,
         spec.memory_swap_max,
@@ -1734,6 +1735,38 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         &spec.io_max,
         spec.io_weight,
     );
+
+    // FAIL-CLOSED on the direct fast path. When we DELIBERATELY skipped the per-box systemd scope
+    // (`took_direct_cap_path()` — the SAME canonical predicate `reexec` used, so they can't diverge), the
+    // box's OWN cgroup is the sole enforcer. `apply_limits` returns `None` iff a MANDATORY cap didn't bite
+    // (memory + pids ALWAYS carry a default cap, verified per-dimension inside apply_limits) — so a `None`
+    // here means we'd run with a missing OOM/fork-bomb backstop. REFUSE. No `caps_requested` gate: the
+    // default memory/pids caps are mandatory, so a default box (no flags) must also be refused if they
+    // didn't take. Hosts with no user systemd never took the direct path → best-effort, no refusal; the
+    // scope path sets `KERN_SCOPE` so `took_direct_cap_path()` is false there and a `None` is fine.
+    // Both checks below only matter when NO cap was applied; when `cg` is `Some` neither the (env + systemd
+    // stat) `took_direct_cap_path()` nor the (cgroup-walking) `env_claims_enforcer_but_none_real()` runs.
+    if cg.is_none() {
+        if crate::cgroup::took_direct_cap_path() {
+            return Err(Error::Unsupported(
+                "resource caps could not be enforced on the direct cgroup path (kern.slice delegation \
+                 raced, was garbage-collected, or is partial); refusing to start an uncapped box",
+            ));
+        }
+        // SECURITY: never run SILENTLY uncapped because of a (possibly forged) outer-enforcer env var. A
+        // caller can set `KERN_MANAGED`/`KERN_SCOPE`/`KERN_BUILD_STEP` to skip the fail-closed above, but if
+        // no real cgroup cap is actually in force (verified against the cgroup, not the env claim), warn
+        // loudly. (Warn, not refuse, so a legit first-party best-effort build step isn't broken; the direct
+        // path already hard-refuses. Mutually exclusive with the refusal: that needs NO outer-enforcer env.)
+        if crate::cgroup::env_claims_enforcer_but_none_real() {
+            eprintln!(
+                "kern: warning: an outer-enforcer env var (KERN_SCOPE/KERN_MANAGED/KERN_BUILD_STEP) is set \
+                 but NO cgroup cap is in force — the box runs UNCAPPED. If kern did not set that variable, a \
+                 caller may be bypassing the resource limits."
+            );
+        }
+    }
+    let _cg = cg; // held for RAII: its Drop removes the box's cgroup dir after waitpid (see CgroupGuard)
 
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
