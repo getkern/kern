@@ -55,14 +55,14 @@ pub fn help() -> Result<(), Error> {
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
     {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
     {c}prune{z}                                                          Remove leftovers of stopped boxes
-    {c}gc{z} [--images]                                                  prune (+ reclaim the image cache)
+    {c}gc{z} [--images]                                                  Prune (+ reclaim the image cache)
     {c}recover{z}                                                        Clean orphaned scratch of dead boxes
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
     {c}compose{z} <file>                                                 Bring up a stack (kern TOML or docker-compose.yml)
     {c}up{z} [--no-pod] / {c}down{z}                                          Bring up / tear down the compose file in this dir
-    {c}pod{z} create <name> / pod ls / pod rm <name>                     Shared-network pod (boxes reach each other by name)
+    {c}pod{z} create <name> [--no-outbound] / pod ls / pod rm <name>     Shared-network pod (boxes reach each other by name)
 
   {d}Config & storage{z}
     {c}config{z} [list|edit|setup|probe|clear]                          List resource profiles; manage kern.toml
@@ -70,7 +70,7 @@ pub fn help() -> Result<(), Error> {
     {c}config rm{z} <kind:name>                                         Delete a profile
     {c}validate{z} [path]                                                Check a kern.toml
     {c}examples{z}                                                       Print an example kern.toml
-    {c}volume{z} <create|ls|rm|inspect|prune>                            Manage named volumes
+    {c}volume{z} <create|ls|rm|inspect|edit|prune>                       Manage named volumes
     {c}login{z} [registry] [--username U] / {c}logout{z} [registry]         Registry credentials (private pulls)
 
   {d}Diagnostics{z}
