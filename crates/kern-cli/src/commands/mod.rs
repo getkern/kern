@@ -495,6 +495,35 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) };
     }
 
+    // Close the start/start race on the name (the `name_taken` check at the top is advisory —
+    // check-then-register): atomically CLAIM the name, in THIS process — i.e. after the scope
+    // re-exec, so the `exec()` can't orphan a claim — and hold it until the box is registered
+    // (dropped explicitly after `register`, or by RAII on any earlier error return; a fork
+    // inheriting it never releases — the claim is pid-owned). Two concurrent same-name starts now
+    // serialize: one wins, the other fails fast here instead of both passing `name_taken` and both
+    // coming up as ambiguous twins.
+    let name_claim = match registry::claim_name(name.as_str()) {
+        Ok(Some(c)) => Some(c),
+        Ok(None) => {
+            return Err(Error::AlreadyRunning(format!(
+                "a box named '{}' is already starting or running",
+                name.as_str()
+            )))
+        }
+        // No usable runtime dir → the registry is equally unavailable; proceed unclaimed
+        // (fail-open, exactly like `name_taken`).
+        Err(_) => None,
+    };
+    // Re-check NOW THAT WE HOLD THE CLAIM: a box that registered between the advisory check and
+    // this claim is invisible to the claim file (its starter already released it after
+    // registering) — the registry entry is authoritative from that point on.
+    if registry::name_taken(name.as_str()) {
+        return Err(Error::AlreadyRunning(format!(
+            "a box named '{}' is already running",
+            name.as_str()
+        )));
+    }
+
     // `--bind-rootfs` only makes sense for a real `--rootfs` directory: an `--image` must stay an
     // immutable, shareable overlay (the cache is read-only and shared across boxes), and a bind
     // can't be remounted read-only on the kernels where bind mode is even useful.
@@ -834,6 +863,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         let path = registry::register(&inst).ok();
         Some((inst, path))
     };
+    // Registered → the registry entry guards the name from here on; release the start-claim
+    // explicitly (this foreground path leaves via `process::exit`, which skips Drop). The detached
+    // path (`run_detached` above) instead drops it on `return` — after the supervisor has
+    // registered (readiness is signalled post-register, and `await_box_started` waits for it).
+    drop(name_claim);
     // Foreground: run the box (the runtime forks `-p` forwarders before the unshare and tears them
     // down when the box exits). `--timeout N`: arm a watchdog that SIGKILLs the box's PID 1 after N
     // seconds. The watchdog MUST be forked here — BEFORE `run_in_sandbox_with` does its
