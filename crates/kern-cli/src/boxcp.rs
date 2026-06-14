@@ -13,52 +13,8 @@
 //! (in), where `<box>` is a running box name. Single regular files only for now.
 
 use crate::error::Error;
+use crate::openat2::openat2_in_root;
 use std::os::unix::io::RawFd;
-
-// `struct open_how` + `openat2` (`<linux/openat2.h>`, Linux 5.6+). `openat2` is nr 437 on every
-// current arch.
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-const SYS_OPENAT2: libc::c_long = 437;
-const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-const RESOLVE_IN_ROOT: u64 = 0x10;
-
-/// Open `path` (interpreted relative to `root_fd` as its own `/`) with symlink/`..` escape confined to
-/// that root. `extra_flags` adds `O_WRONLY|O_CREAT|O_TRUNC` etc.; `mode` applies on create.
-fn openat2_in_root(
-    root_fd: RawFd,
-    path: &str,
-    extra_flags: i32,
-    mode: u32,
-) -> std::io::Result<RawFd> {
-    // Strip the leading `/` — with RESOLVE_IN_ROOT the path is already rooted at `root_fd`.
-    let rel = path.trim_start_matches('/');
-    let c =
-        std::ffi::CString::new(rel).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-    let how = OpenHow {
-        flags: (libc::O_CLOEXEC | extra_flags) as u64,
-        mode: mode as u64,
-        resolve: RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
-    };
-    let fd = unsafe {
-        libc::syscall(
-            SYS_OPENAT2,
-            root_fd,
-            c.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(fd as RawFd)
-    }
-}
 
 /// Open `/proc/<pid1>/root` as an `O_PATH` dirfd — the box's root for confined resolution.
 fn box_root_fd(pid1: i32) -> std::io::Result<RawFd> {

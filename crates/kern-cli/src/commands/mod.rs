@@ -4152,10 +4152,10 @@ unsafe fn copy_confined_tree(
     // needs /proc (absent here), so a fresh confined openat2 is the clean way.
     let sfd = openat2_in_root(root_fd, src_rel, libc::O_PATH | libc::O_NOFOLLOW);
     if sfd < 0 {
-        let e = *libc::__errno_location();
-        // ENOSYS → kernel < 5.6 (no openat2): 107 (parent maps to a precise hint). ENOENT / RESOLVE
-        // refusal → 108 (a confined "no such file" — e.g. an opaque dir correctly hid the source).
-        return if e == libc::ENOSYS { 107 } else { 108 };
+        // The adapter returns `-errno`. ENOSYS → kernel < 5.6 (no openat2): 107 (parent maps to a precise
+        // hint). ENOENT / RESOLVE refusal → 108 (a confined "no such file" — e.g. an opaque dir correctly
+        // hid the source).
+        return if sfd == -libc::ENOSYS { 107 } else { 108 };
     }
     let mut st: libc::stat = std::mem::zeroed();
     if libc::fstatat(sfd, c"".as_ptr(), &mut st, libc::AT_EMPTY_PATH) != 0 {
@@ -4185,24 +4185,14 @@ unsafe fn copy_confined_tree(
     }
 }
 
-/// `openat2(root_fd, path, flags | RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`. The confinement primitive:
-/// every component of `path` (incl. `..` and in-image absolute symlinks) is resolved with `root_fd` as
-/// the root, so nothing outside the merged view is reachable. Returns the fd or -1 (errno set).
-unsafe fn openat2_in_root(root_fd: libc::c_int, path: &str, flags: libc::c_int) -> libc::c_int {
-    let Ok(path_c) = std::ffi::CString::new(path) else {
-        *libc::__errno_location() = libc::EINVAL;
-        return -1;
-    };
-    let mut how: libc::open_how = std::mem::zeroed(); // #[non_exhaustive]: zero then set
-    how.flags = flags as u64;
-    how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
-    libc::syscall(
-        libc::SYS_openat2,
-        root_fd,
-        path_c.as_ptr(),
-        &how as *const libc::open_how,
-        std::mem::size_of::<libc::open_how>(),
-    ) as libc::c_int
+/// Thin `c_int`-returning adapter over the shared [`crate::openat2::openat2_in_root`] confinement
+/// primitive, for the post-fork copier which speaks raw fds + numeric exit codes (not `io::Result`).
+/// Returns the fd, or `-errno` so the caller can distinguish `ENOSYS` (pre-5.6 kernel) from `ENOENT`.
+fn openat2_in_root(root_fd: libc::c_int, path: &str, flags: libc::c_int) -> libc::c_int {
+    match crate::openat2::openat2_in_root(root_fd, path, flags, 0) {
+        Ok(fd) => fd,
+        Err(e) => -e.raw_os_error().unwrap_or(libc::EINVAL),
+    }
 }
 
 /// Copy a symlink SOURCE verbatim (read its target off the already-confined O_PATH `src_fd`, recreate
@@ -4406,11 +4396,13 @@ unsafe fn copy_one_file(
             }
         }
     }
-    // Preserve xattrs (best-effort) BEFORE owner/mtime. The one that matters for correctness is
-    // `security.capability`: a binary with file-capabilities (`setcap cap_net_raw+ep …`, e.g. `ping`,
-    // `ip`) carries the cap in this xattr; without it the pushed image's binary silently loses the
-    // capability and fails at run. We also carry `user.*`. We SKIP `system.*`/`trusted.*` (they need
-    // privilege we don't have and aren't ours to propagate).
+    // Carry `user.*` xattrs (application metadata, harmless) — best-effort, BEFORE owner/mtime. We do
+    // NOT carry `security.capability`: file-capabilities are a privilege channel exactly like setuid, and
+    // the source image is UNTRUSTED (a hostile `COPY --from`/push base could ship `/bin/sh` with
+    // `cap_setuid+ep` → escalation in the copied/published image, and file-caps bypass the box's
+    // MS_NOSUID unlike setuid). kern's model grants no file-caps at runtime, so dropping them removes an
+    // injection vector without losing anything usable — the same call kern makes for setuid (stripped at
+    // push). `system.*`/`trusted.*` are skipped too (need privilege, not ours to propagate).
     copy_xattrs(rfd, dfd);
     // Preserve owner + mtime best-effort (mode was set at create time).
     libc::fchown(dfd, st.st_uid, st.st_gid);
@@ -4430,11 +4422,12 @@ unsafe fn copy_one_file(
     0
 }
 
-/// Copy the extended attributes we care about from `src_fd` to `dst_fd`, best-effort. Preserves
-/// `security.capability` (file-capabilities — a binary loses its caps in the pushed image without this)
-/// and `user.*`; SKIPS `system.*`/`trusted.*` (need privilege, not ours to propagate). Failures are
-/// ignored: xattrs are best-effort like `cp --preserve=all`, and a filesystem without xattr support (or
-/// a `security.*` we can't set unprivileged) must not fail the whole copy.
+/// Copy the `user.*` extended attributes from `src_fd` to `dst_fd`, best-effort. Carries ONLY `user.*`
+/// (application metadata, no privilege). Deliberately NOT `security.capability`: file-capabilities are a
+/// privilege channel like setuid, and the source image is untrusted — blindly propagating an attacker's
+/// `cap_setuid+ep` would inject an escalation into the copied/pushed image (worse than setuid: caps
+/// bypass MS_NOSUID). `system.*`/`trusted.*` need privilege we don't have. Failures are ignored (xattrs
+/// are best-effort like `cp --preserve=all`; a filesystem without xattr support must not fail the copy).
 unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
     // List the source's xattr names into a buffer. `flistxattr(_, NULL, 0)` returns the needed size.
     let need = libc::flistxattr(src_fd, std::ptr::null_mut(), 0);
@@ -4452,11 +4445,10 @@ unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
         .split(|&b| b == 0)
         .filter(|n| !n.is_empty())
     {
-        // Only carry `security.capability` and `user.*`. Everything else (system.*, trusted.*, other
-        // security.*) is skipped — unprivileged we can't set them and they aren't ours to move.
-        let is_capability = name == b"security.capability";
-        let is_user = name.starts_with(b"user.");
-        if !is_capability && !is_user {
+        // Carry ONLY `user.*`. NOT `security.capability` (privilege channel — an untrusted image's caps
+        // would be injected into the output; kern uses no runtime file-caps), NOT `system.*`/`trusted.*`
+        // (need privilege, not ours to move).
+        if !name.starts_with(b"user.") {
             continue;
         }
         let Ok(name_c) = std::ffi::CString::new(name) else {
@@ -4531,8 +4523,9 @@ fn cstring(s: &str) -> Result<std::ffi::CString, Error> {
 }
 
 /// `true` if this process has exactly one thread — read from `/proc/self/stat`'s `num_threads` field.
-/// Used only in a `debug_assert` to guard the fork-safety invariant of [`merged_view_extract`]. Best
-/// effort: if `/proc` is unreadable we assume single-threaded (don't fire a spurious assert).
+/// Guards the fork-safety invariant of [`merged_view_extract`] via a HARD runtime check (it returns an
+/// error if false — NOT a debug_assert, which would vanish in release where the guard matters most).
+/// Best effort: if `/proc` is unreadable we assume single-threaded (don't refuse a legitimate run).
 fn single_threaded() -> bool {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
         return true;

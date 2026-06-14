@@ -187,9 +187,9 @@ fn pack_layer(
     // escalation the original image never had, introduced by our push. So strip setuid/setgid from the
     // rootfs (a throwaway temp squash) BEFORE tarring. Unconditional: kern's model treats in-image setuid
     // as inert anyway (the box root mount is MS_NOSUID, and pull normalizes ownership via
-    // `--no-same-owner`), and a workload needing elevated privilege uses file-capabilities (preserved
-    // via the build copier's `security.capability` xattr handling), not setuid. So stripping removes the
-    // escalation vector without removing anything usable in kern's model.
+    // `--no-same-owner`). File-capabilities are the SAME class of privilege channel and are handled the
+    // same way — the build copier deliberately does NOT propagate `security.capability` (it would inject
+    // an untrusted image's caps), so the two escalation vectors, setuid and file-caps, are both closed.
     let stripped = Command::new("find")
         .arg(rootfs)
         .args([
