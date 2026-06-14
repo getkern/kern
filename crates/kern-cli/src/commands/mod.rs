@@ -4421,9 +4421,248 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     let work = cache.join(format!(".build-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| Error::Sandbox(format!("build dir: {e}")))?;
-    let result = build_run(args.quiet, tag, &ctx, &work, &instrs);
+    // Multi-stage (a second `FROM`, or any `COPY --from`) is orchestrated across stages; a single-stage
+    // build goes straight to `build_run`, byte-for-byte unchanged.
+    let multi = instrs
+        .iter()
+        .skip(1)
+        .any(|i| matches!(i, crate::dockerfile::Instr::From { .. }))
+        || instrs
+            .iter()
+            .any(|i| matches!(i, crate::dockerfile::Instr::Copy { from: Some(_), .. }));
+    let result = if multi {
+        build_multi_stage(args.quiet, tag, &ctx, &work, &instrs)
+    } else {
+        build_run(args.quiet, tag, &ctx, &work, &instrs)
+    };
     remove_build_tree(&work); // overlay leaves mode-000 workdirs; force-clean so nothing leaks
     result
+}
+
+/// Execute a MULTI-STAGE build. Each stage is built in order via the ordinary single-stage `build_run`
+/// under an internal temp tag (`.stage-<pid>-<idx>`), so every stage reuses the proven, byte-identical
+/// single-stage path (RUN batching, layer cache, config handling). Only the LAST stage is built under
+/// the user's real `tag`; the temp stage images are dropped at the end.
+///
+/// `COPY --from=<stage>` (the multi-stage feature) is made safe by REUSE, not by a hand-rolled overlay
+/// mount: the source stage is materialized to a single merged rootfs dir (`materialize_image`, which
+/// already resolves the overlay chain + whiteouts correctly), and the copy runs through the SAME
+/// `copy_into_rootfs` guards as a context COPY — it canonicalizes the source under the stage rootfs and
+/// rejects any `..`/symlink escape, so `COPY --from=build /etc/../../host` fails exactly like a hostile
+/// context COPY. The `--from` COPY is rewritten to a plain COPY whose "context" is that merged rootfs.
+fn build_multi_stage(
+    quiet: bool,
+    tag: &str,
+    ctx: &std::path::Path,
+    work: &std::path::Path,
+    instrs: &[crate::dockerfile::Instr],
+) -> Result<(), Error> {
+    use crate::dockerfile::{resolve_from, Instr};
+    // Split into stages at each FROM. `stages[i]` = the instruction slice for stage i (starts with FROM).
+    let from_idxs: Vec<usize> = instrs
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| matches!(x, Instr::From { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let n = from_idxs.len();
+    // Stage names in order, for resolving `--from=<name>` (mirrors the parser).
+    let stage_names: Vec<Option<String>> = from_idxs
+        .iter()
+        .map(|&i| match &instrs[i] {
+            Instr::From { as_name, .. } => as_name.clone(),
+            _ => None,
+        })
+        .collect();
+    let pid = std::process::id();
+    // Temp tags for the non-final stages, cleaned up at the end (whatever happens).
+    let mut stage_tags: Vec<String> = Vec::with_capacity(n);
+    let cleanup_stage_tags = |tags: &[String]| {
+        for t in tags {
+            let _ = drop_cached_image(t);
+        }
+    };
+
+    for si in 0..n {
+        let start = from_idxs[si];
+        let end = from_idxs.get(si + 1).copied().unwrap_or(instrs.len());
+        let is_last = si == n - 1;
+        let stage_tag = if is_last {
+            tag.to_string()
+        } else {
+            format!(".stage-{pid}-{si}")
+        };
+
+        // Build this stage's instruction slice, rewriting any `COPY --from=<stage>` into a plain COPY
+        // whose source is the referenced stage's materialized rootfs. Non-final `COPY --from` are the
+        // only cross-stage edge; a `COPY` from the context stays as-is.
+        let mut stage_instrs: Vec<Instr> = Vec::with_capacity(end - start);
+        // Each materialized source stage keeps its temp dir alive until this stage finishes copying.
+        let mut mounts: Vec<PathBuf> = Vec::new();
+        // A per-stage sub-context dir holds copies pulled from source stages, so `copy_into_rootfs`
+        // (which takes ONE ctx) can reach them; the FROM/RUN/context-COPY still use the real ctx.
+        for ins in &instrs[start..end] {
+            match ins {
+                Instr::Copy {
+                    srcs,
+                    dst,
+                    from: Some(fref),
+                } => {
+                    // Resolve the referenced stage (earlier only — parser already validated).
+                    let Some(src_idx) = resolve_from(fref, &stage_names, si) else {
+                        cleanup_stage_tags(&stage_tags);
+                        return Err(Error::Build(format!(
+                            "COPY --from='{fref}' does not name an earlier stage"
+                        )));
+                    };
+                    // Materialize the source stage to a merged rootfs dir (whiteout-safe). Copy each src
+                    // out of it into a fresh sub-context, through the SAME guards as a context COPY, so
+                    // the escape classes are closed identically.
+                    let (src_rootfs, _cfg, cleanup) = materialize_image(&stage_tags[src_idx])?;
+                    let subctx = work.join(format!("from-{si}-{}", mounts.len()));
+                    let _ = std::fs::create_dir_all(&subctx);
+                    for s in srcs {
+                        // Pull `s` out of the source stage rootfs into `subctx`, confined to src_rootfs.
+                        if let Err(e) = copy_from_stage_rootfs(&src_rootfs, s, &subctx) {
+                            if let Some(t) = cleanup {
+                                remove_build_tree(&t);
+                            }
+                            cleanup_stage_tags(&stage_tags);
+                            return Err(e);
+                        }
+                    }
+                    if let Some(t) = cleanup {
+                        remove_build_tree(&t); // squashed rootfs no longer needed
+                    }
+                    // Now a plain COPY from the sub-context: same dst-side guards, WORKDIR, dir semantics.
+                    let names: Vec<String> = srcs
+                        .iter()
+                        .map(|s| {
+                            std::path::Path::new(s.trim_end_matches('/'))
+                                .file_name()
+                                .map(|b| b.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| s.clone())
+                        })
+                        .collect();
+                    stage_instrs.push(Instr::Copy {
+                        srcs: names,
+                        dst: dst.clone(),
+                        from: None,
+                    });
+                    mounts.push(subctx);
+                }
+                other => stage_instrs.push(other.clone()),
+            }
+        }
+
+        // The stage's build context: if it pulled from other stages, it needs BOTH the real ctx (for
+        // context COPY) and the sub-contexts (for the rewritten --from COPY). We keep them separate by
+        // building the stage against a MERGED context dir only when there were --from copies; otherwise
+        // the real ctx is used directly (no copy, byte-identical to single-stage).
+        let stage_ctx = if mounts.is_empty() {
+            ctx.to_path_buf()
+        } else {
+            let merged = work.join(format!("ctx-{si}"));
+            let _ = std::fs::remove_dir_all(&merged);
+            copy_tree(ctx, &merged)?;
+            for m in &mounts {
+                // Overlay the pulled files on top of the real context (same-name context files lose to
+                // the stage-copied ones, which is the intent of an explicit COPY --from).
+                merge_context(m, &merged)?;
+            }
+            merged
+        };
+
+        let stage_work = work.join(format!("s{si}"));
+        let _ = std::fs::create_dir_all(&stage_work);
+        if let Err(e) = build_run(quiet, &stage_tag, &stage_ctx, &stage_work, &stage_instrs) {
+            cleanup_stage_tags(&stage_tags);
+            return Err(e);
+        }
+        if !is_last {
+            stage_tags.push(stage_tag);
+        }
+    }
+    cleanup_stage_tags(&stage_tags);
+    Ok(())
+}
+
+/// Copy `src_rel` OUT of a source stage's materialized rootfs into `dest`, confined to the rootfs (the
+/// same canonicalize + `starts_with` escape check `copy_into_rootfs` applies to a context COPY). A
+/// `COPY --from=build /etc/../../host` therefore fails exactly like a hostile context COPY.
+fn copy_from_stage_rootfs(
+    src_rootfs: &std::path::Path,
+    src_rel: &str,
+    dest: &std::path::Path,
+) -> Result<(), Error> {
+    let clean = src_rel.trim_start_matches('/');
+    let src = std::fs::canonicalize(src_rootfs.join(clean))
+        .map_err(|e| Error::Build(format!("COPY --from source '{src_rel}': {e}")))?;
+    if !src.starts_with(src_rootfs) {
+        return Err(Error::Build(format!(
+            "COPY --from source '{src_rel}' escapes the source stage"
+        )));
+    }
+    let name = src
+        .file_name()
+        .ok_or(Error::Build("COPY --from source has no file name".into()))?;
+    let target = dest.join(name);
+    // `cp -a --` no-follow, preserving modes — same tool/flags as the rest of the builder.
+    let ok = std::process::Command::new("cp")
+        .arg("-a")
+        .arg("--")
+        .arg(&src)
+        .arg(&target)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err(Error::Build(format!(
+            "COPY --from could not copy '{src_rel}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Overlay `from`'s entries onto `into` (used to graft stage-copied files onto a build sub-context).
+/// Each entry may be a file OR a directory, so we can't use `copy_tree` (which assumes a dir); a plain
+/// `cp -a --` on the entry path handles both.
+fn merge_context(from: &std::path::Path, into: &std::path::Path) -> Result<(), Error> {
+    for e in std::fs::read_dir(from).map_err(|e| Error::Build(e.to_string()))? {
+        let e = e.map_err(|e| Error::Build(e.to_string()))?;
+        let dst = into.join(e.file_name());
+        let _ = std::fs::remove_dir_all(&dst);
+        let _ = std::fs::remove_file(&dst);
+        let ok = std::process::Command::new("cp")
+            .arg("-a")
+            .arg("--")
+            .arg(e.path())
+            .arg(&dst)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return Err(Error::Build(format!(
+                "grafting '{}' into the build context failed",
+                e.file_name().to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Remove a cached image (all sidecar forms) by ref — used to drop the internal temp stage images a
+/// multi-stage build creates. Best-effort.
+fn drop_cached_image(image: &str) -> Result<(), Error> {
+    let cache = cache_dir();
+    let safe = sanitize_ref(image);
+    let _ = std::fs::remove_dir_all(cache.join(&safe));
+    let _ = std::fs::remove_dir_all(cache.join(format!("{safe}.diff")));
+    let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
+    let _ = std::fs::remove_file(cache.join(format!("{safe}.base")));
+    let _ = std::fs::remove_file(cache.join(format!("{safe}.image")));
+    let _ = std::fs::remove_file(cache.join(format!("{safe}.ok")));
+    Ok(())
 }
 
 /// The build body — separated so [`build`] can always clean up the work tree, success or error.
@@ -4454,21 +4693,8 @@ fn build_run(
     else {
         return Err(Error::Sandbox("internal: build has no FROM".into()));
     };
-    // Multi-stage executor is a separate, larger change; until it lands, a Dockerfile with a second
-    // stage (extra FROM) or a `COPY --from` is refused CLEANLY here — the parser accepts the syntax, but
-    // the single-stage build path below stays byte-for-byte unchanged for the common case.
-    if instrs
-        .iter()
-        .skip(1)
-        .any(|i| matches!(i, Instr::From { .. }))
-        || instrs
-            .iter()
-            .any(|i| matches!(i, Instr::Copy { from: Some(_), .. }))
-    {
-        return Err(Error::Build(
-            "multi-stage builds (multiple FROM / COPY --from) aren't executable yet — single-stage builds work".into(),
-        ));
-    }
+    // `build_run` builds ONE stage. A multi-stage Dockerfile is orchestrated by `build_multi_stage`,
+    // which calls us once per stage with a single-stage slice — so we never see a second FROM here.
     if !quiet {
         eprintln!("[1/{total}] FROM {base_ref}");
     }
@@ -6928,5 +7154,36 @@ mod net_resource_tests {
                 "{evil:?} → {joined:?} escaped the cache"
             );
         }
+    }
+
+    #[test]
+    fn copy_from_stage_cannot_escape_the_source_stage() {
+        // The `COPY --from` security guard: a source that resolves (via `..` or a planted symlink)
+        // OUTSIDE the source stage's rootfs must be rejected, exactly like a hostile context COPY. We
+        // build a fake stage rootfs with a symlink to `/` and confirm a copy THROUGH it is refused.
+        let stage = std::env::temp_dir().join(format!("kern-fromtest-{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("kern-fromdest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(stage.join("etc")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(stage.join("etc/ok.txt"), b"in-stage").unwrap();
+        // A legit in-stage copy succeeds.
+        assert!(copy_from_stage_rootfs(&stage, "/etc/ok.txt", &dest).is_ok());
+        assert!(dest.join("ok.txt").exists());
+        // A `..` escape and a symlink-to-root escape are both refused (canonicalize + starts_with).
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/", stage.join("rootlink")).unwrap();
+            let via_symlink = copy_from_stage_rootfs(&stage, "/rootlink/etc/hostname", &dest);
+            assert!(
+                via_symlink.is_err(),
+                "a symlink-to-/ in the stage must not let a COPY --from escape"
+            );
+        }
+        let via_dotdot = copy_from_stage_rootfs(&stage, "/etc/../../../../etc/passwd", &dest);
+        assert!(via_dotdot.is_err(), "a `..` escape must be refused");
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }
