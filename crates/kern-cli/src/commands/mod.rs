@@ -7244,4 +7244,36 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&dest);
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_from_stage_preserves_inner_symlinks_no_follow() {
+        // The double-copy escape class (reviewer 2a): copying a DIR out of a stage that CONTAINS an
+        // absolute symlink to a host file must PRESERVE the symlink (cp -a no-follow), never dereference
+        // it and copy the host file's bytes at build time. The symlink resolves only later, inside the
+        // box, against the box's own rootfs — so a `→ /etc/passwd` reads the box's passwd, not the host's.
+        let stage = std::env::temp_dir().join(format!("kern-sym-{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("kern-symdst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(stage.join("app")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(stage.join("app/real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", stage.join("app/evil")).unwrap();
+        // Copy the whole `app` dir out — succeeds, and `evil` arrives as a SYMLINK, not the host file.
+        assert!(copy_from_stage_rootfs(&stage, "/app", &dest).is_ok());
+        let copied = dest.join("app/evil");
+        let meta = std::fs::symlink_metadata(&copied).expect("evil should exist");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the inner symlink must be preserved as a symlink, not dereferenced to the host file"
+        );
+        assert_eq!(
+            std::fs::read_link(&copied).unwrap(),
+            std::path::Path::new("/etc/passwd"),
+            "the symlink target must be verbatim, resolved only inside the box at run"
+        );
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
 }

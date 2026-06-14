@@ -746,7 +746,15 @@ fn extract_layer(
             if !zstd_available() {
                 return Err(extract_err(zstd_missing()));
             }
-            // zstd -dc <tmp>  |  tar -xf -  -C staging …
+            // zstd -dc <tmp>  |  head -c <cap>  |  tar -xf -  -C staging …
+            //
+            // DEFENCE IN DEPTH: unlike the `tar -xzf`/`-xf` paths (which read the on-disk blob and are
+            // bounded by tar itself), the zstd path STREAMS a decompressor into tar and does NOT re-run
+            // the size-capped vetter. `check_layer_safe` already rejected an over-2GiB bomb before we get
+            // here — but a gate shouldn't depend on ANOTHER gate being perfect. `head -c MAX_LAYER_BYTES`
+            // hard-caps the decompressed bytes reaching tar, so even if the vet ever let a gonfio blob
+            // through, the extract writes at most the cap (the truncated tar then fails cleanly). One
+            // extra tiny process; irrelevant vs the decompression cost.
             let mut z = Command::new("zstd")
                 .args(["-dc", &tmp_s])
                 .stdout(Stdio::piped())
@@ -755,6 +763,14 @@ fn extract_layer(
                 .map_err(|_| zstd_missing())
                 .map_err(extract_err)?;
             let zout = z.stdout.take().expect("zstd stdout piped");
+            let mut h = Command::new("head")
+                .args(["-c", &MAX_LAYER_BYTES.to_string()])
+                .stdin(zout)
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|e| OciError::Tool("head", e.to_string()))
+                .map_err(extract_err)?;
+            let hout = h.stdout.take().expect("head stdout piped");
             let tar_status = Command::new("tar")
                 .args([
                     "-xf",
@@ -764,10 +780,14 @@ fn extract_layer(
                     "--no-same-owner",
                     "--same-permissions",
                 ])
-                .stdin(zout)
+                .stdin(hout)
                 .status()
                 .map_err(|e| OciError::Tool("tar", e.to_string()));
             let zcode = z.wait().map(|s| s.success()).unwrap_or(false);
+            // `head` closing the pipe early (cap hit) makes zstd take SIGPIPE — that's the intended
+            // truncation, and tar then fails on the short archive, so we don't treat head's own status
+            // as authoritative; tar + a clean zstd exit are what matter.
+            let _ = h.wait();
             tar_status.map(|s| s.success() && zcode)
         }
     };
