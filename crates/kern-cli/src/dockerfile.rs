@@ -1,8 +1,10 @@
 //! A tiny, dependency-free parser for a **subset** of the Dockerfile format, used by `kern build`.
 //!
 //! Supported instructions: `FROM RUN COPY ADD ENV WORKDIR USER CMD ENTRYPOINT EXPOSE ARG LABEL`.
+//! `VOLUME` and `HEALTHCHECK` are ACCEPTED (parsed, no build-time effect) so stock upstream Dockerfiles
+//! build instead of failing; `HEALTHCHECK` nudges the user to kern's runtime `--health-cmd`.
 //! Deliberately NOT supported (and rejected with a clear error, never silently ignored):
-//! multi-stage builds (`FROM … AS`, `COPY --from`), `VOLUME`, `HEALTHCHECK`, `SHELL`, `ONBUILD`,
+//! multi-stage builds (`FROM … AS`, `COPY --from`), `SHELL`, `ONBUILD`,
 //! `STOPSIGNAL`, `ADD <url>`, and `ADD` auto-extraction. Comments (`#`), blank lines and backslash
 //! line-continuations are handled; `ARG`/`ENV` values substitute into later `${VAR}`/`$VAR`.
 //!
@@ -141,7 +143,29 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 }
             }
             "LABEL" | "MAINTAINER" => { /* metadata — parsed and ignored */ }
-            "VOLUME" | "HEALTHCHECK" | "SHELL" | "ONBUILD" | "STOPSIGNAL" => {
+            // VOLUME/HEALTHCHECK are ACCEPTED (parsed, not fatal) so a real-world upstream Dockerfile that
+            // uses them builds instead of exploding — they were the two commonest reasons a `kern build`
+            // of a stock image failed. They carry NO build-time filesystem effect, so we emit no Instr:
+            //   VOLUME    → a runtime mount point; kern mounts volumes at run via `-v`, so it's advisory
+            //               at build (Docker also only *declares* it — the anonymous volume is a runtime
+            //               concern). Parsed and dropped.
+            //   HEALTHCHECK → maps onto kern's runtime `--health-cmd`/`--health-interval`/… flags; kern
+            //               doesn't yet BAKE it into the image config, so we accept it and (once, on the
+            //               first HEALTHCHECK) tell the user to pass the health flags at `kern box` time,
+            //               rather than silently dropping a health contract or failing the build.
+            "VOLUME" => { /* runtime mount point — advisory at build, mounted via `-v` at run */ }
+            "HEALTHCHECK" => {
+                // Don't fail; nudge the user to the runtime flags. `HEALTHCHECK NONE` disables — nothing to say.
+                let body = subst(rest, &vars);
+                if !body.trim().eq_ignore_ascii_case("none") {
+                    eprintln!(
+                        "kern build: HEALTHCHECK accepted but not baked into the image — add it at run \
+                         with `kern box … --health-cmd '<cmd>'` (see `kern box --help`)"
+                    );
+                }
+            }
+            // Still genuinely unsupported (and rare): fail clearly rather than silently mis-build.
+            "SHELL" | "ONBUILD" | "STOPSIGNAL" => {
                 return err(&format!("{kw} isn't supported yet"));
             }
             other => return err(&format!("unknown instruction {other}")),
@@ -505,9 +529,10 @@ mod tests {
         assert!(parse("FROM a\nCOPY --from=x /a /b\n", &ba())
             .unwrap_err()
             .contains("multi-stage"));
-        assert!(parse("FROM a\nVOLUME /data\n", &ba())
+        // SHELL/ONBUILD/STOPSIGNAL are still genuinely unsupported → clear error.
+        assert!(parse("FROM a\nONBUILD RUN x\n", &ba())
             .unwrap_err()
-            .contains("VOLUME"));
+            .contains("ONBUILD"));
         assert!(parse("RUN echo hi\n", &ba())
             .unwrap_err()
             .contains("must be FROM"));
@@ -527,5 +552,19 @@ mod tests {
     fn arg_may_precede_from() {
         let df = "ARG BASE=alpine\nFROM $BASE\n";
         assert_eq!(parse(df, &ba()).unwrap()[0], Instr::From("alpine".into()));
+    }
+
+    #[test]
+    fn volume_and_healthcheck_are_accepted_not_fatal() {
+        // A stock upstream Dockerfile with VOLUME/HEALTHCHECK must BUILD, not explode. They carry no
+        // build-time filesystem effect, so they produce no instruction — the FROM/RUN around them do.
+        let df = "FROM alpine\nVOLUME /data\nHEALTHCHECK --interval=30s CMD curl -f localhost || exit 1\nRUN echo hi\n";
+        let got = parse(df, &ba()).expect("VOLUME/HEALTHCHECK must not fail the build");
+        // Only FROM + RUN survive as instructions; VOLUME/HEALTHCHECK emit none.
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Instr::From("alpine".into()));
+        assert!(matches!(got[1], Instr::Run(_)));
+        // `HEALTHCHECK NONE` is also fine (disables — nothing to nudge).
+        assert!(parse("FROM alpine\nHEALTHCHECK NONE\n", &ba()).is_ok());
     }
 }
