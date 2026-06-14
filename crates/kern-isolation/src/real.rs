@@ -100,6 +100,11 @@ pub struct SandboxSpec {
     /// `--tun`: expose `/dev/net/tun` in the box's `/dev` (WireGuard / userspace VPN). The box owns
     /// its network namespace, so it can create the tunnel; the node is bound like the base allowlist.
     pub tun: bool,
+    /// `--init`: run a minimal built-in init (kern itself, no external tini) as box PID 1. It forks the
+    /// workload, reaps ALL reparented orphans (no zombies), forwards SIGTERM/SIGINT to the workload, and
+    /// exits with its status. Off by default (PID 1 execs the command directly), so the common path is
+    /// byte-for-byte unchanged.
+    pub init: bool,
     /// `--tmpfs PATH[:size]`: extra fresh tmpfs mounts inside the box (`(path, size_option)` — size is
     /// a tmpfs `size=` string like `"64m"`, or empty for the default). Blocked over hardened mounts.
     pub tmpfs: Vec<(String, String)>,
@@ -367,8 +372,15 @@ impl PhaseTimer {
     }
 }
 
-/// `Ok` — on success `exec` replaces the process; otherwise it returns the error.
-fn child_setup_and_exec(spec: &SandboxSpec, argv: &[CString]) -> Result<Infallible, Error> {
+/// `Ok` — on success `exec` (or the built-in init) replaces/owns the process; otherwise it returns the
+/// error. `ready_fd` (the readiness pipe's write end) is threaded through so that with `--init`, PID 1
+/// can close its own copy after forking the workload (so the launcher still gets EOF = "box up"), and
+/// the forked workload can write the failure byte if its own exec fails.
+fn child_setup_and_exec(
+    spec: &SandboxSpec,
+    argv: &[CString],
+    ready_fd: Option<i32>,
+) -> Result<Infallible, Error> {
     let mut t = PhaseTimer::new();
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(Error::last("unshare(CLONE_NEWNS)"));
@@ -494,10 +506,131 @@ fn child_setup_and_exec(spec: &SandboxSpec, argv: &[CString]) -> Result<Infallib
     clear_caps_from_sets(cap_mask);
 
     // Install the seccomp filter LAST — after all setup syscalls (mount/pivot) are done, so it
-    // only constrains the workload. Then exec.
+    // only constrains the workload. Then exec (or hand off to the built-in init).
     crate::seccomp::install()?;
     t.mark("seccomp");
-    Err(exec(argv))
+    if spec.init {
+        // `--init`: this PID-1 process forks the workload and becomes a reaping init. Never returns.
+        run_init(spec, argv, ready_fd)
+    } else {
+        // Default: PID 1 IS the workload — exec directly, byte-for-byte the original path.
+        Err(exec(argv))
+    }
+}
+
+/// Built-in init (`--init`): kern PID 1 forks the workload, then loops reaping EVERY child (the direct
+/// workload plus any orphan reparented to PID 1 — the zombie-reaping guarantee), forwarding SIGTERM and
+/// SIGINT to the workload, and finally `_exit`s with the workload's own status. Raw libc only, never
+/// unwinds. `ready_fd` is the readiness pipe write end: PID 1 closes its own copy right after the fork
+/// so the launcher still sees EOF when the workload execs; the workload child writes the failure byte
+/// if ITS exec fails (so a detached box reports "exited before starting" instead of hanging).
+fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
+    // The forwarding signal handler needs the workload pid; a static is the only way to reach it.
+    static CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    extern "C" fn forward(sig: libc::c_int) {
+        // Async-signal-safe: `kill` is on the AS-safe list. Forward to the workload only (pid > 0).
+        let pid = CHILD.load(std::sync::atomic::Ordering::SeqCst);
+        if pid > 0 {
+            unsafe { libc::kill(pid, sig) };
+        }
+    }
+
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        if let Some(fd) = ready_fd {
+            let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+        }
+        eprintln!("kern: --init: fork failed");
+        unsafe { libc::_exit(127) };
+    }
+    if child == 0 {
+        // WORKLOAD child: inherits the CLOEXEC ready_fd — a successful exec closes it (→ launcher EOF).
+        // On exec failure, write the byte HERE (this is not PID 1, so the parent's byte-write below
+        // won't fire for us) so the launcher learns it failed, then report and exit.
+        // `exec` only ever returns on failure (its type is `-> Error`).
+        let e = exec(argv);
+        if let Some(fd) = ready_fd {
+            let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+        }
+        report_exec_failure(spec, &e);
+        unsafe { libc::_exit(127) };
+    }
+
+    // PID 1 (init). Close our own copy of the ready fd NOW, so the workload's exec is the last holder
+    // of the write end → the launcher reads EOF exactly when the box is up (not when PID 1 exits).
+    if let Some(fd) = ready_fd {
+        unsafe { libc::close(fd) };
+    }
+    // Publish the child pid, THEN install the forwarders — so an early signal can't `kill(0)` the
+    // whole group. `SA_RESTART` is deliberately OFF so `waitpid` returns EINTR and we can re-loop.
+    CHILD.store(child, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = forward as extern "C" fn(libc::c_int) as usize;
+        sa.sa_flags = 0; // no SA_RESTART
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+    // Reap loop: wait for ANY child. The workload's status is what we exit with; every other reaped
+    // pid is a reparented orphan (the zombie-reaping guarantee). EINTR = a forwarded signal → re-loop.
+    let mut child_status = 0i32;
+    let mut child_reaped = false;
+    loop {
+        let mut status = 0i32;
+        let r = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if r < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue; // interrupted by a forwarded signal — keep reaping
+            }
+            break; // ECHILD (all children gone) or an unexpected error
+        }
+        if r == child {
+            child_status = status;
+            child_reaped = true;
+        }
+    }
+    // Exit with the workload's decoded status (128+signo if it was killed); if we somehow never saw it,
+    // don't decode uninitialized status — fail with 1.
+    unsafe {
+        libc::_exit(if child_reaped {
+            wait_code(child_status)
+        } else {
+            1
+        })
+    };
+}
+
+/// Print the actionable "cannot start the box command" diagnostic for a failed `execvp` (command not
+/// found, missing loader, or a dropped-uid permission error), or a generic setup-failure line for any
+/// other error. Shared by the direct-exec path and the `--init` workload child so both give the same
+/// hint. Does not exit — the caller `_exit`s.
+fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
+    if let Error::Syscall("execvp", io) = e {
+        let cmd = spec.command.first().map(String::as_str).unwrap_or("?");
+        // A permission-denied exec while dropped to a non-root `--user` is almost always the uid, not a
+        // missing command: in a rootless box the overlay rootfs is owned by the box's root uid and a
+        // dropped uid can't traverse/exec it. Name the real cause.
+        let dropped = matches!(spec.run_as, Some((u, _)) if u != 0);
+        if io.kind() == std::io::ErrorKind::PermissionDenied && dropped {
+            let uid = spec.run_as.map(|(u, _)| u).unwrap_or(0);
+            eprintln!(
+                "kern: cannot start '{cmd}' as uid {uid} in box: {io}\n\
+                 hint: a rootless box's rootfs is owned by the box's root uid, so a \
+                 non-root --user often can't exec it — drop --user (runs as the box's \
+                 root) or provide a rootfs owned by uid {uid}"
+            );
+        } else {
+            eprintln!(
+                "kern: cannot start '{cmd}' in box: {io}\n\
+                 hint: the command must exist inside the box (try a full path like \
+                 /bin/sh) and, if dynamically linked, its libraries/loader must be \
+                 present in the rootfs"
+            );
+        }
+    } else {
+        eprintln!("kern: sandbox setup failed: {e}");
+    }
 }
 
 /// `--user`: drop to `uid`/`gid` for the workload. Order matters — `setgroups` (clear supplementary
@@ -1702,42 +1835,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         if let Some(fd) = ready_fd {
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
-        match child_setup_and_exec(spec, &argv) {
+        match child_setup_and_exec(spec, &argv, ready_fd) {
             Ok(never) => match never {},
             Err(e) => {
                 if let Some(fd) = ready_fd {
                     let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
                 }
-                // A failed `execvp` is the common, confusing case (command not found, not
-                // executable, or — for a dynamic binary in a bare rootfs — a missing loader,
-                // which the kernel also reports as ENOENT). Name the command and hint, rather
-                // than leaking a bare `execvp failed: ... (os error 2)`.
-                if let Error::Syscall("execvp", io) = &e {
-                    let cmd = spec.command.first().map(String::as_str).unwrap_or("?");
-                    // A permission-denied exec while dropped to a non-root `--user` is almost always
-                    // the uid, not a missing command: in a rootless box the overlay rootfs is owned
-                    // by the box's root uid and a dropped uid can't traverse/exec it. Name the real
-                    // cause instead of sending the user to check paths and loaders.
-                    let dropped = matches!(spec.run_as, Some((u, _)) if u != 0);
-                    if io.kind() == std::io::ErrorKind::PermissionDenied && dropped {
-                        let uid = spec.run_as.map(|(u, _)| u).unwrap_or(0);
-                        eprintln!(
-                            "kern: cannot start '{cmd}' as uid {uid} in box: {io}\n\
-                             hint: a rootless box's rootfs is owned by the box's root uid, so a \
-                             non-root --user often can't exec it — drop --user (runs as the box's \
-                             root) or provide a rootfs owned by uid {uid}"
-                        );
-                    } else {
-                        eprintln!(
-                            "kern: cannot start '{cmd}' in box: {io}\n\
-                             hint: the command must exist inside the box (try a full path like \
-                             /bin/sh) and, if dynamically linked, its libraries/loader must be \
-                             present in the rootfs"
-                        );
-                    }
-                } else {
-                    eprintln!("kern: sandbox setup failed: {e}");
-                }
+                // A failed `execvp` is the common, confusing case (command not found, not executable,
+                // or a missing loader). Name the command and hint, rather than a bare os-error leak.
+                report_exec_failure(spec, &e);
                 unsafe { libc::_exit(127) };
             }
         }
