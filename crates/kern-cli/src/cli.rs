@@ -177,6 +177,11 @@ pub enum Command {
         local: String,
         remote: Option<String>,
     },
+    /// `kern tag <src> <dst>`: give a cached image a second name (build→tag→push).
+    Tag {
+        src: String,
+        dst: String,
+    },
     /// `kern build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image
     /// from a Dockerfile subset.
     Build {
@@ -376,6 +381,23 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 None => None,
             };
             Command::Push { local, remote }
+        }
+        // `tag <src> <dst>`: give a cached image a second name.
+        Some("tag") => {
+            let args: Vec<&&str> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .collect();
+            let src = args
+                .first()
+                .map(|s| s.to_string())
+                .ok_or(Error::Usage("tag <src> <dst>"))?;
+            let dst = args
+                .get(1)
+                .map(|s| s.to_string())
+                .ok_or(Error::Usage("tag <src> <dst>"))?;
+            Command::Tag { src, dst }
         }
         // `images`: list pulled (cached) images.
         Some("images") => Command::Images {
@@ -1551,6 +1573,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             platform,
         } => commands::pull(&image, dest.as_deref(), platform.as_deref()),
         Command::Push { local, remote } => commands::push(&local, remote.as_deref()),
+        Command::Tag { src, dst } => commands::tag(&src, &dst),
         Command::Stop { names, all } => commands::stop(&names, all),
         Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
         Command::Attach { name } => commands::attach(&name),
