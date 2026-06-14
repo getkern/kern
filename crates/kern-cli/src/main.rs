@@ -19,6 +19,7 @@ mod config;
 mod dockerfile;
 mod doctor;
 mod error;
+mod openat2;
 mod pod;
 mod ports;
 mod pty;
