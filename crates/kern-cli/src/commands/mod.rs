@@ -4454,6 +4454,22 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
 /// `copy_into_rootfs` guards as a context COPY — it canonicalizes the source under the stage rootfs and
 /// rejects any `..`/symlink escape, so `COPY --from=build /etc/../../host` fails exactly like a hostile
 /// context COPY. The `--from` COPY is rewritten to a plain COPY whose "context" is that merged rootfs.
+///
+/// Non-final stages build under an internal tag prefixed with [`STAGE_TAG_PREFIX`]; that prefix is the
+/// single source of truth for both creating those tags and suppressing their "built …" line
+/// ([`announce_built`]). A leading `.` never appears in a user ref, so the two can't collide.
+const STAGE_TAG_PREFIX: &str = ".stage-";
+
+/// Print the "built '<tag>'" success line — UNLESS `tag` is an internal multi-stage stage tag (prefixed
+/// [`STAGE_TAG_PREFIX`]), which the user shouldn't see. Single-sourced so the create/suppress contract
+/// can't drift.
+fn announce_built(tag: &str) {
+    if !tag.starts_with(STAGE_TAG_PREFIX) {
+        println!("built '{tag}'");
+        println!("  run: kern box myapp --image {tag}");
+    }
+}
+
 fn build_multi_stage(
     quiet: bool,
     tag: &str,
@@ -4494,7 +4510,7 @@ fn build_multi_stage(
         let stage_tag = if is_last {
             tag.to_string()
         } else {
-            format!(".stage-{pid}-{si}")
+            format!("{STAGE_TAG_PREFIX}{pid}-{si}")
         };
 
         // Prepare this stage's rewritten instructions + sub-context (all the `COPY --from` handling and
@@ -4906,8 +4922,7 @@ fn build_run(
     let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
     write_image_config(&cache.join(format!("{safe}.image")), &config);
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
-    println!("built '{tag}'");
-    println!("  run: kern box myapp --image {tag}");
+    announce_built(tag);
     Ok(())
 }
 
@@ -5143,8 +5158,7 @@ fn build_layered_cached(
         .map_err(|e| Error::Sandbox(format!("finalize image '{tag}': {e}")))?;
     write_image_config(&cache.join(format!("{safe}.image")), &config);
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
-    println!("built '{tag}'");
-    println!("  run: kern box myapp --image {tag}");
+    announce_built(tag);
     Ok(())
 }
 
