@@ -334,16 +334,21 @@ pub fn unregister(path: &Path) {
 /// `list()` (which `kern ps`/`volume rm`/`stop` all call) with a multi-gigabyte junk file.
 const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 
+/// The `<name>` of a well-formed `<name>-<pid>` entry filename (name non-empty, pid all digits), else
+/// `None`. The SOLE decoder of the on-disk key grammar (paired with `register`'s `format!("{name}-{pid}")`
+/// encoder) — so `well_formed_entry` and `find`'s filename pre-filter can't drift on what a valid entry
+/// is (they had already diverged: one required a non-empty name, the other didn't).
+fn entry_name(fname: &std::ffi::OsStr) -> Option<&str> {
+    let (n, pid) = fname.to_str()?.rsplit_once('-')?;
+    (!n.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then_some(n)
+}
+
 /// Is this a well-formed registry filename (`<name>-<pid>`, pid all digits)? Skips anything else a
 /// same-user process dropped in the dir, so junk files aren't parsed. NOTE: we deliberately do NOT
 /// cap the *number* of entries — a cap could push a real box's entry out of view and let its
 /// in-use volume be deleted (fail-open). Reading many small files stays O(n) but bounded per file.
 fn well_formed_entry(name: &std::ffi::OsStr) -> bool {
-    name.to_str()
-        .and_then(|s| s.rsplit_once('-'))
-        .is_some_and(|(n, pid)| {
-            !n.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
-        })
+    entry_name(name).is_some()
 }
 
 /// Read at most [`MAX_ENTRY_BYTES`] of a registry file (bounded against a huge planted file).
@@ -385,6 +390,45 @@ pub fn list() -> Vec<Instance> {
     }
     out.sort_by_key(|i| i.started);
     out
+}
+
+/// The LIVE box named `name`, or `None`. The targeted-lookup primitive: unlike [`list`], it opens and
+/// `/proc`-stats ONLY the entry whose FILENAME (`<name>-<pid>`) matches `name` — every OTHER running box
+/// costs nothing but its dirent. This is what keeps by-name commands (start name-check, `exec`, `stop`,
+/// `attach`, health polls…) O(1) in file I/O regardless of how many boxes run: routing them through
+/// `list()` made each call O(running boxes) (open + parse + `kill` + read `/proc/<pid>/stat` for EVERY
+/// box) — measured super-linear (3 ms idle → 19 ms at 100 live boxes), and O(N²) for a per-box health
+/// checker polling forever. Prunes a dead same-name entry as a side effect (name reusable after a crash),
+/// never a live one.
+pub fn find(name: &str) -> Option<Instance> {
+    let d = dir().ok()?;
+    for e in fs::read_dir(&d).ok()?.flatten() {
+        // Match on the `<name>-<pid>` FILENAME (one grammar decoder, shared with `well_formed_entry`)
+        // WITHOUT opening the file, so a non-matching box — the common case at scale — costs only its
+        // dirent, never an open/`/proc` stat.
+        let fname = e.file_name();
+        if entry_name(&fname) != Some(name) {
+            continue;
+        }
+        let path = e.path();
+        // A filename match — confirm it's actually a LIVE box named `name` (body `name=` is authoritative,
+        // matching `list()`). Dead/unparseable → prune so the name is reusable. Never prune a live entry.
+        match read_entry_capped(&path).and_then(|b| parse(&b)) {
+            Some(inst) if is_alive(inst.pid, inst.starttime) => {
+                if inst.name == name {
+                    return Some(inst);
+                }
+                // live box whose body-name differs from its filename (shouldn't happen) — leave it, keep looking
+            }
+            _ => unregister(&path),
+        }
+    }
+    None
+}
+
+/// Is a LIVE box already named `name`? Thin wrapper over [`find`] — the box-start hot-path name-check.
+pub fn name_taken(name: &str) -> bool {
+    find(name).is_some()
 }
 
 /// The set of named volumes any running box currently mounts (for `volume prune`'s in-use guard).

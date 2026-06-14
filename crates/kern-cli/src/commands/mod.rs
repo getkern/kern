@@ -343,9 +343,10 @@ fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
     // Reject a name already held by a LIVE box — otherwise two boxes share a name and `stop`/`logs`/
-    // `exec` become ambiguous (and a repeated `compose up` would silently stack duplicates). `list()`
-    // returns only alive instances (it prunes dead ones), so a freed name is immediately reusable.
-    if registry::list().iter().any(|i| i.name == name.as_str()) {
+    // `exec` become ambiguous (and a repeated `compose up` would silently stack duplicates). `name_taken`
+    // checks ONLY this name's entry (not the whole registry), so start stays fast at scale; it prunes a
+    // dead same-name entry, so a freed name is immediately reusable.
+    if registry::name_taken(name.as_str()) {
         return Err(Error::AlreadyRunning(format!(
             "a box named '{}' is already running",
             name.as_str()
@@ -1875,9 +1876,7 @@ pub fn exec(
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let env = parse_envs(env)?;
     let cmd = default_if_empty(command);
-    let inst = registry::list()
-        .into_iter()
-        .find(|i| i.name == name.as_str())
+    let inst = registry::find(name.as_str())
         .ok_or_else(|| Error::NotRunning(format!("no running box named '{}'", name.as_str())))?;
     // PID 1 of the box. Older entries (or a race before the supervisor recorded it) → fall back
     // to the supervisor's sole child.
@@ -2115,12 +2114,10 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
             unsafe { libc::sleep(hc.interval as libc::c_uint) };
             elapsed = elapsed.saturating_add(hc.interval);
         }
-        // Current box PID 1 (changes across `--restart`); read it from the registry by name.
-        let pid1 = registry::list()
-            .into_iter()
-            .find(|b| b.name == name)
-            .map(|b| b.pid1)
-            .unwrap_or(0);
+        // Current box PID 1 (changes across `--restart`); read it from the registry by name. `find`
+        // opens ONLY this box's entry — critical here: this runs in a per-box checker loop forever, so a
+        // full `list()` would be O(running boxes) every interval → O(N²) steady-state across N checkers.
+        let pid1 = registry::find(&name).map(|b| b.pid1).unwrap_or(0);
         let status = if pid1 > 0 {
             let ok = run_probe(pid1, &probe, hc.timeout);
             if ok {
@@ -2303,9 +2300,7 @@ fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> i32 {
         return child;
     }
     unsafe { libc::sleep(secs as libc::c_uint) };
-    let still = registry::list()
-        .into_iter()
-        .any(|b| b.name == name && b.pid == sup_pid);
+    let still = registry::find(&name).is_some_and(|b| b.pid == sup_pid);
     if still {
         let _ = stop(std::slice::from_ref(&name), false);
     }
@@ -3174,10 +3169,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// scrubbed of terminal-escape sequences before display, exactly like the status panel and tables.
 /// Errors with a `kern ps` hint if no live box has that name.
 pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
-    let boxes = registry::list();
-    let b = boxes
-        .iter()
-        .find(|b| b.name == name)
+    let b = registry::find(name)
         .ok_or_else(|| Error::NotRunning(format!("no running box named '{name}'")))?;
     let health = registry::health_of(&b.name, b.pid);
     let mem = registry::mem_bytes(b.pid);
@@ -3749,7 +3741,7 @@ fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
 /// box leaves the registry.
 pub fn attach(name: &str) -> Result<(), Error> {
     use std::io::{Read, Write};
-    let bx = registry::list().into_iter().find(|b| b.name == name);
+    let bx = registry::find(name);
     let Some(bx) = bx else {
         return Err(Error::NotRunning(format!("no running box named '{name}'")));
     };
@@ -3779,10 +3771,7 @@ pub fn attach(name: &str) -> Result<(), Error> {
             }
         }
         // Stop once the box is gone (drain one final time first, above).
-        if !registry::list()
-            .iter()
-            .any(|b| b.name == name && b.pid == bx.pid)
-        {
+        if registry::find(name).is_none_or(|b| b.pid != bx.pid) {
             eprintln!("kern: box '{name}' exited");
             return Ok(());
         }
@@ -6774,9 +6763,7 @@ fn wait_for_conditions(
 /// sidecar is keyed `name-pid`, so resolve the pid via the registry first; a box that has already
 /// left the registry reads as empty (which the caller treats as "not yet healthy").
 fn current_health(name: &str) -> String {
-    registry::list()
-        .into_iter()
-        .find(|i| i.name == name)
+    registry::find(name)
         .map(|i| registry::health_of(name, i.pid))
         .unwrap_or_default()
 }
@@ -6784,7 +6771,7 @@ fn current_health(name: &str) -> String {
 /// Is a box with this name currently in the registry (i.e. still running)? `list()` prunes dead
 /// entries, so presence == alive. Used to fail a `depends_healthy` wait fast when the dep has died.
 fn is_box_alive(name: &str) -> bool {
-    registry::list().iter().any(|i| i.name == name)
+    registry::name_taken(name)
 }
 
 /// `kern compose <file>` — bring up a stack of boxes (detached) in `depends_on` order. Each
