@@ -3994,12 +3994,15 @@ fn merged_view_extract(
     // FORK SAFETY: the child allocates (the copier uses `format!`/`CString`), which is only safe after
     // `fork()` when no OTHER thread could hold the allocator lock — i.e. the process is single-threaded.
     // `kern build`/`push` run on a synchronous single-threaded `main` (background threads live only in the
-    // run/box paths), so this holds today. Assert it in debug builds so a future worker-pool/pre-fork
-    // thread trips the test suite here instead of a rare production malloc deadlock.
-    debug_assert!(
-        single_threaded(),
-        "merged_view_extract forks + allocates in the child; the caller must be single-threaded"
-    );
+    // run/box paths), so this holds today. Enforce it as a HARD runtime check (not a debug_assert, which
+    // vanishes in release — the fork-safety it guards would then be unprotected exactly in production): a
+    // future worker-pool/pre-fork thread gets a clean error here instead of a rare malloc deadlock.
+    if !single_threaded() {
+        unsafe { libc::close(out_fd) };
+        return Err(Error::Oci(
+            "merged-view: refusing to fork in a multi-threaded process (fork-safety)".into(),
+        ));
+    }
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -4403,6 +4406,12 @@ unsafe fn copy_one_file(
             }
         }
     }
+    // Preserve xattrs (best-effort) BEFORE owner/mtime. The one that matters for correctness is
+    // `security.capability`: a binary with file-capabilities (`setcap cap_net_raw+ep …`, e.g. `ping`,
+    // `ip`) carries the cap in this xattr; without it the pushed image's binary silently loses the
+    // capability and fails at run. We also carry `user.*`. We SKIP `system.*`/`trusted.*` (they need
+    // privilege we don't have and aren't ours to propagate).
+    copy_xattrs(rfd, dfd);
     // Preserve owner + mtime best-effort (mode was set at create time).
     libc::fchown(dfd, st.st_uid, st.st_gid);
     let times = [
@@ -4419,6 +4428,57 @@ unsafe fn copy_one_file(
     libc::close(rfd);
     libc::close(dfd);
     0
+}
+
+/// Copy the extended attributes we care about from `src_fd` to `dst_fd`, best-effort. Preserves
+/// `security.capability` (file-capabilities — a binary loses its caps in the pushed image without this)
+/// and `user.*`; SKIPS `system.*`/`trusted.*` (need privilege, not ours to propagate). Failures are
+/// ignored: xattrs are best-effort like `cp --preserve=all`, and a filesystem without xattr support (or
+/// a `security.*` we can't set unprivileged) must not fail the whole copy.
+unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
+    // List the source's xattr names into a buffer. `flistxattr(_, NULL, 0)` returns the needed size.
+    let need = libc::flistxattr(src_fd, std::ptr::null_mut(), 0);
+    if need <= 0 {
+        return; // no xattrs (0) or not supported (<0)
+    }
+    let mut names = vec![0u8; need as usize];
+    let got = libc::flistxattr(src_fd, names.as_mut_ptr() as *mut libc::c_char, names.len());
+    if got <= 0 {
+        return;
+    }
+    let mut val = vec![0u8; 4096];
+    // Names are a NUL-separated, NUL-terminated list.
+    for name in names[..got as usize]
+        .split(|&b| b == 0)
+        .filter(|n| !n.is_empty())
+    {
+        // Only carry `security.capability` and `user.*`. Everything else (system.*, trusted.*, other
+        // security.*) is skipped — unprivileged we can't set them and they aren't ours to move.
+        let is_capability = name == b"security.capability";
+        let is_user = name.starts_with(b"user.");
+        if !is_capability && !is_user {
+            continue;
+        }
+        let Ok(name_c) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        let vlen = libc::fgetxattr(
+            src_fd,
+            name_c.as_ptr(),
+            val.as_mut_ptr() as *mut libc::c_void,
+            val.len(),
+        );
+        if vlen < 0 {
+            continue;
+        }
+        libc::fsetxattr(
+            dst_fd,
+            name_c.as_ptr(),
+            val.as_ptr() as *const libc::c_void,
+            vlen as usize,
+            0,
+        );
+    }
 }
 
 /// `write(open(path), val)` — async-signal-safe (no allocation). `true` on full write.
