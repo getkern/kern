@@ -39,6 +39,12 @@ fn current_v2_cgroup() -> Option<PathBuf> {
         .lines()
         .find_map(|l| l.strip_prefix("0::"))?
         .trim_start_matches('/');
+    // Defence in depth: `/proc/self/cgroup` is kernel-generated and this runs in the host supervisor
+    // BEFORE any unshare, so `rel` can't be attacker-forged today — but never join a `..` component into
+    // a `/sys/fs/cgroup` path (a future caller inside a controlled cgroup-ns could otherwise escape).
+    if rel.split('/').any(|c| c == "..") {
+        return None;
+    }
     Some(PathBuf::from("/sys/fs/cgroup").join(rel))
 }
 
