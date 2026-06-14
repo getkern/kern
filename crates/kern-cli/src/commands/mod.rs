@@ -5433,11 +5433,23 @@ fn build_run(
     // (`KERN_BUILD_FLAT=1`, an escape hatch for a misbehaving overlay) or the probe says overlay
     // isn't usable here. A layered base can only be built on with overlay (cp can't duplicate a colon
     // chain), so require overlay in that case.
+    //
+    // SECURITY (opaque-dir leak, fail-CLOSED across kernels): a layered build represents `rm -rf dir &&
+    // mkdir dir` as an OPAQUE directory in the upper layer — a file the delete hid stays out of the
+    // merged view ONLY IF the kernel actually records the opaque. On some rootless overlay kernels it
+    // does NOT (measured: tegra 5.15 silently omits it → a secret `rm`'d in a build step reappears in a
+    // `COPY --from`/push; rpi/android hard-fail the delete). Where the opaque isn't honoured, layered is
+    // UNSAFE, so we fall back to the FLAT build — which copies the base and deletes files for real (no
+    // opaque marker involved), closing the leak by construction on every kernel. `probe_opaque_honored`
+    // tests this once, in-process, and only matters on the (older/vendor) kernels that lack it; on a
+    // modern kernel it's a sub-ms no-op that returns true.
     let layered = std::env::var_os("KERN_BUILD_FLAT").is_none()
-        && probe_overlay(&self_exe, &base_lower, work);
+        && probe_overlay(&self_exe, &base_lower, work)
+        && probe_opaque_honored();
     if !layered && base_lower.contains(':') {
         return Err(Error::Sandbox(
-            "cannot build FROM a layered image without unprivileged-overlay support on this kernel"
+            "cannot build FROM a layered image without unprivileged overlay + honoured opaque dirs on \
+             this kernel (needed to avoid a deleted-file leak); rebuild on a newer kernel"
                 .into(),
         ));
     }
@@ -5845,6 +5857,106 @@ fn remove_build_tree(path: &std::path::Path) {
 /// Probe whether an unprivileged overlay with a persistent upper actually mounts on this kernel (a
 /// tiny `true`-box over `base_lower`). Decides layered-vs-flat build up front. Best-effort; any
 /// failure → `false` → the flat copy path.
+/// `true` if this kernel HONOURS an overlay opaque directory in a rootless (single-uid userns) mount —
+/// i.e. after `rm -rf dir && mkdir dir` on a dir that lives in a lower layer, the lower's files are
+/// hidden from the merged view. Tested once, in-process (fork + `unshare(CLONE_NEWUSER|NEWNS)` +
+/// single-uid self-map + a throwaway 2-dir overlay), so it needs no `newuidmap` and mirrors exactly what
+/// a build layer does. Returns `true` on a modern kernel (a sub-ms check); `false` on a kernel that
+/// silently omits the opaque (measured: tegra 5.15) — where the caller must NOT build layered, or a
+/// deleted file would leak into a `COPY --from`/push. Best-effort: if the probe itself can't run
+/// (no unpriv userns at all — but then `probe_overlay` already said no), we return `false` (fail-closed).
+fn probe_opaque_honored() -> bool {
+    let tmp = cache_dir().join(format!(".opaque-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    // lower/dir/secret + empty upper/work + a merge target. If mkdir fails we can't probe → fail-closed.
+    let mk = |p: &std::path::Path| std::fs::create_dir_all(p).is_ok();
+    if !(mk(&tmp.join("lower/dir"))
+        && mk(&tmp.join("up"))
+        && mk(&tmp.join("wk"))
+        && mk(&tmp.join("mg")))
+    {
+        remove_build_tree(&tmp);
+        return false;
+    }
+    if std::fs::write(tmp.join("lower/dir/secret"), b"x").is_err() {
+        remove_build_tree(&tmp);
+        return false;
+    }
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    // The child does the ns/mount/rm and _exits 0 iff the opaque IS honoured (secret hidden). Any failure
+    // (mount error, opaque not honoured, secret still visible) → non-zero → fail-closed.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        remove_build_tree(&tmp);
+        return false;
+    }
+    if pid == 0 {
+        unsafe { probe_opaque_child(&tmp, euid, egid) };
+    }
+    let mut status = 0i32;
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    remove_build_tree(&tmp);
+    waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
+/// Child of [`probe_opaque_honored`]: mount a RW overlay (lower has `dir/secret`), `rm -rf dir && mkdir
+/// dir` in the merged view, then re-open the merged view read-only and check `dir/secret` is GONE (the
+/// opaque was honoured). `_exit(0)` iff hidden; any other path `_exit`s non-zero. Async-signal-safe until
+/// the `system()` — acceptable here (single-threaded at fork, like `merged_view_child`).
+unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: libc::gid_t) -> ! {
+    let cs = |p: String| std::ffi::CString::new(p).unwrap();
+    if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+        libc::_exit(11);
+    }
+    if !write_proc_self(b"/proc/self/setgroups\0", b"deny")
+        || !write_proc_self_map(b"/proc/self/uid_map\0", euid)
+        || !write_proc_self_map(b"/proc/self/gid_map\0", egid)
+    {
+        libc::_exit(12);
+    }
+    libc::mount(
+        c"none".as_ptr(),
+        c"/".as_ptr(),
+        std::ptr::null(),
+        libc::MS_REC | libc::MS_PRIVATE,
+        std::ptr::null(),
+    );
+    let d = tmp.to_string_lossy();
+    let opts = cs(format!("lowerdir={d}/lower,upperdir={d}/up,workdir={d}/wk"));
+    let mg = cs(format!("{d}/mg"));
+    if libc::mount(
+        c"overlay".as_ptr(),
+        mg.as_ptr(),
+        c"overlay".as_ptr(),
+        0,
+        opts.as_ptr() as *const libc::c_void,
+    ) != 0
+    {
+        libc::_exit(13);
+    }
+    // Reproduce EXACTLY what a build does — and the leak that only shows on RE-MOUNT. A build RUN does
+    // `rm -rf dir && mkdir dir` in the live overlay (which every kernel honours in the LIVE view), then
+    // `commit_layer` saves the UPPER as a standalone layer, and later the merged-view RE-MOUNTS
+    // upper-as-lower. The leak is that some kernels (tegra 5.15) honour the opaque live but DON'T
+    // persist it into the upper (no opaque xattr / whiteout written) — so on re-mount the lower's file
+    // resurfaces. So: do the rm in the live mount, then RE-MOUNT `up:lower` read-only (as the merged
+    // view would) and check the secret is STILL hidden. Only if it stays hidden across the re-mount is
+    // the opaque truly persisted → layered is safe.
+    let script = cs(format!(
+        "rm -rf {d}/mg/dir && mkdir {d}/mg/dir && \
+         umount {d}/mg && \
+         mount -t overlay overlay -o lowerdir={d}/up:{d}/lower,ro {d}/mg && \
+         test ! -e {d}/mg/dir/secret"
+    ));
+    let ret = libc::system(script.as_ptr());
+    // system() returns the shell's wait-status; 0 exit == opaque persisted (secret gone after re-mount).
+    if ret == 0 {
+        libc::_exit(0);
+    }
+    libc::_exit(14);
+}
+
 fn probe_overlay(self_exe: &std::path::Path, base_lower: &str, work: &std::path::Path) -> bool {
     let probe = work.join(".probe");
     let ok = std::process::Command::new(self_exe)
