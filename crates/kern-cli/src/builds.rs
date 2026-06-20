@@ -116,6 +116,16 @@ fn record_dir(id: &str) -> PathBuf {
     builds_dir().join(id)
 }
 
+/// Create `dir` (and parents) 0700 — build transcripts can contain whatever a `RUN` step printed
+/// (potentially build-time secrets), so keep the tree owner-only, not umask-default.
+fn mkdir_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 /// The transcript log path for build `id`.
 pub fn log_path(id: &str) -> PathBuf {
     record_dir(id).join("log")
@@ -128,7 +138,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid build id"));
     }
     let dir = record_dir(&rec.id);
-    std::fs::create_dir_all(&dir)?;
+    mkdir_private(&dir)?;
     let mut body = String::new();
     // Append-only wire format: readers tolerate missing keys, so new fields never break old records.
     let _ = write!(
@@ -152,6 +162,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join("meta"))?;
     f.write_all(body.as_bytes())
@@ -298,8 +309,15 @@ impl Capture {
             return None;
         }
         let dir = record_dir(id);
-        std::fs::create_dir_all(&dir).ok()?;
-        let mut logf = std::fs::File::create(dir.join("log")).ok()?;
+        mkdir_private(&dir).ok()?;
+        let mut logf = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join("log"))
+            .ok()?;
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return None;
@@ -365,6 +383,8 @@ pub fn append_log(id: &str, msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(log_path(id))
     {
         let _ = writeln!(f, "{msg}");
