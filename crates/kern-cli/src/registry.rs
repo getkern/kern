@@ -378,18 +378,25 @@ pub fn list() -> Vec<Instance> {
         if !well_formed_entry(&e.file_name()) {
             continue;
         }
-        let path = e.path();
-        let Some(body) = read_entry_capped(&path) else {
-            continue;
-        };
-        match parse(&body) {
-            Some(inst) if is_alive(inst.pid, inst.starttime) => out.push(inst),
-            // Unparseable or dead → prune.
-            _ => unregister(&path),
+        if let Some(inst) = load_live(&e.path()) {
+            out.push(inst);
         }
     }
     out.sort_by_key(|i| i.started);
     out
+}
+
+/// Load the registry entry at `path` if it is a LIVE box, pruning a dead/unparseable one as a side
+/// effect (never a live one). The single entry-loading rule — [`list`] and [`find`] both go through
+/// here, so the capped read, the parse, the liveness gate and the prune can't drift between them.
+fn load_live(path: &Path) -> Option<Instance> {
+    match read_entry_capped(path).and_then(|b| parse(&b)) {
+        Some(inst) if is_alive(inst.pid, inst.starttime) => Some(inst),
+        _ => {
+            unregister(path);
+            None
+        }
+    }
 }
 
 /// The LIVE box named `name`, or `None`. The targeted-lookup primitive: unlike [`list`], it opens and
@@ -410,20 +417,28 @@ pub fn find(name: &str) -> Option<Instance> {
         if entry_name(&fname) != Some(name) {
             continue;
         }
-        let path = e.path();
         // A filename match — confirm it's actually a LIVE box named `name` (body `name=` is authoritative,
-        // matching `list()`). Dead/unparseable → prune so the name is reusable. Never prune a live entry.
-        match read_entry_capped(&path).and_then(|b| parse(&b)) {
-            Some(inst) if is_alive(inst.pid, inst.starttime) => {
-                if inst.name == name {
-                    return Some(inst);
-                }
-                // live box whose body-name differs from its filename (shouldn't happen) — leave it, keep looking
-            }
-            _ => unregister(&path),
+        // matching `list()`). Dead/unparseable → pruned by `load_live` so the name is reusable; a live box
+        // whose body-name differs from its filename (shouldn't happen) is left alone, keep looking.
+        match load_live(&e.path()) {
+            Some(inst) if inst.name == name => return Some(inst),
+            _ => {}
         }
     }
     None
+}
+
+/// Is the EXACT `<name>-<pid>` entry a live box? The targeted (name,pid)-PAIR probe for watchers
+/// that track one specific instance (the detached `--timeout` watchdog, `attach`'s exit poll): a
+/// by-name [`find`] would test the pid against whichever same-name entry readdir yields first, so a
+/// duplicate entry (possible only from a fail-open unclaimed start or a pre-claim kern) could shadow
+/// the tracked box — the watchdog would never fire / attach would report a live box as exited.
+/// Opens exactly one file; never prunes.
+pub fn pair_alive(name: &str, pid: i32) -> bool {
+    let Ok(d) = dir() else { return false };
+    read_entry_capped(&d.join(format!("{name}-{pid}")))
+        .and_then(|b| parse(&b))
+        .is_some_and(|i| i.name == name && i.pid == pid && is_alive(i.pid, i.starttime))
 }
 
 /// Is a LIVE box already named `name`? Thin wrapper over [`find`] — the box-start hot-path name-check.
@@ -440,13 +455,18 @@ fn claims_dir() -> io::Result<PathBuf> {
 /// leak). ALL claim mutation — take, stale takeover, prune — happens under it, so two starters that
 /// both see the same stale claim can't both "take it over" (one would silently delete the other's
 /// fresh claim). Held for a handful of syscalls; contention cost is microseconds against a ~3 ms
-/// box start.
+/// box start. Retries `EINTR`: a signal landing while blocked on a contended lock must not surface
+/// as "no usable runtime dir" — the caller would fail-open UNCLAIMED, quietly disabling the very
+/// race protection this lock exists for.
 fn lock_claims(d: &Path) -> io::Result<fs::File> {
     use std::os::fd::AsRawFd;
     // `.lock` can never collide with a claim: names are `BoxName`-vetted (no leading '.').
     let f = fs::File::create(d.join(".lock"))?;
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error());
+    while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
     }
     Ok(f)
 }
@@ -481,8 +501,10 @@ impl Drop for NameClaim {
 ///
 /// * `Ok(Some(_))` — this process owns the name; hold the claim until the box is registered (the
 ///   registry entry is authoritative from then on), then drop it.
-/// * `Ok(None)` — a LIVE process holds the claim: the name is already being started (or the starter
-///   is still alive supervising it).
+/// * `Ok(None)` — the name is taken: a LIVE process holds the claim (already starting), or a live
+///   box is already REGISTERED under it. The registry re-check happens HERE, under the lock, so
+///   name reservation is atomic-by-construction for every caller — a second start path that only
+///   calls `claim_name` cannot silently reintroduce the race.
 /// * `Err(_)` — no usable runtime dir. The registry itself is equally unavailable then, so callers
 ///   proceed unclaimed (fail-open, exactly like `name_taken`).
 ///
@@ -494,14 +516,26 @@ pub fn claim_name(name: &str) -> io::Result<Option<NameClaim>> {
     let _lock = lock_claims(&d)?;
     let path = d.join(name);
     if let Ok(body) = fs::read_to_string(&path) {
-        if parse_claim(&body).is_some_and(|(p, t)| is_alive(p, t)) {
+        if live_claim(&body) {
             return Ok(None); // live claimant → name busy
         }
         // Dead claimant or malformed body → stale; fall through and take it over (we hold the lock).
     }
+    // A box that REGISTERED before we locked is invisible to the claim file (its starter already
+    // released the claim after registering) — the registry entry is authoritative from that point.
+    if name_taken(name) {
+        return Ok(None);
+    }
     let pid = std::process::id();
     fs::write(&path, format!("{pid} {}\n", proc_starttime(pid as i32)))?;
     Ok(Some(NameClaim { path, owner: pid }))
+}
+
+/// Is this claim body a LIVE claimant's? The single staleness rule — [`claim_name`]'s takeover and
+/// [`prune`]'s sweep both ask here, so they can never disagree on what counts as live (a divergence
+/// would let prune delete a claim a racing starter still honors).
+fn live_claim(body: &str) -> bool {
+    parse_claim(body).is_some_and(|(p, t)| is_alive(p, t))
 }
 
 /// The set of named volumes any running box currently mounts (for `volume prune`'s in-use guard).
@@ -597,11 +631,9 @@ pub fn prune() -> (usize, u64) {
                     if f.starts_with('.') {
                         continue; // `.lock` — never a claim (BoxName forbids a leading '.')
                     }
-                    let live_claim = fs::read_to_string(e.path())
-                        .ok()
-                        .and_then(|b| parse_claim(&b))
-                        .is_some_and(|(p, t)| is_alive(p, t));
-                    if !live_claim {
+                    let live = fs::read_to_string(e.path())
+                        .is_ok_and(|b| live_claim(&b));
+                    if !live {
                         let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
                         if fs::remove_file(e.path()).is_ok() {
                             removed += 1;
@@ -747,6 +779,29 @@ mod tests {
         // Released → the name is claimable again (and the file is gone).
         let c2 = claim_name(&name).unwrap();
         assert!(c2.is_some(), "claim must be reusable after release");
+    }
+
+    #[test]
+    fn claim_name_refuses_a_live_registered_box() {
+        // The registry re-check lives INSIDE claim_name (under its lock): a box that registered and
+        // released its claim must still make a fresh claim fail — for EVERY caller, by construction.
+        let name = format!("clm-reg-{}", std::process::id());
+        let pid = std::process::id() as i32;
+        let path = register(&Instance {
+            name: name.clone(),
+            pid,
+            pid1: 0,
+            rootfs: String::new(),
+            command: String::new(),
+            started: 1,
+            starttime: proc_starttime(pid),
+            ports: String::new(),
+            volumes: String::new(),
+        })
+        .unwrap();
+        let got = claim_name(&name).unwrap();
+        unregister(&path);
+        assert!(got.is_none(), "a live registered box must refuse the claim");
     }
 
     #[test]

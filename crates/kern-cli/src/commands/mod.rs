@@ -505,9 +505,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // check-then-register): atomically CLAIM the name, in THIS process — i.e. after the scope
     // re-exec, so the `exec()` can't orphan a claim — and hold it until the box is registered
     // (dropped explicitly after `register`, or by RAII on any earlier error return; a fork
-    // inheriting it never releases — the claim is pid-owned). Two concurrent same-name starts now
-    // serialize: one wins, the other fails fast here instead of both passing `name_taken` and both
-    // coming up as ambiguous twins.
+    // inheriting it never releases — the claim is pid-owned). `claim_name` itself re-checks the
+    // registry UNDER its lock, so `Ok(None)` covers both a concurrent starter and an already-
+    // running box. Two concurrent same-name starts now serialize: one wins, the other fails fast
+    // here instead of both passing `name_taken` and both coming up as ambiguous twins.
     let name_claim = match registry::claim_name(name.as_str()) {
         Ok(Some(c)) => Some(c),
         Ok(None) => {
@@ -520,15 +521,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // (fail-open, exactly like `name_taken`).
         Err(_) => None,
     };
-    // Re-check NOW THAT WE HOLD THE CLAIM: a box that registered between the advisory check and
-    // this claim is invisible to the claim file (its starter already released it after
-    // registering) — the registry entry is authoritative from that point on.
-    if registry::name_taken(name.as_str()) {
-        return Err(Error::AlreadyRunning(format!(
-            "a box named '{}' is already running",
-            name.as_str()
-        )));
-    }
 
     // `--bind-rootfs` only makes sense for a real `--rootfs` directory: an `--image` must stay an
     // immutable, shareable overlay (the cache is read-only and shared across boxes), and a bind
@@ -797,6 +789,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }
         cleanup_scratch(scratch.as_deref());
         let _ = std::fs::remove_dir_all(&vdisk_work);
+        // Release the start-claim BEFORE `systemctl enable --now`: the unit's own `kern box` run
+        // claims the same name, and this launcher (still alive) holding it would fail the unit's
+        // FIRST start with 'already starting' — systemd would only succeed on the 1s restart retry,
+        // making every `--restart` install flaky. From here the unit is the name's owner.
+        drop(name_claim);
         return install_persistent_box(
             &name,
             args.restart,
@@ -837,6 +834,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         print_box_status(&args, cpus);
     }
     if args.tty {
+        // Release the start-claim: `run_box_interactive` leaves via `process::exit` (raw-terminal
+        // teardown), which skips Drop — holding it here would leak one stale claim file per `-it`
+        // session. An interactive box never registers, so duplicate `-it` names stay allowed,
+        // exactly as before the claim existed.
+        drop(name_claim);
         return run_box_interactive(spec, scratch, ports, args.timeout);
     }
     // A persistent box (`--restart always`) is started by systemd in the foreground — systemd is the
@@ -2340,8 +2342,10 @@ fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> i32 {
         return child;
     }
     unsafe { libc::sleep(secs as libc::c_uint) };
-    let still = registry::find(&name).is_some_and(|b| b.pid == sup_pid);
-    if still {
+    // Exact (name,pid)-PAIR probe: a by-name `find` would test the pid against whichever same-name
+    // entry readdir yields first — a duplicate entry (fail-open unclaimed start / pre-claim kern)
+    // could shadow the tracked box and the timeout would silently never fire.
+    if registry::pair_alive(&name, sup_pid) {
         let _ = stop(std::slice::from_ref(&name), false);
     }
     unsafe { libc::_exit(0) };
@@ -2451,6 +2455,17 @@ fn await_box_started(
                     format!("box '{n}' exited before starting — run `kern logs {n}` for the reason")
                 }
             }));
+        }
+    } else {
+        // No readiness pipe (fd exhaustion): the supervisor hasn't necessarily REGISTERED yet, and
+        // the caller releases its name-claim right after we return — an unlucky concurrent
+        // same-name start could slip into that gap. Wait (bounded, best-effort) for the entry to
+        // appear so the claim's release contract — "after register" — holds on this path too.
+        for _ in 0..20 {
+            if registry::name_taken(name.as_str()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
     let p = crate::ui::Palette::detect();
@@ -3815,8 +3830,9 @@ pub fn attach(name: &str) -> Result<(), Error> {
                 Err(_) => break,
             }
         }
-        // Stop once the box is gone (drain one final time first, above).
-        if registry::find(name).is_none_or(|b| b.pid != bx.pid) {
+        // Stop once the box is gone (drain one final time first, above). Exact (name,pid) pair —
+        // a duplicate same-name entry must not make a live box read as exited (see `pair_alive`).
+        if !registry::pair_alive(name, bx.pid) {
             eprintln!("kern: box '{name}' exited");
             return Ok(());
         }
