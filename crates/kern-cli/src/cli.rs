@@ -211,6 +211,27 @@ pub enum Command {
     Images {
         json: bool,
     },
+    /// `kern builds [--json]`: list past builds (build history — the `docker buildx history` analogue).
+    Builds {
+        json: bool,
+    },
+    /// `kern build logs <id>`: print a past build's captured transcript.
+    BuildLogs {
+        id: String,
+    },
+    /// `kern build inspect <id> [--json]`: full detail for one past build.
+    BuildInspect {
+        id: String,
+        json: bool,
+    },
+    /// `kern build rm <id>...`: delete build-history records.
+    BuildRm {
+        ids: Vec<String>,
+    },
+    /// `kern build prune [--keep N]`: keep the N newest build records, delete the rest.
+    BuildPrune {
+        keep: usize,
+    },
     /// `kern ps [--json]`: list running boxes.
     Ps {
         json: bool,
@@ -401,6 +422,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `images`: list pulled (cached) images.
         Some("images") => Command::Images {
+            json: rest.contains(&"--json"),
+        },
+        Some("builds") => Command::Builds {
             json: rest.contains(&"--json"),
         },
         // `stop <name>` / `kill <name>`: stop running box(es). kern's `stop` already SIGKILLs the
@@ -1371,6 +1395,53 @@ fn discover_compose_file() -> Option<String> {
 
 /// `kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [-q] [<context>]`.
 fn parse_build(rest: &[&str]) -> Result<Command, Error> {
+    // `build <sub> …` — build-history management subcommands. A bare `build … -t <name>` (an actual
+    // build) never starts with one of these verbs, so the dispatch is unambiguous. `--json` may sit
+    // anywhere after the verb.
+    let json = rest.contains(&"--json");
+    let first_id = || -> Result<String, Error> {
+        rest.iter()
+            .skip(2)
+            .find(|a| !a.starts_with('-'))
+            .map(|s| (*s).to_string())
+            .ok_or(Error::Usage("build <logs|inspect|rm> <id>"))
+    };
+    match rest.get(1).copied() {
+        Some("logs") => return Ok(Command::BuildLogs { id: first_id()? }),
+        Some("inspect") => {
+            return Ok(Command::BuildInspect {
+                id: first_id()?,
+                json,
+            })
+        }
+        Some("rm" | "remove" | "delete") => {
+            let ids: Vec<String> = rest
+                .iter()
+                .skip(2)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if ids.is_empty() {
+                return Err(Error::Usage("build rm <id>..."));
+            }
+            return Ok(Command::BuildRm { ids });
+        }
+        Some("prune") => {
+            // `--keep N` (default 20): how many newest records to retain.
+            let mut keep = 20usize;
+            let mut it = rest.iter().skip(2);
+            while let Some(a) = it.next() {
+                if *a == "--keep" {
+                    keep = it
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                        .ok_or(Error::Usage("build prune --keep <N>"))?;
+                }
+            }
+            return Ok(Command::BuildPrune { keep });
+        }
+        _ => {}
+    }
     let mut tag: Option<String> = None;
     let mut file: Option<String> = None;
     let mut context: Option<String> = None;
@@ -1567,6 +1638,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodHolder => crate::pod::run_holder(),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
+        Command::Builds { json } => commands::builds_list(json),
+        Command::BuildLogs { id } => commands::build_logs(&id),
+        Command::BuildInspect { id, json } => commands::build_inspect(&id, json),
+        Command::BuildRm { ids } => commands::build_rm(&ids),
+        Command::BuildPrune { keep } => commands::build_prune(keep),
         Command::Pull {
             image,
             dest,

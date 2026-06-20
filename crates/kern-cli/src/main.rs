@@ -8,6 +8,7 @@
 
 mod auth;
 mod boxcp;
+mod builds;
 mod caps;
 mod cli;
 mod commands;

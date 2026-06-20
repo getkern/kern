@@ -43,6 +43,59 @@ pub enum Instr {
     Expose(String),
 }
 
+/// Lint a parsed instruction list for common Dockerfile smells, returning a human-readable warning per
+/// finding (empty = clean). These are advisory only — they never fail a build — but drive the `warn`
+/// status in the build history (`kern builds`). Deliberately a small, high-signal set (the same
+/// families `hadolint`/BuildKit surface most): unpinned base image, `apt-get`/`apk` without a
+/// no-recommends / `--no-cache` flag, a `RUN cd` that doesn't persist, and a missing final `CMD`.
+pub fn lint(instrs: &[Instr]) -> Vec<String> {
+    let mut warns = Vec::new();
+    for i in instrs {
+        match i {
+            Instr::From { image, .. } => {
+                // Unpinned tag: no `:tag`/`@digest`, or the mutable `:latest` — non-reproducible builds.
+                let bare = image.rsplit('/').next().unwrap_or(image);
+                if !bare.contains(':') && !bare.contains('@') {
+                    warns.push(format!("FROM {image}: no tag pinned (implicit ':latest' — builds aren't reproducible); pin a version"));
+                } else if image.ends_with(":latest") {
+                    warns.push(format!("FROM {image}: ':latest' is mutable — pin a specific version for reproducible builds"));
+                }
+            }
+            Instr::Run(argv) => {
+                let joined = argv.join(" ");
+                if joined.contains("apt-get install") && !joined.contains("--no-install-recommends") {
+                    warns.push("RUN apt-get install without --no-install-recommends (pulls extra packages, larger image)".into());
+                }
+                if joined.contains("apt-get")
+                    && joined.contains("install")
+                    && !joined.contains("rm -rf /var/lib/apt/lists")
+                {
+                    warns.push("RUN apt-get install without cleaning /var/lib/apt/lists (bloats the layer)".into());
+                }
+                if joined.contains("apk add")
+                    && !joined.contains("--no-cache")
+                    && !joined.contains("rm -rf /var/cache/apk")
+                {
+                    warns.push("RUN apk add without --no-cache (leaves the apk index in the layer)".into());
+                }
+                // A `cd` in its own RUN doesn't persist to later instructions — a frequent footgun.
+                let trimmed = joined.trim_start();
+                if (trimmed == "cd" || trimmed.starts_with("cd "))
+                    && !joined.contains("&&")
+                    && !joined.contains(';')
+                {
+                    warns.push("RUN cd <dir>: the directory change doesn't persist to later steps — use WORKDIR".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    if !instrs.iter().any(|i| matches!(i, Instr::Cmd(_) | Instr::Entrypoint(_))) {
+        warns.push("no CMD or ENTRYPOINT: the image has no default command".into());
+    }
+    warns
+}
+
 /// Parse Dockerfile `text` into an ordered instruction list. `build_args` seed the substitution
 /// table (they override any in-file `ARG` default). Returns a human-readable error on the first
 /// malformed or unsupported line, tagged with the 1-based line number.
@@ -475,6 +528,44 @@ mod tests {
 
     fn ba() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    #[test]
+    fn lint_flags_unpinned_base_and_missing_cmd_but_not_clean() {
+        // Unpinned FROM + no CMD → two warnings.
+        let dirty = lint(&[Instr::From {
+            image: "alpine".into(),
+            as_name: None,
+        }]);
+        assert!(dirty.iter().any(|w| w.contains("no tag pinned")));
+        assert!(dirty.iter().any(|w| w.contains("no CMD")));
+        // A pinned base + a CMD → clean, zero warnings.
+        let clean = lint(&[
+            Instr::From {
+                image: "alpine:3.19".into(),
+                as_name: None,
+            },
+            Instr::Cmd(vec!["/bin/sh".into()]),
+        ]);
+        assert!(clean.is_empty(), "pinned + CMD must be clean: {clean:?}");
+        // ':latest' is flagged as mutable even though it's "tagged".
+        assert!(lint(&[Instr::From {
+            image: "ubuntu:latest".into(),
+            as_name: None,
+        }])
+        .iter()
+        .any(|w| w.contains("mutable")));
+        // RUN apt-get install without --no-install-recommends is flagged.
+        assert!(lint(&[
+            Instr::From {
+                image: "debian:12".into(),
+                as_name: None,
+            },
+            Instr::Run(vec!["apt-get install -y curl".into()]),
+            Instr::Cmd(vec!["/bin/sh".into()]),
+        ])
+        .iter()
+        .any(|w| w.contains("no-install-recommends")));
     }
 
     /// A plain single-stage `FROM <image>` instruction (as_name None), for terse test assertions.
