@@ -791,6 +791,13 @@ fn process_layer(
     // `dest`. Then merge it into `dest` ourselves with no-follow semantics (see `merge_layer`),
     // so a symlink planted by a previous layer cannot be traversed by this layer's writes — the
     // cross-layer symlink-escape class is closed structurally, not by trusting tar.
+    //
+    // The extract + merge + cleanup below touch the image's REAL modes (a 0555 dir, a setuid file), so
+    // run them with the capability to override permissions — directly as root, or inside a forked
+    // single-uid userns for a non-root user (see `unpack_as_root`). verify + vet above stayed in the
+    // parent (they need no privilege and produce detailed errors). Plain `tar` here (no `unshare -r`
+    // wrapper): we're already in-ns root when non-root, so it has the caps.
+    let unpack = unpack_as_root(move || {
     let staging = dest.with_file_name(format!(".kern-stg-{}", digest.replace([':', '/'], "_")));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| OciError::Extract(e.to_string()))?;
@@ -891,6 +898,8 @@ fn process_layer(
     let merged = merge_layer(&staging, dest);
     let _ = std::fs::remove_dir_all(&staging);
     merged
+    });
+    unpack
 }
 
 /// Verify `file` hashes to `digest` (`sha256:HEX`). Uses `sha256sum` (coreutils). An unknown
@@ -1040,6 +1049,77 @@ pub(crate) fn pin_for_url(url: &str) -> &'static [&'static str] {
     } else {
         TLS_PIN
     }
+}
+
+/// One-time probe: can this host create a `unshare -r`-style single-uid user namespace? Mirrors the
+/// old tar-probe style. Used to decide whether a NON-root unpack can gain CAP_DAC_OVERRIDE.
+fn userns_ok() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        Command::new("unshare")
+            .args(["-r", "true"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Run the mode-sensitive part of a layer unpack (extract + merge + cleanup) with the capability to
+/// override file/dir permissions. Root already has it → runs `f` directly (the CI/WSL/desktop-root
+/// path is byte-identical to before). A NON-root user forks a child that maps its uid to in-ns root
+/// (a single-uid user namespace — the same primitive as `unshare -r`), then runs `f` there: with
+/// CAP_DAC_OVERRIDE/DAC_READ_SEARCH the extractor and merger never EACCES on an image's restrictive
+/// dir/file modes (fedora's 0555 `etc/pki/...` dirs, a setuid `/usr/bin/sudo`) — the exact failures a
+/// plain non-root unpack hit on edge boards. Falls back to a direct best-effort run where userns is
+/// unavailable (no worse than before there). The fork is SAFE w.r.t. the layer-prefetch thread: it
+/// happens only AFTER verify+vet (seconds of work), by which point any prefetch download is blocked
+/// in `waitpid` (not holding an allocator lock). The child reports failure via a non-zero exit.
+fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Result<(), OciError> {
+    let is_root = unsafe { libc::geteuid() == 0 };
+    if is_root || !userns_ok() {
+        return f();
+    }
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    // Flush our own buffered output so the forked child doesn't duplicate it on exit.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return f(); // fork failed → best-effort direct run
+    }
+    if pid == 0 {
+        // CHILD: enter a single-uid userns (real uid → in-ns 0) BEFORE any privileged fs op. `setgroups`
+        // must be denied before writing gid_map in an unprivileged userns.
+        let entered = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0
+            && std::fs::write("/proc/self/setgroups", "deny").is_ok()
+            && std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")).is_ok()
+            && std::fs::write("/proc/self/gid_map", format!("0 {gid} 1")).is_ok();
+        let code = if !entered {
+            eprintln!("kern: could not enter a user namespace to unpack the layer");
+            1
+        } else {
+            match f() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("kern: {e}");
+                    1
+                }
+            }
+        };
+        unsafe { libc::_exit(code) };
+    }
+    // PARENT: wait for the unpack child.
+    let mut status = 0i32;
+    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        if unsafe { *libc::__errno_location() } != libc::EINTR {
+            return Err(OciError::Extract("waiting for the layer-unpack child failed".into()));
+        }
+    }
+    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    ok.then_some(())
+        .ok_or_else(|| OciError::Extract("layer extraction failed".into()))
 }
 
 /// How a layer blob is compressed. Detected from the blob's leading magic bytes (never from the
