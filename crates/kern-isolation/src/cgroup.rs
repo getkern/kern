@@ -106,9 +106,40 @@ pub fn took_direct_cap_path() -> bool {
 /// `memory.max` capped-in-tree is a reliable, env-INDEPENDENT check that a real enforcer exists. When this
 /// is true and the box couldn't cap, it would run uncapped because of a (possibly forged) env — the caller
 /// warns loudly rather than let it happen silently. (Verifies the CLAIM against the actual cgroup state.)
+///
+/// Gated on the memory controller being AVAILABLE somewhere up-tree: on a host that never enables it for
+/// user sessions (a stock Raspberry Pi without `cgroup_enable=memory`), no genuine enforcer COULD have set
+/// a `memory.max` — our own legit scope re-exec sets `KERN_SCOPE` and its `MemoryMax` can't bite, so this
+/// check would otherwise cry "possible bypass" on EVERY box (and pollute each detached box's log). There
+/// the dedicated "--memory not enforced (controller isn't delegated)" message already tells the truth;
+/// this one only speaks when the host CAN cap memory and yet nothing does — the actual forgery signature.
 pub fn env_claims_enforcer_but_none_real() -> bool {
     outer_enforcer_present()
-        && current_v2_cgroup().is_some_and(|c| !capped_in_tree(&c, "memory.max"))
+        && current_v2_cgroup().is_some_and(|c| {
+            memory_cappable_in_tree(&c) && !capped_in_tree(&c, "memory.max")
+        })
+}
+
+/// Could ANY level of this cgroup's ancestry even HOLD a memory cap — i.e. does a `memory.max` file
+/// exist anywhere up to the cgroup root? The file exists iff the memory controller is enabled for that
+/// cgroup, so "no file anywhere" == the controller was never delegated down our path (nothing — genuine
+/// or kern — can cap memory here). Same bounded walk as [`capped_in_tree`], existence instead of value.
+fn memory_cappable_in_tree(child: &std::path::Path) -> bool {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let mut dir = child.to_path_buf();
+    loop {
+        if dir.join("memory.max").exists() {
+            return true;
+        }
+        if dir.as_path() == root {
+            break;
+        }
+        match dir.parent() {
+            Some(p) if p.starts_with(root) => dir = p.to_path_buf(),
+            _ => break,
+        }
+    }
+    false
 }
 
 /// Is this slice actually USABLE for capping — i.e. its delegated `cgroup.controllers` really contains
@@ -450,6 +481,24 @@ fn capped_in_tree(child: &std::path::Path, file: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_cappable_requires_the_file_to_exist() {
+        // A temp dir isn't under /sys/fs/cgroup, so the walk checks just this leaf. No `memory.max`
+        // file = the controller was never delegated (stock-Pi case) → NOT cappable → the forged-env
+        // warning stays silent there. The file existing — capped or `max` — means the host CAN cap.
+        let d = std::env::temp_dir().join(format!("kern-cgcap-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(
+            !memory_cappable_in_tree(&d),
+            "no memory.max file anywhere = controller absent = not cappable"
+        );
+        std::fs::write(d.join("memory.max"), "max").unwrap();
+        assert!(
+            memory_cappable_in_tree(&d),
+            "an uncapped (`max`) file still proves the controller is available"
+        );
+    }
 
     #[test]
     fn capped_in_tree_reads_the_max_sentinel() {
