@@ -814,6 +814,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             scratch,
             ports,
             &mounted_vols,
+            args.pod.unwrap_or(""),
             restart,
             HealthConfig {
                 cmd: args.health_cmd,
@@ -867,6 +868,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             starttime: registry::proc_starttime(pid),
             ports: ports_summary(ports),
             volumes: mounted_vols.clone(),
+            pod: args.pod.unwrap_or("").to_string(),
         };
         let path = registry::register(&inst).ok();
         Some((inst, path))
@@ -2619,6 +2621,7 @@ fn run_detached(
     scratch: Option<PathBuf>,
     ports: &[(u32, u16, u16)],
     volumes: &str,
+    pod: &str,
     restart: bool,
     health: HealthConfig,
     timeout: u64,
@@ -2669,6 +2672,7 @@ fn run_detached(
         starttime: registry::proc_starttime(pid),
         ports: ports_summary(ports),
         volumes: volumes.to_string(),
+        pod: pod.to_string(),
     };
     let path = registry::register(&inst).ok();
     // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
@@ -3049,9 +3053,10 @@ pub fn ps(json: bool) -> Result<(), Error> {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"name\":{},\"pid\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{}}}",
                 json_str(&b.name),
                 b.pid,
+                json_str(&b.pod),
                 json_str(&b.rootfs),
                 json_str(&b.command),
                 b.started,
@@ -3113,25 +3118,64 @@ pub fn ps(json: bool) -> Result<(), Error> {
             d = p.d,
             z = p.z
         );
-        for (b, up, health, ports) in &rows {
-            // Colour follows the panel standard: bold-cyan NAME, semantic HEALTH. Each cell is
-            // padded on its PLAIN value, then wrapped in colour, so alignment is preserved.
-            let name = format!("{}{}{:<16}{}", p.b, p.c, b.name, p.z);
-            let hc = match health.as_str() {
-                "healthy" => p.g,
-                "unhealthy" => p.r,
-                _ => p.d,
+        // One box row. `connector` is a tree glyph ("├─ "/"└─ ") drawn INSIDE the 16-wide NAME cell
+        // for a pod member, or "" for a standalone box — so every PID column still lines up.
+        let print_row =
+            |b: &registry::Instance, up: u64, health: &str, ports: &str, connector: &str| {
+                let cw = connector.chars().count();
+                // dim connector, then reset, then the standard bold-cyan NAME padded to fill the cell.
+                let name = format!(
+                    "{d}{connector}{z}{b}{c}{:<nw$}{z}",
+                    b.name,
+                    d = p.d,
+                    z = p.z,
+                    b = p.b,
+                    c = p.c,
+                    nw = 16usize.saturating_sub(cw),
+                );
+                let hc = match health {
+                    "healthy" => p.g,
+                    "unhealthy" => p.r,
+                    _ => p.d,
+                };
+                let health_cell = format!("{hc}{:<9}{}", health, p.z);
+                let cmd = if tty {
+                    truncate(&b.command, width.saturating_sub(prefix_w).max(8))
+                } else {
+                    b.command.clone()
+                };
+                println!(
+                    "{name} {:>7} {:>6}s  {health_cell} {ports:<pw$} {cmd}",
+                    b.pid, up
+                );
             };
-            let health_cell = format!("{hc}{:<9}{}", health, p.z);
-            let cmd = if tty {
-                truncate(&b.command, width.saturating_sub(prefix_w).max(8))
-            } else {
-                b.command.clone()
-            };
+        // Standalone boxes (no pod) print flat, exactly like before. Pod members are grouped under a
+        // header line — the `kern ps` mirror of Docker Desktop's collapsed compose-project rows.
+        for (b, up, health, ports) in rows.iter().filter(|(b, ..)| b.pod.is_empty()) {
+            print_row(b, *up, health, ports, "");
+        }
+        // Group the rest by pod, pods in name order, members in start order (rows already are).
+        let mut pods: std::collections::BTreeMap<&str, Vec<&(&registry::Instance, u64, String, String)>> =
+            std::collections::BTreeMap::new();
+        for row in rows.iter().filter(|(b, ..)| !b.pod.is_empty()) {
+            pods.entry(row.0.pod.as_str()).or_default().push(row);
+        }
+        for (pod, members) in &pods {
+            // Pod header: bold accent name + a dim "(N boxes)" tag. `kern stop <pod>` acts on the whole
+            // group — the header is the "root" the user stops or removes.
+            let n = members.len();
+            let plural = if n == 1 { "box" } else { "boxes" };
             println!(
-                "{name} {:>7} {:>6}s  {health_cell} {ports:<pw$} {cmd}",
-                b.pid, up
+                "{b}{y}{pod}{z} {d}(pod · {n} {plural}){z}",
+                b = p.b,
+                y = p.y,
+                d = p.d,
+                z = p.z,
             );
+            for (i, (b, up, health, ports)) in members.iter().enumerate() {
+                let connector = if i + 1 == n { "└─ " } else { "├─ " };
+                print_row(b, *up, health, ports, connector);
+            }
         }
     }
     Ok(())
@@ -6436,21 +6480,26 @@ fn boxes_matching_refs(
     let live_names: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
     running
         .into_iter()
-        .filter(|b| {
-            refs.iter().any(|n| {
-                *n == b.name || (!live_names.contains(n) && n.parse::<i32>().ok() == Some(b.pid))
-            })
-        })
+        .filter(|b| refs.iter().any(|n| ref_matches(b, n, &live_names)))
         .collect()
+}
+
+/// Does ref `n` select box `b`? A ref matches by NAME (always), else — only when no live box bears
+/// that exact name (NAME wins globally) — by its PID or by its POD name. Matching a pod name selects
+/// every member of that pod, so `kern stop <pod>` / `kern pause <pod>` act on the whole group.
+fn ref_matches(b: &registry::Instance, n: &str, live_names: &[String]) -> bool {
+    n == b.name
+        || (!live_names.contains(&n.to_string())
+            && (n.parse::<i32>().ok() == Some(b.pid) || n == b.pod))
 }
 
 pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     let dir = registry::dir().map_err(|e| Error::Sandbox(format!("registry: {e}")))?;
     let running = registry::list();
     let targets: Vec<_> = if all {
-        running
+        running.clone()
     } else {
-        boxes_matching_refs(running, names)
+        boxes_matching_refs(running.clone(), names)
     };
     // A persistent (`--restart always`) box is supervised by systemd and may be momentarily down
     // between restarts — not in the registry, but its unit still exists and would resurrect it at
@@ -6508,13 +6557,32 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         stop_managed_unit(n);
         println!("stopped '{n}' (systemd-managed)");
     }
+    // Stopping a pod means removing its "root" too (like Docker Desktop's stop-the-project): once every
+    // member of a pod is stopped, tear the pod down — its holder process, network namespace and shared
+    // hosts/resolv files. This fires whether the pod was named directly (`kern stop <pod>`), swept by
+    // `--all`, or emptied by stopping its last member — matching `compose down`'s cleanup.
+    let stopped_pods: std::collections::BTreeSet<&str> = targets
+        .iter()
+        .map(|b| b.pod.as_str())
+        .filter(|p| !p.is_empty())
+        .collect();
+    for pod in stopped_pods {
+        let survivor =
+            running.iter().any(|b| b.pod == pod && !targets.iter().any(|t| t.pid == b.pid));
+        if !survivor {
+            let (existed, _) = crate::pod::teardown(pod);
+            if existed {
+                println!("removed pod '{pod}'");
+            }
+        }
+    }
     // Don't silently ignore refs that matched no running box (and no managed unit). A ref matched a
-    // target by NAME or by its PID (same name-or-pid rule as the selection above), so check both —
-    // else `kern stop <pid>` stops the box AND then wrongly warns the pid "isn't a box".
+    // target by NAME, by its PID, or by its POD name (same rule as the selection above), so check all
+    // three — else `kern stop <pid|pod>` acts AND then wrongly warns the ref "isn't a box".
     if !all {
+        let live_names: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
         for n in names {
-            let matched =
-                targets.iter().any(|b| &b.name == n || n.parse::<i32>().ok() == Some(b.pid));
+            let matched = targets.iter().any(|b| ref_matches(b, n, &live_names));
             if !matched && !managed_only.contains(n) {
                 eprintln!("kern: no running box '{n}'");
             }
@@ -7764,6 +7832,44 @@ size = "2g"
 #[cfg(test)]
 mod net_resource_tests {
     use super::*;
+
+    fn inst(name: &str, pid: i32, pod: &str) -> registry::Instance {
+        registry::Instance {
+            name: name.to_string(),
+            pid,
+            pid1: 0,
+            rootfs: String::new(),
+            command: String::new(),
+            started: 0,
+            starttime: 0,
+            ports: String::new(),
+            volumes: String::new(),
+            pod: pod.to_string(),
+        }
+    }
+
+    #[test]
+    fn ref_matches_name_pid_and_pod_with_name_winning() {
+        let web = inst("web", 100, "myapp");
+        let db = inst("db", 101, "myapp");
+        let live = vec!["web".to_string(), "db".to_string()];
+        // by exact NAME
+        assert!(ref_matches(&web, "web", &live));
+        assert!(!ref_matches(&db, "web", &live));
+        // by POD name — selects every member of the pod
+        assert!(ref_matches(&web, "myapp", &live));
+        assert!(ref_matches(&db, "myapp", &live));
+        // by PID (as a string) when no live box bears that exact name
+        assert!(ref_matches(&web, "100", &live));
+        assert!(!ref_matches(&web, "101", &live));
+        // NAME WINS: a ref equal to a live box name never falls through to the pid/pod branch — so a
+        // box literally named "web" can't sweep a same-named pod, and a numeric name isn't shadowed.
+        let numname = inst("100", 999, "grp");
+        let live2 = vec!["100".to_string()];
+        assert!(ref_matches(&numname, "100", &live2)); // matches by its NAME…
+        let other = inst("x", 100, "grp"); // …and NOT by a coincidental pid == that name
+        assert!(!ref_matches(&other, "100", &live2));
+    }
 
     #[test]
     fn brackets_outside_quotes_ignores_strings() {
