@@ -7131,6 +7131,21 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
             Some((f, v)) => (f, Some(v)),
             None => (raw, None),
         };
+        // Alias the Docker-aligned CLI flag names onto the kern.toml FIELD names for `vcpu` profiles,
+        // where they're spelled the OPPOSITE way: `vcpus` is the cpu.max QUOTA, `cpus` is the cpuset
+        // PIN. Without this, `config add vcpu:x --cpus 2` silently sets the PIN (like `kern box
+        // --cpuset-cpus 2`), not the 2-core quota a `kern box --cpus 2` user expects — a real footgun.
+        // So `--cpus`→`vcpus` (quota) and `--cpuset-cpus`/`--cpuset`→`cpus` (pin), making `config add`
+        // consistent with `kern box`. (The raw field names still work for anyone editing by schema.)
+        let field = if kind == "vcpu" {
+            match field {
+                "cpus" => "vcpus",
+                "cpuset-cpus" | "cpuset" => "cpus",
+                other => other,
+            }
+        } else {
+            field
+        };
         if allowed.iter().all(|f| *f != field) {
             return Err(Error::Config(format!(
                 "{kind} has no --{field}; valid flags: {}",
