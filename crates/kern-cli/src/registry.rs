@@ -446,6 +446,30 @@ pub fn name_taken(name: &str) -> bool {
     find(name).is_some()
 }
 
+/// Resolve a box by a user-supplied reference: its NAME, or — as a fallback — its supervisor PID as
+/// shown in `kern ps` (Docker-style ref-or-name for the live commands: `stop`/`exec`/`logs`/…).
+/// NAME WINS: a box literally named "79" resolves before a box whose pid is 79, so an all-digit box
+/// name is never shadowed by a coincidental pid. The pid branch runs ONLY when the ref is a plain
+/// positive integer AND is not a live box name, and scans the (small) registry once. Caveat: a pid is
+/// a LIVE handle only — reused by the OS, changed by `--restart` — so the NAME stays the stable identity.
+pub fn find_ref(x: &str) -> Option<Instance> {
+    if let Some(inst) = find(x) {
+        return Some(inst); // a live box named `x` — name wins
+    }
+    let pid: i32 = x.parse().ok().filter(|&p| p > 0)?; // else it can't be a pid
+    let d = dir().ok()?;
+    for e in fs::read_dir(&d).ok()?.flatten() {
+        if entry_name(&e.file_name()).is_none() {
+            continue; // planted junk / non-entry filename
+        }
+        match load_live(&e.path()) {
+            Some(inst) if inst.pid == pid => return Some(inst),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The claims directory — one `<name>` file per IN-FLIGHT box start (see [`claim_name`]).
 fn claims_dir() -> io::Result<PathBuf> {
     runtime_subdir("claims")
@@ -779,6 +803,40 @@ mod tests {
         // Released → the name is claimable again (and the file is gone).
         let c2 = claim_name(&name).unwrap();
         assert!(c2.is_some(), "claim must be reusable after release");
+    }
+
+    #[test]
+    fn find_ref_resolves_name_then_pid_name_wins() {
+        let pid = std::process::id() as i32; // THIS process is alive → is_alive true
+        let mk = |name: &str, p: i32| {
+            register(&Instance {
+                name: name.to_string(),
+                pid: p,
+                pid1: 0,
+                rootfs: String::new(),
+                command: String::new(),
+                started: 1,
+                starttime: proc_starttime(pid),
+                ports: String::new(),
+                volumes: String::new(),
+            })
+            .unwrap()
+        };
+        let uniq = format!("fr-{pid}");
+        let p1 = mk(&uniq, pid);
+        // by NAME and by PID both resolve the same box.
+        assert_eq!(find_ref(&uniq).map(|i| i.name), Some(uniq.clone()));
+        assert_eq!(find_ref(&pid.to_string()).map(|i| i.name), Some(uniq.clone()));
+        // an unknown name and a non-existent pid both miss.
+        assert!(find_ref("no-such-box-xyz").is_none());
+        assert!(find_ref("2147483647").is_none()); // i32::MAX — no such pid
+        // NAME WINS: a box literally named after a NUMBER resolves by that NAME (via `find`), never
+        // via the pid branch — so a numeric name can't be shadowed by a coincidental pid.
+        let numname = format!("{}", pid.wrapping_add(1)); // a name that looks like a (different) pid
+        let p2 = mk(&numname, pid);
+        assert_eq!(find_ref(&numname).map(|i| i.name), Some(numname.clone()));
+        unregister(&p1);
+        unregister(&p2);
     }
 
     #[test]

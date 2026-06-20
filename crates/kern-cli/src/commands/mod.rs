@@ -1918,7 +1918,7 @@ pub fn exec(
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let env = parse_envs(env)?;
     let cmd = default_if_empty(command);
-    let inst = registry::find(name.as_str())
+    let inst = registry::find_ref(name.as_str())
         .ok_or_else(|| Error::NotRunning(format!("no running box named '{}'", name.as_str())))?;
     // PID 1 of the box. Older entries (or a race before the supervisor recorded it) → fall back
     // to the supervisor's sole child.
@@ -3176,12 +3176,17 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
     // `stats <name>...` filters to the named boxes; a requested name that isn't running is reported
     // (not silently dropped — that would look like a box with no stats).
     if !names.is_empty() {
+        // name-or-PID (NAME wins globally — an all-digit box name is never shadowed by a coincidental pid).
+        let live: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
+        let hit = |b: &registry::Instance, n: &str| -> bool {
+            n == b.name || (!live.iter().any(|m| m == n) && n.parse::<i32>().ok() == Some(b.pid))
+        };
         for want in names {
-            if !boxes.iter().any(|b| &b.name == want) {
-                eprintln!("kern: no running box named '{want}'");
+            if !boxes.iter().any(|b| hit(b, want)) {
+                eprintln!("kern: no running box '{want}'");
             }
         }
-        boxes.retain(|b| names.iter().any(|n| n == &b.name));
+        boxes.retain(|b| names.iter().any(|n| hit(b, n)));
     }
     if json {
         let mut out = String::from("[");
@@ -3229,7 +3234,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// scrubbed of terminal-escape sequences before display, exactly like the status panel and tables.
 /// Errors with a `kern ps` hint if no live box has that name.
 pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
-    let b = registry::find(name)
+    let b = registry::find_ref(name)
         .ok_or_else(|| Error::NotRunning(format!("no running box named '{name}'")))?;
     let health = registry::health_of(&b.name, b.pid);
     let mem = registry::mem_bytes(b.pid);
@@ -3747,6 +3752,10 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// `kern logs <name>` — print the captured stdout/stderr of the most recent box named `name`.
 pub fn logs(name: &str) -> Result<(), Error> {
+    // Accept a `kern ps` PID too: a live box's pid resolves to its name; a name (incl. a stopped box,
+    // whose log file persists) is used as-is.
+    let by_pid = registry::find_ref(name).map(|i| i.name);
+    let name = by_pid.as_deref().unwrap_or(name);
     match newest_log(name)? {
         Some(path) => {
             let body = std::fs::read_to_string(&path)
@@ -3801,7 +3810,7 @@ fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
 /// box leaves the registry.
 pub fn attach(name: &str) -> Result<(), Error> {
     use std::io::{Read, Write};
-    let bx = registry::find(name);
+    let bx = registry::find_ref(name);
     let Some(bx) = bx else {
         return Err(Error::NotRunning(format!("no running box named '{name}'")));
     };
@@ -6416,16 +6425,32 @@ fn scratch_dir() -> PathBuf {
 /// scratch. Stops every name in `names` (a name may match more than one box if names ever collide),
 /// or — with `all` — every running box. A requested name that isn't running is reported on stderr
 /// (never silently ignored); the command succeeds as long as at least one box was stopped.
+/// The running boxes matching a list of user refs — each a box NAME or (fallback) its `kern ps`
+/// supervisor PID. NAME WINS GLOBALLY: `!live_names.contains(n)` gates the pid branch, so an all-digit
+/// box name is never shadowed by a coincidental pid, and `stop 79` can't hit both a box named "79" and
+/// a different pid-79 box. Shared by `stop` and `pause`/`unpause` (the multi-target live commands).
+fn boxes_matching_refs(
+    running: Vec<registry::Instance>,
+    refs: &[String],
+) -> Vec<registry::Instance> {
+    let live_names: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
+    running
+        .into_iter()
+        .filter(|b| {
+            refs.iter().any(|n| {
+                *n == b.name || (!live_names.contains(n) && n.parse::<i32>().ok() == Some(b.pid))
+            })
+        })
+        .collect()
+}
+
 pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     let dir = registry::dir().map_err(|e| Error::Sandbox(format!("registry: {e}")))?;
     let running = registry::list();
     let targets: Vec<_> = if all {
         running
     } else {
-        running
-            .into_iter()
-            .filter(|b| names.iter().any(|n| n == &b.name))
-            .collect()
+        boxes_matching_refs(running, names)
     };
     // A persistent (`--restart always`) box is supervised by systemd and may be momentarily down
     // between restarts — not in the registry, but its unit still exists and would resurrect it at
@@ -6483,11 +6508,15 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         stop_managed_unit(n);
         println!("stopped '{n}' (systemd-managed)");
     }
-    // Don't silently ignore names that matched no running box (and no managed unit).
+    // Don't silently ignore refs that matched no running box (and no managed unit). A ref matched a
+    // target by NAME or by its PID (same name-or-pid rule as the selection above), so check both —
+    // else `kern stop <pid>` stops the box AND then wrongly warns the pid "isn't a box".
     if !all {
         for n in names {
-            if !targets.iter().any(|b| &b.name == n) && !managed_only.contains(n) {
-                eprintln!("kern: no running box named '{n}'");
+            let matched =
+                targets.iter().any(|b| &b.name == n || n.parse::<i32>().ok() == Some(b.pid));
+            if !matched && !managed_only.contains(n) {
+                eprintln!("kern: no running box '{n}'");
             }
         }
     }
@@ -6540,10 +6569,7 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
     let targets: Vec<_> = if all {
         running
     } else {
-        running
-            .into_iter()
-            .filter(|b| names.iter().any(|n| n == &b.name))
-            .collect()
+        boxes_matching_refs(running, names)
     };
     if targets.is_empty() {
         return Err(Error::NotRunning(format!("no running box to {verb}")));
