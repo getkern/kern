@@ -38,7 +38,7 @@ fn as_box_ref(spec: &str) -> Option<(i32, String)> {
     if name.is_empty() || path.is_empty() {
         return None;
     }
-    let inst = crate::registry::find(name)?;
+    let inst = crate::registry::find_ref(name)?;
     let pid1 = if inst.pid1 > 0 {
         inst.pid1
     } else {
