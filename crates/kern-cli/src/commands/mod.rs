@@ -3798,16 +3798,20 @@ pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
         );
     } else {
         let p = crate::ui::Palette::detect();
+        // Free-text fields (tag/dockerfile/context/error) are scrubbed of terminal escapes — a record
+        // with a crafted tag can't inject an escape sequence into a terminal that runs `inspect` (same
+        // guard the `builds` table and `--json` already apply).
+        let s = crate::ui::scrub;
         println!("{}{}build {}{}", p.b, p.c, r.id, p.z);
-        println!("  tag        {}", r.tag);
+        println!("  tag        {}", s(&r.tag));
         println!("  status     {}", r.status.label());
         println!("  duration   {}", fmt_dur(r.duration_ms));
         println!("  size       {}", human_bytes(r.size));
         println!("  warnings   {}", r.warnings);
-        println!("  dockerfile {}", r.dockerfile);
-        println!("  context    {}", r.context);
+        println!("  dockerfile {}", s(&r.dockerfile));
+        println!("  context    {}", s(&r.context));
         if !r.error.is_empty() {
-            println!("  error      {}", r.error);
+            println!("  error      {}", s(&r.error));
         }
         println!("  logs       kern build logs {}", r.id);
     }
