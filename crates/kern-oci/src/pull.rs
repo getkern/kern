@@ -139,35 +139,40 @@ pub fn pull(
         // `curl -o` the same `.kern-layer-<digest>.tar.gz` at once → torn read / spurious digest mismatch.
         std::thread::spawn(move || download_layer(i, &reg, &rp, &dig, &a, &dst))
     };
-    // Escape hatch (like KERN_NO_SCOPE): KERN_NO_PREFETCH=1 → download strictly before extract, no
-    // overlap. Off by default; also used to A/B the speedup.
+    // Escape hatch (like KERN_NO_SCOPE): KERN_NO_PREFETCH=1 → the pre-prefetch execution model,
+    // downloads run INLINE (no worker thread at all), strictly before each extract. Off by default;
+    // also used to A/B the speedup.
     let prefetch = std::env::var_os("KERN_NO_PREFETCH").is_none();
-    let mut next = Some(spawn_dl(0));
+    let mut next = prefetch.then(|| spawn_dl(0));
     // index loop, not `.enumerate()`: we need `i + 1` to prefetch the NEXT layer's download.
     #[allow(clippy::needless_range_loop)]
     for i in 0..total {
-        let tmp = next
-            .take()
-            .expect("download handle present each iteration")
-            .join()
-            .map_err(|_| OciError::Extract("layer download thread panicked".into()))??;
-        // Prefetch: start layer i+1's download BEFORE extracting i → its network overlaps i's CPU.
+        let tmp = match next.take() {
+            Some(h) => h
+                .join()
+                .map_err(|_| OciError::Extract("layer download thread panicked".into()))??,
+            None => download_layer(i, &registry, &repo, &layers[i], &auth, dest)?,
+        };
+        // Prefetch: start layer i+1's download BEFORE extracting i — the SINGLE spawn site — so its
+        // network overlaps i's CPU.
         if prefetch && i + 1 < total {
             next = Some(spawn_dl(i + 1));
         }
         // On error, don't just bail: an already-spawned prefetch thread would detach and keep writing its
-        // blob into `dest` after the pull failed. Wait for it and unlink its tmp before returning.
+        // blob into `dest` after the pull failed. Wait for it — SAYING SO first: the join can take as
+        // long as that download (the error is worth more than the wait; a detached writer is worse) —
+        // and unlink its blob whatever the outcome (`download_layer` cleans up its own curl failures;
+        // the deterministic tmp name covers a panicked thread).
         if let Err(e) = process_layer(&tmp, &layers[i], dest, i + 1, total) {
             if let Some(h) = next.take() {
-                if let Ok(Ok(orphan)) = h.join() {
-                    let _ = std::fs::remove_file(orphan);
-                }
+                eprintln!(
+                    "✗ layer {}/{total} failed — stopping the in-flight prefetch…",
+                    i + 1
+                );
+                let _ = h.join();
+                let _ = std::fs::remove_file(layer_tmp_path(dest, i + 1, &layers[i + 1]));
             }
             return Err(e);
-        }
-        // No-prefetch: only start i+1 AFTER i is fully extracted → strictly sequential (for A/B).
-        if !prefetch && i + 1 < total {
-            next = Some(spawn_dl(i + 1));
         }
     }
     eprintln!("✓ pulled {image} → {} ({total} layers)", dest.display());
@@ -722,15 +727,26 @@ fn download_layer(
     let short = short_digest(digest);
     eprintln!("→ layer  {short}  downloading…");
     let url = format!("{}/v2/{repo}/blobs/{digest}", reg_base(registry));
-    // Per-INDEX tmp name (not per-digest): adjacent layers may share a digest, and prefetch runs two
-    // downloads at once — a digest-only name would make them collide on one file.
-    let tmp = dest.join(format!(
+    let tmp = layer_tmp_path(dest, idx, digest);
+    let tmp_s = tmp.to_string_lossy().into_owned();
+    if let Err(e) = curl_download(&url, &tmp_s, auth) {
+        // curl `-o` may have written a partial blob before failing — never leave it inside `dest`
+        // (which can be the user's rootfs dir): a junk `.kern-layer-*` would end up visible at `/`
+        // in every box booted from that rootfs.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// The tmp blob path for layer `idx` — per-INDEX (not per-digest): adjacent layers may legally
+/// share a digest, and prefetch runs two downloads at once — a digest-only name would make them
+/// collide on one file. One definition, so the download and the error-path cleanup can't drift.
+fn layer_tmp_path(dest: &Path, idx: usize, digest: &str) -> std::path::PathBuf {
+    dest.join(format!(
         ".kern-layer-{idx}-{}.tar.gz",
         digest.replace([':', '/'], "_")
-    ));
-    let tmp_s = tmp.to_string_lossy().into_owned();
-    curl_download(&url, &tmp_s, auth)?;
-    Ok(tmp)
+    ))
 }
 
 /// Verify + vet + extract + merge ONE already-downloaded layer, strictly IN ORDER (never concurrent:
