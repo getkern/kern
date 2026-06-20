@@ -61,6 +61,12 @@ impl Error {
             Error::Compose(_) => {
                 Some("compose: `[box.NAME]` tables with image/rootfs, command, depends_on".into())
             }
+            // A build-history lookup miss (`build logs|inspect <id>`) is not a Dockerfile problem, so
+            // point it at the list — not the FROM/COPY hint, which would mislead. Same message-shape
+            // routing as `oci_hint`.
+            Error::Build(msg) if msg.starts_with("no build ") => {
+                Some("run `kern builds` to list build ids".into())
+            }
             Error::Build(_) => Some(
                 "build: the Dockerfile must start with FROM (ARG may precede it); COPY/ADD paths \
                  stay inside the image"
@@ -120,6 +126,17 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_hint_routes_history_miss_to_the_builds_list() {
+        // A build-history lookup miss points at `kern builds`, not the Dockerfile/FROM hint.
+        let miss = Error::Build("no build '1-2'".into()).hint().unwrap();
+        assert!(miss.contains("kern builds"));
+        assert!(!miss.contains("FROM"));
+        // A real build error keeps the Dockerfile hint.
+        let real = Error::Build("RUN failed (exit 1)".into()).hint().unwrap();
+        assert!(real.contains("FROM"));
+    }
 
     #[test]
     fn oci_hint_points_at_the_actual_cause() {

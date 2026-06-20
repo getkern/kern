@@ -44,6 +44,8 @@ pub fn help() -> Result<(), Error> {
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
+    {c}builds{z} [--json]                                                List past builds (build history)
+    {c}build{z} logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
   {d}Manage boxes{z}
     {c}top{z}                                                            Interactive task manager (TUI)
@@ -3638,25 +3640,7 @@ pub fn images(json: bool) -> Result<(), Error> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| stem.clone());
-            // Size: a pulled (flat) image is `<stem>/`; a single-diff build is `<stem>.diff/`; a
-            // multi-layer build (`<stem>.layers`) is the sum of its layer dirs in the `L/` cache.
-            let flat = cache.join(&stem);
-            let layers_file = cache.join(format!("{stem}.layers"));
-            let size = if flat.is_dir() {
-                dir_size(&flat)
-            } else if layers_file.exists() {
-                let lc = layer_cache_dir();
-                std::fs::read_to_string(&layers_file)
-                    .unwrap_or_default()
-                    .lines()
-                    .skip(1) // line 0 is the base ref
-                    .map(str::trim)
-                    .filter(|k| !k.is_empty())
-                    .map(|k| dir_size(&lc.join(k)))
-                    .sum()
-            } else {
-                dir_size(&cache.join(format!("{stem}.diff")))
-            };
+            let size = image_size(&cache, &stem);
             let pulled = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok()
@@ -3703,6 +3687,173 @@ pub fn images(json: bool) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Compact build duration for the `kern builds` table (`ms` / `s` / `m` `s`).
+fn fmt_dur(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+/// `kern builds [--json]` — the build history: one row per past `kern build`, newest first (the kern
+/// analogue of Docker Desktop's "Builds" panel / `docker buildx history`).
+pub fn builds_list(json: bool) -> Result<(), Error> {
+    let recs = crate::builds::list();
+    if json {
+        let mut out = String::from("[");
+        for (i, r) in recs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"id\":{},\"tag\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{}}}",
+                json_str(&r.id),
+                json_str(&r.tag),
+                json_str(r.status.label()),
+                r.duration_ms,
+                r.started,
+                r.size,
+                r.warnings,
+            ));
+        }
+        out.push(']');
+        println!("{out}");
+    } else if recs.is_empty() {
+        println!("no builds yet — build one with `kern build -t <name> .`");
+    } else {
+        let p = crate::ui::Palette::detect();
+        // Size TAG to its widest value (capped) so STATUS stays aligned.
+        let tw = recs
+            .iter()
+            .map(|r| r.tag.chars().count())
+            .chain(std::iter::once(3))
+            .max()
+            .unwrap_or(3)
+            .min(30);
+        println!(
+            "{d}{:<18} {:<tw$} {:<11} {:>8} {:>9}  CREATED{z}",
+            "ID",
+            "TAG",
+            "STATUS",
+            "TIME",
+            "SIZE",
+            d = p.d,
+            z = p.z
+        );
+        let now = registry::now_unix();
+        for r in &recs {
+            let sc = match r.status {
+                crate::builds::Status::Ok => p.g,
+                crate::builds::Status::Warn => p.y,
+                crate::builds::Status::Failed => p.r,
+                crate::builds::Status::Running => p.d,
+            };
+            let id = format!("{}{}{:<18}{}", p.b, p.c, r.id, p.z);
+            let status = format!("{sc}{:<11}{}", r.status.label(), p.z);
+            println!(
+                "{id} {:<tw$} {status} {:>8} {:>9}  {}",
+                truncate(&r.tag, tw),
+                fmt_dur(r.duration_ms),
+                human_bytes(r.size),
+                fmt_age(now.saturating_sub(r.started)),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `kern build logs <id>` — the captured transcript of a past build.
+pub fn build_logs(id: &str) -> Result<(), Error> {
+    if crate::builds::get(id).is_none() {
+        return Err(Error::Build(format!("no build '{id}'")));
+    }
+    match std::fs::read_to_string(crate::builds::log_path(id)) {
+        Ok(s) => print!("{s}"),
+        Err(_) => println!("(no transcript captured for build '{id}')"),
+    }
+    Ok(())
+}
+
+/// `kern build inspect <id> [--json]` — full detail for one past build.
+pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
+    let r = crate::builds::get(id).ok_or_else(|| Error::Build(format!("no build '{id}'")))?;
+    if json {
+        println!(
+            "{{\"id\":{},\"tag\":{},\"dockerfile\":{},\"context\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{},\"error\":{}}}",
+            json_str(&r.id),
+            json_str(&r.tag),
+            json_str(&r.dockerfile),
+            json_str(&r.context),
+            json_str(r.status.label()),
+            r.duration_ms,
+            r.started,
+            r.size,
+            r.warnings,
+            json_str(&r.error),
+        );
+    } else {
+        let p = crate::ui::Palette::detect();
+        println!("{}{}build {}{}", p.b, p.c, r.id, p.z);
+        println!("  tag        {}", r.tag);
+        println!("  status     {}", r.status.label());
+        println!("  duration   {}", fmt_dur(r.duration_ms));
+        println!("  size       {}", human_bytes(r.size));
+        println!("  warnings   {}", r.warnings);
+        println!("  dockerfile {}", r.dockerfile);
+        println!("  context    {}", r.context);
+        if !r.error.is_empty() {
+            println!("  error      {}", r.error);
+        }
+        println!("  logs       kern build logs {}", r.id);
+    }
+    Ok(())
+}
+
+/// `kern build rm <id>...` — delete build-history records.
+pub fn build_rm(ids: &[String]) -> Result<(), Error> {
+    for id in ids {
+        if crate::builds::remove(id) {
+            println!("removed build '{id}'");
+        } else {
+            eprintln!("kern: no build '{id}'");
+        }
+    }
+    Ok(())
+}
+
+/// `kern build prune [--keep N]` — keep the N newest build records, delete the rest.
+pub fn build_prune(keep: usize) -> Result<(), Error> {
+    let n = crate::builds::prune(keep);
+    println!("pruned {n} build record(s); kept the {keep} newest");
+    Ok(())
+}
+
+/// On-disk size of the cached image whose sanitized stem is `stem` — a pulled (flat) image is
+/// `<stem>/`, a single-diff build is `<stem>.diff/`, a multi-layer build (`<stem>.layers`) sums its
+/// layer dirs in the `L/` cache. Extracted so `images()` and the build-history record agree exactly.
+fn image_size(cache: &std::path::Path, stem: &str) -> u64 {
+    let flat = cache.join(stem);
+    let layers_file = cache.join(format!("{stem}.layers"));
+    if flat.is_dir() {
+        dir_size(&flat)
+    } else if layers_file.exists() {
+        let lc = layer_cache_dir();
+        std::fs::read_to_string(&layers_file)
+            .unwrap_or_default()
+            .lines()
+            .skip(1) // line 0 is the base ref
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(|k| dir_size(&lc.join(k)))
+            .sum()
+    } else {
+        dir_size(&cache.join(format!("{stem}.diff")))
+    }
 }
 
 /// Recursive on-disk size of `dir` in bytes (best-effort). Uses the no-follow dirent file type, so
@@ -5208,12 +5359,69 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
         || instrs
             .iter()
             .any(|i| matches!(i, crate::dockerfile::Instr::Copy { from: Some(_), .. }));
+
+    // ── Build history ──
+    // Mint an id, lint the Dockerfile (advisory → drives the `warn` status), and pre-write a `running`
+    // record so a build killed mid-flight (Ctrl-C) still leaves an "interrupted" trace. `Capture`
+    // redirects stderr into the record's log for the build's lifetime (teed live to the terminal), so
+    // `kern build logs <id>` shows the real transcript incl. child RUN output.
+    let started = registry::now_unix();
+    let id = crate::builds::new_id(started, std::process::id());
+    let warns = crate::dockerfile::lint(&instrs);
+    let mut rec = crate::builds::Record {
+        id: id.clone(),
+        tag: tag.to_string(),
+        dockerfile: dfpath.display().to_string(),
+        context: ctx.display().to_string(),
+        started,
+        duration_ms: 0,
+        status: crate::builds::Status::Running,
+        warnings: warns.len() as u32,
+        size: 0,
+        error: String::new(),
+    };
+    let _ = crate::builds::write(&rec);
+    let capture = crate::builds::Capture::start(&id);
+    for w in &warns {
+        if !args.quiet {
+            eprintln!("warning: {w}");
+        }
+    }
+    let t0 = std::time::Instant::now();
     let result = if multi {
         build_multi_stage(args.quiet, tag, &ctx, &work, &instrs)
     } else {
         build_run(args.quiet, tag, &ctx, &work, &instrs)
     };
     remove_build_tree(&work); // overlay leaves mode-000 workdirs; force-clean so nothing leaks
+    // Finalize the record: outcome from `result`, size read back the way `images()` computes it. Drop
+    // the capture (restores stderr) before appending the summary so it lands after the transcript.
+    rec.duration_ms = t0.elapsed().as_millis() as u64;
+    match &result {
+        Ok(()) => {
+            rec.status = if rec.warnings > 0 {
+                crate::builds::Status::Warn
+            } else {
+                crate::builds::Status::Ok
+            };
+            rec.size = image_size(&cache, &sanitize_ref(&rec.tag));
+        }
+        Err(e) => {
+            rec.status = crate::builds::Status::Failed;
+            rec.error = e.to_string();
+        }
+    }
+    drop(capture);
+    let _ = crate::builds::write(&rec);
+    crate::builds::append_log(
+        &id,
+        &format!(
+            "--- {} in {}ms · {} ---",
+            rec.status.label(),
+            rec.duration_ms,
+            rec.tag
+        ),
+    );
     result
 }
 
