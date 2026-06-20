@@ -6035,11 +6035,15 @@ unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: lib
     // resurfaces. So: do the rm in the live mount, then RE-MOUNT `up:lower` read-only (as the merged
     // view would) and check the secret is STILL hidden. Only if it stays hidden across the re-mount is
     // the opaque truly persisted → layered is safe.
+    // stderr silenced ({{…}} 2>/dev/null): this is an internal PROBE — only its exit status matters
+    // (drives the layered-vs-flat decision). On a filesystem where the overlay `rm` can't fully remove
+    // the dir (WSL's 9p/overlay: "rm: can't remove …: I/O error"), the probe correctly falls back to a
+    // flat build; leaking that rm's diagnostic to the user's build output just looks alarming.
     let script = cs(format!(
-        "rm -rf {d}/mg/dir && mkdir {d}/mg/dir && \
-         umount {d}/mg && \
-         mount -t overlay overlay -o lowerdir={d}/up:{d}/lower,ro {d}/mg && \
-         test ! -e {d}/mg/dir/secret"
+        "{{ rm -rf {d}/mg/dir && mkdir {d}/mg/dir && \
+           umount {d}/mg && \
+           mount -t overlay overlay -o lowerdir={d}/up:{d}/lower,ro {d}/mg && \
+           test ! -e {d}/mg/dir/secret; }} 2>/dev/null"
     ));
     let ret = libc::system(script.as_ptr());
     // system() returns the shell's wait-status; 0 exit == opaque persisted (secret gone after re-mount).
