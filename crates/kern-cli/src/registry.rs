@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One registered, running box.
+#[derive(Clone)]
 pub struct Instance {
     pub name: String,
     pub pid: i32,
@@ -32,6 +33,9 @@ pub struct Instance {
     /// Comma-separated **named volumes** this box mounts (from `-v name:/dst`) — so `kern volume rm`
     /// can refuse to delete a volume still in use. Empty when none; absent in older entries.
     pub volumes: String,
+    /// The **pod** (`--pod <name>`, e.g. a compose stack) this box belongs to — the grouping key for
+    /// `kern ps`'s tree view and `kern stop <pod>`. Empty for a standalone box; absent in older entries.
+    pub pod: String,
 }
 
 impl Instance {
@@ -310,7 +314,7 @@ pub fn now_unix() -> u64 {
 pub fn register(inst: &Instance) -> io::Result<PathBuf> {
     let path = dir()?.join(format!("{}-{}", inst.name, inst.pid));
     let body = format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -320,6 +324,7 @@ pub fn register(inst: &Instance) -> io::Result<PathBuf> {
         inst.starttime,
         one_line(&inst.ports),
         one_line(&inst.volumes),
+        one_line(&inst.pod),
     );
     fs::write(&path, body)?;
     Ok(path)
@@ -719,7 +724,7 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut name, mut pid) = (None, None);
     let (mut rootfs, mut command, mut ports) = (String::new(), String::new(), String::new());
     let (mut pid1, mut started, mut starttime) = (0i32, 0u64, 0u64);
-    let mut volumes = String::new();
+    let (mut volumes, mut pod) = (String::new(), String::new());
     for line in body.lines() {
         let (k, v) = line.split_once('=')?;
         match k {
@@ -732,6 +737,7 @@ fn parse(body: &str) -> Option<Instance> {
             "starttime" => starttime = v.parse().unwrap_or(0),
             "ports" => ports = v.to_string(),
             "volumes" => volumes = v.to_string(),
+            "pod" => pod = v.to_string(),
             _ => {}
         }
     }
@@ -745,6 +751,7 @@ fn parse(body: &str) -> Option<Instance> {
         starttime,
         ports,
         volumes,
+        pod,
     })
 }
 
@@ -819,6 +826,7 @@ mod tests {
                 starttime: proc_starttime(pid),
                 ports: String::new(),
                 volumes: String::new(),
+                pod: String::new(),
             })
             .unwrap()
         };
@@ -855,6 +863,7 @@ mod tests {
             starttime: proc_starttime(pid),
             ports: String::new(),
             volumes: String::new(),
+            pod: String::new(),
         })
         .unwrap();
         let got = claim_name(&name).unwrap();
@@ -895,13 +904,17 @@ mod tests {
 
     #[test]
     fn parse_reads_volumes_and_tolerates_older_entries() {
-        // A full entry round-trips the volumes field.
-        let full = "name=web\npid=42\npid1=7\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nports=\nvolumes=data,cache\n";
+        // A full entry round-trips the volumes and pod fields.
+        let full = "name=web\npid=42\npid1=7\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nports=\nvolumes=data,cache\npod=myapp\n";
         let i = parse(full).unwrap();
         assert_eq!(i.name, "web");
         assert_eq!(i.volumes, "data,cache");
-        // An OLDER entry with no `volumes=` line still parses (field defaults to empty).
+        assert_eq!(i.pod, "myapp");
+        // An OLDER entry with no `volumes=`/`pod=` line still parses (fields default to empty) — the
+        // wire format is append-only, so a box registered by a previous kern version is never dropped.
         let old = "name=web\npid=42\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nports=\n";
-        assert_eq!(parse(old).unwrap().volumes, "");
+        let oi = parse(old).unwrap();
+        assert_eq!(oi.volumes, "");
+        assert_eq!(oi.pod, "");
     }
 }
