@@ -7890,6 +7890,49 @@ mod net_resource_tests {
     }
 
     #[test]
+    fn matching_refs_dedups_a_box_selected_by_both_its_name_and_pod() {
+        // `kern stop web mypod` where box `web` is a member of `mypod`: the box matches TWO refs but
+        // must appear once (else stop would kill -SIGKILL a pid twice / double-print).
+        let running = vec![inst("web", 10, "mypod"), inst("db", 11, "mypod")];
+        let sel = boxes_matching_refs(running, &["web".into(), "mypod".into()]);
+        assert_eq!(sel.len(), 2, "web selected by name AND pod must not duplicate");
+        let names: Vec<&str> = sel.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["web", "db"]);
+    }
+
+    #[test]
+    fn a_box_named_like_a_pod_wins_over_the_pod_members() {
+        // NAME-wins across the whole ref: a standalone box literally named `web` coexisting with a pod
+        // also named `web` → `kern stop web` selects ONLY the standalone box, never the pod's members
+        // (the pod branch is gated off whenever a live box bears that exact name).
+        let running = vec![
+            inst("web", 20, ""),      // standalone box literally named "web"
+            inst("api", 21, "web"),   // a DIFFERENT box that belongs to a pod named "web"
+            inst("cache", 22, "web"), // another member of pod "web"
+        ];
+        let sel = boxes_matching_refs(running, &["web".into()]);
+        let names: Vec<&str> = sel.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["web"], "name wins; pod members are not swept");
+    }
+
+    #[test]
+    fn matching_refs_selects_two_pods_and_a_loose_name_together() {
+        // `kern stop p1 p2 loner` sweeps every member of both pods plus the standalone — one pass,
+        // stable order, no cross-contamination between pods.
+        let running = vec![
+            inst("a1", 30, "p1"),
+            inst("b1", 31, "p2"),
+            inst("a2", 32, "p1"),
+            inst("loner", 33, ""),
+            inst("c", 34, "p3"), // untouched
+        ];
+        let sel = boxes_matching_refs(running, &["p1".into(), "p2".into(), "loner".into()]);
+        let mut names: Vec<&str> = sel.iter().map(|b| b.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a1", "a2", "b1", "loner"]);
+    }
+
+    #[test]
     fn brackets_outside_quotes_ignores_strings() {
         // Deep validate audit: a `[`/`]` inside a string value must NOT count toward the multi-line
         // array balance — else `name = "has ] bracket"` would spuriously open/close an array and make
