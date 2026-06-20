@@ -36,6 +36,7 @@ name = "kern-oci"
 version = "0.6.1"
 dependencies = [
  "kern-common",
+ "libc",
 ]
 
 [[package]]
