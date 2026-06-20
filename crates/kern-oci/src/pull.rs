@@ -142,7 +142,16 @@ pub fn pull(
     // Escape hatch (like KERN_NO_SCOPE): KERN_NO_PREFETCH=1 → the pre-prefetch execution model,
     // downloads run INLINE (no worker thread at all), strictly before each extract. Off by default;
     // also used to A/B the speedup.
-    let prefetch = std::env::var_os("KERN_NO_PREFETCH").is_none();
+    //
+    // NON-root ALSO disables prefetch — and this is a CORRECTNESS guarantee, not a perf choice: a
+    // non-root unpack `fork()`s a userns child (see `unpack_as_root`), and forking while a prefetch
+    // DOWNLOAD THREAD is live risks the classic fork-in-threaded-process deadlock (the child inherits a
+    // possibly-locked allocator). With no prefetch thread, the process is single-threaded at every fork,
+    // so the child can never deadlock. Root never forks here (it unpacks in-process), so it keeps the
+    // overlap. The cost is only non-root multi-layer pulls losing download/extract overlap — a fair
+    // price for a can't-deadlock guarantee on the exact hosts that fork (edge boards run as a user).
+    let is_root = unsafe { libc::geteuid() == 0 };
+    let prefetch = std::env::var_os("KERN_NO_PREFETCH").is_none() && is_root;
     let mut next = prefetch.then(|| spawn_dl(0));
     // index loop, not `.enumerate()`: we need `i + 1` to prefetch the NEXT layer's download.
     #[allow(clippy::needless_range_loop)]
@@ -1066,15 +1075,22 @@ fn userns_ok() -> bool {
 }
 
 /// Run the mode-sensitive part of a layer unpack (extract + merge + cleanup) with the capability to
-/// override file/dir permissions. Root already has it → runs `f` directly (the CI/WSL/desktop-root
-/// path is byte-identical to before). A NON-root user forks a child that maps its uid to in-ns root
-/// (a single-uid user namespace — the same primitive as `unshare -r`), then runs `f` there: with
-/// CAP_DAC_OVERRIDE/DAC_READ_SEARCH the extractor and merger never EACCES on an image's restrictive
-/// dir/file modes (fedora's 0555 `etc/pki/...` dirs, a setuid `/usr/bin/sudo`) — the exact failures a
-/// plain non-root unpack hit on edge boards. Falls back to a direct best-effort run where userns is
-/// unavailable (no worse than before there). The fork is SAFE w.r.t. the layer-prefetch thread: it
-/// happens only AFTER verify+vet (seconds of work), by which point any prefetch download is blocked
-/// in `waitpid` (not holding an allocator lock). The child reports failure via a non-zero exit.
+/// override file/dir permissions. ROOT (any OS, incl. WSL's default root) already has it → runs `f`
+/// DIRECTLY, byte-identical to before (no fork, no userns). A NON-root user forks a child that maps
+/// its uid to in-ns root (a single-uid user namespace — the same primitive as `unshare -r`), then
+/// runs `f` there: with CAP_DAC_OVERRIDE/DAC_READ_SEARCH the extractor and merger never EACCES on an
+/// image's restrictive dir/file modes (fedora's 0555 `etc/pki/...` dirs, a setuid `/usr/bin/sudo`) —
+/// the exact failures a plain non-root unpack hit on edge boards. Falls back to a direct best-effort
+/// run where userns is unavailable (no worse than before there).
+///
+/// FORK SAFETY (not by timing — by construction): forking a MULTI-threaded process is a deadlock
+/// hazard (the child inherits a possibly-locked allocator). We fork ONLY on the non-root path, and the
+/// caller (`pull`) DISABLES the layer-prefetch thread whenever non-root — so the process is provably
+/// SINGLE-THREADED at every `fork()` here and the child can't inherit a held lock. Root keeps prefetch
+/// but never forks. The child reports failure via a non-zero exit (its specific error already went to
+/// the inherited stderr); the single-uid mapping means its in-ns root can only override perms on the
+/// USER'S OWN files (a root-owned host file appears as the unmapped overflow uid → DAC still blocks
+/// it), so the unpack gains no power over anything outside the user's own image cache.
 fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Result<(), OciError> {
     let is_root = unsafe { libc::geteuid() == 0 };
     if is_root || !userns_ok() {
@@ -1745,6 +1761,15 @@ fn remove_no_follow(p: &Path) {
 fn clear_dir(d: &Path) {
     if let Ok(rd) = std::fs::read_dir(d) {
         for e in rd.flatten() {
+            // NEVER delete kern's own transient files: the layer cache dir (`dest`) also holds the
+            // in-flight prefetch blob (`.kern-layer-<i>-*`) and, in `dest`'s parent, staging dirs.
+            // A layer with a ROOT-LEVEL opaque whiteout (`.wh..wh..opq` at the tar root) makes the
+            // merge `clear_dir(dest)` — without this skip, a (possibly hostile) image would wipe the
+            // blob curl is still writing for the NEXT layer, ENOENT-ing the pull. Image members can
+            // never legitimately be named `.kern-*` (nothing in an OCI layer is), so this is safe.
+            if e.file_name().to_string_lossy().starts_with(".kern-") {
+                continue;
+            }
             remove_no_follow(&e.path());
         }
     }
