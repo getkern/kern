@@ -411,7 +411,7 @@ fn child_setup_and_exec(
     // `-it` slave). The overwhelming common case (agent code-exec, CI, `sh -c`) never opens a PTY, so
     // gate the whole devpts mount+mkdir+symlink out of it — one fewer filesystem-mount syscall per box.
     let needs_pts = spec.ssh.is_some() || spec.tty_slave.is_some();
-    setup_dev(&spec.root, spec.tun, needs_pts)?;
+    setup_dev(&spec.root, spec.tun, needs_pts, spec.tty_slave)?;
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
     setup_volumes(&spec.root, &spec.volumes)?;
@@ -927,7 +927,7 @@ const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 /// device binds all resolve to a directory we own *inside* the new root — never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
-fn setup_dev(root: &str, tun: bool, needs_pts: bool) -> Result<(), Error> {
+fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> Result<(), Error> {
     let dev_path = format!("{root}/dev");
     let dp = cstr(&dev_path)?;
     // Neutralize a hostile `/dev` symlink before any path resolves through it.
@@ -985,6 +985,46 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool) -> Result<(), Error> {
                     ptr::null(),
                 )
             };
+        }
+    }
+    // `-it`: bind the controlling-PTY SLAVE onto `/dev/console` (like runc/Docker). kern's `-it` slave
+    // is a HOST devpts node; the box's own `/dev/pts` is a private `newinstance` that doesn't contain
+    // it, so fd 0's device isn't found under the box's `/dev` and `ttyname()` fails — bash prints
+    // "ttyname error: No such device" and the `tty` command errors. The slave's host path is still
+    // resolvable here (pre-pivot), so read it off `/proc/self/fd/<slave>` and bind the device onto a
+    // fresh `/dev/console` node; `ttyname()` then resolves fd 0 to `/dev/console`. Best-effort: a
+    // failure just leaves the (cosmetic) warning, never breaks the box.
+    if let Some(slave) = tty_slave {
+        let mut buf = [0u8; 256];
+        if let Ok(link) = cstr(&format!("/proc/self/fd/{slave}")) {
+            let n = unsafe {
+                libc::readlink(link.as_ptr(), buf.as_mut_ptr().cast(), buf.len() - 1)
+            };
+            if n > 0 {
+                let src = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+                let target = format!("{root}/dev/console");
+                if let (Ok(t), Ok(s)) = (cstr(&target), cstr(&src)) {
+                    let f = unsafe {
+                        libc::open(
+                            t.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                            0o600,
+                        )
+                    };
+                    if f >= 0 {
+                        unsafe { libc::close(f) };
+                    }
+                    unsafe {
+                        libc::mount(
+                            s.as_ptr(),
+                            t.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND as libc::c_ulong,
+                            ptr::null(),
+                        )
+                    };
+                }
+            }
         }
     }
     // Standard `/dev` symlinks into procfs — `/dev/fd`, `/dev/std{in,out,err}` — exactly as Docker/runc
