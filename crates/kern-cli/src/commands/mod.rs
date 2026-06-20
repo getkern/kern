@@ -4941,8 +4941,24 @@ fn content_hash(path: &std::path::Path) -> String {
                 // Fold in the file MODE: a `cp -a` COPY preserves it, so a chmod-only change (e.g.
                 // adding +x to an entrypoint) must bust the cache or the layer ships the old mode.
                 feed(h, &(m.permissions().mode() & 0o7777).to_le_bytes());
-                match std::fs::read(p) {
-                    Ok(c) => feed(h, &c),
+                // Stream the file in a fixed buffer instead of slurping it whole: a large COPY source
+                // (a big binary, node_modules) otherwise spikes RAM by its full size, on EVERY build
+                // (this runs to compute the cache key, even on a cache hit). Byte-identical hash → same key.
+                match std::fs::File::open(p) {
+                    Ok(mut f) => {
+                        use std::io::Read;
+                        let mut buf = [0u8; 64 * 1024];
+                        loop {
+                            match f.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => feed(h, &buf[..n]),
+                                Err(_) => {
+                                    feed(h, b"?");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Err(_) => feed(h, b"?"),
                 }
             }
