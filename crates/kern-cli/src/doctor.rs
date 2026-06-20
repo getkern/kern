@@ -185,11 +185,9 @@ fn check_cgroup() -> R {
             "boxes still run (isolation holds); enable the unified cgroup v2 hierarchy for resource caps".into(),
         );
     }
-    // A systemd --user manager gives kern a delegated scope for the box.
-    let has_scope = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|d| std::path::Path::new(&d).join("systemd").exists())
-        .unwrap_or(false);
-    if !has_scope {
+    // A systemd --user manager gives kern a delegated scope for the box. Same predicate the box
+    // start itself uses, so doctor can't report an availability the runtime would disagree with.
+    if !kern_isolation::user_systemd_present() {
         return R::Warn(
             "cgroup v2 present but no systemd --user manager — resource caps are best-effort".into(),
             "on a host with neither systemd-user nor a delegated cgroup, `--memory`/`--pids-limit` may not bind".into(),

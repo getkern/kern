@@ -89,57 +89,102 @@ fn outer_enforcer_present() -> bool {
         || std::env::var_os("KERN_BUILD_STEP").is_some()
 }
 
-/// Did this box DELIBERATELY take the direct cap path (no outer enforcer, not opted out, a user systemd
-/// manager present)? CANONICAL predicate — `reexec_in_scope_if_possible` skips the scope under it (+
-/// `direct_caps_available()`), `apply_limits` picks kern.slice + arms the per-dimension fail-closed under
-/// it (AND-ed with the caller's `allow_direct`, so `kern run` stays off it), and `run_in_sandbox`'s refusal
-/// arms under it. ONE source of truth so the sites can't diverge. Gating on the DECISION (not on `kern.slice`
-/// being live) makes the refusal fire even if the slice was GC'd — a live-presence check would go false
-/// exactly when the refusal must happen.
-pub fn took_direct_cap_path() -> bool {
-    !outer_enforcer_present() && std::env::var_os("KERN_NO_SCOPE").is_none() && user_systemd_present()
+/// In-process marker recording that `choose_direct_cap_path` DECIDED to skip the per-box scope.
+/// An env var (not a static) because the decision must survive the detached supervisor's forks —
+/// a `--restart` runner re-applies limits in a forked child and must still know the path it's on.
+const DIRECT_MARKER: &str = "KERN_DIRECT_CAPS";
+
+/// Decide — at the ONE decision site, `reexec_in_scope_if_possible` — whether this box takes the
+/// direct kern.slice cap path (skipping the per-box `systemd-run --scope`). True only when NO outer
+/// enforcer env is set, the user hasn't opted out, a user systemd manager is present, AND the
+/// delegated slice is actually usable (ensured as a side effect). Records the decision in
+/// [`DIRECT_MARKER`] so [`took_direct_cap_path`] reports the REAL choice, not a re-derivation:
+/// re-deriving from env alone made the fail-closed refusal fire on hosts where the scope re-exec
+/// was ATTEMPTED and its `exec()` failed (broken/absent `systemd-run` with a leftover
+/// `$XDG_RUNTIME_DIR/systemd` dir) — a host that used to run boxes best-effort would refuse ALL of
+/// them. Callers scrub an INHERITED marker first (see `box_run`), so a nested `kern` can't be
+/// poisoned by its parent's decision.
+pub fn choose_direct_cap_path() -> bool {
+    if outer_enforcer_present()
+        || std::env::var_os("KERN_NO_SCOPE").is_some()
+        || !user_systemd_present()
+        || !direct_caps_available()
+    {
+        return false;
+    }
+    std::env::set_var(DIRECT_MARKER, "1");
+    true
 }
 
-/// Does an env var CLAIM an outer enforcer while NO real memory cap is actually in force up-tree? A caller
-/// launching `kern box` can FORGE `KERN_MANAGED`/`KERN_SCOPE`/`KERN_BUILD_STEP` to disarm the fail-closed —
-/// but a genuine systemd scope/unit ALWAYS sets a `MemoryMax`, and the shared `user.slice` NEVER does, so
-/// `memory.max` capped-in-tree is a reliable, env-INDEPENDENT check that a real enforcer exists. When this
-/// is true and the box couldn't cap, it would run uncapped because of a (possibly forged) env — the caller
-/// warns loudly rather than let it happen silently. (Verifies the CLAIM against the actual cgroup state.)
+/// Remove an inherited direct-path marker. Called at the top of `box_run`: the marker is meaningful
+/// only for the invocation whose `reexec` set it — a nested `kern box` (or any child re-running
+/// kern) inheriting it would arm the fail-closed refusal on a host that never chose the direct path.
+pub fn scrub_direct_marker() {
+    std::env::remove_var(DIRECT_MARKER);
+}
+
+/// Did THIS box invocation actually take the direct cap path? Reads the decision recorded by
+/// [`choose_direct_cap_path`] — `apply_limits` picks kern.slice under it (AND-ed with the caller's
+/// `allow_direct`, so `kern run` stays off it), and `run_in_sandbox`'s fail-closed refusal arms
+/// under it. Because it reports the recorded DECISION (not slice liveness, not an env re-derivation),
+/// the refusal fires when the slice was GC'd mid-flight — and never on the scope-exec-failed
+/// fall-through, which keeps its historical warn-and-run behavior.
+pub fn took_direct_cap_path() -> bool {
+    std::env::var_os(DIRECT_MARKER).is_some()
+}
+
+/// Does an env var CLAIM an outer enforcer while NO real memory cap is actually in force up-tree?
+/// A caller launching `kern box` can FORGE `KERN_SCOPE`/`KERN_MANAGED` to disarm the fail-closed —
+/// but a genuine scope ALWAYS sets a `MemoryMax` (see `reexec`'s props) and a genuine managed unit
+/// runs under its own delegated service cgroup, so `memory.max` capped-in-tree is a reliable,
+/// env-INDEPENDENT check that a real enforcer exists. When this is true and the box couldn't cap,
+/// it would run uncapped because of a (possibly forged) env — the caller warns loudly rather than
+/// let it happen silently. Two deliberate scope-downs (both board/audit findings):
 ///
-/// Gated on the memory controller being AVAILABLE somewhere up-tree: on a host that never enables it for
-/// user sessions (a stock Raspberry Pi without `cgroup_enable=memory`), no genuine enforcer COULD have set
-/// a `memory.max` — our own legit scope re-exec sets `KERN_SCOPE` and its `MemoryMax` can't bite, so this
-/// check would otherwise cry "possible bypass" on EVERY box (and pollute each detached box's log). There
-/// the dedicated "--memory not enforced (controller isn't delegated)" message already tells the truth;
-/// this one only speaks when the host CAN cap memory and yet nothing does — the actual forgery signature.
+/// * **`KERN_BUILD_STEP` never arms it** — `kern build` sets that var as a best-effort scope-skip
+///   with NO enforcer anywhere by design, so it claims nothing to verify; arming on it fired the
+///   "may be bypassing" accusation once per RUN step of every build launched from a session scope.
+/// * **Gated on the memory controller being AVAILABLE up-tree** (per `cgroup.controllers`, root
+///   included — a privileged systemd can cap where the user can't): on a host that never enables it
+///   (a stock Pi without `cgroup_enable=memory`) no genuine enforcer COULD have set a `memory.max`,
+///   so our own legit scope re-exec would otherwise trip the warning on EVERY box and pollute each
+///   detached box's log; the dedicated "--memory not enforced" message already tells that truth.
 pub fn env_claims_enforcer_but_none_real() -> bool {
-    outer_enforcer_present()
+    let claims = std::env::var_os("KERN_SCOPE").is_some()
+        || std::env::var_os("KERN_MANAGED").is_some();
+    claims
         && current_v2_cgroup().is_some_and(|c| {
-            memory_cappable_in_tree(&c) && !capped_in_tree(&c, "memory.max")
+            controller_available_in_tree(&c, "memory") && !capped_in_tree(&c, "memory.max")
         })
 }
 
-/// Could ANY level of this cgroup's ancestry even HOLD a memory cap — i.e. does a `memory.max` file
-/// exist anywhere up to the cgroup root? The file exists iff the memory controller is enabled for that
-/// cgroup, so "no file anywhere" == the controller was never delegated down our path (nothing — genuine
-/// or kern — can cap memory here). Same bounded walk as [`capped_in_tree`], existence instead of value.
-fn memory_cappable_in_tree(child: &std::path::Path) -> bool {
+/// Does ANY level of this cgroup's ancestry have `ctrl` in its `cgroup.controllers` — i.e. could a
+/// cap on that controller exist in our tree at all? Checked via `cgroup.controllers` (not `.max`
+/// file existence): the root of a cgroup namespace lists its controllers but carries no limit
+/// files, and a limit set by privileged systemd counts even where the user has no delegation.
+fn controller_available_in_tree(child: &std::path::Path, ctrl: &str) -> bool {
+    in_tree(child, |dir| has_controller(dir, ctrl))
+}
+
+/// Walk from `child` up to the cgroup root (inclusive), returning true at the first level where
+/// `pred` holds. THE shared ancestry walker — `capped_in_tree` and `controller_available_in_tree`
+/// are one-predicate wrappers, so the subtle termination rules (root clamp, never escaping
+/// `/sys/fs/cgroup`) exist exactly once.
+fn in_tree(child: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> bool {
     let root = std::path::Path::new("/sys/fs/cgroup");
     let mut dir = child.to_path_buf();
     loop {
-        if dir.join("memory.max").exists() {
+        if pred(&dir) {
             return true;
         }
         if dir.as_path() == root {
-            break;
+            return false;
         }
         match dir.parent() {
             Some(p) if p.starts_with(root) => dir = p.to_path_buf(),
-            _ => break,
+            _ => return false,
         }
     }
-    false
 }
 
 /// Is this slice actually USABLE for capping — i.e. its delegated `cgroup.controllers` really contains
@@ -149,12 +194,14 @@ fn memory_cappable_in_tree(child: &std::path::Path) -> bool {
 /// direct path and then fail-closed-refuse EVERY capped box on such a host; with it, `direct_caps_available`
 /// is false there → we fall back to the scope / best-effort + warning path, exactly as before.
 fn slice_can_cap(slice: &std::path::Path) -> bool {
-    fs::read_to_string(slice.join("cgroup.controllers"))
-        .map(|c| {
-            let has = |w| c.split_whitespace().any(|t| t == w);
-            has("memory") && has("pids")
-        })
-        .unwrap_or(false)
+    has_controller(slice, "memory") && has_controller(slice, "pids")
+}
+
+/// Is `ctrl` listed in this cgroup's `cgroup.controllers`? The single decoder of that file — shared
+/// by [`slice_can_cap`] and [`controller_available_in_tree`] so "available" can't mean two things.
+fn has_controller(dir: &std::path::Path, ctrl: &str) -> bool {
+    fs::read_to_string(dir.join("cgroup.controllers"))
+        .is_ok_and(|c| c.split_whitespace().any(|t| t == ctrl))
 }
 
 /// Path of kern's own slice, a sibling under our `user@<uid>.service` delegation root (derived from our
@@ -244,6 +291,20 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     (created && slice_can_cap(&slice)).then_some(slice)
 }
 
+/// Make the controllers available to `parent`'s children. cgroup-v2 accepts several tokens in one
+/// write, so try them all at once (1 syscall); only if that fails enable them one at a time — so an
+/// unavailable controller (e.g. no `cpu` on some Android-derived kernels) can't block the others.
+/// (Controllers may already be on, or be denied by the no-internal-process rule when the parent has
+/// members — all best-effort either way.)
+fn enable_subtree_controllers(parent: &std::path::Path) {
+    let subtree = parent.join("cgroup.subtree_control");
+    if fs::write(&subtree, "+memory +pids +cpu +cpuset +io").is_err() {
+        for ctrl in ["+memory", "+pids", "+cpu", "+cpuset", "+io"] {
+            let _ = fs::write(&subtree, ctrl);
+        }
+    }
+}
+
 /// Default memory ceiling for a sandbox (512 MiB) — conservative but generous; `--memory` overrides.
 const DEFAULT_MEMORY_MAX: u64 = 536_870_912;
 /// Process-count ceiling — caps fork bombs.
@@ -299,20 +360,23 @@ pub fn apply_limits(
     } else {
         origin.clone()?
     };
-    let child = parent.join(format!("kern-box-{tag}-{}", std::process::id()));
+    let mut child = parent.join(format!("kern-box-{tag}-{}", std::process::id()));
 
-    // Make the controllers available to children. cgroup-v2 accepts several tokens in one write, so
-    // try them all at once (1 syscall). Only if that fails do we fall back to enabling them one at a
-    // time — so an unavailable controller (e.g. no `cpu` on some Android-derived kernels) still can't
-    // block the others. (Controllers may already be on, or be denied by the no-internal-process rule
-    // when the parent has members — all best-effort either way.)
-    let subtree = parent.join("cgroup.subtree_control");
-    if fs::write(&subtree, "+memory +pids +cpu +cpuset +io").is_err() {
-        for ctrl in ["+memory", "+pids", "+cpu", "+cpuset", "+io"] {
-            let _ = fs::write(&subtree, ctrl);
+    enable_subtree_controllers(&parent);
+    if fs::create_dir(&child).is_err() {
+        if !direct {
+            return None;
         }
+        // Direct path only: kern.slice may have been GC'd since this process memoized it — systemd
+        // reaps the empty slice the moment a box exits, and a LONG-LIVED `--restart` supervisor's
+        // forked runner still holds the stale `ensure_kern_slice` memo. Re-bootstrap once, uncached,
+        // and retry; without this every restart attempt fails the fail-closed refusal and the box
+        // dies permanently where a fresh `kern box` would have recreated the slice.
+        let parent = ensure_kern_slice_uncached()?;
+        enable_subtree_controllers(&parent);
+        child = parent.join(format!("kern-box-{tag}-{}", std::process::id()));
+        fs::create_dir(&child).ok()?;
     }
-    fs::create_dir(&child).ok()?;
 
     // Set the memory + PID caps. If BOTH fail the controllers aren't delegated here — do NOT leave a
     // useless cgroup behind and do NOT pretend the workload is capped. Clean up and bail, so the
@@ -461,21 +525,9 @@ fn is_real_limit(raw: &str) -> bool {
 /// is `max` (`memory.max`) or `max <period>` (`cpu.max`), so any value not starting with `max` at any
 /// level means a real limit is in effect.
 fn capped_in_tree(child: &std::path::Path, file: &str) -> bool {
-    let root = std::path::Path::new("/sys/fs/cgroup");
-    let mut dir = child.to_path_buf();
-    loop {
-        if fs::read_to_string(dir.join(file)).is_ok_and(|v| is_real_limit(&v)) {
-            return true;
-        }
-        if dir.as_path() == root {
-            break;
-        }
-        match dir.parent() {
-            Some(p) if p.starts_with(root) => dir = p.to_path_buf(),
-            _ => break,
-        }
-    }
-    false
+    in_tree(child, |dir| {
+        fs::read_to_string(dir.join(file)).is_ok_and(|v| is_real_limit(&v))
+    })
 }
 
 #[cfg(test)]
@@ -483,20 +535,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_cappable_requires_the_file_to_exist() {
-        // A temp dir isn't under /sys/fs/cgroup, so the walk checks just this leaf. No `memory.max`
-        // file = the controller was never delegated (stock-Pi case) → NOT cappable → the forged-env
-        // warning stays silent there. The file existing — capped or `max` — means the host CAN cap.
+    fn controller_availability_reads_cgroup_controllers() {
+        // A temp dir isn't under /sys/fs/cgroup, so the walk checks just this leaf. `memory` absent
+        // from cgroup.controllers = never enabled (stock-Pi case) → NOT available → the forged-env
+        // warning stays silent there. Listed = the host CAN cap, even at a namespace root that has
+        // no memory.max file (the reason this reads controllers, not limit-file existence).
         let d = std::env::temp_dir().join(format!("kern-cgcap-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         assert!(
-            !memory_cappable_in_tree(&d),
-            "no memory.max file anywhere = controller absent = not cappable"
+            !controller_available_in_tree(&d, "memory"),
+            "no cgroup.controllers file = controller absent = not available"
         );
-        std::fs::write(d.join("memory.max"), "max").unwrap();
+        std::fs::write(d.join("cgroup.controllers"), "cpu pids\n").unwrap();
         assert!(
-            memory_cappable_in_tree(&d),
-            "an uncapped (`max`) file still proves the controller is available"
+            !controller_available_in_tree(&d, "memory"),
+            "the stock-Pi list (`cpu pids`) must not count as memory-available"
+        );
+        std::fs::write(d.join("cgroup.controllers"), "cpuset cpu io memory pids\n").unwrap();
+        assert!(
+            controller_available_in_tree(&d, "memory"),
+            "memory listed = the host can cap, even with no memory.max file here"
         );
     }
 

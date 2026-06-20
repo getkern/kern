@@ -342,11 +342,17 @@ fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
 /// Defaults to `/bin/sh`. Foreground propagates the exit code; `-d` detaches (track via `kern ps`).
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
+    // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
+    // start chose the direct path) is meaningless here and would arm the fail-closed refusal on a
+    // host that never chose it — scrub before any cap decision is read.
+    kern_isolation::scrub_direct_marker();
     // Reject a name already held by a LIVE box — otherwise two boxes share a name and `stop`/`logs`/
     // `exec` become ambiguous (and a repeated `compose up` would silently stack duplicates). `name_taken`
     // checks ONLY this name's entry (not the whole registry), so start stays fast at scale; it prunes a
-    // dead same-name entry, so a freed name is immediately reusable.
-    if registry::name_taken(name.as_str()) {
+    // dead same-name entry, so a freed name is immediately reusable. ADVISORY fast-fail only — the
+    // authoritative check runs inside `claim_name` below; skipped on the scoped inner re-run
+    // (`KERN_SCOPE`), which already passed it in the outer process.
+    if std::env::var_os("KERN_SCOPE").is_none() && registry::name_taken(name.as_str()) {
         return Err(Error::AlreadyRunning(format!(
             "a box named '{}' is already running",
             name.as_str()
@@ -2918,9 +2924,14 @@ fn reexec_in_scope_if_possible(
     // FAST PATH (box only): if kern's delegated `kern.slice` is usable, SKIP the per-box `systemd-run
     // --scope` and let `apply_limits` cap DIRECTLY under it — ~4 ms less/box, same hard kernel caps; a
     // downstream fail-closed refuses the box if the cap doesn't bite, so it never silently runs uncapped.
-    // NOT for `kern run` (`allow_direct=false`): it exec()s in place with no supervisor to run the guard's
-    // Drop, so without the scope's `--collect` its `kern.slice/kern-box-run-*` cgroup would leak forever.
-    if allow_direct && kern_isolation::direct_caps_available() {
+    // `choose_direct_cap_path` is THE decision site: it also rules out an outer enforcer
+    // (KERN_MANAGED/KERN_BUILD_STEP — their ancestor already caps, and `apply_limits` wouldn't use
+    // kern.slice anyway) and RECORDS the decision, so the fail-closed refusal downstream fires only
+    // when this return was actually taken — never on the `exec()`-failed fall-through below, which
+    // keeps its historical best-effort behavior. NOT for `kern run` (`allow_direct=false`): it
+    // exec()s in place with no supervisor to run the guard's Drop, so without the scope's
+    // `--collect` its `kern.slice/kern-box-run-*` cgroup would leak forever.
+    if allow_direct && kern_isolation::choose_direct_cap_path() {
         return;
     }
     let Ok(self_exe) = std::env::current_exe() else {
