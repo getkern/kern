@@ -284,7 +284,7 @@ class Sandbox:
 
     def __enter__(self) -> "Sandbox":
         if self.workspace is None:
-            self._ws = tempfile.mkdtemp(prefix="kern-ws-")
+            self._ws = os.path.realpath(tempfile.mkdtemp(prefix="kern-ws-"))
             self._own_ws = True
         else:
             # A caller-supplied workspace is host input → validate it like a mount source, and DON'T
@@ -489,7 +489,7 @@ class Sandbox:
         So: lexically contain the requested name here, then open the final component with O_NOFOLLOW
         (in read/write) so a symlinked LAST component can't redirect the host I/O outside the workspace.
         """
-        base = os.path.realpath(self._ws)
+        base = self._ws  # canonical since enter — no per-walk re-resolution
         # Lexical containment: join + normpath collapses `..`, then require it stays under base.
         full = os.path.normpath(os.path.join(base, rel))
         if full != base and not full.startswith(base + os.sep):
@@ -528,7 +528,7 @@ class Sandbox:
     def list_files(self, subdir: str = "") -> list[FileInfo]:
         """List files under the workspace (excluding the ``.deps`` install dir)."""
         self._require_entered()
-        root = self._ws_path(subdir) if subdir else os.path.realpath(self._ws)
+        root = self._ws_path(subdir) if subdir else self._ws  # _ws is canonical (set at enter)
         return [FileInfo(path=p, size=s, change="created") for p, (_, s) in self._walk(root).items()]
 
     # -- setup (the only network window) -------------------------------------------------------------
@@ -548,7 +548,7 @@ class Sandbox:
     # -- files diff (created/modified; excludes .deps) -----------------------------------------------
 
     def _snapshot(self) -> dict[str, tuple[int, int]]:
-        return self._walk(os.path.realpath(self._ws))
+        return self._walk(self._ws)  # _ws is canonical (set at enter)
 
     def _walk(self, root: str) -> dict[str, tuple[int, int]]:
         """Map WORKSPACE-relative path -> (mtime_ns, size), skipping .deps, our env-file, and symlinks.
