@@ -12,6 +12,7 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 /// A build's outcome. Serialized to the record as a lowercase word; unknown/older values read back as
@@ -144,7 +145,16 @@ pub fn write(rec: &Record) -> io::Result<()> {
         rec.size,
         one_line(&rec.error),
     );
-    std::fs::write(dir.join("meta"), body)
+    // O_NOFOLLOW: refuse to write THROUGH a pre-planted `meta` symlink (a same-uid process can't make a
+    // real build clobber an arbitrary file it points at). Legit records are always regular files kern
+    // wrote itself, so this never affects normal use.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("meta"))?;
+    f.write_all(body.as_bytes())
 }
 
 /// A real record is tiny; bound the read so a planted giant `meta` can't wedge `list()`.
@@ -154,7 +164,11 @@ fn parse(body: &str) -> Option<Record> {
     let mut r = Record::default();
     let mut have_id = false;
     for line in body.lines() {
-        let (k, v) = line.split_once('=')?;
+        // Skip (don't abort on) a line without '=' — a blank line, a truncated tail from the read cap,
+        // or stray junk must not discard an otherwise-valid record. Only a present, valid `id=` matters.
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         match k {
             "id" => {
                 r.id = v.to_string();
@@ -185,14 +199,32 @@ pub fn get(id: &str) -> Option<Record> {
 }
 
 fn read_capped(path: &Path) -> Option<String> {
+    read_nofollow(path, MAX_META_BYTES)
+}
+
+/// Read at most `max` bytes of `path`, refusing to follow a symlink at the final component
+/// (`O_NOFOLLOW`) — a planted `meta`/`log` symlink can't turn a record read into an arbitrary
+/// file read. `from_utf8_lossy` so a binary file symlinked in still can't produce invalid UTF-8.
+fn read_nofollow(path: &Path, max: u64) -> Option<String> {
     use std::io::Read;
-    let mut buf = String::new();
-    std::fs::File::open(path)
+    let mut bytes = Vec::new();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
         .ok()?
-        .take(MAX_META_BYTES)
-        .read_to_string(&mut buf)
+        .take(max)
+        .read_to_end(&mut bytes)
         .ok()?;
-    Some(buf)
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Read a build's captured transcript (symlink-refusing, capped), or `None` if absent/unreadable.
+pub fn read_log(id: &str) -> Option<String> {
+    if !valid_id(id) {
+        return None;
+    }
+    read_nofollow(&log_path(id), MAX_LOG_BYTES)
 }
 
 /// All build records, newest first (by `started`, then id).
@@ -342,13 +374,12 @@ pub fn append_log(id: &str, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
-
-    // XDG_DATA_HOME is process-global; serialize the tests that repoint it.
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+    // XDG_DATA_HOME is process-global; the CRATE-WIDE lock serializes this against every other module's
+    // env-mutating tests (e.g. `volume`), which also repoint XDG_DATA_HOME.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     fn with_tmp_home<T>(f: impl FnOnce() -> T) -> T {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("kern-builds-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_DATA_HOME", &tmp);
@@ -428,6 +459,38 @@ mod tests {
             assert_eq!(kept.len(), 2);
             assert_eq!(kept[0].id, "4-1");
             assert_eq!(kept[1].id, "3-1"); // the two oldest (1-1, 2-1) were pruned
+        });
+    }
+
+    #[test]
+    fn symlinked_meta_and_log_are_refused() {
+        with_tmp_home(|| {
+            // meta → symlink to an outside file: get() must refuse (O_NOFOLLOW → open fails), so a
+            // planted symlink can't turn a record read into an arbitrary-file read.
+            let dir = builds_dir().join("9-9");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink("/etc/hostname", dir.join("meta")).unwrap();
+            assert!(get("9-9").is_none(), "symlinked meta must be refused");
+            // legit meta + symlinked log: read_log must refuse the log.
+            let dir2 = builds_dir().join("8-8");
+            std::fs::create_dir_all(&dir2).unwrap();
+            std::fs::write(dir2.join("meta"), "id=8-8\ntag=x\nstarted=1\nstatus=ok\n").unwrap();
+            std::os::unix::fs::symlink("/etc/hostname", dir2.join("log")).unwrap();
+            assert!(read_log("8-8").is_none(), "symlinked log must be refused");
+        });
+    }
+
+    #[test]
+    fn giant_meta_is_capped_not_unbounded() {
+        with_tmp_home(|| {
+            let dir = builds_dir().join("7-7");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut body = String::from("id=7-7\ntag=big\nstarted=1\nstatus=ok\n");
+            body.push_str(&"junk=x\n".repeat(200_000)); // ~1.4 MB — well over the 64 KiB read cap
+            std::fs::write(dir.join("meta"), &body).unwrap();
+            // The bounded read sees the leading real fields; no OOM/hang on a planted giant file.
+            let r = get("7-7").unwrap();
+            assert_eq!(r.tag, "big");
         });
     }
 

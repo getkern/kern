@@ -833,9 +833,10 @@ fn human_bytes(b: u64) -> String {
 mod tests {
     use super::*;
 
-    // `XDG_DATA_HOME` is process-global; serialize the tests that mutate it so parallel runs don't
-    // clobber each other's value.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `XDG_DATA_HOME` is process-global; the CRATE-WIDE lock serializes this against every other
+    // module's env-mutating tests (e.g. `builds`), which also repoint XDG_DATA_HOME — a per-module lock
+    // wouldn't (they'd race across modules).
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn is_named_distinguishes_names_from_paths_and_urls() {
@@ -862,7 +863,7 @@ mod tests {
 
     #[test]
     fn resolve_named_auto_creates_under_the_data_home() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("kern-voltest-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &tmp);
         let path = resolve_named("unit_vol").unwrap();
@@ -964,7 +965,7 @@ mod tests {
     fn size_limit_rejects_bad_name_and_out_of_range() {
         // A traversing name never reaches the filesystem read.
         assert_eq!(size_limit("../etc"), None);
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("kern-qclamp-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &tmp);
         // A hand-edited meta.json past the ceiling is re-clamped away (treated as unset).
@@ -982,7 +983,7 @@ mod tests {
 
     #[test]
     fn edit_renames_requotas_and_guards() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("kern-edittest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_DATA_HOME", &tmp);
@@ -1030,7 +1031,7 @@ mod tests {
         assert!(parse_named_spec("../evil:/w").is_err());
 
         // create --size records a quota that size_limit reads back.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("kern-qtest-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &tmp);
         create(&[
