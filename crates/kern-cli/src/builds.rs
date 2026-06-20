@@ -155,17 +155,22 @@ pub fn write(rec: &Record) -> io::Result<()> {
         rec.size,
         one_line(&rec.error),
     );
-    // O_NOFOLLOW: refuse to write THROUGH a pre-planted `meta` symlink (a same-uid process can't make a
-    // real build clobber an arbitrary file it points at). Legit records are always regular files kern
-    // wrote itself, so this never affects normal use.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join("meta"))?;
-    f.write_all(body.as_bytes())
+    // Write a temp then rename over `meta` — the swap is atomic, so a crash mid-finalize can't leave a
+    // truncated/0-byte record: the pre-written `running`/`interrupted` trace survives until the new meta
+    // is complete. O_NOFOLLOW on the temp refuses writing THROUGH a planted symlink; `rename` onto `meta`
+    // replaces a symlinked `meta` itself (never clobbers through it), so both writes stay confined.
+    let tmp = dir.join("meta.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+    }
+    std::fs::rename(&tmp, dir.join("meta"))
 }
 
 /// A real record is tiny; bound the read so a planted giant `meta` can't wedge `list()`.
@@ -365,13 +370,14 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         // Restore fd 2 → the last pipe-write ref is gone → the reader thread hits EOF and exits.
-        unsafe {
-            libc::dup2(self.saved_err, 2);
-            libc::close(self.saved_err);
-        }
+        unsafe { libc::dup2(self.saved_err, 2) };
+        // Join BEFORE closing `saved_err`: the pipe may still hold up to a buffer of stderr the reader
+        // must drain and tee to the terminal; closing first would make that final `write(saved_err,…)`
+        // hit a closed fd (and, in theory, a reused one). Close only once the reader has finished.
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        unsafe { libc::close(self.saved_err) };
     }
 }
 
@@ -479,6 +485,33 @@ mod tests {
             assert_eq!(kept.len(), 2);
             assert_eq!(kept[0].id, "4-1");
             assert_eq!(kept[1].id, "3-1"); // the two oldest (1-1, 2-1) were pruned
+        });
+    }
+
+    #[test]
+    fn append_log_and_read_log_roundtrip() {
+        with_tmp_home(|| {
+            write(&rec("30-1", 30, Status::Ok)).unwrap();
+            append_log("30-1", "line one");
+            append_log("30-1", "line two");
+            let log = read_log("30-1").unwrap();
+            assert!(log.contains("line one") && log.contains("line two"), "{log:?}");
+            // a build with no log yet → None, not a panic.
+            write(&rec("31-1", 31, Status::Ok)).unwrap();
+            assert!(read_log("31-1").is_none());
+        });
+    }
+
+    #[test]
+    fn write_is_atomic_no_stray_meta_tmp_on_success() {
+        with_tmp_home(|| {
+            write(&rec("32-1", 32, Status::Ok)).unwrap();
+            // rename consumed the temp; only `meta` remains.
+            assert!(builds_dir().join("32-1").join("meta").is_file());
+            assert!(!builds_dir().join("32-1").join("meta.tmp").exists());
+            // a second write (the finalize) still lands atomically and parses.
+            write(&rec("32-1", 32, Status::Failed)).unwrap();
+            assert_eq!(get("32-1").unwrap().status, Status::Failed);
         });
     }
 
