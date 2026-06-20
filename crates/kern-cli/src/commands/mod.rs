@@ -6490,7 +6490,9 @@ fn boxes_matching_refs(
 fn ref_matches(b: &registry::Instance, n: &str, live_names: &[String]) -> bool {
     n == b.name
         || (!live_names.contains(&n.to_string())
-            && (n.parse::<i32>().ok() == Some(b.pid) || n == b.pod))
+            // The pod branch guards against an EMPTY ref: a standalone box has `pod == ""`, so an
+            // empty `n` would otherwise sweep every standalone box. A pid parses only when non-empty.
+            && (n.parse::<i32>().ok() == Some(b.pid) || (!n.is_empty() && n == b.pod)))
 }
 
 pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
@@ -6634,6 +6636,9 @@ fn stop_managed_unit(name: &str) -> bool {
 pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
     let verb = if freeze { "pause" } else { "unpause" };
     let running = registry::list();
+    // Captured before `running` is consumed — the unmatched-ref report below needs the full live-name
+    // set to apply the same NAME-wins rule as selection (a pod/pid ref must not be called "not a box").
+    let live_names: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
     let targets: Vec<_> = if all {
         running
     } else {
@@ -6660,7 +6665,9 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
     }
     if !all {
         for n in names {
-            if !targets.iter().any(|b| &b.name == n) {
+            // Same NAME-or-PID-or-POD rule as `stop`: a `kern pause <pod>` froze every member, so the
+            // pod ref matched — don't then wrongly report it as "no running box".
+            if !targets.iter().any(|b| ref_matches(b, n, &live_names)) {
                 eprintln!("kern: no running box named '{n}'");
             }
         }
@@ -7869,6 +7876,17 @@ mod net_resource_tests {
         assert!(ref_matches(&numname, "100", &live2)); // matches by its NAME…
         let other = inst("x", 100, "grp"); // …and NOT by a coincidental pid == that name
         assert!(!ref_matches(&other, "100", &live2));
+    }
+
+    #[test]
+    fn ref_matches_empty_ref_never_sweeps_standalone_boxes() {
+        // A standalone box has pod == "". An empty ref (`kern stop ""`) must NOT match it via the pod
+        // branch — otherwise one stray empty argument would stop/pause every standalone box at once.
+        let solo = inst("solo", 7, "");
+        assert!(!ref_matches(&solo, "", &[]));
+        // …and an empty ref also can't match a real pod member (there's no pod named "").
+        let member = inst("m", 8, "realpod");
+        assert!(!ref_matches(&member, "", &[]));
     }
 
     #[test]
