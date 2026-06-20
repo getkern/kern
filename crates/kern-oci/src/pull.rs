@@ -925,6 +925,40 @@ pub(crate) fn unsafe_member_path(p: &str) -> bool {
     p.starts_with('/') || p.split('/').any(|c| c == "..") || p.contains('\0')
 }
 
+/// Canonicalize a (relative, already `..`-free) member path the way a tar extractor lays it on disk:
+/// drop `.` and empty components (leading `./`, `//`, `/./`, trailing `/`). The symlink-escape tracking
+/// keys on this, so a member spelled `./A/x` / `A//x` / `A/./x` can't slip past a symlink recorded as
+/// `A` — the vetter's string view has to equal the filesystem's, or the textual prefix check is fooled.
+pub(crate) fn normalize_member_path(p: &str) -> String {
+    p.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Is `p` AT, or UNDER, a recorded escaping symlink? True iff `p` itself or one of its ancestor
+/// directories is a path in `set`. Walks `p`'s prefixes from the root down — O(path depth) HashSet
+/// lookups, so vetting stays linear in the number of members even at the 2M-entry cap. Used for BOTH
+/// the per-member escape check and the chain resolution (a symlink whose target lands here escapes).
+pub(crate) fn under_escaping(p: &str, set: &std::collections::HashSet<String>) -> bool {
+    if set.is_empty() {
+        return false;
+    }
+    let mut prefix = String::new();
+    for comp in p.split('/') {
+        if prefix.is_empty() {
+            prefix.push_str(comp);
+        } else {
+            prefix.push('/');
+            prefix.push_str(comp);
+        }
+        if set.contains(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Max uncompressed bytes per layer — a decompression-bomb ceiling (2 GiB).
 const MAX_LAYER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Max entries per layer — a dir/empty-file *inode* bomb has ~0 byte total but still exhausts the fs.
@@ -1008,21 +1042,6 @@ pub(crate) fn pin_for_url(url: &str) -> &'static [&'static str] {
     }
 }
 
-/// Is the system `tar` GNU tar? GNU tar refuses to extract THROUGH a planted symlink (the secure
-/// default); BusyBox tar historically follows it, so on a non-GNU tar we must reject escaping symlink
-/// targets in a layer ourselves. Probed once.
-fn tar_is_gnu() -> bool {
-    use std::sync::OnceLock;
-    static GNU: OnceLock<bool> = OnceLock::new();
-    *GNU.get_or_init(|| {
-        Command::new("tar")
-            .arg("--version")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
-            .unwrap_or(false)
-    })
-}
-
 /// How a layer blob is compressed. Detected from the blob's leading magic bytes (never from the
 /// manifest's declared media type, which can lie or be omitted), so the codec is decided by the
 /// actual, already-sha256-verified bytes. `Plain` is an uncompressed tar (`…tar`, no `+gzip`/`+zstd`)
@@ -1051,7 +1070,7 @@ fn detect_compression(path: &Path) -> Compression {
     }
 }
 
-/// Is a `zstd` decompressor available? Probed once, mirroring [`tar_is_gnu`]. Used to give a specific
+/// Is a `zstd` decompressor available? Probed once. Used to give a specific
 /// "install zstd" error BEFORE spawning, rather than a cryptic spawn failure, when a zstd-compressed
 /// image is pulled on a host without it (common on BusyBox/musl edge boards).
 fn zstd_available() -> bool {
@@ -1088,7 +1107,7 @@ fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(), OciError> 
     // Plain (uncompressed) tar: vet the file directly, no decompressor process.
     if comp == Compression::Plain {
         let mut f = std::fs::File::open(tar_path).map_err(|e| OciError::Extract(e.to_string()))?;
-        return vet_tar_stream(&mut f, tar_is_gnu());
+        return vet_tar_stream(&mut f);
     }
     // gzip / zstd: the decompressor does ONLY the decompression; `vet_tar_stream` (the fuzzed core)
     // reads the DECOMPRESSED stream and is codec-agnostic — so the entire hardening surface (bomb
@@ -1116,7 +1135,7 @@ fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(), OciError> 
             }
         })?;
     let mut stdout = child.stdout.take().expect("stdout piped");
-    let res = vet_tar_stream(&mut stdout, tar_is_gnu());
+    let res = vet_tar_stream(&mut stdout);
     // We stop reading at the end-of-archive marker (or on rejection), so the decompressor may take a
     // SIGPIPE — its exit status isn't meaningful here. Truncation/corruption is caught inside
     // `vet_tar_stream` (a short read before the end-of-archive marker is an error), so a cut-off unsafe
@@ -1263,13 +1282,18 @@ fn parse_pax(data: &[u8]) -> PaxInfo {
 /// Vet the raw (decompressed) tar stream `r` block by block. Resolves the effective path/linkname
 /// through ustar `prefix`, GNU `L`/`K` long name/link, and PAX `x`/`g` `path=`/`linkpath=`, so what we
 /// check is what tar will actually create — never a truncated or text-desynced approximation.
-pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Result<(), OciError> {
+pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError> {
     let bad = |m: &str| OciError::Extract(m.to_string());
     let mut header = [0u8; TAR_BLOCK];
     let mut total: u64 = 0;
     let mut entries: u64 = 0;
     let mut next_name: Option<String> = None; // override carried by a preceding L / PAX block
     let mut next_link: Option<String> = None; // …K / PAX linkpath
+    // Paths of symlinks seen SO FAR in this layer whose target ESCAPES the rootfs (absolute / `..`).
+    // A symlink-following extractor (BusyBox tar) writing THROUGH one would land outside the staging
+    // dir — so a LATER member that descends through one is the real escape (tracked, not the mere
+    // existence of an absolute symlink, which every busybox-based image — alpine's `/bin/*` — has).
+    let mut escaping_symlinks: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         let n = read_block(r, &mut header).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
@@ -1451,21 +1475,33 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
         if unsafe_member_path(&path) {
             return Err(OciError::Extract(format!("unsafe path in layer: {path}")));
         }
-        // '1' HARDLINK target is a real rootfs path — an absolute/`..` target hardlinks a HOST inode
-        // into the image (confidentiality escape) → always reject. '2' SYMLINK target is fine unless a
-        // non-GNU `tar -xzf` follows it during this layer's own extraction (GNU tar doesn't).
-        if let Some(t) = &link {
-            let escapes = unsafe_member_path(t);
-            if (typeflag == b'1' && escapes) || (typeflag == b'2' && escapes && !gnu_tar) {
-                return Err(OciError::Extract(format!(
-                    "layer {} target escapes the rootfs: {path} -> {t}",
-                    if typeflag == b'1' {
-                        "hardlink"
-                    } else {
-                        "symlink"
-                    }
-                )));
-            }
+        // CANONICALIZE the way the extractor lays it on disk (drop `.`/empty components: leading `./`,
+        // `//`, `/./`, trailing `/`) — else a member spelled `./A/x` or `A//x` would slip past a symlink
+        // recorded as `A` (the vetter's string view must match the filesystem's). `..` already rejected.
+        let path = normalize_member_path(&path);
+
+        // SYMLINK-ESCAPE: reject any member AT or UNDER a symlink recorded earlier in THIS layer whose
+        // (resolved) target escapes the rootfs. On a symlink-FOLLOWING extractor (BusyBox tar) such a
+        // member writes OUTSIDE the isolated staging dir — whether it DESCENDS the symlink (`a/x` through
+        // `a -> /etc`), writes a file straight ONTO it (`a` over `a -> /etc/x`, which tar opens through
+        // the link), or the symlink was reached through a CHAIN (`b -> a -> /etc`). `under_escaping` is
+        // O(path depth) HashSet lookups → linear even at 2M entries (a per-member scan of all prior
+        // symlinks would be O(n²)). This REPLACES the old blanket "reject any escaping symlink target":
+        // that also killed the ubiquitous, harmless absolute symlink (alpine's `/bin/* -> /bin/busybox`),
+        // breaking every busybox-based image on a non-GNU-tar host (the shipped WSL distro, edge Pi/Alpine).
+        if under_escaping(&path, &escaping_symlinks) {
+            return Err(OciError::Extract(format!(
+                "layer member '{path}' would be written through an escaping symlink (rootfs escape)"
+            )));
+        }
+        // '1' HARDLINK target is resolved to a real path AT EXTRACTION → an absolute/`..` target
+        // hardlinks a HOST inode into the image (confidentiality escape) → always reject. (A '2'
+        // SYMLINK's escaping target is handled by the escaping-symlink tracking above/below, not here.)
+        if typeflag == b'1' && link.as_deref().is_some_and(unsafe_member_path) {
+            return Err(OciError::Extract(format!(
+                "layer hardlink target escapes the rootfs: {path} -> {}",
+                link.as_deref().unwrap_or_default()
+            )));
         }
 
         // A symlink('2'), hardlink('1') or directory('5') header carries NO data — its `size` MUST be
@@ -1480,6 +1516,24 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read, gnu_tar: bool) -> Resul
             return Err(bad(
                 "layer has a symlink/hardlink/directory header with non-zero size (tar desync attack)",
             ));
+        }
+        // Record this symlink if its target ESCAPES the rootfs — DIRECTLY (absolute / `..`) or via a
+        // CHAIN (a relative target that resolves onto an already-escaping symlink, e.g. `b -> a` where
+        // `a -> /etc`). ADD-ONLY, never cleared: once a path holds an escaping symlink a later same-path
+        // member must NOT un-guard it — a symlink-following extractor may leave the original link in place
+        // (a dir/file written over it EEXISTs or is opened THROUGH it), and any member at/under it is
+        // already refused by `under_escaping` above. The relative-target resolution is done against the
+        // symlink's PARENT dir (that's what the link is relative to), normalized like any member path.
+        if typeflag == b'2' {
+            let target = link.as_deref().unwrap_or("");
+            let escapes = unsafe_member_path(target) || {
+                let parent = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                let resolved = normalize_member_path(&format!("{parent}/{target}"));
+                under_escaping(&resolved, &escaping_symlinks)
+            };
+            if escapes {
+                escaping_symlinks.insert(path.clone());
+            }
         }
         // Cap BEFORE consuming the data: a single member with a huge size would otherwise stream its
         // entire (decompressed) body from gzip before the running total tripped the cap — a per-member
@@ -2155,7 +2209,7 @@ mod tests {
             // On the BusyBox target (gnu_tar=false) the desync is exploitable; reject regardless.
             for gnu in [false, true] {
                 let mut r: &[u8] = &stream;
-                let res = vet_tar_stream(&mut r, gnu);
+                let res = vet_tar_stream(&mut r);
                 assert!(
                     res.is_err(),
                     "carrier {} size!=0 must be rejected (gnu_tar={gnu})",
@@ -2168,7 +2222,7 @@ mod tests {
         ok.extend_from_slice(&hdr(b"link", b'2', 0, b"target"));
         ok.extend(end_marker());
         let mut r: &[u8] = &ok;
-        assert!(vet_tar_stream(&mut r, false).is_ok());
+        assert!(vet_tar_stream(&mut r).is_ok());
     }
 
     /// REGRESSION (panic): a PAX record whose `<len>` falls INSIDE a multi-byte UTF-8 sequence must not
@@ -2191,7 +2245,7 @@ mod tests {
         stream.extend_from_slice(&hdr(b"sparsefile", b'S', 0, b""));
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
-        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        let err = format!("{:?}", vet_tar_stream(&mut r).unwrap_err());
         assert!(
             err.contains("sparse"),
             "a GNU sparse ('S') member must be refused, got: {err}"
@@ -2206,7 +2260,7 @@ mod tests {
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
         assert!(
-            vet_tar_stream(&mut r, true).is_err(),
+            vet_tar_stream(&mut r).is_err(),
             "a multivolume ('M') member must be refused"
         );
     }
@@ -2222,7 +2276,7 @@ mod tests {
         stream.extend_from_slice(&hdr(b"regular/file", b'0', 0, b""));
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
-        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        let err = format!("{:?}", vet_tar_stream(&mut r).unwrap_err());
         assert!(
             err.contains("sparse"),
             "a PAX-encoded sparse member must be refused, got: {err}"
@@ -2237,7 +2291,7 @@ mod tests {
         stream.extend_from_slice(&hdr(b"safe/file", b'0', 0, b""));
         stream.extend_from_slice(&vec![0u8; BLK * 5000]); // 5000 zero blocks » the 4096 cap
         let mut r: &[u8] = &stream;
-        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        let err = format!("{:?}", vet_tar_stream(&mut r).unwrap_err());
         assert!(
             err.contains("zero-bomb"),
             "an unbounded zero tail must be refused, got: {err}"
@@ -2252,7 +2306,7 @@ mod tests {
         stream.extend_from_slice(&hdr(b"weird", b'Z', 0, b"")); // 'Z' is not a modelled member type
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
-        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        let err = format!("{:?}", vet_tar_stream(&mut r).unwrap_err());
         assert!(
             err.contains("unsupported tar member type"),
             "unknown typeflag must be refused: {err}"
@@ -2268,7 +2322,7 @@ mod tests {
         stream.extend_from_slice(&hdr(b"var/run/pipe", b'6', 0, b""));
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
-        let err = format!("{:?}", vet_tar_stream(&mut r, true).unwrap_err());
+        let err = format!("{:?}", vet_tar_stream(&mut r).unwrap_err());
         assert!(
             err.contains("FIFO"),
             "a FIFO must be refused with a specific policy message: {err}"
@@ -2284,7 +2338,7 @@ mod tests {
             stream.extend(end_marker());
             let mut r: &[u8] = &stream;
             assert!(
-                vet_tar_stream(&mut r, true).is_ok(),
+                vet_tar_stream(&mut r).is_ok(),
                 "member typeflag {:?} should be accepted",
                 tf as char
             );
@@ -2300,7 +2354,7 @@ mod tests {
         stream.extend_from_slice(&vec![0u8; BLK * 18]); // GNU pads to a 20-block record — legit
         let mut r: &[u8] = &stream;
         assert!(
-            vet_tar_stream(&mut r, true).is_ok(),
+            vet_tar_stream(&mut r).is_ok(),
             "normal trailing zero padding must pass"
         );
     }
@@ -2338,7 +2392,7 @@ mod tests {
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
         assert!(
-            vet_tar_stream(&mut r, true).is_err(),
+            vet_tar_stream(&mut r).is_err(),
             "two path sources for one member must be refused, not resolved to the wrong one"
         );
     }
@@ -2356,7 +2410,7 @@ mod tests {
         stream.extend_from_slice(&hdr(b"usr/bin/app", b'0', 0, b"")); // SAFE header name
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
-        let err = vet_tar_stream(&mut r, true).unwrap_err();
+        let err = vet_tar_stream(&mut r).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("global"),
@@ -2375,7 +2429,7 @@ mod tests {
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
         assert!(
-            vet_tar_stream(&mut r, true).is_err(),
+            vet_tar_stream(&mut r).is_err(),
             "a member after a stray zero block must not slip past the vetter"
         );
     }
@@ -2388,8 +2442,112 @@ mod tests {
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
         assert!(
-            vet_tar_stream(&mut r, true).is_err(),
+            vet_tar_stream(&mut r).is_err(),
             "an absolute hardlink target must be refused (delimiter-in-name class stays dead)"
+        );
+    }
+
+    /// REGRESSION (busybox images): alpine's `/bin/*` and `/usr/bin/*` are ABSOLUTE symlinks to
+    /// `/bin/busybox`. The old guard blanket-rejected every escaping symlink target under non-GNU tar,
+    /// so `kern box --image alpine` failed on EVERY BusyBox host (the shipped WSL distro, edge Pi/Alpine).
+    /// A lone absolute symlink with nothing written through it must now PASS — on GNU tar AND BusyBox.
+    #[test]
+    fn accepts_absolute_symlinks_with_no_write_through() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"bin", b'5', 0, b"")); // dir
+        stream.extend_from_slice(&hdr(b"bin/arch", b'2', 0, b"/bin/busybox")); // alpine applet symlink
+        stream.extend_from_slice(&hdr(b"bin/sh", b'2', 0, b"/bin/busybox"));
+        stream.extend_from_slice(&hdr(b"bin/busybox", b'0', 0, b"")); // the real binary
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r).is_ok(),
+            "absolute symlinks with no write-through must pass (the alpine regression)"
+        );
+    }
+
+    /// SECURITY (the real escape the guard exists for): a symlink whose target escapes the rootfs
+    /// (`evil -> /etc`) FOLLOWED by a member that writes THROUGH it (`evil/passwd`) would make a
+    /// symlink-following extractor write to `/etc/passwd` on the HOST. Must be refused. Also the
+    /// FILE-OVER-SYMLINK variant: a regular file written straight ONTO the escaping symlink path.
+    #[test]
+    fn rejects_write_through_an_escaping_symlink() {
+        // (target, follow-member) — follow descends OR lands on the symlink.
+        let cases: &[(&str, &str)] = &[
+            ("/etc", "evil/passwd"),            // absolute escape, descend
+            ("../../../../etc", "evil/x"),      // `..` escape, descend
+            ("/etc/cron.d/x", "evil"),          // file written straight onto the escaping symlink
+        ];
+        for (target, follow) in cases {
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&hdr(b"evil", b'2', 0, target.as_bytes()));
+            stream.extend_from_slice(&hdr(follow.as_bytes(), b'0', 0, b""));
+            stream.extend(end_marker());
+            let mut r: &[u8] = &stream;
+            let res = vet_tar_stream(&mut r);
+            assert!(
+                res.is_err(),
+                "member through an escaping symlink must be refused (target={target}, follow={follow})"
+            );
+            assert!(
+                format!("{:?}", res.unwrap_err()).contains("escaping symlink"),
+                "the refusal must name the symlink escape"
+            );
+        }
+    }
+
+    /// SECURITY (audit findings — the subtle bypasses of a naive textual guard). Each of these would
+    /// escape on a symlink-following extractor while a first-cut guard passed it. All must be refused.
+    #[test]
+    fn rejects_symlink_escape_bypasses() {
+        // Helper: a symlink member sequence followed by a write, expected to be refused.
+        let refuse = |members: &[(&[u8], u8, &[u8])]| {
+            let mut stream = Vec::new();
+            for (name, tf, link) in members {
+                stream.extend_from_slice(&hdr(name, *tf, 0, link));
+            }
+            stream.extend(end_marker());
+            let mut r: &[u8] = &stream;
+            assert!(
+                vet_tar_stream(&mut r).is_err(),
+                "must refuse: {:?}",
+                members.iter().map(|(n, _, _)| String::from_utf8_lossy(n)).collect::<Vec<_>>()
+            );
+        };
+        // CHAIN: b -> a -> /etc, then write through b. `a` escapes (absolute); `b`'s target `a`
+        // resolves onto the escaping `a` → `b` escapes too → `b/passwd` refused.
+        refuse(&[(b"a", b'2', b"/etc"), (b"b", b'2', b"a"), (b"b/passwd", b'0', b"")]);
+        // NORMALIZATION: symlink `a`, write spelled `./a/passwd` / `a//passwd` / `a/./passwd`.
+        refuse(&[(b"a", b'2', b"/etc"), (b"./a/passwd", b'0', b"")]);
+        refuse(&[(b"a", b'2', b"/etc"), (b"a//passwd", b'0', b"")]);
+        refuse(&[(b"a", b'2', b"/etc"), (b"a/./passwd", b'0', b"")]);
+        // NORMALIZATION of the SYMLINK name: recorded via a `.`/`//`-spelled name, write plain.
+        refuse(&[(b"x/./a", b'2', b"/etc"), (b"x/a/passwd", b'0', b"")]);
+        refuse(&[(b"a//b", b'2', b"/etc"), (b"a/b/passwd", b'0', b"")]);
+        // SET-CLEARING: a -> /etc, then a dir at `a` (must NOT un-guard), then a/passwd.
+        refuse(&[(b"a", b'2', b"/etc"), (b"a", b'5', b""), (b"a/passwd", b'0', b"")]);
+        // A symlink UNDER an escaping symlink can't even be created.
+        refuse(&[(b"a", b'2', b"/etc"), (b"a/b", b'2', b"whatever")]);
+    }
+
+    /// A symlink with a SAFE (in-rootfs) target is NOT escaping, so writing through it stays inside
+    /// staging — allowed. A deeper member that does NOT descend an escaping symlink is fine too. And a
+    /// CHAIN of safe symlinks (c -> d -> real) stays allowed.
+    #[test]
+    fn safe_symlink_traversal_and_sibling_writes_pass() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"data", b'2', 0, b"real")); // relative, in-rootfs target
+        stream.extend_from_slice(&hdr(b"data/file", b'0', 0, b"")); // writes through a SAFE symlink — ok
+        stream.extend_from_slice(&hdr(b"d", b'2', 0, b"real2")); // safe
+        stream.extend_from_slice(&hdr(b"c", b'2', 0, b"d")); // safe chain c -> d -> real2
+        stream.extend_from_slice(&hdr(b"c/x", b'0', 0, b"")); // through a safe chain — ok
+        stream.extend_from_slice(&hdr(b"lib", b'2', 0, b"/usr/lib")); // escaping symlink…
+        stream.extend_from_slice(&hdr(b"libexec/tool", b'0', 0, b"")); // …but this does NOT descend it
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r).is_ok(),
+            "safe-symlink traversal, safe chains, and non-descending writes must pass"
         );
     }
 
@@ -2403,7 +2561,7 @@ mod tests {
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
         assert!(
-            vet_tar_stream(&mut r, true).is_ok(),
+            vet_tar_stream(&mut r).is_ok(),
             "a normal member stream (incl. an absolute symlink target) should pass"
         );
     }

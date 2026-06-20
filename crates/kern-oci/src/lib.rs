@@ -39,8 +39,9 @@ pub mod __fuzz {
     /// layer bytes at fixed offsets and must never panic (no OOB slice, no unbounded read) however
     /// malformed the input.
     pub fn tar_vet(data: &[u8]) {
-        let _ = crate::pull::vet_tar_stream(&mut std::io::Cursor::new(data), true);
-        let _ = crate::pull::vet_tar_stream(&mut std::io::Cursor::new(data), false);
+        // The vetter is tar-flavour-INDEPENDENT (its verdict must not hinge on which `tar` the host
+        // has — a security boundary can't trust an external tool's version), so one pass covers it.
+        let _ = crate::pull::vet_tar_stream(&mut std::io::Cursor::new(data));
     }
 }
 
