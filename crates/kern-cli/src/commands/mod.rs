@@ -3772,9 +3772,9 @@ pub fn build_logs(id: &str) -> Result<(), Error> {
     if crate::builds::get(id).is_none() {
         return Err(Error::Build(format!("no build '{id}'")));
     }
-    match std::fs::read_to_string(crate::builds::log_path(id)) {
-        Ok(s) => print!("{s}"),
-        Err(_) => println!("(no transcript captured for build '{id}')"),
+    match crate::builds::read_log(id) {
+        Some(s) => print!("{s}"),
+        None => println!("(no transcript captured for build '{id}')"),
     }
     Ok(())
 }

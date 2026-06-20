@@ -6,6 +6,13 @@
 //!
 //! See README.md / ARCHITECTURE.md for the roadmap. Commands and flags may still change before 1.0.
 
+/// One process-wide lock serializing every test that mutates a global env var (`XDG_DATA_HOME`,
+/// `HOME`, …). `std::env::set_var` is process-global, so tests in DIFFERENT modules (e.g. `volume` and
+/// `builds`, which both repoint `XDG_DATA_HOME`) must share ONE lock or they race. Poison is recovered
+/// (`into_inner`) so one panicking test doesn't cascade-fail every later env test.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod auth;
 mod boxcp;
 mod builds;
