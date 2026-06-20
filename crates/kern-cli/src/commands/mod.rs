@@ -4979,6 +4979,9 @@ fn content_hash(path: &std::path::Path) -> String {
                             match f.read(&mut buf) {
                                 Ok(0) => break,
                                 Ok(n) => feed(h, &buf[..n]),
+                                // Retry EINTR like `fs::read` did — a stray signal mid-read must
+                                // not flap the cache key of an unchanged file.
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                 Err(_) => {
                                     feed(h, b"?");
                                     break;
