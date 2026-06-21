@@ -145,6 +145,9 @@ struct Row {
     /// The pod (compose stack) this box belongs to, empty for a standalone box — drives the `kern ps`
     /// tree grouping in the Boxes tab.
     pod: String,
+    /// How this box DEVIATES from the secure default — `net:host` and/or `root-mapped`, empty when
+    /// fully isolated (the common case). Flags only the LESS-confined boxes, never a vanity badge.
+    iso: String,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -1194,6 +1197,39 @@ fn refresh_full(
     }
 }
 
+/// A compact marker of how a running box DEVIATES from the secure default: `net:host` (it shares the
+/// host network namespace instead of an isolated one) and/or `root-mapped` (its uid 0 maps to host uid
+/// 0 — kern ran as root). Empty when the box is fully isolated, so the Boxes tab flags only the boxes
+/// that are LESS confined than default (the always-on layers — seccomp, masked `/proc`, dropped caps —
+/// are identical for every box, so a "secure" badge would be vanity). Read-only `/proc` introspection.
+fn box_isolation(pid: i32) -> String {
+    let mut flags = Vec::new();
+    // Shared host netns? `kern top` runs in the host netns, so an equal namespace link means the box
+    // was started with `--network host` (no isolated netns).
+    if let (Ok(bx), Ok(me)) = (
+        std::fs::read_link(format!("/proc/{pid}/ns/net")),
+        std::fs::read_link("/proc/self/ns/net"),
+    ) {
+        if bx == me {
+            flags.push("net:host");
+        }
+    }
+    // Root-mapped: the first uid_map line is `inside outside count`; inside-0 → outside-0 means the box
+    // root is host root (a rootless box maps 0 to the unprivileged user's uid instead).
+    if let Ok(map) = std::fs::read_to_string(format!("/proc/{pid}/uid_map")) {
+        let first: Vec<&str> = map
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        if first.len() == 3 && first[0] == "0" && first[1] == "0" {
+            flags.push("root-mapped");
+        }
+    }
+    flags.join(" ")
+}
+
 fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, (u64, Instant)>) {
     let now_t = Instant::now();
     let now_u = registry::now_unix();
@@ -1212,6 +1248,11 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         };
         seen.insert(b.pid, (cpu_now, now_t));
         let health = registry::health_of(&b.name, b.pid);
+        // Introspect the box's INTERIOR init (`pid1`), not the host-side supervisor `pid` — the
+        // supervisor lives in the host netns with the kernel's trivial uid_map, which would falsely flag
+        // every box. `pid1 == 0` (unrecorded / old entry) → the /proc reads fail → no flag, no false
+        // positive.
+        let iso = box_isolation(b.pid1);
         rows.push(Row {
             uptime: now_u.saturating_sub(b.started),
             mem: st.mem,
@@ -1223,6 +1264,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
             name: b.name,
             pid: b.pid,
             pod: b.pod,
+            iso,
         });
     }
     // Group for the pod-tree view: standalone boxes first, then each pod's members contiguous (pods in
@@ -1453,6 +1495,7 @@ fn help_text() -> String {
      TABS — what each one shows\n\
        1 Overview   host CPU / RAM / load and the box totals\n\
        2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
+     \x20                (a yellow net:host / root-mapped flags a box LESS isolated than default)\n\
        3 Runs       kern run throughput: rate/sec, avg latency, peak, total (aggregate)\n\
        4 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
        5 Builds     build history: status, duration, size, age (like kern builds)\n\
@@ -2068,7 +2111,7 @@ fn builds_table(
 }
 
 fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String {
-    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
+    let (b, c, d, g, y, z) = (p.b, p.c, p.d, p.g, p.y, p.z);
     let mut s = String::new();
     s.push_str(&format!(
         "    {b}{:<16}  {:>7}  {:>8}  {:>8}  {:>5}  {:>4}  {:<9}  {:<14}  STATUS{z}\n",
@@ -2125,9 +2168,16 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
         } else {
             format!("{:<14}", trunc(&r.ports, 14))
         };
+        // Trailing flag only when the box is LESS isolated than default (net:host / root-mapped) — in
+        // yellow so it reads as "heads-up", never a green all-clear badge.
+        let iso = if r.iso.is_empty() {
+            String::new()
+        } else {
+            format!("  {y}{}{z}", r.iso)
+        };
         let (lead, name_col) = sel_marker(p, i == sel);
         s.push_str(&format!(
-            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}\n",
+            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}{iso}\n",
             name_cell,
             r.pid,
             fmt_uptime(r.uptime),
@@ -2190,7 +2240,28 @@ mod tests {
             health: String::new(),
             ports: String::new(),
             pod: String::new(),
+            iso: String::new(),
         }
+    }
+
+    #[test]
+    fn boxes_flag_only_reduced_isolation_never_a_secure_badge() {
+        // A default (fully isolated) box carries NO isolation marker — no vanity "secure" badge.
+        let out = boxes_table(&plain(), &[row("safe", false)], 10, usize::MAX);
+        let safe = out.lines().find(|l| l.contains("safe")).unwrap();
+        assert!(
+            !safe.contains("net:host") && !safe.contains("root-mapped"),
+            "an isolated box shows no deviation flag: {safe}"
+        );
+        // A box that deviates (net:host / root-mapped) surfaces exactly that, as a heads-up.
+        let mut r = row("loose", false);
+        r.iso = "net:host root-mapped".into();
+        let out2 = boxes_table(&plain(), &[r], 10, usize::MAX);
+        let loose = out2.lines().find(|l| l.contains("loose")).unwrap();
+        assert!(
+            loose.contains("net:host") && loose.contains("root-mapped"),
+            "a less-confined box flags its deviations: {loose}"
+        );
     }
 
     #[test]
