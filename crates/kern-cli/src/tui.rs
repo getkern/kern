@@ -60,6 +60,9 @@ enum Pending {
     RemoveVolume(String),
     PruneVolumes,
     DeleteProfile(&'static str, String), // (section header, profile name)
+    RemoveImage(String),                 // image ref (as shown in the Images tab)
+    PruneImages,                         // reclaim orphaned build layers
+    DeleteBuild(String),                 // build id
 }
 
 /// A multi-field input form. `active` is the focused field; typing edits its value.
@@ -391,6 +394,8 @@ pub fn run() -> Result<(), crate::error::Error> {
                     &snap.rows,
                     &snap.profs,
                     &snap.vols,
+                    &snap.builds,
+                    &snap.images,
                     &snap.cfg,
                     &mut mode,
                 );
@@ -444,6 +449,8 @@ fn handle_nav(
     rows: &[Row],
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
+    builds: &[crate::builds::Record],
+    images: &[(String, u64, u64)],
     cfg: &crate::config::KernConfig,
     mode: &mut Mode,
 ) -> bool {
@@ -484,6 +491,8 @@ fn handle_nav(
         // Only the Boxes tab acts immediately (stop/pause/kill). Profiles/Storage keys just open a
         // modal, so the mutation (if any) happens later via Confirm/Form — nothing to refresh yet.
         _ if *tab == TAB_BOXES => return nav_boxes(key[0], *sel, rows, mode),
+        _ if *tab == TAB_IMAGES => nav_images(key[0], *sel, images, mode),
+        _ if *tab == TAB_BUILDS => nav_builds(key[0], *sel, builds, mode),
         _ if *tab == TAB_PROFILES => nav_profiles(key[0], *sel, profs, cfg, mode),
         _ if *tab == TAB_STORAGE => nav_storage(key[0], *sel, vols, mode),
         _ => {}
@@ -580,6 +589,71 @@ fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mo
     }
 }
 
+/// Images-tab action keys: delete the selected image (`d`), prune orphaned build layers (`p`), or open
+/// a read-only detail overlay (`Enter`). Images are pulled/built elsewhere (no in-`top` "create"), so
+/// the interactive surface is Delete + Prune + Read — the meaningful CRUD for a cache of artifacts.
+fn nav_images(k: u8, sel: usize, images: &[(String, u64, u64)], mode: &mut Mode) {
+    match k {
+        b'd' => {
+            if let Some((name, ..)) = images.get(sel) {
+                *mode = Mode::Confirm {
+                    prompt: format!("remove image '{name}' and its unshared layers?  (y/n)"),
+                    action: Pending::RemoveImage(name.clone()),
+                };
+            }
+        }
+        b'p' => {
+            *mode = Mode::Confirm {
+                prompt: "prune orphaned build layers?  (y/n)".into(),
+                action: Pending::PruneImages,
+            };
+        }
+        b'\r' | b'\n' => {
+            if let Some(img) = images.get(sel) {
+                *mode = Mode::Overlay(image_detail(img));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Builds-tab action keys: delete the selected build record (`d`) or view its captured transcript
+/// (`Enter`). Builds are immutable history created by `kern build` (no in-`top` create/edit), so the
+/// interactive surface is Delete + Read-logs.
+fn nav_builds(k: u8, sel: usize, builds: &[crate::builds::Record], mode: &mut Mode) {
+    match k {
+        b'd' => {
+            if let Some(b) = builds.get(sel) {
+                *mode = Mode::Confirm {
+                    prompt: format!("delete build record '{}'?  (y/n)", b.id),
+                    action: Pending::DeleteBuild(b.id.clone()),
+                };
+            }
+        }
+        b'\r' | b'\n' => {
+            if let Some(b) = builds.get(sel) {
+                let body = crate::builds::read_log(&b.id)
+                    .unwrap_or_else(|| "(no transcript captured for this build)".into());
+                *mode = Mode::Overlay(format!("build {} — {}\n{}", b.id, b.tag, body));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A read-only detail block for one cached image (Images tab `Enter`). The ref is scrubbed of terminal
+/// escapes — a `.ok` sentinel's content is untrusted.
+fn image_detail(img: &(String, u64, u64)) -> String {
+    let (name, size, pulled) = img;
+    let now = registry::now_unix();
+    format!(
+        "image {}\nsize     {}\npulled   {}\n\ndelete with `d` · reclaim layers with `p`",
+        crate::ui::scrub(name),
+        human_bytes(*size),
+        fmt_uptime(now.saturating_sub(*pulled)),
+    )
+}
+
 /// Carry out a confirmed destructive action, muting the helper's stdio.
 fn perform_pending(action: Pending) {
     match action {
@@ -591,6 +665,15 @@ fn perform_pending(action: Pending) {
         }),
         Pending::DeleteProfile(section, name) => {
             let _ = delete_profile(section, &name);
+        }
+        Pending::RemoveImage(name) => quiet_io(|| {
+            let _ = crate::commands::image_rm(&[name]);
+        }),
+        Pending::PruneImages => quiet_io(|| {
+            let _ = crate::commands::image_prune();
+        }),
+        Pending::DeleteBuild(id) => {
+            crate::builds::remove(&id);
         }
     }
 }
@@ -1327,7 +1410,7 @@ fn render(
                 TAB_STORAGE => s.push_str(&storage_table(p, vols, body_rows, sel)),
                 _ => s.push_str(&overview(p, rows, host)),
             }
-            nav_footer(p, tab, rows, profs, vols)
+            nav_footer(p, tab, rows, profs, vols, builds, images)
         }
     };
     s.push_str(&format!("\n{d}{}{z}\n  {keys}\n", "─".repeat(width)));
@@ -1357,6 +1440,12 @@ fn help_text() -> String {
        s  stop        p  pause        u  unpause        k  kill\n\
        Enter          view its logs (a box's own output)\n\
      \n\
+     IMAGES tab\n\
+       d  delete      p  prune orphaned layers          Enter  detail\n\
+     \n\
+     BUILDS tab\n\
+       d  delete      Enter  view the build transcript\n\
+     \n\
      PROFILES tab\n\
        n  new         e  edit         d  delete\n\
      \n\
@@ -1375,6 +1464,8 @@ fn nav_footer(
     rows: &[Row],
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
+    builds: &[crate::builds::Record],
+    images: &[(String, u64, u64)],
 ) -> String {
     let (d, z) = (p.d, p.z);
     // Every footer ends with a permanent `[?] help` — a first-time user doesn't know `?` exists until
@@ -1383,6 +1474,12 @@ fn nav_footer(
     match tab {
         TAB_BOXES if !rows.is_empty() => format!(
             "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}p{d}]ause [{z}u{d}]npause [{z}k{d}]ill [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+        ),
+        TAB_IMAGES if !images.is_empty() => format!(
+            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}p{d}]rune-layers [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+        ),
+        TAB_BUILDS if !builds.is_empty() => format!(
+            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_PROFILES => {
             let edit = if profs.is_empty() { "" } else { " [e]dit [d]elete" };
@@ -2164,6 +2261,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
             &crate::config::KernConfig::default(),
             &mut mode,
         );
@@ -2180,7 +2279,7 @@ mod tests {
         }
         // Every footer advertises `?` so a first-time user knows it exists.
         for t in [TAB_OVERVIEW, TAB_BOXES, TAB_PROFILES, TAB_STORAGE] {
-            let f = nav_footer(&plain(), t, &[row("x", false)], &[], &[]);
+            let f = nav_footer(&plain(), t, &[row("x", false)], &[], &[], &[], &[]);
             assert!(
                 f.contains("?] help"),
                 "footer for tab {t} must advertise [?] help"
