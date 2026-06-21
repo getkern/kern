@@ -55,6 +55,18 @@ impl Status {
             Status::Failed => "failed",
         }
     }
+
+    /// Parse a `--status <s>` filter value (accepts the labels shown by `kern builds`). `None` for an
+    /// unknown word so the caller can reject it with a usage error.
+    pub fn from_label(s: &str) -> Option<Status> {
+        match s {
+            "ok" => Some(Status::Ok),
+            "warn" => Some(Status::Warn),
+            "failed" | "fail" => Some(Status::Failed),
+            "running" | "interrupted" => Some(Status::Running),
+            _ => None,
+        }
+    }
 }
 
 /// One past (or in-flight) build.
@@ -263,6 +275,22 @@ pub fn list() -> Vec<Record> {
     }
     out.sort_by(|a, b| b.started.cmp(&a.started).then_with(|| b.id.cmp(&a.id)));
     out
+}
+
+/// Apply the `kern builds` query to an already-newest-first list: keep records whose tag CONTAINS
+/// `tag` (if given) and whose status equals `status` (if given), then cap to the `limit` newest. Pure,
+/// so the filter/limit/status logic is unit-tested without the filesystem.
+pub fn filter_builds(
+    recs: Vec<Record>,
+    tag: Option<&str>,
+    status: Option<Status>,
+    limit: Option<usize>,
+) -> Vec<Record> {
+    recs.into_iter()
+        .filter(|r| tag.is_none_or(|t| r.tag.contains(t)))
+        .filter(|r| status.is_none_or(|s| r.status == s))
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
 }
 
 /// Delete one build record (and its log). Returns whether it existed.
@@ -486,6 +514,35 @@ mod tests {
             assert_eq!(kept[0].id, "4-1");
             assert_eq!(kept[1].id, "3-1"); // the two oldest (1-1, 2-1) were pruned
         });
+    }
+
+    #[test]
+    fn filter_builds_by_tag_status_and_limit() {
+        let recs = vec![
+            Record { tag: "web-api".into(), status: Status::Ok, ..rec("5-1", 5, Status::Ok) },
+            Record { tag: "web-ui".into(), status: Status::Warn, ..rec("4-1", 4, Status::Warn) },
+            Record { tag: "db".into(), status: Status::Failed, ..rec("3-1", 3, Status::Failed) },
+            Record { tag: "web-cron".into(), status: Status::Ok, ..rec("2-1", 2, Status::Ok) },
+        ];
+        // tag substring
+        let web = filter_builds(recs.clone(), Some("web"), None, None);
+        assert_eq!(web.len(), 3);
+        assert!(web.iter().all(|r| r.tag.contains("web")));
+        // status
+        let ok = filter_builds(recs.clone(), None, Some(Status::Ok), None);
+        assert_eq!(ok.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(), vec!["web-api", "web-cron"]);
+        // tag AND status AND limit (newest-first order preserved → first match kept)
+        let one = filter_builds(recs.clone(), Some("web"), Some(Status::Ok), Some(1));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].tag, "web-api");
+        // limit alone
+        assert_eq!(filter_builds(recs.clone(), None, None, Some(2)).len(), 2);
+        // no filters → identity
+        assert_eq!(filter_builds(recs.clone(), None, None, None).len(), 4);
+        // status label parsing (incl. interrupted == running)
+        assert_eq!(Status::from_label("failed"), Some(Status::Failed));
+        assert_eq!(Status::from_label("interrupted"), Some(Status::Running));
+        assert_eq!(Status::from_label("bogus"), None);
     }
 
     #[test]

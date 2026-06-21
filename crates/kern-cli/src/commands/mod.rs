@@ -44,7 +44,7 @@ pub fn help() -> Result<(), Error> {
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
-    {c}builds{z} [--json]                                                List past builds (build history)
+    {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds (build history)
     {c}build{z} logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
   {d}Manage boxes{z}
@@ -3700,10 +3700,24 @@ fn fmt_dur(ms: u64) -> String {
     }
 }
 
-/// `kern builds [--json]` — the build history: one row per past `kern build`, newest first (the kern
-/// analogue of Docker Desktop's "Builds" panel / `docker buildx history`).
-pub fn builds_list(json: bool) -> Result<(), Error> {
-    let recs = crate::builds::list();
+/// `kern builds [<tag>] [--status S] [-n N] [--json]` — the build history: one row per past `kern
+/// build`, newest first (the kern analogue of Docker Desktop's "Builds" panel / `docker buildx
+/// history`). Optional query: `<tag>` keeps builds whose tag contains the substring, `--status`
+/// filters by outcome, `-n` caps to the N newest.
+pub fn builds_list(
+    json: bool,
+    filter: Option<&str>,
+    status: Option<&str>,
+    limit: Option<usize>,
+) -> Result<(), Error> {
+    let status = match status {
+        Some(s) => Some(
+            crate::builds::Status::from_label(s)
+                .ok_or(Error::Usage("build --status ok|warn|failed|interrupted"))?,
+        ),
+        None => None,
+    };
+    let recs = crate::builds::filter_builds(crate::builds::list(), filter, status, limit);
     if json {
         let mut out = String::from("[");
         for (i, r) in recs.iter().enumerate() {
@@ -3724,7 +3738,13 @@ pub fn builds_list(json: bool) -> Result<(), Error> {
         out.push(']');
         println!("{out}");
     } else if recs.is_empty() {
-        println!("no builds yet — build one with `kern build -t <name> .`");
+        // Distinguish "history is empty" from "your query matched nothing" — else a filter that finds
+        // nothing looks like you've never built.
+        if filter.is_some() || status.is_some() || limit.is_some() {
+            println!("no builds match — run `kern builds` to see the full history");
+        } else {
+            println!("no builds yet — build one with `kern build -t <name> .`");
+        }
     } else {
         let p = crate::ui::Palette::detect();
         // Size TAG to its widest value (capped) so STATUS stays aligned.
@@ -3754,7 +3774,14 @@ pub fn builds_list(json: bool) -> Result<(), Error> {
                 crate::builds::Status::Running => p.d,
             };
             let id = format!("{}{}{:<18}{}", p.b, p.c, r.id, p.z);
-            let status = format!("{sc}{:<11}{}", r.status.label(), p.z);
+            // Show the warning count inline (Docker's `⚠️ N`): a `warn` row reads `warn 2`. Other
+            // outcomes just show their label; `warn` ⟺ warnings>0, so the number is unambiguous.
+            let label = if r.status == crate::builds::Status::Warn && r.warnings > 0 {
+                format!("warn {}", r.warnings)
+            } else {
+                r.status.label().to_string()
+            };
+            let status = format!("{sc}{:<11}{}", label, p.z);
             println!(
                 "{id} {:<tw$} {status} {:>8} {:>9}  {}",
                 truncate(&r.tag, tw),
