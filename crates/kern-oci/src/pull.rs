@@ -807,106 +807,106 @@ fn process_layer(
     // parent (they need no privilege and produce detailed errors). Plain `tar` here (no `unshare -r`
     // wrapper): we're already in-ns root when non-root, so it has the caps.
     let unpack = unpack_as_root(move || {
-    let staging = dest.with_file_name(format!(".kern-stg-{}", digest.replace([':', '/'], "_")));
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| OciError::Extract(e.to_string()))?;
-    let staging_s = staging.to_string_lossy().into_owned();
-    // `--same-permissions`: preserve the image's EXACT modes, including the sticky bit and world-write
-    // on `/tmp` (1777) that many images rely on — without it, tar as a non-root user applies the umask
-    // (022) and drops world-write + sticky, so a workload that drops to a non-root uid can't write
-    // `/tmp` (e.g. mariadb InnoDB temp files fail EACCES). Docker/podman extract with `-p` for the same
-    // reason. `--no-same-owner` still maps ownership to the extracting user (we don't want the image's
-    // raw uids on the host); the tar vetter already rejected setuid/device nodes, so preserving modes is
-    // safe (a setuid bit on a rootfs file is inert anyway — the box root mount is MS_NOSUID).
-    // Extract with the codec detected above. gzip → tar's own `-z`; plain → no decompressor (`-xf`);
-    // zstd → pipe `zstd -dc` into `tar -xf -` rather than relying on `tar --zstd`, which BusyBox/musl
-    // edge builds often lack even when a standalone `zstd` is present. `--no-same-owner`
-    // `--same-permissions` are preserved on every path (see the mode-preservation note above).
-    let extract_err = |e: OciError| -> OciError {
+        let staging = dest.with_file_name(format!(".kern-stg-{}", digest.replace([':', '/'], "_")));
         let _ = std::fs::remove_dir_all(&staging);
-        e
-    };
-    let ok = match comp {
-        Compression::Gzip | Compression::Plain => {
-            let flag = if matches!(comp, Compression::Gzip) {
-                "-xzf"
-            } else {
-                "-xf"
-            };
-            Command::new("tar")
-                .args([
-                    flag,
-                    &tmp_s,
-                    "-C",
-                    &staging_s,
-                    "--no-same-owner",
-                    "--same-permissions",
-                ])
-                .status()
-                .map_err(|e| OciError::Tool("tar", e.to_string()))
-                .map(|s| s.success())
-        }
-        Compression::Zstd => {
-            if !zstd_available() {
-                return Err(extract_err(zstd_missing()));
+        std::fs::create_dir_all(&staging).map_err(|e| OciError::Extract(e.to_string()))?;
+        let staging_s = staging.to_string_lossy().into_owned();
+        // `--same-permissions`: preserve the image's EXACT modes, including the sticky bit and world-write
+        // on `/tmp` (1777) that many images rely on — without it, tar as a non-root user applies the umask
+        // (022) and drops world-write + sticky, so a workload that drops to a non-root uid can't write
+        // `/tmp` (e.g. mariadb InnoDB temp files fail EACCES). Docker/podman extract with `-p` for the same
+        // reason. `--no-same-owner` still maps ownership to the extracting user (we don't want the image's
+        // raw uids on the host); the tar vetter already rejected setuid/device nodes, so preserving modes is
+        // safe (a setuid bit on a rootfs file is inert anyway — the box root mount is MS_NOSUID).
+        // Extract with the codec detected above. gzip → tar's own `-z`; plain → no decompressor (`-xf`);
+        // zstd → pipe `zstd -dc` into `tar -xf -` rather than relying on `tar --zstd`, which BusyBox/musl
+        // edge builds often lack even when a standalone `zstd` is present. `--no-same-owner`
+        // `--same-permissions` are preserved on every path (see the mode-preservation note above).
+        let extract_err = |e: OciError| -> OciError {
+            let _ = std::fs::remove_dir_all(&staging);
+            e
+        };
+        let ok = match comp {
+            Compression::Gzip | Compression::Plain => {
+                let flag = if matches!(comp, Compression::Gzip) {
+                    "-xzf"
+                } else {
+                    "-xf"
+                };
+                Command::new("tar")
+                    .args([
+                        flag,
+                        &tmp_s,
+                        "-C",
+                        &staging_s,
+                        "--no-same-owner",
+                        "--same-permissions",
+                    ])
+                    .status()
+                    .map_err(|e| OciError::Tool("tar", e.to_string()))
+                    .map(|s| s.success())
             }
-            // zstd -dc <tmp>  |  head -c <cap>  |  tar -xf -  -C staging …
-            //
-            // DEFENCE IN DEPTH: unlike the `tar -xzf`/`-xf` paths (which read the on-disk blob and are
-            // bounded by tar itself), the zstd path STREAMS a decompressor into tar and does NOT re-run
-            // the size-capped vetter. `check_layer_safe` already rejected an over-2GiB bomb before we get
-            // here — but a gate shouldn't depend on ANOTHER gate being perfect. `head -c MAX_LAYER_BYTES`
-            // hard-caps the decompressed bytes reaching tar, so even if the vet ever let a gonfio blob
-            // through, the extract writes at most the cap (the truncated tar then fails cleanly). One
-            // extra tiny process; irrelevant vs the decompression cost.
-            let mut z = Command::new("zstd")
-                .args(["-dc", &tmp_s])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|_| zstd_missing())
-                .map_err(extract_err)?;
-            let zout = z.stdout.take().expect("zstd stdout piped");
-            let mut h = Command::new("head")
-                .args(["-c", &MAX_LAYER_BYTES.to_string()])
-                .stdin(zout)
-                .stdout(Stdio::piped())
-                .spawn()
-                .map_err(|e| OciError::Tool("head", e.to_string()))
-                .map_err(extract_err)?;
-            let hout = h.stdout.take().expect("head stdout piped");
-            let tar_status = Command::new("tar")
-                .args([
-                    "-xf",
-                    "-",
-                    "-C",
-                    &staging_s,
-                    "--no-same-owner",
-                    "--same-permissions",
-                ])
-                .stdin(hout)
-                .status()
-                .map_err(|e| OciError::Tool("tar", e.to_string()));
-            let zcode = z.wait().map(|s| s.success()).unwrap_or(false);
-            // `head` closing the pipe early (cap hit) makes zstd take SIGPIPE — that's the intended
-            // truncation, and tar then fails on the short archive, so we don't treat head's own status
-            // as authoritative; tar + a clean zstd exit are what matter.
-            let _ = h.wait();
-            tar_status.map(|s| s.success() && zcode)
+            Compression::Zstd => {
+                if !zstd_available() {
+                    return Err(extract_err(zstd_missing()));
+                }
+                // zstd -dc <tmp>  |  head -c <cap>  |  tar -xf -  -C staging …
+                //
+                // DEFENCE IN DEPTH: unlike the `tar -xzf`/`-xf` paths (which read the on-disk blob and are
+                // bounded by tar itself), the zstd path STREAMS a decompressor into tar and does NOT re-run
+                // the size-capped vetter. `check_layer_safe` already rejected an over-2GiB bomb before we get
+                // here — but a gate shouldn't depend on ANOTHER gate being perfect. `head -c MAX_LAYER_BYTES`
+                // hard-caps the decompressed bytes reaching tar, so even if the vet ever let a gonfio blob
+                // through, the extract writes at most the cap (the truncated tar then fails cleanly). One
+                // extra tiny process; irrelevant vs the decompression cost.
+                let mut z = Command::new("zstd")
+                    .args(["-dc", &tmp_s])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|_| zstd_missing())
+                    .map_err(extract_err)?;
+                let zout = z.stdout.take().expect("zstd stdout piped");
+                let mut h = Command::new("head")
+                    .args(["-c", &MAX_LAYER_BYTES.to_string()])
+                    .stdin(zout)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| OciError::Tool("head", e.to_string()))
+                    .map_err(extract_err)?;
+                let hout = h.stdout.take().expect("head stdout piped");
+                let tar_status = Command::new("tar")
+                    .args([
+                        "-xf",
+                        "-",
+                        "-C",
+                        &staging_s,
+                        "--no-same-owner",
+                        "--same-permissions",
+                    ])
+                    .stdin(hout)
+                    .status()
+                    .map_err(|e| OciError::Tool("tar", e.to_string()));
+                let zcode = z.wait().map(|s| s.success()).unwrap_or(false);
+                // `head` closing the pipe early (cap hit) makes zstd take SIGPIPE — that's the intended
+                // truncation, and tar then fails on the short archive, so we don't treat head's own status
+                // as authoritative; tar + a clean zstd exit are what matter.
+                let _ = h.wait();
+                tar_status.map(|s| s.success() && zcode)
+            }
+        };
+        let _ = std::fs::remove_file(tmp);
+        let succeeded = match ok {
+            Ok(s) => s,
+            Err(e) => return Err(extract_err(e)),
+        };
+        if !succeeded {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(OciError::Extract("layer extraction failed".into()));
         }
-    };
-    let _ = std::fs::remove_file(tmp);
-    let succeeded = match ok {
-        Ok(s) => s,
-        Err(e) => return Err(extract_err(e)),
-    };
-    if !succeeded {
+        let merged = merge_layer(&staging, dest);
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(OciError::Extract("layer extraction failed".into()));
-    }
-    let merged = merge_layer(&staging, dest);
-    let _ = std::fs::remove_dir_all(&staging);
-    merged
+        merged
     });
     unpack
 }
@@ -1130,7 +1130,9 @@ pub(crate) fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Resul
     let mut status = 0i32;
     while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
         if unsafe { *libc::__errno_location() } != libc::EINTR {
-            return Err(OciError::Extract("waiting for the layer-unpack child failed".into()));
+            return Err(OciError::Extract(
+                "waiting for the layer-unpack child failed".into(),
+            ));
         }
     }
     let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
@@ -1385,10 +1387,10 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
     let mut entries: u64 = 0;
     let mut next_name: Option<String> = None; // override carried by a preceding L / PAX block
     let mut next_link: Option<String> = None; // …K / PAX linkpath
-    // Paths of symlinks seen SO FAR in this layer whose target ESCAPES the rootfs (absolute / `..`).
-    // A symlink-following extractor (BusyBox tar) writing THROUGH one would land outside the staging
-    // dir — so a LATER member that descends through one is the real escape (tracked, not the mere
-    // existence of an absolute symlink, which every busybox-based image — alpine's `/bin/*` — has).
+                                              // Paths of symlinks seen SO FAR in this layer whose target ESCAPES the rootfs (absolute / `..`).
+                                              // A symlink-following extractor (BusyBox tar) writing THROUGH one would land outside the staging
+                                              // dir — so a LATER member that descends through one is the real escape (tracked, not the mere
+                                              // existence of an absolute symlink, which every busybox-based image — alpine's `/bin/*` — has).
     let mut escaping_symlinks: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
@@ -2579,9 +2581,9 @@ mod tests {
     fn rejects_write_through_an_escaping_symlink() {
         // (target, follow-member) — follow descends OR lands on the symlink.
         let cases: &[(&str, &str)] = &[
-            ("/etc", "evil/passwd"),            // absolute escape, descend
-            ("../../../../etc", "evil/x"),      // `..` escape, descend
-            ("/etc/cron.d/x", "evil"),          // file written straight onto the escaping symlink
+            ("/etc", "evil/passwd"),       // absolute escape, descend
+            ("../../../../etc", "evil/x"), // `..` escape, descend
+            ("/etc/cron.d/x", "evil"),     // file written straight onto the escaping symlink
         ];
         for (target, follow) in cases {
             let mut stream = Vec::new();
@@ -2616,12 +2618,19 @@ mod tests {
             assert!(
                 vet_tar_stream(&mut r).is_err(),
                 "must refuse: {:?}",
-                members.iter().map(|(n, _, _)| String::from_utf8_lossy(n)).collect::<Vec<_>>()
+                members
+                    .iter()
+                    .map(|(n, _, _)| String::from_utf8_lossy(n))
+                    .collect::<Vec<_>>()
             );
         };
         // CHAIN: b -> a -> /etc, then write through b. `a` escapes (absolute); `b`'s target `a`
         // resolves onto the escaping `a` → `b` escapes too → `b/passwd` refused.
-        refuse(&[(b"a", b'2', b"/etc"), (b"b", b'2', b"a"), (b"b/passwd", b'0', b"")]);
+        refuse(&[
+            (b"a", b'2', b"/etc"),
+            (b"b", b'2', b"a"),
+            (b"b/passwd", b'0', b""),
+        ]);
         // NORMALIZATION: symlink `a`, write spelled `./a/passwd` / `a//passwd` / `a/./passwd`.
         refuse(&[(b"a", b'2', b"/etc"), (b"./a/passwd", b'0', b"")]);
         refuse(&[(b"a", b'2', b"/etc"), (b"a//passwd", b'0', b"")]);
@@ -2630,7 +2639,11 @@ mod tests {
         refuse(&[(b"x/./a", b'2', b"/etc"), (b"x/a/passwd", b'0', b"")]);
         refuse(&[(b"a//b", b'2', b"/etc"), (b"a/b/passwd", b'0', b"")]);
         // SET-CLEARING: a -> /etc, then a dir at `a` (must NOT un-guard), then a/passwd.
-        refuse(&[(b"a", b'2', b"/etc"), (b"a", b'5', b""), (b"a/passwd", b'0', b"")]);
+        refuse(&[
+            (b"a", b'2', b"/etc"),
+            (b"a", b'5', b""),
+            (b"a/passwd", b'0', b""),
+        ]);
         // A symlink UNDER an escaping symlink can't even be created.
         refuse(&[(b"a", b'2', b"/etc"), (b"a/b", b'2', b"whatever")]);
     }

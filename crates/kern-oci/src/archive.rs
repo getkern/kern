@@ -80,7 +80,11 @@ pub fn save(
         .map_err(|e| OciError::Extract(format!("save layer: {e}")))?;
     std::fs::write(layout.join(&conf_name), &config_json)
         .map_err(|e| OciError::Extract(format!("save config: {e}")))?;
-    let tags_json = repo_tags.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(",");
+    let tags_json = repo_tags
+        .iter()
+        .map(|t| jstr(t))
+        .collect::<Vec<_>>()
+        .join(",");
     let manifest = format!(
         "[{{\"Config\":{},\"RepoTags\":[{}],\"Layers\":[{}]}}]",
         jstr(&conf_name),
@@ -117,12 +121,16 @@ pub fn save(
 fn pack_plain_layer(rootfs: &Path, out: &Path) -> Result<(), OciError> {
     let stripped = Command::new("find")
         .arg(rootfs)
-        .args(["-type", "f", "-perm", "/6000", "-exec", "chmod", "a-s", "{}", "+"])
+        .args([
+            "-type", "f", "-perm", "/6000", "-exec", "chmod", "a-s", "{}", "+",
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !stripped {
-        return Err(OciError::Extract("stripping setuid before save failed".into()));
+        return Err(OciError::Extract(
+            "stripping setuid before save failed".into(),
+        ));
     }
     let ok = Command::new("tar")
         .args(["-C"])
@@ -185,7 +193,9 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok {
-                return Err(OciError::Extract("reading the archive from stdin failed".into()));
+                return Err(OciError::Extract(
+                    "reading the archive from stdin failed".into(),
+                ));
             }
             dst
         }
@@ -209,14 +219,16 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
         return Err(OciError::Extract("extracting the archive failed".into()));
     }
 
-    let manifest = std::fs::read_to_string(unpacked.join("manifest.json")).map_err(|_| {
-        OciError::Extract("not a docker-save archive (no manifest.json)".into())
-    })?;
+    let manifest = std::fs::read_to_string(unpacked.join("manifest.json"))
+        .map_err(|_| OciError::Extract("not a docker-save archive (no manifest.json)".into()))?;
 
     let mut out = Vec::new();
-    for (i, obj) in crate::json::split_objects(&manifest).into_iter().enumerate() {
-        let config_rel =
-            str_field(obj, "Config").ok_or_else(|| OciError::Extract("manifest: no Config".into()))?;
+    for (i, obj) in crate::json::split_objects(&manifest)
+        .into_iter()
+        .enumerate()
+    {
+        let config_rel = str_field(obj, "Config")
+            .ok_or_else(|| OciError::Extract("manifest: no Config".into()))?;
         let repo_tags = crate::json::str_array_after(obj, "RepoTags");
         let layers = crate::json::str_array_after(obj, "Layers");
         if layers.is_empty() {

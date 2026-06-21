@@ -161,7 +161,10 @@ pub fn log_path(id: &str) -> PathBuf {
 /// again at completion with the final status/duration/size.
 pub fn write(rec: &Record) -> io::Result<()> {
     if !valid_id(&rec.id) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid build id"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid build id",
+        ));
     }
     let dir = record_dir(&rec.id);
     mkdir_private(&dir)?;
@@ -506,7 +509,7 @@ mod tests {
         assert_eq!(r.tag, "x");
         assert_eq!(r.warnings, 0);
         assert_eq!(r.status, Status::Running); // absent status → running/interrupted
-        // No id → rejected.
+                                               // No id → rejected.
         assert!(parse("tag=x\nstarted=5\n").is_none());
     }
 
@@ -545,10 +548,26 @@ mod tests {
     #[test]
     fn filter_builds_by_tag_status_and_limit() {
         let recs = vec![
-            Record { tag: "web-api".into(), status: Status::Ok, ..rec("5-1", 5, Status::Ok) },
-            Record { tag: "web-ui".into(), status: Status::Warn, ..rec("4-1", 4, Status::Warn) },
-            Record { tag: "db".into(), status: Status::Failed, ..rec("3-1", 3, Status::Failed) },
-            Record { tag: "web-cron".into(), status: Status::Ok, ..rec("2-1", 2, Status::Ok) },
+            Record {
+                tag: "web-api".into(),
+                status: Status::Ok,
+                ..rec("5-1", 5, Status::Ok)
+            },
+            Record {
+                tag: "web-ui".into(),
+                status: Status::Warn,
+                ..rec("4-1", 4, Status::Warn)
+            },
+            Record {
+                tag: "db".into(),
+                status: Status::Failed,
+                ..rec("3-1", 3, Status::Failed)
+            },
+            Record {
+                tag: "web-cron".into(),
+                status: Status::Ok,
+                ..rec("2-1", 2, Status::Ok)
+            },
         ];
         // tag substring
         let web = filter_builds(recs.clone(), Some("web"), None, None);
@@ -556,7 +575,10 @@ mod tests {
         assert!(web.iter().all(|r| r.tag.contains("web")));
         // status
         let ok = filter_builds(recs.clone(), None, Some(Status::Ok), None);
-        assert_eq!(ok.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(), vec!["web-api", "web-cron"]);
+        assert_eq!(
+            ok.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(),
+            vec!["web-api", "web-cron"]
+        );
         // tag AND status AND limit (newest-first order preserved → first match kept)
         let one = filter_builds(recs.clone(), Some("web"), Some(Status::Ok), Some(1));
         assert_eq!(one.len(), 1);
@@ -602,7 +624,10 @@ mod tests {
             append_log("30-1", "line one");
             append_log("30-1", "line two");
             let log = read_log("30-1").unwrap();
-            assert!(log.contains("line one") && log.contains("line two"), "{log:?}");
+            assert!(
+                log.contains("line one") && log.contains("line two"),
+                "{log:?}"
+            );
             // a build with no log yet → None, not a panic.
             write(&rec("31-1", 31, Status::Ok)).unwrap();
             assert!(read_log("31-1").is_none());

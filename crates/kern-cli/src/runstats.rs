@@ -58,12 +58,17 @@ pub fn record() {
         .get()
         .map(|s| s.elapsed().as_micros().min(u64::MAX as u128) as u64)
         .unwrap_or(0);
-    with_map(&p, libc::O_RDWR | libc::O_CREAT, libc::PROT_READ | libc::PROT_WRITE, |ptr| unsafe {
-        // SAFETY: `ptr` is a valid MAP_SHARED page; offsets 0 and 8 are naturally-aligned u64s we only
-        // ever touch atomically, so concurrent writers from other `kern run` processes are race-free.
-        (*(ptr as *const AtomicU64)).fetch_add(1, Ordering::Relaxed);
-        (*((ptr as *const u8).add(8) as *const AtomicU64)).fetch_add(micros, Ordering::Relaxed);
-    });
+    with_map(
+        &p,
+        libc::O_RDWR | libc::O_CREAT,
+        libc::PROT_READ | libc::PROT_WRITE,
+        |ptr| unsafe {
+            // SAFETY: `ptr` is a valid MAP_SHARED page; offsets 0 and 8 are naturally-aligned u64s we only
+            // ever touch atomically, so concurrent writers from other `kern run` processes are race-free.
+            (*(ptr as *const AtomicU64)).fetch_add(1, Ordering::Relaxed);
+            (*((ptr as *const u8).add(8) as *const AtomicU64)).fetch_add(micros, Ordering::Relaxed);
+        },
+    );
 }
 
 /// `(total, setup_latency_µs_sum)` — the cumulative `kern run` count and the summed entry→exec latency
@@ -112,7 +117,9 @@ mod tests {
     #[test]
     fn record_increments_the_shared_total() {
         // Isolate the counter file to a temp runtime dir (process-global env — serialize with others).
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("kern-runstats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_RUNTIME_DIR", &tmp);

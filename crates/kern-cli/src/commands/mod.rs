@@ -1159,7 +1159,14 @@ pub fn run(
     let cpus = clamp_cpus(cpus);
     // `kern run` exec()s in place (no supervisor to reap the cgroup) → `false`: it must use the systemd
     // `--scope --collect` path (which auto-removes the cgroup on exit), never the direct kern.slice path.
-    reexec_in_scope_if_possible(memory, memory_swap_max, cpuset.as_deref(), cpus, None, false);
+    reexec_in_scope_if_possible(
+        memory,
+        memory_swap_max,
+        cpuset.as_deref(),
+        cpus,
+        None,
+        false,
+    );
     let cg = kern_isolation::apply_cgroup_limits(
         false, // allow_direct: `kern run` exec()s in place (no supervisor) → never relocate into kern.slice
         "run",
@@ -3164,8 +3171,10 @@ pub fn ps(json: bool) -> Result<(), Error> {
             print_row(b, *up, health, ports, "");
         }
         // Group the rest by pod, pods in name order, members in start order (rows already are).
-        let mut pods: std::collections::BTreeMap<&str, Vec<&(&registry::Instance, u64, String, String)>> =
-            std::collections::BTreeMap::new();
+        let mut pods: std::collections::BTreeMap<
+            &str,
+            Vec<&(&registry::Instance, u64, String, String)>,
+        > = std::collections::BTreeMap::new();
         for row in rows.iter().filter(|(b, ..)| !b.pod.is_empty()) {
             pods.entry(row.0.pod.as_str()).or_default().push(row);
         }
@@ -3766,7 +3775,12 @@ pub fn image_rm(refs: &[String]) -> Result<(), Error> {
     for r in refs {
         match remove_image(&cache, r) {
             Some(freed) => {
-                println!("{}removed{} image '{r}', freed {}", p.g, p.z, human_bytes(freed))
+                println!(
+                    "{}removed{} image '{r}', freed {}",
+                    p.g,
+                    p.z,
+                    human_bytes(freed)
+                )
             }
             None => eprintln!("kern: no such image '{r}'"),
         }
@@ -5605,8 +5619,8 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
         build_run(args.quiet, tag, &ctx, &work, &instrs)
     };
     remove_build_tree(&work); // overlay leaves mode-000 workdirs; force-clean so nothing leaks
-    // Finalize the record: outcome from `result`, size read back the way `images()` computes it. Drop
-    // the capture (restores stderr) before appending the summary so it lands after the transcript.
+                              // Finalize the record: outcome from `result`, size read back the way `images()` computes it. Drop
+                              // the capture (restores stderr) before appending the summary so it lands after the transcript.
     rec.duration_ms = t0.elapsed().as_millis() as u64;
     match &result {
         Ok(()) => {
@@ -8311,7 +8325,8 @@ mod net_resource_tests {
         // NAME WINS: a ref equal to a live box name never falls through to the pid/pod branch — so a
         // box literally named "web" can't sweep a same-named pod, and a numeric name isn't shadowed.
         let numname = inst("100", 999, "grp");
-        let live2: std::collections::HashSet<String> = ["100"].into_iter().map(String::from).collect();
+        let live2: std::collections::HashSet<String> =
+            ["100"].into_iter().map(String::from).collect();
         assert!(ref_matches(&numname, "100", &live2)); // matches by its NAME…
         let other = inst("x", 100, "grp"); // …and NOT by a coincidental pid == that name
         assert!(!ref_matches(&other, "100", &live2));
@@ -8335,7 +8350,11 @@ mod net_resource_tests {
         // must appear once (else stop would kill -SIGKILL a pid twice / double-print).
         let running = vec![inst("web", 10, "mypod"), inst("db", 11, "mypod")];
         let sel = boxes_matching_refs(running, &["web".into(), "mypod".into()]);
-        assert_eq!(sel.len(), 2, "web selected by name AND pod must not duplicate");
+        assert_eq!(
+            sel.len(),
+            2,
+            "web selected by name AND pod must not duplicate"
+        );
         let names: Vec<&str> = sel.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["web", "db"]);
     }
@@ -8938,7 +8957,9 @@ mod image_rm_tests {
     #[test]
     fn rmi_removes_only_the_named_image_and_reports_freed() {
         // Process-global env (XDG_CACHE_HOME) — serialize with every other env-mutating test.
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("kern-rmitest-{}", std::process::id()));
         let cache = tmp.join("kern/images");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -8950,7 +8971,10 @@ mod image_rm_tests {
 
         // Resolve BY REF (as shown in `kern images`) and delete just that one.
         let freed = remove_image(&cache, "alpine:3.19").expect("image should be found by ref");
-        assert!(freed >= 4096, "freed should include the payload dir, got {freed}");
+        assert!(
+            freed >= 4096,
+            "freed should include the payload dir, got {freed}"
+        );
         assert!(
             !cache.join("alpine_3_19-aaaa.ok").exists() && !cache.join("alpine_3_19-aaaa").exists(),
             "the removed image's sentinel and payload are both gone"
@@ -8961,7 +8985,10 @@ mod image_rm_tests {
             "an unrelated image must survive a targeted rmi"
         );
         // Also resolvable BY STEM, and a miss returns None (→ "no such image", never a silent success).
-        assert!(remove_image(&cache, "alpine_3_20-bbbb").is_some(), "stem resolves too");
+        assert!(
+            remove_image(&cache, "alpine_3_20-bbbb").is_some(),
+            "stem resolves too"
+        );
         assert!(remove_image(&cache, "ghost:1").is_none(), "a miss is None");
 
         std::env::remove_var("XDG_CACHE_HOME");

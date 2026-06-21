@@ -660,8 +660,7 @@ pub fn prune() -> (usize, u64) {
                     if f.starts_with('.') {
                         continue; // `.lock` — never a claim (BoxName forbids a leading '.')
                     }
-                    let live = fs::read_to_string(e.path())
-                        .is_ok_and(|b| live_claim(&b));
+                    let live = fs::read_to_string(e.path()).is_ok_and(|b| live_claim(&b));
                     if !live {
                         let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
                         if fs::remove_file(e.path()).is_ok() {
@@ -834,12 +833,15 @@ mod tests {
         let p1 = mk(&uniq, pid);
         // by NAME and by PID both resolve the same box.
         assert_eq!(find_ref(&uniq).map(|i| i.name), Some(uniq.clone()));
-        assert_eq!(find_ref(&pid.to_string()).map(|i| i.name), Some(uniq.clone()));
+        assert_eq!(
+            find_ref(&pid.to_string()).map(|i| i.name),
+            Some(uniq.clone())
+        );
         // an unknown name and a non-existent pid both miss.
         assert!(find_ref("no-such-box-xyz").is_none());
         assert!(find_ref("2147483647").is_none()); // i32::MAX — no such pid
-        // NAME WINS: a box literally named after a NUMBER resolves by that NAME (via `find`), never
-        // via the pid branch — so a numeric name can't be shadowed by a coincidental pid.
+                                                   // NAME WINS: a box literally named after a NUMBER resolves by that NAME (via `find`), never
+                                                   // via the pid branch — so a numeric name can't be shadowed by a coincidental pid.
         let numname = format!("{}", pid.wrapping_add(1)); // a name that looks like a (different) pid
         let p2 = mk(&numname, pid);
         assert_eq!(find_ref(&numname).map(|i| i.name), Some(numname.clone()));

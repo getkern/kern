@@ -1173,9 +1173,9 @@ fn box_run_hardening_uts_net_seccomp() {
     ]);
     let mounts = String::from_utf8_lossy(&mounts.stdout);
     assert!(
-        mounts
-            .lines()
-            .any(|l| l.contains(" /proc/sys ") && l.split_whitespace().any(|f| f == "ro" || f.starts_with("ro,"))),
+        mounts.lines().any(|l| l.contains(" /proc/sys ")
+            && l.split_whitespace()
+                .any(|f| f == "ro" || f.starts_with("ro,"))),
         "/proc/sys must be mounted read-only (core_pattern escape guard):\n{mounts}"
     );
 
