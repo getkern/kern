@@ -26,11 +26,12 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-const TABS: [&str; 4] = ["Overview", "Boxes", "Profiles", "Storage"];
+const TABS: [&str; 5] = ["Overview", "Boxes", "Builds", "Profiles", "Storage"];
 const TAB_OVERVIEW: usize = 0;
 const TAB_BOXES: usize = 1;
-const TAB_PROFILES: usize = 2;
-const TAB_STORAGE: usize = 3;
+const TAB_BUILDS: usize = 2;
+const TAB_PROFILES: usize = 3;
+const TAB_STORAGE: usize = 4;
 
 /// What the TUI is doing right now: plain navigation, or a modal layered over it.
 enum Mode {
@@ -262,7 +263,7 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs);
     loop {
         let (cols, term_rows) = term_size();
-        let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols);
+        let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols, &snap.builds);
         if sel >= list_len {
             sel = list_len.saturating_sub(1);
         }
@@ -274,6 +275,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             &snap.host,
             &snap.profs,
             &snap.vols,
+            &snap.builds,
             cols,
             term_rows,
             sel,
@@ -408,9 +410,11 @@ fn tab_list_len(
     rows: &[Row],
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
+    builds: &[crate::builds::Record],
 ) -> usize {
     match tab {
         TAB_BOXES => rows.len(),
+        TAB_BUILDS => builds.len(),
         TAB_PROFILES => profs.len(),
         TAB_STORAGE => vols.len(),
         _ => 0,
@@ -458,8 +462,9 @@ fn handle_nav(
         b'h' => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
         b'1' => switch(tab, sel, TAB_OVERVIEW),
         b'2' => switch(tab, sel, TAB_BOXES),
-        b'3' => switch(tab, sel, TAB_PROFILES),
-        b'4' => switch(tab, sel, TAB_STORAGE),
+        b'3' => switch(tab, sel, TAB_BUILDS),
+        b'4' => switch(tab, sel, TAB_PROFILES),
+        b'5' => switch(tab, sel, TAB_STORAGE),
         b'j' => down(sel),
         // Only the Boxes tab acts immediately (stop/pause/kill). Profiles/Storage keys just open a
         // modal, so the mutation (if any) happens later via Confirm/Form — nothing to refresh yet.
@@ -1015,6 +1020,7 @@ struct Snapshot {
     cfg: crate::config::KernConfig,
     profs: Vec<ProfRow>,
     vols: Vec<crate::volume::VolInfo>,
+    builds: Vec<crate::builds::Record>,
 }
 
 /// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) — used
@@ -1041,12 +1047,14 @@ fn refresh_full(
     let cfg = crate::config::load(None).unwrap_or_default();
     let profs = profile_rows(&cfg);
     let vols = crate::volume::entries();
+    let builds = crate::builds::list();
     Snapshot {
         rows,
         host,
         cfg,
         profs,
         vols,
+        builds,
     }
 }
 
@@ -1200,6 +1208,7 @@ fn render(
     host: &HostStats,
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
+    builds: &[crate::builds::Record],
     cols: usize,
     term_rows: usize,
     sel: usize,
@@ -1224,6 +1233,7 @@ fn render(
     for (i, name) in TABS.iter().enumerate() {
         let label = match i {
             TAB_BOXES => format!("{name} ({})", rows.len()),
+            TAB_BUILDS => format!("{name} ({})", builds.len()),
             TAB_PROFILES => format!("{name} ({})", profs.len()),
             TAB_STORAGE => format!("{name} ({})", vols.len()),
             _ => name.to_string(),
@@ -1258,6 +1268,7 @@ fn render(
         Mode::Nav => {
             match tab {
                 TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel)),
+                TAB_BUILDS => s.push_str(&builds_table(p, builds, body_rows, sel)),
                 TAB_PROFILES => s.push_str(&profiles_table(p, profs, body_rows, sel)),
                 TAB_STORAGE => s.push_str(&storage_table(p, vols, body_rows, sel)),
                 _ => s.push_str(&overview(p, rows, host)),
@@ -1684,6 +1695,56 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
 
 /// The Boxes tab: a per-box table, capped to `max_rows` so it never overflows the screen. `sel` is the
 /// highlighted row (the target of the lifecycle keys), marked with a `›` and reverse-video.
+/// The Builds tab: `kern build` history (newest first) — id, tag, coloured status (+ warning count),
+/// duration, size, age. A read-only in-`top` mirror of `kern builds`.
+fn builds_table(p: &Palette, builds: &[crate::builds::Record], max_rows: usize, sel: usize) -> String {
+    let (b, c, d, g, y, r, z) = (p.b, p.c, p.d, p.g, p.y, p.r, p.z);
+    let cut = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
+    let mut s = String::new();
+    s.push_str(&format!(
+        "\n  {d}build history — {z}{c}kern build -t NAME .{z}{d} · newest first{z}\n\n"
+    ));
+    s.push_str(&format!(
+        "  {b}{:<18} {:<16} {:<11} {:>8} {:>9}  CREATED{z}\n",
+        "ID", "TAG", "STATUS", "TIME", "SIZE"
+    ));
+    if builds.is_empty() {
+        s.push_str(&format!(
+            "  {d}no builds yet — run {z}{g}kern build -t app .{z}\n"
+        ));
+        return s;
+    }
+    let now = registry::now_unix();
+    let shown = builds.len().min(max_rows);
+    for (i, bd) in builds[..shown].iter().enumerate() {
+        let (lead, col) = sel_marker(p, i == sel);
+        let (sc, label) = match bd.status {
+            crate::builds::Status::Ok => (g, "ok".to_string()),
+            crate::builds::Status::Warn => (y, format!("warn {}", bd.warnings)),
+            crate::builds::Status::Failed => (r, "failed".to_string()),
+            crate::builds::Status::Running => (d, "interrupted".to_string()),
+        };
+        let dur = if bd.duration_ms < 1000 {
+            format!("{}ms", bd.duration_ms)
+        } else {
+            format!("{:.1}s", bd.duration_ms as f64 / 1000.0)
+        };
+        s.push_str(&format!(
+            "  {lead}{col}{:<18}{z} {:<16} {sc}{:<11}{z} {:>8} {:>9}  {d}{}{z}\n",
+            cut(&bd.id, 18),
+            cut(&bd.tag, 16),
+            label,
+            dur,
+            human_bytes(bd.size),
+            fmt_uptime(now.saturating_sub(bd.started)),
+        ));
+    }
+    if shown < builds.len() {
+        s.push_str(&format!("  {d}… {} more{z}\n", builds.len() - shown));
+    }
+    s
+}
+
 fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String {
     let (b, d, g, z) = (p.b, p.d, p.g, p.z);
     let mut s = String::new();
@@ -1829,6 +1890,7 @@ mod tests {
             TAB_BOXES,
             &boxes,
             &host,
+            &[],
             &[],
             &[],
             80,
