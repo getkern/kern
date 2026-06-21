@@ -343,7 +343,15 @@ fn ro_bind_ro(path: &str) -> Result<(), Error> {
 fn null_over(path: &str) -> Result<(), Error> {
     let src = cstr("/dev/null")?;
     let dst = cstr(path)?;
-    if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ptr::null(), libc::MS_BIND, ptr::null()) } != 0
+    if unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            ptr::null(),
+            libc::MS_BIND,
+            ptr::null(),
+        )
+    } != 0
     {
         return Err(Error::last("mount(mask proc)"));
     }
@@ -1075,9 +1083,8 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
     if let Some(slave) = tty_slave {
         let mut buf = [0u8; 256];
         if let Ok(link) = cstr(&format!("/proc/self/fd/{slave}")) {
-            let n = unsafe {
-                libc::readlink(link.as_ptr(), buf.as_mut_ptr().cast(), buf.len() - 1)
-            };
+            let n =
+                unsafe { libc::readlink(link.as_ptr(), buf.as_mut_ptr().cast(), buf.len() - 1) };
             if n > 0 {
                 let src = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
                 let target = format!("{root}/dev/console");

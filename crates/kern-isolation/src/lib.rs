@@ -22,14 +22,14 @@ mod ssh;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 pub use cgroup::apply_limits as apply_cgroup_limits;
+/// Is a user systemd manager present (a `systemd` dir under `$XDG_RUNTIME_DIR`)? The single
+/// definition — the scope re-exec gate and `kern doctor` both call it, so they can't drift.
+pub use cgroup::user_systemd_present;
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
 /// records itself in an in-process marker) and the scrub of an INHERITED marker (a nested kern must
 /// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,
 /// `env_claims_enforcer_but_none_real`) stay crate-internal — only `real.rs` reads them.
 pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
-/// Is a user systemd manager present (a `systemd` dir under `$XDG_RUNTIME_DIR`)? The single
-/// definition — the scope re-exec gate and `kern doctor` both call it, so they can't drift.
-pub use cgroup::user_systemd_present;
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::preflight as preflight_ports;
 pub use real::{

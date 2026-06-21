@@ -63,7 +63,8 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
             }
             Instr::Run(argv) => {
                 let joined = argv.join(" ");
-                if joined.contains("apt-get install") && !joined.contains("--no-install-recommends") {
+                if joined.contains("apt-get install") && !joined.contains("--no-install-recommends")
+                {
                     warns.push("RUN apt-get install without --no-install-recommends (pulls extra packages, larger image)".into());
                 }
                 if joined.contains("apt-get")
@@ -76,7 +77,9 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
                     && !joined.contains("--no-cache")
                     && !joined.contains("rm -rf /var/cache/apk")
                 {
-                    warns.push("RUN apk add without --no-cache (leaves the apk index in the layer)".into());
+                    warns.push(
+                        "RUN apk add without --no-cache (leaves the apk index in the layer)".into(),
+                    );
                 }
                 // A `cd` in its own RUN doesn't persist to later instructions — a frequent footgun.
                 let trimmed = joined.trim_start();
@@ -90,7 +93,10 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
             _ => {}
         }
     }
-    if !instrs.iter().any(|i| matches!(i, Instr::Cmd(_) | Instr::Entrypoint(_))) {
+    if !instrs
+        .iter()
+        .any(|i| matches!(i, Instr::Cmd(_) | Instr::Entrypoint(_)))
+    {
         warns.push("no CMD or ENTRYPOINT: the image has no default command".into());
     }
     warns

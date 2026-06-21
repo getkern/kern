@@ -453,7 +453,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 match *a {
                     "-o" | "--output" => {
                         out = Some(
-                            it.next().ok_or(Error::Usage("save <image> -o <file>"))?.to_string(),
+                            it.next()
+                                .ok_or(Error::Usage("save <image> -o <file>"))?
+                                .to_string(),
                         )
                     }
                     s if !s.starts_with('-') && image.is_none() => image = Some(s.to_string()),
@@ -488,7 +490,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "--status" => {
                         status = Some(
                             it.next()
-                                .ok_or(Error::Usage("builds --status <ok|warn|failed|interrupted>"))?
+                                .ok_or(Error::Usage(
+                                    "builds --status <ok|warn|failed|interrupted>",
+                                ))?
                                 .to_string(),
                         )
                     }

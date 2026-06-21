@@ -150,8 +150,8 @@ pub fn took_direct_cap_path() -> bool {
 ///   so our own legit scope re-exec would otherwise trip the warning on EVERY box and pollute each
 ///   detached box's log; the dedicated "--memory not enforced" message already tells that truth.
 pub fn env_claims_enforcer_but_none_real() -> bool {
-    let claims = std::env::var_os("KERN_SCOPE").is_some()
-        || std::env::var_os("KERN_MANAGED").is_some();
+    let claims =
+        std::env::var_os("KERN_SCOPE").is_some() || std::env::var_os("KERN_MANAGED").is_some();
     claims
         && current_v2_cgroup().is_some_and(|c| {
             controller_available_in_tree(&c, "memory") && !capped_in_tree(&c, "memory.max")
@@ -588,12 +588,21 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kern-wrl-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let f = d.join("memory.max");
-        assert!(wrote_real_limit(&f, "67108864"), "a byte count reads back → real cap");
+        assert!(
+            wrote_real_limit(&f, "67108864"),
+            "a byte count reads back → real cap"
+        );
         assert!(wrote_real_limit(&f, "512"), "pids-style count → real cap");
         // A host that accepts the write but leaves it uncapped reads back `max` → must be false.
-        assert!(!wrote_real_limit(&f, "max"), "`max` sentinel = NOT a real cap");
+        assert!(
+            !wrote_real_limit(&f, "max"),
+            "`max` sentinel = NOT a real cap"
+        );
         // An unwritable target (parent gone) → false, never a false positive.
-        assert!(!wrote_real_limit(&d.join("nope/memory.max"), "123"), "unwritable → false");
+        assert!(
+            !wrote_real_limit(&d.join("nope/memory.max"), "123"),
+            "unwritable → false"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -605,7 +614,10 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         assert!(d.exists());
         {
-            let _g = CgroupGuard { dir: d.clone(), origin: None };
+            let _g = CgroupGuard {
+                dir: d.clone(),
+                origin: None,
+            };
         } // guard dropped here
         assert!(
             !d.exists(),
@@ -618,7 +630,10 @@ mod tests {
         // An outer systemd `--collect` may remove the scope (and our dir) first — the guard's Drop must
         // tolerate ENOENT, not panic.
         let d = std::env::temp_dir().join(format!("kern-guard-gone-{}", std::process::id()));
-        let g = CgroupGuard { dir: d.clone(), origin: None }; // dir never created
+        let g = CgroupGuard {
+            dir: d.clone(),
+            origin: None,
+        }; // dir never created
         drop(g); // must not panic on ENOENT
         assert!(!d.exists());
     }

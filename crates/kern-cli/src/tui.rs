@@ -276,7 +276,14 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist);
     loop {
         let (cols, term_rows) = term_size();
-        let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols, &snap.builds, &snap.images);
+        let list_len = tab_list_len(
+            tab,
+            &snap.rows,
+            &snap.profs,
+            &snap.vols,
+            &snap.builds,
+            &snap.images,
+        );
         if sel >= list_len {
             sel = list_len.saturating_sub(1);
         }
@@ -1943,9 +1950,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
 fn images_table(p: &Palette, images: &[(String, u64, u64)], max_rows: usize, sel: usize) -> String {
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
     let cut = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
-    let mut s = format!(
-        "\n  {d}cached images — {z}{c}kern pull <image>{z}{d} · name order{z}\n\n"
-    );
+    let mut s = format!("\n  {d}cached images — {z}{c}kern pull <image>{z}{d} · name order{z}\n\n");
     s.push_str(&format!(
         "  {b}{:<24} {:<14} {:>9}  PULLED{z}\n",
         "REPOSITORY", "TAG", "SIZE"
@@ -1982,7 +1987,12 @@ fn images_table(p: &Palette, images: &[(String, u64, u64)], max_rows: usize, sel
 /// highlighted row (the target of the lifecycle keys), marked with a `›` and reverse-video.
 /// The Builds tab: `kern build` history (newest first) — id, tag, coloured status (+ warning count),
 /// duration, size, age. A read-only in-`top` mirror of `kern builds`.
-fn builds_table(p: &Palette, builds: &[crate::builds::Record], max_rows: usize, sel: usize) -> String {
+fn builds_table(
+    p: &Palette,
+    builds: &[crate::builds::Record],
+    max_rows: usize,
+    sel: usize,
+) -> String {
     let (b, c, d, g, y, r, z) = (p.b, p.c, p.d, p.g, p.y, p.r, p.z);
     let cut = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
     let mut s = String::new();
@@ -2049,7 +2059,10 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
         if !r.pod.is_empty() && r.pod != prev_pod {
             let n = rows.iter().filter(|x| x.pod == r.pod).count();
             let plural = if n == 1 { "box" } else { "boxes" };
-            s.push_str(&format!("  {b}{c}{}{z} {d}(pod · {n} {plural}){z}\n", r.pod));
+            s.push_str(&format!(
+                "  {b}{c}{}{z} {d}(pod · {n} {plural}){z}\n",
+                r.pod
+            ));
         }
         prev_pod = r.pod.as_str();
         // Tree connector inside the NAME cell for a pod member (└─ for the group's last member), so
