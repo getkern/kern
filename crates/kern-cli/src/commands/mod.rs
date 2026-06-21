@@ -6716,19 +6716,31 @@ fn boxes_matching_refs(
     running: Vec<registry::Instance>,
     refs: &[String],
 ) -> Vec<registry::Instance> {
-    let live_names: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
+    let live_names = live_name_set(&running);
     running
         .into_iter()
         .filter(|b| refs.iter().any(|n| ref_matches(b, n, &live_names)))
         .collect()
 }
 
+/// The set of live box names, for the NAME-wins gate. A `HashSet` (not a `Vec`) so `ref_matches`'
+/// membership test is O(1): it's called for every (box × ref) pair, so a `Vec::contains` scan would
+/// make selection O(N²) in the box count when stopping/pausing many refs.
+fn live_name_set(running: &[registry::Instance]) -> std::collections::HashSet<String> {
+    running.iter().map(|b| b.name.clone()).collect()
+}
+
 /// Does ref `n` select box `b`? A ref matches by NAME (always), else — only when no live box bears
 /// that exact name (NAME wins globally) — by its PID or by its POD name. Matching a pod name selects
 /// every member of that pod, so `kern stop <pod>` / `kern pause <pod>` act on the whole group.
-fn ref_matches(b: &registry::Instance, n: &str, live_names: &[String]) -> bool {
+fn ref_matches(
+    b: &registry::Instance,
+    n: &str,
+    live_names: &std::collections::HashSet<String>,
+) -> bool {
     n == b.name
-        || (!live_names.contains(&n.to_string())
+        // `HashSet<String>::contains(&str)` via Borrow — O(1), no per-call allocation.
+        || (!live_names.contains(n)
             // The pod branch guards against an EMPTY ref: a standalone box has `pod == ""`, so an
             // empty `n` would otherwise sweep every standalone box. A pid parses only when non-empty.
             && (n.parse::<i32>().ok() == Some(b.pid) || (!n.is_empty() && n == b.pod)))
@@ -6807,10 +6819,17 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         .map(|b| b.pod.as_str())
         .filter(|p| !p.is_empty())
         .collect();
+    // A pod survives iff some running member's pid ISN'T among the stopped targets. Compute the set of
+    // surviving pods in ONE pass with a pid HashSet — the naive `for pod { running.any(!targets.any) }`
+    // is O(pods·running·targets) (≈O(N³) on `stop --all` with many boxes); this is O(N).
+    let target_pids: std::collections::HashSet<i32> = targets.iter().map(|b| b.pid).collect();
+    let survivors: std::collections::HashSet<&str> = running
+        .iter()
+        .filter(|b| !b.pod.is_empty() && !target_pids.contains(&b.pid))
+        .map(|b| b.pod.as_str())
+        .collect();
     for pod in stopped_pods {
-        let survivor =
-            running.iter().any(|b| b.pod == pod && !targets.iter().any(|t| t.pid == b.pid));
-        if !survivor {
+        if !survivors.contains(pod) {
             let (existed, _) = crate::pod::teardown(pod);
             if existed {
                 println!("removed pod '{pod}'");
@@ -6821,7 +6840,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     // target by NAME, by its PID, or by its POD name (same rule as the selection above), so check all
     // three — else `kern stop <pid|pod>` acts AND then wrongly warns the ref "isn't a box".
     if !all {
-        let live_names: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
+        let live_names = live_name_set(&running);
         for n in names {
             let matched = targets.iter().any(|b| ref_matches(b, n, &live_names));
             if !matched && !managed_only.contains(n) {
@@ -6877,7 +6896,7 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
     let running = registry::list();
     // Captured before `running` is consumed — the unmatched-ref report below needs the full live-name
     // set to apply the same NAME-wins rule as selection (a pod/pid ref must not be called "not a box").
-    let live_names: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
+    let live_names = live_name_set(&running);
     let targets: Vec<_> = if all {
         running
     } else {
@@ -8098,7 +8117,8 @@ mod net_resource_tests {
     fn ref_matches_name_pid_and_pod_with_name_winning() {
         let web = inst("web", 100, "myapp");
         let db = inst("db", 101, "myapp");
-        let live = vec!["web".to_string(), "db".to_string()];
+        let live: std::collections::HashSet<String> =
+            ["web", "db"].into_iter().map(String::from).collect();
         // by exact NAME
         assert!(ref_matches(&web, "web", &live));
         assert!(!ref_matches(&db, "web", &live));
@@ -8111,7 +8131,7 @@ mod net_resource_tests {
         // NAME WINS: a ref equal to a live box name never falls through to the pid/pod branch — so a
         // box literally named "web" can't sweep a same-named pod, and a numeric name isn't shadowed.
         let numname = inst("100", 999, "grp");
-        let live2 = vec!["100".to_string()];
+        let live2: std::collections::HashSet<String> = ["100"].into_iter().map(String::from).collect();
         assert!(ref_matches(&numname, "100", &live2)); // matches by its NAME…
         let other = inst("x", 100, "grp"); // …and NOT by a coincidental pid == that name
         assert!(!ref_matches(&other, "100", &live2));
@@ -8121,11 +8141,12 @@ mod net_resource_tests {
     fn ref_matches_empty_ref_never_sweeps_standalone_boxes() {
         // A standalone box has pod == "". An empty ref (`kern stop ""`) must NOT match it via the pod
         // branch — otherwise one stray empty argument would stop/pause every standalone box at once.
+        let empty = std::collections::HashSet::new();
         let solo = inst("solo", 7, "");
-        assert!(!ref_matches(&solo, "", &[]));
+        assert!(!ref_matches(&solo, "", &empty));
         // …and an empty ref also can't match a real pod member (there's no pod named "").
         let member = inst("m", 8, "realpod");
-        assert!(!ref_matches(&member, "", &[]));
+        assert!(!ref_matches(&member, "", &empty));
     }
 
     #[test]
