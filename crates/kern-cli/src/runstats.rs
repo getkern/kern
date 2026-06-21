@@ -6,15 +6,29 @@
 //! nanoseconds plus a one-time page map. `kern top` samples the MONOTONIC total each refresh and
 //! derives runs/sec + a sparkline entirely reader-side.
 //!
-//! Only a monotonic total is tracked: `kern run` exec()s IN PLACE (no supervisor is left to run a
-//! decrement on exit), so "active/peak concurrent" would require a per-run reaper process — against
-//! the whole point of a ~1 ms run. Throughput + cumulative count are the honest, zero-cost metrics.
+//! Two honest, zero-cost fields are tracked (a page has room for more): a monotonic **total** count
+//! and the cumulative **setup latency** (process entry → `exec`, in microseconds) so `top` can show a
+//! real average — this IS kern's "~1 ms per run" overhead, measured, not guessed. What is NOT tracked:
+//! "active/peak CONCURRENT" — `kern run` exec()s IN PLACE (no supervisor left to decrement on exit), so
+//! a live-count would need a per-run reaper against the whole point of a ~1 ms run. `top` derives
+//! runs/sec, a session peak throughput, and a sparkline entirely reader-side from the monotonic total.
 
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// A page (room for future fields); only offset 0 (a u64 total) is used today.
+// A page (room for future fields). Offset 0 = u64 total count, offset 8 = u64 sum of setup-latency µs.
 const MAP_LEN: usize = 4096;
+
+/// Captured once at process entry (see [`mark_start`]); [`record`] measures entry→exec against it to
+/// accumulate the honest per-run setup latency. If `mark_start` was never called the latency add is 0
+/// (the count still increments) — a metric must never change behaviour, only observe it.
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Stamp the process-start instant, as early as possible in `main`. Cheap (one `Instant::now`), safe to
+/// call on every `kern` invocation — only `kern run` reads it back via [`record`].
+pub fn mark_start() {
+    let _ = START.set(std::time::Instant::now());
+}
 
 /// `$XDG_RUNTIME_DIR/kern/runstats` (falling back to `/run/user/<uid>` then `/tmp/kern-<uid>`), the
 /// same runtime-dir resolution as the box registry — so writer (`kern run`) and reader (`kern top`)
@@ -38,19 +52,29 @@ pub fn record() {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    with_map(&p, libc::O_RDWR | libc::O_CREAT, libc::PROT_READ | libc::PROT_WRITE, |ptr| {
-        // SAFETY: `ptr` is a valid MAP_SHARED page; offset 0 is a naturally-aligned u64 we only ever
-        // touch atomically, so concurrent writers from other `kern run` processes are race-free.
-        unsafe { &*(ptr as *const AtomicU64) }.fetch_add(1, Ordering::Relaxed);
+    // Setup latency = time from process entry (mark_start) to here (right before exec) = kern's own
+    // per-run overhead. Saturating cast so an absurd clock never wraps the accumulator.
+    let micros = START
+        .get()
+        .map(|s| s.elapsed().as_micros().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+    with_map(&p, libc::O_RDWR | libc::O_CREAT, libc::PROT_READ | libc::PROT_WRITE, |ptr| unsafe {
+        // SAFETY: `ptr` is a valid MAP_SHARED page; offsets 0 and 8 are naturally-aligned u64s we only
+        // ever touch atomically, so concurrent writers from other `kern run` processes are race-free.
+        (*(ptr as *const AtomicU64)).fetch_add(1, Ordering::Relaxed);
+        (*((ptr as *const u8).add(8) as *const AtomicU64)).fetch_add(micros, Ordering::Relaxed);
     });
 }
 
-/// The cumulative number of `kern run` invocations (0 if the counter file is absent/unreadable).
-/// Read-only and lock-free — safe to sample from `kern top` on every refresh.
-pub fn total() -> u64 {
-    let mut out = 0u64;
-    with_map(&path(), libc::O_RDONLY, libc::PROT_READ, |ptr| {
-        out = unsafe { &*(ptr as *const AtomicU64) }.load(Ordering::Relaxed);
+/// `(total, setup_latency_µs_sum)` — the cumulative `kern run` count and the summed entry→exec latency
+/// (both 0 if the counter file is absent/unreadable). Read-only and lock-free — safe to sample from
+/// `kern top` on every refresh; the average latency is `sum / total`.
+pub fn snapshot() -> (u64, u64) {
+    let mut out = (0u64, 0u64);
+    with_map(&path(), libc::O_RDONLY, libc::PROT_READ, |ptr| unsafe {
+        let total = (*(ptr as *const AtomicU64)).load(Ordering::Relaxed);
+        let sum = (*((ptr as *const u8).add(8) as *const AtomicU64)).load(Ordering::Relaxed);
+        out = (total, sum);
     });
     out
 }
@@ -93,11 +117,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_RUNTIME_DIR", &tmp);
 
-        assert_eq!(total(), 0, "fresh counter starts at 0");
+        assert_eq!(snapshot().0, 0, "fresh counter starts at 0");
         record();
         record();
         record();
-        assert_eq!(total(), 3, "three records → total 3");
+        assert_eq!(snapshot().0, 3, "three records → total 3");
 
         std::env::remove_var("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
