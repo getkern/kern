@@ -44,6 +44,7 @@ pub fn help() -> Result<(), Error> {
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
+    {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
     {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)
     {c}load{z} [-i file]                                                 Import an image from a tar (docker save format)
     {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds (build history)
