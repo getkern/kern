@@ -3717,7 +3717,7 @@ pub fn builds_list(
         ),
         None => None,
     };
-    let recs = crate::builds::filter_builds(crate::builds::list(), filter, status, limit);
+    let recs = crate::builds::query(filter, status, limit);
     if json {
         let mut out = String::from("[");
         for (i, r) in recs.iter().enumerate() {

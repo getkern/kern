@@ -282,6 +282,40 @@ pub fn list() -> Vec<Record> {
     out
 }
 
+/// The record ids (dir names) newest-first, WITHOUT opening any `meta`. An id is `<started_unix>-<pid>`
+/// and `started` is a fixed-width 10-digit stamp for every real record, so a descending string sort is
+/// newest-first — letting `query`/`prune` avoid the O(N) meta reads `list()` does when they only need
+/// the newest few. (The full/filtered path still uses `list()`'s exact `started` sort.)
+fn record_ids_newest_first() -> Vec<String> {
+    let mut ids: Vec<String> = match std::fs::read_dir(builds_dir()) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .filter(|n| valid_id(n))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+/// Records for a `kern builds` query, reading only what's needed. A bare `-n N` (no tag/status filter)
+/// reads just the N newest `meta` files — not the whole history — since ids sort newest-first without a
+/// read. Any tag/status filter must read all records (those fields live in the meta), so it falls back
+/// to `list()`.
+pub fn query(tag: Option<&str>, status: Option<Status>, limit: Option<usize>) -> Vec<Record> {
+    if tag.is_none() && status.is_none() {
+        if let Some(n) = limit {
+            return record_ids_newest_first()
+                .into_iter()
+                .take(n)
+                .filter_map(|id| get(&id))
+                .collect();
+        }
+    }
+    filter_builds(list(), tag, status, limit)
+}
+
 /// Apply the `kern builds` query to an already-newest-first list: keep records whose tag CONTAINS
 /// `tag` (if given) and whose status equals `status` (if given), then cap to the `limit` newest. Pure,
 /// so the filter/limit/status logic is unit-tested without the filesystem.
@@ -311,11 +345,11 @@ pub fn remove(id: &str) -> bool {
 
 /// Keep the `keep` newest records, delete the rest. Returns how many were removed. Build records have
 /// no liveness (a build is a past event), so retention is count-based, not "is it still running".
+/// Uses the name-only newest-first order so pruning a large history doesn't open every `meta` first.
 pub fn prune(keep: usize) -> usize {
-    let all = list(); // newest first
     let mut removed = 0;
-    for r in all.into_iter().skip(keep) {
-        if remove(&r.id) {
+    for id in record_ids_newest_first().into_iter().skip(keep) {
+        if remove(&id) {
             removed += 1;
         }
     }
@@ -535,6 +569,30 @@ mod tests {
         assert_eq!(Status::from_label("failed"), Some(Status::Failed));
         assert_eq!(Status::from_label("interrupted"), Some(Status::Running));
         assert_eq!(Status::from_label("bogus"), None);
+    }
+
+    #[test]
+    fn query_limit_only_reads_newest_n_without_full_scan() {
+        with_tmp_home(|| {
+            for (id, t) in [("100-1", 100u64), ("200-1", 200), ("300-1", 300)] {
+                write(&rec(id, t, Status::Ok)).unwrap();
+            }
+            // `-n 2` fast path: newest two, correct order, via name sort (no meta of 100-1 needed).
+            let got = query(None, None, Some(2));
+            assert_eq!(
+                got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                vec!["300-1", "200-1"]
+            );
+            // a tag filter still finds the right record (falls back to the full read path).
+            write(&Record {
+                tag: "special".into(),
+                ..rec("50-1", 50, Status::Ok)
+            })
+            .unwrap();
+            let f = query(Some("special"), None, None);
+            assert_eq!(f.len(), 1);
+            assert_eq!(f[0].id, "50-1");
+        });
     }
 
     #[test]
