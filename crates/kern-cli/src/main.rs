@@ -28,6 +28,7 @@ mod dockerfile;
 mod doctor;
 mod error;
 mod openat2;
+mod runstats;
 mod pod;
 mod ports;
 mod pty;

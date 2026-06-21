@@ -1194,6 +1194,10 @@ pub fn run(
     if let Some(n) = nice {
         unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) };
     }
+    // Bump the daemonless run-throughput counter (one atomic on a shared mmap) so `kern top` can show
+    // live runs/sec — done here, in the final process that actually runs the workload (past any
+    // scope re-exec), so each `kern run` counts exactly once. Best-effort: never fails the run.
+    crate::runstats::record();
     // exec() replaces this process with the command (which inherits the cgroup) and only returns on
     // failure — so a successful run propagates the command's own exit code as kern's.
     let err = std::process::Command::new(&command[0])
