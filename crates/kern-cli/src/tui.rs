@@ -133,6 +133,9 @@ struct Row {
     health: String,
     /// Published-ports summary (e.g. `8080->80`), empty if none — parity with `kern ps`.
     ports: String,
+    /// The pod (compose stack) this box belongs to, empty for a standalone box — drives the `kern ps`
+    /// tree grouping in the Boxes tab.
+    pod: String,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -1086,8 +1089,17 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
             ports: b.ports,
             name: b.name,
             pid: b.pid,
+            pod: b.pod,
         });
     }
+    // Group for the pod-tree view: standalone boxes first, then each pod's members contiguous (pods in
+    // name order). A STABLE sort, so registry order is preserved within a group — and the selection
+    // index stays valid (it just indexes this display order; actions still hit rows[sel]).
+    rows.sort_by(|a, b| {
+        (!a.pod.is_empty())
+            .cmp(&!b.pod.is_empty())
+            .then_with(|| a.pod.cmp(&b.pod))
+    });
     (rows, seen)
 }
 
@@ -1287,14 +1299,15 @@ fn help_text() -> String {
      \n\
      MOVE\n\
        Tab / → / l      next tab            ← / h      previous tab\n\
-       1 2 3 4          jump to a tab       ↑ ↓ / j k  select a row\n\
+       1 2 3 4 5        jump to a tab       ↑ ↓ / j k  select a row\n\
        q  or  Ctrl-C    quit\n\
      \n\
      TABS — what each one shows\n\
-       1 Overview   host CPU / RAM / load, and the totals across all boxes\n\
-       2 Boxes      every running box: MEM, CPU%, PIDS, HEALTH, PORTS\n\
-       3 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
-       4 Storage    physical disks (read-only) and your named volumes\n\
+       1 Overview   host CPU / RAM / load, run throughput, and the box totals\n\
+       2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
+       3 Builds     build history: status, duration, size, age (like kern builds)\n\
+       4 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
+       5 Storage    physical disks (read-only) and your named volumes\n\
      \n\
      BOXES tab — act on the selected box\n\
        s  stop        p  pause        u  unpause        k  kill\n\
@@ -1746,7 +1759,7 @@ fn builds_table(p: &Palette, builds: &[crate::builds::Record], max_rows: usize, 
 }
 
 fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String {
-    let (b, d, g, z) = (p.b, p.d, p.g, p.z);
+    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let mut s = String::new();
     s.push_str(&format!(
         "    {b}{:<16}  {:>7}  {:>8}  {:>8}  {:>5}  {:>4}  {:<9}  {:<14}  STATUS{z}\n",
@@ -1757,7 +1770,30 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
         return s;
     }
     let shown = rows.len().min(max_rows);
+    let mut prev_pod = "";
     for (i, r) in rows[..shown].iter().enumerate() {
+        // Pod header when entering a new pod group — the `kern ps` tree view: standalone boxes are
+        // flat, a pod's members sit under a `<pod> (pod · N boxes)` header, indented with ├─/└─.
+        if !r.pod.is_empty() && r.pod != prev_pod {
+            let n = rows.iter().filter(|x| x.pod == r.pod).count();
+            let plural = if n == 1 { "box" } else { "boxes" };
+            s.push_str(&format!("  {b}{c}{}{z} {d}(pod · {n} {plural}){z}\n", r.pod));
+        }
+        prev_pod = r.pod.as_str();
+        // Tree connector inside the NAME cell for a pod member (└─ for the group's last member), so
+        // every other column stays aligned. Empty for a standalone box.
+        let connector = if r.pod.is_empty() {
+            String::new()
+        } else if i + 1 >= shown || rows[i + 1].pod != r.pod {
+            "└─ ".to_string()
+        } else {
+            "├─ ".to_string()
+        };
+        let name_cell = format!(
+            "{connector}{}",
+            trunc(&r.name, 16usize.saturating_sub(connector.chars().count()))
+        );
+
         let mem = r.mem.map_or("-".into(), human_bytes);
         let tasks = r.tasks.map_or("-".into(), |n| n.to_string());
         let status = if r.paused {
@@ -1780,7 +1816,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
         let (lead, name_col) = sel_marker(p, i == sel);
         s.push_str(&format!(
             "  {lead}{name_col}{:<16}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}\n",
-            trunc(&r.name, 16),
+            name_cell,
             r.pid,
             fmt_uptime(r.uptime),
             mem,
@@ -1841,6 +1877,7 @@ mod tests {
             paused,
             health: String::new(),
             ports: String::new(),
+            pod: String::new(),
         }
     }
 
