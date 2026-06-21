@@ -3653,26 +3653,42 @@ pub(crate) struct ImageEntry {
     pub dangling: bool,
 }
 
-/// Is cached image `<stem>` unrunnable because its payload is missing? A flat pulled image (`<stem>/`)
-/// or a single-diff build (`<stem>.diff/`) is intact when its dir exists. A multi-layer build dangles
-/// when its `.layers` manifest references an `L/<key>` dir that no longer exists (a legitimately EMPTY
-/// build — a present but 0-byte layer — is NOT dangling). A sentinel with none of these has no payload.
-fn image_dangling(cache: &std::path::Path, stem: &str) -> bool {
-    if cache.join(stem).is_dir() || cache.join(format!("{stem}.diff")).is_dir() {
-        return false;
+/// On-disk `(size_bytes, dangling)` of cached image `<stem>`, computed in ONE pass — a flat pulled
+/// image (`<stem>/`) or single-diff build (`<stem>.diff/`) is sized by its dir and never dangles; a
+/// multi-layer build sums its referenced `L/<key>` dirs AND dangles if any is missing (a present but
+/// 0-byte layer is a valid EMPTY build, not dangling); a sentinel with no payload at all dangles. Both
+/// `kern images` and the build-history record read this, so size and health can't drift, and each
+/// manifest/layer is stat'd once. The layer cache is `<cache>/L` (== [`layer_cache_dir`] when `cache`
+/// is [`cache_dir`]), derived from the arg so it stays consistent with the entry and is testable.
+fn image_stat(cache: &std::path::Path, stem: &str) -> (u64, bool) {
+    let flat = cache.join(stem);
+    if flat.is_dir() {
+        return (dir_size(&flat), false);
+    }
+    let diff = cache.join(format!("{stem}.diff"));
+    if diff.is_dir() {
+        return (dir_size(&diff), false);
     }
     match std::fs::read_to_string(cache.join(format!("{stem}.layers"))) {
         Ok(body) => {
-            // The layer cache is always `<cache>/L` (see `layer_cache_dir`); derive it from the passed
-            // `cache` so this stays consistent with the entry it describes (and testable in isolation).
             let lc = cache.join("L");
-            body.lines()
+            let (mut size, mut dangling) = (0u64, false);
+            for key in body
+                .lines()
                 .skip(1) // line 0 is the base ref, not an `L/` key
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
-                .any(|k| !lc.join(k).is_dir())
+            {
+                let d = lc.join(key);
+                if d.is_dir() {
+                    size += dir_size(&d);
+                } else {
+                    dangling = true; // a referenced layer is gone → the image can't be assembled
+                }
+            }
+            (size, dangling)
         }
-        Err(_) => true, // no flat / no diff / no manifest → nothing to run
+        Err(_) => (0, true), // no flat / no diff / no manifest → nothing to run
     }
 }
 
@@ -3695,8 +3711,7 @@ pub(crate) fn image_entries() -> Vec<ImageEntry> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| stem.clone());
-            let size = image_size(&cache, &stem);
-            let dangling = image_dangling(&cache, &stem);
+            let (size, dangling) = image_stat(&cache, &stem);
             let pulled = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok()
@@ -4073,27 +4088,10 @@ pub fn build_prune(keep: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// On-disk size of the cached image whose sanitized stem is `stem` — a pulled (flat) image is
-/// `<stem>/`, a single-diff build is `<stem>.diff/`, a multi-layer build (`<stem>.layers`) sums its
-/// layer dirs in the `L/` cache. Extracted so `images()` and the build-history record agree exactly.
+/// On-disk size of cached image `<stem>` — the size half of [`image_stat`]. Used by the build-history
+/// record (which needs only the size, not the health flag).
 fn image_size(cache: &std::path::Path, stem: &str) -> u64 {
-    let flat = cache.join(stem);
-    let layers_file = cache.join(format!("{stem}.layers"));
-    if flat.is_dir() {
-        dir_size(&flat)
-    } else if layers_file.exists() {
-        let lc = layer_cache_dir();
-        std::fs::read_to_string(&layers_file)
-            .unwrap_or_default()
-            .lines()
-            .skip(1) // line 0 is the base ref
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-            .map(|k| dir_size(&lc.join(k)))
-            .sum()
-    } else {
-        dir_size(&cache.join(format!("{stem}.diff")))
-    }
+    image_stat(cache, stem).0
 }
 
 /// Recursive on-disk size of `dir` in bytes (best-effort). Uses the no-follow dirent file type, so
@@ -9230,25 +9228,27 @@ mod image_rm_tests {
     }
 
     #[test]
-    fn image_dangling_flags_missing_layers_not_empty_builds() {
-        // The honesty fix behind `kern images`: distinguish a broken image (layers gone → would fail to
-        // run) from a legitimately EMPTY build (a present but 0-byte layer).
+    fn image_stat_flags_missing_layers_not_empty_builds() {
+        // The honesty fix behind `kern images`: image_stat returns (size, dangling) in one pass, and
+        // distinguishes a broken image (layers gone → would fail to run) from a legitimately EMPTY build
+        // (a present but 0-byte layer → size 0 but NOT dangling).
         let tmp = std::env::temp_dir().join(format!("kern-dangling-{}", std::process::id()));
         let cache = tmp.join("images");
         let lc = cache.join("L");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&lc).unwrap();
 
-        // Present layer (even empty) → NOT dangling.
+        // Present but empty layer → size 0, NOT dangling (a valid empty build).
         std::fs::create_dir_all(lc.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
         std::fs::write(
             cache.join("empty-1.layers"),
             "base\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
         )
         .unwrap();
-        assert!(
-            !image_dangling(&cache, "empty-1"),
-            "a present (even 0-byte) layer is a valid empty build, not dangling"
+        assert_eq!(
+            image_stat(&cache, "empty-1"),
+            (0, false),
+            "a present (0-byte) layer is a valid empty build: size 0, not dangling"
         );
         // Missing layer → dangling.
         std::fs::write(
@@ -9257,18 +9257,18 @@ mod image_rm_tests {
         )
         .unwrap();
         assert!(
-            image_dangling(&cache, "broken-2"),
+            image_stat(&cache, "broken-2").1,
             "a manifest naming a missing L/ layer is dangling"
         );
         // A flat pulled image (dir present) → never dangling.
         std::fs::create_dir_all(cache.join("pulled-3")).unwrap();
         assert!(
-            !image_dangling(&cache, "pulled-3"),
+            !image_stat(&cache, "pulled-3").1,
             "a present flat rootfs is intact"
         );
         // A bare sentinel with no payload at all → dangling.
         assert!(
-            image_dangling(&cache, "orphan-4"),
+            image_stat(&cache, "orphan-4").1,
             "no flat/diff/layers → nothing to run"
         );
 
