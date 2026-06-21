@@ -195,6 +195,32 @@ fn term_size() -> (usize, usize) {
     }
 }
 
+/// An inotify fd watching the box registry dir for box create/remove/rename, or `-1` if unavailable.
+/// `kern top` polls this alongside stdin, so a box lifecycle change (from ANY kern process) refreshes
+/// the view INSTANTLY instead of on the next 1 s tick — the "no lag" property. Best-effort.
+fn setup_registry_watch() -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return -1;
+    }
+    if let Ok(dir) = crate::registry::dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+            let mask = libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_TO
+                | libc::IN_MOVED_FROM
+                | libc::IN_CLOSE_WRITE;
+            if unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) } >= 0 {
+                return fd;
+            }
+        }
+    }
+    unsafe { libc::close(fd) };
+    -1
+}
+
 /// Run the interactive TUI. Returns when the user quits (`q`, `Esc`, or `Ctrl-C`).
 pub fn run() -> Result<(), crate::error::Error> {
     let fd = 0; // stdin
@@ -226,8 +252,14 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut mode = Mode::Nav;
     let mut prev: HashMap<i32, (u64, Instant)> = HashMap::new();
     let mut prev_cpu: Option<(u64, u64)> = None;
+    let mut prev_runs: Option<(u64, std::time::Instant)> = None;
 
-    let mut snap = refresh_full(&mut prev, &mut prev_cpu);
+    // Live wake: an inotify watch on the box registry dir so a box created/removed by ANY kern
+    // process shows up INSTANTLY, with zero poll lag. Best-effort — if inotify or the dir is
+    // unavailable, the 1 s timer below still keeps the view fresh (just not sub-second on changes).
+    let ino_fd = setup_registry_watch();
+
+    let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs);
     loop {
         let (cols, term_rows) = term_size();
         let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols);
@@ -256,15 +288,34 @@ pub fn run() -> Result<(), crate::error::Error> {
         let _ = out.write_all(b"\x1b[J");
         let _ = out.flush();
 
-        // Wait up to ~1s for a key. On timeout, do a full refresh (a proper ~1 s CPU% window).
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 1000) } <= 0 {
-            snap = refresh_full(&mut prev, &mut prev_cpu);
+        // Wait for a key, a registry change (inotify), or ~1 s (the CPU%/stats window). A registry
+        // change wakes us instantly (no poll lag); the timer keeps stats fresh even when idle.
+        let mut pfds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: ino_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds = if ino_fd >= 0 { 2 } else { 1 };
+        if unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 1000) } <= 0 {
+            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs); // timeout → periodic refresh (CPU% window)
             continue;
+        }
+        // A registry change woke us: drain the inotify queue and refresh NOW. If no key is also
+        // pending, re-render and wait again — no 1 s lag on box appear/disappear.
+        if ino_fd >= 0 && pfds[1].revents & libc::POLLIN != 0 {
+            let mut ibuf = [0u8; 4096];
+            while unsafe { libc::read(ino_fd, ibuf.as_mut_ptr().cast(), ibuf.len()) } > 0 {}
+            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs);
+            if pfds[0].revents & libc::POLLIN == 0 {
+                continue;
+            }
         }
         let mut buf = [0u8; 8];
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
@@ -971,11 +1022,22 @@ struct Snapshot {
 fn refresh_full(
     prev: &mut HashMap<i32, (u64, Instant)>,
     prev_cpu: &mut Option<(u64, u64)>,
+    prev_runs: &mut Option<(u64, Instant)>,
 ) -> Snapshot {
     let (rows, seen) = collect_rows(prev);
     *prev = seen;
-    let (host, cpu_now) = read_host(*prev_cpu);
+    let (mut host, cpu_now) = read_host(*prev_cpu);
     *prev_cpu = cpu_now;
+    // Live `kern run` throughput from the mmap counter: cumulative total + rate since the last sample.
+    let rt = crate::runstats::total();
+    if let Some((pt, pi)) = *prev_runs {
+        let dt = pi.elapsed().as_secs_f64();
+        if dt > 0.05 {
+            host.runs_per_sec = rt.saturating_sub(pt) as f64 / dt;
+        }
+    }
+    host.runs_total = rt;
+    *prev_runs = Some((rt, Instant::now()));
     let cfg = crate::config::load(None).unwrap_or_default();
     let profs = profile_rows(&cfg);
     let vols = crate::volume::entries();
@@ -1028,6 +1090,10 @@ struct HostStats {
     cpu_pct: f64,
     cores: usize,
     load1: f64,
+    /// Cumulative `kern run` invocations (from the daemonless runstats mmap counter) + the derived
+    /// rate/sec — kern's fire-and-forget capped-process throughput, which Docker can't show at scale.
+    runs_total: u64,
+    runs_per_sec: f64,
 }
 
 impl HostStats {
@@ -1118,6 +1184,8 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
             cpu_pct,
             cores,
             load1,
+            runs_total: 0,
+            runs_per_sec: 0.0,
         },
         sample,
     )
@@ -1537,6 +1605,17 @@ fn storage_table(
     s
 }
 
+/// Compact large counts (`1.2k`, `3.4M`) for the runs metric — thousands of runs shouldn't sprawl.
+fn human_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
 /// The Overview tab: host resources first (the machine kern runs on), then the box aggregate.
 fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     let (b, d, z) = (p.b, p.d, p.z);
@@ -1565,6 +1644,18 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     // Physical disks — read-only hardware, the pool a `vdisk:` profile's image lives on.
     if let Some(summary) = disks_summary() {
         s.push_str(&row("Disks", format!("{d}{summary}{z}")));
+    }
+    // `kern run` throughput — fire-and-forget capped processes (~1 ms, no sandbox). Cumulative count +
+    // live rate from the daemonless mmap counter: kern's scale metric (Docker has no analogue).
+    if host.runs_total > 0 || host.runs_per_sec > 0.0 {
+        s.push_str(&row(
+            "Runs",
+            format!(
+                "{} {d}total · {:.0}/s{z}",
+                human_count(host.runs_total),
+                host.runs_per_sec
+            ),
+        ));
     }
 
     // Boxes — the aggregate of what kern is running.
@@ -1729,6 +1820,8 @@ mod tests {
             cpu_pct: 0.0,
             cores: 1,
             load1: 0.0,
+            runs_total: 0,
+            runs_per_sec: 0.0,
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
         let out = render(
