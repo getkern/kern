@@ -33,9 +33,9 @@ pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::preflight as preflight_ports;
 pub use real::{
-    exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder, set_cpu_affinity,
-    shed_inherited_fds, sub_range, trusted_helper, username, CapSpec, OverlayDirs, RealMounts,
-    SandboxSpec, VdiskMount, Volume,
+    default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
+    set_cpu_affinity, shed_inherited_fds, sub_range, trusted_helper, username, CapSpec,
+    OverlayDirs, RealMounts, SandboxSpec, VdiskMount, Volume,
 };
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};

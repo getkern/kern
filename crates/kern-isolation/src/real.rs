@@ -2165,6 +2165,14 @@ pub struct CapSpec {
     pub adds: Vec<u32>,
 }
 
+/// The bitmask (bit N = cap N) of the dangerous caps kern ALWAYS drops from a box's bounding set
+/// ([`DEFAULT_DROP`]). `kern top` reads a box's `CapBnd` and, if it intersects this mask, knows the box
+/// re-added a normally-dropped cap via `--cap-add` — i.e. it is LESS confined than the default. A
+/// rootless box's `CapEff` is full-but-namespaced (not a signal), so the bounding set is what matters.
+pub fn default_dropped_cap_mask() -> u64 {
+    DEFAULT_DROP.iter().fold(0u64, |m, &c| m | (1u64 << c))
+}
+
 /// The kernel's `CAP_LAST_CAP`, read from procfs (so a newer kernel's caps are covered by
 /// `--cap-drop ALL`); falls back to 40 (`CAP_CHECKPOINT_RESTORE`) where the file is unreadable.
 fn cap_last_cap() -> u32 {
@@ -2706,5 +2714,46 @@ mod cpuset_expand_tests {
         assert!(expand_cpu_list("999999999").is_empty());
         // Normal small lists are unaffected.
         assert_eq!(expand_cpu_list("0-3,5"), vec![0, 1, 2, 3, 5]);
+    }
+}
+
+#[cfg(test)]
+mod cap_mask_tests {
+    use super::*;
+
+    #[test]
+    fn default_dropped_mask_covers_the_dangerous_set_only() {
+        let m = default_dropped_cap_mask();
+        // Every DEFAULT_DROP cap is set: SYS_MODULE(16), SYS_RAWIO(17), SYS_BOOT(22), BPF(39), PERFMON(38).
+        for c in [16u32, 17, 20, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39] {
+            assert!(m & (1u64 << c) != 0, "cap {c} must be in the dropped mask");
+        }
+        // Kept caps are NOT in the mask (so a default box never false-flags): CHOWN(0), SETUID(7),
+        // NET_ADMIN(12), SYS_ADMIN(21), MKNOD(27), SYS_PTRACE(19).
+        for c in [0u32, 7, 12, 19, 21, 27] {
+            assert!(
+                m & (1u64 << c) == 0,
+                "kept cap {c} must NOT be in the dropped mask"
+            );
+        }
+        // The mask is exactly the default drop of an unmodified spec (the bounding set kern imposes).
+        assert_eq!(m, cap_drop_mask(&CapSpec::default()));
+    }
+
+    #[test]
+    fn cap_add_puts_a_dropped_cap_back_so_top_can_flag_it() {
+        // `--cap-add SYS_MODULE` removes cap 16 from the drop set → the box's bounding set KEEPS it →
+        // its CapBnd then intersects default_dropped_cap_mask(), which is how `kern top` flags caps:+.
+        let spec = CapSpec {
+            adds: vec![16],
+            ..Default::default()
+        };
+        let dropped = cap_drop_mask(&spec);
+        assert!(
+            dropped & (1u64 << 16) == 0,
+            "--cap-add SYS_MODULE must NOT drop cap 16"
+        );
+        // The bounding set = full minus the drop set; cap 16 survives and would be flagged.
+        assert!(default_dropped_cap_mask() & (1u64 << 16) != 0);
     }
 }

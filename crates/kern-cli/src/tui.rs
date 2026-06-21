@@ -1227,6 +1227,19 @@ fn box_isolation(pid: i32) -> String {
             flags.push("root-mapped");
         }
     }
+    // Extra caps: a box whose BOUNDING set (`CapBnd`) contains a cap kern always drops by default
+    // (DEFAULT_DROP — module load, raw I/O, BPF, …) was handed it back via `--cap-add`, so it is less
+    // confined than default. The bounding set is the honest signal: a rootless box's `CapEff` is full
+    // but namespaced (grants no host power) and would false-positive; `CapBnd` reflects what kern kept.
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        if let Some(bnd) = status.lines().find_map(|l| l.strip_prefix("CapBnd:")) {
+            if let Ok(bits) = u64::from_str_radix(bnd.trim(), 16) {
+                if bits & kern_isolation::default_dropped_cap_mask() != 0 {
+                    flags.push("caps:+");
+                }
+            }
+        }
+    }
     flags.join(" ")
 }
 
@@ -1495,7 +1508,7 @@ fn help_text() -> String {
      TABS — what each one shows\n\
        1 Overview   host CPU / RAM / load and the box totals\n\
        2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
-     \x20                (a yellow net:host / root-mapped flags a box LESS isolated than default)\n\
+     \x20                (yellow net:host / root-mapped / caps:+ flags a box LESS isolated than default)\n\
        3 Runs       kern run throughput: rate/sec, avg latency, peak, total (aggregate)\n\
        4 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
        5 Builds     build history: status, duration, size, age (like kern builds)\n\
@@ -2253,13 +2266,13 @@ mod tests {
             !safe.contains("net:host") && !safe.contains("root-mapped"),
             "an isolated box shows no deviation flag: {safe}"
         );
-        // A box that deviates (net:host / root-mapped) surfaces exactly that, as a heads-up.
+        // A box that deviates (net:host / root-mapped / caps:+) surfaces exactly that, as a heads-up.
         let mut r = row("loose", false);
-        r.iso = "net:host root-mapped".into();
+        r.iso = "net:host root-mapped caps:+".into();
         let out2 = boxes_table(&plain(), &[r], 10, usize::MAX);
         let loose = out2.lines().find(|l| l.contains("loose")).unwrap();
         assert!(
-            loose.contains("net:host") && loose.contains("root-mapped"),
+            loose.contains("net:host") && loose.contains("root-mapped") && loose.contains("caps:+"),
             "a less-confined box flags its deviations: {loose}"
         );
     }
