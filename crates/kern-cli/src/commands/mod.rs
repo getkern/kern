@@ -3713,13 +3713,40 @@ pub fn images(json: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// Delete one cached image, resolved by its ref (as shown in `kern images`) OR its sanitized stem:
-/// removes the `.ok` sentinel and the image's own payload (`<stem>/` pulled dir, `<stem>.diff/` build
-/// diff, `<stem>.layers` manifest, `<stem>.lock`), then sweeps any `L/` layers left referenced by no
-/// remaining image. Shared layers still used by another image survive. Returns bytes freed, or `None`
-/// if nothing matched. `want` is compared against BOTH the sanitized stem and the sentinel's ref text.
+/// A stem is a real [`sanitize_ref`] token only when it's non-empty and every byte is `[A-Za-z0-9_-]`.
+/// Delete paths gate on this so a **planted** `.ok` filename can never steer a removal outside the
+/// cache: e.g. a file literally named `...ok` has `Path::file_stem() == ".."`, which unchecked would
+/// make `cache.join(stem)` resolve to the cache's PARENT — `is_safe_stem` rejects it (`.` isn't allowed).
+fn is_safe_stem(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The on-disk artifacts of cached image `<stem>`: the flat rootfs dir, a single-diff dir, and the
+/// `.layers`/`.base`/`.image`/`.ok`/`.lock` sidecars. ONE place owns this list so every remover (`rmi`,
+/// untag, temp-stage drop) deletes the SAME set and can't drift — a leaked `.base`/`.image` would
+/// otherwise linger and misclassify a later same-name pull. Best-effort; a missing artifact is fine.
+/// `stem` MUST already be a [`sanitize_ref`] token (see [`is_safe_stem`]) — never raw user input.
+fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
+    let _ = std::fs::remove_dir_all(cache.join(stem));
+    let _ = std::fs::remove_dir_all(cache.join(format!("{stem}.diff")));
+    for suffix in [".layers", ".base", ".image", ".ok", ".lock"] {
+        let _ = std::fs::remove_file(cache.join(format!("{stem}{suffix}")));
+    }
+}
+
+/// Delete one cached image, resolved by its ref (as shown in `kern images`) OR its sanitized stem, then
+/// sweep any `L/` layers left referenced by no remaining image (shared layers survive). Returns bytes
+/// freed, or `None` if nothing matched. Resolution scans the `.ok` sentinels and prefers an exact REF
+/// (sentinel content) match over a stem match, so an image whose ref happens to equal another's stem
+/// can't be deleted by accident. Entries with an unsafe stem or an unreadable sentinel are skipped — a
+/// crafted name never steers the delete, and an empty `want` matches nothing.
 fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
-    let mut stem = None;
+    if want.is_empty() {
+        return None;
+    }
+    let (mut by_ref, mut by_stem) = (None, None);
     if let Ok(rd) = std::fs::read_dir(cache) {
         for e in rd.flatten() {
             let path = e.path();
@@ -3729,19 +3756,24 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
             let Some(st) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let content = std::fs::read_to_string(&path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            if st == want || content == want {
-                stem = Some(st.to_string());
-                break;
+            if !is_safe_stem(st) {
+                continue; // a planted `...ok` (stem `..`) is never a delete target
+            }
+            if st == want {
+                by_stem = Some(st.to_string());
+            }
+            // Only a READABLE sentinel counts as a ref match — never default to matching "".
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if content.trim() == want {
+                    by_ref = Some(st.to_string());
+                    break; // an exact ref match wins outright
+                }
             }
         }
     }
-    let stem = stem?;
-    // The image's OWN on-disk payload, measured before removal. A multi-layer build owns no dir here —
-    // its bytes live in the shared `L/` cache and are accounted by the orphan-layer sweep below.
+    let stem = by_ref.or(by_stem)?;
+    // The image's OWN on-disk payload (flat + single-diff), measured before removal. A multi-layer image
+    // owns no dir here — its bytes live in the shared `L/` cache, accounted by the orphan sweep below.
     let mut freed = 0u64;
     let flat = cache.join(&stem);
     let diff = cache.join(format!("{stem}.diff"));
@@ -3751,11 +3783,7 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     if diff.is_dir() {
         freed += dir_size(&diff);
     }
-    let _ = std::fs::remove_file(cache.join(format!("{stem}.ok")));
-    let _ = std::fs::remove_file(cache.join(format!("{stem}.lock")));
-    let _ = std::fs::remove_file(cache.join(format!("{stem}.layers")));
-    let _ = std::fs::remove_dir_all(&flat);
-    let _ = std::fs::remove_dir_all(&diff);
+    drop_image_artifacts(cache, &stem);
     // Reclaim layers this image was the last to reference (the sweep fails closed, so a shared layer is
     // never dropped while another image's manifest still names it).
     let (_, layer_freed) = sweep_orphan_layers();
@@ -3763,7 +3791,8 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
 }
 
 /// `kern rmi <image>...` — remove one or more cached images by ref (or sanitized stem). Per-image
-/// feedback: what it freed, or an explicit "no such image" — never a silent no-op.
+/// feedback: what it freed on success; any unknown ref is collected and the command FAILS (non-zero
+/// exit, one error listing them) so `kern rmi x && …` can't proceed on a no-op — matching `docker rmi`.
 pub fn image_rm(refs: &[String]) -> Result<(), Error> {
     if refs.is_empty() {
         return Err(Error::Usage(
@@ -3772,6 +3801,7 @@ pub fn image_rm(refs: &[String]) -> Result<(), Error> {
     }
     let cache = cache_dir();
     let p = crate::ui::Palette::detect();
+    let mut missing: Vec<&str> = Vec::new();
     for r in refs {
         match remove_image(&cache, r) {
             Some(freed) => {
@@ -3782,15 +3812,22 @@ pub fn image_rm(refs: &[String]) -> Result<(), Error> {
                     human_bytes(freed)
                 )
             }
-            None => eprintln!("kern: no such image '{r}'"),
+            None => missing.push(r),
         }
+    }
+    if !missing.is_empty() {
+        return Err(Error::Oci(format!(
+            "no such image: {} — `kern images` lists cached images",
+            missing.join(", ")
+        )));
     }
     Ok(())
 }
 
-/// `kern image prune` — reclaim orphaned build layers (`L/` dirs referenced by no image). Safe and
-/// non-destructive: every tagged image is kept; only dangling layers are freed.
-pub fn image_prune() -> Result<(), Error> {
+/// Reclaim orphaned build layers (`L/` dirs referenced by no image). Safe and non-destructive: every
+/// tagged image is kept; only dangling layers are freed. Invoked from the `kern top` Images tab (`p`);
+/// the CLI equivalent is `kern gc` (which also prunes dead-box sidecars).
+pub(crate) fn image_prune() -> Result<(), Error> {
     let (n, freed) = sweep_orphan_layers();
     let p = crate::ui::Palette::detect();
     if n == 0 {
@@ -5960,14 +5997,9 @@ fn merge_context(from: &std::path::Path, into: &std::path::Path) -> Result<(), E
 /// Remove a cached image (all sidecar forms) by ref — used to drop the internal temp stage images a
 /// multi-stage build creates. Best-effort.
 fn drop_cached_image(image: &str) -> Result<(), Error> {
-    let cache = cache_dir();
-    let safe = sanitize_ref(image);
-    let _ = std::fs::remove_dir_all(cache.join(&safe));
-    let _ = std::fs::remove_dir_all(cache.join(format!("{safe}.diff")));
-    let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
-    let _ = std::fs::remove_file(cache.join(format!("{safe}.base")));
-    let _ = std::fs::remove_file(cache.join(format!("{safe}.image")));
-    let _ = std::fs::remove_file(cache.join(format!("{safe}.ok")));
+    // `sanitize_ref` yields an `is_safe_stem` token, so this shares the single artifact-remover with
+    // `rmi` (they can't drift on which sidecars make up an image).
+    drop_image_artifacts(&cache_dir(), &sanitize_ref(image));
     Ok(())
 }
 
@@ -8990,6 +9022,72 @@ mod image_rm_tests {
             "stem resolves too"
         );
         assert!(remove_image(&cache, "ghost:1").is_none(), "a miss is None");
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rmi_rejects_a_planted_dotdot_stem_and_cannot_escape_the_cache() {
+        // A file literally named `...ok` has file_stem() == ".."; unchecked, cache.join("..") would let
+        // a `remove_dir_all` wipe the cache's PARENT. `is_safe_stem` must reject it — a delete never
+        // escapes the images dir, whatever a planted sentinel is named.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-rmiesc-{}", std::process::id()));
+        let cache = tmp.join("kern/images");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&cache).unwrap();
+        // A canary living in the cache's PARENT (`kern/`) — it must survive no matter what.
+        let canary = tmp.join("kern/CANARY");
+        std::fs::write(&canary, b"do-not-delete").unwrap();
+        // Plant the hostile sentinel: `...ok` (stem "..") with an arbitrary ref content.
+        std::fs::write(cache.join("...ok"), "evil:1").unwrap();
+
+        assert!(is_safe_stem("alpine_3_19-aaaa"));
+        assert!(!is_safe_stem("..") && !is_safe_stem(".") && !is_safe_stem(""));
+        // Neither the stem `..` nor the ref content can resolve to a deletion.
+        assert!(
+            remove_image(&cache, "..").is_none(),
+            "a `..` stem is never a target"
+        );
+        assert!(
+            remove_image(&cache, "evil:1").is_none(),
+            "a planted sentinel's ref is inert"
+        );
+        assert!(canary.exists(), "the cache-parent canary must be untouched");
+        assert!(cache.exists(), "the cache dir itself must be untouched");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rmi_removes_the_base_and_image_sidecars_too() {
+        // rmi must delete ALL sidecar forms (via the shared drop_image_artifacts) — a leaked `.base`
+        // would otherwise misclassify a later same-name pull.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-rmiside-{}", std::process::id()));
+        let cache = tmp.join("kern/images");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &tmp);
+
+        let stem = "myapp-cccc";
+        std::fs::write(cache.join(format!("{stem}.ok")), "myapp:latest").unwrap();
+        std::fs::write(cache.join(format!("{stem}.base")), "alpine").unwrap();
+        std::fs::write(cache.join(format!("{stem}.image")), "{}").unwrap();
+        std::fs::create_dir_all(cache.join(format!("{stem}.diff"))).unwrap();
+
+        assert!(remove_image(&cache, "myapp:latest").is_some());
+        for suffix in [".ok", ".base", ".image", ".diff"] {
+            assert!(
+                !cache.join(format!("{stem}{suffix}")).exists(),
+                "rmi must remove the {suffix} sidecar"
+            );
+        }
 
         std::env::remove_var("XDG_CACHE_HOME");
         let _ = std::fs::remove_dir_all(&tmp);

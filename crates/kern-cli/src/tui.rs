@@ -417,6 +417,11 @@ pub fn run() -> Result<(), crate::error::Error> {
             snap.cfg = crate::config::load(None).unwrap_or_default();
             snap.profs = profile_rows(&snap.cfg);
             snap.vols = crate::volume::entries();
+            // Also re-read the lists whose tabs now mutate (Images `d`/`p`, Builds `d`) so a deleted row
+            // disappears on the very next frame, not on the ≤1 s periodic refresh (inotify watches the
+            // box registry, not the image cache / build history).
+            snap.builds = crate::builds::list();
+            snap.images = crate::commands::image_entries();
         }
     }
     Ok(()) // _guard restores the terminal on drop
@@ -604,7 +609,12 @@ fn nav_images(k: u8, sel: usize, images: &[(String, u64, u64)], mode: &mut Mode)
         b'd' => {
             if let Some((name, ..)) = images.get(sel) {
                 *mode = Mode::Confirm {
-                    prompt: format!("remove image '{name}' and its unshared layers?  (y/n)"),
+                    // `name` is untrusted (`.ok` content) → scrub escapes in the prompt; the action still
+                    // carries the raw ref so `image_rm` resolves the real cache entry.
+                    prompt: format!(
+                        "remove image '{}' and its unshared layers?  (y/n)",
+                        crate::ui::scrub(name)
+                    ),
                     action: Pending::RemoveImage(name.clone()),
                 };
             }
@@ -1818,9 +1828,9 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
         s.push_str(&row("Disks", format!("{d}{summary}{z}")));
     }
     // `kern run` throughput lives on its own **Runs** tab (fire-and-forget capped processes) — Overview
-    // stays the host + box picture. A one-line pointer only while runs are actively streaming, so an
-    // idle Overview never carries a stale cumulative that reads as "current state".
-    if host.runs_per_sec > 0.0 {
+    // stays the host + box picture. A one-line pointer only while runs actively stream (same > 0.5/s
+    // threshold as the Runs-tab `⚡`, so the two never disagree), never a stale idle cumulative.
+    if host.runs_per_sec > 0.5 {
         s.push_str(&row(
             "Runs",
             format!("{d}⚡ live — see the {z}{b}Runs{z}{d} tab{z}"),
@@ -1969,10 +1979,12 @@ fn images_table(p: &Palette, images: &[(String, u64, u64)], max_rows: usize, sel
             Some((r, t)) if !t.contains('/') => (r, t),
             _ => (name.as_str(), "latest"),
         };
+        // The ref is the untrusted `.ok` sentinel content — scrub terminal escapes before it reaches the
+        // raw-mode alt-screen (same guard `image_detail` and the `kern images` CLI already apply).
         s.push_str(&format!(
             "  {lead}{col}{:<24}{z} {d}{:<14}{z} {:>9}  {d}{}{z}\n",
-            cut(repo, 24),
-            cut(tag, 14),
+            cut(&crate::ui::scrub(repo), 24),
+            cut(&crate::ui::scrub(tag), 14),
             human_bytes(*size),
             fmt_uptime(now.saturating_sub(*pulled)),
         ));

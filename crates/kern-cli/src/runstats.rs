@@ -8,7 +8,9 @@
 //!
 //! Two honest, zero-cost fields are tracked (a page has room for more): a monotonic **total** count
 //! and the cumulative **setup latency** (process entry → `exec`, in microseconds) so `top` can show a
-//! real average — this IS kern's "~1 ms per run" overhead, measured, not guessed. What is NOT tracked:
+//! real average — the per-run exec-setup cost, measured not guessed. (Honest caveat: for a *scoped*
+//! run the workload is exec'd in a re-exec'd child, so this is the child's entry→exec leg, not the full
+//! outer→inner setup — an under-, never over-count.) What is NOT tracked:
 //! "active/peak CONCURRENT" — `kern run` exec()s IN PLACE (no supervisor left to decrement on exit), so
 //! a live-count would need a per-run reaper against the whole point of a ~1 ms run. `top` derives
 //! runs/sec, a session peak throughput, and a sparkline entirely reader-side from the monotonic total.
