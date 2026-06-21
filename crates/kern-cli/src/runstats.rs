@@ -102,6 +102,15 @@ fn with_map(path: &std::path::Path, open_flags: i32, prot: i32, f: impl FnOnce(*
             // Idempotent: grow a fresh file to a page; never shrinks an existing one below a page.
             let _ = libc::ftruncate(fd, MAP_LEN as libc::off_t);
         }
+        // Guard against a SIGBUS: mapping MAP_LEN over a file SHORTER than a page leaves the page we
+        // touch (offsets 0/8) with no backing, and any access faults. A 0-byte counter — planted, or a
+        // failed/racing ftruncate — must not crash `kern top`. Refuse to map under a full page: the
+        // reader then reports 0, the writer skips this one increment rather than abort.
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 || (st.st_size as u64) < MAP_LEN as u64 {
+            libc::close(fd);
+            return;
+        }
         let ptr = libc::mmap(std::ptr::null_mut(), MAP_LEN, prot, libc::MAP_SHARED, fd, 0);
         libc::close(fd);
         if ptr == libc::MAP_FAILED {
@@ -131,6 +140,37 @@ mod tests {
         record();
         record();
         assert_eq!(snapshot().0, 3, "three records → total 3");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_short_counter_file_reads_as_empty_and_never_sigbuses() {
+        // A 0-byte counter (planted, externally truncated, or a failed/racing ftruncate) mmaps a page
+        // with no backing — touching it would SIGBUS and crash `kern top`. `with_map`'s fstat guard must
+        // make the reader report 0 instead, and the writer must self-heal the file (ftruncate to a page)
+        // then count. This test would ABORT the whole runner if the guard regressed.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-runstats-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("kern")).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+
+        std::fs::write(tmp.join("kern/runstats"), b"").unwrap(); // 0 bytes
+        assert_eq!(
+            snapshot(),
+            (0, 0),
+            "a 0-byte counter reads as empty, no crash"
+        );
+        record(); // self-heals: ftruncate grows it to a page, then increments
+        assert_eq!(
+            snapshot().0,
+            1,
+            "the writer grows the short file and counts"
+        );
 
         std::env::remove_var("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);

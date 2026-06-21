@@ -439,7 +439,7 @@ fn tab_list_len(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
-    images: &[(String, u64, u64)],
+    images: &[crate::commands::ImageEntry],
 ) -> usize {
     match tab {
         TAB_BOXES => rows.len(),
@@ -462,7 +462,7 @@ fn handle_nav(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
-    images: &[(String, u64, u64)],
+    images: &[crate::commands::ImageEntry],
     cfg: &crate::config::KernConfig,
     mode: &mut Mode,
 ) -> bool {
@@ -604,18 +604,18 @@ fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mo
 /// Images-tab action keys: delete the selected image (`d`), prune orphaned build layers (`p`), or open
 /// a read-only detail overlay (`Enter`). Images are pulled/built elsewhere (no in-`top` "create"), so
 /// the interactive surface is Delete + Prune + Read — the meaningful CRUD for a cache of artifacts.
-fn nav_images(k: u8, sel: usize, images: &[(String, u64, u64)], mode: &mut Mode) {
+fn nav_images(k: u8, sel: usize, images: &[crate::commands::ImageEntry], mode: &mut Mode) {
     match k {
         b'd' => {
-            if let Some((name, ..)) = images.get(sel) {
+            if let Some(img) = images.get(sel) {
                 *mode = Mode::Confirm {
-                    // `name` is untrusted (`.ok` content) → scrub escapes in the prompt; the action still
-                    // carries the raw ref so `image_rm` resolves the real cache entry.
+                    // the ref is untrusted (`.ok` content) → scrub escapes in the prompt; the action
+                    // still carries the raw ref so `image_rm` resolves the real cache entry.
                     prompt: format!(
                         "remove image '{}' and its unshared layers?  (y/n)",
-                        crate::ui::scrub(name)
+                        crate::ui::scrub(&img.name)
                     ),
-                    action: Pending::RemoveImage(name.clone()),
+                    action: Pending::RemoveImage(img.name.clone()),
                 };
             }
         }
@@ -660,14 +660,19 @@ fn nav_builds(k: u8, sel: usize, builds: &[crate::builds::Record], mode: &mut Mo
 
 /// A read-only detail block for one cached image (Images tab `Enter`). The ref is scrubbed of terminal
 /// escapes — a `.ok` sentinel's content is untrusted.
-fn image_detail(img: &(String, u64, u64)) -> String {
-    let (name, size, pulled) = img;
+fn image_detail(img: &crate::commands::ImageEntry) -> String {
     let now = registry::now_unix();
+    // A dangling image (layers gone) shows that plainly instead of a misleading `0 B` size.
+    let size = if img.dangling {
+        "dangling (missing layers — would fail to run)".to_string()
+    } else {
+        human_bytes(img.size)
+    };
     format!(
         "image {}\nsize     {}\npulled   {}\n\ndelete with `d` · reclaim layers with `p`",
-        crate::ui::scrub(name),
-        human_bytes(*size),
-        fmt_uptime(now.saturating_sub(*pulled)),
+        crate::ui::scrub(&img.name),
+        size,
+        fmt_uptime(now.saturating_sub(img.pulled)),
     )
 }
 
@@ -1136,7 +1141,7 @@ struct Snapshot {
     profs: Vec<ProfRow>,
     vols: Vec<crate::volume::VolInfo>,
     builds: Vec<crate::builds::Record>,
-    images: Vec<(String, u64, u64)>, // (repository:tag, size bytes, pulled unix)
+    images: Vec<crate::commands::ImageEntry>,
 }
 
 /// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) — used
@@ -1358,7 +1363,7 @@ fn render(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
-    images: &[(String, u64, u64)],
+    images: &[crate::commands::ImageEntry],
     cols: usize,
     term_rows: usize,
     sel: usize,
@@ -1483,7 +1488,7 @@ fn nav_footer(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
-    images: &[(String, u64, u64)],
+    images: &[crate::commands::ImageEntry],
 ) -> String {
     let (d, z) = (p.d, p.z);
     // Every footer ends with a permanent `[?] help` — a first-time user doesn't know `?` exists until
@@ -1958,8 +1963,13 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
 /// in-`top` mirror of `kern images`, sourced from the exact same [`crate::commands::image_entries`] so
 /// the two never drift. `repository:tag` is split on the last `:` (unless that tail holds a `/`, i.e. a
 /// `host:port/…` reference with no explicit tag → shown as `latest`).
-fn images_table(p: &Palette, images: &[(String, u64, u64)], max_rows: usize, sel: usize) -> String {
-    let (b, c, d, z) = (p.b, p.c, p.d, p.z);
+fn images_table(
+    p: &Palette,
+    images: &[crate::commands::ImageEntry],
+    max_rows: usize,
+    sel: usize,
+) -> String {
+    let (b, c, d, y, z) = (p.b, p.c, p.d, p.y, p.z);
     let cut = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
     let mut s = format!("\n  {d}cached images — {z}{c}kern pull <image>{z}{d} · name order{z}\n\n");
     s.push_str(&format!(
@@ -1974,20 +1984,24 @@ fn images_table(p: &Palette, images: &[(String, u64, u64)], max_rows: usize, sel
     }
     let now = registry::now_unix();
     let shown = images.len().min(max_rows);
-    for (i, (name, size, pulled)) in images[..shown].iter().enumerate() {
+    for (i, img) in images[..shown].iter().enumerate() {
         let (lead, col) = sel_marker(p, i == sel);
-        let (repo, tag) = match name.rsplit_once(':') {
+        let (repo, tag) = match img.name.rsplit_once(':') {
             Some((r, t)) if !t.contains('/') => (r, t),
-            _ => (name.as_str(), "latest"),
+            _ => (img.name.as_str(), "latest"),
         };
-        // The ref is the untrusted `.ok` sentinel content — scrub terminal escapes before it reaches the
-        // raw-mode alt-screen (same guard `image_detail` and the `kern images` CLI already apply).
+        // A dangling image (layers gone) shows `dangling` in yellow, never a misleading `0 B`. The ref is
+        // untrusted `.ok` content — scrub escapes before the raw alt-screen (as image_detail / the CLI do).
+        let size = if img.dangling {
+            format!("{y}{:>9}{z}", "dangling")
+        } else {
+            format!("{:>9}", human_bytes(img.size))
+        };
         s.push_str(&format!(
-            "  {lead}{col}{:<24}{z} {d}{:<14}{z} {:>9}  {d}{}{z}\n",
+            "  {lead}{col}{:<24}{z} {d}{:<14}{z} {size}  {d}{}{z}\n",
             cut(&crate::ui::scrub(repo), 24),
             cut(&crate::ui::scrub(tag), 14),
-            human_bytes(*size),
-            fmt_uptime(now.saturating_sub(*pulled)),
+            fmt_uptime(now.saturating_sub(img.pulled)),
         ));
     }
     if shown < images.len() {
