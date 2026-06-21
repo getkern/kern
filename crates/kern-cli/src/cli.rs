@@ -211,9 +211,13 @@ pub enum Command {
     Images {
         json: bool,
     },
-    /// `kern builds [--json]`: list past builds (build history — the `docker buildx history` analogue).
+    /// `kern builds [<tag>] [--status S] [-n N] [--json]`: list past builds (build history — the
+    /// `docker buildx history` analogue), optionally filtered by tag substring / outcome / count.
     Builds {
         json: bool,
+        filter: Option<String>,
+        status: Option<String>,
+        limit: Option<usize>,
     },
     /// `kern build logs <id>`: print a past build's captured transcript.
     BuildLogs {
@@ -424,9 +428,39 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("images") => Command::Images {
             json: rest.contains(&"--json"),
         },
-        Some("builds") => Command::Builds {
-            json: rest.contains(&"--json"),
-        },
+        Some("builds") => {
+            let mut json = false;
+            let (mut filter, mut status, mut limit) = (None, None, None);
+            let mut it = rest.iter().skip(1);
+            while let Some(a) = it.next() {
+                match *a {
+                    "--json" => json = true,
+                    "--status" => {
+                        status = Some(
+                            it.next()
+                                .ok_or(Error::Usage("builds --status <ok|warn|failed|interrupted>"))?
+                                .to_string(),
+                        )
+                    }
+                    "-n" | "--limit" => {
+                        limit = Some(
+                            it.next()
+                                .and_then(|n| n.parse().ok())
+                                .ok_or(Error::Usage("builds -n <N>"))?,
+                        )
+                    }
+                    // The first bare word is a tag-substring filter (`kern builds web`).
+                    s if !s.starts_with('-') && filter.is_none() => filter = Some(s.to_string()),
+                    _ => return Err(Error::Usage("builds [<tag>] [--status S] [-n N] [--json]")),
+                }
+            }
+            Command::Builds {
+                json,
+                filter,
+                status,
+                limit,
+            }
+        }
         // `stop <name>` / `kill <name>`: stop running box(es). kern's `stop` already SIGKILLs the
         // box's process group, so `kill` is a Docker-parity alias. `killall` = `stop --all`.
         Some("stop" | "kill") => {
@@ -1638,7 +1672,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodHolder => crate::pod::run_holder(),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
-        Command::Builds { json } => commands::builds_list(json),
+        Command::Builds {
+            json,
+            filter,
+            status,
+            limit,
+        } => commands::builds_list(json, filter.as_deref(), status.as_deref(), limit),
         Command::BuildLogs { id } => commands::build_logs(&id),
         Command::BuildInspect { id, json } => commands::build_inspect(&id, json),
         Command::BuildRm { ids } => commands::build_rm(&ids),
