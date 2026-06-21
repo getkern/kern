@@ -1163,11 +1163,12 @@ fn refresh_full(
     host.runs_total = rt;
     host.runs_avg_us = lat_sum_us.checked_div(rt).unwrap_or(0);
     // Reader-side sparkline: keep the last N runs/sec samples so the Runs tab shows recent shape, and
-    // track the session peak. The very first sample (no prior baseline) is 0 — harmless.
+    // track the session peak. The very first sample (no prior baseline) is 0 — harmless. One push per
+    // refresh, so at most one drop keeps the ring bounded.
     const SPARK_N: usize = 48;
     runs_hist.push(host.runs_per_sec);
     if runs_hist.len() > SPARK_N {
-        runs_hist.drain(0..runs_hist.len() - SPARK_N);
+        runs_hist.remove(0);
     }
     host.runs_peak = runs_hist.iter().copied().fold(0.0_f64, f64::max);
     host.runs_spark = runs_hist.clone();
