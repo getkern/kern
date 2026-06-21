@@ -1355,7 +1355,7 @@ fn nav_footer(
             )
         }
         _ => format!(
-            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}4{d}] jump{help}"
+            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}5{d}] jump{help}"
         ),
     }
 }
