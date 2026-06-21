@@ -1,7 +1,9 @@
 //! `kern top` — a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
-//! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Four tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
+//! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Six tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
 //! per-box table — MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) — with lifecycle
-//! actions: stop/pause/unpause/kill/logs), **Profiles** (the reusable
+//! actions: stop/pause/unpause/kill/logs), **Runs** (aggregate `kern run` throughput — rate/sec, avg
+//! setup latency, peak, total + sparkline; a `⚡` on the tab marks live activity), **Builds** (`kern
+//! build` history), **Profiles** (the reusable
 //! specs you attach by prefix — vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
 //! disks, and its `[[disk]]` is materialised from that choice, never hand-created) and **Storage** (the
 //! concrete data layer — physical disks read-only + named volumes you create). Host stats come straight
@@ -26,12 +28,13 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-const TABS: [&str; 5] = ["Overview", "Boxes", "Builds", "Profiles", "Storage"];
+const TABS: [&str; 6] = ["Overview", "Boxes", "Runs", "Builds", "Profiles", "Storage"];
 const TAB_OVERVIEW: usize = 0;
 const TAB_BOXES: usize = 1;
-const TAB_BUILDS: usize = 2;
-const TAB_PROFILES: usize = 3;
-const TAB_STORAGE: usize = 4;
+const TAB_RUNS: usize = 2;
+const TAB_BUILDS: usize = 3;
+const TAB_PROFILES: usize = 4;
+const TAB_STORAGE: usize = 5;
 
 /// What the TUI is doing right now: plain navigation, or a modal layered over it.
 enum Mode {
@@ -257,13 +260,14 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut prev: HashMap<i32, (u64, Instant)> = HashMap::new();
     let mut prev_cpu: Option<(u64, u64)> = None;
     let mut prev_runs: Option<(u64, std::time::Instant)> = None;
+    let mut runs_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the Runs tab
 
     // Live wake: an inotify watch on the box registry dir so a box created/removed by ANY kern
     // process shows up INSTANTLY, with zero poll lag. Best-effort — if inotify or the dir is
     // unavailable, the 1 s timer below still keeps the view fresh (just not sub-second on changes).
     let ino_fd = setup_registry_watch();
 
-    let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs);
+    let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist);
     loop {
         let (cols, term_rows) = term_size();
         let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols, &snap.builds);
@@ -309,7 +313,7 @@ pub fn run() -> Result<(), crate::error::Error> {
         ];
         let nfds = if ino_fd >= 0 { 2 } else { 1 };
         if unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 1000) } <= 0 {
-            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs); // timeout → periodic refresh (CPU% window)
+            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist); // timeout → periodic refresh (CPU% window)
             continue;
         }
         // A registry change woke us: drain the inotify queue and refresh NOW. If no key is also
@@ -317,7 +321,7 @@ pub fn run() -> Result<(), crate::error::Error> {
         if ino_fd >= 0 && pfds[1].revents & libc::POLLIN != 0 {
             let mut ibuf = [0u8; 4096];
             while unsafe { libc::read(ino_fd, ibuf.as_mut_ptr().cast(), ibuf.len()) } > 0 {}
-            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs);
+            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist);
             if pfds[0].revents & libc::POLLIN == 0 {
                 continue;
             }
@@ -465,9 +469,10 @@ fn handle_nav(
         b'h' => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
         b'1' => switch(tab, sel, TAB_OVERVIEW),
         b'2' => switch(tab, sel, TAB_BOXES),
-        b'3' => switch(tab, sel, TAB_BUILDS),
-        b'4' => switch(tab, sel, TAB_PROFILES),
-        b'5' => switch(tab, sel, TAB_STORAGE),
+        b'3' => switch(tab, sel, TAB_RUNS),
+        b'4' => switch(tab, sel, TAB_BUILDS),
+        b'5' => switch(tab, sel, TAB_PROFILES),
+        b'6' => switch(tab, sel, TAB_STORAGE),
         b'j' => down(sel),
         // Only the Boxes tab acts immediately (stop/pause/kill). Profiles/Storage keys just open a
         // modal, so the mutation (if any) happens later via Confirm/Form — nothing to refresh yet.
@@ -1032,13 +1037,15 @@ fn refresh_full(
     prev: &mut HashMap<i32, (u64, Instant)>,
     prev_cpu: &mut Option<(u64, u64)>,
     prev_runs: &mut Option<(u64, Instant)>,
+    runs_hist: &mut Vec<f64>,
 ) -> Snapshot {
     let (rows, seen) = collect_rows(prev);
     *prev = seen;
     let (mut host, cpu_now) = read_host(*prev_cpu);
     *prev_cpu = cpu_now;
-    // Live `kern run` throughput from the mmap counter: cumulative total + rate since the last sample.
-    let rt = crate::runstats::total();
+    // Live `kern run` throughput from the mmap counter: cumulative total + rate since the last sample,
+    // plus the honest average setup latency (summed entry→exec µs / total).
+    let (rt, lat_sum_us) = crate::runstats::snapshot();
     if let Some((pt, pi)) = *prev_runs {
         let dt = pi.elapsed().as_secs_f64();
         if dt > 0.05 {
@@ -1046,6 +1053,16 @@ fn refresh_full(
         }
     }
     host.runs_total = rt;
+    host.runs_avg_us = if rt > 0 { lat_sum_us / rt } else { 0 };
+    // Reader-side sparkline: keep the last N runs/sec samples so the Runs tab shows recent shape, and
+    // track the session peak. The very first sample (no prior baseline) is 0 — harmless.
+    const SPARK_N: usize = 48;
+    runs_hist.push(host.runs_per_sec);
+    if runs_hist.len() > SPARK_N {
+        runs_hist.drain(0..runs_hist.len() - SPARK_N);
+    }
+    host.runs_peak = runs_hist.iter().copied().fold(0.0_f64, f64::max);
+    host.runs_spark = runs_hist.clone();
     *prev_runs = Some((rt, Instant::now()));
     let cfg = crate::config::load(None).unwrap_or_default();
     let profs = profile_rows(&cfg);
@@ -1114,6 +1131,12 @@ struct HostStats {
     /// rate/sec — kern's fire-and-forget capped-process throughput, which Docker can't show at scale.
     runs_total: u64,
     runs_per_sec: f64,
+    /// Average per-run setup latency in microseconds (entry→exec, the honest "~1 ms"); 0 with no runs.
+    runs_avg_us: u64,
+    /// The highest runs/sec seen since `top` started (session peak throughput) and a reader-side ring of
+    /// recent runs/sec samples for the Runs-tab sparkline — both derived from the monotonic total.
+    runs_peak: f64,
+    runs_spark: Vec<f64>,
 }
 
 impl HostStats {
@@ -1206,6 +1229,9 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
             load1,
             runs_total: 0,
             runs_per_sec: 0.0,
+            runs_avg_us: 0,
+            runs_peak: 0.0,
+            runs_spark: Vec::new(),
         },
         sample,
     )
@@ -1248,6 +1274,8 @@ fn render(
             TAB_BUILDS => format!("{name} ({})", builds.len()),
             TAB_PROFILES => format!("{name} ({})", profs.len()),
             TAB_STORAGE => format!("{name} ({})", vols.len()),
+            // Runs is aggregate (no per-row list) — a ⚡ marks live throughput instead of a stale count.
+            TAB_RUNS if host.runs_per_sec > 0.5 => format!("{name} ⚡"),
             _ => name.to_string(),
         };
         if i == tab {
@@ -1280,6 +1308,7 @@ fn render(
         Mode::Nav => {
             match tab {
                 TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel)),
+                TAB_RUNS => s.push_str(&runs_table(p, host)),
                 TAB_BUILDS => s.push_str(&builds_table(p, builds, body_rows, sel)),
                 TAB_PROFILES => s.push_str(&profiles_table(p, profs, body_rows, sel)),
                 TAB_STORAGE => s.push_str(&storage_table(p, vols, body_rows, sel)),
@@ -1299,15 +1328,16 @@ fn help_text() -> String {
      \n\
      MOVE\n\
        Tab / → / l      next tab            ← / h      previous tab\n\
-       1 2 3 4 5        jump to a tab       ↑ ↓ / j k  select a row\n\
+       1 2 3 4 5 6      jump to a tab       ↑ ↓ / j k  select a row\n\
        q  or  Ctrl-C    quit\n\
      \n\
      TABS — what each one shows\n\
-       1 Overview   host CPU / RAM / load, run throughput, and the box totals\n\
+       1 Overview   host CPU / RAM / load and the box totals\n\
        2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
-       3 Builds     build history: status, duration, size, age (like kern builds)\n\
-       4 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
-       5 Storage    physical disks (read-only) and your named volumes\n\
+       3 Runs       kern run throughput: rate/sec, avg latency, peak, total (aggregate)\n\
+       4 Builds     build history: status, duration, size, age (like kern builds)\n\
+       5 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
+       6 Storage    physical disks (read-only) and your named volumes\n\
      \n\
      BOXES tab — act on the selected box\n\
        s  stop        p  pause        u  unpause        k  kill\n\
@@ -1355,7 +1385,7 @@ fn nav_footer(
             )
         }
         _ => format!(
-            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}5{d}] jump{help}"
+            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}6{d}] jump{help}"
         ),
     }
 }
@@ -1669,16 +1699,13 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     if let Some(summary) = disks_summary() {
         s.push_str(&row("Disks", format!("{d}{summary}{z}")));
     }
-    // `kern run` throughput — fire-and-forget capped processes (~1 ms, no sandbox). Cumulative count +
-    // live rate from the daemonless mmap counter: kern's scale metric (Docker has no analogue).
-    if host.runs_total > 0 || host.runs_per_sec > 0.0 {
+    // `kern run` throughput lives on its own **Runs** tab (fire-and-forget capped processes) — Overview
+    // stays the host + box picture. A one-line pointer only while runs are actively streaming, so an
+    // idle Overview never carries a stale cumulative that reads as "current state".
+    if host.runs_per_sec > 0.0 {
         s.push_str(&row(
             "Runs",
-            format!(
-                "{} {d}total · {:.0}/s{z}",
-                human_count(host.runs_total),
-                host.runs_per_sec
-            ),
+            format!("{d}⚡ live — see the {z}{b}Runs{z}{d} tab{z}"),
         ));
     }
 
@@ -1703,6 +1730,98 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
             "\n  {d}no running boxes — start one with `kern box <name> -d …`{z}\n"
         ));
     }
+    s
+}
+
+/// A tiny unicode-block sparkline of `samples`, scaled to their own max — a compact recent-shape glyph
+/// for the Runs tab. An all-zero (idle) window renders as a flat baseline, never a panic.
+fn spark(samples: &[f64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = samples.iter().copied().fold(0.0_f64, f64::max);
+    if max <= 0.0 {
+        return BARS[0].to_string().repeat(samples.len().max(1));
+    }
+    samples
+        .iter()
+        .map(|&v| {
+            let idx = ((v / max) * (BARS.len() - 1) as f64).round() as usize;
+            BARS[idx.min(BARS.len() - 1)]
+        })
+        .collect()
+}
+
+/// The Runs tab. `kern run` is fire-and-forget (~1 ms, no sandbox, exec-in-place, not registered), so it
+/// has NO per-row list — it's shown as **aggregate throughput**. Every figure here is really measured
+/// from the daemonless mmap counter: the live rate, the honest average setup latency (entry→exec — this
+/// IS the "~1 ms"), the session-peak rate, the cumulative total, and a recent-shape sparkline.
+/// Deliberately NOT shown: "active / peak concurrent" — unmeasurable without a per-run reaper that would
+/// defeat the whole point of a ~1 ms run, so we don't invent it.
+fn runs_table(p: &Palette, host: &HostStats) -> String {
+    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
+    let row = |k: &str, v: String| format!("  {b}{:<14}{z}{v}\n", k);
+    let mut s = format!(
+        "\n  {d}capped processes — {z}{c}kern run -- <cmd>{z}{d} · ~1 ms, no sandbox, fire-and-forget{z}\n\n"
+    );
+
+    if host.runs_total == 0 {
+        s.push_str(&format!(
+            "  {d}no runs yet — fire capped processes with {z}{c}kern run -- <cmd>{z}\n"
+        ));
+        s.push_str(&format!(
+            "  {d}e.g.  {z}{c}for i in $(seq 1000); do kern run -- true; done{z}\n\n"
+        ));
+        s.push_str(&format!(
+            "  {d}a run is a CPU/mem-capped process with no sandbox — Docker has no analogue this fast.{z}\n"
+        ));
+        return s;
+    }
+
+    let rate = host.runs_per_sec.round().max(0.0) as u64;
+    let per_min = (host.runs_per_sec * 60.0).round().max(0.0) as u64;
+    // Live rate is green while streaming, dim when idle (0/s) — the number is the honest "now".
+    let rate_col = if host.runs_per_sec > 0.5 { g } else { d };
+    s.push_str(&row(
+        "Throughput",
+        format!(
+            "{rate_col}{} {d}/s{z}   {d}({}/min){z}",
+            human_count(rate),
+            human_count(per_min)
+        ),
+    ));
+    s.push_str(&row(
+        "Avg latency",
+        format!(
+            "{:.1} {d}ms · kern setup overhead (entry→exec){z}",
+            host.runs_avg_us as f64 / 1000.0
+        ),
+    ));
+    s.push_str(&row(
+        "Peak",
+        format!(
+            "{} {d}/s · session max{z}",
+            human_count(host.runs_peak.round().max(0.0) as u64)
+        ),
+    ));
+    s.push_str(&row(
+        "Total",
+        format!("{} {d}cumulative{z}", human_count(host.runs_total)),
+    ));
+
+    // Recent-shape sparkline of runs/sec (the reader-side ring) — only once we have a couple of samples.
+    if host.runs_spark.len() >= 2 {
+        s.push_str(&format!(
+            "\n  {b}{:<14}{z}{g}{}{z}\n",
+            "Recent /s",
+            spark(&host.runs_spark)
+        ));
+    }
+
+    s.push_str(&format!(
+        "\n  {d}runs = capped processes (CPU/mem cgroup, no sandbox), fire-and-forget — shown as{z}\n"
+    ));
+    s.push_str(&format!(
+        "  {d}aggregate throughput, not a per-row list. This is what Docker can't do at scale.{z}\n"
+    ));
     s
 }
 
@@ -1920,6 +2039,9 @@ mod tests {
             load1: 0.0,
             runs_total: 0,
             runs_per_sec: 0.0,
+            runs_avg_us: 0,
+            runs_peak: 0.0,
+            runs_spark: Vec::new(),
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
         let out = render(

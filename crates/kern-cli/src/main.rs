@@ -51,6 +51,10 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // Stamp process entry as early as possible: `kern run` measures entry→exec against it to record its
+    // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Runs tab). Cheap and harmless
+    // on every other subcommand.
+    runstats::mark_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Map the result to an exit code in exactly ONE place (the lib/command layer returns
     // `Result`, never calls `process::exit` itself).
