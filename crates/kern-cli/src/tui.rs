@@ -28,13 +28,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-const TABS: [&str; 6] = ["Overview", "Boxes", "Runs", "Builds", "Profiles", "Storage"];
+const TABS: [&str; 7] = [
+    "Overview", "Boxes", "Runs", "Images", "Builds", "Profiles", "Storage",
+];
 const TAB_OVERVIEW: usize = 0;
 const TAB_BOXES: usize = 1;
 const TAB_RUNS: usize = 2;
-const TAB_BUILDS: usize = 3;
-const TAB_PROFILES: usize = 4;
-const TAB_STORAGE: usize = 5;
+const TAB_IMAGES: usize = 3;
+const TAB_BUILDS: usize = 4;
+const TAB_PROFILES: usize = 5;
+const TAB_STORAGE: usize = 6;
 
 /// What the TUI is doing right now: plain navigation, or a modal layered over it.
 enum Mode {
@@ -270,7 +273,7 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist);
     loop {
         let (cols, term_rows) = term_size();
-        let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols, &snap.builds);
+        let list_len = tab_list_len(tab, &snap.rows, &snap.profs, &snap.vols, &snap.builds, &snap.images);
         if sel >= list_len {
             sel = list_len.saturating_sub(1);
         }
@@ -283,6 +286,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             &snap.profs,
             &snap.vols,
             &snap.builds,
+            &snap.images,
             cols,
             term_rows,
             sel,
@@ -418,9 +422,11 @@ fn tab_list_len(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
+    images: &[(String, u64, u64)],
 ) -> usize {
     match tab {
         TAB_BOXES => rows.len(),
+        TAB_IMAGES => images.len(),
         TAB_BUILDS => builds.len(),
         TAB_PROFILES => profs.len(),
         TAB_STORAGE => vols.len(),
@@ -470,9 +476,10 @@ fn handle_nav(
         b'1' => switch(tab, sel, TAB_OVERVIEW),
         b'2' => switch(tab, sel, TAB_BOXES),
         b'3' => switch(tab, sel, TAB_RUNS),
-        b'4' => switch(tab, sel, TAB_BUILDS),
-        b'5' => switch(tab, sel, TAB_PROFILES),
-        b'6' => switch(tab, sel, TAB_STORAGE),
+        b'4' => switch(tab, sel, TAB_IMAGES),
+        b'5' => switch(tab, sel, TAB_BUILDS),
+        b'6' => switch(tab, sel, TAB_PROFILES),
+        b'7' => switch(tab, sel, TAB_STORAGE),
         b'j' => down(sel),
         // Only the Boxes tab acts immediately (stop/pause/kill). Profiles/Storage keys just open a
         // modal, so the mutation (if any) happens later via Confirm/Form — nothing to refresh yet.
@@ -1029,6 +1036,7 @@ struct Snapshot {
     profs: Vec<ProfRow>,
     vols: Vec<crate::volume::VolInfo>,
     builds: Vec<crate::builds::Record>,
+    images: Vec<(String, u64, u64)>, // (repository:tag, size bytes, pulled unix)
 }
 
 /// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) — used
@@ -1053,7 +1061,7 @@ fn refresh_full(
         }
     }
     host.runs_total = rt;
-    host.runs_avg_us = if rt > 0 { lat_sum_us / rt } else { 0 };
+    host.runs_avg_us = lat_sum_us.checked_div(rt).unwrap_or(0);
     // Reader-side sparkline: keep the last N runs/sec samples so the Runs tab shows recent shape, and
     // track the session peak. The very first sample (no prior baseline) is 0 — harmless.
     const SPARK_N: usize = 48;
@@ -1068,6 +1076,7 @@ fn refresh_full(
     let profs = profile_rows(&cfg);
     let vols = crate::volume::entries();
     let builds = crate::builds::list();
+    let images = crate::commands::image_entries();
     Snapshot {
         rows,
         host,
@@ -1075,6 +1084,7 @@ fn refresh_full(
         profs,
         vols,
         builds,
+        images,
     }
 }
 
@@ -1247,6 +1257,7 @@ fn render(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
+    images: &[(String, u64, u64)],
     cols: usize,
     term_rows: usize,
     sel: usize,
@@ -1271,6 +1282,7 @@ fn render(
     for (i, name) in TABS.iter().enumerate() {
         let label = match i {
             TAB_BOXES => format!("{name} ({})", rows.len()),
+            TAB_IMAGES => format!("{name} ({})", images.len()),
             TAB_BUILDS => format!("{name} ({})", builds.len()),
             TAB_PROFILES => format!("{name} ({})", profs.len()),
             TAB_STORAGE => format!("{name} ({})", vols.len()),
@@ -1309,6 +1321,7 @@ fn render(
             match tab {
                 TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel)),
                 TAB_RUNS => s.push_str(&runs_table(p, host)),
+                TAB_IMAGES => s.push_str(&images_table(p, images, body_rows, sel)),
                 TAB_BUILDS => s.push_str(&builds_table(p, builds, body_rows, sel)),
                 TAB_PROFILES => s.push_str(&profiles_table(p, profs, body_rows, sel)),
                 TAB_STORAGE => s.push_str(&storage_table(p, vols, body_rows, sel)),
@@ -1328,16 +1341,17 @@ fn help_text() -> String {
      \n\
      MOVE\n\
        Tab / → / l      next tab            ← / h      previous tab\n\
-       1 2 3 4 5 6      jump to a tab       ↑ ↓ / j k  select a row\n\
+       1 2 3 4 5 6 7    jump to a tab       ↑ ↓ / j k  select a row\n\
        q  or  Ctrl-C    quit\n\
      \n\
      TABS — what each one shows\n\
        1 Overview   host CPU / RAM / load and the box totals\n\
        2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
        3 Runs       kern run throughput: rate/sec, avg latency, peak, total (aggregate)\n\
-       4 Builds     build history: status, duration, size, age (like kern builds)\n\
-       5 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
-       6 Storage    physical disks (read-only) and your named volumes\n\
+       4 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
+       5 Builds     build history: status, duration, size, age (like kern builds)\n\
+       6 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
+       7 Storage    physical disks (read-only) and your named volumes\n\
      \n\
      BOXES tab — act on the selected box\n\
        s  stop        p  pause        u  unpause        k  kill\n\
@@ -1385,7 +1399,7 @@ fn nav_footer(
             )
         }
         _ => format!(
-            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}6{d}] jump{help}"
+            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}7{d}] jump{help}"
         ),
     }
 }
@@ -1825,6 +1839,48 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
     s
 }
 
+/// The Images tab: cached OCI images (`repository` + `tag` split, size, pulled age) — a read-only
+/// in-`top` mirror of `kern images`, sourced from the exact same [`crate::commands::image_entries`] so
+/// the two never drift. `repository:tag` is split on the last `:` (unless that tail holds a `/`, i.e. a
+/// `host:port/…` reference with no explicit tag → shown as `latest`).
+fn images_table(p: &Palette, images: &[(String, u64, u64)], max_rows: usize, sel: usize) -> String {
+    let (b, c, d, z) = (p.b, p.c, p.d, p.z);
+    let cut = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
+    let mut s = format!(
+        "\n  {d}cached images — {z}{c}kern pull <image>{z}{d} · name order{z}\n\n"
+    );
+    s.push_str(&format!(
+        "  {b}{:<24} {:<14} {:>9}  PULLED{z}\n",
+        "REPOSITORY", "TAG", "SIZE"
+    ));
+    if images.is_empty() {
+        s.push_str(&format!(
+            "  {d}no images yet — pull one with {z}{c}kern pull alpine{z}\n"
+        ));
+        return s;
+    }
+    let now = registry::now_unix();
+    let shown = images.len().min(max_rows);
+    for (i, (name, size, pulled)) in images[..shown].iter().enumerate() {
+        let (lead, col) = sel_marker(p, i == sel);
+        let (repo, tag) = match name.rsplit_once(':') {
+            Some((r, t)) if !t.contains('/') => (r, t),
+            _ => (name.as_str(), "latest"),
+        };
+        s.push_str(&format!(
+            "  {lead}{col}{:<24}{z} {d}{:<14}{z} {:>9}  {d}{}{z}\n",
+            cut(repo, 24),
+            cut(tag, 14),
+            human_bytes(*size),
+            fmt_uptime(now.saturating_sub(*pulled)),
+        ));
+    }
+    if shown < images.len() {
+        s.push_str(&format!("  {d}… {} more{z}\n", images.len() - shown));
+    }
+    s
+}
+
 /// The Boxes tab: a per-box table, capped to `max_rows` so it never overflows the screen. `sel` is the
 /// highlighted row (the target of the lifecycle keys), marked with a `›` and reverse-video.
 /// The Builds tab: `kern build` history (newest first) — id, tag, coloured status (+ warning count),
@@ -2049,6 +2105,7 @@ mod tests {
             TAB_BOXES,
             &boxes,
             &host,
+            &[],
             &[],
             &[],
             &[],
