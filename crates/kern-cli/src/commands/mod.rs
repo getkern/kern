@@ -3689,6 +3689,24 @@ pub fn images(json: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// One build record as a JSON object — the single emitter for both `kern builds --json` (an array of
+/// these) and `kern build inspect --json` (one of these), so the two can't drift on fields or escaping.
+fn build_json(r: &crate::builds::Record) -> String {
+    format!(
+        "{{\"id\":{},\"tag\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{},\"dockerfile\":{},\"context\":{},\"error\":{}}}",
+        json_str(&r.id),
+        json_str(&r.tag),
+        json_str(r.status.label()),
+        r.duration_ms,
+        r.started,
+        r.size,
+        r.warnings,
+        json_str(&r.dockerfile),
+        json_str(&r.context),
+        json_str(&r.error),
+    )
+}
+
 /// Compact build duration for the `kern builds` table (`ms` / `s` / `m` `s`).
 fn fmt_dur(ms: u64) -> String {
     if ms < 1000 {
@@ -3724,16 +3742,7 @@ pub fn builds_list(
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(&format!(
-                "{{\"id\":{},\"tag\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{}}}",
-                json_str(&r.id),
-                json_str(&r.tag),
-                json_str(r.status.label()),
-                r.duration_ms,
-                r.started,
-                r.size,
-                r.warnings,
-            ));
+            out.push_str(&build_json(r));
         }
         out.push(']');
         println!("{out}");
@@ -3810,19 +3819,7 @@ pub fn build_logs(id: &str) -> Result<(), Error> {
 pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
     let r = crate::builds::get(id).ok_or_else(|| Error::Build(format!("no build '{id}'")))?;
     if json {
-        println!(
-            "{{\"id\":{},\"tag\":{},\"dockerfile\":{},\"context\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{},\"error\":{}}}",
-            json_str(&r.id),
-            json_str(&r.tag),
-            json_str(&r.dockerfile),
-            json_str(&r.context),
-            json_str(r.status.label()),
-            r.duration_ms,
-            r.started,
-            r.size,
-            r.warnings,
-            json_str(&r.error),
-        );
+        println!("{}", build_json(&r));
     } else {
         let p = crate::ui::Palette::detect();
         // Free-text fields (tag/dockerfile/context/error) are scrubbed of terminal escapes — a record
