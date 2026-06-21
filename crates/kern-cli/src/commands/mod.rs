@@ -3639,12 +3639,48 @@ pub fn history(count: usize) -> Result<(), Error> {
 /// `kern images [--json]` — list OCI images pulled into the local cache. Each completed pull leaves
 /// a `<sanitized>.ok` sentinel whose *content* is the original image ref, next to the `<sanitized>/`
 /// rootfs dir — so we recover the real name, the on-disk size, and when it was pulled.
-/// The cached OCI images as `(repository:tag, size_bytes, pulled_unix)`, sorted by name — the SINGLE
-/// source for both `kern images` and the `kern top` Images tab, so the CLI and TUI can never drift on
-/// which images exist or their sizes.
-pub(crate) fn image_entries() -> Vec<(String, u64, u64)> {
+/// One cached OCI image as shown by `kern images` and the `kern top` Images tab.
+pub(crate) struct ImageEntry {
+    /// The original ref (`repository:tag`), recovered from the `.ok` sentinel's content.
+    pub name: String,
+    /// On-disk size in bytes (0 for an empty build — a valid image that added no files).
+    pub size: u64,
+    /// When it was pulled/built (unix seconds).
+    pub pulled: u64,
+    /// The image can't be assembled: a multi-layer build whose `.layers` manifest names an `L/` layer
+    /// dir that is GONE (swept/deleted), or a sentinel with no payload at all. It would FAIL to run, so
+    /// callers show a distinct `dangling` marker rather than a misleading `0 B` (which reads as "empty").
+    pub dangling: bool,
+}
+
+/// Is cached image `<stem>` unrunnable because its payload is missing? A flat pulled image (`<stem>/`)
+/// or a single-diff build (`<stem>.diff/`) is intact when its dir exists. A multi-layer build dangles
+/// when its `.layers` manifest references an `L/<key>` dir that no longer exists (a legitimately EMPTY
+/// build — a present but 0-byte layer — is NOT dangling). A sentinel with none of these has no payload.
+fn image_dangling(cache: &std::path::Path, stem: &str) -> bool {
+    if cache.join(stem).is_dir() || cache.join(format!("{stem}.diff")).is_dir() {
+        return false;
+    }
+    match std::fs::read_to_string(cache.join(format!("{stem}.layers"))) {
+        Ok(body) => {
+            // The layer cache is always `<cache>/L` (see `layer_cache_dir`); derive it from the passed
+            // `cache` so this stays consistent with the entry it describes (and testable in isolation).
+            let lc = cache.join("L");
+            body.lines()
+                .skip(1) // line 0 is the base ref, not an `L/` key
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .any(|k| !lc.join(k).is_dir())
+        }
+        Err(_) => true, // no flat / no diff / no manifest → nothing to run
+    }
+}
+
+/// The cached OCI images, sorted by name — the SINGLE source for both `kern images` and the `kern top`
+/// Images tab, so the CLI and TUI can never drift on which images exist, their sizes, or their health.
+pub(crate) fn image_entries() -> Vec<ImageEntry> {
     let cache = cache_dir();
-    let mut rows: Vec<(String, u64, u64)> = Vec::new(); // (image ref, size bytes, pulled unix)
+    let mut rows: Vec<ImageEntry> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&cache) {
         for e in entries.flatten() {
             let path = e.path();
@@ -3660,15 +3696,21 @@ pub(crate) fn image_entries() -> Vec<(String, u64, u64)> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| stem.clone());
             let size = image_size(&cache, &stem);
+            let dangling = image_dangling(&cache, &stem);
             let pulled = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
-            rows.push((name, size, pulled));
+            rows.push(ImageEntry {
+                name,
+                size,
+                pulled,
+                dangling,
+            });
         }
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
 }
 
@@ -3677,13 +3719,16 @@ pub fn images(json: bool) -> Result<(), Error> {
 
     if json {
         let mut out = String::from("[");
-        for (i, (name, size, pulled)) in rows.iter().enumerate() {
+        for (i, e) in rows.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"image\":{},\"size_bytes\":{size},\"pulled\":{pulled}}}",
-                json_str(name)
+                "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}}}",
+                json_str(&e.name),
+                e.size,
+                e.pulled,
+                e.dangling
             ));
         }
         out.push(']');
@@ -3700,13 +3745,25 @@ pub fn images(json: bool) -> Result<(), Error> {
             z = p.z
         );
         let now = registry::now_unix();
-        for (name, size, pulled) in &rows {
+        let mut dangling = 0usize;
+        for e in &rows {
             // `truncate` also strips escapes — the `.ok` sentinel content is untrusted.
-            let repo = format!("{}{}{:<30}{}", p.b, p.c, truncate(name, 30), p.z);
+            let repo = format!("{}{}{:<30}{}", p.b, p.c, truncate(&e.name, 30), p.z);
+            // A dangling image shows an explicit `dangling` (yellow), never a `0 B` that reads as "empty".
+            let size = if e.dangling {
+                dangling += 1;
+                format!("{}{:>9}{}", p.y, "dangling", p.z)
+            } else {
+                format!("{:>9}", human_bytes(e.size))
+            };
+            println!("{repo} {size}  {}", fmt_age(now.saturating_sub(e.pulled)));
+        }
+        if dangling > 0 {
             println!(
-                "{repo} {:>9}  {}",
-                human_bytes(*size),
-                fmt_age(now.saturating_sub(*pulled))
+                "{d}{dangling} dangling (missing layers) — reclaim with {z}{c}kern rmi <image>{z}{d} or {z}{c}kern gc{z}",
+                d = p.d,
+                z = p.z,
+                c = p.c
             );
         }
     }
@@ -9090,6 +9147,131 @@ mod image_rm_tests {
         }
 
         std::env::remove_var("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rmi_never_follows_a_symlinked_payload_dir() {
+        // If the payload `<stem>/` is a SYMLINK to a dir outside the cache, deleting the image must NOT
+        // reach through it — remove_dir_all unlinks the symlink, never the target's contents.
+        use std::os::unix::fs::symlink;
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-rmisym-{}", std::process::id()));
+        let cache = tmp.join("kern/images");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&cache).unwrap();
+        // A victim dir OUTSIDE the cache with a canary the delete must never touch.
+        let victim = tmp.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep"), b"precious").unwrap();
+        // Plant an image whose payload dir is a symlink to the victim.
+        let stem = "evil-dddd";
+        std::fs::write(cache.join(format!("{stem}.ok")), "evil:latest").unwrap();
+        symlink(&victim, cache.join(stem)).unwrap();
+
+        assert!(
+            remove_image(&cache, "evil:latest").is_some(),
+            "the sentinel resolves"
+        );
+        assert!(
+            !cache.join(format!("{stem}.ok")).exists(),
+            "the .ok sentinel is removed"
+        );
+        // The crucial invariant: the symlink TARGET (outside the cache) is untouched.
+        assert!(
+            victim.join("keep").exists(),
+            "a symlinked payload's target must survive rmi"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rmi_keeps_a_layer_still_referenced_by_another_image() {
+        // A shared L/ layer named by TWO images' manifests must survive rmi of the first, and only be
+        // reclaimed once its last referrer is removed — the fail-closed sweep, end to end.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-rmilayer-{}", std::process::id()));
+        let cache = tmp.join("kern/images");
+        let lc = cache.join("L");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&lc).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &tmp);
+
+        let key = "0123456789abcdef0123456789abcdef"; // 32 hex
+        std::fs::create_dir_all(lc.join(key)).unwrap();
+        std::fs::write(lc.join(key).join("blob"), vec![0u8; 2048]).unwrap();
+        for (stem, refn) in [("app1-1111", "app1:latest"), ("app2-2222", "app2:latest")] {
+            std::fs::write(cache.join(format!("{stem}.ok")), refn).unwrap();
+            std::fs::write(
+                cache.join(format!("{stem}.layers")),
+                format!("base\n{key}\n"),
+            )
+            .unwrap();
+        }
+
+        assert!(remove_image(&cache, "app1:latest").is_some());
+        assert!(
+            lc.join(key).is_dir(),
+            "a layer still referenced by another image must survive rmi"
+        );
+        assert!(remove_image(&cache, "app2:latest").is_some());
+        assert!(
+            !lc.join(key).exists(),
+            "an orphaned layer is reclaimed once its last referrer is gone"
+        );
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn image_dangling_flags_missing_layers_not_empty_builds() {
+        // The honesty fix behind `kern images`: distinguish a broken image (layers gone → would fail to
+        // run) from a legitimately EMPTY build (a present but 0-byte layer).
+        let tmp = std::env::temp_dir().join(format!("kern-dangling-{}", std::process::id()));
+        let cache = tmp.join("images");
+        let lc = cache.join("L");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&lc).unwrap();
+
+        // Present layer (even empty) → NOT dangling.
+        std::fs::create_dir_all(lc.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
+        std::fs::write(
+            cache.join("empty-1.layers"),
+            "base\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        assert!(
+            !image_dangling(&cache, "empty-1"),
+            "a present (even 0-byte) layer is a valid empty build, not dangling"
+        );
+        // Missing layer → dangling.
+        std::fs::write(
+            cache.join("broken-2.layers"),
+            "base\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        assert!(
+            image_dangling(&cache, "broken-2"),
+            "a manifest naming a missing L/ layer is dangling"
+        );
+        // A flat pulled image (dir present) → never dangling.
+        std::fs::create_dir_all(cache.join("pulled-3")).unwrap();
+        assert!(
+            !image_dangling(&cache, "pulled-3"),
+            "a present flat rootfs is intact"
+        );
+        // A bare sentinel with no payload at all → dangling.
+        assert!(
+            image_dangling(&cache, "orphan-4"),
+            "no flat/diff/layers → nothing to run"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
