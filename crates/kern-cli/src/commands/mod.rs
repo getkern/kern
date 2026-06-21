@@ -3703,6 +3703,95 @@ pub fn images(json: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// Delete one cached image, resolved by its ref (as shown in `kern images`) OR its sanitized stem:
+/// removes the `.ok` sentinel and the image's own payload (`<stem>/` pulled dir, `<stem>.diff/` build
+/// diff, `<stem>.layers` manifest, `<stem>.lock`), then sweeps any `L/` layers left referenced by no
+/// remaining image. Shared layers still used by another image survive. Returns bytes freed, or `None`
+/// if nothing matched. `want` is compared against BOTH the sanitized stem and the sentinel's ref text.
+fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
+    let mut stem = None;
+    if let Ok(rd) = std::fs::read_dir(cache) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("ok") {
+                continue;
+            }
+            let Some(st) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let content = std::fs::read_to_string(&path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if st == want || content == want {
+                stem = Some(st.to_string());
+                break;
+            }
+        }
+    }
+    let stem = stem?;
+    // The image's OWN on-disk payload, measured before removal. A multi-layer build owns no dir here —
+    // its bytes live in the shared `L/` cache and are accounted by the orphan-layer sweep below.
+    let mut freed = 0u64;
+    let flat = cache.join(&stem);
+    let diff = cache.join(format!("{stem}.diff"));
+    if flat.is_dir() {
+        freed += dir_size(&flat);
+    }
+    if diff.is_dir() {
+        freed += dir_size(&diff);
+    }
+    let _ = std::fs::remove_file(cache.join(format!("{stem}.ok")));
+    let _ = std::fs::remove_file(cache.join(format!("{stem}.lock")));
+    let _ = std::fs::remove_file(cache.join(format!("{stem}.layers")));
+    let _ = std::fs::remove_dir_all(&flat);
+    let _ = std::fs::remove_dir_all(&diff);
+    // Reclaim layers this image was the last to reference (the sweep fails closed, so a shared layer is
+    // never dropped while another image's manifest still names it).
+    let (_, layer_freed) = sweep_orphan_layers();
+    Some(freed + layer_freed)
+}
+
+/// `kern rmi <image>...` — remove one or more cached images by ref (or sanitized stem). Per-image
+/// feedback: what it freed, or an explicit "no such image" — never a silent no-op.
+pub fn image_rm(refs: &[String]) -> Result<(), Error> {
+    if refs.is_empty() {
+        return Err(Error::Usage(
+            "rmi <image>... — name at least one image (see `kern images`)",
+        ));
+    }
+    let cache = cache_dir();
+    let p = crate::ui::Palette::detect();
+    for r in refs {
+        match remove_image(&cache, r) {
+            Some(freed) => {
+                println!("{}removed{} image '{r}', freed {}", p.g, p.z, human_bytes(freed))
+            }
+            None => eprintln!("kern: no such image '{r}'"),
+        }
+    }
+    Ok(())
+}
+
+/// `kern image prune` — reclaim orphaned build layers (`L/` dirs referenced by no image). Safe and
+/// non-destructive: every tagged image is kept; only dangling layers are freed.
+pub fn image_prune() -> Result<(), Error> {
+    let (n, freed) = sweep_orphan_layers();
+    let p = crate::ui::Palette::detect();
+    if n == 0 {
+        println!("{}nothing to prune — no orphaned layers{}", p.d, p.z);
+    } else {
+        println!(
+            "{}pruned{} {n} orphaned layer{}, freed {}",
+            p.g,
+            p.z,
+            if n == 1 { "" } else { "s" },
+            human_bytes(freed)
+        );
+    }
+    Ok(())
+}
+
 /// One build record as a JSON object — the single emitter for both `kern builds --json` (an array of
 /// these) and `kern build inspect --json` (one of these), so the two can't drift on fields or escaping.
 fn build_json(r: &crate::builds::Record) -> String {
@@ -8829,5 +8918,52 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(&canary);
+    }
+}
+
+#[cfg(test)]
+mod image_rm_tests {
+    use super::*;
+
+    // Build a fake pulled-image entry in `cache`: a `<stem>.ok` sentinel (content = ref) + a `<stem>/`
+    // payload dir with one file of `bytes` bytes.
+    fn fake_image(cache: &std::path::Path, stem: &str, refname: &str, bytes: usize) {
+        std::fs::write(cache.join(format!("{stem}.ok")), refname).unwrap();
+        let dir = cache.join(stem);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("blob"), vec![0u8; bytes]).unwrap();
+    }
+
+    #[test]
+    fn rmi_removes_only_the_named_image_and_reports_freed() {
+        // Process-global env (XDG_CACHE_HOME) — serialize with every other env-mutating test.
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-rmitest-{}", std::process::id()));
+        let cache = tmp.join("kern/images");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &tmp);
+
+        fake_image(&cache, "alpine_3_19-aaaa", "alpine:3.19", 4096);
+        fake_image(&cache, "alpine_3_20-bbbb", "alpine:3.20", 4096);
+
+        // Resolve BY REF (as shown in `kern images`) and delete just that one.
+        let freed = remove_image(&cache, "alpine:3.19").expect("image should be found by ref");
+        assert!(freed >= 4096, "freed should include the payload dir, got {freed}");
+        assert!(
+            !cache.join("alpine_3_19-aaaa.ok").exists() && !cache.join("alpine_3_19-aaaa").exists(),
+            "the removed image's sentinel and payload are both gone"
+        );
+        // The OTHER image is untouched (no over-broad sweep).
+        assert!(
+            cache.join("alpine_3_20-bbbb.ok").exists() && cache.join("alpine_3_20-bbbb").is_dir(),
+            "an unrelated image must survive a targeted rmi"
+        );
+        // Also resolvable BY STEM, and a miss returns None (→ "no such image", never a silent success).
+        assert!(remove_image(&cache, "alpine_3_20-bbbb").is_some(), "stem resolves too");
+        assert!(remove_image(&cache, "ghost:1").is_none(), "a miss is None");
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

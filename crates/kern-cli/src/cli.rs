@@ -211,6 +211,11 @@ pub enum Command {
     Images {
         json: bool,
     },
+    /// `kern rmi <image>...`: remove cached images by ref (or sanitized stem), reclaiming any layers
+    /// left referenced by no other image.
+    Rmi {
+        images: Vec<String>,
+    },
     /// `kern save <image> [-o file]`: export a cached image to a `docker load`-compatible tar.
     Save {
         image: String,
@@ -436,6 +441,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `images`: list pulled (cached) images.
         Some("images") => Command::Images {
             json: rest.contains(&"--json"),
+        },
+        // `rmi <image>...`: delete cached images (the counterpart to `pull`).
+        Some("rmi") => Command::Rmi {
+            images: rest.iter().skip(1).map(|s| s.to_string()).collect(),
         },
         Some("save") => {
             let (mut image, mut out) = (None, None);
@@ -1713,6 +1722,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodHolder => crate::pod::run_holder(),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
+        Command::Rmi { images } => commands::image_rm(&images),
         Command::Save { image, out } => commands::save(&image, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),
         Command::Builds {
