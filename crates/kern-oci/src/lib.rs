@@ -1,10 +1,12 @@
 //! OCI image handling for kern: pull, layer extraction, whiteout application, and Hub search.
 
+mod archive;
 mod json;
 mod net;
 mod pull;
 mod push;
 mod search;
+pub use archive::{load, save, Loaded};
 pub use pull::{pull, ImageConfig, OciError, Platform};
 pub use push::{push, ImageConfigOut};
 pub use search::{search, SearchResult};

@@ -31,6 +31,8 @@ const VERBS: &[&str] = &[
     "search",
     "images",
     "builds",
+    "save",
+    "load",
     "compose",
     "volume",
     "config",

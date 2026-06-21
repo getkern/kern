@@ -978,7 +978,7 @@ pub(crate) fn under_escaping(p: &str, set: &std::collections::HashSet<String>) -
 }
 
 /// Max uncompressed bytes per layer — a decompression-bomb ceiling (2 GiB).
-const MAX_LAYER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_LAYER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Max entries per layer — a dir/empty-file *inode* bomb has ~0 byte total but still exhausts the fs.
 const MAX_LAYER_ENTRIES: u64 = 2_000_000;
 /// Max COMPRESSED bytes for a single layer download (curl `--max-filesize`), as a string for the argv.
@@ -1091,7 +1091,7 @@ fn userns_ok() -> bool {
 /// the inherited stderr); the single-uid mapping means its in-ns root can only override perms on the
 /// USER'S OWN files (a root-owned host file appears as the unmapped overflow uid → DAC still blocks
 /// it), so the unpack gains no power over anything outside the user's own image cache.
-fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Result<(), OciError> {
+pub(crate) fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Result<(), OciError> {
     let is_root = unsafe { libc::geteuid() == 0 };
     if is_root || !userns_ok() {
         return f();
@@ -1143,7 +1143,7 @@ fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Result<(), OciEr
 /// actual, already-sha256-verified bytes. `Plain` is an uncompressed tar (`…tar`, no `+gzip`/`+zstd`)
 /// — accepting it also fixes a latent gap where uncompressed OCI layers failed the gzip-only path.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Compression {
+pub(crate) enum Compression {
     Gzip,
     Zstd,
     Plain,
@@ -1153,7 +1153,7 @@ enum Compression {
 /// `28 b5 2f fd`, anything else = an uncompressed tar. Reads at most 4 bytes; a short/empty read is
 /// treated as `Plain` (tar then errors cleanly). Called only AFTER `verify_digest`, so the content is
 /// authentic — sniffing adds no attack surface.
-fn detect_compression(path: &Path) -> Compression {
+pub(crate) fn detect_compression(path: &Path) -> Compression {
     use std::io::Read;
     let mut buf = [0u8; 4];
     let n = std::fs::File::open(path)
@@ -1198,7 +1198,7 @@ fn zstd_missing() -> OciError {
 /// target (on non-GNU tar), device/special nodes, a total uncompressed size over the 2 GiB bomb cap,
 /// and an entry count over the inode cap. (Cross-layer symlink escapes are additionally handled
 /// structurally by isolated staging + no-follow merge in [`merge_layer`].)
-fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(), OciError> {
+pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(), OciError> {
     let path = tar_path.to_string_lossy();
     // Plain (uncompressed) tar: vet the file directly, no decompressor process.
     if comp == Compression::Plain {
@@ -1649,7 +1649,7 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
 /// symlink to escape through — refuse). `.wh.<name>` deletes `<name>`; `.wh..wh..opq` drops the
 /// directory's lower-layer contents. Targets are removed without following symlinks, so the
 /// merge can never write through one.
-fn merge_layer(staging: &Path, dest: &Path) -> Result<(), OciError> {
+pub(crate) fn merge_layer(staging: &Path, dest: &Path) -> Result<(), OciError> {
     let dest_s = dest
         .to_str()
         .ok_or_else(|| OciError::Extract("non-utf8 rootfs path".into()))?;

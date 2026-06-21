@@ -44,6 +44,8 @@ pub fn help() -> Result<(), Error> {
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
+    {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)
+    {c}load{z} [-i file]                                                 Import an image from a tar (docker save format)
     {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds (build history)
     {c}build{z} logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
@@ -4157,6 +4159,85 @@ pub fn push(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
         remove_build_tree(&tmp); // squashed rootfs (overlay merge) → force-clean mode-000 dirs
     }
     result
+}
+
+/// `kern save <image> [-o file]` — export a cached image to a `docker load`-compatible tar (offline /
+/// air-gapped transfer). Materializes the image to one rootfs (like `push`), then writes the archive.
+pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
+    let (rootfs, config, cleanup) = materialize_image(image)?;
+    let cfg = kern_oci::ImageConfigOut {
+        entrypoint: config.entrypoint,
+        cmd: config.cmd,
+        env: config.env,
+        workdir: config.workdir,
+        user: config.user,
+    };
+    let work = cache_dir().join(format!(".save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("save work dir: {e}")))?;
+    let result = kern_oci::save(
+        &rootfs,
+        &cfg,
+        std::slice::from_ref(&image.to_string()),
+        out.map(std::path::Path::new),
+        &work,
+    )
+    .map_err(|e| Error::Oci(e.to_string()));
+    let _ = std::fs::remove_dir_all(&work);
+    if let Some(tmp) = cleanup {
+        remove_build_tree(&tmp);
+    }
+    if result.is_ok() {
+        // On stderr so a `kern save img > img.tar` (stdout) stream stays clean.
+        eprintln!(
+            "✓ saved '{image}'{}",
+            out.map(|o| format!(" → {o}")).unwrap_or_default()
+        );
+    }
+    result
+}
+
+/// `kern load [-i file]` — import an image from a `docker save`-format tar (kern's OR docker's), file
+/// or stdin. Every tar is vetted + extracted through the SAME hardened path as `pull` (an archive is
+/// as untrusted as a registry image).
+pub fn load(input: Option<&str>) -> Result<(), Error> {
+    let cache = cache_dir();
+    own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
+    let work = cache.join(format!(".load-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let loaded = kern_oci::load(input.map(std::path::Path::new), &work)
+        .map_err(|e| Error::Oci(e.to_string()));
+    let loaded = match loaded {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e);
+        }
+    };
+    for img in &loaded {
+        let Some(primary) = img.repo_tags.first() else {
+            eprintln!("kern: loaded an untagged image (skipped — no name to reference it by)");
+            continue;
+        };
+        let safe = sanitize_ref(primary);
+        let dest = cache.join(&safe);
+        let _ = std::fs::remove_dir_all(&dest);
+        // Place the assembled rootfs as the image's cache dir + write the sentinel and config sidecar,
+        // the exact on-disk shape of a flat pulled image (so `box --image <tag>` / `images` see it).
+        std::fs::rename(&img.rootfs, &dest).map_err(|e| Error::Oci(format!("load rootfs: {e}")))?;
+        std::fs::write(cache.join(format!("{safe}.ok")), primary.as_bytes())
+            .map_err(|e| Error::Oci(format!("load sentinel: {e}")))?;
+        write_image_config(&cache.join(format!("{safe}.image")), &img.config);
+        println!("loaded '{primary}'");
+        // Extra RepoTags become aliases (content-shared where possible), like `docker load`.
+        for t in img.repo_tags.iter().skip(1) {
+            if tag(primary, t).is_ok() {
+                println!("loaded '{t}'");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(())
 }
 
 /// `kern tag <src> <dst>` — give a cached image a second name, so `build -t x` then `tag x y:1.0` then
