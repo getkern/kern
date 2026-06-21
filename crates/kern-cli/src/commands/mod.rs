@@ -3629,7 +3629,10 @@ pub fn history(count: usize) -> Result<(), Error> {
 /// `kern images [--json]` — list OCI images pulled into the local cache. Each completed pull leaves
 /// a `<sanitized>.ok` sentinel whose *content* is the original image ref, next to the `<sanitized>/`
 /// rootfs dir — so we recover the real name, the on-disk size, and when it was pulled.
-pub fn images(json: bool) -> Result<(), Error> {
+/// The cached OCI images as `(repository:tag, size_bytes, pulled_unix)`, sorted by name — the SINGLE
+/// source for both `kern images` and the `kern top` Images tab, so the CLI and TUI can never drift on
+/// which images exist or their sizes.
+pub(crate) fn image_entries() -> Vec<(String, u64, u64)> {
     let cache = cache_dir();
     let mut rows: Vec<(String, u64, u64)> = Vec::new(); // (image ref, size bytes, pulled unix)
     if let Ok(entries) = std::fs::read_dir(&cache) {
@@ -3656,6 +3659,11 @@ pub fn images(json: bool) -> Result<(), Error> {
         }
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+pub fn images(json: bool) -> Result<(), Error> {
+    let rows = image_entries();
 
     if json {
         let mut out = String::from("[");
