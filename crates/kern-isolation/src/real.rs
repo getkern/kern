@@ -307,6 +307,81 @@ fn mount_proc() -> Result<(), Error> {
     Ok(())
 }
 
+/// Read-only bind a procfs path onto itself: writes fail (EROFS) but reads still work. Used to lock
+/// down the host-global, NON-namespaced knobs under `/proc` that a container must never write.
+fn ro_bind_ro(path: &str) -> Result<(), Error> {
+    let c = cstr(path)?;
+    if unsafe {
+        libc::mount(
+            c.as_ptr(),
+            c.as_ptr(),
+            ptr::null(),
+            libc::MS_BIND,
+            ptr::null(),
+        )
+    } != 0
+    {
+        return Err(Error::last("mount(bind proc)"));
+    }
+    if unsafe {
+        libc::mount(
+            ptr::null(),
+            c.as_ptr(),
+            ptr::null(),
+            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+            ptr::null(),
+        )
+    } != 0
+    {
+        return Err(Error::last("remount(ro proc)"));
+    }
+    Ok(())
+}
+
+/// Mask a procfs file by bind-mounting `/dev/null` over it — reads return empty, writes go nowhere.
+/// Used for kernel-memory / info-leak files (`/proc/kcore`, `/proc/kallsyms`, …).
+fn null_over(path: &str) -> Result<(), Error> {
+    let src = cstr("/dev/null")?;
+    let dst = cstr(path)?;
+    if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ptr::null(), libc::MS_BIND, ptr::null()) } != 0
+    {
+        return Err(Error::last("mount(mask proc)"));
+    }
+    Ok(())
+}
+
+/// Neutralize the host-global procfs surface — the runc "readonlyPaths" + "maskedPaths" set. These
+/// files/dirs are NOT namespaced, so on a kernel where the box's root maps to a privileged host uid
+/// (kern run as root, in WSL, under `sudo`, or in CI), an in-box write reaches the HOST. The escape
+/// that motivated this: `/proc/sys/kernel/core_pattern` → set it to `|/evil` and the kernel runs your
+/// program as ROOT on the host at the next core dump. `/proc/sys` read-only is therefore the HARD
+/// requirement (fail-closed); the rest are best-effort (present on all mainstream kernels).
+fn mask_proc_paths() -> Result<(), Error> {
+    ro_bind_ro("/proc/sys")?; // core_pattern, kernel.modprobe, … — every host-global sysctl. FATAL.
+    for p in [
+        "/proc/sysrq-trigger",
+        "/proc/irq",
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/asound",
+    ] {
+        let _ = ro_bind_ro(p);
+    }
+    for p in [
+        "/proc/kcore",
+        "/proc/kallsyms",
+        "/proc/kmsg",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/timer_list",
+        "/proc/sched_debug",
+        "/proc/scsi",
+    ] {
+        let _ = null_over(p);
+    }
+    Ok(())
+}
+
 /// Detach the old root, which the self-pivot left stacked at "." (== the new root's "/"). Must run
 /// IMMEDIATELY after the pivot, before any absolute-path mount: until the old root is detached,
 /// "/" resolves through it. Resolution of "." starts at the new root and moves up the stack, so
@@ -433,6 +508,9 @@ fn child_setup_and_exec(
     let staged = mounted.create_old_root(&mut ops)?;
     mount_proc()?;
     detach_old_root()?;
+    // Lock down the non-namespaced host-global procfs knobs (core_pattern, sysrq, kernel info) now that
+    // `/proc` resolves to the fresh procfs — closes the classic core_pattern escape for a root-mapped box.
+    mask_proc_paths()?;
     t.mark("pivot+proc");
     // Optional read-only remount LAST — the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep

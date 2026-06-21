@@ -1157,6 +1157,28 @@ fn box_run_hardening_uts_net_seccomp() {
         "the denied syscall should be killed by SIGSYS (reported as 128+31)"
     );
 
+    // PROC MASKING (regression for a real pen-test finding): `/proc/sys` is mounted READ-ONLY, so a
+    // root-mapped box (kern as root / WSL / sudo / CI) can't write a host-global, non-namespaced sysctl
+    // like `kernel/core_pattern` (`|/evil` → runs as ROOT on the host at the next core dump). Confirm
+    // the fresh procfs carries the read-only /proc/sys submount.
+    let mounts = kern_out(&[
+        "box",
+        "isobox",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "cat",
+        "/proc/mounts",
+    ]);
+    let mounts = String::from_utf8_lossy(&mounts.stdout);
+    assert!(
+        mounts
+            .lines()
+            .any(|l| l.contains(" /proc/sys ") && l.split_whitespace().any(|f| f == "ro" || f.starts_with("ro,"))),
+        "/proc/sys must be mounted read-only (core_pattern escape guard):\n{mounts}"
+    );
+
     let _ = fs::remove_dir_all(&root);
 }
 
