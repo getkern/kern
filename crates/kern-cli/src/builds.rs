@@ -138,6 +138,20 @@ fn mkdir_private(dir: &Path) -> io::Result<()> {
         .create(dir)
 }
 
+/// Open a record file for writing, 0600 and refusing to follow a symlink at the final component — the
+/// single "private, no-symlink" open every record writer uses. `append` = append (create if absent)
+/// vs create+truncate. O_NOFOLLOW means a planted `meta`/`log` symlink can't redirect the write.
+fn open_private(path: &Path, append: bool) -> io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.mode(0o600).custom_flags(libc::O_NOFOLLOW).create(true);
+    if append {
+        o.append(true);
+    } else {
+        o.write(true).truncate(true);
+    }
+    o.open(path)
+}
+
 /// The transcript log path for build `id`.
 pub fn log_path(id: &str) -> PathBuf {
     record_dir(id).join("log")
@@ -172,16 +186,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
     // is complete. O_NOFOLLOW on the temp refuses writing THROUGH a planted symlink; `rename` onto `meta`
     // replaces a symlinked `meta` itself (never clobbers through it), so both writes stay confined.
     let tmp = dir.join("meta.tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        f.write_all(body.as_bytes())?;
-    }
+    open_private(&tmp, false)?.write_all(body.as_bytes())?;
     std::fs::rename(&tmp, dir.join("meta"))
 }
 
@@ -343,14 +348,7 @@ impl Capture {
         }
         let dir = record_dir(id);
         mkdir_private(&dir).ok()?;
-        let mut logf = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(dir.join("log"))
-            .ok()?;
+        let mut logf = open_private(&dir.join("log"), false).ok()?;
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return None;
@@ -414,13 +412,7 @@ pub fn append_log(id: &str, msg: &str) {
     if !valid_id(id) {
         return;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(log_path(id))
-    {
+    if let Ok(mut f) = open_private(&log_path(id), true) {
         let _ = writeln!(f, "{msg}");
     }
 }
