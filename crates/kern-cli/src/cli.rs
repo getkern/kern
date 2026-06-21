@@ -211,6 +211,15 @@ pub enum Command {
     Images {
         json: bool,
     },
+    /// `kern save <image> [-o file]`: export a cached image to a `docker load`-compatible tar.
+    Save {
+        image: String,
+        out: Option<String>,
+    },
+    /// `kern load [-i file]`: import an image from a `docker save`-format tar (file or stdin).
+    Load {
+        input: Option<String>,
+    },
     /// `kern builds [<tag>] [--status S] [-n N] [--json]`: list past builds (build history — the
     /// `docker buildx history` analogue), optionally filtered by tag substring / outcome / count.
     Builds {
@@ -428,6 +437,38 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("images") => Command::Images {
             json: rest.contains(&"--json"),
         },
+        Some("save") => {
+            let (mut image, mut out) = (None, None);
+            let mut it = rest.iter().skip(1);
+            while let Some(a) = it.next() {
+                match *a {
+                    "-o" | "--output" => {
+                        out = Some(
+                            it.next().ok_or(Error::Usage("save <image> -o <file>"))?.to_string(),
+                        )
+                    }
+                    s if !s.starts_with('-') && image.is_none() => image = Some(s.to_string()),
+                    _ => return Err(Error::Usage("save <image> [-o <file>]")),
+                }
+            }
+            Command::Save {
+                image: image.ok_or(Error::Usage("save <image> [-o <file>]"))?,
+                out,
+            }
+        }
+        Some("load") => {
+            let mut input = None;
+            let mut it = rest.iter().skip(1);
+            while let Some(a) = it.next() {
+                match *a {
+                    "-i" | "--input" => {
+                        input = Some(it.next().ok_or(Error::Usage("load -i <file>"))?.to_string())
+                    }
+                    _ => return Err(Error::Usage("load [-i <file>]")),
+                }
+            }
+            Command::Load { input }
+        }
         Some("builds") => {
             let mut json = false;
             let (mut filter, mut status, mut limit) = (None, None, None);
@@ -1672,6 +1713,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodHolder => crate::pod::run_holder(),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
+        Command::Save { image, out } => commands::save(&image, out.as_deref()),
+        Command::Load { input } => commands::load(input.as_deref()),
         Command::Builds {
             json,
             filter,

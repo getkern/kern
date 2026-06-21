@@ -245,7 +245,7 @@ fn pack_layer(
 }
 
 /// `sha256:<hex>` of a file, via `sha256sum` (coreutils). Errs if the tool is missing or fails.
-fn sha256_file(path: &Path) -> Result<String, OciError> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, OciError> {
     let out = Command::new("sha256sum")
         .arg("--")
         .arg(path)
@@ -267,7 +267,7 @@ fn sha256_file(path: &Path) -> Result<String, OciError> {
 /// Build the OCI/Docker image config JSON. Minimal but valid: `rootfs.diff_ids` (the one layer's
 /// uncompressed digest) plus a `config` with the runtime fields. JSON is emitted by hand (no serde) —
 /// the fields are simple string arrays, matching the dependency-free posture of the rest of kern-oci.
-fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
+pub(crate) fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
     let arr = |xs: &[String]| {
         let items: Vec<String> = xs.iter().map(|s| json_str(s)).collect();
         format!("[{}]", items.join(","))
@@ -455,7 +455,7 @@ fn json_str(s: &str) -> String {
 
 /// Shell-quote a path for the one `sh -c` we use (gzip redirection). Single-quote and escape any
 /// embedded single quote — a cache path never contains one in practice, but be correct anyway.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
