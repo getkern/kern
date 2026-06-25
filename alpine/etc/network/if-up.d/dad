@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# Block ifup until DAD completion
+# Copyright (c) 2016-2018 Kaarle Ritvanen
+
+has_flag() {
+	ip address show dev $IFACE up | grep -q " $1 "
+}
+
+counter=100
+while [ "$counter" -gt 0 ] &&
+	has_flag tentative &&
+	! has_flag dadfailed; do
+	sleep 0.2
+	counter=$((counter - 1))
+done

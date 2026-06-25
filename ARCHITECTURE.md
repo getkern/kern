@@ -20,16 +20,14 @@ default**, so the core carries zero EULA exposure.
 ## Design choices (and why)
 
 - **Real `mod`s, no `include!()`.** The binary uses ordinary modules with `pub(crate)`
-  boundaries and a command enum + `match` dispatch. (An older internal tree concatenated files
-  via `include!()` to feed a build-time string-obfuscation pass; that justification disappears
-  once the source is public, so the obfuscation — if kept — belongs in a `build.rs`/macro
-  codegen step decoupled from file layout, never in the module structure.)
+  boundaries and a command enum + `match` dispatch — a real module tree, not a concatenated
+  script.
 - **The sandbox is a sequence of steps against a seam.** Mount/pivot/remount operations go
   through the `kern_isolation::MountOps` trait. A `Recorder` impl captures the exact ordered
   call list so a test asserts it byte-identical before/after a refactor — the *refactor-safety*
-  net for breaking up the (historically ~2900-line) setup function. This does **not** replace
-  the real-syscall correctness tests that actually mount/pivot and assert escape-blocked.
-- **Mount-ordering as a typestate (roadmap 0.2).** `Rootfs<Mounted>` → `create_old_root()` →
+  net for the setup sequence. This does **not** replace the real-syscall correctness tests that
+  actually mount/pivot and assert escape-blocked.
+- **Mount-ordering as a typestate (0.2).** `Rootfs<Mounted>` → `create_old_root()` →
   `Rootfs<OldRootReady>` → `into_readonly()` makes "remount read-only before `.old_root`
   exists" a *compile error*, not a runtime bug.
 - **GPU backends as a closed enum (roadmap 0.9).** `enum Backend { Cuda, Hip, Vulkan }` with

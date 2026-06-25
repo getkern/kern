@@ -1,0 +1,6 @@
+This directory should contain shell scripts configuring system-wide
+environment on users' shells.
+
+Files with the .sh extension found in this directory are evaluated by
+Bourne-compatible shells (like ash, bash or zsh) when started as a
+login shell.

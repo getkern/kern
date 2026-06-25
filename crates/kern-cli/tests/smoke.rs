@@ -12,7 +12,7 @@ fn version_prints_and_succeeds() {
     let out = kern().arg("--version").output().expect("run kern");
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.starts_with("kern 0.2.0"), "got: {s}");
+    assert!(s.starts_with("kern 0.3.0"), "got: {s}");
 }
 
 #[test]
