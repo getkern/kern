@@ -155,6 +155,9 @@ Daemonless, rootless, and complete — the full container UX plus resource slice
   `--cap-add CAP` keeps one (still bounded by userns + seccomp).
 - **Seccomp** — an always-on denylist (kexec, kernel modules, ptrace, the mount API, `setns`,
   `syslog`, …); wrong-arch **and x86_64 x32-ABI** syscalls are killed, closing the alias bypass.
+- **`--privileged`** — opt-in, relaxes seccomp for a **nested `kern box`** (docker-in-docker): re-allows
+  exactly `unshare`/`setns`/`mount`/`umount2`/`pivot_root`, keeps kexec/modules/bpf/io_uring/keyring
+  blocked (stronger than Docker's `--privileged`), **rootless-only**. See [SECURITY.md](SECURITY.md).
 
 **Lifecycle & operations, no daemon**
 
@@ -402,7 +405,7 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 ## Project status
 
 **0.6.1 — a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (**378 tests**, clippy-clean,
+Everything in [Features](#features) works today and is tested (**379 tests**, clippy-clean,
 `cargo-deny`-clean, security-audited slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem) — the point is a small, fast, honest core. The
 CLI and config surface are **not frozen until 1.0**.
