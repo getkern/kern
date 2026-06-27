@@ -18,6 +18,20 @@
 use std::mem;
 use std::ptr;
 
+/// One published port mapping. Replaces a bare `(u32, u16, u16, bool)` — the two adjacent `u16`s
+/// (host / box port) made the tuple swap-prone at every call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortMap {
+    /// Host bind address in host byte order (`0` = `0.0.0.0`, all interfaces; default `127.0.0.1`).
+    pub bind_ip: u32,
+    /// Host-side port.
+    pub host: u16,
+    /// Box-side (in-namespace) port.
+    pub box_port: u16,
+    /// UDP when true, else TCP.
+    pub udp: bool,
+}
+
 /// A forwarder forked before the box's namespaces existed. Activate it with the box PID 1 once the
 /// box is forked; [`stop`](PortForwarder::stop) tears it down.
 pub struct PortForwarder {
@@ -51,9 +65,9 @@ impl PortForwarder {
 /// stderr a detached box swallows — so the box prints "✔ started" while nothing listens. Returns the
 /// first conflicting `(host_port, os-error)`. Best-effort: a socket-creation failure is skipped (the
 /// forwarder still reports its own bind error as the backstop).
-pub fn preflight(ports: &[(u32, u16, u16, bool)]) -> Result<(), (u16, String)> {
-    for &(ip, hp, _bp, udp) in ports {
-        let ty = if udp {
+pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, String)> {
+    for p in ports {
+        let ty = if p.udp {
             libc::SOCK_DGRAM
         } else {
             libc::SOCK_STREAM
@@ -72,12 +86,12 @@ pub fn preflight(ports: &[(u32, u16, u16, bool)]) -> Result<(), (u16, String)> {
                 mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
-        let addr = addr_in(ip, hp);
+        let addr = addr_in(p.bind_ip, p.host);
         let r = unsafe { libc::bind(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) };
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(s) };
         if r != 0 {
-            return Err((hp, err.to_string()));
+            return Err((p.host, err.to_string()));
         }
     }
     Ok(())
@@ -86,15 +100,16 @@ pub fn preflight(ports: &[(u32, u16, u16, bool)]) -> Result<(), (u16, String)> {
 /// Fork one forwarder per `(host_port, box_port)` mapping. MUST be called BEFORE the sandbox
 /// `unshare`, so each forwarder inherits the host network + user namespace. Each blocks until
 /// [`activate`](PortForwarder::activate) sends the box PID 1.
-pub fn fork_forwarders(ports: &[(u32, u16, u16, bool)]) -> Vec<PortForwarder> {
+pub fn fork_forwarders(ports: &[PortMap]) -> Vec<PortForwarder> {
     let mut out = Vec::new();
-    for &(ip, hp, bp, udp) in ports {
-        let mut p = [0i32; 2];
-        if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+    for m in ports {
+        let (ip, hp, bp, udp) = (m.bind_ip, m.host, m.box_port, m.udp);
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
             eprintln!("kern: -p {hp}:{bp}: pipe failed");
             continue;
         }
-        let (rd, wr) = (p[0], p[1]);
+        let (rd, wr) = (pipefd[0], pipefd[1]);
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             unsafe {
@@ -501,7 +516,13 @@ mod tests {
         // printing "started" while its `-p` forwarder silently fails to bind).
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let taken = l.local_addr().unwrap().port();
-        match preflight(&[(LOOPBACK, taken, 80, false)]) {
+        let pm = |host| PortMap {
+            bind_ip: LOOPBACK,
+            host,
+            box_port: 80,
+            udp: false,
+        };
+        match preflight(&[pm(taken)]) {
             Err((p, _)) => assert_eq!(p, taken, "reported the conflicting port"),
             Ok(()) => panic!("preflight passed a port that is actively listening"),
         }
@@ -510,9 +531,6 @@ mod tests {
             let t = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             t.local_addr().unwrap().port()
         };
-        assert!(
-            preflight(&[(LOOPBACK, free, 80, false)]).is_ok(),
-            "a free port should pass"
-        );
+        assert!(preflight(&[pm(free)]).is_ok(), "a free port should pass");
     }
 }

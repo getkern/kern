@@ -31,7 +31,7 @@ pub use cgroup::user_systemd_present;
 /// `env_claims_enforcer_but_none_real`) stay crate-internal — only `real.rs` reads them.
 pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
 pub use outcome::{Outcome, OutputView, ResourceSource};
-pub use ports::preflight as preflight_ports;
+pub use ports::{preflight as preflight_ports, PortMap};
 pub use real::{
     default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
     set_cpu_affinity, shed_inherited_fds, sub_range, trusted_helper, username, CapSpec,

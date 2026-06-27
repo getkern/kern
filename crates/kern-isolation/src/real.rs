@@ -14,7 +14,7 @@
 //! `apt`/`dpkg` and daemons that drop to non-root users work). Either way no host privilege is
 //! gained. Linux-only.
 
-use crate::{Error, MountMode, MountOps, Rootfs};
+use crate::{Error, MountMode, MountOps, PortMap, Rootfs};
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -1881,7 +1881,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     ready_fd: Option<i32>,
     on_started: F,
     tty_master: Option<i32>,
-    ports: &[(u32, u16, u16, bool)],
+    ports: &[PortMap],
 ) -> Result<i32, Error> {
     // Armed until the box child takes ownership (post-fork) or the parent disarms it: a drop on
     // any error path before then writes the failure byte, so a pre-fork failure is never reported
