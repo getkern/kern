@@ -416,8 +416,8 @@ pods (`--pod` / `--no-outbound`), and the **Python** binding. `build`/`push` are
 surface — audited (COPY-from confinement, setuid/opaque hardening) and, where a rootless-overlay
 kernel can't persist an opaque dir, they **fail closed** to a safe path rather than leak.
 
-**Deliberately not here yet:** the headline **GPU slices** and a **Windows (WSL2) hybrid** — both on
-the [Roadmap](#roadmap) — and Docker-style overlay networking.
+**Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
+overlay networking.
 
 ## Roadmap
 
@@ -426,11 +426,13 @@ governs is driven by what proves useful.
 
 - **Shipped:** build + tag + push, zstd layers, `--init`, `--platform`, pods, the Python binding;
   ongoing polish + broader (ARM) CI and edge/I/O ergonomics.
-- **Windows, via WSL2 (planned).** Windows already runs a real Linux kernel (WSL2). The plan: one
-  ~1.5 MB `kern` binary that drops into it — a daemonless Linux-container UX on Windows without Docker
-  Desktop's VM + background service. Honest caveat: on Windows kern runs *inside* the WSL2 VM, so it
-  doesn't shed the VM weight the way it does on native Linux — the win is "no Docker Desktop", not "no
-  VM". Not shipped; on the roadmap.
+- **Windows, via WSL2 (runs today; one-line installer being wired).** kern runs on Windows inside WSL2
+  — a real Linux kernel — so hard caps (`--memory`/`--cpus`) are real there, verified. A `kern.exe` shim
+  and a pre-baked kern WSL2 distro (Alpine + kern, no Ubuntu, no manual steps) are built and staged; the
+  one-shot `irm … | iex` installer that self-elevates, imports the distro and drops the shim on PATH is
+  being wired to the public release (its assets ship on the GitHub release). Honest caveat: kern runs
+  *inside* the WSL2 kernel, so it doesn't shed the VM weight native Linux does — the win is "no Docker
+  Desktop", not "no VM".
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. It lands incrementally,
   each stage useful on its own and each opt-in (`--no-gpu` stays the default): first **safe access +
   visibility** (device passthrough, driver-gated, sysfs/procfs masked; per-box VRAM + utilisation in
