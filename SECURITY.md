@@ -72,7 +72,9 @@ What is **enforced now** by `kern box`:
   ptrace + `process_vm_readv`/`writev` / reboot / swap / the classic **and** new mount API — including
   the whole reconfiguration family `mount_setattr` / `fspick` / `fsopen`/`fsconfig`/`fsmount` /
   `open_tree`/`move_mount`, so a box cannot re-mount its own root writable / `pivot_root` / `setns` /
-  `unshare` / `bpf` / `perf_event_open` / `userfaultfd` / `syslog`),
+  `unshare` / `bpf` / `perf_event_open` / `userfaultfd` / `syslog`; the opt-in `--privileged` flag
+  re-allows exactly five of these — `unshare`/`setns`/`mount`/`umount2`/`pivot_root`, rootless-only —
+  for nested boxes, see below),
   wrong-arch syscalls killed, and on x86_64 every **x32-ABI** syscall (the `__X32_SYSCALL_BIT`
   variant, which shares the x86_64 arch token) is killed too — closing the classic bypass where the
   x32 alias of a denied syscall number would otherwise slip past a number-only denylist;
@@ -100,6 +102,22 @@ opt-in configurations — is tracked for a dedicated, runtime-validated release;
 than shipped untested because it reorders capability-sensitive setup that must be verified on real
 namespaces. `--uid-range` boxes remain covered by the seccomp + capability layers (the mount-lock is
 single-uid by construction).
+
+**Nested boxes (`--privileged`).** By default the always-on filter blocks the namespace + mount
+syscalls, so a full `kern box` cannot run *inside* another (it gets `SIGSYS`). `--privileged` relaxes
+**exactly five** — `unshare`, `setns`, `mount`, `umount2`, `pivot_root` — so a nested box
+(docker-in-docker style) can create its own namespaces and rootfs. Everything else in the denylist stays
+blocked (kexec, module load/unload, `bpf`, `io_uring`, keyring, `ptrace`, `perf_event_open`, the *new*
+mount API, `mount_setattr`), so a `--privileged` box is materially stronger than a Docker `--privileged`
+container — which drops the seccomp filter wholesale. It also skips the `/proc` masking, because the
+kernel refuses a nested `/proc` mount underneath the locked masks. **Rootless-only, and gated on the
+effective mapping, not the caller's euid:** it is honoured only when the box's root maps to an
+*unprivileged* host uid, decided by reading `/proc/self/uid_map` after the namespace is set up — so a
+`--pod` box is judged by its holder's map — and it is refused outright when run as real root, where a
+relaxed `mount` could reach the host-global `/proc/sys` knobs. In rootless mode those knobs stay
+unwritable regardless (they are owned by the init user namespace): a `--privileged` box can *read*
+`/proc/sys` but not write it (verified against `core_pattern`). Like `--no-seccomp` and
+`--cap-add SYS_ADMIN`, this is an explicit opt-in that widens the box's syscall surface by choice.
 
 Resource caps (memory + tasks): when a systemd **user** manager is present, `kern box` re-execs
 inside a transient `systemd-run --user --scope` with `MemoryMax`/`TasksMax`, so fork-bomb / OOM

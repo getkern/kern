@@ -494,6 +494,11 @@ fn uid_map_root_is_unprivileged(map: &str) -> bool {
         let f: Vec<u64> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
         if let [inside, outside, count] = f[..] {
             if inside == 0 && count >= 1 {
+                // `outside` is an id in the PARENT user namespace, not guaranteed a host uid. That's
+                // safe here: only real root can construct a userns mapping any id to host uid 0, and
+                // real root is refused `--privileged` up front — so a non-root caller can never reach
+                // a chain where inner-0 resolves to host root. We also fail toward OVER-refusal (a
+                // one-level-deep `0 0 1` is refused, never wrongly allowed).
                 return outside != 0;
             }
         }
