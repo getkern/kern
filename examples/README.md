@@ -1,10 +1,21 @@
 # kern examples
 
-Real, runnable use-cases. Build kern first:
+Real, runnable use-cases. Install kern first:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+<details><summary>…or build from source</summary>
 
 ```sh
 cargo build --release      # then add target/release to PATH, or use ./target/release/kern
 ```
+
+Every script honours `KERN=./target/release/kern` (and the SDKs honour `KERN_BIN`) if you'd rather
+point at a local build than one on `PATH`.
+
+</details>
 
 All examples are plain shell scripts you can read and run. They use unprivileged user
 namespaces (no root, no daemon) and pull images straight from a registry (Docker Hub, GHCR, …)
@@ -32,6 +43,8 @@ shows the boundaries holding.
 | [compose-stack.sh](compose-stack.sh) + [stack.toml](stack.toml) | Bring up a multi-box stack in dependency order |
 | [fan-out.sh](fan-out.sh) | Run hundreds of isolated jobs in parallel (per-task sandboxing) |
 | [inspect-plan.sh](inspect-plan.sh) | `--plan`: see the exact isolation steps before running anything |
+| [nested-privileged.sh](nested-privileged.sh) | Run a `kern box` inside a `kern box` — `--privileged` relaxes exactly 5 syscalls (rootless-only), keeps the rest blocked |
+| [save-load-interop.sh](save-load-interop.sh) | `kern save` / `kern load` — move an image as a plain tar, Docker-loadable both ways, no registry |
 
 ### Things kern makes trivial (that otherwise need a daemon, root, or a hand-built rootfs)
 
@@ -62,6 +75,22 @@ shows the boundaries holding.
 | [benchmark.py](benchmark.py) | Reproduce the whole **Performance** table — kern vs bubblewrap / crun / runc / podman / docker (auto-detects what's installed) |
 | [compare-vs-docker.sh](compare-vs-docker.sh) | Same isolated `/bin/true`, kern vs `docker run` — timed, and kern needs no daemon |
 | [compare-vs-bwrap.sh](compare-vs-bwrap.sh) | Same speed class as bubblewrap, but kern adds OCI images, overlay, and lifecycle |
+
+### Embed kern in your own program
+
+Don't shell out — call kern as a library and get a structured result back (exit code, stdout/stderr
+with truncation flags, wall time). Ideal for running LLM/agent-generated code or CI steps.
+
+| Example | What it shows |
+|---|---|
+| [embed-python.py](embed-python.py) | The `kern_sandbox` Python package: a fresh box per `run_code`, file-state on disk, sandbox faults (timeout/OOM/blocked-escape) as data — not exceptions |
+| [embed-rust.rs](embed-rust.rs) | The `kern-isolation` crate's fluent `Sandbox::builder()…build()?.run(...)` → a structured `Outcome` |
+
+### Windows
+
+| Example | What it shows |
+|---|---|
+| [windows-wsl2.md](windows-wsl2.md) | kern on Windows runs inside WSL2 — same commands, real kernel-enforced caps; honest note that it uses the WSL2 kernel (no VM of its own) |
 
 > Edge / ARM (Jetson, Pi, …): see **[../EDGE.md](../EDGE.md)** — the daemonless footprint is the
 > killer feature on RAM-constrained boards.
