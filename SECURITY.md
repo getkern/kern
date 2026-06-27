@@ -37,7 +37,7 @@ that surface is an accepted, patched risk — not an adversary's playground.
 ## kern vs a microVM — when to use what
 
 kern isolates with Linux **namespaces + seccomp + a read-only pivot**: microsecond-to-millisecond
-start, ~1 MB, no VM, no daemon. That shared-kernel boundary is real, but its attack surface is the
+start, ~1.5 MB, no VM, no daemon. That shared-kernel boundary is real, but its attack surface is the
 host **kernel** — a kernel privilege-escalation bug is an escape.
 
 - **Reach for kern** when the code is **yours or semi-trusted** and you want speed, density and
