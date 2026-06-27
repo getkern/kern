@@ -4428,6 +4428,18 @@ pub fn push(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
 
 /// `kern save <image> [-o file]` — export a cached image to a `docker load`-compatible tar (offline /
 /// air-gapped transfer). Materializes the image to one rootfs (like `push`), then writes the archive.
+/// Normalise an image ref to a `repo:tag` that `docker load` accepts: append `:latest` when the ref
+/// carries no tag. A registry port (`localhost:5000/img`) is not a tag — only a `:` in the LAST path
+/// component (after the final `/`) counts, so `localhost:5000/app` → `localhost:5000/app:latest`.
+fn ensure_repo_tag(image: &str) -> String {
+    let last = image.rsplit('/').next().unwrap_or(image);
+    if last.contains(':') {
+        image.to_string()
+    } else {
+        format!("{image}:latest")
+    }
+}
+
 pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     let (rootfs, config, cleanup) = materialize_image(image)?;
     let cfg = kern_oci::ImageConfigOut {
@@ -4440,10 +4452,14 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     let work = cache_dir().join(format!(".save-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("save work dir: {e}")))?;
+    // `docker load` REJECTS a bare repo with no tag ("invalid tag 'alpine'"), so the RepoTag must be a
+    // full `repo:tag` — normalise a tagless ref to `…:latest` (matching how `docker save alpine` writes
+    // `alpine:latest`). Keeps kern↔docker save/load interop working for the common `kern save alpine`.
+    let repo_tag = ensure_repo_tag(image);
     let result = kern_oci::save(
         &rootfs,
         &cfg,
-        std::slice::from_ref(&image.to_string()),
+        std::slice::from_ref(&repo_tag),
         out.map(std::path::Path::new),
         &work,
     )
@@ -9082,6 +9098,29 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(&canary);
+    }
+}
+
+#[cfg(test)]
+mod save_tag_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_repo_tag_appends_latest_only_when_untagged() {
+        // a bare repo → :latest (so `docker load` doesn't reject "invalid tag")
+        assert_eq!(ensure_repo_tag("alpine"), "alpine:latest");
+        assert_eq!(ensure_repo_tag("library/nginx"), "library/nginx:latest");
+        // an explicit tag is preserved
+        assert_eq!(ensure_repo_tag("alpine:3.19"), "alpine:3.19");
+        // a registry PORT is not a tag (it's before the last '/')
+        assert_eq!(
+            ensure_repo_tag("localhost:5000/app"),
+            "localhost:5000/app:latest"
+        );
+        assert_eq!(
+            ensure_repo_tag("localhost:5000/app:v2"),
+            "localhost:5000/app:v2"
+        );
     }
 }
 
