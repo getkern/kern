@@ -44,6 +44,13 @@
   .badge{font-family:var(--mono);font-size:.72rem;border:1px solid var(--border);border-radius:20px;
          padding:3px 11px;color:var(--mut);background:var(--panel)}
   .badge b{color:var(--fg)}
+  .cta{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:.5rem 0 1.4rem}
+  .btn{font-family:var(--sans);font-size:.92rem;font-weight:600;border-radius:8px;
+       padding:9px 20px;border:1px solid var(--border)}
+  .btn.primary{background:var(--acc);color:#08130a;border-color:var(--acc)}
+  .btn.primary:hover{filter:brightness(1.08);text-decoration:none}
+  .btn.ghost{background:var(--panel);color:var(--fg)}
+  .btn.ghost:hover{border-color:var(--acc2);text-decoration:none}
   nav.toc{display:flex;gap:6px 16px;justify-content:center;flex-wrap:wrap;font-size:.86rem;
           font-family:var(--mono);color:var(--mut);padding-top:6px}
   nav.toc a{color:var(--mut)} nav.toc a:hover{color:var(--acc2)}
@@ -93,6 +100,10 @@
       <span class="badge">Platform <b>linux x86_64 · aarch64</b></span>
       <span class="badge">Tests <b>379 · clippy-clean</b></span>
       <span class="badge">One Rust dep <b>libc</b></span>
+    </div>
+    <div class="cta">
+      <a class="btn primary" href="#install">Get started</a>
+      <a class="btn ghost" href="https://github.com/getkern/kern">View on GitHub ↗</a>
     </div>
     <nav class="toc">
       <a href="#why">Why</a><a href="#model">Model</a><a href="#features">Features</a>
