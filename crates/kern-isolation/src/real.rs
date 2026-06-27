@@ -122,6 +122,9 @@ pub struct SandboxSpec {
     /// cgroup v2 `io.weight` (`--io-weight`, 1..=10000): relative I/O priority for the box. `None`
     /// leaves the default. Best-effort like `io_max` (needs the `io` controller delegated).
     pub io_weight: Option<u64>,
+    /// `--add-host NAME:IP`: extra `/etc/hosts` entries appended inside the box (`host-gateway` is
+    /// already resolved to a concrete address by the caller). Empty for none.
+    pub extra_hosts: Vec<(String, String)>,
 }
 
 /// A resolved vDisk to mount in the box at `/vdisk/<name>`. When `host_dir` is set, the host prepared
@@ -509,6 +512,7 @@ fn child_setup_and_exec(
         make_box_tmpfs(&spec.root, "run")?;
     }
     setup_secrets(&spec.root, &spec.secrets, run_tmpfs)?;
+    setup_extra_hosts(&spec.root, &spec.extra_hosts);
     t.mark("volumes");
     // Self-pivot into the new root. The old root is left stacked at "/"; mount a fresh `proc`
     // (cwd-relative, while the old root still provides the visible proc instance the kernel
@@ -1430,6 +1434,40 @@ fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Append `--add-host NAME:IP` entries to the box's `/etc/hosts` (Docker parity). Best-effort,
+/// pre-pivot, writing into the box's OWN root (an overlay copy-up, not the shared image). The final
+/// `hosts` component is opened `O_NOFOLLOW`, so a hostile image shipping `/etc/hosts` as a symlink
+/// can't redirect the append out of the box. A bad entry (empty / whitespace in the name) is skipped.
+fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
+    if hosts.is_empty() {
+        return;
+    }
+    let mut block = String::from("\n# kern --add-host\n");
+    for (name, ip) in hosts {
+        if name.is_empty() || ip.is_empty() || name.split_whitespace().count() != 1 {
+            continue;
+        }
+        block.push_str(&format!("{ip}\t{name}\n"));
+    }
+    let Ok(p) = cstr(&format!("{root}/etc/hosts")) else {
+        return;
+    };
+    let fd = unsafe {
+        libc::open(
+            p.as_ptr(),
+            libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return; // no /etc, or /etc/hosts is a symlink (refused) — best-effort, don't fail the box
+    }
+    unsafe {
+        libc::write(fd, block.as_ptr().cast(), block.len());
+        libc::close(fd);
+    }
 }
 
 /// Expose `--secret` values as `/run/secrets/<name>` (mode 0400) inside the box. The bytes were read
