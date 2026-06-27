@@ -325,10 +325,9 @@ impl Sandbox {
         // scope the env of the KERN CLI PROCESS itself. Unless the caller opts
         // into inheritance, clear it and forward only what kern needs to run:
         //   PATH                    - resolve the kern binary's own helpers
-        //   HOME                    - locate ~/.config/kern + the EULA marker
+        //   HOME                    - locate ~/.config/kern (config + registry)
         //   XDG_RUNTIME_DIR,
         //   DBUS_SESSION_BUS_ADDRESS - cgroup v2 delegation via the user session
-        //   KERN_ACCEPT_EULA        - non-interactive EULA gate
         //   USER, LOGNAME           - user-scope identity
         if !self.inherit_env {
             cmd.env_clear();
@@ -339,7 +338,6 @@ impl Sandbox {
                 "XDG_CONFIG_HOME",
                 "XDG_DATA_HOME",
                 "DBUS_SESSION_BUS_ADDRESS",
-                "KERN_ACCEPT_EULA",
                 "USER",
                 "LOGNAME",
             ] {
