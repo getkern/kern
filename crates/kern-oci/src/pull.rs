@@ -130,10 +130,6 @@ pub fn pull(
         manifest
     };
 
-    // The image's runtime config (entrypoint/env/…) lives in a small blob the manifest points at.
-    // Best-effort: a missing/odd config just yields defaults, never fails the pull.
-    let config = fetch_config(&registry, &repo, &manifest, &auth, dest);
-
     let layers = layer_digests(&manifest);
     if layers.is_empty() {
         return Err(manifest_error(&manifest, &registry, &repo));
@@ -145,6 +141,18 @@ pub fn pull(
     );
     std::fs::create_dir_all(dest).map_err(|e| OciError::Extract(e.to_string()))?;
     warn_if_windows_mount(dest);
+    // ONE-CONNECTION PRE-DOWNLOAD (cold-pull speedup): fetch the config blob + every layer blob in a
+    // SINGLE `curl` process (keep-alive reused across `--next`), so the whole blob set costs ONE TLS
+    // handshake instead of one per blob — the measured cold-pull bottleneck was that each separate
+    // `curl` process re-handshakes to the same registry host. Best-effort and TRANSPORT-ONLY: it writes
+    // each blob to the SAME tmp path `fetch_config`/`download_layer` use, so they find it already there
+    // and skip their own download; every blob is still sha256-verified and every layer still vetted +
+    // merged no-follow, byte-identical to before. A no-op for Basic-credential registries (leaves that
+    // audited off-argv `-K` path untouched) and on any failure (tmps cleaned → the per-blob path re-runs).
+    download_blobs_oneconn(&registry, &repo, &manifest, &layers, &auth, dest);
+    // The image's runtime config (entrypoint/env/…) — now usually already fetched above; `fetch_config`
+    // reuses the pre-downloaded tmp when present. Best-effort: a missing/odd config yields defaults.
+    let config = fetch_config(&registry, &repo, &manifest, &auth, dest);
     // PREFETCH: download layer K+1 concurrently while layer K is verified + extracted + merged. The
     // per-layer download command is UNCHANGED (same TLS pin, auth, timeouts) — only the SCHEDULING
     // overlaps the next layer's network with the current layer's CPU (decompress/extract). Extract +
@@ -238,7 +246,9 @@ fn fetch_config(
             .map(|m| m.len() <= MAX_CONFIG_BYTES)
             .unwrap_or(false)
     };
-    let parsed = if download_blob_quiet(&url, &tmp_s, auth).is_ok()
+    // `tmp.exists()` = the one-connection batch pre-download already fetched it; else fetch it now.
+    // Either way it is size-capped AND sha256-verified below before we read it.
+    let parsed = if (tmp.exists() || download_blob_quiet(&url, &tmp_s, auth).is_ok())
         && within_cap()
         && verify_digest(&tmp, &digest).is_ok()
     {
@@ -465,6 +475,98 @@ fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
         ));
     }
     Ok(())
+}
+
+/// Pre-download the config blob + every layer blob in ONE `curl` process — `--next` between requests
+/// makes curl reuse the SAME keep-alive connection, so the whole set pays ONE TLS handshake instead of
+/// one per blob (the measured cold-pull bottleneck: each separate `curl` process re-handshakes to the
+/// registry host). Best-effort and TRANSPORT-ONLY: each blob is written to the exact tmp path
+/// `fetch_config` / `download_layer` use, so they find it and skip their own fetch; every blob is still
+/// sha256-verified and every layer vetted + merged no-follow by the caller — byte-identical to the
+/// per-blob path. Scoped to Bearer / anonymous auth (the public path — ~all of Docker Hub & GHCR): a
+/// Basic-credential registry returns early, leaving the audited off-argv `-K` credential plumbing
+/// untouched. On ANY curl failure every partial tmp is removed, so the caller's per-blob path re-runs.
+fn download_blobs_oneconn(
+    registry: &str,
+    repo: &str,
+    manifest: &str,
+    layers: &[String],
+    auth: &Auth,
+    dest: &Path,
+) {
+    // Escape hatch (like KERN_NO_PREFETCH): opt out of the one-connection batch and let the per-blob
+    // path run. For A/B measuring, or if a registry mishandles `--next` connection reuse.
+    if std::env::var_os("KERN_NO_BLOB_BATCH").is_some() {
+        return;
+    }
+    // Basic creds go off-argv via `-K` stdin; do NOT reshape that into a `--next` chain — fall back.
+    let bearer = match auth {
+        Auth::Basic { .. } => return,
+        Auth::Bearer(t) => Some(format!("Authorization: Bearer {t}")),
+        Auth::None => None,
+    };
+    // (url, tmp_path) for the config blob (if present) then each layer, in order — the exact tmp paths
+    // `fetch_config` and `download_layer` expect.
+    let mut blobs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Some(d) = object_after(manifest, "config").and_then(|d| first_str(d, "digest")) {
+        blobs.push((
+            format!("{}/v2/{repo}/blobs/{d}", reg_base(registry)),
+            dest.join(".kern-image-config.json"),
+        ));
+    }
+    for (i, dig) in layers.iter().enumerate() {
+        blobs.push((
+            format!("{}/v2/{repo}/blobs/{dig}", reg_base(registry)),
+            layer_tmp_path(dest, i, dig),
+        ));
+    }
+    if blobs.len() < 2 {
+        return; // 0–1 blobs: no second request to share a connection with — nothing to save.
+    }
+    // Build one `curl` command, a `--next`-separated segment per blob. curl RESETS per-request options
+    // at `--next`, so the TLS pin + size cap + `-o` + Bearer header MUST be repeated on every segment
+    // (dropping the pin on a later segment would silently weaken it — hence per-segment, identical to
+    // `curl_download`'s single-blob options).
+    let tmp_strs: Vec<String> = blobs
+        .iter()
+        .map(|(_, t)| t.to_string_lossy().into_owned())
+        .collect();
+    let mut args: Vec<&str> = Vec::new();
+    for (i, (url, _)) in blobs.iter().enumerate() {
+        if i > 0 {
+            args.push("--next");
+        }
+        args.push("--no-progress-meter");
+        args.push("-S");
+        args.push("-L");
+        args.extend_from_slice(pin_for_url(url));
+        args.push("--max-redirs");
+        args.push("10");
+        args.push("--connect-timeout");
+        args.push("10");
+        args.push("--max-time");
+        args.push("600");
+        args.push("--max-filesize");
+        args.push(MAX_LAYER_DOWNLOAD_BYTES);
+        args.push("-o");
+        args.push(tmp_strs[i].as_str());
+        if let Some(h) = &bearer {
+            args.push("-H");
+            args.push(h.as_str());
+        }
+        // The URL goes POSITIONAL (no `--`): a leading `--` ends option parsing for the segment and
+        // then swallows the following `--next` (breaking every later segment's `-o`, sending its body
+        // to stdout). Safe without it — the URL always comes from `reg_base` (`https://…`, never `-`)
+        // and `--proto =https` above rejects any non-https anyway.
+        args.push(url.as_str());
+    }
+    if crate::net::curl(&args).is_err() {
+        // Partial/failed batch: remove every tmp so the caller's per-blob path re-downloads cleanly —
+        // a leftover partial would otherwise be picked up and (correctly) fail digest verification.
+        for (_, t) in &blobs {
+            let _ = std::fs::remove_file(t);
+        }
+    }
 }
 
 /// Escape a value for curl's `-K` config double-quoted string: backslash-escape `\` and `"`, and
@@ -762,12 +864,17 @@ fn download_layer(
     let url = format!("{}/v2/{repo}/blobs/{digest}", reg_base(registry));
     let tmp = layer_tmp_path(dest, idx, digest);
     let tmp_s = tmp.to_string_lossy().into_owned();
-    if let Err(e) = curl_download(&url, &tmp_s, auth) {
-        // curl `-o` may have written a partial blob before failing — never leave it inside `dest`
-        // (which can be the user's rootfs dir): a junk `.kern-layer-*` would end up visible at `/`
-        // in every box booted from that rootfs.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    // Already fetched by the one-connection batch pre-download? Use it (it wrote this exact path). The
+    // blob is still sha256-verified + vetted by `process_layer` afterwards, so a bad batch download is
+    // caught there exactly as a bad per-blob download would be.
+    if !tmp.exists() {
+        if let Err(e) = curl_download(&url, &tmp_s, auth) {
+            // curl `-o` may have written a partial blob before failing — never leave it inside `dest`
+            // (which can be the user's rootfs dir): a junk `.kern-layer-*` would end up visible at `/`
+            // in every box booted from that rootfs.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     Ok(tmp)
 }
