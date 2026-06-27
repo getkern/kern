@@ -99,6 +99,18 @@ kern build -t app:1 . && kern tag app:1 registry.example/app:1 && kern push regi
 
 ## Features
 
+Daemonless, rootless, and complete — the full container UX plus resource slices, in one binary:
+
+- **Run anything, isolated** — OCI images from any registry (v2 auth, multi-arch, gzip **+ zstd**) or a `--rootfs`; CoW overlay (image immutable, scratch discarded) or `--read-only`; `-it` TTY; `--init` PID-1 reaper.
+- **Governed slices** — hard cgroup-v2 caps on any `box`/`run`: `--memory` · `--cpus` · `--cpuset-cpus` · `--memory-swap-max` · `--pids-limit` · `--io-weight` · `--nice`. `kern run` is the governor with no sandbox.
+- **Data & devices** — `-v` volumes (symlink-safe) · named volumes with a `--size` quota · network volumes (`nfs`/`smb`/`sshfs`) · `--secret` → `/run/secrets` (RAM, `0400`) · `vdisk:` scratch · `vgpio:` device passthrough (deny-by-default) · `--tmpfs`.
+- **Network & identity** — isolated by default; `--network host` for outbound; `-p` rootless publish (loopback unless you ask); in-box `--ssh`; `--pod` shared-net pods (`--no-outbound`); `--tun`; `--user`.
+- **Least privilege** — 13 dangerous caps always dropped (`--cap-add`/`--cap-drop`); an always-on **seccomp** denylist (kexec, modules, ptrace, mount API, `setns`, …) that also kills wrong-arch + x86_64 x32-ABI aliases.
+- **Lifecycle, no daemon** — `--restart` + `--health-cmd`; `cp`/`pause`/`attach`/`exec`; `ps`/`top`/`stats`/`logs`/`inspect`/`prune`/`gc`/`history`/`recover`; `compose` (reads `docker-compose.yml` too); reusable `[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]` profiles; `kern doctor`.
+
+<details>
+<summary><b>Every flag &amp; command, grouped</b></summary>
+
 **Run anything, isolated**
 
 - **OCI images, any registry** — `--image alpine` pulls (registry v2, multi-arch → your arch,
@@ -158,6 +170,8 @@ kern build -t app:1 . && kern tag app:1 registry.example/app:1 && kern push regi
 - **Diagnostics** — `kern doctor` (will boxes run here?), `info`, `bench`, shell `completions`.
 - **Resource profiles** — reusable `[[vcpu]]` / `[[vgpio]]` / `[[vdisk]]` in `~/.config/kern/kern.toml`,
   attached by prefix (`kern run vcpu:heavy vgpio:leds -- ./train.sh`); managed with `kern config`.
+
+</details>
 
 **Built-in hardening** — user+PID+net+UTS+IPC+mount namespaces, self-pivot root, `nosuid,nodev` box
 root, always-on seccomp, least-privilege caps, hard cgroup caps (via `systemd-run` where present);
@@ -276,10 +290,10 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
     print(out.stdout)          # network-off, capped, isolated; a fault is a typed SandboxFault
 ```
 
-Safe by default — every relaxing argument (`network=True`, extra `mounts`) says so; the binding owns
-the timeout, so a `timeout` fault is a known fact, not a guess. Both drivers use the installed `kern`
-binary (`kern` on `PATH` or `KERN_BIN`) and live in this repo — see [bindings/python](bindings/python)
-and the `kern-isolation` crate (depend by git/path, not yet crates.io).
+Safe by default — every relaxing argument (`network=True`, extra `mounts`) says so, and the binding owns
+the timeout, so a `timeout` fault is a fact, not a guess. Both use the installed `kern` (`PATH` or
+`KERN_BIN`) — see [bindings/python](bindings/python) and the `kern-isolation` crate (git/path, not yet
+crates.io).
 
 ## Platforms
 
@@ -351,18 +365,15 @@ numbers vary with hardware and load. Board rows are from on-device runs; full me
 from BENCHMARKS.md. On the **Pi 5, kern is the only runtime present at all** — one ~1.5 MB static binary
 just works where the others are each a setup step (Docker alone is a ~186 MB daemon stack).
 
-kern is the fastest sandbox here at **~1.9 ms** (ahead of bubblewrap). Of that, kern's *own* box setup is
-**~1 ms** — the sum of the `KERN_TIMING` phases (`unshare` + overlay + `/dev` + pivot + seccomp, each
-sub-ms; run `KERN_TIMING=1 kern box … -- true` to see them); the rest is process start + teardown.
-*Adding* a hard cgroup cap — the row above doesn't — brings it to **~6 ms**, but **~4 ms of that is the
-external `systemd-run` + D-Bus scope creation, not kern** — verify it yourself: `systemd-run --user
---scope -- true` alone is ~4 ms. It lands in `crun`/`runc` territory and is opt-out with `KERN_NO_SCOPE`
-(then it's back to ~2 ms, with a best-effort in-process cgroup). The top tier is all within a few ms —
-*nobody* wins single-shot latency outright. The real gap is to the **engines**: kern is **~120–150×
-faster** than podman (~300 ms) and Docker (~307 ms), which round-trip a daemon / fork `conmon` every
-run — yet kern is the only one shipping a full daemonless container UX in ~1.5 MB. Beyond one start:
-**~500 boxes/s** sequential, **~7 MB** RSS/box, **0 resident** (Docker keeps ~186 MB resident before
-you run anything).
+kern is the fastest sandbox here at **~1.9 ms** (ahead of bubblewrap). Its *own* box setup is **~1 ms**
+(the `KERN_TIMING` phases — `unshare` + overlay + `/dev` + pivot + seccomp, each sub-ms); the rest is
+process start + teardown. Adding a hard cgroup cap (the row above doesn't) brings it to **~6 ms** — but
+**~4 ms of that is external `systemd-run` + D-Bus scope creation, not kern** (`systemd-run --user --scope
+-- true` alone is ~4 ms), opt-out with `KERN_NO_SCOPE` (back to ~2 ms, best-effort in-process cgroup). The
+top tier is all within a few ms — *nobody* wins single-shot latency outright. The real gap is to the
+**engines**: **~120–150× faster** than podman/Docker (~300 ms), which round-trip a daemon every run — yet
+kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start: **~500 boxes/s**, **~7 MB**
+RSS/box, **0 resident** (Docker keeps ~186 MB resident before you run anything).
 
 † On the Arduino's Android kernel an overlayfs *mount* is ~31 ms (a kernel quirk — sub-ms elsewhere),
 so the default overlay box is ~34 ms there; `--bind-rootfs` starts in **9.9 ms, ahead of bubblewrap**.
