@@ -40,12 +40,35 @@ fn static_busybox() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// Heuristic: is unprivileged userns plausibly available? The sysctl, when present and `0`,
-/// means no. Absent → don't gate on it (kernel default usually allows).
+/// Is unprivileged userns *actually* usable here? Guessing from sysctls is not enough: on
+/// Ubuntu 24.04 (the GitHub runner) `unprivileged_userns_clone` reads `1`, yet AppArmor then
+/// blocks the `unshare` for unconfined binaries — so a sysctl-only check thinks userns is fine,
+/// the box creation fails with EPERM, and the test fails instead of skipping. Probe for real:
+/// fork a throwaway child, attempt `unshare(CLONE_NEWUSER)`, and report whether it succeeded.
+/// Bulletproof against *any* reason userns is unavailable (sysctl, AppArmor, seccomp, an outer
+/// container). The child only calls async-signal-safe functions before `_exit`.
 fn userns_plausible() -> bool {
-    match fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
-        Ok(s) => s.trim() != "0",
-        Err(_) => true,
+    // Cheap early-out when the classic sysctl explicitly disables it.
+    if let Ok(s) = fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
+        if s.trim() == "0" {
+            return false;
+        }
+    }
+    unsafe {
+        match libc::fork() {
+            0 => {
+                let rc = libc::unshare(libc::CLONE_NEWUSER);
+                libc::_exit(if rc == 0 { 0 } else { 1 });
+            }
+            pid if pid > 0 => {
+                let mut status = 0;
+                if libc::waitpid(pid, &mut status, 0) < 0 {
+                    return true; // can't tell — stay permissive
+                }
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+            }
+            _ => true, // fork failed — stay permissive (old behaviour)
+        }
     }
 }
 
