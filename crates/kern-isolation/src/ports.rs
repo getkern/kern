@@ -76,16 +76,8 @@ pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, String)> {
         if s < 0 {
             continue;
         }
-        let one: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                s,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &one as *const _ as *const libc::c_void,
-                mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+        set_sock_flag(s, libc::SO_REUSEADDR); // NOT REUSEPORT — see the doc: a REUSEPORT probe here
+                                              // would falsely pass alongside another REUSEPORT holder.
         let addr = addr_in(p.bind_ip, p.host);
         let r = unsafe { libc::bind(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) };
         let err = std::io::Error::last_os_error();
@@ -148,25 +140,23 @@ pub fn fork_forwarders(ports: &[PortMap]) -> Vec<PortForwarder> {
     out
 }
 
+/// Dispatch to the TCP or UDP forwarder. Both diverge (`-> !`), so the `udp` branch never falls through.
 fn forwarder_main(box_pid1: i32, bind_ip: u32, host_port: u16, box_port: u16, udp: bool) -> ! {
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) }; // auto-reap per-client relays
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) }; // auto-reap per-connection/-client children
     if udp {
-        udp_forwarder(box_pid1, bind_ip, host_port, box_port);
+        udp_forwarder(box_pid1, bind_ip, host_port, box_port); // -> !
     }
+    tcp_forwarder(box_pid1, bind_ip, host_port, box_port) // -> !
+}
+
+/// TCP publish: bind + listen the host port, and fork a single-threaded connector per accepted
+/// connection (fork, not threads, because `setns(CLONE_NEWUSER)` is refused in a multithreaded process).
+fn tcp_forwarder(box_pid1: i32, bind_ip: u32, host_port: u16, box_port: u16) -> ! {
     let listener = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     if listener < 0 {
         unsafe { libc::_exit(1) };
     }
-    let one: libc::c_int = 1;
-    unsafe {
-        libc::setsockopt(
-            listener,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &one as *const _ as *const libc::c_void,
-            mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+    set_sock_flag(listener, libc::SO_REUSEADDR);
     let addr = addr_in(bind_ip, host_port); // bind_ip:host_port (host net ns)
     if unsafe {
         libc::bind(
@@ -236,36 +226,52 @@ fn connector_main(box_pid1: i32, box_port: u16, conn: i32) {
     if !enter_box_ns(box_pid1) {
         return;
     }
+    let bs = connect_box_loopback(box_port, libc::SOCK_STREAM);
+    if bs < 0 {
+        return;
+    }
+    pump_bidir(conn, bs);
+    unsafe { libc::close(bs) };
+}
+
+/// Create an `AF_INET` socket of type `ty` (`SOCK_STREAM`/`SOCK_DGRAM`) in the CURRENT net ns and
+/// connect it to the box's `127.0.0.1:box_port`. Caller must already be in the box namespaces (see
+/// [`enter_box_ns`]). Returns the fd, or `-1` on any failure.
+fn connect_box_loopback(box_port: u16, ty: libc::c_int) -> i32 {
     unsafe {
-        let bs = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        if bs < 0 {
-            return;
+        let s = libc::socket(libc::AF_INET, ty, 0);
+        if s < 0 {
+            return -1;
         }
-        let addr = addr_in(0x7f00_0001, box_port); // 127.0.0.1:box_port
-        if libc::connect(bs, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
-            libc::close(bs);
-            return;
+        let addr = addr_in(0x7f00_0001, box_port); // 127.0.0.1:box_port (box net ns)
+        if libc::connect(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
+            libc::close(s);
+            return -1;
         }
-        pump_bidir(conn, bs);
-        libc::close(bs);
+        s
     }
 }
 
-/// Set `SO_REUSEADDR` + `SO_REUSEPORT` on `s` (best-effort). REUSEPORT lets each per-client UDP relay
-/// bind the same host port; the kernel then routes a client's datagrams to its own *connected* socket.
-fn reuse_addr_port(s: i32) {
+/// Enable one boolean `SOL_SOCKET` option on `s` (best-effort — a failure is ignored, matching the
+/// existing forwarder behaviour where these are hardening, not correctness).
+fn set_sock_flag(s: i32, opt: libc::c_int) {
     let one: libc::c_int = 1;
-    for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
-        unsafe {
-            libc::setsockopt(
-                s,
-                libc::SOL_SOCKET,
-                opt,
-                &one as *const _ as *const libc::c_void,
-                mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+    unsafe {
+        libc::setsockopt(
+            s,
+            libc::SOL_SOCKET,
+            opt,
+            &one as *const _ as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
+}
+
+/// Set `SO_REUSEADDR` + `SO_REUSEPORT` on `s`. REUSEPORT lets each per-client UDP relay bind the same
+/// host port; the kernel then routes a client's datagrams to its own *connected* socket.
+fn reuse_addr_port(s: i32) {
+    set_sock_flag(s, libc::SO_REUSEADDR);
+    set_sock_flag(s, libc::SO_REUSEPORT);
 }
 
 /// UDP publish. A wildcard host socket receives each client's FIRST datagram; a per-client child then
@@ -370,12 +376,8 @@ fn udp_relay_child(
         if !enter_box_ns(box_pid1) {
             return;
         }
-        let bs = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        let bs = connect_box_loopback(box_port, libc::SOCK_DGRAM);
         if bs < 0 {
-            return;
-        }
-        let ba = addr_in(0x7f00_0001, box_port); // 127.0.0.1:box_port (box net ns)
-        if libc::connect(bs, &ba as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
             return;
         }
         // Forward the datagram that got us here, then relay both ways.
