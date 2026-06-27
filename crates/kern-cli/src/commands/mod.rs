@@ -265,7 +265,7 @@ pub struct BoxRunArgs<'a> {
     /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
     pub tty: bool,
     /// `-p host:box` (repeatable): publish a box TCP port on a host port.
-    pub ports: &'a [(u32, u16, u16, bool)],
+    pub ports: &'a [kern_isolation::PortMap],
     /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret as
     /// `/run/secrets/NAME` (mode 0400) without it hitting the image or the workload env.
     pub secrets: &'a [String],
@@ -700,7 +700,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // in-box sshd on the host port (→ box `:22`) via the ordinary rootless forwarder. `eff_ports`
     // is the user's `-p` maps plus that SSH mapping.
     let (ssh, eff_ports) = prepare_ssh(&name, args.ssh_port, args.ssh_key, args.ports)?;
-    let ports: &[(u32, u16, u16, bool)] = &eff_ports;
+    let ports: &[kern_isolation::PortMap] = &eff_ports;
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
     // forwarder fails inside its fork — whose stderr a detached box swallows — and the box would
     // print "started" while nothing actually listens.
@@ -1110,7 +1110,7 @@ fn first_box_of_session() -> bool {
 fn run_box_interactive(
     mut spec: SandboxSpec,
     scratch: Option<PathBuf>,
-    ports: &[(u32, u16, u16, bool)],
+    ports: &[kern_isolation::PortMap],
     timeout: u64,
 ) -> Result<(), Error> {
     let pty = crate::pty::open().map_err(|e| Error::Sandbox(format!("openpty: {e}")))?;
@@ -1345,13 +1345,19 @@ fn prepare_ssh(
     name: &BoxName,
     ssh_port: Option<u16>,
     ssh_key: Option<&str>,
-    ports: &[(u32, u16, u16, bool)],
-) -> Result<(Option<kern_isolation::SshSetup>, Vec<(u32, u16, u16, bool)>), Error> {
+    ports: &[kern_isolation::PortMap],
+) -> Result<
+    (
+        Option<kern_isolation::SshSetup>,
+        Vec<kern_isolation::PortMap>,
+    ),
+    Error,
+> {
     let Some(port) = ssh_port else {
         return Ok((None, ports.to_vec()));
     };
     // Don't silently shadow a user `-p` on the same host port, or a second box-side :22.
-    if ports.iter().any(|&(_, h, _, _)| h == port) {
+    if ports.iter().any(|m| m.host == port) {
         return Err(Error::Sandbox(format!(
             "--ssh {port} conflicts with a -p mapping on host port {port}"
         )));
@@ -1408,7 +1414,12 @@ fn prepare_ssh(
     };
 
     let mut eff = ports.to_vec();
-    eff.push((0x7f00_0001, port, 22, false)); // 127.0.0.1:<port> -> box :22 (ssh is tcp)
+    eff.push(kern_isolation::PortMap {
+        bind_ip: 0x7f00_0001,
+        host: port,
+        box_port: 22,
+        udp: false,
+    }); // 127.0.0.1:<port> -> box :22
     let id = hint_key.map(|k| format!(" -i {k}")).unwrap_or_default();
     eprintln!(
         "kern: ssh: ssh -p {port}{id} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -2455,10 +2466,10 @@ fn mounted_named_volumes(specs: &[String]) -> String {
     names.join(",")
 }
 
-fn ports_summary(ports: &[(u32, u16, u16, bool)]) -> String {
+fn ports_summary(ports: &[kern_isolation::PortMap]) -> String {
     ports
         .iter()
-        .map(|&(ip, h, b, udp)| crate::ports::fmt(ip, h, b, udp))
+        .map(crate::ports::fmt)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2557,7 +2568,7 @@ fn supervise_box(
     spec: &SandboxSpec,
     have_pipe: bool,
     wr: i32,
-    ports: &[(u32, u16, u16, bool)],
+    ports: &[kern_isolation::PortMap],
     restart: bool,
     inst: &mut registry::Instance,
 ) {
@@ -2681,7 +2692,7 @@ fn run_detached(
     name: &BoxName,
     spec: SandboxSpec,
     scratch: Option<PathBuf>,
-    ports: &[(u32, u16, u16, bool)],
+    ports: &[kern_isolation::PortMap],
     volumes: &str,
     pod: &str,
     restart: bool,

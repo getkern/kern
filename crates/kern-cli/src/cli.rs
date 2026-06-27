@@ -66,7 +66,7 @@ pub enum Command {
         /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
         tty: bool,
         /// `-p host:box` (repeatable): publish a box TCP/UDP port (or range) on a host port.
-        ports: Vec<(u32, u16, u16, bool)>,
+        ports: Vec<kern_isolation::PortMap>,
         /// `--add-host NAME:IP` (repeatable): extra `/etc/hosts` entries; `IP` may be `host-gateway`.
         add_hosts: Vec<(String, String)>,
         /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret to the box
@@ -767,7 +767,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut show_config = false;
     let mut quiet = false;
     let mut verbose = false;
-    let mut ports: Vec<(u32, u16, u16, bool)> = Vec::new();
+    let mut ports: Vec<kern_isolation::PortMap> = Vec::new();
     let mut add_hosts: Vec<(String, String)> = Vec::new();
     let mut secrets: Vec<String> = Vec::new();
     let mut ssh_port: Option<u16> = None;
@@ -1161,7 +1161,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     // this impossible config here rather than let the second forwarder silently fail to bind.
     for a in 0..ports.len() {
         for b in (a + 1)..ports.len() {
-            if ports[a].0 == ports[b].0 && ports[a].1 == ports[b].1 {
+            if ports[a].bind_ip == ports[b].bind_ip && ports[a].host == ports[b].host {
                 return Err(Error::Usage(
                     "duplicate -p host port (one host port maps to a single box port)",
                 ));
@@ -1918,12 +1918,18 @@ mod tests {
         let Command::BoxRun { ports, .. } = cmd else {
             panic!("expected BoxRun")
         };
+        let pm = |bind_ip, host, box_port, udp| kern_isolation::PortMap {
+            bind_ip,
+            host,
+            box_port,
+            udp,
+        };
         assert_eq!(
             ports,
             vec![
-                (0x7f00_0001, 8080, 80, false),
-                (0, 443, 443, false),
-                (0x7f00_0001, 53, 53, true),
+                pm(0x7f00_0001, 8080, 80, false),
+                pm(0, 443, 443, false),
+                pm(0x7f00_0001, 53, 53, true),
             ]
         );
         // Malformed mappings are usage errors, never silently dropped.

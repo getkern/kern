@@ -9,10 +9,10 @@ const MAX_RANGE: usize = 1024;
 /// (e.g. `8000-8010:9000-9010`). Ports are 1..=65535. The optional leading IPv4 is the host bind
 /// address; it defaults to **`127.0.0.1`** (loopback only) — secure by default, so a published service
 /// isn't accidentally exposed to the LAN. Use `0.0.0.0:…` to bind every interface deliberately. A
-/// trailing `/tcp` (default) or `/udp` selects the protocol. Returns the EXPANDED list of
-/// `(bind_ip_host_order, host_port, box_port, is_udp)` mappings (one for a single port, N for a range);
-/// `None` if malformed, if the host/box ranges differ in length, or if the range exceeds [`MAX_RANGE`].
-pub fn parse(spec: &str) -> Option<Vec<(u32, u16, u16, bool)>> {
+/// trailing `/tcp` (default) or `/udp` selects the protocol. Returns the EXPANDED list of [`PortMap`]s
+/// (one for a single port, N for a range); `None` if malformed, if the host/box ranges differ in
+/// length, or if the range exceeds [`MAX_RANGE`].
+pub fn parse(spec: &str) -> Option<Vec<kern_isolation::PortMap>> {
     // Optional trailing protocol: `…/udp` or `…/tcp` (anything else is a malformed spec, not silent tcp).
     let (spec, udp) = match spec.rsplit_once('/') {
         Some((head, p)) if p.eq_ignore_ascii_case("udp") => (head, true),
@@ -39,7 +39,12 @@ pub fn parse(spec: &str) -> Option<Vec<(u32, u16, u16, bool)>> {
     }
     Some(
         (0..count as u16)
-            .map(|k| (ip, hs + k, bs + k, udp))
+            .map(|k| kern_isolation::PortMap {
+                bind_ip: ip,
+                host: hs + k,
+                box_port: bs + k,
+                udp,
+            })
             .collect(),
     )
 }
@@ -61,16 +66,18 @@ fn parse_port_or_range(s: &str) -> Option<(u16, u16)> {
     }
 }
 
-/// Format a parsed `-p` mapping for display (the inverse of [`parse`], e.g. `127.0.0.1:8080->80` or
+/// Format a [`PortMap`] for display (the inverse of [`parse`], e.g. `127.0.0.1:8080->80` or
 /// `…->53/udp`) — always showing the bind address so the exposure is visible.
-pub fn fmt(ip: u32, host: u16, boxp: u16, udp: bool) -> String {
+pub fn fmt(m: &kern_isolation::PortMap) -> String {
     format!(
-        "{}.{}.{}.{}:{host}->{boxp}{}",
-        ip >> 24 & 0xff,
-        ip >> 16 & 0xff,
-        ip >> 8 & 0xff,
-        ip & 0xff,
-        if udp { "/udp" } else { "" }
+        "{}.{}.{}.{}:{}->{}{}",
+        m.bind_ip >> 24 & 0xff,
+        m.bind_ip >> 16 & 0xff,
+        m.bind_ip >> 8 & 0xff,
+        m.bind_ip & 0xff,
+        m.host,
+        m.box_port,
+        if m.udp { "/udp" } else { "" }
     )
 }
 
@@ -90,19 +97,29 @@ fn parse_ipv4(s: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kern_isolation::PortMap;
     const LO: u32 = 0x7f00_0001;
+
+    fn pm(bind_ip: u32, host: u16, box_port: u16, udp: bool) -> PortMap {
+        PortMap {
+            bind_ip,
+            host,
+            box_port,
+            udp,
+        }
+    }
 
     #[test]
     fn parses_tcp_udp_and_ip() {
         // default proto is tcp, default bind is loopback; a single port → a one-element list
-        assert_eq!(parse("8080:80"), Some(vec![(LO, 8080, 80, false)]));
-        assert_eq!(parse("8080:80/tcp"), Some(vec![(LO, 8080, 80, false)]));
-        assert_eq!(parse("5353:53/udp"), Some(vec![(LO, 5353, 53, true)]));
-        assert_eq!(parse("53:53/UDP"), Some(vec![(LO, 53, 53, true)])); // case-insensitive
-        assert_eq!(parse("0.0.0.0:53:53/udp"), Some(vec![(0, 53, 53, true)]));
+        assert_eq!(parse("8080:80"), Some(vec![pm(LO, 8080, 80, false)]));
+        assert_eq!(parse("8080:80/tcp"), Some(vec![pm(LO, 8080, 80, false)]));
+        assert_eq!(parse("5353:53/udp"), Some(vec![pm(LO, 5353, 53, true)]));
+        assert_eq!(parse("53:53/UDP"), Some(vec![pm(LO, 53, 53, true)])); // case-insensitive
+        assert_eq!(parse("0.0.0.0:53:53/udp"), Some(vec![pm(0, 53, 53, true)]));
         // round-trips through fmt (shows /udp only for udp)
-        assert_eq!(fmt(LO, 5353, 53, true), "127.0.0.1:5353->53/udp");
-        assert_eq!(fmt(LO, 8080, 80, false), "127.0.0.1:8080->80");
+        assert_eq!(fmt(&pm(LO, 5353, 53, true)), "127.0.0.1:5353->53/udp");
+        assert_eq!(fmt(&pm(LO, 8080, 80, false)), "127.0.0.1:8080->80");
     }
 
     #[test]
@@ -111,15 +128,15 @@ mod tests {
         assert_eq!(
             parse("8000-8002:9000-9002/udp"),
             Some(vec![
-                (LO, 8000, 9000, true),
-                (LO, 8001, 9001, true),
-                (LO, 8002, 9002, true),
+                pm(LO, 8000, 9000, true),
+                pm(LO, 8001, 9001, true),
+                pm(LO, 8002, 9002, true),
             ])
         );
         // an ip applies to the whole range
         assert_eq!(
             parse("0.0.0.0:80-81:80-81"),
-            Some(vec![(0, 80, 80, false), (0, 81, 81, false)])
+            Some(vec![pm(0, 80, 80, false), pm(0, 81, 81, false)])
         );
         // a range mapping onto a single box port is ambiguous → rejected (like Docker)
         assert_eq!(parse("8000-8010:80"), None);
