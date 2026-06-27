@@ -491,7 +491,10 @@ fn box_root_is_unprivileged() -> bool {
 /// no line is well-formed — so `--privileged` never relaxes seccomp on a map it doesn't understand.
 fn uid_map_root_is_unprivileged(map: &str) -> bool {
     for line in map.lines() {
-        let f: Vec<u64> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        let f: Vec<u64> = line
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect();
         if let [inside, outside, count] = f[..] {
             if inside == 0 && count >= 1 {
                 // `outside` is an id in the PARENT user namespace, not guaranteed a host uid. That's

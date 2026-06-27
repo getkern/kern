@@ -1988,10 +1988,22 @@ mod tests {
     #[test]
     fn box_privileged_flag_parses_and_defaults_off() {
         let (_, cmd) = parse(&["box".into(), "x".into(), "--privileged".into()]).unwrap();
-        assert!(matches!(cmd, Command::BoxRun { privileged: true, .. }));
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                privileged: true,
+                ..
+            }
+        ));
         // off by default — nesting stays blocked unless explicitly requested
         let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
-        assert!(matches!(cmd, Command::BoxRun { privileged: false, .. }));
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                privileged: false,
+                ..
+            }
+        ));
     }
 
     #[test]
