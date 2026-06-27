@@ -65,8 +65,10 @@ pub enum Command {
         cpuset: Option<String>,
         /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
         tty: bool,
-        /// `-p host:box` (repeatable): publish a box TCP port on a host port.
+        /// `-p host:box` (repeatable): publish a box TCP/UDP port (or range) on a host port.
         ports: Vec<(u32, u16, u16, bool)>,
+        /// `--add-host NAME:IP` (repeatable): extra `/etc/hosts` entries; `IP` may be `host-gateway`.
+        add_hosts: Vec<(String, String)>,
         /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret to the box
         /// as `/run/secrets/NAME` (mode 0400) without it touching the image or the workload env.
         secrets: Vec<String>,
@@ -766,6 +768,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut quiet = false;
     let mut verbose = false;
     let mut ports: Vec<(u32, u16, u16, bool)> = Vec::new();
+    let mut add_hosts: Vec<(String, String)> = Vec::new();
     let mut secrets: Vec<String> = Vec::new();
     let mut ssh_port: Option<u16> = None;
     let mut ssh_key: Option<String> = None;
@@ -1053,8 +1056,27 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "-p" | "--publish" => {
                     i += 1;
                     match rest.get(i).and_then(|v| crate::ports::parse(v)) {
-                        Some(p) => ports.push(p),
-                        None => return Err(Error::Usage("-p <hostport>:<boxport> (e.g. 8080:80)")),
+                        Some(p) => ports.extend(p), // one mapping, or many for a port range
+                        None => {
+                            return Err(Error::Usage(
+                                "-p [ip:]<hostport>:<boxport>[/tcp|/udp] (e.g. 8080:80 or 8000-8010:8000-8010)",
+                            ))
+                        }
+                    }
+                }
+                "--add-host" => {
+                    i += 1;
+                    // `NAME:IP` — the name has no colon, so split on the first `:` (IP is v4 or the
+                    // `host-gateway` keyword). Both halves must be non-empty.
+                    match rest.get(i).and_then(|v| v.split_once(':')) {
+                        Some((n, ip)) if !n.is_empty() && !ip.is_empty() => {
+                            add_hosts.push((n.to_string(), ip.to_string()))
+                        }
+                        _ => {
+                            return Err(Error::Usage(
+                                "--add-host <name>:<ip> (ip may be host-gateway)",
+                            ))
+                        }
                     }
                 }
                 "--secret" => {
@@ -1179,6 +1201,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             cpuset,
             tty,
             ports,
+            add_hosts,
             secrets,
             ssh_port,
             ssh_key,
@@ -1608,6 +1631,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             cpuset,
             tty,
             ports,
+            add_hosts,
             secrets,
             ssh_port,
             ssh_key,
@@ -1684,6 +1708,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             quiet,
             verbose,
             profiles: &profiles,
+            add_hosts: &add_hosts,
         }),
         Command::Run {
             command,

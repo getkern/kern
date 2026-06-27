@@ -99,8 +99,11 @@ pub fn help() -> Result<(), Error> {
     --cpuset-cpus <list>  Pin to specific CPUs (e.g. 0-3, 0,2,4; default no pinning)
     --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
     -it, -t, -i         Allocate an interactive PTY (shells/REPLs); foreground only
-    -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; binds 127.0.0.1
-                        by default — use 0.0.0.0:H:B to expose on all interfaces; repeatable)
+    -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; a port RANGE
+                        like 8000-8010:8000-8010 works; binds 127.0.0.1 by default — use
+                        0.0.0.0:H:B to expose on all interfaces; repeatable)
+    --add-host N:IP     Add an /etc/hosts entry N → IP in the box; IP may be `host-gateway`
+                        (the host's address, to reach a service on the host); repeatable
     --secret SPEC       Deliver a secret as /run/secrets/NAME (mode 0400): SRC[:NAME] (file),
                         NAME=value (inline), or NAME=- (from stdin); repeatable
     --ssh PORT          Run an in-box sshd, published on host PORT (→ box :22); prints the ssh
@@ -318,6 +321,45 @@ pub struct BoxRunArgs<'a> {
     pub verbose: bool,
     /// Resource-profile tokens (`vcpu:name` …) applied to the box's caps.
     pub profiles: &'a [String],
+    /// `--add-host NAME:IP` extra `/etc/hosts` entries; the IP may be the keyword `host-gateway`
+    /// (resolved to the host's reachable address at build time).
+    pub add_hosts: &'a [(String, String)],
+}
+
+/// Resolve `--add-host` entries: the `host-gateway` keyword becomes the host's reachable address —
+/// `127.0.0.1` when the box shares the host network, else the host's primary (default-route) IPv4 (the
+/// address a box with egress uses to reach the host). Other values pass through verbatim.
+fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, String)> {
+    let gateway = |()| -> String {
+        if share_net {
+            return "127.0.0.1".to_string();
+        }
+        host_primary_ipv4().unwrap_or_else(|| "127.0.0.1".to_string())
+    };
+    raw.iter()
+        .map(|(name, ip)| {
+            let ip = if ip.eq_ignore_ascii_case("host-gateway") {
+                gateway(())
+            } else {
+                ip.clone()
+            };
+            (name.clone(), ip)
+        })
+        .collect()
+}
+
+/// The host's primary IPv4 (the source address the default route would use), found by `connect()`ing a
+/// UDP socket to a public address — no packet is sent; the kernel just picks the route's source IP. So
+/// it works offline as long as a default route exists. `None` if there's no usable route.
+fn host_primary_ipv4() -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:53").ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
+            Some(v4.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Clamp a `--cpus` request to the host's physical CPU count (from `/proc/cpuinfo`), so the cap
@@ -772,6 +814,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         caps,
         io_max: vdisk_io_max,
         io_weight: args.io_weight,
+        extra_hosts: resolve_add_hosts(args.add_hosts, args.share_net),
     })?;
 
     if args.tty && args.detached {
@@ -1501,6 +1544,8 @@ struct BuildSpec<'a> {
     caps: kern_isolation::CapSpec,
     io_max: Vec<String>,
     io_weight: Option<u64>,
+    /// `--add-host NAME:IP` entries (`host-gateway` already resolved to a concrete address).
+    extra_hosts: Vec<(String, String)>,
 }
 
 /// Build the sandbox spec. **Always an overlay** (the image/rootfs is the read-only lower; a
@@ -1639,6 +1684,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         caps: b.caps,
         io_max: b.io_max,
         io_weight: b.io_weight,
+        extra_hosts: b.extra_hosts,
     };
     Ok((spec, eph))
 }
