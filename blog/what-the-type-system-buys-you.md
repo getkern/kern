@@ -151,7 +151,7 @@ and every future contributor, doesn't have to.
 
 ---
 
-*kern is a fast, daemonless Linux sandbox & virtual-resource runtime — one ~1 MB static binary,
+*kern is a fast, daemonless Linux sandbox & virtual-resource runtime — one ~1.5 MB static binary,
 one Rust dependency (`libc`). The mount-ordering typestate is `Rootfs<S>` in the `kern-isolation`
 crate. Code, benchmarks, and an honest account of the security boundary:
 [github.com/getkern/kern](https://github.com/getkern/kern).*
