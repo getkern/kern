@@ -317,8 +317,11 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
     <li><b>Shipped</b> — build + tag + push, zstd layers, <code>--init</code>, <code>--platform</code>
       (on <code>kern pull</code>), pods, nested <code>--privileged</code> boxes, the Python binding;
       ongoing polish + broader ARM CI.</li>
-    <li><b>Planned</b> — a Windows (WSL2) hybrid: one ~1.5 MB binary that drops into the WSL2 Linux kernel
-      — a daemonless container UX on Windows without Docker Desktop's VM + background service.</li>
+    <li><b>Windows, via WSL2 — runs today.</b> kern runs on Windows inside WSL2 (a real Linux kernel), so
+      hard caps are real there, verified. A <code>kern.exe</code> shim and a pre-baked kern WSL2 distro
+      (Alpine + kern, no Ubuntu) are built and staged; the one-shot <code>irm … | iex</code> installer is
+      being wired to the public release. Honest caveat: kern runs <em>inside</em> the WSL2 kernel, so it
+      doesn't shed the VM weight native Linux does — the win is "no Docker Desktop", not "no VM".</li>
     <li><b>1.0</b> — freeze: CLI + config under semver, threat model + architecture finalised.</li>
   </ul>
   <div class="note future"><b>Later — a light note.</b> Longer term, the same virtual-resource model may
