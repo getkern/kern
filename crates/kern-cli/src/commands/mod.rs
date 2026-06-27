@@ -139,6 +139,8 @@ pub fn help() -> Result<(), Error> {
                         only the caller (faster + more isolated)
     --bind-rootfs       Bind --rootfs directly instead of an overlay — faster on kernels with a
                         slow overlayfs, but the source is mutable & shared (no per-box isolation)
+    --privileged        Relax seccomp so a NESTED `kern box` (docker-in-docker style) can start —
+                        rootless-only; still blocks kexec/modules/bpf/io_uring (unlike Docker)
     --plan              Preview the isolation sequence instead of running
 
 {b}OPTIONS:{z}
@@ -249,6 +251,9 @@ pub struct BoxRunArgs<'a> {
     pub pod: Option<&'a str>,
     pub uid_range: bool,
     pub bind_rootfs: bool,
+    /// `--privileged`: relax the seccomp filter to allow a NESTED `kern box` (rootless-only; see
+    /// [`kern_isolation::SandboxSpec::privileged`]).
+    pub privileged: bool,
     /// INTERNAL (build): explicit colon-joined overlay lower dir(s), used instead of `--rootfs`/
     /// `--image` and paired with `overlay_upper` to run a build's RUN step against the base.
     pub overlay_lower: Option<&'a str>,
@@ -587,6 +592,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }
     }
 
+    // `--privileged` (relax seccomp so a NESTED `kern box` can create its namespaces) is honoured
+    // ONLY rootless: as REAL host root the box's root maps to host root, where re-allowing `mount`
+    // would re-open the host-privilege class (the core_pattern escape). Refuse loudly rather than
+    // silently ignore — the user asked for nesting; tell them it isn't safe here and why.
+    if args.privileged && unsafe { libc::geteuid() } == 0 {
+        return Err(Error::Sandbox(
+            "--privileged (nested box) is rootless-only: run kern as a non-root user. As real \
+             root the box's root maps to host root, and relaxing mount/namespace syscalls there \
+             would break containment. A nested box is safe precisely because a rootless userns \
+             grants no host privilege."
+                .to_string(),
+        ));
+    }
+
     // The lower/base rootfs: an explicit --rootfs, or pull --image into a local cache. An --image
     // also yields its OCI runtime config (Entrypoint/Cmd/Env/WorkingDir/User) — the defaults below.
     let (lower, image_config) = match (args.overlay_lower, args.rootfs, args.image) {
@@ -795,6 +814,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // work; if the helpers are absent the box falls back to single-uid (warned elsewhere).
         uid_range: args.uid_range || ssh.is_some() || non_root_user,
         bind_rootfs: args.bind_rootfs,
+        privileged: args.privileged,
         overlay_upper: args.overlay_upper.map(str::to_string),
         memory,
         memory_swap_max: args.memory_swap_max,
@@ -993,7 +1013,7 @@ fn print_box_status(args: &BoxRunArgs, cpus: Option<f64>) {
         cpus,
         volumes: args.volumes.len(),
         tty: args.tty,
-        seccomp_syscalls: kern_isolation::denied_syscall_count(),
+        seccomp_syscalls: kern_isolation::denied_syscall_count(nesting_active(args.privileged)),
     };
     let p = crate::ui::Palette::detect_stderr();
     let gl = crate::ui::Glyphs::detect();
@@ -1081,8 +1101,15 @@ fn print_resolved_config(
     );
     println!(
         "seccomp_denied_syscalls: {}",
-        kern_isolation::denied_syscall_count()
+        kern_isolation::denied_syscall_count(nesting_active(args.privileged))
     );
+    println!("privileged: {}", nesting_active(args.privileged));
+}
+
+/// Whether a `--privileged` request will ACTUALLY relax seccomp for nesting: only rootless (as real
+/// host root the flag is refused earlier, but keep the display honest if that path is ever reached).
+fn nesting_active(privileged: bool) -> bool {
+    privileged && unsafe { libc::geteuid() } != 0
 }
 
 /// True the first time a foreground box runs in this login session, recording a marker under
@@ -1535,6 +1562,8 @@ struct BuildSpec<'a> {
     pod_holder: Option<i32>,
     uid_range: bool,
     bind_rootfs: bool,
+    /// `--privileged`: relax seccomp for a nested `kern box` (rootless-only).
+    privileged: bool,
     /// INTERNAL (build): a persistent overlay upper dir; overlays `lower` and keeps writes there.
     overlay_upper: Option<String>,
     memory: Option<u64>,
@@ -1696,6 +1725,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         io_max: b.io_max,
         io_weight: b.io_weight,
         extra_hosts: b.extra_hosts,
+        privileged: b.privileged,
     };
     Ok((spec, eph))
 }

@@ -125,6 +125,15 @@ pub struct SandboxSpec {
     /// `--add-host NAME:IP`: extra `/etc/hosts` entries appended inside the box (`host-gateway` is
     /// already resolved to a concrete address by the caller). Empty for none.
     pub extra_hosts: Vec<(String, String)>,
+    /// `--privileged`: relax the always-on seccomp filter to ALLOW the namespace + classic-mount
+    /// syscalls (`unshare`/`setns`/`mount`/`umount2`/`pivot_root`) so a *nested* `kern box` (or
+    /// docker-in-docker-style workload) can start. Honoured ONLY in rootless mode — when the box's
+    /// root maps to an UNPRIVILEGED host uid (caller is non-root), a nested userns grants no new
+    /// host privilege (the reason rootless podman-in-podman is safe). As real host root (euid 0) the
+    /// request is IGNORED (no relaxation): relaxing `mount` there would re-open the core_pattern /
+    /// host-privilege class. Every other dangerous syscall (kexec, modules, bpf, io_uring, keyring,
+    /// ptrace, the NEW mount API) stays blocked even here — stronger than Docker's `--privileged`.
+    pub privileged: bool,
 }
 
 /// A resolved vDisk to mount in the box at `/vdisk/<name>`. When `host_dir` is set, the host prepared
@@ -466,6 +475,7 @@ fn child_setup_and_exec(
     spec: &SandboxSpec,
     argv: &[CString],
     ready_fd: Option<i32>,
+    allow_nesting: bool,
 ) -> Result<Infallible, Error> {
     let mut t = PhaseTimer::new();
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
@@ -522,7 +532,18 @@ fn child_setup_and_exec(
     detach_old_root()?;
     // Lock down the non-namespaced host-global procfs knobs (core_pattern, sysrq, kernel info) now that
     // `/proc` resolves to the fresh procfs — closes the classic core_pattern escape for a root-mapped box.
-    mask_proc_paths()?;
+    //
+    // SKIP for a `--privileged` (nesting) box: the ro-bind/`/dev/null` masks are LOCKED submounts, and
+    // the kernel's `mount_too_revealing` check then refuses a NESTED box's fresh `/proc` mount (EPERM) —
+    // it would "reveal" what the outer masks hide. Presenting a fully-visible `/proc` (exactly what
+    // Docker `--privileged` does) is what lets docker-in-docker-style nesting work. Safe here because
+    // `allow_nesting` is rootless-only: the host-global sysctls under `/proc/sys` are owned by the INIT
+    // user namespace and a rootless box (even as box-root) lacks the CAP_SYS_ADMIN there to write them —
+    // so the mask was defense-in-depth for the ROOT-mapped case, which `--privileged` already refuses.
+    // The nested box, unless itself `--privileged`, re-applies its own masks normally.
+    if !allow_nesting {
+        mask_proc_paths()?;
+    }
     t.mark("pivot+proc");
     // Optional read-only remount LAST — the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep
@@ -596,8 +617,10 @@ fn child_setup_and_exec(
     clear_caps_from_sets(cap_mask);
 
     // Install the seccomp filter LAST — after all setup syscalls (mount/pivot) are done, so it
-    // only constrains the workload. Then exec (or hand off to the built-in init).
-    crate::seccomp::install()?;
+    // only constrains the workload. Then exec (or hand off to the built-in init). `allow_nesting`
+    // (a rootless `--privileged` box) leaves the namespace + classic-mount syscalls allowed so a
+    // nested `kern box` can start; everything else stays blocked.
+    crate::seccomp::install(allow_nesting)?;
     t.mark("seccomp");
     if spec.init {
         // `--init`: this PID-1 process forks the workload and becomes a reaping init. Never returns.
@@ -1955,6 +1978,12 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
 
+    // `--privileged` relaxes the seccomp filter for nesting, but ONLY when the box is genuinely
+    // rootless (box root → an unprivileged host uid). As real host root the box's root maps to host
+    // root, where allowing `mount` would re-open the host-privilege class — so the request is
+    // dropped here (fail-safe; the CLI turns the same condition into a loud error before we fork).
+    let allow_nesting = spec.privileged && euid != 0;
+
     // `--pod`: JOIN the pod holder's existing user + net namespace (created by `kern pod create`)
     // instead of unsharing our own — so every box in the pod shares one loopback network. We start
     // in the host user ns, where we are privileged over our descendant holder, so we can `setns`
@@ -2052,7 +2081,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         if let Some(fd) = ready_fd {
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
-        match child_setup_and_exec(spec, &argv, ready_fd) {
+        match child_setup_and_exec(spec, &argv, ready_fd, allow_nesting) {
             Ok(never) => match never {},
             Err(e) => {
                 if let Some(fd) = ready_fd {
@@ -2604,7 +2633,9 @@ pub fn exec_in_box(
         drop_dangerous_caps(&CapSpec::default());
         // Fail CLOSED if seccomp can't install — never run the exec'd command unfiltered (the box's
         // PID 1 fails closed on this same call; `exec` must match, not fall through unprotected).
-        if crate::seccomp::install().is_err() {
+        // `exec` keeps the STRICT filter regardless of the box's `--privileged` (which isn't
+        // recorded per box) — an exec'd command being *more* constrained than PID 1 is always safe.
+        if crate::seccomp::install(false).is_err() {
             eprintln!("kern: exec: seccomp filter could not be installed — refusing to run");
             unsafe { libc::_exit(126) };
         }
