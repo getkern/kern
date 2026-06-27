@@ -29,6 +29,29 @@ use std::process::{Command, Stdio};
 
 const DEFAULT_REGISTRY: &str = "registry-1.docker.io";
 
+/// Warn if the pull destination sits on a Windows-mounted filesystem. WSL2 exposes the Windows drives
+/// (`/mnt/c`, `\\wsl$`) as a **9p** (`drvfs`) mount that can't represent Linux ownership, permissions,
+/// or special files — so extracting an image there is slow and, for images that carry those (e.g.
+/// `debian`), fails outright with an opaque "layer extraction failed". Turn that into an actionable
+/// hint BEFORE the failure: pull into a real Linux filesystem instead (the WSL home / a Linux-side
+/// cache). Simple images (alpine/busybox) still extract on 9p, so this warns rather than refuses.
+/// Linux-only and a no-op on every native filesystem (9p never matches there).
+fn warn_if_windows_mount(dest: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    const V9FS_MAGIC: i64 = 0x0102_1997; // WSL2 drvfs / `\\wsl$` is a 9p mount
+    let Ok(c) = std::ffi::CString::new(dest.as_os_str().as_bytes()) else {
+        return;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && st.f_type as i64 == V9FS_MAGIC {
+        eprintln!(
+            "kern: warning: pulling into a Windows-mounted path (WSL2 9p/drvfs) — slow, and it fails \
+             for images carrying Linux ownership/permissions (e.g. debian). Pull into a Linux \
+             filesystem instead: run from your WSL home directory, not a /mnt/<drive> path."
+        );
+    }
+}
+
 /// An OCI pull failure.
 #[derive(Debug)]
 pub enum OciError {
@@ -121,6 +144,7 @@ pub fn pull(
         if total == 1 { "" } else { "s" }
     );
     std::fs::create_dir_all(dest).map_err(|e| OciError::Extract(e.to_string()))?;
+    warn_if_windows_mount(dest);
     // PREFETCH: download layer K+1 concurrently while layer K is verified + extracted + merged. The
     // per-layer download command is UNCHANGED (same TLS pin, auth, timeouts) — only the SCHEDULING
     // overlaps the next layer's network with the current layer's CPU (decompress/extract). Extract +
