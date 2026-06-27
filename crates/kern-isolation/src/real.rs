@@ -1444,12 +1444,14 @@ fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
     if hosts.is_empty() {
         return;
     }
+    // Reject any entry whose name or IP carries whitespace or a control char — a newline would let a
+    // crafted value inject extra `/etc/hosts` lines (a legit hostname/IP never contains either).
+    let clean = |s: &str| !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control());
     let mut block = String::from("\n# kern --add-host\n");
     for (name, ip) in hosts {
-        if name.is_empty() || ip.is_empty() || name.split_whitespace().count() != 1 {
-            continue;
+        if clean(name) && clean(ip) {
+            block.push_str(&format!("{ip}\t{name}\n"));
         }
-        block.push_str(&format!("{ip}\t{name}\n"));
     }
     let Ok(p) = cstr(&format!("{root}/etc/hosts")) else {
         return;
@@ -2752,6 +2754,44 @@ mod cpuset_expand_tests {
         assert!(expand_cpu_list("999999999").is_empty());
         // Normal small lists are unaffected.
         assert_eq!(expand_cpu_list("0-3,5"), vec![0, 1, 2, 3, 5]);
+    }
+}
+
+#[cfg(test)]
+mod add_host_tests {
+    use super::*;
+
+    #[test]
+    fn extra_hosts_writes_clean_entries_and_refuses_injection() {
+        let tmp = std::env::temp_dir().join(format!("kern-addhost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("etc")).unwrap();
+        std::fs::write(tmp.join("etc/hosts"), "127.0.0.1 localhost\n").unwrap();
+        let root = tmp.to_string_lossy().into_owned();
+
+        setup_extra_hosts(
+            &root,
+            &[
+                ("db.local".into(), "10.0.0.5".into()), // clean → written
+                // a newline in the IP must NOT inject a second hosts line
+                ("good".into(), "1.2.3.4\n6.6.6.6 evil.injected".into()),
+                // whitespace/newline in the name → skipped
+                ("bad\n7.7.7.7 sneaky".into(), "9.9.9.9".into()),
+                ("".into(), "1.1.1.1".into()), // empty name → skipped
+            ],
+        );
+
+        let out = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap();
+        assert!(out.contains("10.0.0.5\tdb.local"), "clean entry is written");
+        assert!(
+            out.contains("127.0.0.1 localhost"),
+            "existing entries preserved"
+        );
+        assert!(
+            !out.contains("evil.injected") && !out.contains("sneaky"),
+            "no injected /etc/hosts line: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
