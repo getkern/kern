@@ -66,7 +66,7 @@ pub enum Command {
         /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
         tty: bool,
         /// `-p host:box` (repeatable): publish a box TCP port on a host port.
-        ports: Vec<(u32, u16, u16)>,
+        ports: Vec<(u32, u16, u16, bool)>,
         /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret to the box
         /// as `/run/secrets/NAME` (mode 0400) without it touching the image or the workload env.
         secrets: Vec<String>,
@@ -765,7 +765,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut show_config = false;
     let mut quiet = false;
     let mut verbose = false;
-    let mut ports: Vec<(u32, u16, u16)> = Vec::new();
+    let mut ports: Vec<(u32, u16, u16, bool)> = Vec::new();
     let mut secrets: Vec<String> = Vec::new();
     let mut ssh_port: Option<u16> = None;
     let mut ssh_key: Option<String> = None;
@@ -1883,15 +1883,24 @@ mod tests {
             "box".into(),
             "x".into(),
             "-p".into(),
-            "8080:80".into(), // default → 127.0.0.1 (loopback only)
+            "8080:80".into(), // default → 127.0.0.1 (loopback only), tcp
             "-p".into(),
             "0.0.0.0:443:443".into(), // explicit all-interfaces
+            "-p".into(),
+            "53:53/udp".into(), // explicit udp
         ])
         .unwrap();
         let Command::BoxRun { ports, .. } = cmd else {
             panic!("expected BoxRun")
         };
-        assert_eq!(ports, vec![(0x7f00_0001, 8080, 80), (0, 443, 443)]);
+        assert_eq!(
+            ports,
+            vec![
+                (0x7f00_0001, 8080, 80, false),
+                (0, 443, 443, false),
+                (0x7f00_0001, 53, 53, true),
+            ]
+        );
         // Malformed mappings are usage errors, never silently dropped.
         for bad in ["0:80", "abc", "80", "80:0", "999.0.0.1:8080:80"] {
             assert!(

@@ -99,8 +99,8 @@ pub fn help() -> Result<(), Error> {
     --cpuset-cpus <list>  Pin to specific CPUs (e.g. 0-3, 0,2,4; default no pinning)
     --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
     -it, -t, -i         Allocate an interactive PTY (shells/REPLs); foreground only
-    -p, --publish H:B   Publish box port B on host port H ([ip:]H:B; binds 127.0.0.1 by
-                        default — use 0.0.0.0:H:B to expose on all interfaces; repeatable)
+    -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; binds 127.0.0.1
+                        by default — use 0.0.0.0:H:B to expose on all interfaces; repeatable)
     --secret SPEC       Deliver a secret as /run/secrets/NAME (mode 0400): SRC[:NAME] (file),
                         NAME=value (inline), or NAME=- (from stdin); repeatable
     --ssh PORT          Run an in-box sshd, published on host PORT (→ box :22); prints the ssh
@@ -262,7 +262,7 @@ pub struct BoxRunArgs<'a> {
     /// `-it`/`-t`: allocate a PTY so the box gets an interactive controlling terminal.
     pub tty: bool,
     /// `-p host:box` (repeatable): publish a box TCP port on a host port.
-    pub ports: &'a [(u32, u16, u16)],
+    pub ports: &'a [(u32, u16, u16, bool)],
     /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret as
     /// `/run/secrets/NAME` (mode 0400) without it hitting the image or the workload env.
     pub secrets: &'a [String],
@@ -658,7 +658,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // in-box sshd on the host port (→ box `:22`) via the ordinary rootless forwarder. `eff_ports`
     // is the user's `-p` maps plus that SSH mapping.
     let (ssh, eff_ports) = prepare_ssh(&name, args.ssh_port, args.ssh_key, args.ports)?;
-    let ports: &[(u32, u16, u16)] = &eff_ports;
+    let ports: &[(u32, u16, u16, bool)] = &eff_ports;
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
     // forwarder fails inside its fork — whose stderr a detached box swallows — and the box would
     // print "started" while nothing actually listens.
@@ -1067,7 +1067,7 @@ fn first_box_of_session() -> bool {
 fn run_box_interactive(
     mut spec: SandboxSpec,
     scratch: Option<PathBuf>,
-    ports: &[(u32, u16, u16)],
+    ports: &[(u32, u16, u16, bool)],
     timeout: u64,
 ) -> Result<(), Error> {
     let pty = crate::pty::open().map_err(|e| Error::Sandbox(format!("openpty: {e}")))?;
@@ -1302,13 +1302,13 @@ fn prepare_ssh(
     name: &BoxName,
     ssh_port: Option<u16>,
     ssh_key: Option<&str>,
-    ports: &[(u32, u16, u16)],
-) -> Result<(Option<kern_isolation::SshSetup>, Vec<(u32, u16, u16)>), Error> {
+    ports: &[(u32, u16, u16, bool)],
+) -> Result<(Option<kern_isolation::SshSetup>, Vec<(u32, u16, u16, bool)>), Error> {
     let Some(port) = ssh_port else {
         return Ok((None, ports.to_vec()));
     };
     // Don't silently shadow a user `-p` on the same host port, or a second box-side :22.
-    if ports.iter().any(|&(_, h, _)| h == port) {
+    if ports.iter().any(|&(_, h, _, _)| h == port) {
         return Err(Error::Sandbox(format!(
             "--ssh {port} conflicts with a -p mapping on host port {port}"
         )));
@@ -1365,7 +1365,7 @@ fn prepare_ssh(
     };
 
     let mut eff = ports.to_vec();
-    eff.push((0x7f00_0001, port, 22)); // 127.0.0.1:<port> → box :22
+    eff.push((0x7f00_0001, port, 22, false)); // 127.0.0.1:<port> -> box :22 (ssh is tcp)
     let id = hint_key.map(|k| format!(" -i {k}")).unwrap_or_default();
     eprintln!(
         "kern: ssh: ssh -p {port}{id} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -2409,10 +2409,10 @@ fn mounted_named_volumes(specs: &[String]) -> String {
     names.join(",")
 }
 
-fn ports_summary(ports: &[(u32, u16, u16)]) -> String {
+fn ports_summary(ports: &[(u32, u16, u16, bool)]) -> String {
     ports
         .iter()
-        .map(|&(ip, h, b)| crate::ports::fmt(ip, h, b))
+        .map(|&(ip, h, b, udp)| crate::ports::fmt(ip, h, b, udp))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2511,7 +2511,7 @@ fn supervise_box(
     spec: &SandboxSpec,
     have_pipe: bool,
     wr: i32,
-    ports: &[(u32, u16, u16)],
+    ports: &[(u32, u16, u16, bool)],
     restart: bool,
     inst: &mut registry::Instance,
 ) {
@@ -2635,7 +2635,7 @@ fn run_detached(
     name: &BoxName,
     spec: SandboxSpec,
     scratch: Option<PathBuf>,
-    ports: &[(u32, u16, u16)],
+    ports: &[(u32, u16, u16, bool)],
     volumes: &str,
     pod: &str,
     restart: bool,

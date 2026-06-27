@@ -1822,7 +1822,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     ready_fd: Option<i32>,
     on_started: F,
     tty_master: Option<i32>,
-    ports: &[(u32, u16, u16)],
+    ports: &[(u32, u16, u16, bool)],
 ) -> Result<i32, Error> {
     // Armed until the box child takes ownership (post-fork) or the parent disarms it: a drop on
     // any error path before then writes the failure byte, so a pre-fork failure is never reported
