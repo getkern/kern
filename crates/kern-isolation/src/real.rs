@@ -471,6 +471,36 @@ impl PhaseTimer {
 /// error. `ready_fd` (the readiness pipe's write end) is threaded through so that with `--init`, PID 1
 /// can close its own copy after forking the workload (so the launcher still gets EOF = "box up"), and
 /// the forked workload can write the failure byte if its own exec fails.
+/// Whether the box's root (inner uid 0) maps to an UNPRIVILEGED host uid, read from the now-established
+/// `/proc/self/uid_map`. This is the PROPERTY that `--privileged` nesting depends on — a box whose root
+/// maps to host root must never get the relaxed seccomp (a relaxed `mount` there re-opens the host). We
+/// read the map rather than trust the caller's euid because `--pod` joins a holder's user namespace, so
+/// the mapping is the holder's, not a function of our euid. Each map line is `inside outside count`;
+/// the entry covering inside-uid 0 tells us the host uid box-root becomes. Fails CLOSED: if the map is
+/// unreadable, malformed, or has no entry for inside-0, return `false` (treat as privileged, don't relax).
+fn box_root_is_unprivileged() -> bool {
+    match std::fs::read_to_string("/proc/self/uid_map") {
+        Ok(m) => uid_map_root_is_unprivileged(&m),
+        Err(_) => false, // can't read the map → cannot confirm → fail closed
+    }
+}
+
+/// Pure parser behind [`box_root_is_unprivileged`] (unit-testable). Given the contents of a
+/// `uid_map` (`inside outside count` per line), return `true` IFF the entry covering inside-uid 0
+/// maps it to a NON-zero (unprivileged) host uid. Fails CLOSED (`false`) if inside-0 is unmapped or
+/// no line is well-formed — so `--privileged` never relaxes seccomp on a map it doesn't understand.
+fn uid_map_root_is_unprivileged(map: &str) -> bool {
+    for line in map.lines() {
+        let f: Vec<u64> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        if let [inside, outside, count] = f[..] {
+            if inside == 0 && count >= 1 {
+                return outside != 0;
+            }
+        }
+    }
+    false
+}
+
 fn child_setup_and_exec(
     spec: &SandboxSpec,
     argv: &[CString],
@@ -1978,12 +2008,6 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
 
-    // `--privileged` relaxes the seccomp filter for nesting, but ONLY when the box is genuinely
-    // rootless (box root → an unprivileged host uid). As real host root the box's root maps to host
-    // root, where allowing `mount` would re-open the host-privilege class — so the request is
-    // dropped here (fail-safe; the CLI turns the same condition into a loud error before we fork).
-    let allow_nesting = spec.privileged && euid != 0;
-
     // `--pod`: JOIN the pod holder's existing user + net namespace (created by `kern pod create`)
     // instead of unsharing our own — so every box in the pod shares one loopback network. We start
     // in the host user ns, where we are privileged over our descendant holder, so we can `setns`
@@ -2066,6 +2090,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
             }
         }
     }
+
+    // `--privileged` relaxes the seccomp filter so a NESTED box can create its own namespaces — but
+    // ONLY when the box's root actually maps to an UNPRIVILEGED host uid. Decide from the EFFECTIVE
+    // userns uid_map now that it is established (the single-uid / `--uid-range` map written above, OR
+    // the holder's map we joined via `--pod` setns) — NOT from the caller's euid. In pod mode the
+    // mapping is the holder's, so an euid-only proxy could relax a box whose root maps to host root;
+    // reading the actual map closes that. Fails CLOSED on anything it can't confirm. (The CLI also
+    // refuses `--privileged` as real root up front; this is the authoritative, property-based gate.)
+    let allow_nesting = spec.privileged && box_root_is_unprivileged();
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -2907,5 +2940,32 @@ mod cap_mask_tests {
         );
         // The bounding set = full minus the drop set; cap 16 survives and would be flagged.
         assert!(default_dropped_cap_mask() & (1u64 << 16) != 0);
+    }
+}
+
+#[cfg(test)]
+mod nesting_gate_tests {
+    use super::uid_map_root_is_unprivileged;
+
+    /// `--privileged` nesting is gated on the EFFECTIVE box-root mapping, not the caller's euid — so a
+    /// `--pod` box that joins a holder's userns is judged by the holder's real map. This is the parser
+    /// behind that gate; it MUST refuse (fail closed) whenever box-root could reach host root.
+    #[test]
+    fn nesting_gate_reads_the_effective_map_and_fails_closed() {
+        // Rootless: inner 0 → host 1000 (single-uid) or a subuid → UNPRIVILEGED → nesting allowed.
+        assert!(uid_map_root_is_unprivileged("0 1000 1"));
+        assert!(uid_map_root_is_unprivileged("0 100000 65536")); // --uid-range: 0 → a subuid
+        assert!(uid_map_root_is_unprivileged("0 1000 1\n1 100000 65535")); // multi-row, 0 first
+
+        // DANGEROUS: inner 0 → host 0 (a root-mapped box, e.g. a root-created pod holder). MUST refuse,
+        // even though a caller euid check might have said "non-root". This is the whole point of the fix.
+        assert!(!uid_map_root_is_unprivileged("0 0 1"));
+        assert!(!uid_map_root_is_unprivileged("0 0 4294967295"));
+
+        // Fail closed on anything we can't understand: inner-0 unmapped, empty, or malformed.
+        assert!(!uid_map_root_is_unprivileged("1 100000 65536")); // inside-0 not covered
+        assert!(!uid_map_root_is_unprivileged(""));
+        assert!(!uid_map_root_is_unprivileged("garbage\nnot a map"));
+        assert!(!uid_map_root_is_unprivileged("0 0")); // truncated line
     }
 }
