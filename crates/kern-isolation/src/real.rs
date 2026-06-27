@@ -823,10 +823,31 @@ fn apply_userns_range(
         libc::waitpid(helper, ptr::null_mut(), 0);
     }
     if n != 1 || got[0] != b'1' {
-        return Err(Error::Unsupported(
-            "newuidmap/newgidmap failed to map the user namespace (check /etc/subuid and /etc/subgid)",
-        ));
+        // newuidmap/newgidmap are present (detect_id_range found them + a sub-id allocation) but
+        // couldn't actually apply the range here — typically the helper isn't setuid-root, or there
+        // is no matching /etc/subgid row. We're already in a fresh, still-unmapped user namespace, so
+        // fall back to the safe single-uid self-map (identical to the no-range default) instead of
+        // aborting the box — mirroring how an *absent* helper already degrades gracefully. (If a
+        // partial map already populated uid_map, the self-map write fails and that unrecoverable
+        // half-mapped state is surfaced as the error.)
+        eprintln!(
+            "kern: --uid-range mapping via newuidmap/newgidmap failed (helper present but not usable here) — using single-uid map"
+        );
+        return write_single_uid_map(euid, egid);
     }
+    Ok(())
+}
+
+/// Write the dependency-free single-uid identity map (box uid/gid 0 → caller) for the CURRENT,
+/// already-unshared user namespace: deny `setgroups` first (the kernel requires this before an
+/// unprivileged `gid_map`), then the one-row uid/gid maps. Shared by the no-range default and the
+/// `--uid-range` fallback for when the id-mapping helpers can't apply a range.
+fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
+    std::fs::write("/proc/self/setgroups", b"deny").map_err(|e| Error::Syscall("setgroups", e))?;
+    std::fs::write("/proc/self/uid_map", format!("0 {euid} 1"))
+        .map_err(|e| Error::Syscall("uid_map", e))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {egid} 1"))
+        .map_err(|e| Error::Syscall("gid_map", e))?;
     Ok(())
 }
 
@@ -938,12 +959,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                 }
                 return Err(Error::Syscall("unshare(namespaces)", e));
             }
-            std::fs::write("/proc/self/setgroups", b"deny")
-                .map_err(|e| Error::Syscall("setgroups", e))?;
-            std::fs::write("/proc/self/uid_map", format!("0 {euid} 1"))
-                .map_err(|e| Error::Syscall("uid_map", e))?;
-            std::fs::write("/proc/self/gid_map", format!("0 {egid} 1"))
-                .map_err(|e| Error::Syscall("gid_map", e))?;
+            write_single_uid_map(euid, egid)?;
         }
     }
 
