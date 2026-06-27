@@ -159,7 +159,7 @@ kern ps                       # list running boxes
 kern top                      # interactive task manager (TUI: tabs, live mem/CPU)
 kern exec svc -- sh           # shell into a running box (joins its namespaces)
 kern logs svc                 # its captured output
-kern stop svc
+kern stop svc                 # or: kern stop a b c   ·   kern stop --all
 
 # Bring up a small stack in dependency order (TOML, no external runtime).
 kern compose stack.toml
@@ -169,7 +169,7 @@ kern compose stack.toml
 |---------|--------------|
 | `box <name> (--image <ref> \| --rootfs <dir>) [-- cmd]` | Run a command in a sandbox |
 | `box … -v src:dst[:ro]` / `-e K=V` / `-w <dir>` / `--net` | Volumes · env · workdir · host network |
-| `box … -d` · `ps` · `top` · `stats` · `logs <name>` · `stop <name>` | Detach, observe, control |
+| `box … -d` · `ps` · `top` · `stats` · `logs <name>` · `stop <name>… \| --all` | Detach, observe, control |
 | `exec <name> [-- cmd]` | Run a command inside a running box |
 | `search <query>` | Search Docker Hub for images |
 | `pull <image>` / `images` | Download an OCI image · list pulled (cached) images |

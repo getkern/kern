@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to SemVer.
 Pre-1.0: the CLI and config surface are NOT frozen; minor versions may break them.
 
+## [0.3.2] — `kern stop` takes multiple names + `--all`
+
+### Added
+- **`kern stop <name>...`** now stops **every** name given (previously it stopped only the first and
+  silently ignored the rest), and **`kern stop --all`** stops every running box. A requested name
+  that isn't running is reported on stderr instead of being silently dropped.
+
 ## [0.3.1] — `--uid-range` fallback hardening
 
 ### Fixed
