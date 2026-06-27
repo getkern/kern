@@ -9,5 +9,5 @@ description = "OCI image pull / layer extraction / whiteout handling for kern (i
 publish = false
 
 [dependencies]
-kern-common = { path = "../kern-common", version = "0.6.1" }
+kern-common = { path = "../kern-common", version = "0.6.2" }
 libc = "0.2"

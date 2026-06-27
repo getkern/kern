@@ -17,6 +17,24 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.2] — 2026-07-11
+
+### Added
+- **Nested boxes — `kern box --privileged`.** A full `kern box` can now run *inside* another
+  (docker-in-docker style). The always-on seccomp filter blocks namespace + mount syscalls by
+  default; `--privileged` re-allows **exactly five** — `unshare`/`setns`/`mount`/`umount2`/
+  `pivot_root` — so a nested box can create its own namespaces and rootfs. Everything else stays
+  blocked (kexec, modules, `bpf`, `io_uring`, keyring, `ptrace`, the new mount API), so it is
+  materially stronger than a Docker `--privileged` container (which drops seccomp wholesale). It is
+  **rootless-only**: honoured only when the box's root maps to an unprivileged host uid — decided by
+  reading the effective `/proc/self/uid_map` after the namespace is set up (so a `--pod` box is
+  judged by its holder's map, not the caller's euid), and refused outright as real root. Documented
+  in [SECURITY.md](SECURITY.md); validated on x86_64 + aarch64 (incl. an Android-kernel board).
+
+### Fixed
+- Dropped a dead `KERN_ACCEPT_EULA` passthrough and its stale comments from the embedding SDK — the
+  public build has no EULA gate (and never claimed one in docs).
+
 ## [0.6.1] — 2026-07-08
 
 **docker-compose YAML compatibility**, **image registry `push`**, and a split-out, fuzzed compose

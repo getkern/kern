@@ -12,4 +12,4 @@ description = "The kern compose-file parser (docker-compose YAML + kern TOML) â€
 publish = false
 
 [dependencies]
-kern-common = { path = "../kern-common", version = "0.6.1" }
+kern-common = { path = "../kern-common", version = "0.6.2" }
