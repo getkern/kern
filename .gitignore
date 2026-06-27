@@ -20,3 +20,6 @@
 
 # Reviewer prompts / working notes — never in the repo
 /REVISORE-*.md
+
+# Whitepaper draft — provenance/authorship lives on Zenodo, not in the code repo
+/paper/
