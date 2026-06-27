@@ -48,6 +48,9 @@ pub enum Command {
         /// `--bind-rootfs`: bind the rootfs directly instead of an overlay (faster on slow-overlay
         /// kernels; source becomes mutable & shared).
         bind_rootfs: bool,
+        /// `--privileged`: relax the seccomp filter so a NESTED `kern box` (or docker-in-docker-style
+        /// workload) can create its namespaces. Rootless-only; refused as real host root.
+        privileged: bool,
         /// INTERNAL (used by `kern build`): explicit overlay lower dir(s), colon-joined, used as the
         /// read-only base instead of `--rootfs`/`--image`. Paired with `--overlay-upper`.
         overlay_lower: Option<String>,
@@ -749,6 +752,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut pod: Option<String> = None;
     let mut uid_range = false;
     let mut bind_rootfs = false;
+    let mut privileged = false;
     let mut overlay_lower: Option<String> = None;
     let mut overlay_upper: Option<String> = None;
     let mut tty = false;
@@ -883,6 +887,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 "--uid-range" => uid_range = true,
                 "--bind-rootfs" => bind_rootfs = true,
+                "--privileged" => privileged = true,
                 // Internal build-layer flags (see the Command::BoxRun docs) — take a value.
                 "--overlay-lower" => {
                     i += 1;
@@ -1193,6 +1198,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             pod,
             uid_range,
             bind_rootfs,
+            privileged,
             overlay_lower,
             overlay_upper,
             memory,
@@ -1623,6 +1629,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             pod,
             uid_range,
             bind_rootfs,
+            privileged,
             overlay_lower,
             overlay_upper,
             memory,
@@ -1673,6 +1680,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             pod: pod.as_deref(),
             uid_range,
             bind_rootfs,
+            privileged,
             overlay_lower: overlay_lower.as_deref(),
             overlay_upper: overlay_upper.as_deref(),
             memory,
@@ -1975,6 +1983,15 @@ mod tests {
         // off by default
         let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
         assert!(matches!(cmd, Command::BoxRun { tty: false, .. }));
+    }
+
+    #[test]
+    fn box_privileged_flag_parses_and_defaults_off() {
+        let (_, cmd) = parse(&["box".into(), "x".into(), "--privileged".into()]).unwrap();
+        assert!(matches!(cmd, Command::BoxRun { privileged: true, .. }));
+        // off by default — nesting stays blocked unless explicitly requested
+        let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
+        assert!(matches!(cmd, Command::BoxRun { privileged: false, .. }));
     }
 
     #[test]
