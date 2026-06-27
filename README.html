@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kern — a fast, lightweight sandbox &amp; virtual resource manager</title>
+<meta name="description" content="Run untrusted or agent-generated code in a real, kernel-enforced sandbox that starts in ~2 ms. A ~1.5 MB rootless binary, no daemon, no VM. Embed from Python or Rust, or drive it from the CLI.">
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#11161d; --border:#30363d;
+    --fg:#c9d1d9; --mut:#8b949e; --hi:#f0f6fc;
+    --acc:#39d353; --acc2:#58a6ff; --cyan:#56d4dd; --warn:#d29922;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+       line-height:1.65;font-size:16px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:860px;margin:0 auto;padding:0 20px}
+  a{color:var(--acc2);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:var(--mono);font-size:.88em;background:#1f2630;border:1px solid var(--border);
+       border-radius:6px;padding:.12em .4em;color:#e6edf3;white-space:nowrap}
+  pre{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:16px 18px;
+      overflow-x:auto;font-family:var(--mono);font-size:.86em;line-height:1.6}
+  pre code{background:none;border:none;padding:0;white-space:pre;color:#c9d1d9}
+  .cm{color:var(--mut)}
+  h2{font-size:1.5rem;margin:2.6rem 0 .6rem;color:var(--hi);font-weight:650;
+     border-bottom:1px solid var(--border);padding-bottom:.35rem}
+  h3{font-size:1.06rem;margin:1.6rem 0 .4rem;color:var(--hi);font-weight:600}
+  p{margin:.7rem 0}
+  hr{border:none;border-top:1px solid var(--border);margin:2rem 0}
+
+  /* hero */
+  header.hero{text-align:center;padding:64px 0 30px}
+  .logo{font-family:var(--mono);font-size:3.4rem;font-weight:700;letter-spacing:-1px;color:var(--hi);margin:0}
+  .logo .b{color:var(--acc)}
+  .tag{font-size:1.28rem;color:var(--hi);margin:.5rem 0 .2rem;font-weight:500}
+  .sub{color:var(--mut);max-width:660px;margin:.6rem auto 1.1rem}
+  .stats{font-family:var(--mono);font-size:.82rem;color:var(--mut);margin:.4rem 0 1.2rem}
+  .stats b{color:var(--acc)}
+  .badges{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:.6rem 0 1.2rem}
+  .badge{font-family:var(--mono);font-size:.72rem;border:1px solid var(--border);border-radius:20px;
+         padding:3px 11px;color:var(--mut);background:var(--panel)}
+  .badge b{color:var(--fg)}
+  nav.toc{display:flex;gap:6px 16px;justify-content:center;flex-wrap:wrap;font-size:.86rem;
+          font-family:var(--mono);color:var(--mut);padding-top:6px}
+  nav.toc a{color:var(--mut)} nav.toc a:hover{color:var(--acc2)}
+
+  /* callouts */
+  .lead{font-size:1.05rem;color:var(--fg)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:1rem 0}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+  .card h4{margin:0 0 .3rem;color:var(--hi);font-size:.98rem}
+  .card p{margin:0;color:var(--mut);font-size:.92rem}
+  ul.feat{list-style:none;padding:0;margin:1rem 0}
+  ul.feat>li{padding:9px 0;border-bottom:1px solid var(--border)}
+  ul.feat>li:last-child{border-bottom:none}
+  ul.feat b{color:var(--hi)}
+  table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.92rem}
+  th,td{border:1px solid var(--border);padding:8px 11px;text-align:left}
+  th{background:var(--panel);color:var(--hi);font-weight:600}
+  td.n{text-align:right;font-family:var(--mono)}
+  .kern{color:var(--acc);font-weight:600}
+  .ok{color:var(--acc)} .no{color:var(--mut)}
+  .note{background:var(--panel);border-left:3px solid var(--acc2);border-radius:0 8px 8px 0;
+        padding:12px 16px;margin:1.1rem 0;color:var(--fg);font-size:.94rem}
+  .note.future{border-left-color:var(--warn)}
+  .note b{color:var(--hi)}
+  details{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:2px 16px;margin:1rem 0}
+  details summary{cursor:pointer;padding:12px 0;color:var(--hi);font-weight:600}
+  details[open] summary{border-bottom:1px solid var(--border);margin-bottom:10px}
+  footer{color:var(--mut);font-size:.86rem;text-align:center;padding:40px 0 60px;
+         border-top:1px solid var(--border);margin-top:3rem}
+  @media(max-width:640px){.grid{grid-template-columns:1fr}.logo{font-size:2.6rem}.tag{font-size:1.1rem}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1 class="logo"><span class="b">k</span>ern</h1>
+    <p class="tag">A fast, lightweight sandbox &amp; virtual resource manager.</p>
+    <p class="sub">Run untrusted or agent-generated code in a real, kernel-enforced sandbox that starts in
+      <b>~2&nbsp;ms</b> — a <b>~1.5&nbsp;MB</b> rootless binary, no daemon, no VM. Embed it from Python or
+      Rust, or drive it from the CLI; run it on your laptop, in CI, or on a Raspberry&nbsp;Pi where Docker
+      won't even install.</p>
+    <p class="stats"><b>~1.9&nbsp;ms</b> cold start (vs <b>~300&nbsp;ms</b> <code>docker run</code>) ·
+      <b>~1.5&nbsp;MB</b> static binary · <b>0&nbsp;RAM</b> at rest · <b>rootless</b></p>
+    <div class="badges">
+      <span class="badge">License <b>Apache-2.0</b></span>
+      <span class="badge">Platform <b>linux x86_64 · aarch64</b></span>
+      <span class="badge">Tests <b>379 · clippy-clean</b></span>
+      <span class="badge">One Rust dep <b>libc</b></span>
+    </div>
+    <nav class="toc">
+      <a href="#why">Why</a><a href="#model">Model</a><a href="#features">Features</a>
+      <a href="#install">Install</a><a href="#quickstart">Quickstart</a><a href="#embed">Embed</a>
+      <a href="#platforms">Platforms</a><a href="#perf">Benchmarks</a><a href="#security">Security</a>
+      <a href="#roadmap">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <p class="lead">kern runs Linux workloads in real, kernel-enforced sandboxes — user + PID + mount +
+  network + UTS + IPC namespaces, an overlay or read-only root pivoted in, an always-on seccomp filter,
+  and cgroup limits. It pulls OCI images, builds them, runs them, and gets out of the way:
+  <b>no background daemon, one short-lived process per box, started in single-digit milliseconds.</b></p>
+
+  <p>It's built around one idea — <em>virtual resources</em>. A container is the first resource kern
+  manages (isolation); the same model extends to <b>CPU, memory, disk (<code>vdisk:</code>) and GPIO
+  (<code>vgpio:</code>)</b> slices today. A full daemonless container UX — OCI pull <b>and build</b>,
+  overlay, volumes, secrets, in-box SSH, <code>cp</code>/<code>pause</code>/<code>attach</code>,
+  <code>ps</code>/<code>exec</code>/<code>logs</code>, compose, health, <code>tag</code>/<code>push</code>
+  — in ~1.5&nbsp;MB.</p>
+
+<pre><code>kern box dev --image alpine -- sh        <span class="cm"># a throwaway, isolated Alpine shell — in a few ms</span></code></pre>
+
+  <p>…or embed it — a fresh, isolated box per call, for untrusted or agent-generated code
+  (E2B/Firecracker territory, but <em>local</em> and ~1.5&nbsp;MB — no cloud, no account, no VM):</p>
+
+<pre><code>import kern_sandbox as kern
+r = kern.run_code("print(sum(range(100)))")   <span class="cm"># network OFF, hard caps, a timeout the binding enforces</span>
+print(r.stdout, r.success)                     <span class="cm"># → a fresh 2 ms box, discarded after</span></code></pre>
+
+  <h2 id="why">Why kern</h2>
+  <div class="grid">
+    <div class="card"><h4>Daemonless &amp; tiny</h4><p>No <code>dockerd</code>-style service. A ~1.5 MB
+      static binary, one Rust dependency (<code>libc</code>). Cold start ~1.9 ms vs ~300 ms for
+      <code>docker run</code>; ~7 MB RSS per box vs an always-on ~186 MB daemon.
+      <code>kern ps</code> reads state straight from the kernel.</p></div>
+    <div class="card"><h4>Rootless by default</h4><p>Unprivileged user namespaces — your uid maps to root
+      <em>inside</em> the box, and only there. Single-uid is the default and <code>libc</code>-pure;
+      <code>--uid-range</code> opts into a full sub-id range. No host privilege is gained either way.</p></div>
+    <div class="card"><h4>Correct by construction</h4><p>The mount sequence is a <b>typestate</b>:
+      remounting the root read-only <em>before</em> pivoting into it doesn't compile — a class of
+      sandbox-escape bug is unrepresentable, not just untested. <code>--plan</code> prints the exact
+      isolation sequence.</p></div>
+    <div class="card"><h4>Honest about its boundaries</h4><p>Filesystem / process / namespace isolation is
+      a real kernel boundary — the right tool for your own or semi-trusted code (CI, dev, edge, agents).
+      For actively hostile multi-tenant code, reach for a microVM. <code>SECURITY.md</code> says exactly
+      when to use which.</p></div>
+  </div>
+
+  <h2 id="model">The model: two verbs</h2>
+  <table>
+    <tr><th>Verb</th><th>Question it answers</th><th>What it does</th></tr>
+    <tr><td><code>kern box</code></td><td><em>"Isolate this workload."</em></td>
+        <td>Its own namespaces, an overlay/read-only filesystem, a private process tree, seccomp.
+        <b>The container.</b></td></tr>
+    <tr><td><code>kern run</code></td><td><em>"Give this workload a governed slice of resources."</em></td>
+        <td>Run a command against a quota of CPU / memory / disk I/O — no sandbox, just the governor.</td></tr>
+  </table>
+  <p><code>box</code> is <em>isolation</em> (a boundary); <code>run</code> is <em>resource governance</em>
+  (a slice). They compose — <code>run</code> inside <code>box</code>. Both ship today.</p>
+
+  <h2 id="features">Features</h2>
+  <p>Daemonless, rootless, and complete — the full container UX plus resource slices, in one binary:</p>
+  <ul class="feat">
+    <li><b>Run anything, isolated</b> — OCI images from any registry (v2 auth, multi-arch, gzip <b>+ zstd</b>)
+      or a <code>--rootfs</code>; CoW overlay (image immutable, scratch discarded) or <code>--read-only</code>;
+      <code>-it</code> TTY; <code>--init</code> PID-1 reaper.</li>
+    <li><b>Governed slices</b> — hard cgroup-v2 caps on any <code>box</code>/<code>run</code>:
+      <code>--memory</code> · <code>--cpus</code> · <code>--cpuset-cpus</code> · <code>--memory-swap-max</code>
+      · <code>--pids-limit</code> · <code>--io-weight</code> · <code>--nice</code>.</li>
+    <li><b>Data &amp; devices</b> — <code>-v</code> volumes (symlink-safe) · named volumes with a
+      <code>--size</code> quota · network volumes (<code>nfs</code>/<code>smb</code>/<code>sshfs</code>) ·
+      <code>--secret</code> → <code>/run/secrets</code> (RAM, <code>0400</code>) · <code>vdisk:</code>
+      scratch · <code>vgpio:</code> device passthrough (deny-by-default) · <code>--tmpfs</code>.</li>
+    <li><b>Network &amp; identity</b> — isolated by default; <code>--network host</code> for outbound;
+      <code>-p</code> rootless publish (loopback unless you ask); in-box <code>--ssh</code>;
+      <code>--pod</code> shared-net pods (<code>--no-outbound</code>); <code>--tun</code>; <code>--user</code>.</li>
+    <li><b>Least privilege</b> — 13 dangerous caps always dropped; an always-on <b>seccomp</b> denylist
+      (kexec, modules, ptrace, mount API, <code>setns</code>, …) that also kills wrong-arch + x86_64
+      x32-ABI aliases. Opt-in <code>--privileged</code> relaxes exactly five syscalls for a nested box
+      (rootless-only) — see <a href="SECURITY.md">SECURITY.md</a>.</li>
+    <li><b>Lifecycle, no daemon</b> — <code>--restart</code> + <code>--health-cmd</code>;
+      <code>cp</code>/<code>pause</code>/<code>attach</code>/<code>exec</code>;
+      <code>ps</code>/<code>top</code>/<code>stats</code>/<code>logs</code>/<code>inspect</code>/<code>prune</code>/<code>gc</code>;
+      <code>compose</code> (reads <code>docker-compose.yml</code> too); reusable
+      <code>[[vcpu]]</code>/<code>[[vgpio]]</code>/<code>[[vdisk]]</code> profiles; <code>kern doctor</code>.</li>
+  </ul>
+  <p><b>Built-in hardening</b> — user+PID+net+UTS+IPC+mount namespaces, self-pivot root,
+  <code>nosuid,nodev</code> box root, always-on seccomp, least-privilege caps, hard cgroup caps; every
+  pulled blob sha256-verified and every layer vetted in-process (no <code>..</code>/absolute/device
+  escapes, decompression- &amp; inode-bomb caps) before an isolated no-follow merge.</p>
+
+  <h2 id="install">Install</h2>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh</code></pre>
+  <p>Served from <b>github.com</b> (read the script first if you like). It downloads the release binary for
+  your arch (<code>linux-x86_64</code> / <code>linux-aarch64</code>) and verifies the sha256 before
+  installing. No Rust toolchain required. (<code>getkern.dev/install.sh</code> is a short alias.)</p>
+
+  <h2 id="quickstart">Quickstart</h2>
+<pre><code><span class="cm"># Run a real OCI image in a writable overlay (image immutable; scratch discarded). -it = a PTY.</span>
+kern box dev --image alpine -it -- sh
+
+<span class="cm"># Cap the slice: hard memory + CPU (cgroup v2), a bind mount, an env, host net for the build.</span>
+kern box build --image alpine --memory 512M --cpus 1.5 \
+  -v "$PWD:/src" -w /src -e CI=1 --net -- sh -c 'apk add --no-cache make &amp;&amp; make'
+
+<span class="cm"># Governor only, no sandbox — a CPU + memory quota on a host command.</span>
+kern run --memory 256M --cpus 0.5 -- ./crunch-numbers
+
+<span class="cm"># Detached service: publish a port, keep it up, health-check it — without a daemon.</span>
+kern box svc --image alpine -d -p 8080:80 --restart \
+  --health-cmd 'wget -qO- localhost:80' --health-interval 5 -- httpd -f
+kern ps                       <span class="cm"># running boxes, with PORTS + HEALTH</span>
+kern exec svc -it -- sh       <span class="cm"># shell into a running box</span>
+
+kern doctor                   <span class="cm"># will boxes even run on this host? preflight it.</span>
+kern compose stack.toml       <span class="cm"># bring up a small stack in dependency order (TOML or compose.yml)</span></code></pre>
+
+  <h2 id="embed">Embed it</h2>
+  <p>Run a sandboxed command straight from your program — a fresh isolated box per call (untrusted code,
+  agent tools, per-request workers), structured result back.</p>
+  <h3>Rust — the <code>kern-isolation</code> crate</h3>
+<pre><code>use kern_isolation::Sandbox;
+
+let out = Sandbox::builder()
+    .rootfs("/var/lib/kern/rootfs/alpine")
+    .no_network()                    <span class="cm">// isolated loopback-only netns</span>
+    .memory_limit_bytes(256 &lt;&lt; 20)   <span class="cm">// cgroup cap</span>
+    .timeout_ms(5_000)               <span class="cm">// SIGKILL a runaway</span>
+    .build()?
+    .run("python3", &amp;["handler.py"])?;
+
+assert!(out.success());              <span class="cm">// + out.stdout / .stderr / .exit_code / .wall_ms</span></code></pre>
+  <h3>Python — the <code>kern_sandbox</code> package</h3>
+<pre><code>import kern_sandbox as kern
+
+<span class="cm"># one-shot: throwaway box, network OFF, hard caps, a mandatory timeout the binding enforces</span>
+r = kern.run_code("print(sum(range(100)))")
+print(r.stdout, r.success)
+
+<span class="cm"># a session: files persist across calls; deps installed once in the ONLY network-on step</span>
+with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
+                  memory_mb=512, cpus=1.0, timeout_s=30) as s:
+    s.write_file("data.csv", csv_bytes)
+    out = s.run_code("import pandas as pd; print(pd.read_csv('data.csv').describe())")
+    print(out.stdout)          <span class="cm"># network-off, capped, isolated; a fault is a typed SandboxFault</span></code></pre>
+  <p>Safe by default — every relaxing argument (<code>network=True</code>, extra <code>mounts</code>) says
+  so, and the binding owns the timeout, so a <code>timeout</code> fault is a fact, not a guess.</p>
+
+  <h2 id="platforms">Platforms</h2>
+  <p><b>Linux, multi-architecture.</b> Prebuilt static (musl) binaries for <b>linux-x86_64</b> (~1.5 MB) and
+  <b>linux-aarch64</b> (~1.3 MB) — one file, no Rust deps beyond <code>libc</code>.</p>
+  <table>
+    <tr><th>Platform</th><th>Arch</th><th>Status</th></tr>
+    <tr><td>x86_64 Linux</td><td>x86_64</td><td class="ok">✅ primary + automated CI</td></tr>
+    <tr><td>NVIDIA Jetson (L4T)</td><td>aarch64</td><td class="ok">✅ manually validated</td></tr>
+    <tr><td>Raspberry Pi 5</td><td>aarch64</td><td class="ok">✅ manually validated</td></tr>
+    <tr><td>Arduino UNO Q <span class="no">(Android kernel, Debian userland)</span></td><td>aarch64</td>
+        <td class="ok">✅ manually validated</td></tr>
+  </table>
+  <p>Needs a Linux kernel with <b>unprivileged user namespaces</b> + <b>cgroups v2</b> and a Linux
+  userland. The kernel <em>flavor</em> doesn't matter — kern runs even on an Android kernel with a Linux
+  userland. Daemonless is a big win on RAM-constrained boards (0 resident vs ~186 MB).</p>
+
+  <h2 id="perf">Performance</h2>
+  <p>One isolated <code>/bin/true</code>, warm image cache, one box per run. The x86_64 row is re-measured
+  on an Intel i7-14700KF, Linux 6.17 (median of 200 runs); board rows are on-device.</p>
+  <table>
+    <tr><th>host</th><th>kernel</th><th class="n">kern</th><th class="n">bubblewrap</th><th class="n">crun</th>
+        <th class="n">runc</th><th class="n">podman</th><th class="n">docker</th></tr>
+    <tr><td>x86_64 desktop</td><td>6.17</td><td class="n kern">1.9 ms</td><td class="n">3.2 ms</td>
+        <td class="n">5.2 ms*</td><td class="n">16 ms</td><td class="n">~300 ms</td><td class="n">~307 ms</td></tr>
+    <tr><td>Jetson Orin Nano</td><td>5.15-tegra</td><td class="n kern">3.6 ms</td><td class="n">5.6 ms</td>
+        <td class="n no">✗</td><td class="n">32 ms</td><td class="n no">✗</td><td class="n">472 ms</td></tr>
+    <tr><td>Raspberry Pi 5</td><td>6.6-rpi</td><td class="n kern">2.1 ms</td><td class="n no">✗</td>
+        <td class="n no">✗</td><td class="n no">✗</td><td class="n no">✗</td><td class="n no">✗</td></tr>
+    <tr><td>Arduino UNO Q</td><td>6.16 Android</td><td class="n kern">9.9 ms†</td><td class="n">14.9 ms</td>
+        <td class="n no">✗</td><td class="n">76 ms</td><td class="n no">✗</td><td class="n">858 ms</td></tr>
+  </table>
+  <p class="cm" style="font-size:.86rem">✗ = not installed (nor readily installable) on that board ·
+  * crun figure from BENCHMARKS.md · † the Android kernel's overlayfs mount is a ~31 ms quirk;
+  <code>--bind-rootfs</code> starts in 9.9 ms.</p>
+  <p>kern is the fastest sandbox here at <b>~1.9 ms</b> (its own box setup is ~1 ms; the rest is process
+  start + teardown). The top tier is all within a few ms — nobody wins single-shot latency outright. The
+  real gap is to the <b>engines</b>: <b>~120–150× faster</b> than podman/Docker (~300 ms), which round-trip
+  a daemon every run — yet kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start:
+  <b>~500 boxes/s</b>, <b>~7 MB</b> RSS/box, <b>0 resident</b> (Docker keeps ~186 MB resident before you run
+  anything). Full method in <a href="BENCHMARKS.md">BENCHMARKS.md</a>.</p>
+
+  <h2 id="security">Security</h2>
+  <p>kern isolates with Linux <b>namespaces + seccomp + a read-only userns root</b> — a kernel-level
+  boundary, deny-by-default on devices, with the host's sysfs/procfs masked. That's strong for first-party
+  and noisy-neighbour workloads. For <b>adversarial, multi-tenant untrusted code</b> where you want a
+  hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't — a deliberate trade for ~2 ms
+  starts and a ~1.5 MB footprint.</p>
+  <div class="note"><b>Honest by design.</b> The full threat model, per-feature notes, and the
+  <em>"kern vs a microVM — when to use what"</em> guidance live in <a href="SECURITY.md">SECURITY.md</a>,
+  which marks every guarantee that is cooperative or opt-in. Found a vulnerability? Report it
+  <b>privately</b> via GitHub Security Advisories.</div>
+
+  <h2 id="roadmap">Project status &amp; roadmap</h2>
+  <p><b>0.6.1 — a daemonless container + resource runtime that does less than Docker, on purpose.</b>
+  Everything in <a href="#features">Features</a> works today and is tested (379 tests, clippy-clean,
+  <code>cargo-deny</code>-clean, security-audited slice by slice). It deliberately skips a lot Docker has
+  (overlay networks, a plugin ecosystem) — the point is a small, fast, honest core. The CLI and config
+  surface are not frozen until 1.0.</p>
+  <ul class="feat">
+    <li><b>Shipped</b> — build + tag + push, zstd layers, <code>--init</code>, <code>--platform</code>
+      (on <code>kern pull</code>), pods, nested <code>--privileged</code> boxes, the Python binding;
+      ongoing polish + broader ARM CI.</li>
+    <li><b>Planned</b> — a Windows (WSL2) hybrid: one ~1.5 MB binary that drops into the WSL2 Linux kernel
+      — a daemonless container UX on Windows without Docker Desktop's VM + background service.</li>
+    <li><b>1.0</b> — freeze: CLI + config under semver, threat model + architecture finalised.</li>
+  </ul>
+  <div class="note future"><b>Later — a light note.</b> Longer term, the same virtual-resource model may
+  extend to optional <b>GPU slices</b> (a workload gets a slice of a GPU, not the whole device). It would
+  land incrementally, always opt-in and never the default, with an honest trust model. Not a launch
+  feature — a direction. See <a href="ARCHITECTURE.md">ARCHITECTURE.md</a>.</div>
+
+  <hr>
+  <p><b>License.</b> <a href="LICENSE">Apache-2.0</a> — permissive, with an explicit patent grant. The
+  dependency tree is deliberately tiny (<code>libc</code> only on the Rust side; standard-library-only on
+  the Python side) and copyleft-free. <b>kern</b> and <b>getkern</b> are trademarks of the project: the
+  <em>code</em> is yours to use under Apache-2.0, but please don't ship a fork or a competing service under
+  the name.</p>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    kern · a fast, lightweight sandbox &amp; virtual resource manager ·
+    <a href="https://github.com/getkern/kern">github.com/getkern/kern</a> · Apache-2.0
+  </div>
+</footer>
+
+</body>
+</html>
