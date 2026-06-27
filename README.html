@@ -7,9 +7,9 @@
 <meta name="description" content="Run untrusted or agent-generated code in a real, kernel-enforced sandbox that starts in ~2 ms. A ~1.5 MB rootless binary, no daemon, no VM. Embed from Python or Rust, or drive it from the CLI.">
 <style>
   :root{
-    --bg:#0d1117; --panel:#161b22; --panel2:#11161d; --border:#30363d;
-    --fg:#c9d1d9; --mut:#8b949e; --hi:#f0f6fc;
-    --acc:#39d353; --acc2:#58a6ff; --cyan:#56d4dd; --warn:#d29922;
+    --bg:#ffffff; --panel:#f6f8fa; --panel2:#f6f8fa; --border:#d0d7de;
+    --fg:#1f2328; --mut:#59636e; --hi:#1f2328;
+    --acc:#1a7f37; --acc2:#0969da; --cyan:#0a7ea4; --warn:#9a6700;
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
   }
@@ -20,11 +20,11 @@
   .wrap{max-width:860px;margin:0 auto;padding:0 20px}
   a{color:var(--acc2);text-decoration:none}
   a:hover{text-decoration:underline}
-  code{font-family:var(--mono);font-size:.88em;background:#1f2630;border:1px solid var(--border);
-       border-radius:6px;padding:.12em .4em;color:#e6edf3;white-space:nowrap}
+  code{font-family:var(--mono);font-size:.88em;background:#eff1f3;border:1px solid var(--border);
+       border-radius:6px;padding:.12em .4em;color:#1f2328;white-space:nowrap}
   pre{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:16px 18px;
       overflow-x:auto;font-family:var(--mono);font-size:.86em;line-height:1.6}
-  pre code{background:none;border:none;padding:0;white-space:pre;color:#c9d1d9}
+  pre code{background:none;border:none;padding:0;white-space:pre-wrap;overflow-wrap:anywhere;color:#1f2328}
   .cm{color:var(--mut)}
   h2{font-size:1.5rem;margin:2.6rem 0 .6rem;color:var(--hi);font-weight:650;
      border-bottom:1px solid var(--border);padding-bottom:.35rem}
@@ -47,7 +47,7 @@
   .cta{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:.5rem 0 1.4rem}
   .btn{font-family:var(--sans);font-size:.92rem;font-weight:600;border-radius:8px;
        padding:9px 20px;border:1px solid var(--border)}
-  .btn.primary{background:var(--acc);color:#08130a;border-color:var(--acc)}
+  .btn.primary{background:var(--acc);color:#ffffff;border-color:var(--acc)}
   .btn.primary:hover{filter:brightness(1.08);text-decoration:none}
   .btn.ghost{background:var(--panel);color:var(--fg)}
   .btn.ghost:hover{border-color:var(--acc2);text-decoration:none}
@@ -128,14 +128,14 @@
   <code>ps</code>/<code>exec</code>/<code>logs</code>, compose, health, <code>tag</code>/<code>push</code>
   — in ~1.5&nbsp;MB.</p>
 
-<pre><code>kern box dev --image alpine -- sh        <span class="cm"># a throwaway, isolated Alpine shell — in a few ms</span></code></pre>
+<pre><code>kern box dev --image alpine -- sh   <span class="cm"># throwaway isolated Alpine shell, in ms</span></code></pre>
 
   <p>…or embed it — a fresh, isolated box per call, for untrusted or agent-generated code
   (E2B/Firecracker territory, but <em>local</em> and ~1.5&nbsp;MB — no cloud, no account, no VM):</p>
 
 <pre><code>import kern_sandbox as kern
-r = kern.run_code("print(sum(range(100)))")   <span class="cm"># network OFF, hard caps, a timeout the binding enforces</span>
-print(r.stdout, r.success)                     <span class="cm"># → a fresh 2 ms box, discarded after</span></code></pre>
+r = kern.run_code("print(sum(range(100)))")  <span class="cm"># network OFF, hard caps, enforced timeout</span>
+print(r.stdout, r.success)  <span class="cm"># → a fresh 2 ms box, discarded after</span></code></pre>
 
   <h2 id="why">Why kern</h2>
   <div class="grid">
@@ -273,12 +273,12 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
 
   <h2 id="perf">Performance</h2>
   <p>One isolated <code>/bin/true</code>, warm image cache, one box per run. The x86_64 row is re-measured
-  on an Intel i7-14700KF, Linux 6.17 (median of 200 runs); board rows are on-device.</p>
+  on an Intel i7-14700KF, Linux 6.17 (mean over 200 sequential runs); board rows are on-device.</p>
   <table>
     <tr><th>host</th><th>kernel</th><th class="n">kern</th><th class="n">bubblewrap</th><th class="n">crun</th>
         <th class="n">runc</th><th class="n">podman</th><th class="n">docker</th></tr>
-    <tr><td>x86_64 desktop</td><td>6.17</td><td class="n kern">1.9 ms</td><td class="n">3.2 ms</td>
-        <td class="n">5.2 ms*</td><td class="n">16 ms</td><td class="n">~300 ms</td><td class="n">~307 ms</td></tr>
+    <tr><td>x86_64 desktop</td><td>6.17</td><td class="n kern">1.9 ms</td><td class="n">2.6 ms</td>
+        <td class="n">5.2 ms</td><td class="n">12.2 ms</td><td class="n">155 ms</td><td class="n">308 ms</td></tr>
     <tr><td>Jetson Orin Nano</td><td>5.15-tegra</td><td class="n kern">3.6 ms</td><td class="n">5.6 ms</td>
         <td class="n no">✗</td><td class="n">32 ms</td><td class="n no">✗</td><td class="n">472 ms</td></tr>
     <tr><td>Raspberry Pi 5</td><td>6.6-rpi</td><td class="n kern">2.1 ms</td><td class="n no">✗</td>
@@ -287,12 +287,13 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
         <td class="n no">✗</td><td class="n">76 ms</td><td class="n no">✗</td><td class="n">858 ms</td></tr>
   </table>
   <p class="cm" style="font-size:.86rem">✗ = not installed (nor readily installable) on that board ·
-  * crun figure from BENCHMARKS.md · † the Android kernel's overlayfs mount is a ~31 ms quirk;
+  † the Android kernel's overlayfs mount is a ~31 ms quirk;
   <code>--bind-rootfs</code> starts in 9.9 ms.</p>
   <p>kern is the fastest sandbox here at <b>~1.9 ms</b> (its own box setup is ~1 ms; the rest is process
   start + teardown). The top tier is all within a few ms — nobody wins single-shot latency outright. The
-  real gap is to the <b>engines</b>: <b>~120–150× faster</b> than podman/Docker (~300 ms), which round-trip
-  a daemon every run — yet kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start:
+  real gap is to the <b>engines</b>: <b>~80–160× faster to start</b> — podman (~155 ms, daemonless but forks
+  <code>conmon</code> per run) and Docker (~308 ms, a client→daemon round-trip) — yet kern alone ships a full
+  daemonless container UX in ~1.5 MB. Beyond one start:
   <b>~500 boxes/s</b>, <b>~7 MB</b> RSS/box, <b>0 resident</b> (Docker keeps ~186 MB resident before you run
   anything). Full method in <a href="https://github.com/getkern/kern/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
 
