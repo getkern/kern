@@ -1437,15 +1437,16 @@ fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
 }
 
 /// Append `--add-host NAME:IP` entries to the box's `/etc/hosts` (Docker parity). Best-effort,
-/// pre-pivot, writing into the box's OWN root (an overlay copy-up, not the shared image). The final
-/// `hosts` component is opened `O_NOFOLLOW`, so a hostile image shipping `/etc/hosts` as a symlink
-/// can't redirect the append out of the box. A bad entry (empty / whitespace in the name) is skipped.
+/// pre-pivot, writing into the box's OWN root (an overlay copy-up, not the shared image). The path is
+/// resolved with [`open_in_root`], which refuses a symlink at EVERY component (not just the final one)
+/// and rejects `.`/`..` — so a hostile image shipping `/etc` OR `/etc/hosts` as a symlink can't redirect
+/// the append out of the box root (this runs pre-pivot, where a naive open would resolve through the
+/// HOST root). Content is guarded too: an entry whose name or IP carries whitespace/control is skipped,
+/// so a crafted value can't inject extra `/etc/hosts` lines.
 fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
     if hosts.is_empty() {
         return;
     }
-    // Reject any entry whose name or IP carries whitespace or a control char — a newline would let a
-    // crafted value inject extra `/etc/hosts` lines (a legit hostname/IP never contains either).
     let clean = |s: &str| !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control());
     let mut block = String::from("\n# kern --add-host\n");
     for (name, ip) in hosts {
@@ -1453,22 +1454,40 @@ fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
             block.push_str(&format!("{ip}\t{name}\n"));
         }
     }
-    let Ok(p) = cstr(&format!("{root}/etc/hosts")) else {
+    let Ok(rc) = cstr(root) else {
         return;
     };
-    let fd = unsafe {
+    let root_fd = unsafe {
         libc::open(
-            p.as_ptr(),
-            libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW,
-            0o644,
+            rc.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
-    if fd < 0 {
-        return; // no /etc, or /etc/hosts is a symlink (refused) — best-effort, don't fail the box
+    if root_fd < 0 {
+        return;
     }
-    unsafe {
-        libc::write(fd, block.as_ptr().cast(), block.len());
-        libc::close(fd);
+    // Symlink-safe walk to the real `/etc/hosts` (created if absent); returns an O_PATH fd.
+    let path_fd = open_in_root(root_fd, "etc/hosts", false);
+    unsafe { libc::close(root_fd) };
+    let Ok(path_fd) = path_fd else {
+        return; // a symlinked /etc or /etc/hosts (or a bad component) — refuse rather than escape
+    };
+    // O_PATH can't be written; reopen the SAME inode via /proc/self/fd for the append (no re-resolution
+    // of the box path, so the symlink guard above still holds).
+    let ok_reopen = cstr(&format!("/proc/self/fd/{path_fd}")).map(|proc_path| unsafe {
+        libc::open(
+            proc_path.as_ptr(),
+            libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC,
+        )
+    });
+    unsafe { libc::close(path_fd) };
+    if let Ok(wfd) = ok_reopen {
+        if wfd >= 0 {
+            unsafe {
+                libc::write(wfd, block.as_ptr().cast(), block.len());
+                libc::close(wfd);
+            }
+        }
     }
 }
 
@@ -2792,6 +2811,30 @@ mod add_host_tests {
             "no injected /etc/hosts line: {out:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extra_hosts_refuses_a_symlinked_etc_and_cannot_escape_the_box_root() {
+        // A hostile image shipping `/etc` as a symlink must NOT let the append escape the box root
+        // (open_in_root refuses a symlink at every component). Runs pre-pivot, so a naive open would
+        // resolve through the host root — this is the exact escape the audit flagged.
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("kern-etcsym-{}", std::process::id()));
+        let root = base.join("boxroot");
+        let victim = base.join("victim"); // OUTSIDE the box root
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        // box root's `etc` is a symlink to the victim dir
+        symlink(&victim, root.join("etc")).unwrap();
+
+        setup_extra_hosts(&root.to_string_lossy(), &[("db".into(), "1.2.3.4".into())]);
+
+        assert!(
+            !victim.join("hosts").exists(),
+            "a symlinked /etc must not let the append escape to the victim dir"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

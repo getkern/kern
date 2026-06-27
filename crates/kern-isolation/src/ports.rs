@@ -43,12 +43,14 @@ impl PortForwarder {
     }
 }
 
-/// Pre-flight: verify every `-p` host port can actually be bound (same `AF_INET` + `SO_REUSEADDR`
-/// the forwarder uses) BEFORE the box is declared started. Without this, a host port already held by
-/// another box (or any process) only fails inside the forked forwarder — whose stderr a detached box
-/// swallows — so the box prints "✔ started" while nothing listens. Returns the first conflicting
-/// `(host_port, os-error)`. Best-effort: a socket-creation failure is skipped (the forwarder still
-/// reports its own bind error as the backstop).
+/// Pre-flight: verify every `-p` host port can actually be bound (`AF_INET`, matching the mapping's
+/// TCP/UDP type) BEFORE the box is declared started. Uses `SO_REUSEADDR` only — NOT `SO_REUSEPORT` —
+/// on purpose: the UDP forwarder adds `SO_REUSEPORT` (for its per-client sockets), but a REUSEPORT
+/// probe here would bind happily ALONGSIDE another REUSEPORT holder and falsely pass the conflict
+/// check. Without this preflight a taken host port only fails inside the forked forwarder — whose
+/// stderr a detached box swallows — so the box prints "✔ started" while nothing listens. Returns the
+/// first conflicting `(host_port, os-error)`. Best-effort: a socket-creation failure is skipped (the
+/// forwarder still reports its own bind error as the backstop).
 pub fn preflight(ports: &[(u32, u16, u16, bool)]) -> Result<(), (u16, String)> {
     for &(ip, hp, _bp, udp) in ports {
         let ty = if udp {
@@ -253,8 +255,10 @@ fn reuse_addr_port(s: i32) {
 
 /// UDP publish. A wildcard host socket receives each client's FIRST datagram; a per-client child then
 /// binds a `SO_REUSEPORT` socket *connected* to that client (so the kernel routes its later datagrams
-/// straight to the child, not back here) and relays to a box-side UDP socket. One relay process per
-/// unique client, capped so a flood can't fork-bomb; the group is torn down with the box.
+/// straight to the child, not back here) and relays to a box-side UDP socket. Each relay idles out
+/// (see `pump_dgram`) so a request/response client's process/sockets are freed, and the parent's
+/// recent-client table is TIME-bounded (not a lifetime blacklist), so a long-lived resolver never hits
+/// a cumulative ceiling and a client can reconnect after its relay dies. The group dies with the box.
 fn udp_forwarder(box_pid1: i32, bind_ip: u32, host_port: u16, box_port: u16) -> ! {
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if sock < 0 {
@@ -269,7 +273,15 @@ fn udp_forwarder(box_pid1: i32, bind_ip: u32, host_port: u16, box_port: u16) -> 
         );
         unsafe { libc::_exit(1) };
     }
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Recently-forked clients (ip:port → when). Its ONLY job is to dedupe the ~ms race window between
+    // us reading a client's first datagram and its child binding the connected socket that steals the
+    // client's later datagrams. It is TIME-BOUNDED (pruned to `DEDUP_TTL`), NOT a lifetime blacklist —
+    // so a long-lived resolver never hits a cumulative ceiling, and a client whose relay died can
+    // reconnect once its stale entry ages out. The size cap is a secondary flood guard on RECENT peers.
+    const DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+    const MAX_RECENT: usize = 1024;
+    let mut seen: std::collections::HashMap<u64, std::time::Instant> =
+        std::collections::HashMap::new();
     let mut buf = [0u8; 65535];
     loop {
         let mut caddr: libc::sockaddr_in = unsafe { mem::zeroed() };
@@ -290,13 +302,16 @@ fn udp_forwarder(box_pid1: i32, bind_ip: u32, host_port: u16, box_port: u16) -> 
             }
             break;
         }
-        // key = client (ip:port). A datagram from an ALREADY-seen client only reaches us in the tiny
-        // race window before its child bound its connected socket → drop it (UDP is lossy; the client
-        // retransmits to the child). Cap the client table so a spoofed-source flood can't grow it.
+        let now = std::time::Instant::now();
+        seen.retain(|_, &mut t| now.duration_since(t) < DEDUP_TTL);
+        // key = client (ip:port). A datagram from a client we forked a relay for in the last DEDUP_TTL
+        // only reaches us in the race window before its child took over → drop it (UDP is lossy; the
+        // client retransmits to the child). A brand-new (or aged-out) client forks a fresh relay.
         let key = ((caddr.sin_addr.s_addr as u64) << 16) | caddr.sin_port as u64;
-        if seen.len() >= 1024 || !seen.insert(key) {
+        if seen.contains_key(&key) || seen.len() >= MAX_RECENT {
             continue;
         }
+        seen.insert(key, now);
         let c = unsafe { libc::fork() };
         if c == 0 {
             unsafe { libc::close(sock) };
@@ -358,6 +373,10 @@ fn udp_relay_child(
 /// there is no half-close: UDP has no EOF, so it runs until a socket error (e.g. an ICMP port-
 /// unreachable surfaces as `ECONNREFUSED` on the connected socket) tears the relay down.
 fn pump_dgram(a: i32, b: i32) {
+    // UDP has no EOF, so a request/response flow (e.g. DNS) would otherwise leave this relay blocked in
+    // `poll` forever, leaking a process + two sockets per client. Exit after this long with no traffic;
+    // the client's parent-side dedup entry ages out on the same order, so a later datagram re-forks.
+    const IDLE_MS: libc::c_int = 60_000;
     let mut buf = [0u8; 65535];
     loop {
         let mut fds = [
@@ -372,7 +391,11 @@ fn pump_dgram(a: i32, b: i32) {
                 revents: 0,
             },
         ];
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, IDLE_MS) };
+        if r == 0 {
+            return; // idle timeout — no traffic either way, tear the relay down
+        }
+        if r < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }

@@ -330,7 +330,7 @@ pub struct BoxRunArgs<'a> {
 /// `127.0.0.1` when the box shares the host network, else the host's primary (default-route) IPv4 (the
 /// address a box with egress uses to reach the host). Other values pass through verbatim.
 fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, String)> {
-    let gateway = |()| -> String {
+    let gateway = || -> String {
         if share_net {
             return "127.0.0.1".to_string();
         }
@@ -339,7 +339,7 @@ fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, 
     raw.iter()
         .map(|(name, ip)| {
             let ip = if ip.eq_ignore_ascii_case("host-gateway") {
-                gateway(())
+                gateway() // resolved lazily, only for host-gateway entries
             } else {
                 ip.clone()
             };
