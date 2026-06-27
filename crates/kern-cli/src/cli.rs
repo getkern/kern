@@ -16,7 +16,7 @@ pub struct GlobalOpts {
 }
 
 /// The parsed subcommand.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Command {
     Version,
     Help,
@@ -45,6 +45,10 @@ pub enum Command {
         /// `--bind-rootfs`: bind the rootfs directly instead of an overlay (faster on slow-overlay
         /// kernels; source becomes mutable & shared).
         bind_rootfs: bool,
+        /// `--memory`/`-m`: hard memory ceiling in bytes (default cap if `None`).
+        memory: Option<u64>,
+        /// `--cpus`: CPU cap in cores, K8s semantics (1.5 = 1½ cores; uncapped if `None`).
+        cpus: Option<f64>,
     },
     /// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]`: run a command in a box.
     Exec {
@@ -183,6 +187,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut share_net = false;
     let mut uid_range = false;
     let mut bind_rootfs = false;
+    let mut memory: Option<u64> = None;
+    let mut cpus: Option<f64> = None;
     let mut volumes: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -226,6 +232,26 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
                 }
+                "-m" | "--memory" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| parse_size(v)) {
+                        Some(b) => memory = Some(b),
+                        None => {
+                            return Err(Error::Usage("--memory <size> (e.g. 512m, 1g, 268435456)"))
+                        }
+                    }
+                }
+                "--cpus" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|c| *c > 0.0 && c.is_finite())
+                    {
+                        Some(c) => cpus = Some(c),
+                        None => return Err(Error::Usage("--cpus <n> (e.g. 1.5 = 1½ cores, 2)")),
+                    }
+                }
                 // Reject an unknown flag rather than silently ignoring it: a typo'd `--read-only`
                 // must NOT quietly run a writable box. (Flags after `--` are part of the command.)
                 s if s.starts_with('-') => {
@@ -257,9 +283,41 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             share_net,
             uid_range,
             bind_rootfs,
+            memory,
+            cpus,
         }
     };
     Ok(cmd)
+}
+
+/// Parse a memory size like `512m`, `1g`, `512mb`, or a bare `268435456` (= bytes) into bytes.
+/// Units are binary (k = 1024). Returns `None` on a malformed value — the caller turns that into a
+/// usage error.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let last = s.chars().last()?.to_ascii_lowercase();
+    let (num, mult): (&str, u64) = match last {
+        '0'..='9' => (s, 1),
+        // accept a trailing 'b' on a unit ("mb"/"gb") or on its own (bytes)
+        'b' => {
+            let body = &s[..s.len() - 1];
+            match body.chars().last().map(|c| c.to_ascii_lowercase()) {
+                Some('k') => (&body[..body.len() - 1], 1024),
+                Some('m') => (&body[..body.len() - 1], 1024 * 1024),
+                Some('g') => (&body[..body.len() - 1], 1024 * 1024 * 1024),
+                _ => (body, 1),
+            }
+        }
+        'k' => (&s[..s.len() - 1], 1024),
+        'm' => (&s[..s.len() - 1], 1024 * 1024),
+        'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => return None,
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .filter(|b| *b > 0)
 }
 
 /// Parse `exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]`. Missing name → usage error.
@@ -350,6 +408,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             share_net,
             uid_range,
             bind_rootfs,
+            memory,
+            cpus,
         } => commands::box_run(commands::BoxRunArgs {
             name: &name,
             rootfs: rootfs.as_deref(),
@@ -363,6 +423,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             share_net,
             uid_range,
             bind_rootfs,
+            memory,
+            cpus,
         }),
         Command::Exec {
             name,
@@ -413,6 +475,46 @@ mod tests {
         assert!(matches!(
             parse(&["box".into(), "web".into()]).unwrap().1,
             Command::BoxRun { name, rootfs: None, image: None, .. } if name == "web"
+        ));
+    }
+
+    #[test]
+    fn parse_size_units() {
+        assert_eq!(parse_size("512"), Some(512));
+        assert_eq!(parse_size("512m"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_size("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size("512mb"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_size("1024k"), Some(1024 * 1024));
+        assert_eq!(parse_size("0"), None); // zero is not a useful cap
+        assert_eq!(parse_size("pippo"), None);
+        assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn box_parses_memory_and_cpus() {
+        let cmd = parse(&[
+            "box".into(),
+            "x".into(),
+            "--memory".into(),
+            "256m".into(),
+            "--cpus".into(),
+            "1.5".into(),
+        ])
+        .unwrap()
+        .1;
+        assert!(matches!(
+            cmd,
+            Command::BoxRun { memory: Some(m), cpus: Some(c), .. }
+                if m == 256 * 1024 * 1024 && (c - 1.5).abs() < 1e-9
+        ));
+        // Malformed values are usage errors, never silently ignored.
+        assert!(matches!(
+            parse(&["box".into(), "x".into(), "--memory".into(), "nope".into()]),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&["box".into(), "x".into(), "--cpus".into(), "0".into()]),
+            Err(Error::Usage(_))
         ));
     }
 
