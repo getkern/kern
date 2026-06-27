@@ -52,7 +52,7 @@
   .lead{font-size:1.05rem;color:var(--fg)}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:1rem 0}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
-  .card h4{margin:0 0 .3rem;color:var(--hi);font-size:.98rem}
+  .card h3{margin:0 0 .3rem;color:var(--hi);font-size:.98rem}
   .card p{margin:0;color:var(--mut);font-size:.92rem}
   ul.feat{list-style:none;padding:0;margin:1rem 0}
   ul.feat>li{padding:9px 0;border-bottom:1px solid var(--border)}
@@ -73,7 +73,7 @@
   details[open] summary{border-bottom:1px solid var(--border);margin-bottom:10px}
   footer{color:var(--mut);font-size:.86rem;text-align:center;padding:40px 0 60px;
          border-top:1px solid var(--border);margin-top:3rem}
-  @media(max-width:640px){.grid{grid-template-columns:1fr}.logo{font-size:2.6rem}.tag{font-size:1.1rem}}
+  @media(max-width:640px){.grid{grid-template-columns:1fr}.logo{font-size:2.6rem}.tag{font-size:1.1rem}table{display:block;overflow-x:auto;white-space:nowrap}}
 </style>
 </head>
 <body>
@@ -128,18 +128,18 @@ print(r.stdout, r.success)                     <span class="cm"># → a fresh 2 
 
   <h2 id="why">Why kern</h2>
   <div class="grid">
-    <div class="card"><h4>Daemonless &amp; tiny</h4><p>No <code>dockerd</code>-style service. A ~1.5 MB
+    <div class="card"><h3>Daemonless &amp; tiny</h3><p>No <code>dockerd</code>-style service. A ~1.5 MB
       static binary, one Rust dependency (<code>libc</code>). Cold start ~1.9 ms vs ~300 ms for
       <code>docker run</code>; ~7 MB RSS per box vs an always-on ~186 MB daemon.
       <code>kern ps</code> reads state straight from the kernel.</p></div>
-    <div class="card"><h4>Rootless by default</h4><p>Unprivileged user namespaces — your uid maps to root
+    <div class="card"><h3>Rootless by default</h3><p>Unprivileged user namespaces — your uid maps to root
       <em>inside</em> the box, and only there. Single-uid is the default and <code>libc</code>-pure;
       <code>--uid-range</code> opts into a full sub-id range. No host privilege is gained either way.</p></div>
-    <div class="card"><h4>Correct by construction</h4><p>The mount sequence is a <b>typestate</b>:
+    <div class="card"><h3>Correct by construction</h3><p>The mount sequence is a <b>typestate</b>:
       remounting the root read-only <em>before</em> pivoting into it doesn't compile — a class of
       sandbox-escape bug is unrepresentable, not just untested. <code>--plan</code> prints the exact
       isolation sequence.</p></div>
-    <div class="card"><h4>Honest about its boundaries</h4><p>Filesystem / process / namespace isolation is
+    <div class="card"><h3>Honest about its boundaries</h3><p>Filesystem / process / namespace isolation is
       a real kernel boundary — the right tool for your own or semi-trusted code (CI, dev, edge, agents).
       For actively hostile multi-tenant code, reach for a microVM. <code>SECURITY.md</code> says exactly
       when to use which.</p></div>
@@ -176,7 +176,7 @@ print(r.stdout, r.success)                     <span class="cm"># → a fresh 2 
     <li><b>Least privilege</b> — 13 dangerous caps always dropped; an always-on <b>seccomp</b> denylist
       (kexec, modules, ptrace, mount API, <code>setns</code>, …) that also kills wrong-arch + x86_64
       x32-ABI aliases. Opt-in <code>--privileged</code> relaxes exactly five syscalls for a nested box
-      (rootless-only) — see <a href="SECURITY.md">SECURITY.md</a>.</li>
+      (rootless-only) — see <a href="https://github.com/getkern/kern/blob/main/SECURITY.md">SECURITY.md</a>.</li>
     <li><b>Lifecycle, no daemon</b> — <code>--restart</code> + <code>--health-cmd</code>;
       <code>cp</code>/<code>pause</code>/<code>attach</code>/<code>exec</code>;
       <code>ps</code>/<code>top</code>/<code>stats</code>/<code>logs</code>/<code>inspect</code>/<code>prune</code>/<code>gc</code>;
@@ -283,7 +283,7 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
   real gap is to the <b>engines</b>: <b>~120–150× faster</b> than podman/Docker (~300 ms), which round-trip
   a daemon every run — yet kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start:
   <b>~500 boxes/s</b>, <b>~7 MB</b> RSS/box, <b>0 resident</b> (Docker keeps ~186 MB resident before you run
-  anything). Full method in <a href="BENCHMARKS.md">BENCHMARKS.md</a>.</p>
+  anything). Full method in <a href="https://github.com/getkern/kern/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
 
   <h2 id="security">Security</h2>
   <p>kern isolates with Linux <b>namespaces + seccomp + a read-only userns root</b> — a kernel-level
@@ -292,7 +292,7 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
   hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't — a deliberate trade for ~2 ms
   starts and a ~1.5 MB footprint.</p>
   <div class="note"><b>Honest by design.</b> The full threat model, per-feature notes, and the
-  <em>"kern vs a microVM — when to use what"</em> guidance live in <a href="SECURITY.md">SECURITY.md</a>,
+  <em>"kern vs a microVM — when to use what"</em> guidance live in <a href="https://github.com/getkern/kern/blob/main/SECURITY.md">SECURITY.md</a>,
   which marks every guarantee that is cooperative or opt-in. Found a vulnerability? Report it
   <b>privately</b> via GitHub Security Advisories.</div>
 
@@ -313,10 +313,10 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
   <div class="note future"><b>Later — a light note.</b> Longer term, the same virtual-resource model may
   extend to optional <b>GPU slices</b> (a workload gets a slice of a GPU, not the whole device). It would
   land incrementally, always opt-in and never the default, with an honest trust model. Not a launch
-  feature — a direction. See <a href="ARCHITECTURE.md">ARCHITECTURE.md</a>.</div>
+  feature — a direction. See <a href="https://github.com/getkern/kern/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a>.</div>
 
   <hr>
-  <p><b>License.</b> <a href="LICENSE">Apache-2.0</a> — permissive, with an explicit patent grant. The
+  <p><b>License.</b> <a href="https://github.com/getkern/kern/blob/main/LICENSE">Apache-2.0</a> — permissive, with an explicit patent grant. The
   dependency tree is deliberately tiny (<code>libc</code> only on the Rust side; standard-library-only on
   the Python side) and copyleft-free. <b>kern</b> and <b>getkern</b> are trademarks of the project: the
   <em>code</em> is yours to use under Apache-2.0, but please don't ship a fork or a competing service under
