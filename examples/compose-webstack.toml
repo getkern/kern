@@ -9,8 +9,10 @@
 # OCI image box (redis drops to its service uid at start), so we don't declare it here.
 
 # The cache: redis, ephemeral (no volume), with a health probe run inside the box.
+# (redis:7-alpine — lean; redis:8/latest bundles RediSearch/Bloom modules whose init trips the box's
+#  always-on seccomp filter, so the pinned 7-alpine is the rootless-friendly choice for this demo.)
 [box.cache]
-image = "redis"
+image = "redis:7-alpine"
 command = ["redis-server", "--save", "", "--appendonly", "no"]
 memory = "128m"
 # `--health-cmd`: exit 0 = healthy. `kern ps` shows HEALTH, and a `depends_healthy` peer waits on it.
