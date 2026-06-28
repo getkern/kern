@@ -282,9 +282,50 @@ fn prescreen(text: &str) -> Result<(), String> {
                     "line {ln}: unbalanced `[`/`{{` in an inline value (unterminated list/map)"
                 ));
             }
+            // A value that OPENS with a quote must close it on the line (`image: "alpine`). Without
+            // this the stray-quoted value is taken literally and fails later with a confusing
+            // downstream error (a garbage image name → "no layers in manifest"). Only enforce closure
+            // when the value STARTS quoted — an unquoted scalar may legitimately contain a bare
+            // apostrophe (`command: don't`), which is not an opened string.
+            if (vt.starts_with('"') || vt.starts_with('\'')) && has_unterminated_quote(vt) {
+                return Err(format!("line {ln}: unterminated quoted string"));
+            }
         }
     }
     Ok(())
+}
+
+/// True if `s` opens a `"` or `'` quote that is never closed. Double-quoted strings honor a `\"`
+/// escape (YAML basic strings); single-quoted YAML strings have no backslash escapes (a literal `\`),
+/// so a `'` always closes them. Called only for a value that STARTS with a quote, so a bare apostrophe
+/// in an unquoted scalar (`don't`) is not misread as an opened string.
+fn has_unterminated_quote(s: &str) -> bool {
+    let mut q: Option<char> = None;
+    let mut esc = false;
+    for c in s.chars() {
+        match q {
+            Some('"') => {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    q = None;
+                }
+            }
+            Some(_) => {
+                if c == '\'' {
+                    q = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    q = Some(c);
+                }
+            }
+        }
+    }
+    q.is_some()
 }
 
 /// Are `[`/`]` and `{`/`}` balanced in `s`, ignoring brackets inside quotes? Depth never goes negative
@@ -2350,6 +2391,23 @@ mod tests {
         assert_eq!(app.memory.as_deref(), Some("128M"));
         assert_eq!(app.cpus.as_deref(), Some("0.5"));
         assert_eq!(app.pids_limit.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn unterminated_quote_errors_bare_apostrophe_ok() {
+        // An opening quote with no close is a CLEAR parse error, not a confusing downstream failure.
+        let bad = "services:\n  a:\n    image: \"alpine\n    command: [\"true\"]\n";
+        let e = parse(bad).unwrap_err();
+        assert!(
+            e.contains("unterminated quoted"),
+            "want a clear error, got: {e}"
+        );
+        // But a bare apostrophe in an UNQUOTED scalar (`it's-fine`) is valid and must parse.
+        let ok = "services:\n  a:\n    image: alpine\n    hostname: it's-fine\n";
+        assert!(
+            parse(ok).is_ok(),
+            "a bare apostrophe in an unquoted scalar must parse"
+        );
     }
 
     #[test]
