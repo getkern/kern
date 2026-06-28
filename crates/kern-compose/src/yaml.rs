@@ -868,8 +868,13 @@ fn service_to_box(
                 }
             }
             "profiles" => b.profiles = list_value(node),
-            "networks" | "deploy" | "configs" | "labels" | "logging" | "expose" | "extends"
-            | "init" | "stdin_open" | "tty" | "domainname" => {
+            // Docker Compose v3 puts the hard caps under `deploy.resources.limits` (memory/cpus/pids).
+            // CONVERT them — kern enforces them exactly like its own `--memory`/`--cpus`/`--pids-limit`
+            // flags, and Docker rootless famously IGNORES them without cgroup-v2+systemd, so this is a
+            // place kern is *stronger*, not weaker. A silently-dropped cap is worse than a visible gap.
+            "deploy" => apply_deploy(&mut b, node),
+            "networks" | "configs" | "labels" | "logging" | "expose" | "extends" | "init"
+            | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
             other => warn(&format!(
@@ -900,6 +905,28 @@ fn service_to_box(
         }
     }
     Ok(b)
+}
+
+/// Map Docker Compose v3 `deploy.resources.limits.{memory,cpus,pids}` onto kern's hard caps — the
+/// runtime enforces them via `--memory`/`--cpus`/`--pids-limit`. `deploy.resources.reservations` are
+/// soft best-effort hints with no kern equivalent, so they're left alone (a compose that only reserves
+/// still runs, just uncapped — which is what a reservation means). Anything else under `deploy:`
+/// (`replicas`, `restart_policy`, `placement`, …) is swarm/orchestration kern doesn't do; silently
+/// skipped here rather than warned per-key, since a single-node `deploy:` block is common and mostly
+/// inert for `kern compose`.
+fn apply_deploy(b: &mut ComposeBox, node: &Node) {
+    let Some(limits) = node.child("resources").and_then(|r| r.child("limits")) else {
+        return;
+    };
+    if let Some(m) = limits.child("memory").and_then(|n| n.scalar.as_deref()) {
+        b.memory = Some(scalar_str(m));
+    }
+    if let Some(c) = limits.child("cpus").and_then(|n| n.scalar.as_deref()) {
+        b.cpus = Some(scalar_str(c));
+    }
+    if let Some(p) = limits.child("pids").and_then(|n| n.scalar.as_deref()) {
+        b.pids_limit = Some(scalar_str(p));
+    }
 }
 
 /// `command`: exec-form list → argv verbatim; shell-form string → `sh -c "<string>"` (Docker semantics).
@@ -2296,6 +2323,21 @@ mod tests {
             ["db"],
             "gate must be degraded to start-order"
         );
+    }
+
+    #[test]
+    fn deploy_resources_limits_map_to_hard_caps() {
+        // Docker Compose v3 puts hard caps under `deploy.resources.limits` — kern must CONVERT them to
+        // its own enforced caps (Docker rootless ignores them). `reservations` are soft → left alone.
+        let y = "services:\n  app:\n    image: alpine\n    deploy:\n      resources:\n        limits:\n          memory: 128M\n          cpus: \"0.5\"\n          pids: 100\n        reservations:\n          memory: 64M\n";
+        let app = parse(y)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.name == "app")
+            .unwrap();
+        assert_eq!(app.memory.as_deref(), Some("128M"));
+        assert_eq!(app.cpus.as_deref(), Some("0.5"));
+        assert_eq!(app.pids_limit.as_deref(), Some("100"));
     }
 
     #[test]
