@@ -104,6 +104,26 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
 
 /// Parse Dockerfile `text` into an ordered instruction list. `build_args` seed the substitution
 /// table (they override any in-file `ARG` default). Returns a human-readable error on the first
+/// If `s` opens a heredoc (`<<WORD`, `<<-WORD`, `<<"WORD"`, `<<'WORD'`), return the delimiter word.
+/// Heredocs (a BuildKit feature) aren't supported; catching the opener gives one clear error instead
+/// of the body leaking into the parser as bogus "unknown instruction" lines. The delimiter must start
+/// with a letter/`_`, so a shell bit-shift like `$((1<<2))` is NOT mistaken for a heredoc.
+fn heredoc_delimiter(s: &str) -> Option<String> {
+    let i = s.find("<<")?;
+    let mut rest = s[i + 2..].trim_start();
+    rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
+    let first = rest.chars().next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    Some(
+        rest.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect(),
+    )
+}
+
 /// malformed or unsupported line, tagged with the 1-based line number.
 pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Instr>, String> {
     let mut out = Vec::new();
@@ -189,7 +209,17 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     out.push(Instr::Env(k, v));
                 }
             }
-            "RUN" => out.push(Instr::Run(cmd_argv(rest, &vars))),
+            "RUN" => {
+                // Heredoc (`RUN <<EOF … EOF`, a BuildKit feature) isn't supported. Detect the opener
+                // and say so clearly — otherwise the body lines leak into the loop as bogus
+                // "unknown instruction ECHO" errors.
+                if let Some(delim) = heredoc_delimiter(rest) {
+                    return err(&format!(
+                        "RUN heredoc (`<<{delim}`) is not supported — use a single-line `RUN` (join with `&&` / `; `) or `RUN sh -c '…'`"
+                    ));
+                }
+                out.push(Instr::Run(cmd_argv(rest, &vars)))
+            }
             "CMD" => out.push(Instr::Cmd(cmd_argv(rest, &vars))),
             "ENTRYPOINT" => out.push(Instr::Entrypoint(cmd_argv(rest, &vars))),
             "WORKDIR" => {
@@ -721,6 +751,14 @@ mod tests {
         assert!(parse("FROM a\nBOGUS x\n", &ba())
             .unwrap_err()
             .contains("unknown instruction"));
+        // A BuildKit heredoc (`RUN <<EOF`) gets ONE clear error, not a body-line "unknown instruction".
+        assert!(parse("FROM a\nRUN <<EOF\necho hi\nEOF\n", &ba())
+            .unwrap_err()
+            .contains("heredoc"));
+        // …but a shell bit-shift (`1<<2`) is NOT mistaken for a heredoc opener.
+        assert_eq!(heredoc_delimiter("<<EOF").as_deref(), Some("EOF"));
+        assert_eq!(heredoc_delimiter("cat <<-'END' f").as_deref(), Some("END"));
+        assert_eq!(heredoc_delimiter("echo $((1<<2))"), None);
         assert!(parse("RUN x", &ba()).is_err());
         assert!(parse("# only a comment\n", &ba())
             .unwrap_err()
