@@ -546,6 +546,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             cpus,
             args.pids_limit,
             true, // `kern box` has a supervisor → may take the direct kern.slice path
+            !args.detached && !args.tty, // a foreground box dies with its launcher
         );
     }
     // A profile's `nice` set here is inherited by the forked box workload.
@@ -1243,6 +1244,7 @@ pub fn run(
         cpus,
         None,
         false,
+        false, // `kern run` execs the workload in place — no box to tie to the launcher
     );
     let cg = kern_isolation::apply_cgroup_limits(
         false, // allow_direct: `kern run` exec()s in place (no supervisor) → never relocate into kern.slice
@@ -3088,6 +3090,7 @@ fn reexec_in_scope_if_possible(
     cpus: Option<f64>,
     pids_max: Option<u64>,
     allow_direct: bool,
+    die_with_parent: bool,
 ) {
     use std::os::unix::process::CommandExt;
 
@@ -3170,6 +3173,24 @@ fn reexec_in_scope_if_possible(
         .arg(self_exe)
         .args(&args)
         .env("KERN_SCOPE", "1");
+    // A FOREGROUND box must die with its launcher (the SDK's per-request pattern). systemd-run
+    // interposes itself as the box supervisor's parent, so the supervisor's own launcher-PDEATHSIG
+    // would fire on systemd-run's death, not the launcher's — leaving the box orphaned until the
+    // `--timeout` backstop. Close that: arm PR_SET_PDEATHSIG(SIGKILL) HERE, before the execve. It
+    // survives the (non-setuid) exec into `systemd-run`, so a launcher kill SIGKILLs systemd-run,
+    // and the re-exec'd kern (PDEATHSIG vs systemd-run) and box PID 1 (PDEATHSIG vs kern) complete
+    // the cascade launcher→systemd-run→kern→box. Detached/-it/`kern run` pass false.
+    if die_with_parent {
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
+        }
+    }
     // exec() only returns on failure → fall through to the best-effort path.
     let _ = cmd.exec();
 }
