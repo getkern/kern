@@ -17,7 +17,7 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [0.6.2] — 2026-07-11
+## [0.6.2] — 2026-07-12
 
 ### Added
 - **Nested boxes — `kern box --privileged`.** A full `kern box` can now run *inside* another
@@ -30,10 +30,36 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   reading the effective `/proc/self/uid_map` after the namespace is set up (so a `--pod` box is
   judged by its holder's map, not the caller's euid), and refused outright as real root. Documented
   in [SECURITY.md](SECURITY.md); validated on x86_64 + aarch64 (incl. an Android-kernel board).
+- **`kern build`: BuildKit `RUN` heredocs** — `RUN <<EOF … EOF` (the body runs as a shell script),
+  `RUN <interp> <<EOF` (body fed on the command's stdin), `<<-EOF` tab-dedent, and `<<'EOF'` quoted
+  delimiters. Unterminated / stacked / `COPY` heredocs error clearly (never a silent mis-parse).
+- **`kern build`: `COPY --from=<external-image>`** — copy files straight out of an external image
+  (`COPY --from=nginx:alpine /etc/nginx/nginx.conf /`), not just an earlier build stage. A build stage
+  always wins over a same-named image; the image is pulled with the full hardening and its files are
+  copied through the same confined (`openat2 RESOLVE_IN_ROOT`, no-follow, `..`-reject) path as a stage.
+- **`kern compose`: Docker v3 `deploy.resources.limits`** (`memory`/`cpus`/`pids`) are now honoured as
+  hard caps — where rootless Docker ignores them without cgroup-v2+systemd, kern enforces them. A
+  `limits:` block that maps nothing (a typo) warns instead of silently running uncapped.
+- **`kern compose`: multi-line arrays** (`command = [\n …\n]`) in a native TOML stack now parse.
 
 ### Fixed
+- **Multi-stage builds** failed at the first stage's `RUN` with a fork-safety refusal — the build's
+  transcript recorder held a background thread, so `COPY --from`'s merged-view `fork()` saw a
+  multi-threaded process. The recorder is now a child process; the build stays single-threaded.
+- **`redis:latest` (Redis 8) and other io_uring-probing images** were SIGSYS-killed mid-startup and
+  now run — see Security below.
+- Clearer parse errors: an unterminated quoted compose value and an unterminated `RUN` heredoc now
+  report the offending line instead of failing later with a confusing downstream error.
 - Dropped a dead `KERN_ACCEPT_EULA` passthrough and its stale comments from the embedding SDK — the
   public build has no EULA gate (and never claimed one in docs).
+
+### Security
+- **seccomp: deny-but-degrade for probe-and-fallback syscalls.** `io_uring`, `userfaultfd`,
+  `perf_event_open`, the keyring family and `syslog(2)` now return `ENOSYS` instead of a `SIGSYS`
+  kill. They are still fully DENIED — the syscall never runs, so the isolation is identical — but
+  software that merely probes an optional fast-path (e.g. Redis 8's io_uring) now falls back cleanly
+  instead of dying. Real escape vectors (kexec, kernel modules, the mount API, `bpf`, `ptrace`, the
+  nesting set) still hard-KILL. The two sets are asserted disjoint.
 
 ## [0.6.1] — 2026-07-08
 
