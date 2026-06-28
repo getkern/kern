@@ -54,6 +54,50 @@ shows the boundaries holding.
 | [build-and-extract.sh](build-and-extract.sh) | Compile in a disposable toolchain; keep the artifact, your host never gets the compiler |
 | [parallel-matrix.sh](parallel-matrix.sh) | Run one command across a matrix of images **all at once** (daemonless fan-out — no serialization) |
 
+### Secrets, storage & volumes
+
+| Example | What it shows |
+|---|---|
+| [secrets.sh](secrets.sh) | `--secret` delivers a secret to `/run/secrets/<name>` (RAM-backed, `0400`, gone on exit) — file (`SRC:NAME`) or stdin (`NAME=-`) form |
+| [named-volumes.sh](named-volumes.sh) | `kern volume create/inspect/rm`: a named volume persists across boxes (write in A, read in B); `--size` records a quota (a hard cap needs root/ext4-loop — use `vdisk:` for a rootless-enforced size) |
+| [vdisk-scratch.sh](vdisk-scratch.sh) | A `vdisk:` scratch disk from a `[[vdisk]]` profile (`--config`), mounted at `/vdisk/<name>` — a rootless size cap the kernel enforces (writing past it → `ENOSPC`) |
+
+### Lifecycle & operations
+
+| Example | What it shows |
+|---|---|
+| [copy-files.sh](copy-files.sh) | `kern cp` a single file host↔box, resolved inside the box's root (`openat2` — symlinks can't escape to host paths) |
+| [pause-and-attach.sh](pause-and-attach.sh) | `kern pause` / `unpause` freeze & thaw a box (cgroup-v2 freezer), and `kern attach` to reconnect a detached box's live output |
+| [monitor-top-stats.sh](monitor-top-stats.sh) | Daemonless observability: `kern stats --json` (per-box CPU/mem), a `kern top` snapshot, `kern inspect --json` |
+| [gc-prune-doctor.sh](gc-prune-doctor.sh) | Housekeeping: `kern doctor` preflight, `kern prune` (stopped-box leftovers), `kern gc` (reap dead boxes) |
+
+### Networking & pods
+
+| Example | What it shows |
+|---|---|
+| [pods.sh](pods.sh) | `kern pod create` shared-network pods: two boxes joined with `--pod` reach each other by name on one shared loopback; `--no-outbound` blocks egress while keeping intra-pod networking |
+| [add-host.sh](add-host.sh) | `--add-host NAME:IP` custom `/etc/hosts` entries, plus the `host-gateway` keyword resolving to the host IP |
+| [port-publish-advanced.sh](port-publish-advanced.sh) | `-p` beyond a single port: a host↔box port **range**, a `/udp` mapping, and default-loopback vs explicit `0.0.0.0:` bind |
+| [tun-device.sh](tun-device.sh) | `--tun` provisions `/dev/net/tun` inside the box (present with `--tun`, absent without) for a userspace VPN |
+
+### Build, registry & platform
+
+| Example | What it shows |
+|---|---|
+| [build-with-dockerfile.sh](build-with-dockerfile.sh) | `kern build -t` from a Dockerfile (`--build-arg`, `ARG`/`ENV`/`WORKDIR`/`CMD`), then run the built tag |
+| [multi-stage-build.sh](multi-stage-build.sh) | `FROM … AS builder` + `COPY --from=`: compile in a fat stage, ship a slim final image with no compiler |
+| [platform-pull.sh](platform-pull.sh) | `kern pull --platform linux/amd64` vs `linux/arm64` — proven by decoding the busybox ELF header |
+| [tag-and-push-local.sh](tag-and-push-local.sh) | `kern tag` + `kern push` round-trip against a throwaway `registry:2` box on `127.0.0.1:5000` (loopback ⇒ plain-HTTP OK), then pull it back |
+
+### Users, edge & resource profiles
+
+| Example | What it shows |
+|---|---|
+| [multi-uid.sh](multi-uid.sh) | Who runs inside a box: single-uid default vs `--uid-range` (a ~65k sub-uid range) vs `--user 1000`; degrades honestly when `newuidmap`/`/etc/subuid` are absent |
+| [bind-rootfs-edge.sh](bind-rootfs-edge.sh) | `--bind-rootfs` — the edge/Android fast path that binds a `--rootfs` directly instead of an overlay; honest trade: writable & **shared**, not copy-on-write |
+| [init-reaper.sh](init-reaper.sh) | `--init` — a reaping PID 1: orphaned children pile up as zombies without it, get reaped (0) with it |
+| [resource-profiles.sh](resource-profiles.sh) + [kern-profiles.toml](kern-profiles.toml) | Reusable `[[vcpu]]` / `[[vdisk]]` / `[[vgpio]]` profiles in a kern.toml, attached via `--config` + `vcpu:` / `vdisk:` tokens |
+
 ### Real-life scenarios
 
 | Example | What it shows |

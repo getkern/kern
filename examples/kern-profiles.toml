@@ -1,0 +1,53 @@
+# Reusable resource PROFILES for kern — a kern.toml you attach to a box by name.
+#
+# The model is resource-centric: you DECLARE physical resources ([[cpu]], [[gpio]], [[disk]]) and
+# DEFINE named virtual profiles that carve them up ([[vcpu]], [[vgpio]], [[vdisk]]). A box then
+# picks a profile up by its prefix token on the command line:
+#
+#   kern box app --image alpine --config kern-profiles.toml  vcpu:slim vdisk:scratch  -- ./app
+#
+# See resource-profiles.sh in this directory for a runnable walk-through. Field names match kern's
+# schema exactly (crates/kern-cli/src/config.rs).
+
+[kern]
+config_version = 1
+
+# ── virtual CPU slices ([[vcpu]]) ─────────────────────────────────────────────────────────────
+# NOTE the field spellings (they differ from the Docker-style CLI flags on purpose):
+#   vcpus = core QUOTA (cgroup cpu.max)      — the CLI flag for this is --cpus
+#   cpus  = CPU PINNING list (cgroup cpuset) — the CLI flag for this is --cpuset-cpus
+# priority (0 low .. 99 high) maps to nice; or set `nice` (-20..19) directly.
+[[vcpu]]
+name = "slim"
+vcpus = 0.5          # half a core of quota
+cpus = "0"           # pin to CPU 0
+memory = "256 MB"    # RAM ceiling (cgroup memory.max)
+priority = 20        # low-ish scheduling priority -> nice
+
+# `extends` inherits another [[vcpu]] and overrides selected fields.
+[[vcpu]]
+name = "burst"
+extends = "slim"     # start from slim...
+vcpus = 2.0          # ...but allow up to 2 cores
+memory = "512 MB"
+
+# ── virtual disk ([[vdisk]]) ──────────────────────────────────────────────────────────────────
+# A size-capped scratch volume mounted at /vdisk/<name> inside the box. Rootless, this is a
+# size= tmpfs (RAM-backed, ephemeral, discarded on box exit); with privilege + loop devices kern
+# upgrades it to an ext4-on-loop image (disk-backed, honouring persistent/iops/bandwidth).
+[[vdisk]]
+name = "scratch"
+size = "32m"
+# persistent = false   # (default) don't survive box removal
+# backend = "disk:0"   # optional: place the image on a declared [[disk]] pool
+
+# ── virtual GPIO / peripherals ([[vgpio]]) ────────────────────────────────────────────────────
+# Device exposure is host-dependent (real gpiochips / /dev nodes / sysfs). This profile is inert
+# on a host without the hardware; see device-isolation.sh for the device-binding angle. GPIO
+# isolation is chip-granular, not per-line — see SECURITY.md.
+[[vgpio]]
+name = "leds"
+backend = "gpio:0"
+leds = ["led0"]
+# pins = [17, 27]      # requesting any pin binds every /dev/gpiochipN present (chip-granular)
+# i2c  = ["/dev/i2c-1"]
