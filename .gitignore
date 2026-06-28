@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Pulled OCI rootfs / scratch — kern fetches images on demand; never commit a rootfs.
+/alpine/
+/ubuntu/
+/*-rootfs/
