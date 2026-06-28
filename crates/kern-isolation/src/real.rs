@@ -2159,6 +2159,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         // execve; on the `--init` path PID 1 never execs and stays armed. Only for a foreground box:
         // a detached box's supervisor is its persistent owner, and teardown there stays with the
         // existing supervise/`kern stop` path, unchanged.
+        //
+        // Two honest bounds on this hop. (a) It is COOPERATIVE for a hostile PID 1: the box's own init
+        // could `prctl(PR_SET_PDEATHSIG, 0)` to clear it (prctl isn't seccomp-blocked) or a setuid
+        // entrypoint clears it on execve — that only drops the anti-orphan guarantee back to the
+        // `--timeout` backstop (an availability property, not an isolation boundary). (b) Unlike the
+        // supervisor leg we do NOT re-check `getppid()` after arming: this child is already PID 1 of
+        // its new pid namespace (CLONE_NEWPID was unshared above), so `getppid()` reads 0 regardless of
+        // the host-side supervisor's fate — a supervisor death in the fork→prctl microsecond window
+        // simply falls through to the `--timeout` backstop, exactly as before this fix.
         if die_with_parent {
             unsafe {
                 libc::prctl(

@@ -2444,7 +2444,11 @@ fn kill_box(pid: i32, pid1: i32) -> bool {
     } else {
         -1
     };
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    // Never let a corrupt/degenerate `pid <= 1` turn the group sweep into `kill(-1)` (SIGKILL every
+    // process the user owns) or `kill(0)` (our own group): it's only meaningful for a real supervisor.
+    if pid > 1 {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
     if pidfd >= 0 {
         // Wait (bounded) for the init to actually exit — POLLIN fires on termination.
         let mut pfd = libc::pollfd {
