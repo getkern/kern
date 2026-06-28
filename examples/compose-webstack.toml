@@ -9,8 +9,8 @@
 # OCI image box (redis drops to its service uid at start), so we don't declare it here.
 
 # The cache: redis, ephemeral (no volume), with a health probe run inside the box.
-# (redis:7-alpine — lean; redis:8/latest bundles RediSearch/Bloom modules whose init trips the box's
-#  always-on seccomp filter, so the pinned 7-alpine is the rootless-friendly choice for this demo.)
+# (redis:7-alpine — pinned lean for a fast demo pull; plain `redis`/redis:8 also works — its modules
+#  probe io_uring, which the box's seccomp denies with ENOSYS so redis falls back cleanly.)
 [box.cache]
 image = "redis:7-alpine"
 command = ["redis-server", "--save", "", "--appendonly", "no"]
