@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Embed kern in Python: run LLM/agent-generated code in a fresh kernel sandbox per call.
 
-This is the `kern_sandbox` package (`pip install kern-sandbox`, in bindings/python/) — a thin, safe
+This is the `kern_sandbox` package (install from source: `pip install ./bindings/python`) — a thin, safe
 wrapper around the `kern` binary. Each `run_code()`/`run()` spawns a FRESH, ephemeral box (user
 namespace + seccomp + cgroups); FILE state persists between steps via a workspace directory on disk,
 but PROCESSES do not (no resident interpreter — write to disk if you need continuity).
