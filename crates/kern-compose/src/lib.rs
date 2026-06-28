@@ -285,8 +285,8 @@ fn is_yaml(text: &str) -> bool {
 pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
     let mut boxes: Vec<ComposeBox> = Vec::new();
     let mut cur: Option<usize> = None;
-    for (i, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim();
+    for (i, logical) in logical_lines(text) {
+        let line = logical.trim();
         if line.is_empty() {
             continue;
         }
@@ -574,6 +574,67 @@ fn strip_comment(line: &str) -> &str {
     toml_lite::strip_comment(line)
 }
 
+/// Fold physical lines into LOGICAL lines so a multi-line array value —
+/// `command = [\n  "a",\n  "b",\n]` (standard TOML) — is parsed as one unit instead of the parser
+/// choking on the bare `[`. Comments are stripped per physical line first; a logical line stays open
+/// while its bracket depth (counted OUTSIDE quoted strings, so a `[`/`]` inside a string doesn't
+/// count) is positive. Returns `(start_line_index, joined)` so errors still point at the opening line.
+fn logical_lines(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut acc = String::new();
+    let mut start = 0usize;
+    let mut depth: i32 = 0;
+    for (i, raw) in text.lines().enumerate() {
+        let piece = strip_comment(raw);
+        if depth == 0 && acc.is_empty() {
+            if piece.trim().is_empty() {
+                continue;
+            }
+            start = i;
+            acc.push_str(piece.trim());
+        } else {
+            acc.push(' ');
+            acc.push_str(piece.trim());
+        }
+        depth += bracket_delta(piece);
+        if depth <= 0 {
+            out.push((start, std::mem::take(&mut acc)));
+            depth = 0;
+        }
+    }
+    if !acc.trim().is_empty() {
+        out.push((start, acc));
+    }
+    out
+}
+
+/// Net `[` minus `]` in `line`, ignoring brackets inside double- or single-quoted strings.
+fn bracket_delta(line: &str) -> i32 {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in line.chars() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' && q == '"' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            },
+        }
+    }
+    depth
+}
+
 fn parse_box_header(line: &str) -> Option<String> {
     let inner = line.strip_prefix('[')?.strip_suffix(']')?;
     let name = inner.strip_prefix("box.")?.trim();
@@ -632,6 +693,25 @@ mod tests {
         assert_eq!(web.image.as_deref(), Some("alpine"));
         // the comma inside the quoted string must NOT split the array
         assert_eq!(web.command, ["/bin/sh", "-c", "echo hi, there"]);
+        assert_eq!(web.depends_on, ["db"]);
+    }
+
+    #[test]
+    fn multiline_array_folds_into_one_logical_line() {
+        // Standard TOML multi-line array: the parser must fold the continuation lines, not choke on
+        // the bare `[`. A `[bracket]` and a comma inside a quoted string must NOT affect folding.
+        let doc = r#"
+            [box.web]
+            image = "alpine"
+            command = [
+              "/bin/sh", "-c",
+              "echo one, two [three]",
+            ]
+            depends_on = ["db"]
+        "#;
+        let boxes = parse(doc).unwrap();
+        let web = &boxes[0];
+        assert_eq!(web.command, ["/bin/sh", "-c", "echo one, two [three]"]);
         assert_eq!(web.depends_on, ["db"]);
     }
 
