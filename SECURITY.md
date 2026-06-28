@@ -25,13 +25,22 @@ profile. You'll get an acknowledgement and a coordinated-disclosure timeline.
   only on AMD/Intel via the `dmem` cgroup controller. Do not treat the GPU cap as a security
   boundary or a multi-tenant billing mechanism on consumer NVIDIA.
 
-## Current status (0.3 — honest)
+## Current status (0.4 — honest)
 
-What is **enforced now** by `kern box --rootfs`:
+What is **enforced now** by `kern box`:
 - user + PID + network (loopback-only) + UTS + IPC + mount namespaces;
-- `pivot_root` into the rootfs, root remounted **read-only** (mount-ordering is compile-enforced);
-- always-on **seccomp** denylist (kexec / module load-unload / ptrace / reboot / swap /
-  mount / `pivot_root` / `setns`), wrong-arch syscalls killed.
+- `pivot_root` into the rootfs (the default root is a writable overlay whose scratch is discarded
+  on exit; `--read-only` remounts the root **read-only** — and the mount ordering, read-only only
+  *after* the pivot, is compile-enforced by a typestate);
+- **least-privilege capabilities**: 13 never-needed dangerous caps (module load, raw I/O,
+  `SYS_TIME`, `SYSLOG`, `BPF`, `PERFMON`, MAC/audit admin, `SYS_BOOT`, …) are dropped from the
+  effective/permitted/inheritable **and** the bounding set just before exec, so neither the
+  workload nor a setuid/file-capability binary can wield them (they're namespaced anyway — this
+  shrinks the surface against cap-gated kernel bugs);
+- always-on **seccomp** denylist (~25 syscalls: kexec(+`_file_load`) / module load-unload /
+  ptrace + `process_vm_readv`/`writev` / reboot / swap / the classic **and** new mount API /
+  `pivot_root` / `setns` / `unshare` / `bpf` / `perf_event_open` / `userfaultfd` / `syslog`),
+  wrong-arch syscalls killed.
 
 Resource caps (memory + tasks): when a systemd **user** manager is present, `kern box` re-execs
 inside a transient `systemd-run --user --scope` with `MemoryMax`/`TasksMax`, so fork-bomb / OOM
@@ -52,6 +61,11 @@ Opt-in flags that **relax** isolation (off by default — you ask for them):
 - **`kern exec`** joins a running box's namespaces; it is restricted to the user who started the
   box (joining its user namespace requires being that namespace's owner) and the exec'd process
   is given the same seccomp filter.
+- **`-p [ip:]host:box`** publishes a box port on the host via a rootless forwarder. It **binds
+  `127.0.0.1` by default** (reachable only from the host); `-p 0.0.0.0:H:B` binds all interfaces
+  and exposes the box's service to the LAN — a deliberate, warned-about choice. The forwarder runs
+  in the host network namespace (it has to, to bind the host port); the box itself stays in its own
+  isolated network namespace.
 
 OCI pull (`kern pull` / `--image`):
 - **Integrity**: each blob is verified to hash to its `sha256:` digest (via `sha256sum`) before

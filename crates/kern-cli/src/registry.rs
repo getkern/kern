@@ -26,6 +26,8 @@ pub struct Instance {
     /// The pid's kernel start-time (`/proc/<pid>/stat` field 22, clock ticks since boot). Pins
     /// the identity of the pid so a reused pid can't masquerade as a live box.
     pub starttime: u64,
+    /// Published ports summary for `kern ps` (e.g. `8080->80, 127.0.0.1:443->443`); empty if none.
+    pub ports: String,
 }
 
 /// The instances directory (one file per running box), created on demand.
@@ -36,6 +38,35 @@ pub fn dir() -> io::Result<PathBuf> {
 /// The logs directory (one `<name>-<pid>.log` per detached box), created on demand.
 pub fn logs_dir() -> io::Result<PathBuf> {
     runtime_subdir("logs")
+}
+
+/// The health directory — a sidecar `<name>-<pid>` per box with `--health-cmd`, holding its latest
+/// status. Kept SEPARATE from `instances/` so `list()` never mistakes a status file for a box entry.
+fn health_dir() -> io::Result<PathBuf> {
+    runtime_subdir("health")
+}
+
+/// Record a box's latest health (`healthy`/`unhealthy`/`starting`); written by the health-checker.
+pub fn set_health(name: &str, pid: i32, status: &str) {
+    if let Ok(d) = health_dir() {
+        let _ = fs::write(d.join(format!("{name}-{pid}")), status);
+    }
+}
+
+/// A box's current health, or empty string if it has no health check.
+pub fn health_of(name: &str, pid: i32) -> String {
+    health_dir()
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join(format!("{name}-{pid}"))).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Remove a box's health sidecar (on stop / de-register).
+pub fn clear_health(name: &str, pid: i32) {
+    if let Ok(d) = health_dir() {
+        let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
+    }
 }
 
 /// Create and return `<runtime>/kern/<leaf>`, with graceful fallbacks.
@@ -125,7 +156,7 @@ pub fn now_unix() -> u64 {
 pub fn register(inst: &Instance) -> io::Result<PathBuf> {
     let path = dir()?.join(format!("{}-{}", inst.name, inst.pid));
     let body = format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -133,6 +164,7 @@ pub fn register(inst: &Instance) -> io::Result<PathBuf> {
         one_line(&inst.command),
         inst.started,
         inst.starttime,
+        one_line(&inst.ports),
     );
     fs::write(&path, body)?;
     Ok(path)
@@ -225,7 +257,7 @@ fn one_line(s: &str) -> String {
 
 fn parse(body: &str) -> Option<Instance> {
     let (mut name, mut pid) = (None, None);
-    let (mut rootfs, mut command) = (String::new(), String::new());
+    let (mut rootfs, mut command, mut ports) = (String::new(), String::new(), String::new());
     let (mut pid1, mut started, mut starttime) = (0i32, 0u64, 0u64);
     for line in body.lines() {
         let (k, v) = line.split_once('=')?;
@@ -237,6 +269,7 @@ fn parse(body: &str) -> Option<Instance> {
             "command" => command = v.to_string(),
             "started" => started = v.parse().unwrap_or(0),
             "starttime" => starttime = v.parse().unwrap_or(0),
+            "ports" => ports = v.to_string(),
             _ => {}
         }
     }
@@ -248,5 +281,6 @@ fn parse(body: &str) -> Option<Instance> {
         command,
         started,
         starttime,
+        ports,
     })
 }

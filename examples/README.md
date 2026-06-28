@@ -15,6 +15,8 @@ namespaces (no root, no daemon) and pull from Docker Hub via `curl` + `tar`.
 | [throwaway-shell.sh](throwaway-shell.sh) | An ephemeral writable shell — changes vanish on exit, image stays clean |
 | [untrusted-code.sh](untrusted-code.sh) | Run code you don't trust: read-only root + seccomp + no network + caps |
 | [services-and-ps.sh](services-and-ps.sh) | Detached boxes, `kern ps`, `kern stop` — lifecycle without a daemon |
+| [serve-with-port.sh](serve-with-port.sh) | Publish a box port to the host (`-p`), keep it up + health-checked (`--restart` / `--health-cmd`) |
+| [governed-run.sh](governed-run.sh) | Govern CPU + memory — `kern run` (no sandbox) and `--memory`/`--cpus` caps (OOM-enforced) |
 | [mounts-and-exec.sh](mounts-and-exec.sh) | Data in/out with `-v` (+ `--env`/`--workdir`), and `kern exec` into a running box |
 | [with-network.sh](with-network.sh) | Isolated by default; `--net` for outbound (DNS + fetch/install) |
 | [observe.sh](observe.sh) | Daemonless observability: `kern logs` / `stats` / `top` |
