@@ -1,0 +1,31 @@
+# Minimal GitHub Actions workflow: run your build/test inside a kern box on CI.
+#
+# kern is daemonless and rootless, so there is nothing to set up on the runner beyond the single
+# install line — no Docker socket, no privileged service container. The build runs in an isolated
+# sandbox (repo bound read-only, memory-capped), and the box's exit code fails the job on error.
+#
+# Copy this to .github/workflows/ci.yml. `examples/ci-integration.sh` runs the SAME steps locally
+# so you can reproduce a CI failure on your laptop.
+name: kern-ci
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # One line, no daemon. Installs to ~/.local/bin on the (non-root) runner user.
+      - name: Install kern
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Build + test in a sandbox: repo mounted read-only, capped to 512 MiB, no host access.
+      # A non-zero exit from the workload propagates out as kern's exit code and fails the job.
+      - name: Build and test in a kern box
+        run: |
+          kern box ci --image alpine --read-only \
+            -v "$PWD:/src:ro" -w /src -m 512m -- \
+            sh -c 'sh ci/build.sh'

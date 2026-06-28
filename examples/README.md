@@ -111,6 +111,53 @@ shows the boundaries holding.
 | [edge-many-services.sh](edge-many-services.sh) | Many isolated services on a small board — few-MB footprint vs a ~186 MB daemon |
 | [device-isolation.sh](device-isolation.sh) | Give a box exactly one hardware device (i2c / serial / spi) and nothing else |
 
+### Per-language dev & build boxes (your host stays clean)
+
+| Example | What it shows |
+|---|---|
+| [node-app.sh](node-app.sh) | Run a Node.js service with no node/npm on the host: `npm install` a dep with `--net`, then serve it network-isolated with `-p` |
+| [go-static-build.sh](go-static-build.sh) | Build a static Go binary (`CGO_ENABLED=0`) in a `golang` box, then run the extracted artifact in a bare `alpine` box that has no Go |
+| [python-data.sh](python-data.sh) | A Python data task with no python/pip on the host: `pip install` in the one `--net` step, then process a bound-in CSV network-off, output to `-v` |
+| [rust-build.sh](rust-build.sh) | Compile Rust in a `--memory`/`--cpus`-capped `rust` box (governed build), run the extracted binary in a separate minimal box |
+
+### Services & stacks
+
+| Example | What it shows |
+|---|---|
+| [database-box.sh](database-box.sh) | A stateful `redis` service that outlives its box: detached on a named volume + published port; write a key, discard the box, restart on the same volume, read it back |
+| [reverse-proxy-pod.sh](reverse-proxy-pod.sh) | An `nginx` box in front of an app box in one `--pod` (shared loopback, peer-by-name); only nginx's port is published, a host request reaches the app through the proxy |
+| [scheduled-job.sh](scheduled-job.sh) | Daemonless cron-like pattern: a loop starting a fresh, capped, self-removing box each interval — honest that kern has no built-in scheduler (pair with host cron) |
+| [compose-webstack.sh](compose-webstack.sh) + [compose-webstack.toml](compose-webstack.toml) | A richer `kern compose` stack: a cache with a `--health-cmd` and a web front-end gated on `depends_healthy`, brought up in health order and torn down |
+
+### AI / agent sandboxing (run model-generated code safely)
+
+Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fresh box — sandbox events (timeout / OOM-kill / blocked escape) come back as **data**, not exceptions, so an agent loop can read and react to them.
+
+| Example | What it shows |
+|---|---|
+| [agent-tool-runner.py](agent-tool-runner.py) | The canonical "code execution tool" an LLM calls: run model-generated Python in a network-off box, return `{success, stdout, fault}` — a runaway loop returns a `timeout` fault, an exfiltration attempt gets no route out |
+| [code-interpreter.py](code-interpreter.py) | A stateful notebook-style session where **file** state persists turn to turn (write CSV → aggregate → format), a dep installed once via `setup=` |
+| [per-request-workers.py](per-request-workers.py) | A stdlib-only pool mapping N requests to N fresh throwaway boxes, so one request's timeout/crash is contained to its own box |
+| [sandboxed-eval.sh](sandboxed-eval.sh) | The shell angle for agents that shell out: eval an untrusted snippet `--ro --network none` + capped, using the exit code as the signal (benign / blocked / timeout-killed) |
+
+### Data, batch & scraping
+
+| Example | What it shows |
+|---|---|
+| [batch-process.sh](batch-process.sh) | Per-file fan-out: each input file processed in its own capped box; one fails on purpose and the batch keeps going; results collected via `-v`, input `:ro` |
+| [scrape-in-a-box.sh](scrape-in-a-box.sh) | A network-on but otherwise-locked fetch: `--net` is the sole relaxation; root/PID/mount isolation + caps stay; output to a mounted dir |
+| [etl-with-deps.sh](etl-with-deps.sh) | Deps installed once online (a `kern build` `RUN` step) into an image snapshot, then the transform runs that image **network-off** over `:ro` data |
+| [parallel-fanout-limited.sh](parallel-fanout-limited.sh) | Bounded-concurrency fan-out: a POSIX sliding window caps in-flight boxes at N so a big batch never spawns them all at once |
+
+### CI & dev-workflow integration
+
+| Example | What it shows |
+|---|---|
+| [dependency-audit.sh](dependency-audit.sh) | Vet an untrusted npm/pip package: fetch with scripts disabled, then run its lifecycle scripts in a **network-cut** box so install-time code can't read host secrets or exfiltrate |
+| [git-precommit-sandbox.sh](git-precommit-sandbox.sh) | A git pre-commit hook that runs your linters/tests in a read-only, network-less box; the box's exit code gates the commit |
+| [github-actions.yml](github-actions.yml) + [ci-integration.sh](ci-integration.sh) | A minimal GitHub Actions job that installs kern and builds/tests in a capped `kern box` — plus a local script that reproduces the same CI run without pushing |
+| [Makefile.kern](Makefile.kern) + [makefile-kern-demo.sh](makefile-kern-demo.sh) | Hermetic `make lint/test/build` where each target runs in a `kern box` — a machine with only kern (no toolchain) can build and test |
+
 ### Side-by-side with other tools
 
 | Example | What it shows |
