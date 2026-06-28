@@ -7,7 +7,7 @@ mod pull;
 mod push;
 mod search;
 pub use archive::{load, save, Loaded};
-pub use pull::{pull, ImageConfig, OciError, Platform};
+pub use pull::{pull, valid_reference, ImageConfig, OciError, Platform};
 pub use push::{push, ImageConfigOut};
 pub use search::{search, SearchResult};
 

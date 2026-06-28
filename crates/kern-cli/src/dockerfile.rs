@@ -28,12 +28,13 @@ pub enum Instr {
         as_name: Option<String>,
     },
     Run(Vec<String>),
-    /// `COPY [--from=<stage>] <srcs...> <dst>`. `from` is `Some(stage-name-or-index)` only for a
-    /// multi-stage `COPY --from`; a normal `COPY` from the build context leaves it `None`.
+    /// `COPY [--from=<stage|image>] <srcs...> <dst>`. `from` is `Some(_)` for a `COPY --from`; a normal
+    /// `COPY` from the build context leaves it `None`. The [`CopyFrom`] variant records whether the
+    /// source is an earlier build STAGE or an external IMAGE, so the executor takes the right path.
     Copy {
         srcs: Vec<String>,
         dst: String,
-        from: Option<String>,
+        from: Option<CopyFrom>,
     },
     Env(String, String),
     Workdir(String),
@@ -41,6 +42,21 @@ pub enum Instr {
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
     Expose(String),
+}
+
+/// The source of a `COPY --from=<X>`. `X` is resolved at parse time: it names an earlier build
+/// [`Stage`](CopyFrom::Stage) if it matches one (by name or numeric index), otherwise — if it's a
+/// syntactically valid OCI reference — it's an external [`Image`](CopyFrom::Image) to pull and copy
+/// out of. A stage ALWAYS wins over an image of the same spelling (Docker's rule); anything that is
+/// neither is rejected. The distinction is preserved at the type level so the executor never has to
+/// re-guess which path to take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyFrom {
+    /// An earlier build stage, kept as the raw `--from=<name-or-index>` token (resolved to an index by
+    /// [`resolve_from`] on the executor side, exactly as the parser validated it).
+    Stage(String),
+    /// An external image reference (`busybox`, `nginx:alpine`, `ghcr.io/org/img:1.2`, …) to pull.
+    Image(String),
 }
 
 /// Lint a parsed instruction list for common Dockerfile smells, returning a human-readable warning per
@@ -238,23 +254,34 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             }
             "COPY" | "ADD" => {
                 let mut toks = split_ws(&subst(rest, &vars));
-                // `COPY --from=<stage>` (multi-stage) is the ONLY build flag we accept; capture and drop
-                // it. Any other `--flag` (or `--from` on `ADD`) is still rejected rather than ignored.
-                let mut from: Option<String> = None;
+                // `COPY --from=<stage|image>` (multi-stage / external image) is the ONLY build flag we
+                // accept; capture and drop it. Any other `--flag` (or `--from` on `ADD`) is still
+                // rejected rather than ignored.
+                let mut from: Option<CopyFrom> = None;
                 if let Some(pos) = toks.iter().position(|t| t.starts_with("--")) {
                     let flag = toks[pos].clone();
                     if kw == "COPY" && flag.starts_with("--from=") {
-                        let stage = flag["--from=".len()..].to_string();
-                        // Validate against EARLIER stages only: `upto` = index of the CURRENT stage (the
-                        // last FROM pushed), which excludes it → self-reference and forward-reference both
-                        // rejected for free. A numeric `--from=N` must index an already-built stage.
+                        let x = flag["--from=".len()..].to_string();
+                        // Resolve `--from=<X>` at parse time. A build STAGE wins over an image of the same
+                        // spelling (Docker's rule), so check stages FIRST: `upto` = index of the CURRENT
+                        // stage (the last FROM pushed), which excludes it → self- and forward-references
+                        // are rejected for free; a numeric `--from=N` must index an already-built stage.
+                        // Otherwise, if `X` is a valid OCI reference, it's an external image to pull;
+                        // anything that is neither an earlier stage nor a valid ref is an error.
                         let cur = stage_names.len().saturating_sub(1);
-                        if resolve_from(&stage, &stage_names, cur).is_none() {
+                        from = Some(if resolve_from(&x, &stage_names, cur).is_some() {
+                            CopyFrom::Stage(x)
+                        } else if x.parse::<usize>().is_ok() || !kern_oci::valid_reference(&x) {
+                            // A bare NUMBER is always a stage INDEX (never an external image), so an
+                            // out-of-range index is an error — as is anything that's neither a known
+                            // stage nor a syntactically valid image reference.
                             return err(
-                                "COPY --from must reference an earlier build stage (by name or index)",
+                                "COPY --from must reference an earlier build stage (by name or index) \
+                                 or a valid image reference (e.g. --from=busybox)",
                             );
-                        }
-                        from = Some(stage);
+                        } else {
+                            CopyFrom::Image(x)
+                        });
                         toks.remove(pos);
                     } else if flag.starts_with("--from") {
                         return err("--from is only supported on COPY (multi-stage)");
@@ -688,7 +715,7 @@ mod tests {
             Instr::Copy {
                 srcs: vec!["a.txt".into(), "b.txt".into()],
                 dst: "/dst/".into(),
-                from: None
+                from: None,
             }
         );
     }
@@ -734,8 +761,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_and_malformed() {
-        // `COPY --from=<unknown>` (no such earlier stage) is rejected — but `FROM … AS` itself now parses.
-        assert!(parse("FROM a\nCOPY --from=nope /a /b\n", &ba())
+        // `COPY --from=<garbage>` (neither an earlier stage nor a valid image ref) is rejected — an
+        // uppercase repo is not a legal OCI reference. (A bare lowercase `nope` IS a valid ref now, so
+        // it's accepted as an external image — see `copy_from_external_image_ref`.)
+        assert!(parse("FROM a\nCOPY --from=NOPE /a /b\n", &ba())
             .unwrap_err()
             .contains("earlier build stage"));
         // SHELL/ONBUILD/STOPSIGNAL are still genuinely unsupported → clear error.
@@ -802,7 +831,7 @@ mod tests {
             Instr::Copy {
                 srcs: vec!["/app".into()],
                 dst: "/app".into(),
-                from: Some("build".into())
+                from: Some(CopyFrom::Stage("build".into())),
             }
         );
     }
@@ -812,24 +841,28 @@ mod tests {
         // Numeric --from=0 references the first stage; a $BASE in FROM still substitutes before AS-split.
         let df = "FROM alpine AS base\nFROM alpine\nCOPY --from=0 /a /a\nCOPY --from=base /b /b\n";
         let got = parse(df, &ba()).unwrap();
-        assert!(matches!(&got[2], Instr::Copy { from: Some(f), .. } if f == "0"));
-        assert!(matches!(&got[3], Instr::Copy { from: Some(f), .. } if f == "base"));
+        assert!(matches!(&got[2], Instr::Copy { from: Some(CopyFrom::Stage(f)), .. } if f == "0"));
+        assert!(
+            matches!(&got[3], Instr::Copy { from: Some(CopyFrom::Stage(f)), .. } if f == "base")
+        );
     }
 
     #[test]
     fn multi_stage_reference_rules() {
-        // forward-ref (a stage defined LATER) → rejected.
+        // forward-ref (a stage defined LATER) → not an earlier stage. With a name that ISN'T a valid
+        // image ref (uppercase), it's rejected rather than silently treated as an image.
         assert!(parse(
-            "FROM alpine\nCOPY --from=later /a /a\nFROM alpine AS later\n",
+            "FROM alpine\nCOPY --from=Later /a /a\nFROM alpine AS later\n",
             &ba()
         )
         .unwrap_err()
         .contains("earlier build stage"));
-        // self-ref (the current stage's own name) → rejected (upto excludes the current stage).
-        assert!(parse("FROM alpine AS me\nCOPY --from=me /a /a\n", &ba())
+        // self-ref (the current stage's own name, upper-cased so it's not a valid ref) → rejected
+        // (upto excludes the current stage, and `Me` is not a legal image reference).
+        assert!(parse("FROM alpine AS me\nCOPY --from=Me /a /a\n", &ba())
             .unwrap_err()
             .contains("earlier build stage"));
-        // numeric out-of-range → rejected.
+        // numeric out-of-range → rejected (a bare number is a stage index, never an external image).
         assert!(parse("FROM alpine\nCOPY --from=5 /a /a\n", &ba())
             .unwrap_err()
             .contains("earlier build stage"));
@@ -841,6 +874,51 @@ mod tests {
         assert!(parse("FROM a AS s\nFROM a\nADD --from=s /x /y\n", &ba())
             .unwrap_err()
             .contains("--from is only supported on COPY"));
+    }
+
+    #[test]
+    fn copy_from_external_image_ref() {
+        // A `--from=<image>` that names no earlier stage but IS a valid OCI reference is accepted as an
+        // external image to pull (BuildKit's `COPY --from=nginx:alpine …`).
+        let df = "FROM alpine\nCOPY --from=busybox /bin/busybox /bb\n";
+        let got = parse(df, &ba()).unwrap();
+        assert_eq!(
+            got[1],
+            Instr::Copy {
+                srcs: vec!["/bin/busybox".into()],
+                dst: "/bb".into(),
+                from: Some(CopyFrom::Image("busybox".into())),
+            }
+        );
+        // A tagged/registry-qualified ref is fine too.
+        assert!(matches!(
+            &parse("FROM alpine\nCOPY --from=nginx:alpine /etc/nginx/nginx.conf /\n", &ba()).unwrap()[1],
+            Instr::Copy { from: Some(CopyFrom::Image(i)), .. } if i == "nginx:alpine"
+        ));
+        assert!(matches!(
+            &parse("FROM alpine\nCOPY --from=ghcr.io/org/img:1.2 /a /a\n", &ba()).unwrap()[1],
+            Instr::Copy { from: Some(CopyFrom::Image(i)), .. } if i == "ghcr.io/org/img:1.2"
+        ));
+        // Garbage (an uppercase repo isn't a legal ref, nor an earlier stage) is still rejected.
+        assert!(parse("FROM alpine\nCOPY --from=Bad_Ref /a /b\n", &ba())
+            .unwrap_err()
+            .contains("earlier build stage"));
+    }
+
+    #[test]
+    fn copy_from_stage_wins_over_same_named_image() {
+        // `busybox` is both a real image AND an earlier stage name here → the STAGE must win (Docker's
+        // rule), so `--from=busybox` resolves to the Stage, not an external Image pull.
+        let df = "FROM alpine AS busybox\nRUN true\nFROM alpine\nCOPY --from=busybox /a /a\n";
+        let got = parse(df, &ba()).unwrap();
+        assert_eq!(
+            got[3],
+            Instr::Copy {
+                srcs: vec!["/a".into()],
+                dst: "/a".into(),
+                from: Some(CopyFrom::Stage("busybox".into())),
+            }
+        );
     }
 
     #[test]
