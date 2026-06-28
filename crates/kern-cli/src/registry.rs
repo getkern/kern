@@ -758,6 +758,17 @@ fn parse(body: &str) -> Option<Instance> {
 mod tests {
     use super::*;
 
+    // Registry-mutating tests all share ONE process-wide instances dir AND one pid
+    // (`std::process::id()`), so a pid-keyed `find_ref` in one test can observe a box another test
+    // registered under the same pid. Serialize them through this lock so each runs without a
+    // concurrent same-pid registration racing it. (No dir wipe: a stale entry from a prior run is
+    // inert — its pid belongs to a now-dead process, so `is_alive` skips it — and a developer's real
+    // running boxes have different pids and are never touched.)
+    static REG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn reg_guard() -> std::sync::MutexGuard<'static, ()> {
+        REG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn well_formed_entry_accepts_our_files_rejects_junk() {
         use std::ffi::OsStr;
@@ -800,6 +811,7 @@ mod tests {
 
     #[test]
     fn claim_name_excludes_second_starter_and_releases_on_drop() {
+        let _g = reg_guard();
         let name = format!("clm-{}", std::process::id());
         let c1 = claim_name(&name).unwrap();
         assert!(c1.is_some(), "first claim must win");
@@ -813,6 +825,7 @@ mod tests {
 
     #[test]
     fn find_ref_resolves_name_then_pid_name_wins() {
+        let _g = reg_guard();
         let pid = std::process::id() as i32; // THIS process is alive → is_alive true
         let mk = |name: &str, p: i32| {
             register(&Instance {
@@ -831,12 +844,13 @@ mod tests {
         };
         let uniq = format!("fr-{pid}");
         let p1 = mk(&uniq, pid);
-        // by NAME and by PID both resolve the same box.
+        // by NAME: resolves to exactly our box (unique name — deterministic).
         assert_eq!(find_ref(&uniq).map(|i| i.name), Some(uniq.clone()));
-        assert_eq!(
-            find_ref(&pid.to_string()).map(|i| i.name),
-            Some(uniq.clone())
-        );
+        // by PID: a numeric ref resolves via the pid branch to a LIVE box with this pid. Under the
+        // test harness every test shares THIS process's pid, so a concurrent test's box may be the one
+        // returned — assert the resolved box carries the queried pid, not that it's our exact name.
+        // (The name-resolution and name-wins properties below use unique names and stay exact.)
+        assert_eq!(find_ref(&pid.to_string()).map(|i| i.pid), Some(pid));
         // an unknown name and a non-existent pid both miss.
         assert!(find_ref("no-such-box-xyz").is_none());
         assert!(find_ref("2147483647").is_none()); // i32::MAX — no such pid
@@ -851,6 +865,7 @@ mod tests {
 
     #[test]
     fn claim_name_refuses_a_live_registered_box() {
+        let _g = reg_guard();
         // The registry re-check lives INSIDE claim_name (under its lock): a box that registered and
         // released its claim must still make a fresh claim fail — for EVERY caller, by construction.
         let name = format!("clm-reg-{}", std::process::id());
@@ -875,6 +890,7 @@ mod tests {
 
     #[test]
     fn claim_name_takes_over_stale_and_malformed_claims() {
+        let _g = reg_guard();
         // A claimant pid that can't exist (> kernel pid_max) → dead → stale → taken over.
         let name = format!("clm-stale-{}", std::process::id());
         let d = claims_dir().unwrap();
@@ -888,6 +904,7 @@ mod tests {
 
     #[test]
     fn claim_name_one_winner_under_contention() {
+        let _g = reg_guard();
         // The E5 race: N concurrent starts of the SAME name — exactly one may win. Threads each
         // open their own lock fd (flock is per-open-file-description, so they do exclude each other).
         let name = format!("clm-race-{}", std::process::id());
@@ -906,6 +923,7 @@ mod tests {
 
     #[test]
     fn parse_reads_volumes_and_tolerates_older_entries() {
+        let _g = reg_guard();
         // A full entry round-trips the volumes and pod fields.
         let full = "name=web\npid=42\npid1=7\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nports=\nvolumes=data,cache\npod=myapp\n";
         let i = parse(full).unwrap();
