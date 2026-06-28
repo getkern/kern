@@ -2414,6 +2414,54 @@ unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
     }
 }
 
+/// Tear a box down for `kern stop`: SIGKILL its **PID-namespace init** (`pid1`) directly, then sweep
+/// the supervisor's process group. Returns whether the box was **confirmed** gone.
+///
+/// The kernel destroys the *entire* pid namespace the instant its PID 1 dies, so no workload — not
+/// even a `while True: pass` that ignores SIGTERM — can survive, and `setsid` can't dodge it (it moves
+/// the session/process group, not the pid namespace). Signalling `pid1` is also what makes this reach
+/// a **foreground** box: its init is not in the caller's process group, so the historical `kill(-pid)`
+/// alone missed it (there's no group whose id is a non-leader supervisor's pid → a harmless ESRCH).
+/// We keep the group sweep too: for a **detached** box (supervisor `setsid`-ed, pgid == pid) it reaps
+/// the supervisor and any stray helpers exactly as before, and it's the only reachable target for an
+/// old registry entry that never recorded `pid1`.
+///
+/// The pidfd is taken while the box is still alive, so both the signal and the exit-confirmation are
+/// reuse-proof: a `pidfd` polls readable precisely when its process terminates (even before it's
+/// reaped), which side-steps the zombie window a bare `kill(pid, 0)` probe would trip on.
+fn kill_box(pid: i32, pid1: i32) -> bool {
+    let pidfd = if pid1 > 0 {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
+        unsafe { signal_box(fd, pid1, libc::SIGKILL) };
+        fd
+    } else {
+        -1
+    };
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if pidfd >= 0 {
+        // Wait (bounded) for the init to actually exit — POLLIN fires on termination.
+        let mut pfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 1000) };
+        unsafe { libc::close(pidfd) };
+        ready > 0
+    } else {
+        // No pidfd (pid1 unrecorded, or a kernel < 5.3): best-effort probe on the recorded pids. The
+        // signal still went out via `signal_box`/the group sweep; we just can't confirm as precisely.
+        let probe = if pid1 > 0 { pid1 } else { pid };
+        for _ in 0..100 {
+            if unsafe { libc::kill(probe, 0) } != 0 {
+                return true; // ESRCH — the target is gone
+            }
+            unsafe { libc::usleep(10_000) };
+        }
+        false
+    }
+}
+
 /// Hand the box's PID 1 to a foreground `--timeout` watchdog over its pipe (from `on_started`, in the
 /// host-ns parent). No-op when no timeout is armed.
 fn feed_timeout_pid(wd: Option<(i32, i32)>, pid1: i32) {
@@ -7181,14 +7229,27 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     for b in &targets {
         // A persistent box: tell systemd to stop AND disable the unit (so it neither restarts now
         // nor comes back at reboot), then remove it. Killing the process instead would just trip
-        // systemd's `Restart=always`. Otherwise: the supervisor `setsid`-ed, so its pgid == its pid.
-        if !stop_managed_unit(&b.name) {
-            unsafe { libc::kill(-b.pid, libc::SIGKILL) };
-        }
+        // systemd's `Restart=always`. Otherwise kill the box's PID-namespace init directly — see
+        // `kill_box`; a bare `kill(-pid)` reaches only a detached, `setsid`-ed supervisor's group,
+        // never a foreground box whose init isn't in that group.
+        let killed = if stop_managed_unit(&b.name) {
+            true // systemd owns the lifecycle and has torn the unit down
+        } else {
+            kill_box(b.pid, b.pid1)
+        };
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
         registry::clear_health(&b.name, b.pid); // a kill/SIGTERM skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
-        println!("stopped '{}' (pid {})", b.name, b.pid);
+        if killed {
+            println!("stopped '{}' (pid {})", b.name, b.pid);
+        } else {
+            // Don't report success while alive: the SIGKILL went out but the box wasn't confirmed
+            // gone within the grace window. Surface it honestly instead of printing `stopped`.
+            eprintln!(
+                "kern: sent SIGKILL to '{}' (pid {}) but it did not exit in time",
+                b.name, b.pid
+            );
+        }
     }
     for n in &managed_only {
         stop_managed_unit(n);
@@ -9399,5 +9460,55 @@ mod image_rm_tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kill_box_reaps_a_foreground_sigterm_ignoring_init() {
+        // Reproduces the reported bug: a FOREGROUND box's init is NOT a process-group leader, so the
+        // historical `kill(-pid)` misses it, and a workload that ignores SIGTERM never dies. `kill_box`
+        // must reach it by signalling `pid1` directly (SIGKILL, unignorable) and CONFIRM the exit.
+        // Skip gracefully where pidfd_open is unavailable (kernel < 5.3); target boards are 5.15+.
+        let self_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id() as i32, 0) };
+        if self_fd < 0 {
+            eprintln!("skip: pidfd_open unsupported on this kernel");
+            return;
+        }
+        unsafe { libc::close(self_fd as i32) };
+
+        // Fork a child that ignores SIGTERM and does NOT `setsid` (it stays in our process group, like
+        // a foreground box's init), then busy-loops. Only async-signal-safe calls before it spins.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+            loop {
+                std::hint::spin_loop();
+            }
+        }
+
+        unsafe { libc::usleep(50_000) }; // let it install the handler and start spinning
+        assert_eq!(unsafe { libc::kill(child, 0) }, 0, "child should be running");
+        // The OLD mechanism alone can't touch it: it's not a group leader, so no group has id `child`
+        // — `kill(-child, SIGTERM)` is a harmless ESRCH, and SIGTERM is ignored regardless.
+        unsafe { libc::kill(-child, libc::SIGTERM) };
+        unsafe { libc::usleep(50_000) };
+        assert_eq!(
+            unsafe { libc::kill(child, 0) },
+            0,
+            "the process-group SIGTERM must NOT reach a foreground, SIGTERM-ignoring init"
+        );
+
+        // The fix: `kill_box` signals pid1 directly and confirms the exit before returning.
+        assert!(
+            kill_box(child, child),
+            "kill_box must confirm the foreground box is gone"
+        );
+        // Reap the zombie (kill_box confirms via the pidfd BEFORE the process is reaped).
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        assert_ne!(
+            unsafe { libc::kill(child, 0) },
+            0,
+            "child must be dead after kill_box"
+        );
     }
 }
