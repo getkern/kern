@@ -336,6 +336,127 @@ pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciErro
     Ok((registry, repo, reference))
 }
 
+/// Is `image` a syntactically valid OCI image reference (`[registry[:port]/]name[:tag][@digest]`)?
+///
+/// Used to tell a `COPY --from=<image>` apart from an unresolved build-stage name (or plain garbage):
+/// the parser first checks for an earlier stage, and only falls back to "is this a real image ref?".
+/// This mirrors the distribution-spec grammar closely enough to ACCEPT the everyday forms — `busybox`,
+/// `nginx:alpine`, `ghcr.io/org/img:1.2`, `registry:5000/img@sha256:<hex>` — while REJECTING an
+/// uppercase repo, a `..`/absolute path, whitespace, a stray `--flag`, or an empty string. It is pure
+/// (no I/O), so it stays usable from the pure Dockerfile parser. Deliberately syntactic only — a
+/// well-formed ref that doesn't exist still fails later, at pull time, with the registry's own error.
+pub fn valid_reference(image: &str) -> bool {
+    if image.is_empty() || image.len() > 255 {
+        return false;
+    }
+    // Peel an optional `@<algo>:<hex>` digest off the end.
+    let name_tag = match image.split_once('@') {
+        Some((n, digest)) => {
+            let Some((algo, hex)) = digest.split_once(':') else {
+                return false;
+            };
+            if algo.is_empty()
+                || hex.len() < 32
+                || !algo.bytes().all(|b| b.is_ascii_alphanumeric())
+                || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return false;
+            }
+            n
+        }
+        None => image,
+    };
+    // Split off an optional leading registry host: the first `/`-segment is a registry only if it looks
+    // like a host (has a `.`/`:`, or is `localhost`) — matching `parse_ref`'s rule, so the two agree.
+    let (registry, rest) = match name_tag.split_once('/') {
+        Some((host, r)) if host.contains('.') || host.contains(':') || host == "localhost" => {
+            (Some(host), r)
+        }
+        _ => (None, name_tag),
+    };
+    if let Some(host) = registry {
+        if !valid_registry(host) {
+            return false;
+        }
+    }
+    // `rest` = `path[:tag]`. A `:` (host:port already peeled) after the last `/` introduces the tag.
+    let (path, tag) = match rest.rsplit_once(':') {
+        Some((p, t)) if !t.contains('/') => (p, Some(t)),
+        _ => (rest, None),
+    };
+    if let Some(t) = tag {
+        if !valid_tag(t) {
+            return false;
+        }
+    }
+    valid_repo_path(path)
+}
+
+/// A registry host: dot-separated labels (`[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?`) with an optional
+/// `:<port>`. Accepts `localhost`, `ghcr.io`, `registry-1.docker.io`, `host:5000`.
+fn valid_registry(host: &str) -> bool {
+    let (h, port) = match host.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (host, None),
+    };
+    if let Some(p) = port {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    if h.is_empty() {
+        return false;
+    }
+    h.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && label.as_bytes()[0] != b'-'
+            && *label.as_bytes().last().unwrap() != b'-'
+    })
+}
+
+/// An image tag: `[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`.
+fn valid_tag(tag: &str) -> bool {
+    let b = tag.as_bytes();
+    if b.is_empty() || b.len() > 128 {
+        return false;
+    }
+    let head_ok = b[0].is_ascii_alphanumeric() || b[0] == b'_';
+    head_ok
+        && b.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-')
+}
+
+/// A repository path: one or more `/`-separated components, each a lowercase `[a-z0-9]` run with
+/// interior `.`/`_`/`-` separators (no leading/trailing separator, no `..`). Rejects uppercase (OCI
+/// repos are lowercase), a leading `/`, an empty component, and any `..` traversal.
+fn valid_repo_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    path.split('/').all(valid_path_component)
+}
+
+/// One repository-path component: `[a-z0-9]+((\.|_|-)+[a-z0-9]+)*` — starts and ends alphanumeric
+/// (lowercase), only `.`/`_`/`-` in between, and never a `..`.
+fn valid_path_component(c: &str) -> bool {
+    let b = c.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let is_alnum = |x: u8| x.is_ascii_lowercase() || x.is_ascii_digit();
+    if !is_alnum(b[0]) || !is_alnum(b[b.len() - 1]) {
+        return false;
+    }
+    if c.contains("..") {
+        return false;
+    }
+    b.iter()
+        .all(|&x| is_alnum(x) || x == b'.' || x == b'_' || x == b'-')
+}
+
 /// Explain a manifest that yielded no layers. A registry error body (`UNAUTHORIZED`/`denied`) or an
 /// empty body (a bare `401`) almost always means a **private repo you're not logged into**, so point
 /// at `kern login` rather than the opaque "no layers"; otherwise the tag is malformed or absent.
@@ -2019,6 +2140,42 @@ mod tests {
             parse_ref("ghcr.io/org/app:v1").unwrap(),
             ("ghcr.io".into(), "org/app".into(), "v1".into())
         );
+    }
+
+    #[test]
+    fn valid_reference_accepts_real_refs_rejects_garbage() {
+        // Everyday forms an external `COPY --from=<image>` uses must be accepted.
+        for ok in [
+            "busybox",
+            "nginx:alpine",
+            "alpine:3.19",
+            "library/alpine",
+            "user/repo:tag",
+            "ghcr.io/org/app:v1",
+            "registry-1.docker.io/library/alpine:latest",
+            "localhost:5000/img",
+            "host:5000/img@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "my-app.v2/sub_dir:1.2.3",
+        ] {
+            assert!(valid_reference(ok), "should accept '{ok}'");
+        }
+        // Garbage / unresolved stage-looking junk must be rejected.
+        for bad in [
+            "",
+            "CAP",            // uppercase repo (OCI repos are lowercase)
+            "Bad_Name",       // uppercase
+            "..",             // traversal
+            "../evil",        // traversal (registry label empty)
+            "/etc/passwd",    // absolute path → empty first component
+            "-leadingdash",   // component can't start with '-'
+            "trailingdash-",  // …or end with one
+            "has space",      // whitespace
+            "img@sha256:xyz", // digest hex too short / non-hex
+            "img@notadigest", // digest without algo:hex
+            "repo:BAD/tag",   // tag-looking part actually a path with uppercase
+        ] {
+            assert!(!valid_reference(bad), "should reject '{bad}'");
+        }
     }
 
     #[test]

@@ -6060,10 +6060,12 @@ struct StagePrep {
     stage_uses_context: bool,
 }
 
-/// Rewrite a stage's instruction slice, turning every `COPY --from=<stage>` into a plain COPY whose
-/// source is the referenced stage's materialized rootfs (pulled into `subctx` through the same confine
-/// guards as a context COPY). Each distinct source stage is materialized+squashed AT MOST ONCE (perf),
-/// and those temp squashes are cleaned up before returning — so the caller sees a straight `?`.
+/// Rewrite a stage's instruction slice, turning every `COPY --from=<stage|image>` into a plain COPY
+/// whose source is the referenced stage's built rootfs — OR, for an external `--from=<image>`, the
+/// image's pulled rootfs (`resolve_image`, the same path `FROM`/`--image` use). Files are grafted into
+/// `subctx` through the SAME confine guards as a context COPY (`copy_from_stage_chain`), so an external
+/// image's `srcs` can't `..`/symlink-escape its rootfs any more than a stage's can. Each distinct
+/// source stage/image is resolved AT MOST ONCE (perf) so the caller sees a straight `?`.
 fn prepare_stage(
     slice: &[crate::dockerfile::Instr],
     stage_tags: &[String],
@@ -6071,7 +6073,7 @@ fn prepare_stage(
     si: usize,
     subctx: &std::path::Path,
 ) -> Result<StagePrep, Error> {
-    use crate::dockerfile::{resolve_from, Instr};
+    use crate::dockerfile::{resolve_from, CopyFrom, Instr};
     let mut stage_instrs: Vec<Instr> = Vec::with_capacity(slice.len());
     let mut stage_uses_context = false;
     let mut pulled_from_stage = false;
@@ -6080,31 +6082,60 @@ fn prepare_stage(
     // inside copy_from_stage_chain. Caching the chain dedups N `COPY --from=X`.
     let mut chains: std::collections::HashMap<usize, Vec<String>> =
         std::collections::HashMap::new();
+    // Same idea for external `COPY --from=<image>`: pull+resolve each distinct image AT MOST ONCE.
+    let mut image_chains: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let mut build = || -> Result<(), Error> {
         for ins in slice {
             match ins {
                 Instr::Copy {
                     srcs,
                     dst,
-                    from: Some(fref),
+                    from: Some(cf),
                 } => {
-                    let src_idx = resolve_from(fref, stage_names, si).ok_or_else(|| {
-                        Error::Build(format!(
-                            "COPY --from='{fref}' does not name an earlier stage"
-                        ))
-                    })?;
-                    if let std::collections::hash_map::Entry::Vacant(slot) = chains.entry(src_idx) {
-                        // The chain is `top:...:base`; split into a top-first Vec of layer dirs.
-                        let (lower, _cfg) = resolve_image(&stage_tags[src_idx])?;
-                        slot.insert(lower.split(':').map(str::to_string).collect());
-                    }
-                    let chain = &chains[&src_idx];
+                    // Resolve the source's overlay chain (top-first list of layer dirs), pulling an
+                    // external image on demand. A build STAGE takes precedence over an image of the same
+                    // spelling — already decided by the parser, which only emits `CopyFrom::Image` when
+                    // the token names NO earlier stage. Both paths feed the SAME confined copy helper
+                    // (`copy_from_stage_chain` → single-layer `starts_with` guard, or ≥2-layer
+                    // `merged_view_extract` with `openat2(RESOLVE_IN_ROOT)`), so an external image's
+                    // `srcs` are confined to its rootfs exactly like a stage's — no `..`/symlink escape.
+                    let (chain, label): (Vec<String>, String) = match cf {
+                        CopyFrom::Stage(fref) => {
+                            let src_idx = resolve_from(fref, stage_names, si).ok_or_else(|| {
+                                Error::Build(format!(
+                                    "COPY --from='{fref}' does not name an earlier stage"
+                                ))
+                            })?;
+                            if let std::collections::hash_map::Entry::Vacant(slot) =
+                                chains.entry(src_idx)
+                            {
+                                // The chain is `top:...:base`; split into a top-first Vec of layer dirs.
+                                let (lower, _cfg) = resolve_image(&stage_tags[src_idx])?;
+                                slot.insert(lower.split(':').map(str::to_string).collect());
+                            }
+                            (chains[&src_idx].clone(), stage_tags[src_idx].clone())
+                        }
+                        CopyFrom::Image(img) => {
+                            if let std::collections::hash_map::Entry::Vacant(slot) =
+                                image_chains.entry(img.clone())
+                            {
+                                // Pull (if not cached) + resolve the external image's overlay chain —
+                                // the SAME path `FROM`/`--image` use (`resolve_image` → `pull_to_cache`).
+                                // Runs synchronously on the single-threaded build main, so the confined
+                                // copy that follows keeps the fork-safety invariant.
+                                let (lower, _cfg) = resolve_image(img)?;
+                                slot.insert(lower.split(':').map(str::to_string).collect());
+                            }
+                            (image_chains[img].clone(), img.clone())
+                        }
+                    };
                     if !pulled_from_stage {
                         let _ = std::fs::create_dir_all(subctx);
                         pulled_from_stage = true;
                     }
                     for s in srcs {
-                        copy_from_stage_chain(chain, s, subctx, &stage_tags[src_idx])?;
+                        copy_from_stage_chain(&chain, s, subctx, &label)?;
                     }
                     // Rewrite to a plain COPY from the sub-context (same dst-side guards downstream).
                     let names: Vec<String> = srcs
