@@ -83,10 +83,11 @@ compose — `run` inside `box`. Both ship today.
 - **Exec into a running box** — `kern exec <name> -- sh` joins its namespaces.
 - **Lifecycle, no daemon** — `-d` detached, `kern ps` / `top` / `stats` / `logs` / `stop`.
 - **Compose** — `kern compose stack.toml` brings up a multi-box stack in dependency order.
-- **Readable, honest startup** *(new in 0.4)* — a foreground box prints an aligned status panel
+- **Readable, honest output** *(new in 0.4)* — a foreground box prints an aligned status panel
   (command, what's isolated vs open, resource caps) with an **actionable warning** for the
-  deliberately-open choices (`--net`, `--bind-rootfs`); colour is semantic, untrusted fields are
-  escape-stripped, and it's **silent when piped or detached** so scripts stay clean.
+  deliberately-open choices (`--net`, `--bind-rootfs`); `ps`/`stats`/`images`/`search` share the
+  same styling (dim header, semantic colour — green `healthy` / red `unhealthy`). Colour is
+  meaning, untrusted fields are escape-stripped, and it's **silent when piped** so scripts stay clean.
 - **Hardened isolation** — user + PID + net + UTS + IPC + mount namespaces, self-pivot root,
   always-on seccomp denylist (now also blocks `syslog`, closing a `dmesg` kernel-log leak),
   **least-privilege capabilities** (13 dangerous caps dropped from the bounding set), and cgroup
@@ -308,7 +309,7 @@ method + caveats in **[BENCHMARKS.md](BENCHMARKS.md)**.
 ## Project status
 
 **0.4 — early, but it genuinely runs.** Everything in [Features](#features-shipping-in-04) works
-today and is tested (73 tests, clippy-clean, `cargo-deny`-clean); the isolation is real. The CLI
+today and is tested (74 tests, clippy-clean, `cargo-deny`-clean); the isolation is real. The CLI
 and config surface are **not frozen until 1.0**.
 
 **Not yet (on the roadmap):** declarative TOML profiles, image **build**, ARM in CI, and the
