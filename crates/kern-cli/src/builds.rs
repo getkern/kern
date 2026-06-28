@@ -365,17 +365,24 @@ pub fn prune(keep: usize) -> usize {
 // logs <id>` without threading a writer through every build function, [`Capture`] redirects this
 // process's fd 2 into the build's `log` file for the build's lifetime, teed LIVE back to the real
 // stderr so the user still sees the build. Child RUN boxes inherit the redirected fd 2, so their
-// stderr is captured too. On drop, stderr is restored and the reader thread drains and exits. stdout
+// stderr is captured too. On drop, stderr is restored and the logger drains and exits. stdout
 // (fd 1) is untouched, so `kern build ... | …` piping and the final `built '<tag>'` line are unchanged.
+//
+// FORK SAFETY: the pipe is drained by a CHILD PROCESS, not a background thread — deliberately. A
+// reader THREAD would make `kern build` multi-threaded for the whole build, and a multi-stage build
+// then `fork()`s (and allocates in the child) to read a source stage's merged overlay view for
+// `COPY --from` (see `commands::merged_view_extract`) — which its fork-safety guard (correctly)
+// REFUSES in a multi-threaded process, breaking every multi-stage build. A separate logger process
+// keeps this process single-threaded, so that fork stays safe without weakening the guard.
 
 /// Cap the captured transcript so a pathological build can't grow an unbounded log.
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
-/// RAII stderr→log tee. `start` returns `None` (build proceeds uncaptured) if the pipe/dup fails — a
-/// logging problem must never fail a build.
+/// RAII stderr→log tee. `start` returns `None` (build proceeds uncaptured) if the pipe/dup/fork fails —
+/// a logging problem must never fail a build.
 pub struct Capture {
     saved_err: i32,
-    thread: Option<std::thread::JoinHandle<()>>,
+    logger_pid: libc::pid_t,
 }
 
 impl Capture {
@@ -399,13 +406,22 @@ impl Capture {
             }
             return None;
         }
-        // Point fd 2 at the pipe write end, then drop the spare write fd — now only fd 2 (and any child
-        // that inherits it) holds the write end, so restoring fd 2 later yields a clean EOF.
-        unsafe {
-            libc::dup2(wr, 2);
-            libc::close(wr);
+        // Drain the tee in a child PROCESS (see the FORK SAFETY note above). Fork here, while the build
+        // is still single-threaded, so this is a plain safe fork.
+        let logger_pid = unsafe { libc::fork() };
+        if logger_pid < 0 {
+            unsafe {
+                libc::close(rd);
+                libc::close(wr);
+                libc::close(saved_err);
+            }
+            return None;
         }
-        let thread = std::thread::spawn(move || {
+        if logger_pid == 0 {
+            // ---- LOGGER CHILD: read the pipe, tee to the real stderr (inherited `saved_err`) + the log,
+            // until EOF. Holds only the read end — closing our copy of the write end is what lets the
+            // final EOF ever arrive once the parent (and any RUN box) drops fd 2. ----
+            unsafe { libc::close(wr) };
             let mut buf = [0u8; 4096];
             let mut written: u64 = 0;
             loop {
@@ -414,33 +430,46 @@ impl Capture {
                     break; // EOF (all write ends closed) or error
                 }
                 let n = n as usize;
-                // Tee live to the real stderr so the build stays visible.
                 unsafe { libc::write(saved_err, buf.as_ptr().cast(), n) };
                 if written < MAX_LOG_BYTES {
                     let _ = logf.write_all(&buf[..n]);
                     written += n as u64;
                 }
             }
-            unsafe { libc::close(rd) };
-        });
+            unsafe {
+                libc::close(rd);
+                // `_exit`: skip atexit/flush and never unwind back into the parent's build logic.
+                libc::_exit(0)
+            };
+        }
+        // ---- PARENT: point fd 2 at the pipe write end, drop every fd the logger now owns. Only fd 2
+        // (and any child that inherits it) holds the write end, so restoring fd 2 later yields a clean
+        // EOF. The logger child owns the log file now. ----
+        unsafe {
+            libc::close(rd);
+            libc::dup2(wr, 2);
+            libc::close(wr);
+        }
+        drop(logf);
         Some(Capture {
             saved_err,
-            thread: Some(thread),
+            logger_pid,
         })
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        // Restore fd 2 → the last pipe-write ref is gone → the reader thread hits EOF and exits.
+        // Restore fd 2 → the last pipe-write ref is gone → the logger child hits EOF and exits.
         unsafe { libc::dup2(self.saved_err, 2) };
-        // Join BEFORE closing `saved_err`: the pipe may still hold up to a buffer of stderr the reader
-        // must drain and tee to the terminal; closing first would make that final `write(saved_err,…)`
-        // hit a closed fd (and, in theory, a reused one). Close only once the reader has finished.
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        // Reap the logger BEFORE closing `saved_err`, mirroring the old thread-join: the pipe may still
+        // hold a buffer of stderr the logger must drain and tee. (It tees through its OWN inherited copy
+        // of the real stderr, so closing ours can't cut it off — but reaping first also avoids a zombie.)
+        unsafe {
+            let mut status = 0i32;
+            libc::waitpid(self.logger_pid, &mut status, 0);
+            libc::close(self.saved_err);
         }
-        unsafe { libc::close(self.saved_err) };
     }
 }
 
