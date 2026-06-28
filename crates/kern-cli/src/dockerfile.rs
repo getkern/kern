@@ -10,6 +10,9 @@
 //! Deliberately NOT supported (rejected with a clear error, never silently ignored): `SHELL`, `ONBUILD`,
 //! `STOPSIGNAL`, `ADD <url>`, and `ADD` auto-extraction. Comments (`#`), blank lines and backslash
 //! line-continuations are handled; `ARG`/`ENV` values substitute into later `${VAR}`/`$VAR`.
+//! BuildKit `RUN` **heredocs** (`RUN <<EOF … EOF`, incl. `<<-` tab-strip, quoted `<<'EOF'`, and the
+//! interpreter form `RUN python3 <<EOF`) are parsed and reduced to a single `/bin/sh -c` argv; a COPY
+//! heredoc and multiple/stacked heredocs on one instruction are rejected with a clear error.
 //!
 //! The parser is pure (text in, instructions out) so it is unit-testable without touching disk or
 //! the network; the executor lives in `commands::build`.
@@ -118,28 +121,139 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
     warns
 }
 
-/// Parse Dockerfile `text` into an ordered instruction list. `build_args` seed the substitution
-/// table (they override any in-file `ARG` default). Returns a human-readable error on the first
-/// If `s` opens a heredoc (`<<WORD`, `<<-WORD`, `<<"WORD"`, `<<'WORD'`), return the delimiter word.
-/// Heredocs (a BuildKit feature) aren't supported; catching the opener gives one clear error instead
-/// of the body leaking into the parser as bogus "unknown instruction" lines. The delimiter must start
-/// with a letter/`_`, so a shell bit-shift like `$((1<<2))` is NOT mistaken for a heredoc.
-fn heredoc_delimiter(s: &str) -> Option<String> {
-    let i = s.find("<<")?;
-    let mut rest = s[i + 2..].trim_start();
-    rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
-    let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
-    let first = rest.chars().next()?;
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return None;
-    }
-    Some(
-        rest.chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect(),
-    )
+/// A heredoc operator (`<<WORD`, `<<-WORD`, `<<"WORD"`, `<<'WORD'`) found on a RUN/COPY opener line,
+/// with its byte range in the scanned string so the opener text can be reconstructed without it.
+struct HeredocOp {
+    /// Byte range of the whole operator token (`<<…WORD` incl. any `-`/quotes) in the scanned string.
+    start: usize,
+    end: usize,
+    /// The delimiter word (unquoted), e.g. `EOF`.
+    delim: String,
+    /// `true` for `<<-`: strip leading TABs from body lines and allow a tab-indented close.
+    strip_tabs: bool,
 }
 
+/// One collected heredoc: its delimiter, the joined body (`\n`-separated, tabs already stripped for
+/// `<<-`), and whether its closing delimiter was found before EOF.
+struct Heredoc {
+    delim: String,
+    body: String,
+    terminated: bool,
+}
+
+/// A folded instruction line: `text` is the opener (backslash-continuations already joined), plus any
+/// heredoc bodies attached to it (RUN/COPY/ADD only). `lineno` is the 1-based line of the opener.
+struct Logical {
+    lineno: usize,
+    text: String,
+    heredocs: Vec<Heredoc>,
+}
+
+/// Scan a string for heredoc operators in order. A `<<` is only an operator when a delimiter word
+/// (starting with a letter/`_`, optionally quoted, optionally `<<-`) follows — so a shell bit-shift
+/// like `1<<2` (a digit follows) is NOT mistaken for one.
+fn scan_heredoc_ops(s: &str) -> Vec<HeredocOp> {
+    let b = s.as_bytes();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] != b'<' || b[i + 1] != b'<' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut j = i + 2;
+        let strip_tabs = j < b.len() && b[j] == b'-';
+        if strip_tabs {
+            j += 1;
+        }
+        let quote = if j < b.len() && (b[j] == b'"' || b[j] == b'\'') {
+            let q = b[j];
+            j += 1;
+            Some(q)
+        } else {
+            None
+        };
+        // The delimiter word must start with a letter or `_` (rules out `1<<2`).
+        if j >= b.len() || !(b[j].is_ascii_alphabetic() || b[j] == b'_') {
+            i += 2;
+            continue;
+        }
+        let ds = j;
+        j += 1;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        let delim = s[ds..j].to_string();
+        if let Some(q) = quote {
+            if j < b.len() && b[j] == q {
+                j += 1; // consume the closing quote
+            }
+        }
+        ops.push(HeredocOp {
+            start,
+            end: j,
+            delim,
+            strip_tabs,
+        });
+        i = j;
+    }
+    ops
+}
+
+/// The heredoc operators an instruction OPENS: only RUN/COPY/ADD may open a heredoc, so a stray `<<`
+/// on any other instruction (or a bit-shift) never starts consuming following lines as a body.
+fn opener_heredoc_ops(text: &str) -> Vec<HeredocOp> {
+    let kw = text
+        .split_once(char::is_whitespace)
+        .map(|(k, _)| k)
+        .unwrap_or(text)
+        .to_ascii_uppercase();
+    if matches!(kw.as_str(), "RUN" | "COPY" | "ADD") {
+        scan_heredoc_ops(text)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build the argv for a `RUN` that opens a heredoc. `rest` is the opener minus the `RUN` keyword.
+/// Two shapes. With no command before `<<`, the body IS a shell script: `["/bin/sh","-c",<body>]`
+/// (BuildKit's `RUN <<EOF … EOF`, the dominant case). With a command/interpreter before `<<` (e.g.
+/// `python3 <<EOF`), feed the body on that command's stdin by handing a real heredoc to `/bin/sh`:
+/// `["/bin/sh","-c","<cmd> <<'DELIM'\n<body>\nDELIM"]`.
+///
+/// The body is kept verbatim (kern doesn't env-expand RUN bodies). Multiple heredocs on one RUN and
+/// an unterminated heredoc are rejected with a clear error.
+fn heredoc_run_argv(rest: &str, heredocs: &[Heredoc]) -> Result<Vec<String>, String> {
+    let ops = scan_heredoc_ops(rest);
+    if ops.len() > 1 {
+        return Err(
+            "multiple heredocs on one instruction aren't supported yet — use one `<<DELIM` per RUN"
+                .to_string(),
+        );
+    }
+    let op = &ops[0]; // caller only routes here when opener_heredoc_ops found ≥1
+    let hd = &heredocs[0];
+    if !hd.terminated {
+        return Err(format!("unterminated heredoc `<<{}`", hd.delim));
+    }
+    let prefix = format!("{}{}", &rest[..op.start], &rest[op.end..]);
+    let prefix = prefix.trim();
+    let argv = if prefix.is_empty() {
+        vec!["/bin/sh".to_string(), "-c".to_string(), hd.body.clone()]
+    } else {
+        let script = format!(
+            "{prefix} <<'{d}'\n{body}\n{d}",
+            d = hd.delim,
+            body = hd.body
+        );
+        vec!["/bin/sh".to_string(), "-c".to_string(), script]
+    };
+    Ok(argv)
+}
+
+/// Parse Dockerfile `text` into an ordered instruction list. `build_args` seed the substitution
+/// table (they override any in-file `ARG` default). Returns a human-readable error on the first
 /// malformed or unsupported line, tagged with the 1-based line number.
 pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Instr>, String> {
     let mut out = Vec::new();
@@ -151,7 +265,12 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
     // `COPY --from=<name-or-index>` against EARLIER stages only (no forward-ref, no self-ref).
     let mut stage_names: Vec<Option<String>> = Vec::new();
 
-    for (lineno, logical) in logical_lines(text).into_iter() {
+    for ll in logical_lines(text).into_iter() {
+        let Logical {
+            lineno,
+            text: logical,
+            heredocs,
+        } = ll;
         let line = logical.trim();
         if line.is_empty() {
             continue;
@@ -226,15 +345,16 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 }
             }
             "RUN" => {
-                // Heredoc (`RUN <<EOF … EOF`, a BuildKit feature) isn't supported. Detect the opener
-                // and say so clearly — otherwise the body lines leak into the loop as bogus
-                // "unknown instruction ECHO" errors.
-                if let Some(delim) = heredoc_delimiter(rest) {
-                    return err(&format!(
-                        "RUN heredoc (`<<{delim}`) is not supported — use a single-line `RUN` (join with `&&` / `; `) or `RUN sh -c '…'`"
-                    ));
+                // A BuildKit heredoc (`RUN <<EOF … EOF`) is folded here: `heredocs` holds the body
+                // lines the parser consumed verbatim. Reduce it to a single `/bin/sh -c` argv.
+                if heredocs.is_empty() {
+                    out.push(Instr::Run(cmd_argv(rest, &vars)))
+                } else {
+                    out.push(Instr::Run(
+                        heredoc_run_argv(rest, &heredocs)
+                            .map_err(|m| format!("Dockerfile line {lineno}: {m}"))?,
+                    ))
                 }
-                out.push(Instr::Run(cmd_argv(rest, &vars)))
             }
             "CMD" => out.push(Instr::Cmd(cmd_argv(rest, &vars))),
             "ENTRYPOINT" => out.push(Instr::Entrypoint(cmd_argv(rest, &vars))),
@@ -253,6 +373,12 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 out.push(Instr::User(u));
             }
             "COPY" | "ADD" => {
+                // `COPY <<EOF <dest>` (heredoc → file) is a valid BuildKit form we don't implement
+                // yet. Its body was consumed verbatim into `heredocs`, so error clearly rather than
+                // mis-parsing the opener (never silently drop the body).
+                if !heredocs.is_empty() {
+                    return err(&format!("{kw} heredoc (`<<…`) isn't supported yet"));
+                }
                 let mut toks = split_ws(&subst(rest, &vars));
                 // `COPY --from=<stage|image>` (multi-stage / external image) is the ONLY build flag we
                 // accept; capture and drop it. Any other `--flag` (or `--from` on `ADD`) is still
@@ -363,34 +489,81 @@ pub fn resolve_from(from: &str, stage_names: &[Option<String>], upto: usize) -> 
 }
 
 /// Fold physical lines into logical ones: drop full-line comments, honour a trailing `\`
-/// continuation. Returns `(first_physical_lineno, joined_text)` per logical line.
-fn logical_lines(text: &str) -> Vec<(usize, String)> {
+/// continuation, and — for a RUN/COPY/ADD line that OPENS a heredoc (`<<DELIM`) — consume the
+/// following physical lines VERBATIM (no comment stripping, no continuation) as the heredoc body,
+/// up to the closing delimiter (tab-indented close allowed for `<<-`). Each `Logical` carries the
+/// opener text plus any attached heredoc bodies.
+fn logical_lines(text: &str) -> Vec<Logical> {
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut start = 0usize;
-    let mut continuing = false;
-    for (i, raw) in text.lines().enumerate() {
-        let lineno = i + 1;
-        // A `#` comment line is only a comment when NOT continuing a previous line.
-        if !continuing && raw.trim_start().starts_with('#') {
+    let mut idx = 0;
+    while idx < lines.len() {
+        // A `#` comment line (when not mid-continuation) is dropped whole.
+        if lines[idx].trim_start().starts_with('#') {
+            idx += 1;
             continue;
         }
-        if !continuing {
-            start = lineno;
+        let start = idx + 1;
+        // Fold backslash continuations into the opener text.
+        let mut cur = String::new();
+        loop {
+            let raw = lines[idx];
+            let trimmed_end = raw.trim_end();
+            idx += 1;
+            if let Some(stripped) = trimmed_end.strip_suffix('\\') {
+                cur.push_str(stripped);
+                cur.push(' ');
+                if idx >= lines.len() {
+                    break;
+                }
+            } else {
+                cur.push_str(raw);
+                break;
+            }
         }
-        let trimmed_end = raw.trim_end();
-        if let Some(stripped) = trimmed_end.strip_suffix('\\') {
-            cur.push_str(stripped);
-            cur.push(' ');
-            continuing = true;
-        } else {
-            cur.push_str(raw);
-            out.push((start, std::mem::take(&mut cur)));
-            continuing = false;
+        // If this opener opens heredoc(s), consume their bodies verbatim from the following lines.
+        let mut heredocs = Vec::new();
+        for op in opener_heredoc_ops(&cur) {
+            let mut body = Vec::new();
+            let mut terminated = false;
+            while idx < lines.len() {
+                let raw = lines[idx];
+                idx += 1;
+                // Closing delimiter: the line (leading tabs stripped for `<<-`, trailing CR ignored)
+                // must equal the delimiter exactly.
+                let close = if op.strip_tabs {
+                    raw.trim_start_matches('\t')
+                } else {
+                    raw
+                };
+                if close.strip_suffix('\r').unwrap_or(close) == op.delim {
+                    terminated = true;
+                    break;
+                }
+                // Body line: `<<-` strips leading TABs (only tabs, not spaces).
+                let line = if op.strip_tabs {
+                    raw.trim_start_matches('\t')
+                } else {
+                    raw
+                };
+                body.push(line.to_string());
+            }
+            let unterminated = !terminated;
+            heredocs.push(Heredoc {
+                delim: op.delim,
+                body: body.join("\n"),
+                terminated,
+            });
+            // A body that ran to EOF swallowed any later openers — stop; the RUN handler reports it.
+            if unterminated {
+                break;
+            }
         }
-    }
-    if !cur.is_empty() {
-        out.push((start, cur));
+        out.push(Logical {
+            lineno: start,
+            text: cur,
+            heredocs,
+        });
     }
     out
 }
@@ -780,14 +953,6 @@ mod tests {
         assert!(parse("FROM a\nBOGUS x\n", &ba())
             .unwrap_err()
             .contains("unknown instruction"));
-        // A BuildKit heredoc (`RUN <<EOF`) gets ONE clear error, not a body-line "unknown instruction".
-        assert!(parse("FROM a\nRUN <<EOF\necho hi\nEOF\n", &ba())
-            .unwrap_err()
-            .contains("heredoc"));
-        // …but a shell bit-shift (`1<<2`) is NOT mistaken for a heredoc opener.
-        assert_eq!(heredoc_delimiter("<<EOF").as_deref(), Some("EOF"));
-        assert_eq!(heredoc_delimiter("cat <<-'END' f").as_deref(), Some("END"));
-        assert_eq!(heredoc_delimiter("echo $((1<<2))"), None);
         assert!(parse("RUN x", &ba()).is_err());
         assert!(parse("# only a comment\n", &ba())
             .unwrap_err()
@@ -933,5 +1098,105 @@ mod tests {
         assert_eq!(resolve_from("final", &names, 2), None); // final is index 2, not < upto=2
         assert_eq!(resolve_from("3", &names, 3), None); // no such index
         assert_eq!(resolve_from("nope", &names, 3), None);
+    }
+
+    /// Pull the shell script out of a `RUN` reduced to `["/bin/sh","-c",<script>]`.
+    fn run_script(instr: &Instr) -> &str {
+        match instr {
+            Instr::Run(a) if a.len() == 3 && a[0] == "/bin/sh" && a[1] == "-c" => &a[2],
+            other => panic!("expected shell-form RUN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_heredoc_ops_detects_forms_and_ignores_bitshift() {
+        // Bare, tab-strip, and both quote styles are recognised (delimiter word only).
+        assert_eq!(scan_heredoc_ops("<<EOF").len(), 1);
+        let dash = &scan_heredoc_ops("cat <<-END x")[0];
+        assert_eq!(dash.delim, "END");
+        assert!(dash.strip_tabs);
+        assert_eq!(scan_heredoc_ops("python3 <<'PY'")[0].delim, "PY");
+        assert_eq!(scan_heredoc_ops("sh <<\"SH\"")[0].delim, "SH");
+        // A shell bit-shift (digit after `<<`) is NOT a heredoc.
+        assert!(scan_heredoc_ops("echo $((1<<2))").is_empty());
+        // Two openers on one line are both found (RUN handler then rejects the pair).
+        assert_eq!(scan_heredoc_ops("<<A <<B").len(), 2);
+    }
+
+    #[test]
+    fn run_heredoc_basic_body_runs_as_shell_script() {
+        // The two body lines become ONE `/bin/sh -c` script (newline-joined), the dominant case.
+        let df =
+            "FROM alpine\nRUN <<EOF\necho line1\necho line2 > /tmp/x\nEOF\nCMD [\"/bin/sh\"]\n";
+        let got = parse(df, &ba()).unwrap();
+        assert_eq!(
+            got[1],
+            Instr::Run(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo line1\necho line2 > /tmp/x".into()
+            ])
+        );
+        // The delimiter line is consumed, not parsed as an instruction: FROM, RUN, CMD only.
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn run_heredoc_dash_strips_leading_tabs() {
+        // `<<-` strips leading TABs from body lines and allows a tab-indented close; spaces are kept.
+        let df = "FROM alpine\nRUN <<-EOF\n\techo hi\n\t  spaced\n\tEOF\n";
+        let got = parse(df, &ba()).unwrap();
+        assert_eq!(run_script(&got[1]), "echo hi\n  spaced");
+    }
+
+    #[test]
+    fn run_heredoc_quoted_delimiter_body_verbatim() {
+        // A quoted delimiter matches the unquoted word; the body is kept verbatim.
+        let df = "FROM alpine\nRUN <<'EOF'\necho ${NOT_EXPANDED}\nEOF\n";
+        let got = parse(df, &ba()).unwrap();
+        assert_eq!(run_script(&got[1]), "echo ${NOT_EXPANDED}");
+    }
+
+    #[test]
+    fn run_heredoc_interpreter_form_feeds_stdin() {
+        // A command before `<<` (here `cat`) gets the body on stdin via a real shell heredoc.
+        let df = "FROM alpine\nRUN cat <<EOF\nhello\nworld\nEOF\n";
+        let got = parse(df, &ba()).unwrap();
+        assert_eq!(run_script(&got[1]), "cat <<'EOF'\nhello\nworld\nEOF");
+        // A body containing single quotes survives (the batcher single-quote-escapes when combining).
+        let py = "FROM alpine\nRUN python3 <<EOF\nprint('hi')\nEOF\n";
+        assert_eq!(
+            run_script(&parse(py, &ba()).unwrap()[1]),
+            "python3 <<'EOF'\nprint('hi')\nEOF"
+        );
+    }
+
+    #[test]
+    fn run_heredoc_bitshift_is_not_a_heredoc() {
+        // `RUN echo $((1<<2))` is an ordinary single-line RUN, never a heredoc opener.
+        let got = parse("FROM alpine\nRUN echo $((1<<2))\n", &ba()).unwrap();
+        assert_eq!(run_script(&got[1]), "echo $((1<<2))");
+    }
+
+    #[test]
+    fn run_heredoc_unterminated_errors() {
+        // Delimiter never reappears before EOF → a clear "unterminated heredoc" error, no panic.
+        let err = parse("FROM alpine\nRUN <<EOF\necho hi\n", &ba()).unwrap_err();
+        assert!(err.contains("unterminated heredoc"), "{err}");
+        assert!(err.contains("EOF"), "{err}");
+    }
+
+    #[test]
+    fn run_multiple_heredocs_rejected() {
+        // Stacked heredocs on one instruction are detected and rejected, not mis-parsed.
+        let err = parse("FROM alpine\nRUN <<A <<B\nx\nA\ny\nB\n", &ba()).unwrap_err();
+        assert!(err.contains("multiple heredocs"), "{err}");
+    }
+
+    #[test]
+    fn copy_heredoc_errors_clearly() {
+        // COPY heredoc isn't implemented; error clearly rather than silently dropping the body.
+        let err = parse("FROM alpine\nCOPY <<EOF /app/x\nhello\nEOF\n", &ba()).unwrap_err();
+        assert!(err.contains("heredoc"), "{err}");
     }
 }
