@@ -398,7 +398,10 @@ impl Capture {
             return None;
         }
         let (rd, wr) = (fds[0], fds[1]);
-        let saved_err = unsafe { libc::dup(2) };
+        // `F_DUPFD_CLOEXEC` (not plain `dup`): the logger child inherits this saved stderr across the
+        // fork below (fork ignores CLOEXEC), but a later RUN box `execve`s — CLOEXEC then closes it, so
+        // the host-stderr fd never leaks into the sandboxed workload.
+        let saved_err = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 0) };
         if saved_err < 0 {
             unsafe {
                 libc::close(rd);

@@ -6210,9 +6210,20 @@ fn copy_from_stage_rootfs(
     dest: &std::path::Path,
 ) -> Result<(), Error> {
     let clean = src_rel.trim_start_matches('/');
-    let src = std::fs::canonicalize(src_rootfs.join(clean))
+    // Canonicalize the ROOT too, so the confinement check compares canonical-vs-canonical. Without
+    // this, a `src_rootfs` reached through a symlinked component (e.g. a cache dir under a symlinked
+    // $HOME) would make `canonicalize(src)` resolve past the raw prefix and FALSE-reject a legitimate
+    // copy. Security is unchanged: a src that symlinks OUT of the image still resolves outside `root`
+    // and is rejected.
+    let root = std::fs::canonicalize(src_rootfs).map_err(|e| {
+        Error::Build(format!(
+            "COPY --from source rootfs '{}': {e}",
+            src_rootfs.display()
+        ))
+    })?;
+    let src = std::fs::canonicalize(root.join(clean))
         .map_err(|e| Error::Build(format!("COPY --from source '{src_rel}': {e}")))?;
-    if !src.starts_with(src_rootfs) {
+    if !src.starts_with(&root) {
         return Err(Error::Build(format!(
             "COPY --from source '{src_rel}' escapes the source stage"
         )));
