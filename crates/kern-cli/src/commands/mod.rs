@@ -970,6 +970,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         },
         None,
         ports,
+        // Foreground box: tie its lifetime to the launcher via PDEATHSIG, so a hard-killed launcher
+        // (SIGKILL/OOM) doesn't orphan the box until `--timeout`. NOT for a managed box — systemd is
+        // its supervisor (KillMode=mixed tears it down); a PDEATHSIG relative to systemd is pointless.
+        !managed,
     );
     cancel_foreground_timeout(timeout_wd);
     // Tear down any ext4-loop vdisks (unmount + detach loop + remove ephemeral image) and network
@@ -1154,6 +1158,9 @@ fn run_box_interactive(
         |pid1| feed_timeout_pid(timeout_wd, pid1),
         Some(pty.master),
         ports,
+        // `-it`: leave the box tied to the controlling terminal/session, not to a launcher PDEATHSIG —
+        // the terminal owns the session and the pty pump already ends the box when the tty closes.
+        false,
     );
     cancel_foreground_timeout(timeout_wd);
     if let Some(ref prev) = saved {
@@ -2678,6 +2685,10 @@ fn supervise_box(
                 },
                 None,  // detached boxes have no terminal to attach
                 ports, // the runtime forks `-p` forwarders before unshare, kills them on box exit
+                // Detached: the supervisor is the box's PERSISTENT owner (the launcher already
+                // returned from `await_box_started`), so NEVER arm a launcher PDEATHSIG here — it
+                // would kill the box the instant the launcher exits. Teardown stays with `kern stop`.
+                false,
             ) {
                 Ok(c) => c,
                 Err(e) => {

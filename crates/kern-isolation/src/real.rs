@@ -1898,7 +1898,7 @@ fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
 /// Run `spec.command` inside a fresh user + PID + mount namespace sandbox. Returns the child's
 /// exit code. Requires unprivileged user namespaces.
 pub fn run_in_sandbox(spec: &SandboxSpec) -> Result<i32, Error> {
-    run_in_sandbox_with(spec, None, |_| {}, None, &[])
+    run_in_sandbox_with(spec, None, |_| {}, None, &[], false)
 }
 
 /// Owns the readiness-pipe write end and *fails closed*: if dropped while still armed (i.e. before
@@ -1937,12 +1937,20 @@ impl Drop for ReadyGuard {
 /// `uid_map`, or uid-range mapping — all of which return before the box is even forked) signals
 /// failure on drop. Without this, an error before the fork would close the pipe cleanly and the
 /// launcher would misread the EOF as a successful start.
+///
+/// `die_with_parent` is set ONLY for a FOREGROUND box (a plain `kern box`, not `-d`/`-it`/managed):
+/// this supervisor arms `PR_SET_PDEATHSIG(SIGKILL)` relative to its launcher and the box's PID 1
+/// arms it relative to this supervisor, so a hard kill of the launcher (SIGKILL/OOM — where no
+/// cleanup can run) cascades launcher → supervisor → pidns-init instead of orphaning the box until
+/// the `--timeout` backstop fires. It MUST stay false for a detached box, whose launcher exits right
+/// after forking the supervisor (arming would kill the box instantly).
 pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     spec: &SandboxSpec,
     ready_fd: Option<i32>,
     on_started: F,
     tty_master: Option<i32>,
     ports: &[PortMap],
+    die_with_parent: bool,
 ) -> Result<i32, Error> {
     // Armed until the box child takes ownership (post-fork) or the parent disarms it: a drop on
     // any error path before then writes the failure byte, so a pre-fork failure is never reported
@@ -1950,6 +1958,31 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     let mut ready = ReadyGuard(ready_fd);
     if spec.command.is_empty() {
         return Err(Error::Unsupported("no command given to run in the sandbox"));
+    }
+    // FOREGROUND box: die with the launcher. Arm `PR_SET_PDEATHSIG(SIGKILL)` so that if the process
+    // that launched this `kern` (our parent) is hard-killed — SIGKILL/OOM, where no exit path or
+    // Drop can run `kern stop` — this supervisor is torn down too, rather than being reparented and
+    // keeping the box alive until the `--timeout` backstop. PDEATHSIG is per parent *thread*; the
+    // fork below already requires this process to be single-threaded, so it fires on the launcher's
+    // real death. Skipped for `-d`/`-it`/managed (see `die_with_parent`).
+    if die_with_parent {
+        // Capture the launcher BEFORE arming, then re-check: PDEATHSIG only fires on a *future*
+        // parent death, so if the launcher already exited (its child `kern` reparented) between our
+        // spawn and this prctl, the signal would never come — detect the reparent and refuse to
+        // start, leaving no orphaned box.
+        let launcher = unsafe { libc::getppid() };
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
+        }
+        if unsafe { libc::getppid() } != launcher {
+            return Err(Error::Unsupported("launcher exited before the box started"));
+        }
     }
     // Build argv CStrings before fork (the child stays allocation-light).
     let argv: Vec<CString> = spec
@@ -2118,6 +2151,25 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         // it, so the waiting launcher reads EOF = "the box is up". On any error below we write one
         // byte first, so it learns it failed. (The guard is disarmed; the child never unwinds —
         // it always exec()s or `_exit`s — so its Drop never runs here.)
+        //
+        // FOREGROUND box: complete the death cascade. Arm `PR_SET_PDEATHSIG(SIGKILL)` relative to
+        // the supervisor (our parent) FIRST, so if the supervisor is hard-killed — e.g. because ITS
+        // launcher died and its own PDEATHSIG fired above — this pidns init dies too, and killing
+        // PID 1 tears down the box's whole namespace. It survives the workload's (non-setuid)
+        // execve; on the `--init` path PID 1 never execs and stays armed. Only for a foreground box:
+        // a detached box's supervisor is its persistent owner, and teardown there stays with the
+        // existing supervise/`kern stop` path, unchanged.
+        if die_with_parent {
+            unsafe {
+                libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
         let ready_fd = ready.disarm();
         if let Some(fd) = ready_fd {
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -2769,6 +2821,103 @@ mod ready_guard_tests {
             unsafe { libc::close(fd) };
         }
         assert_eq!(drain(rd), 0, "disarmed drop must be silent (EOF)");
+    }
+}
+
+#[cfg(test)]
+mod pdeathsig_cascade_tests {
+    // Reproduces the OS mechanism the orphan-on-launcher-death fix relies on: a "box PID 1" (G)
+    // that arms `PR_SET_PDEATHSIG(SIGKILL)` relative to its "supervisor" (A) is SIGKILLed the moment
+    // A dies — the same relationship `run_in_sandbox_with` wires between the box's pidns-init and its
+    // supervisor when `die_with_parent` is set. Deterministic (kernel-guaranteed pdeathsig delivery),
+    // no namespaces/root needed, so it runs anywhere. The whole scenario runs inside a dedicated
+    // observer child so the subreaper mode + `waitpid(-1)` can't disturb the cargo test harness.
+    #[test]
+    fn armed_grandchild_is_sigkilled_when_its_parent_dies() {
+        unsafe {
+            let outer = libc::fork();
+            assert!(outer >= 0, "fork(observer) failed");
+            if outer == 0 {
+                // ── Observer (isolated process) ──
+                // Anti-hang: if the cascade DOESN'T fire, G would `pause()` forever and our
+                // `waitpid` would block — SIGALRM turns that into a visible non-zero exit instead.
+                libc::alarm(10);
+                // Become a subreaper so a grandchild orphaned by A's death reparents to US, letting
+                // us reap it and observe HOW it died (rather than losing it to init).
+                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+                let mut sync = [0i32; 2];
+                if libc::pipe(sync.as_mut_ptr()) != 0 {
+                    libc::_exit(10);
+                }
+                let (sr, sw) = (sync[0], sync[1]);
+                let a = libc::fork();
+                if a < 0 {
+                    libc::_exit(11);
+                }
+                if a == 0 {
+                    // ── A: the "supervisor" ──
+                    let g = libc::fork();
+                    if g < 0 {
+                        libc::_exit(12);
+                    }
+                    if g == 0 {
+                        // ── G: the "box PID 1" — arm the death cascade, then block forever ──
+                        libc::close(sr);
+                        libc::prctl(
+                            libc::PR_SET_PDEATHSIG,
+                            libc::SIGKILL as libc::c_ulong,
+                            0,
+                            0,
+                            0,
+                        );
+                        // Tell A we've armed it BEFORE A exits — closes the pdeathsig race (a parent
+                        // that dies before the child arms would never trigger the signal).
+                        let one = [1u8; 1];
+                        let _ = libc::write(sw, one.as_ptr().cast(), 1);
+                        libc::close(sw);
+                        loop {
+                            libc::pause();
+                        }
+                    }
+                    // A: wait until G has armed pdeathsig, then die to trigger it.
+                    libc::close(sw);
+                    let mut b = [0u8; 1];
+                    while libc::read(sr, b.as_mut_ptr().cast(), 1) < 0 {}
+                    libc::_exit(0);
+                }
+                libc::close(sr);
+                libc::close(sw);
+                // Reap both descendants: A (clean exit 0) and G (SIGKILL, reparented to us).
+                let (mut got_kill, mut got_exit0) = (false, false);
+                loop {
+                    let mut st = 0i32;
+                    let r = libc::waitpid(-1, &mut st, 0);
+                    if r <= 0 {
+                        break; // ECHILD: everyone reaped
+                    }
+                    if libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGKILL {
+                        got_kill = true;
+                    } else if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0 {
+                        got_exit0 = true;
+                    }
+                }
+                libc::_exit(if got_kill && got_exit0 { 0 } else { 20 });
+            }
+            // ── Test process ── reap ONLY our observer by pid (no `waitpid(-1)` here, so we never
+            // steal a sibling test's child).
+            let mut st = 0i32;
+            let r = libc::waitpid(outer, &mut st, 0);
+            assert_eq!(r, outer, "waitpid(observer) failed");
+            assert!(
+                libc::WIFEXITED(st),
+                "observer was signaled (e.g. SIGALRM timeout) — cascade never fired (status {st})"
+            );
+            assert_eq!(
+                libc::WEXITSTATUS(st),
+                0,
+                "PDEATHSIG cascade broken: the armed grandchild was NOT SIGKILLed when its parent died"
+            );
+        }
     }
 }
 
