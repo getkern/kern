@@ -872,7 +872,7 @@ fn service_to_box(
             // CONVERT them — kern enforces them exactly like its own `--memory`/`--cpus`/`--pids-limit`
             // flags, and Docker rootless famously IGNORES them without cgroup-v2+systemd, so this is a
             // place kern is *stronger*, not weaker. A silently-dropped cap is worse than a visible gap.
-            "deploy" => apply_deploy(&mut b, node),
+            "deploy" => apply_deploy(&mut b, node, name),
             "networks" | "configs" | "labels" | "logging" | "expose" | "extends" | "init"
             | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
@@ -914,18 +914,30 @@ fn service_to_box(
 /// (`replicas`, `restart_policy`, `placement`, …) is swarm/orchestration kern doesn't do; silently
 /// skipped here rather than warned per-key, since a single-node `deploy:` block is common and mostly
 /// inert for `kern compose`.
-fn apply_deploy(b: &mut ComposeBox, node: &Node) {
+fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
     let Some(limits) = node.child("resources").and_then(|r| r.child("limits")) else {
         return;
     };
+    let mut mapped = false;
     if let Some(m) = limits.child("memory").and_then(|n| n.scalar.as_deref()) {
         b.memory = Some(scalar_str(m));
+        mapped = true;
     }
     if let Some(c) = limits.child("cpus").and_then(|n| n.scalar.as_deref()) {
         b.cpus = Some(scalar_str(c));
+        mapped = true;
     }
     if let Some(p) = limits.child("pids").and_then(|n| n.scalar.as_deref()) {
         b.pids_limit = Some(scalar_str(p));
+        mapped = true;
+    }
+    // Honesty: a `limits:` block that maps NOTHING (a mistyped key like `mem:`/`cpu:`) would leave the
+    // service silently UNCAPPED — a "runs but lies" the trust model forbids. Say so out loud rather than
+    // pretend the cap took. (An empty/whitespace `limits:` — no children — is a no-op, not a typo.)
+    if !mapped && !limits.children.is_empty() {
+        warn(&format!(
+            "service '{name}': deploy.resources.limits set none of memory/cpus/pids — the service runs UNCAPPED (check the key names)"
+        ));
     }
 }
 
@@ -2338,6 +2350,22 @@ mod tests {
         assert_eq!(app.memory.as_deref(), Some("128M"));
         assert_eq!(app.cpus.as_deref(), Some("0.5"));
         assert_eq!(app.pids_limit.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn deploy_limits_typo_maps_no_cap_and_does_not_lie() {
+        // A mistyped limits key (`mem:` not `memory:`) must NOT silently apply a cap — it maps nothing
+        // (and apply_deploy warns the service runs uncapped). Better a visible gap than a runs-but-lies.
+        let y = "services:\n  app:\n    image: alpine\n    deploy:\n      resources:\n        limits:\n          mem: 64m\n";
+        let app = parse(y)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.name == "app")
+            .unwrap();
+        assert!(
+            app.memory.is_none(),
+            "a mistyped limits key must not silently map a cap"
+        );
     }
 
     #[test]
