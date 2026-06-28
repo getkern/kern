@@ -345,6 +345,15 @@ pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciErro
 /// uppercase repo, a `..`/absolute path, whitespace, a stray `--flag`, or an empty string. It is pure
 /// (no I/O), so it stays usable from the pure Dockerfile parser. Deliberately syntactic only — a
 /// well-formed ref that doesn't exist still fails later, at pull time, with the registry's own error.
+///
+/// SSRF note: like `FROM`, an accepted ref names ANY registry host — including a numeric IP or
+/// `localhost:<port>` — so a `FROM`/`COPY --from=<image>` in a Dockerfile triggers a build-time fetch
+/// to whatever host the ref names. This is not a new capability (`FROM` already does it) and the
+/// **Dockerfile author is the trust boundary** — they already choose the base images. The fetch itself
+/// is HTTPS + TLS-pinned and runs the full pull hardening (sha256 blob verify, layer vetting), so a
+/// plain-HTTP metadata endpoint (e.g. cloud IMDS `169.254.169.254`) fails the TLS handshake, not
+/// silently exfiltrating. Kept syntactic on purpose: an allow/deny-list of registries is a
+/// policy/config concern layered on top, not a job for the ref validator.
 pub fn valid_reference(image: &str) -> bool {
     if image.is_empty() || image.len() > 255 {
         return false;
