@@ -1,0 +1,32 @@
+# A web stack for `kern compose`: a cache (redis) with a HEALTH CHECK, and a web front-end that
+# waits for the cache to be HEALTHY before it starts. `kern compose` brings both up in dependency
+# order, on a shared pod network (created automatically for a multi-service stack), and tears the
+# whole thing down again.
+#
+# Schema note: `[box.NAME]` keys mirror the `kern box` flags one-to-one. A scalar is a quoted
+# string carrying the exact CLI value (memory = "128m"); a repeatable flag is an array
+# (command/ports/volumes/env); a switch is a bool. Compose adds --uid-range automatically for an
+# OCI image box (redis drops to its service uid at start), so we don't declare it here.
+
+# The cache: redis, ephemeral (no volume), with a health probe run inside the box.
+[box.cache]
+image = "redis"
+command = ["redis-server", "--save", "", "--appendonly", "no"]
+memory = "128m"
+# `--health-cmd`: exit 0 = healthy. `kern ps` shows HEALTH, and a `depends_healthy` peer waits on it.
+health_cmd = "redis-cli ping | grep -q PONG"
+health_interval = 2
+
+# The web front-end: does NOT start until `cache` reports healthy (compose gates on it).
+# Both services share the auto-created pod network, so web could reach the cache at
+# 127.0.0.1:6379 (same shared loopback). Here it just serves a page proving it came up AFTER
+# the cache was ready. Its port is published to the host.
+[box.web]
+image = "alpine"
+depends_healthy = ["cache"]
+memory = "64m"
+ports = ["8088:8080"]
+command = [
+  "/bin/sh", "-c",
+  "while true; do printf 'HTTP/1.1 200 OK\\r\\nConnection: close\\r\\n\\r\\nweb is up and the cache was healthy first\\n' | nc -lp 8080; done",
+]
