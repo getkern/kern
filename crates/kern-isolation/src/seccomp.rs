@@ -28,6 +28,14 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 // seccomp return actions (`<linux/seccomp.h>`).
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+// Deny gracefully with an errno instead of killing. The syscall STILL never runs (isolation is
+// identical to a kill), but the caller gets `ENOSYS` and can take its fallback path — so software
+// that merely PROBES an optional capability (io_uring, perf, userfaultfd, keyring) keeps working
+// instead of being SIGSYS-killed mid-startup. Reserved for deny-but-degrade syscalls (see
+// `errno_syscalls`); true escape vectors still kill. `SECCOMP_RET_DATA` masks the errno into the low
+// 16 bits of the return value.
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
 
 // Offsets into `struct seccomp_data`.
 const OFF_NR: u32 = 0;
@@ -102,27 +110,12 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
         // Kernel attack surface a sandboxed workload never needs and that has a long history of
         // local-privilege-escalation bugs.
         libc::SYS_bpf,
-        libc::SYS_userfaultfd,
-        libc::SYS_perf_event_open,
-        // io_uring: a large, historically bug-rich async-I/O subsystem (multiple LPE CVEs used in real
-        // container escapes). A sandboxed workload never needs it; Docker default profile, gVisor and
-        // the hardening guides all block/gate it. Deny the whole family. (Hacker-mode audit.)
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
-        // Kernel keyring: add_key/request_key/keyctl reach the keyring subsystem (keyring LPE-CVE
-        // history, and unswappable-memory pinning). The box own user-ns already namespaces the keyring
-        // and its quota, so this is defense-in-depth / Docker-default parity, not a live escape — but a
-        // sandboxed workload has no legitimate use for it, so deny it.
-        libc::SYS_add_key,
-        libc::SYS_request_key,
-        libc::SYS_keyctl,
-        // `syslog(2)` / klogctl — reads the kernel ring buffer (dmesg): kernel pointers + host
-        // activity, an info leak. CAP_SYSLOG is already dropped, but on a host with
-        // `kernel.dmesg_restrict=0` (e.g. some Android-derived kernels) no cap is needed — so deny
-        // the syscall outright. The libc `syslog()` logging function uses the /dev/log socket, NOT
-        // this syscall, so application logging is unaffected.
-        libc::SYS_syslog,
+        // io_uring, userfaultfd, perf_event_open, the keyring family (add_key/request_key/keyctl) and
+        // syslog(2) are ALSO denied — but via `errno_syscalls()` (→ ENOSYS) rather than a kill. They're
+        // deny-but-degrade: legitimate software probes them for an optional fast-path (async I/O,
+        // profiling, GC) and falls back when they're unavailable, so a SIGSYS-kill was a needless
+        // compat break (it killed Redis 8's modules mid-startup) while the isolation — the syscall
+        // never runs — is identical. See `errno_syscalls`.
     ];
     // Namespace creation + classic mount API. Blocked by default (nested userns → CAP_SYS_ADMIN
     // escape, and mount would undo the RO/masked-/proc contract). A rootless `--privileged` box
@@ -141,11 +134,40 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
     v
 }
 
+/// Denied, but with `ENOSYS` instead of a kill (see [`SECCOMP_RET_ERRNO`]). A hostile payload can't
+/// escape through any of these anyway — they're capabilities that legitimate software merely PROBES
+/// for an optional fast-path and gracefully falls back on when unavailable. Killing on them (the old
+/// behaviour) needlessly broke such software: Redis 8's modules probe io_uring on startup and were
+/// SIGSYS-killed. Returning `ENOSYS` keeps the isolation IDENTICAL (the syscall still never runs)
+/// while letting the fallback path (epoll/threads/no-op) take over. Not affected by `allow_nesting` —
+/// none of these are nesting syscalls. True escape vectors (kexec, modules, the mount API, bpf,
+/// ptrace, the nesting set) stay in [`denylist`] and still KILL.
+fn errno_syscalls() -> [libc::c_long; 9] {
+    [
+        // io_uring: bug-rich async-I/O (LPE-CVE history). Still fully denied — callers fall back to
+        // epoll/thread-pool I/O, which is exactly what every one of them already ships as the default.
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        // Optional GC / profiling fast-paths — software runs fine without them.
+        libc::SYS_userfaultfd,
+        libc::SYS_perf_event_open,
+        // Kernel keyring: already namespaced by the box user-ns (defense-in-depth, not a live escape);
+        // callers that probe it degrade cleanly.
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
+        // syslog(2)/klogctl reads the kernel ring buffer (dmesg) — an info leak; a prober just gets
+        // nothing. (The libc `syslog()` LOGGING function uses /dev/log, not this syscall — unaffected.)
+        libc::SYS_syslog,
+    ]
+}
+
 /// How many syscalls the denylist blocks (for the box status banner — kept truthful by reading the
 /// live list rather than a hard-coded number). `allow_nesting` reflects a rootless `--privileged`
 /// box, which blocks [`nesting_syscalls`] fewer.
 pub fn denied_syscall_count(allow_nesting: bool) -> usize {
-    denylist(allow_nesting).len()
+    denylist(allow_nesting).len() + errno_syscalls().len()
 }
 
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
@@ -184,10 +206,20 @@ pub fn install(allow_nesting: bool) -> Result<(), Error> {
         prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1)); // bit set → next (kill)
         prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     }
-    // 3. Each denied number: ==nr → kill.
+    // 3. Each KILL-set number: ==nr → kill the process. These are real escape vectors / pure-attack
+    // syscalls (kexec, modules, the mount API, bpf, ptrace, nesting) — no legitimate workload calls
+    // them, so an attempt is treated as hostile and the process dies.
     for nr in denylist(allow_nesting) {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (kill); else skip
         prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    }
+    // 3b. Each deny-but-degrade number: ==nr → return ENOSYS instead of killing. The syscall still
+    // never runs (isolation identical to a kill); the caller merely sees "not implemented" and takes
+    // its fallback path, so probing software (Redis 8's io_uring, profilers, …) keeps working.
+    let errno_ret = SECCOMP_RET_ERRNO | (libc::ENOSYS as u32 & SECCOMP_RET_DATA);
+    for nr in errno_syscalls() {
+        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (errno); else skip
+        prog.push(stmt(BPF_RET | BPF_K, errno_ret));
     }
     // 4. Default: allow.
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
@@ -213,13 +245,17 @@ pub fn install(allow_nesting: bool) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{denylist, nesting_syscalls};
+    use super::{denylist, errno_syscalls, nesting_syscalls};
 
-    /// The always-on denylist must include the high-value escape/DoS syscalls a sandboxed workload
-    /// never needs — a regression here (someone dropping an entry) silently reopens a kernel surface.
+    /// Every high-value syscall a sandboxed workload must never run stays DENIED — whether by a kill
+    /// (escape vectors) or by ENOSYS (deny-but-degrade). A regression that drops an entry from BOTH
+    /// sets silently reopens a kernel surface, so the test checks the union.
     #[test]
-    fn denylist_covers_the_critical_syscalls() {
-        let d = denylist(false);
+    fn all_critical_syscalls_stay_denied() {
+        let denied: Vec<_> = denylist(false)
+            .into_iter()
+            .chain(errno_syscalls())
+            .collect();
         let must = [
             libc::SYS_ptrace,
             libc::SYS_mount,
@@ -235,7 +271,7 @@ mod tests {
             libc::SYS_move_mount,
             libc::SYS_fsopen,
             libc::SYS_mount_setattr,
-            // io_uring family + keyring (hacker-mode audit additions).
+            // io_uring family + keyring (now denied via ENOSYS, still denied).
             libc::SYS_io_uring_setup,
             libc::SYS_io_uring_enter,
             libc::SYS_io_uring_register,
@@ -244,7 +280,46 @@ mod tests {
             libc::SYS_keyctl,
         ];
         for nr in must {
-            assert!(d.contains(&nr), "denylist is missing syscall nr {nr}");
+            assert!(
+                denied.contains(&nr),
+                "syscall nr {nr} is no longer denied by EITHER set"
+            );
+        }
+    }
+
+    /// The KILL set and the ENOSYS set must stay DISJOINT, and — critically — the ENOSYS demotion must
+    /// only ever apply to deny-but-degrade syscalls. A real escape vector (kexec, bpf, ptrace, the
+    /// mount API) demoted to a mere ENOSYS would let a hostile payload keep probing instead of dying,
+    /// so this asserts every escape vector stays a hard kill.
+    #[test]
+    fn kill_and_errno_sets_are_disjoint_escape_vectors_still_kill() {
+        let kill = denylist(false);
+        let errno = errno_syscalls();
+        for nr in errno {
+            assert!(
+                !kill.contains(&nr),
+                "syscall {nr} is in BOTH the kill and errno sets"
+            );
+        }
+        // The deny-but-degrade family lands in the errno set…
+        assert!(errno.contains(&libc::SYS_io_uring_setup));
+        // …while every real escape vector stays a hard KILL and is NEVER demoted to ENOSYS.
+        for nr in [
+            libc::SYS_kexec_load,
+            libc::SYS_init_module,
+            libc::SYS_bpf,
+            libc::SYS_ptrace,
+            libc::SYS_mount_setattr,
+            libc::SYS_open_tree,
+        ] {
+            assert!(
+                kill.contains(&nr),
+                "escape vector {nr} must stay in the KILL set"
+            );
+            assert!(
+                !errno.contains(&nr),
+                "escape vector {nr} must NOT be demoted to ENOSYS"
+            );
         }
     }
 
@@ -269,13 +344,19 @@ mod tests {
             libc::SYS_init_module,
             libc::SYS_reboot,
             libc::SYS_bpf,
-            libc::SYS_io_uring_setup,
-            libc::SYS_keyctl,
             libc::SYS_ptrace,
             libc::SYS_open_tree, // new mount API stays blocked; kern uses the classic one
             libc::SYS_mount_setattr,
         ] {
-            assert!(nest.contains(&nr), "nesting must STILL block {nr}");
+            assert!(nest.contains(&nr), "nesting must STILL block (kill) {nr}");
+        }
+        // io_uring + the keyring stay denied under `--privileged` too — via ENOSYS. The errno set is
+        // independent of nesting, so a privileged box is no weaker on these than a strict one.
+        for nr in [libc::SYS_io_uring_setup, libc::SYS_keyctl] {
+            assert!(
+                errno_syscalls().contains(&nr),
+                "nesting must STILL deny (errno) {nr}"
+            );
         }
     }
 }
