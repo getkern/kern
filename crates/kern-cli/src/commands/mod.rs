@@ -9498,7 +9498,11 @@ mod image_rm_tests {
         }
 
         unsafe { libc::usleep(50_000) }; // let it install the handler and start spinning
-        assert_eq!(unsafe { libc::kill(child, 0) }, 0, "child should be running");
+        assert_eq!(
+            unsafe { libc::kill(child, 0) },
+            0,
+            "child should be running"
+        );
         // The OLD mechanism alone can't touch it: it's not a group leader, so no group has id `child`
         // — `kill(-child, SIGTERM)` is a harmless ESRCH, and SIGTERM is ignored regardless.
         unsafe { libc::kill(-child, libc::SIGTERM) };
