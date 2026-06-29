@@ -149,7 +149,7 @@ only one that ships OCI images + caps + `ps`/`exec`/`logs`/compose. That reach i
 
 | | |
 |---|---:|
-| **kern** binary (the whole thing) | **~690 KB** static, stripped (one dep, `libc`) — musl x86_64 ~692 KB at 0.4 (release profile: `opt-level=z` + LTO + `panic=abort` + strip); aarch64 comparable |
+| **kern** binary (the whole thing) | **~690 KB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`) — musl x86_64 ~692 KB at 0.4 (release profile: `opt-level=z` + LTO + `panic=abort` + strip); aarch64 comparable |
 | kern resident memory at rest | **0** — no daemon |
 | kern RSS per box (setup) | ~7 MB |
 | bubblewrap binary | 70 KB (launcher only) |

@@ -34,13 +34,16 @@ kern box dev --image alpine -- sh        # a throwaway, isolated Alpine shell �
 
 - **Daemonless.** No `dockerd`-style background service. `kern ps` reads state straight from the
   kernel and the runtime directory, pruning dead boxes as it goes.
-- **Tiny & fast.** A ~690 KB static binary, one dependency (`libc`). Cold start ~1.9–5.5 ms vs
-  ~308 ms for `docker run`; ~7 MB RSS per box vs an always-on ~186 MB daemon (`dockerd` +
-  `containerd`).
+- **Tiny & fast.** A ~690 KB static binary, **one Rust dependency** (`libc`) — it shells out to
+  the system's `curl`/`tar` only to pull OCI images (running a box needs neither). Cold start
+  ~1.9–5.5 ms vs ~308 ms for `docker run`; ~7 MB RSS per box vs an always-on ~186 MB daemon
+  (`dockerd` + `containerd`).
 - **Rootless by default.** Unprivileged user namespaces — your uid maps to root *inside* the box,
-  and only that (single-uid: fastest, smallest id surface). Add `--uid-range` for a full sub-id
-  range (needs `newuidmap` + `/etc/subuid`) so `apt install` and daemons that drop to `www-data`
-  (e.g. Apache) work. No privilege gained on the host either way.
+  and only that. **Single-uid is the default and is `libc`-pure** (no helper, fastest, smallest id
+  surface) — it covers most boxes. Workloads that need a full uid range (`apt install`, daemons
+  that drop to `www-data` like Apache) use **`--uid-range`, which relies on the standard system
+  helper `newuidmap` + `/etc/subuid`** — we state it plainly: that path is not helper-free. No
+  privilege is gained on the host either way.
 - **Correct by construction.** The mount sequence is a **typestate**: remounting the root
   read-only *before* pivoting into it doesn't compile — a whole class of sandbox-escape bug is
   unrepresentable, not just untested.
@@ -99,7 +102,8 @@ compose — `run` inside `box`. Both ship today.
 ## Platforms
 
 **Linux, multi-architecture.** Prebuilt static (musl) binaries for **`linux-x86_64`** and
-**`linux-aarch64`**; one ~690 KB file, no runtime dependencies beyond `libc`.
+**`linux-aarch64`**; one ~690 KB file, no Rust dependencies beyond `libc` (the OCI-pull path
+shells out to the system's `curl`/`tar`).
 
 | Platform | Arch | Status |
 |---|---|---|
@@ -124,22 +128,22 @@ vs ~186 MB for a daemon) — see **[EDGE.md](EDGE.md)**. Automated ARM CI is tra
 ## Install
 
 ```sh
-curl -fsSL https://getkern.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-Downloads a checksum-verified static binary for your platform (`linux-x86_64` / `linux-aarch64`),
-published on every tagged release. No Rust toolchain required.
+The script lives in this repo (read it first if you like) and is served from **github.com** — not a
+domain you've never seen. It downloads the checksum-verified release binary for your arch
+(`linux-x86_64` / `linux-aarch64`) and verifies the sha256 before installing. No Rust toolchain
+required. (`getkern.dev/install.sh` is a short alias for the same script.)
 
 <details>
-<summary>Other ways to install (no custom domain needed)</summary>
+<summary>Prefer to download + verify by hand?</summary>
 
 ```sh
-# The same installer, served straight from the repo:
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-
-# Or grab a binary directly from the latest GitHub Release:
+# Grab the binary straight from GitHub Releases and check the checksum yourself:
 curl -fsSL https://github.com/getkern/kern/releases/latest/download/kern-x86_64-unknown-linux-musl.tar.gz \
-  | tar xz && install -m 755 kern ~/.local/bin/kern   # (aarch64: swap x86_64 → aarch64)
+  | tar xz && install -m 755 kern ~/.local/bin/kern   # aarch64: swap x86_64 → aarch64
+# each release ships a matching .tar.gz.sha256 next to it
 ```
 
 </details>
@@ -226,7 +230,9 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 A `kern box` is set up in a single short-lived process tree — no daemon, no shared state:
 
 1. **Namespaces.** `unshare` into a fresh user + PID + UTS + IPC namespace (and, by default, an
-   isolated loopback-only network namespace; `--net` shares the host's instead). A single-UID map
+   isolated loopback-only network namespace; `--net` shares the host's instead — so the box can
+   then reach host services on `127.0.0.1` and the host's abstract sockets: opt-in, flagged in the
+   status panel). A single-UID map
    makes your uid root *inside* the box only (`--uid-range` opts into a full sub-id range for
    `apt`/`www-data`-style workloads).
 2. **Root filesystem.** An **overlay** by default (the OCI image / rootfs is the read-only lower; a
@@ -278,7 +284,8 @@ kern is the only one shipping a full daemonless container UX (OCI pull, overlay,
 compose) in ~690 KB.
 
 **Same binary, every board — nothing to set up.** kern is *one* ~690 KB static aarch64 binary you
-`scp` and run: no daemon, no package, no dependency. The same `kern box` runs on a desktop, a
+`scp` and run: no daemon, no package, no Rust runtime deps (it shells out to the system's
+`curl`/`tar` only for image pull). The same `kern box` runs on a desktop, a
 Jetson, a Raspberry Pi 5, and an **Android-kernel** board — fastest on all four (cold start,
 isolated `/bin/true`):
 
