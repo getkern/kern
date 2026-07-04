@@ -122,7 +122,7 @@
     <span class="mono"><span class="prompt">$ </span><code id="cmd">curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh</code></span>
     <button class="cp" data-cmd="curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh" aria-label="copy Linux install command">copy</button>
   </div>
-  <p class="note"><strong>Linux · macOS (WSL) · ARM boards (Pi / Jetson / Arduino UNO&nbsp;Q)</strong> — checksum-verified static binary, no toolchain.</p>
+  <p class="note"><strong>Linux · macOS</strong> — one line; auto-detects your CPU (x86-64 or aarch64), verifies the checksum, no toolchain.</p>
 
   <div class="install" style="margin-top:.7rem">
     <span class="mono"><span class="prompt">PS&gt; </span><code>irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex</code></span>
@@ -136,10 +136,10 @@
     <span class="mono"><span class="prompt">$ </span><code>scp kern &lt;board&gt;:  &amp;&amp;  ssh &lt;board&gt; kern box edge --image alpine -- sh</code></span>
     <button class="cp" data-cmd="scp kern <board>: && ssh <board> kern box edge --image alpine -- sh" aria-label="copy board install command">copy</button>
   </div>
-  <p class="note"><strong>ARM boards</strong> (Raspberry&nbsp;Pi, NVIDIA&nbsp;Jetson, Arduino&nbsp;UNO&nbsp;Q) — one&nbsp;~1.5&nbsp;MB
-    static binary you <code>scp</code> and run: no daemon, no package. Or run the one-liner above on the board
-    (it auto-detects aarch64). Runs where Docker won't even install — see
-    <a href="https://github.com/getkern/kern/blob/main/EDGE.md">EDGE.md</a>.</p>
+  <p class="note"><strong>ARM boards</strong> (Raspberry&nbsp;Pi · Jetson · Arduino&nbsp;UNO&nbsp;Q) — kern is a single ~1.5&nbsp;MB
+    static binary: <code>scp</code> it over and run, <strong>even with no internet on the board</strong> — no daemon, no
+    package, nothing to install. (Board online? The <code>curl</code> one-liner above works there too.) This is why it
+    runs where Docker can't — see <a href="https://github.com/getkern/kern/blob/main/EDGE.md">EDGE.md</a>.</p>
 
   <div class="links">
     <a href="https://github.com/getkern/kern">GitHub</a>
