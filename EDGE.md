@@ -33,6 +33,9 @@ It has been run by hand (static `aarch64-musl` binary) on:
   image pull, overlay, volumes, env, `--net`, exec, detached services, `--read-only`, and
   parallel fan-out; sub-MB per box. (`--read-only` works because kern remounts an *overlay*
   read-only, not a bind mount — this Android kernel denies the latter in a user namespace.)
+  For the same reason, a **read-only *volume* bind** (`-v host:box:ro`) is **not** supported on such
+  kernels — a `:ro` bind has no overlay to remount, so kern fails it with a clear message; use a
+  read-write `-v` or `--read-only` for the box root instead. (Verified on the UNO Q, kern 0.6.2.)
 
 > Honest status: ARM is **manually validated**, not yet in CI (tracked in the issues). And kern
 > on the edge today is the **sandbox/OCI runtime** — fast, tiny, daemonless isolation. **GPU
