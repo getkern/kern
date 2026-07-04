@@ -5,14 +5,15 @@
 **A fast, lightweight sandbox & virtual resource manager.**
 
 Run untrusted or agent-generated code in a real, kernel-enforced sandbox that starts in **~1.9 ms** —
-a **~1.5 MB** rootless binary, **no daemon, no VM**. Embed it from Python or Rust, or drive it from the
-CLI; run it on your laptop, in CI, or on a Raspberry Pi where Docker won't even install.
+a single **~1.5 MB** rootless binary, **no daemon**. **Runs everywhere Linux does: bare Linux,
+Windows (via WSL2), and ARM boards** — Raspberry Pi, NVIDIA Jetson, Arduino UNO Q — where Docker won't
+even install. Embed it from Python or Rust, or drive it from the CLI.
 
 **~1.9 ms** cold start (vs **~300 ms** `docker run`) · **~1.5 MB** static binary · **0 RAM at rest** · **rootless**
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platform: Linux](https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-informational.svg)](#platforms)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](#platforms)
 [![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 <p align="center">
@@ -72,11 +73,11 @@ print(r.stdout, r.success)                     # → a fresh 1.9 ms box, discard
 
 | Verb | Question it answers | What it does | Status |
 |------|--------------------|--------------|--------|
-| **`kern box`** | *"Isolate this workload."* | Its own namespaces, an overlay/read-only filesystem, a private process tree, seccomp. **The container.** | ✅ works now |
-| **`kern run`** | *"Give this workload a governed slice of resources."* | Run a command against a quota of CPU / memory — no sandbox, just the governor. (A **GPU slice** is on the roadmap.) | ✅ works now |
+| **`kern box`** | *"Isolate this workload — and slice its resources."* | Its own namespaces, overlay/read-only fs, private process tree, seccomp — **the container** — **plus** the same resource slices (`--memory`, `--cpus`, `vcpu:`, `vdisk:`, `vgpio:`). | ✅ works now |
+| **`kern run`** | *"Just slice resources — no sandbox."* | Run a command against a CPU / memory quota with no isolation — the lean governor on its own. (A **GPU slice** is on the roadmap.) | ✅ works now |
 
-`box` is *isolation* (a boundary); `run` is *resource governance* (a slice). They compose — `run`
-inside `box`. Both ship today.
+**Both take resource slices** — the difference is the sandbox. `box` = isolation **+** slices; `run` =
+slices **without** the sandbox. They compose — `run` inside `box`. Both ship today.
 
 ## What you can do in one line
 

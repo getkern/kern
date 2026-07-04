@@ -1,5 +1,0 @@
-# Netlify / Cloudflare Pages headers. Serve the installer as plain text so it's inspectable in a
-# browser (curl ignores content-type, so `curl | sh` works regardless), with a short cache.
-/install.sh
-  Content-Type: text/x-shellscript; charset=utf-8
-  Cache-Control: public, max-age=300
