@@ -452,7 +452,7 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 |---|---|
 | **A guided tour** — a tool, your code, resource caps, untrusted code, a service | [showcase.sh](examples/showcase.sh) |
 | **Try to break out** — an adversarial isolation battery + 50 boxes at once | [hardening.sh](examples/hardening.sh) |
-| Vet an untrusted `curl \| sh` safely (no net, no host access) | [safe-install-script.sh](examples/safe-install-script.sh) |
+| Safely vet an untrusted `curl … sh` install script (no net, no host access) | [safe-install-script.sh](examples/safe-install-script.sh) |
 | Per-job pipeline: read-only input → isolated processing → output | [data-pipeline.sh](examples/data-pipeline.sh) |
 | Build/test a repo in a clean box (laptop or on-device) | [ci-in-a-box.sh](examples/ci-in-a-box.sh) |
 | Many isolated services on a small board (few MB vs a 186 MB daemon) | [edge-many-services.sh](examples/edge-many-services.sh) |
