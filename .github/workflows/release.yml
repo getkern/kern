@@ -89,7 +89,9 @@ jobs:
         id: tag
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
       - name: Build the kern.exe shim (mingw cross)
-        run: cargo build --release --target x86_64-pc-windows-gnu --manifest-path windows/kern-win/Cargo.toml
+        # --target-dir target: the shim is its OWN (workspace-excluded) crate, so by default it would
+        # build into windows/kern-win/target; pin it to the repo-root target dir the Package step reads.
+        run: cargo build --release --target x86_64-pc-windows-gnu --manifest-path windows/kern-win/Cargo.toml --target-dir target
       - name: Build the kern musl binary (baked into the WSL rootfs)
         run: cargo build --release --target x86_64-unknown-linux-musl --bin kern
       - name: Build the pre-baked WSL rootfs (Alpine + kern, in a user namespace)
