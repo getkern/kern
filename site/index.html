@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kern — a fast, lightweight sandbox &amp; virtual resource manager</title>
+<meta name="description" content="Run Linux workloads in real, kernel-enforced sandboxes — daemonless, ~1 MB, single-digit-millisecond cold start. One static binary, x86_64 + aarch64.">
+<meta property="og:title" content="kern">
+<meta property="og:description" content="A fast, lightweight sandbox & virtual resource manager. Daemonless, ~1 MB, single-digit-ms cold start.">
+<meta name="theme-color" content="#ffffff">
+<link rel="stylesheet" href="/vendor/github-markdown.css">
+<style>
+  :root{
+    --bg:#ffffff; --fg:#1f2328; --dim:#636c76; --line:#d1d9e0; --panel:#f6f8fa;
+    --accent:#0969da; --logo:#0b7285; --green:#1a7f37;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:54rem; margin:0 auto; padding:3.2rem 1.4rem 4rem}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  pre.logo{color:var(--logo); font-weight:700; font-size:clamp(.6rem,2vw,.95rem);
+    line-height:1.15; margin:0 0 .5rem; overflow-x:auto}
+  h1{font-size:0; margin:0}
+  .tagline{font-size:1.3rem; font-weight:600; margin:.2rem 0; color:var(--fg)}
+  .pill{display:inline-block; font-size:.76rem; color:var(--green); border:1px solid #c9e8d2;
+    background:#dafbe1; border-radius:999px; padding:.1rem .55rem; vertical-align:middle; font-weight:600}
+  .sub{color:var(--dim); margin:.4rem 0 1.5rem; max-width:42rem}
+  .install{
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:.85rem 1rem; display:flex; align-items:center; gap:1rem; flex-wrap:wrap;
+  }
+  .install code{color:var(--fg); font-size:.98rem; word-break:break-all}
+  .install .prompt{color:var(--dim)}
+  button#copy{
+    margin-left:auto; background:#fff; color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:.4rem .75rem; cursor:pointer; font-size:.83rem;
+  }
+  button#copy:hover{border-color:var(--accent); color:var(--accent)}
+  .note{color:var(--dim); font-size:.9rem; margin:.55rem 0 0}
+  .note a, .links a{color:var(--accent); text-decoration:none}
+  .note a:hover, .links a:hover{text-decoration:underline}
+  .links{display:flex; gap:1.2rem; flex-wrap:wrap; margin:1.4rem 0 0; font-weight:600; font-size:.95rem}
+  hr.sep{border:0; border-top:1px solid var(--line); margin:2.4rem 0 1.8rem}
+  /* github-markdown-css scopes everything under .markdown-body */
+  .markdown-body{color:var(--fg)}
+  #readme.loading{color:var(--dim); font-size:.95rem}
+  .skel{height:.85rem; background:linear-gradient(90deg,#eee,#f6f8fa,#eee);
+    background-size:200% 100%; border-radius:4px; margin:.7rem 0; animation:sh 1.3s infinite}
+  .skel.w1{width:55%} .skel.w2{width:80%} .skel.w3{width:35%}
+  @keyframes sh{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .fallback{color:var(--dim)}
+  footer{color:var(--dim); font-size:.85rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1.2rem}
+  footer a{color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <pre class="logo mono" aria-hidden="true"> _  _______ ____  _   _
+| |/ / ____|  _ \| \ | |
+| ' /|  _| | |_) |  \| |
+| . \| |___|  _ &lt;| |\  |
+|_|\_\_____|_| \_\_| \_|</pre>
+  <h1>kern</h1>
+
+  <p class="tagline">A fast, lightweight sandbox &amp; virtual resource manager. <span class="pill" id="pill">early — but it runs</span></p>
+  <p class="sub"><strong>~5.5&nbsp;ms</strong> to a rootless, kernel-enforced box — vs <strong>~308&nbsp;ms</strong>
+    for <code>docker run</code>. Daemonless, no root, no runtime to install. Runs on
+    <strong>Linux</strong>, <strong>Windows (via WSL2)</strong>, and <strong>ARM boards</strong> —
+    Raspberry&nbsp;Pi, NVIDIA&nbsp;Jetson, Arduino&nbsp;UNO&nbsp;Q — the same&nbsp;~1&nbsp;MB binary everywhere.</p>
+
+  <div class="install">
+    <span class="mono"><span class="prompt">$ </span><code id="cmd">curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh</code></span>
+    <button class="cp" data-cmd="curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh" aria-label="copy Linux install command">copy</button>
+  </div>
+  <p class="note"><strong>Linux · macOS (WSL) · ARM boards (Pi / Jetson / Arduino UNO&nbsp;Q)</strong> — checksum-verified static binary, no toolchain.</p>
+
+  <div class="install" style="margin-top:.7rem">
+    <span class="mono"><span class="prompt">PS&gt; </span><code>irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex</code></span>
+    <button class="cp" data-cmd="irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex" aria-label="copy Windows install command">copy</button>
+  </div>
+  <p class="note"><strong>Windows</strong> — one line in PowerShell: sets up WSL2 + kern automatically, no Docker Desktop.
+    Inspect first: <a href="https://raw.githubusercontent.com/getkern/kern/main/install.sh">install.sh</a> ·
+    <a href="https://raw.githubusercontent.com/getkern/kern/main/install.ps1">install.ps1</a>.</p>
+
+  <div class="install" style="margin-top:.7rem">
+    <span class="mono"><span class="prompt">$ </span><code>scp kern &lt;board&gt;:  &amp;&amp;  ssh &lt;board&gt; kern box edge --image alpine -- sh</code></span>
+    <button class="cp" data-cmd="scp kern <board>: && ssh <board> kern box edge --image alpine -- sh" aria-label="copy board install command">copy</button>
+  </div>
+  <p class="note"><strong>ARM boards</strong> (Raspberry&nbsp;Pi, NVIDIA&nbsp;Jetson, Arduino&nbsp;UNO&nbsp;Q) — one&nbsp;~1&nbsp;MB
+    static binary you <code>scp</code> and run: no daemon, no package. Or run the one-liner above on the board
+    (it auto-detects aarch64). Runs where Docker won't even install — see
+    <a href="https://github.com/getkern/kern/blob/main/EDGE.md">EDGE.md</a>.</p>
+
+  <div class="links">
+    <a href="https://github.com/getkern/kern">GitHub</a>
+    <a href="https://github.com/getkern/kern/blob/main/BENCHMARKS.md">Benchmarks</a>
+    <a href="https://github.com/getkern/kern/releases">Releases</a>
+  </div>
+
+  <hr class="sep">
+
+  <noscript>
+    <p class="fallback">The README below is pre-rendered. With JavaScript on it refreshes live from GitHub.
+      Full source on <a href="https://github.com/getkern/kern#readme">github.com/getkern/kern</a>.</p>
+  </noscript>
+
+  <article id="readme" class="markdown-body loading">
+    <p>Loading the current README live from <a href="https://github.com/getkern/kern#readme">github.com/getkern/kern</a>…</p>
+    <div class="skel w2"></div><div class="skel w1"></div><div class="skel w3"></div>
+  </article>
+
+  <footer>
+    Apache-2.0 · the CLI &amp; config surface are not frozen until 1.0 ·
+    <a href="https://github.com/getkern/kern">github.com/getkern/kern</a> ·
+    <span title="the README and version on this page are fetched live from the GitHub repo">content synced live from GitHub</span>
+    <div id="ver" class="mono" title="current production release" style="font-size:.72rem; opacity:.6; margin-top:.55rem; letter-spacing:.02em">kern</div>
+  </footer>
+
+</div>
+
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script>
+(function () {
+  // --- copy buttons (Linux + Windows install commands) ---
+  if (navigator.clipboard) {
+    document.querySelectorAll('button.cp').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        navigator.clipboard.writeText(btn.getAttribute('data-cmd') || '').then(function () {
+          var t = btn.textContent; btn.textContent = 'copied ✓';
+          setTimeout(function () { btn.textContent = t; }, 1400);
+        });
+      });
+    });
+  }
+
+  // --- live README: fetch raw → marked → DOMPurify → inject ---
+  var RAW  = 'https://raw.githubusercontent.com/getkern/kern/main/README.md';
+  var BLOB = 'https://github.com/getkern/kern/blob/main/';
+  var RRAW = 'https://raw.githubusercontent.com/getkern/kern/main/';
+  var el = document.getElementById('readme');
+
+  // The README is pre-rendered into the page at deploy time (works with JS off, survives a GitHub
+  // API hiccup). Below we refetch it live and replace the baked copy so it's always current; on any
+  // failure — no renderer, offline, rate-limited — we simply keep the baked copy.
+  if (!window.marked || !window.DOMPurify) return;
+  marked.setOptions({ gfm: true, breaks: false });
+
+  fetch(RAW, { cache: 'no-cache' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+    .then(function (md) {
+      var html = DOMPurify.sanitize(marked.parse(md));
+      el.classList.remove('loading'); el.removeAttribute('aria-busy');
+      el.innerHTML = html;
+      // resolve repo-relative links/images against the GitHub repo; open externals in a new tab
+      el.querySelectorAll('a[href]').forEach(function (a) {
+        var h = a.getAttribute('href') || '';
+        if (!/^(https?:|#|mailto:)/i.test(h)) a.setAttribute('href', BLOB + h.replace(/^\.?\//, ''));
+        if (/^https?:/i.test(a.getAttribute('href'))) { a.target = '_blank'; a.rel = 'noopener'; }
+      });
+      el.querySelectorAll('img[src]').forEach(function (img) {
+        var s = img.getAttribute('src') || '';
+        if (!/^https?:/i.test(s)) img.setAttribute('src', RRAW + s.replace(/^\.?\//, ''));
+      });
+    })
+    .catch(function () { /* keep the pre-rendered README */ });
+
+  // --- version badge: show the CURRENT production release (pill + footer), live from GitHub.
+  // Falls back to the neutral static label if the API is unreachable, so it never shows a stale version.
+  fetch('https://api.github.com/repos/getkern/kern/releases/latest', { cache: 'no-cache' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) {
+      var v = d && d.tag_name;
+      if (!v) return;
+      var pill = document.getElementById('pill');
+      if (pill) pill.textContent = v;
+      var ver = document.getElementById('ver');
+      if (ver) ver.textContent = 'kern ' + v;
+    })
+    .catch(function () {});
+})();
+</script>
+</body>
+</html>
