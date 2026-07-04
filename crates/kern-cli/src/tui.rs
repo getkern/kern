@@ -1,5 +1,5 @@
 //! `kern top` — a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
-//! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Six tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
+//! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Seven tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
 //! per-box table — MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) — with lifecycle
 //! actions: stop/pause/unpause/kill/logs), **Runs** (aggregate `kern run` throughput — rate/sec, avg
 //! setup latency, peak, total + sparkline; a `⚡` on the tab marks live activity), **Builds** (`kern
@@ -1439,22 +1439,38 @@ fn render(
 
     // Tab bar — active tab inverted, each data tab showing a LIVE count of its rows so you can see how
     // many boxes/profiles/volumes exist without entering the tab. Overview is an aggregate → no count.
-    s.push(' ');
-    for (i, name) in TABS.iter().enumerate() {
-        let label = match i {
-            TAB_BOXES => format!("{name} ({})", rows.len()),
-            TAB_IMAGES => format!("{name} ({})", images.len()),
-            TAB_BUILDS => format!("{name} ({})", builds.len()),
-            TAB_PROFILES => format!("{name} ({})", profs.len()),
-            TAB_STORAGE => format!("{name} ({})", vols.len()),
+    // Each tab carries a live count — but 7 counted tabs (~87 cols) overflow a narrow/80-col
+    // terminal: the bar wraps and shoves the later tabs (Images/Builds/…) off screen. If the full
+    // bar won't fit `width`, drop the counts and render just the names so every tab stays visible.
+    let label = |i: usize, compact: bool| -> String {
+        if compact {
+            return TABS[i].to_string();
+        }
+        match i {
+            TAB_BOXES => format!("{} ({})", TABS[i], rows.len()),
+            TAB_IMAGES => format!("{} ({})", TABS[i], images.len()),
+            TAB_BUILDS => format!("{} ({})", TABS[i], builds.len()),
+            TAB_PROFILES => format!("{} ({})", TABS[i], profs.len()),
+            TAB_STORAGE => format!("{} ({})", TABS[i], vols.len()),
             // Runs is aggregate (no per-row list) — a ⚡ marks live throughput instead of a stale count.
-            TAB_RUNS if host.runs_per_sec > 0.5 => format!("{name} ⚡"),
-            _ => name.to_string(),
-        };
+            TAB_RUNS if host.runs_per_sec > 0.5 => format!("{} ⚡", TABS[i]),
+            _ => TABS[i].to_string(),
+        }
+    };
+    // A rendered tab takes `label.len() + 3` visible cols (a space each side + a trailing separator);
+    // the leading space adds one. Compact the whole bar if the full version won't fit.
+    let full_w = 1
+        + (0..TABS.len())
+            .map(|i| label(i, false).chars().count() + 3)
+            .sum::<usize>();
+    let compact = full_w > width;
+    s.push(' ');
+    for i in 0..TABS.len() {
+        let l = label(i, compact);
         if i == tab {
-            s.push_str(&format!("{b}\x1b[7m {label} \x1b[27m{z} "));
+            s.push_str(&format!("{b}\x1b[7m {l} \x1b[27m{z} "));
         } else {
-            s.push_str(&format!("{d} {label} {z} "));
+            s.push_str(&format!("{d} {l} {z} "));
         }
     }
     s.push('\n');
@@ -2321,6 +2337,7 @@ mod tests {
             runs_spark: Vec::new(),
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
+        // A wide terminal (≥ the ~87-col full bar) shows the live counts.
         let out = render(
             &plain(),
             TAB_BOXES,
@@ -2330,7 +2347,7 @@ mod tests {
             &[],
             &[],
             &[],
-            80,
+            100,
             24,
             0,
             &Mode::Nav,
@@ -2347,6 +2364,32 @@ mod tests {
             !out.contains("Overview ("),
             "Overview must NOT carry a count"
         );
+
+        // A narrow terminal drops the counts but keeps EVERY tab visible (the overflow bug: at 80
+        // cols the counted bar would wrap and shove Images/Builds/… off screen).
+        let narrow = render(
+            &plain(),
+            TAB_BOXES,
+            &boxes,
+            &host,
+            &[],
+            &[],
+            &[],
+            &[],
+            80,
+            24,
+            0,
+            &Mode::Nav,
+        );
+        assert!(!narrow.contains("Boxes (3)"), "narrow bar drops counts");
+        for t in [
+            "Overview", "Boxes", "Runs", "Images", "Builds", "Profiles", "Storage",
+        ] {
+            assert!(
+                narrow.contains(t),
+                "narrow bar keeps every tab: missing {t}"
+            );
+        }
     }
 
     #[test]
