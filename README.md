@@ -4,7 +4,7 @@
 
 **A fast, lightweight sandbox & virtual resource manager.**
 
-Run untrusted or agent-generated code in a real, kernel-enforced sandbox that starts in **~2 ms** —
+Run untrusted or agent-generated code in a real, kernel-enforced sandbox that starts in **~1.9 ms** —
 a **~1.5 MB** rootless binary, **no daemon, no VM**. Embed it from Python or Rust, or drive it from the
 CLI; run it on your laptop, in CI, or on a Raspberry Pi where Docker won't even install.
 
@@ -16,7 +16,7 @@ CLI; run it on your laptop, in CI, or on a Raspberry Pi where Docker won't even 
 [![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1.5 MB static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~300 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1.5 MB static binary, no daemon.">
 </p>
 
 [Install](#install) · [Quickstart](#quickstart) · [Build & publish](#build--publish-images) · [Embed (Rust / Python)](#embed-it) · [How it works](#how-it-works) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
@@ -46,7 +46,7 @@ territory, but *local* and ~1.5 MB — no cloud, no account, no VM):
 ```python
 import kern_sandbox as kern
 r = kern.run_code("print(sum(range(100)))")   # network OFF, hard caps, a timeout the binding enforces
-print(r.stdout, r.success)                     # → a fresh 2 ms box, discarded after
+print(r.stdout, r.success)                     # → a fresh 1.9 ms box, discarded after
 ```
 
 ## Why kern
@@ -367,7 +367,7 @@ travel off-argv. See [ARCHITECTURE.md](ARCHITECTURE.md).
 One isolated `/bin/true`, warm image cache, one box per run. The x86_64 row is **re-measured on an
 Intel i7-14700KF, Linux 6.17**, pinned to a P-core to isolate the hybrid P/E-core scheduler (an
 `/bin/true` box that lands on an E-core runs ~2.1 ms — same class): median of 200 (kern) / 20 (engines)
-sequential runs. kern here: **median 1.7 ms, avg 1.9 ms, best 1.6 ms** (~2 ms unpinned/typical). Your
+sequential runs. kern here: **median 1.7 ms, avg 1.9 ms, best 1.6 ms** (~1.9 ms unpinned/typical). Your
 numbers vary with hardware and load. Board rows are from on-device runs; full method in
 **[BENCHMARKS.md](BENCHMARKS.md)**.
 
@@ -386,7 +386,7 @@ kern is the fastest sandbox here at **~1.9 ms** (ahead of bubblewrap). Its *own*
 (the `KERN_TIMING` phases — `unshare` + overlay + `/dev` + pivot + seccomp, each sub-ms); the rest is
 process start + teardown. Adding a hard cgroup cap (the row above doesn't) brings it to **~6 ms** — but
 **~4 ms of that is external `systemd-run` + D-Bus scope creation, not kern** (`systemd-run --user --scope
--- true` alone is ~4 ms), opt-out with `KERN_NO_SCOPE` (back to ~2 ms, best-effort in-process cgroup). The
+-- true` alone is ~4 ms), opt-out with `KERN_NO_SCOPE` (back to ~1.9 ms, best-effort in-process cgroup). The
 top tier is all within a few ms — *nobody* wins single-shot latency outright. The real gap is to the
 **engines**: **~120–150× faster** than podman/Docker (~300 ms), which round-trip a daemon every run — yet
 kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start: **~500 boxes/s**, **~7 MB**
@@ -465,7 +465,7 @@ kern isolates with Linux **namespaces + seccomp + a read-only userns root** — 
 deny-by-default on devices, with the host's sysfs/procfs masked. That's strong for first-party and
 noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
 hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't — a deliberate trade for
-~2 ms starts and a ~1.5 MB footprint.
+~1.9 ms starts and a ~1.5 MB footprint.
 
 The full threat model, per-feature notes, and the honest *"kern vs a microVM — when to use what"*
 guidance live in [SECURITY.md](SECURITY.md). Found a vulnerability? Report it **privately** via GitHub

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
 <title>kern — a fast, daemonless sandbox &amp; container runtime (Docker alternative)</title>
-<meta name="description" content="kern runs Linux workloads in real, kernel-enforced sandboxes in ~2 ms — a daemonless, ~1 MB Docker alternative. Installs on Linux, Windows (WSL2) and ARM boards (Raspberry Pi, Jetson, Arduino UNO Q).">
+<meta name="description" content="kern runs Linux workloads in real, kernel-enforced sandboxes in ~1.9 ms — a daemonless, ~1.5 MB Docker alternative. Installs on Linux, Windows (WSL2) and ARM boards (Raspberry Pi, Jetson, Arduino UNO Q).">
 <meta name="keywords" content="kern, sandbox, container runtime, Docker alternative, daemonless, rootless, seccomp, cgroups, WSL2, Windows containers, Raspberry Pi, Jetson, ARM, edge, agent sandbox, code execution, OCI, microVM alternative, Firecracker alternative, E2B alternative">
 <meta name="author" content="kern contributors">
 <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
@@ -18,7 +18,7 @@
 <meta property="og:site_name" content="kern">
 <meta property="og:url" content="https://getkern.dev/">
 <meta property="og:title" content="kern — a fast, daemonless sandbox &amp; container runtime">
-<meta property="og:description" content="Run Linux workloads in real, kernel-enforced sandboxes in ~2 ms. A daemonless, ~1 MB Docker alternative — Linux, Windows (WSL2) and ARM boards.">
+<meta property="og:description" content="Run Linux workloads in real, kernel-enforced sandboxes in ~1.9 ms. A daemonless, ~1.5 MB Docker alternative — Linux, Windows (WSL2) and ARM boards.">
 <meta property="og:image" content="https://raw.githubusercontent.com/getkern/kern/main/site/og-image.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
@@ -27,7 +27,7 @@
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="kern — a fast, daemonless sandbox &amp; container runtime">
-<meta name="twitter:description" content="Run Linux workloads in real, kernel-enforced sandboxes in ~2 ms. A daemonless, ~1 MB Docker alternative — Linux, Windows (WSL2) and ARM boards.">
+<meta name="twitter:description" content="Run Linux workloads in real, kernel-enforced sandboxes in ~1.9 ms. A daemonless, ~1.5 MB Docker alternative — Linux, Windows (WSL2) and ARM boards.">
 <meta name="twitter:image" content="https://raw.githubusercontent.com/getkern/kern/main/site/og-image.png">
 
 <link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
@@ -39,7 +39,7 @@
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "kern",
-  "description": "A fast, daemonless, rootless sandbox and virtual resource manager — run Linux workloads in real kernel-enforced boxes in ~2 ms. A ~1 MB Docker alternative.",
+  "description": "A fast, daemonless, rootless sandbox and virtual resource manager — run Linux workloads in real kernel-enforced boxes in ~1.9 ms. A ~1.5 MB Docker alternative.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux, Windows (WSL2), aarch64/ARM",
   "url": "https://getkern.dev/",
@@ -113,10 +113,10 @@
   <h1>kern</h1>
 
   <p class="tagline">A fast, lightweight sandbox &amp; virtual resource manager. <span class="pill" id="pill">early — but it runs</span></p>
-  <p class="sub"><strong>~5.5&nbsp;ms</strong> to a rootless, kernel-enforced box — vs <strong>~308&nbsp;ms</strong>
+  <p class="sub"><strong>~1.9&nbsp;ms</strong> to a rootless, kernel-enforced box — vs <strong>~300&nbsp;ms</strong>
     for <code>docker run</code>. Daemonless, no root, no runtime to install. Runs on
     <strong>Linux</strong>, <strong>Windows (via WSL2)</strong>, and <strong>ARM boards</strong> —
-    Raspberry&nbsp;Pi, NVIDIA&nbsp;Jetson, Arduino&nbsp;UNO&nbsp;Q — the same&nbsp;~1&nbsp;MB binary everywhere.</p>
+    Raspberry&nbsp;Pi, NVIDIA&nbsp;Jetson, Arduino&nbsp;UNO&nbsp;Q — the same&nbsp;~1.5&nbsp;MB binary everywhere.</p>
 
   <div class="install">
     <span class="mono"><span class="prompt">$ </span><code id="cmd">curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh</code></span>
@@ -136,7 +136,7 @@
     <span class="mono"><span class="prompt">$ </span><code>scp kern &lt;board&gt;:  &amp;&amp;  ssh &lt;board&gt; kern box edge --image alpine -- sh</code></span>
     <button class="cp" data-cmd="scp kern <board>: && ssh <board> kern box edge --image alpine -- sh" aria-label="copy board install command">copy</button>
   </div>
-  <p class="note"><strong>ARM boards</strong> (Raspberry&nbsp;Pi, NVIDIA&nbsp;Jetson, Arduino&nbsp;UNO&nbsp;Q) — one&nbsp;~1&nbsp;MB
+  <p class="note"><strong>ARM boards</strong> (Raspberry&nbsp;Pi, NVIDIA&nbsp;Jetson, Arduino&nbsp;UNO&nbsp;Q) — one&nbsp;~1.5&nbsp;MB
     static binary you <code>scp</code> and run: no daemon, no package. Or run the one-liner above on the board
     (it auto-detects aarch64). Runs where Docker won't even install — see
     <a href="https://github.com/getkern/kern/blob/main/EDGE.md">EDGE.md</a>.</p>
