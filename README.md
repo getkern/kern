@@ -20,7 +20,7 @@ even install. Embed it from Python or Rust, or drive it from the CLI.
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~300 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1.5 MB static binary, no daemon.">
 </p>
 
-[Install](#install) · [Quickstart](#quickstart) · [Build & publish](#build--publish-images) · [Embed (Rust / Python)](#embed-it) · [How it works](#how-it-works) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
+[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern--and-when-not) · [Embed (Rust / Python)](#embed-it) · [How it works](#how-it-works) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -343,6 +343,38 @@ userland**. The kernel *flavor* doesn't matter — kern runs even on an *Android
 userland (the Arduino UNO Q). It does **not** run on stock Android-the-OS (Bionic, SELinux, userns
 off). Daemonless is a big win on RAM-constrained boards (0 resident vs ~186 MB) — see
 **[EDGE.md](EDGE.md)**. ARM CI is tracked in the issues.
+
+## Docker compatibility
+
+kern speaks Docker's **formats**, so your existing images and stacks just work — but it does **not**
+reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in clone.
+
+| From your Docker setup | kern |
+|------------------------|------|
+| **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run — multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd** |
+| **`docker-compose.yml`** | ✅ `kern compose` reads it — `depends_on`, `healthcheck`, `deploy.resources.limits` |
+| **Dockerfile** `build` | ✅ `kern build` — all common instructions, **multi-stage**, `COPY --from=<stage \| external image>`, BuildKit **heredocs**, `--build-arg`, layer cache. Daemonless: each `RUN` is a real box |
+| **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
+| **Docker Engine API** / `docker.sock` | ❌ — tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
+| **`alias docker=kern`** (CLI drop-in) | ❌ — it's `kern box …`, not `docker run …` (close, not identical) |
+| **Swarm** | ❌ — use `compose` / `--pod` |
+
+## When to use kern — and when not
+
+**Use kern when you want:**
+
+- a **fast, daemonless sandbox** for your own or **agent/LLM-generated** code (fresh box per call, embeddable from Rust/Python);
+- **CI / build** boxes, or a throwaway dev environment, without a background daemon;
+- containers on **edge / ARM** boards where Docker won't even install (Pi, Jetson, Android-kernel);
+- **resource slices** beyond containers — `vcpu:` / `vdisk:` / `vgpio:` (GPU on the roadmap).
+
+**Reach for something else when you need:**
+
+- a hard boundary against **actively hostile multi-tenant** code → a **microVM** (Firecracker) or gVisor. kern's FS/PID/namespace/cgroup isolation is a real kernel boundary for *your own or semi-trusted* code, not a VM;
+- the **Docker Engine API / Docker Desktop** workflow, or a true CLI drop-in → **Docker / Podman**;
+- **Kubernetes CRI** integration → containerd / CRI-O.
+
+kern states every boundary that is cooperative or opt-in plainly in **[SECURITY.md](SECURITY.md)** — being honest about the edges is the point.
 
 ## How it works
 
