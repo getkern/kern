@@ -3,11 +3,53 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>kern — a fast, lightweight sandbox &amp; virtual resource manager</title>
-<meta name="description" content="Run Linux workloads in real, kernel-enforced sandboxes — daemonless, ~1 MB, single-digit-millisecond cold start. One static binary, x86_64 + aarch64.">
-<meta property="og:title" content="kern">
-<meta property="og:description" content="A fast, lightweight sandbox & virtual resource manager. Daemonless, ~1 MB, single-digit-ms cold start.">
+
+<title>kern — a fast, daemonless sandbox &amp; container runtime (Docker alternative)</title>
+<meta name="description" content="kern runs Linux workloads in real, kernel-enforced sandboxes in ~2 ms — a daemonless, ~1 MB Docker alternative. Installs on Linux, Windows (WSL2) and ARM boards (Raspberry Pi, Jetson, Arduino UNO Q).">
+<meta name="keywords" content="kern, sandbox, container runtime, Docker alternative, daemonless, rootless, seccomp, cgroups, WSL2, Windows containers, Raspberry Pi, Jetson, ARM, edge, agent sandbox, code execution, OCI, microVM alternative, Firecracker alternative, E2B alternative">
+<meta name="author" content="kern contributors">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<link rel="canonical" href="https://getkern.dev/">
+<link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22&gt;&lt;text y=%22.9em%22 font-size=%2290%22&gt;📦&lt;/text&gt;&lt;/svg&gt;">
 <meta name="theme-color" content="#ffffff">
+
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="kern">
+<meta property="og:url" content="https://getkern.dev/">
+<meta property="og:title" content="kern — a fast, daemonless sandbox &amp; container runtime">
+<meta property="og:description" content="Run Linux workloads in real, kernel-enforced sandboxes in ~2 ms. A daemonless, ~1 MB Docker alternative — Linux, Windows (WSL2) and ARM boards.">
+<meta property="og:image" content="https://raw.githubusercontent.com/getkern/kern/main/assets/demo.svg">
+<meta property="og:image:alt" content="kern terminal demo: a rootless isolated box starting in ~5.5 ms">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="kern — a fast, daemonless sandbox &amp; container runtime">
+<meta name="twitter:description" content="Run Linux workloads in real, kernel-enforced sandboxes in ~2 ms. A daemonless, ~1 MB Docker alternative — Linux, Windows (WSL2) and ARM boards.">
+<meta name="twitter:image" content="https://raw.githubusercontent.com/getkern/kern/main/assets/demo.svg">
+
+<link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
+<link rel="preconnect" href="https://api.github.com" crossorigin>
+
+<!-- Structured data: this is a developer software application, free/open-source -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "kern",
+  "description": "A fast, daemonless, rootless sandbox and virtual resource manager — run Linux workloads in real kernel-enforced boxes in ~2 ms. A ~1 MB Docker alternative.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux, Windows (WSL2), aarch64/ARM",
+  "url": "https://getkern.dev/",
+  "downloadUrl": "https://github.com/getkern/kern/releases/latest",
+  "softwareHelp": "https://github.com/getkern/kern#readme",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "isAccessibleForFree": true,
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Organization", "name": "kern contributors", "url": "https://github.com/getkern/kern" }
+}
+</script>
+
 <link rel="stylesheet" href="/vendor/github-markdown.css">
 <style>
   :root{
@@ -110,9 +152,11 @@
       Full source on <a href="https://github.com/getkern/kern#readme">github.com/getkern/kern</a>.</p>
   </noscript>
 
-  <article id="readme" class="markdown-body loading">
-    <p>Loading the current README live from <a href="https://github.com/getkern/kern#readme">github.com/getkern/kern</a>…</p>
+  <article id="readme" class="markdown-body">
+<!--README_START-->
+    <p class="loading">Loading the current README from <a href="https://github.com/getkern/kern#readme">github.com/getkern/kern</a>…</p>
     <div class="skel w2"></div><div class="skel w1"></div><div class="skel w3"></div>
+<!--README_END-->
   </article>
 
   <footer>

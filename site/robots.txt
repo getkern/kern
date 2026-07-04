@@ -1,0 +1,5 @@
+# getkern.dev — everything is public and crawlable
+User-agent: *
+Allow: /
+
+Sitemap: https://getkern.dev/sitemap.xml
