@@ -334,15 +334,19 @@ crates.io).
 | Platform | Arch | Status |
 |---|---|---|
 | x86_64 Linux | x86_64 | ✅ primary + automated CI |
+| **Windows 10/11 (via WSL2)** | x86_64 | ✅ CI-built shim + distro (`install.ps1`) |
 | NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated |
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
 
-Needs a **Linux kernel** with **unprivileged user namespaces** + **cgroups v2**, and a **Linux
+kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroups v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter — kern runs even on an *Android kernel* with a Linux
-userland (the Arduino UNO Q). It does **not** run on stock Android-the-OS (Bionic, SELinux, userns
-off). Daemonless is a big win on RAM-constrained boards (0 resident vs ~186 MB) — see
-**[EDGE.md](EDGE.md)**. ARM CI is tracked in the issues.
+userland (the Arduino UNO Q). **On Windows, WSL2 *is* that Linux kernel** — the one-line PowerShell
+installer sets up WSL2 and drops in a pre-baked kern distro, so hard caps (`--memory`/`--cpus`) are
+enforced for real (the honest caveat: you're inside the WSL2 VM, so it's "no Docker Desktop", not "no
+VM"). kern does **not** run on stock Android-the-OS (Bionic, SELinux, userns off). Daemonless is a big
+win on RAM-constrained boards (0 resident vs ~186 MB) — see **[EDGE.md](EDGE.md)**. ARM CI is tracked
+in the issues.
 
 ## Docker compatibility
 
