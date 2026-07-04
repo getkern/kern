@@ -958,7 +958,21 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             };
             unsafe { libc::close(ro_fd) };
             if r2 != 0 {
-                result = Err(Error::last("remount_ro(volume)"));
+                let e = std::io::Error::last_os_error();
+                result = Err(if e.raw_os_error() == Some(libc::EPERM) {
+                    // Some kernels (notably Android-kernel boards) refuse a bind remount-RO with
+                    // EPERM. The root `--read-only` path sidesteps this (it remounts the overlay,
+                    // not a bind), but a `:ro` VOLUME has no overlay to fall back to — so fail with
+                    // a clear, actionable message instead of a bare "Operation not permitted".
+                    Error::Unsupported(
+                        "a read-only bind mount (:ro) isn't supported on this kernel — bind \
+                         remount-RO is refused here (common on Android-kernel boards). Drop ':ro' \
+                         to mount it read-write, or use --read-only for the box root (overlay-based, \
+                         which works here).",
+                    )
+                } else {
+                    Error::Syscall("remount_ro(volume)", e)
+                });
                 break;
             }
         }

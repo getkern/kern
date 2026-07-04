@@ -717,7 +717,7 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
 
     // Direct `/dev/*` device nodes: canonicalize, then require the real path stays under `/dev/`.
     for path in vgpio_device_paths(e) {
-        match std::fs::canonicalize(path) {
+        match std::fs::canonicalize(&path) {
             Ok(real) if real.starts_with("/dev/") => {
                 devs.push(real.to_string_lossy().into_owned());
             }
@@ -740,22 +740,34 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
 }
 
 /// The `/dev/*`-path fields of a vGPIO profile (everything except pins/pwm/adc/onewire/leds/net,
-/// which map to gpiochips or sysfs). Matches the private's `device_paths()`.
-fn vgpio_device_paths(e: &VGpioEntry) -> impl Iterator<Item = &str> {
-    e.i2c
-        .iter()
-        .chain(&e.spi)
-        .chain(&e.uart)
-        .chain(&e.can)
-        .chain(&e.camera)
-        .chain(&e.audio)
-        .chain(&e.bluetooth)
-        .chain(&e.usb)
-        .chain(&e.input)
-        .chain(&e.midi)
-        .chain(&e.display)
-        .chain(&e.extra)
-        .map(String::as_str)
+/// which map to gpiochips or sysfs). Matches the private's `device_paths()`. An `i2c` entry may be a
+/// bare bus number (`"1"`) or `"i2c-1"` — both normalise to `/dev/i2c-1` — or a full `/dev/…` path;
+/// the other buses are taken as `/dev/*` paths verbatim.
+fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
+    let i2c = e.i2c.iter().map(|s| {
+        if s.starts_with('/') {
+            s.clone()
+        } else {
+            format!("/dev/i2c-{}", s.strip_prefix("i2c-").unwrap_or(s))
+        }
+    });
+    let rest = [
+        &e.spi,
+        &e.uart,
+        &e.can,
+        &e.camera,
+        &e.audio,
+        &e.bluetooth,
+        &e.usb,
+        &e.input,
+        &e.midi,
+        &e.display,
+        &e.extra,
+    ]
+    .into_iter()
+    .flatten()
+    .cloned();
+    i2c.chain(rest).collect()
 }
 
 /// A resolved `[[vdisk]]` profile: a size-capped volume the box mounts at `/vdisk/<name>`. The
