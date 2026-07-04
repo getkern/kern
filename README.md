@@ -356,7 +356,6 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 | **Dockerfile** `build` | ✅ `kern build` — all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), BuildKit **heredocs**, `--build-arg`, layer cache. Daemonless: each `RUN` is a real box |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
 | **Docker Engine API** / `docker.sock` | ❌ — tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
-| **`alias docker=kern`** (CLI drop-in) | ❌ — it's `kern box …`, not `docker run …` (close, not identical) |
 | **Swarm** | ❌ — use `compose` / `--pod` |
 
 ## When to use kern (and when not)
