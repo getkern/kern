@@ -744,11 +744,24 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
 /// bare bus number (`"1"`) or `"i2c-1"` — both normalise to `/dev/i2c-1` — or a full `/dev/…` path;
 /// the other buses are taken as `/dev/*` paths verbatim.
 fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
-    let i2c = e.i2c.iter().map(|s| {
+    let i2c = e.i2c.iter().filter_map(|s| {
+        // A full path is taken verbatim — the `canonicalize` + `starts_with("/dev/")` gate at the
+        // call site is the confinement check (so `/dev/../etc/x` → `/etc/x` is rejected there). For
+        // a NON-path entry we require a plain bus NUMBER: validate all-digits BEFORE building the
+        // path, so a crafted `"1/../spi0"` can't concatenate into `/dev/i2c-1/../spi0` → `/dev/spi0`
+        // (a different device that would still pass the `/dev/` gate). Validate the property (a bus
+        // number), not the shape.
         if s.starts_with('/') {
-            s.clone()
+            return Some(s.clone());
+        }
+        let n = s.strip_prefix("i2c-").unwrap_or(s);
+        if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+            Some(format!("/dev/i2c-{n}"))
         } else {
-            format!("/dev/i2c-{}", s.strip_prefix("i2c-").unwrap_or(s))
+            eprintln!(
+                "kern: vgpio i2c entry {s:?} is not a bus number (e.g. \"1\", \"i2c-1\") or a /dev/ path — skipped"
+            );
+            None
         }
     });
     let rest = [
