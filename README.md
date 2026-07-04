@@ -185,15 +185,17 @@ or opt-in (the GPU cap, vGPIO/vdisk trust scope, network volumes), [SECURITY.md]
 
 ## Install
 
+**🐧 Linux & ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q) — one line; auto-detects `x86-64` / `aarch64`:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
 Served from **github.com** (read the script first if you like). It downloads the release binary for
-your arch (`linux-x86_64` / `linux-aarch64`) and verifies the sha256 before installing. No Rust
-toolchain required. (`getkern.dev/install.sh` is a short alias.)
+your arch and verifies the sha256 before installing. No Rust toolchain required. (`getkern.dev/install.sh`
+is a short alias. On macOS, run it inside a Linux VM.)
 
-**Windows** — one line in PowerShell (no Docker Desktop, no Ubuntu):
+**🪟 Windows** — one line in PowerShell (no Docker Desktop, no Ubuntu):
 
 ```powershell
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
@@ -206,6 +208,16 @@ manual steps), drops the `kern.exe` shim on your PATH, and verifies end-to-end. 
 sha256-checked. After it finishes: `kern box dev --image alpine -it -- sh`. Honest caveat: kern runs
 *inside* the WSL2 kernel, so it doesn't shed the VM weight native Linux does — the win is "no Docker
 Desktop", not "no VM".
+
+**📦 Offline / air-gapped** (a board or locked-down server with no internet) — kern is a single
+~1.5 MB static binary, so copying that one file *is* the install:
+
+```sh
+scp kern pi@raspberrypi:~/          # then:  ssh pi@raspberrypi kern box dev --image alpine -- sh
+```
+
+No daemon, no package, nothing to install on the target — which is why it runs where Docker can't
+(see [EDGE.md](EDGE.md)).
 
 <details>
 <summary>Download + verify by hand, or build from source</summary>
