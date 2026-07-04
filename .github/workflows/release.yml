@@ -4,6 +4,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)build + attach assets for (e.g. v0.6.2)"
+        required: true
 
 permissions:
   contents: write # create/upload release assets
@@ -11,6 +16,9 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.target }}
+    # A tag push builds everything; a manual dispatch only backfills the Windows assets (below) onto an
+    # existing release — the Linux binaries + SBOM are already attached from the tag's original run.
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -48,6 +56,7 @@ jobs:
 
   sbom:
     name: SBOM (SPDX)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write # anchore/sbom-action attaches the SBOM to the tag's release
@@ -62,3 +71,49 @@ jobs:
           path: .
           format: spdx-json
           artifact-name: kern.spdx.json
+
+  windows:
+    name: windows shim + WSL rootfs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach the Windows assets to the release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu, x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross tooling (mingw + musl)
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 musl-tools
+      - name: The release tag to attach to
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Build the kern.exe shim (mingw cross)
+        run: cargo build --release --target x86_64-pc-windows-gnu --manifest-path windows/kern-win/Cargo.toml
+      - name: Build the kern musl binary (baked into the WSL rootfs)
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin kern
+      - name: Build the pre-baked WSL rootfs (Alpine + kern, in a user namespace)
+        run: |
+          set -eu
+          # Ubuntu 24.04 runners default to AppArmor-restricted unprivileged userns; the rootfs build
+          # bootstraps Alpine via `unshare -r` (no root). Relax the restriction for this runner only.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          KERN_BIN="$PWD/target/x86_64-unknown-linux-musl/release/kern" \
+          OUT="$PWD/kern-wsl-rootfs.tar.gz" \
+          sh windows/kern-win/build-wsl-rootfs.sh
+      - name: Package + checksums (exact names install.ps1 expects)
+        run: |
+          set -eu
+          cp target/x86_64-pc-windows-gnu/release/kern.exe kern-windows-x86_64.exe
+          sha256sum kern-windows-x86_64.exe > kern-windows-x86_64.exe.sha256
+          sha256sum kern-wsl-rootfs.tar.gz  > kern-wsl-rootfs.tar.gz.sha256
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            kern-windows-x86_64.exe
+            kern-windows-x86_64.exe.sha256
+            kern-wsl-rootfs.tar.gz
+            kern-wsl-rootfs.tar.gz.sha256
+          fail_on_unmatched_files: true

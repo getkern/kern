@@ -1,0 +1,25 @@
+# kern.exe — the Windows→WSL2 bridge. kern is one Linux binary; on Windows the edge is a thin shim
+# that forwards to kern running inside a WSL2 distro. Zero dependencies (std only), like kern itself.
+#
+# This crate is OUTSIDE the main workspace (see the root Cargo.toml `exclude`) so the normal Linux
+# `cargo build`/`clippy`/`test` never tries to build a Windows target. The release CI cross-compiles it:
+#   cargo build --release --target x86_64-pc-windows-gnu --manifest-path windows/kern-win/Cargo.toml
+# (needs the mingw-w64 toolchain + `rustup target add x86_64-pc-windows-gnu`).
+[package]
+name = "kern-win"
+version = "0.6.2"
+edition = "2021"
+description = "Windows->WSL2 forwarder for kern (the Windows edge is a thin shim over one Linux kern)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "kern"          # ships as kern.exe on Windows
+path = "src/main.rs"
+
+[dependencies]           # zero — std only, like kern itself
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"          # a tiny exe
