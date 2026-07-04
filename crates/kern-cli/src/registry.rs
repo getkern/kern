@@ -576,13 +576,22 @@ pub fn volumes_in_use() -> std::collections::HashSet<String> {
 }
 
 /// Is this our live box supervisor? It must exist (`kill(pid,0)==0`; `EPERM` = another user's
-/// pid → gone) AND its kernel start-time must match what we recorded — so a reused pid (a
-/// different process that happens to have the same number) is correctly seen as gone.
+/// pid → gone) AND — when both start-times are known — its kernel start-time must match what we
+/// recorded, so a reused pid (a different process that happens to have the same number) is seen as
+/// gone. The start-time check is an ANTI-REUSE refinement layered on the existence proof, NOT a
+/// second liveness test: if we recorded no start-time (`starttime == 0`) OR the live read comes back
+/// empty (`proc_starttime` returns 0 — a transient `/proc` read failure: `open` hitting `EMFILE`
+/// under heavy parallel fd pressure, a stat hiccup during namespace churn), we fall back to the
+/// `kill(0)` proof rather than declaring a demonstrably-existing process dead. Pruning a live box's
+/// entry on a momentary read failure is fail-DANGEROUS — it would drop a running box from `ps`/
+/// `stop` and let `volume prune` delete a volume it still mounts. Pid-reuse is still caught whenever
+/// the live read succeeds (the overwhelmingly common case).
 fn is_alive(pid: i32, starttime: u64) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0 {
         return false;
     }
-    starttime == 0 || proc_starttime(pid) == starttime
+    let live = proc_starttime(pid);
+    starttime == 0 || live == 0 || live == starttime
 }
 
 /// The fields of `/proc/<pid>/stat` *after* the `comm` field — i.e. the slice past the last `)`.
