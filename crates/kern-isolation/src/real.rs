@@ -960,15 +960,17 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             if r2 != 0 {
                 let e = std::io::Error::last_os_error();
                 result = Err(if e.raw_os_error() == Some(libc::EPERM) {
-                    // Some kernels (notably Android-kernel boards) refuse a bind remount-RO with
-                    // EPERM. The root `--read-only` path sidesteps this (it remounts the overlay,
-                    // not a bind), but a `:ro` VOLUME has no overlay to fall back to — so fail with
-                    // a clear, actionable message instead of a bare "Operation not permitted".
+                    // EPERM on a bind remount-RO has more than one cause: the kernel may not support
+                    // it at all (common on Android-kernel boards, where the root `--read-only` path
+                    // sidesteps it by remounting the *overlay*, not a bind), OR a mount policy —
+                    // e.g. SELinux, always on under an Android kernel — refused it. Don't assert one
+                    // cause; list the alternatives so the message isn't misleading when it's a policy.
                     Error::Unsupported(
-                        "a read-only bind mount (:ro) isn't supported on this kernel — bind \
-                         remount-RO is refused here (common on Android-kernel boards). Drop ':ro' \
-                         to mount it read-write, or use --read-only for the box root (overlay-based, \
-                         which works here).",
+                        "read-only bind mount (:ro) failed with EPERM — this kernel may not support a \
+                         bind remount-RO (common on Android-kernel boards), or a mount policy (e.g. \
+                         SELinux) refused it. Alternatives: use --read-only for the box root \
+                         (overlay-based, works on Android), or drop ':ro' to mount read-write. On a \
+                         hardened/SELinux kernel, check your mount policy.",
                     )
                 } else {
                     Error::Syscall("remount_ro(volume)", e)
