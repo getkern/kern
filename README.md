@@ -192,6 +192,20 @@ Served from **github.com** (read the script first if you like). It downloads the
 your arch (`linux-x86_64` / `linux-aarch64`) and verifies the sha256 before installing. No Rust
 toolchain required. (`getkern.dev/install.sh` is a short alias.)
 
+**Windows** — one line in PowerShell (no Docker Desktop, no Ubuntu):
+
+```powershell
+irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+```
+
+kern runs inside **WSL2** — a real Linux kernel — so hard caps (`--memory`/`--cpus`) are enforced for
+real. The installer ensures the WSL2 engine (self-elevating for the one reboot it may need, then
+resuming on its own), imports kern's **own** pre-baked distro (a tiny Alpine + kern — no Ubuntu, no
+manual steps), drops the `kern.exe` shim on your PATH, and verifies end-to-end. Every download is
+sha256-checked. After it finishes: `kern box dev --image alpine -it -- sh`. Honest caveat: kern runs
+*inside* the WSL2 kernel, so it doesn't shed the VM weight native Linux does — the win is "no Docker
+Desktop", not "no VM".
+
 <details>
 <summary>Download + verify by hand, or build from source</summary>
 
@@ -426,13 +440,14 @@ governs is driven by what proves useful.
 
 - **Shipped:** build + tag + push, zstd layers, `--init`, `--platform`, pods, the Python binding;
   ongoing polish + broader (ARM) CI and edge/I/O ergonomics.
-- **Windows, via WSL2 (runs today; one-line installer being wired).** kern runs on Windows inside WSL2
+- **Windows, via WSL2 (shipped — one line: see [Install](#install)).** kern runs on Windows inside WSL2
   — a real Linux kernel — so hard caps (`--memory`/`--cpus`) are real there, verified. A `kern.exe` shim
-  and a pre-baked kern WSL2 distro (Alpine + kern, no Ubuntu, no manual steps) are built and staged; the
-  one-shot `irm … | iex` installer that self-elevates, imports the distro and drops the shim on PATH is
-  being wired to the public release (its assets ship on the GitHub release). Honest caveat: kern runs
-  *inside* the WSL2 kernel, so it doesn't shed the VM weight native Linux does — the win is "no Docker
-  Desktop", not "no VM".
+  and a pre-baked kern WSL2 distro (Alpine + kern, no Ubuntu, no manual steps) install with a single
+  `irm … | iex` that self-elevates, imports the distro and drops the shim on PATH. Both the shim and the
+  distro are **built by the release CI from tagged source and sha256-signed** — the installer verifies
+  every download, so it's the same trust level as the Linux binaries, not a hand-uploaded exe. Honest
+  caveat: kern runs *inside* the WSL2 kernel, so it doesn't shed the VM weight native Linux does — the
+  win is "no Docker Desktop", not "no VM".
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. It lands incrementally,
   each stage useful on its own and each opt-in (`--no-gpu` stays the default): first **safe access +
   visibility** (device passthrough, driver-gated, sysfs/procfs masked; per-box VRAM + utilisation in
