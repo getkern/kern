@@ -2605,7 +2605,7 @@ mod tests {
         // Symlink header (typeflag '2', harmless linkname 'safe') with a FALSE size=512, followed by a
         // hidden second symlink header `esc -> /etc/shadow`. Pre-fix the vetter returned Ok (skipping
         // the hidden header); now it must reject the desync.
-        for carrier in [b'2', b'1', b'5'] {
+        for carrier in *b"215" {
             let mut stream = Vec::new();
             stream.extend_from_slice(&hdr(b"safe_looking", carrier, 512, b"safe"));
             stream.extend_from_slice(&hdr(b"esc", b'2', 0, b"/etc/shadow")); // the hidden escaper
@@ -2736,7 +2736,7 @@ mod tests {
     /// The modelled member types (dir '5', regular '0', contiguous '7') still pass.
     #[test]
     fn accepts_known_member_typeflags() {
-        for tf in [b'0', b'5', b'7'] {
+        for tf in *b"057" {
             let mut stream = Vec::new();
             stream.extend_from_slice(&hdr(b"usr/lib/thing", tf, 0, b""));
             stream.extend(end_marker());

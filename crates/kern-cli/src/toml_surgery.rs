@@ -18,10 +18,9 @@ fn name_value(trimmed: &str) -> Option<&str> {
     // wasn't found → `config add` on an existing name created a DUPLICATE instead of erroring.
     let (q, after) = if let Some(a) = rest.strip_prefix('"') {
         ('"', a)
-    } else if let Some(a) = rest.strip_prefix('\'') {
-        ('\'', a)
     } else {
-        return None;
+        let a = rest.strip_prefix('\'')?;
+        ('\'', a)
     };
     let end = after.find(q)?;
     Some(&after[..end])

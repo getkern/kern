@@ -872,7 +872,7 @@ mod tests {
         // Enumerate ALL length-6 strings over the structural ASCII alphabet — total coverage of the
         // short-input space where a brace/quote/comma scanner bug lives. Complements the randomized
         // test below (which reaches long inputs, multibyte, and deep nesting the enumeration can't).
-        let alphabet = [b'{', b'}', b'"', b',', b'=', b'a'];
+        let alphabet = *b"{}\",=a";
         let n = alphabet.len();
         for i in 0..n.pow(6) {
             let mut buf = [0u8; 6];
