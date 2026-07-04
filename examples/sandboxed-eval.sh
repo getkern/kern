@@ -8,7 +8,7 @@
 # (e.g. `--image node ... node -e "<snippet>"`) — the isolation is identical.
 #
 # The lockdown on every eval:
-#   --ro           whole root read-only (writes fail)
+#   --read-only    whole root read-only (writes fail)
 #   --network none  no network at all (isolated netns, loopback only) — the model can't phone home
 #   --memory/--cpus/--pids-limit   resource caps (RAM ceiling, CPU share, fork-bomb containment)
 #   --timeout      wall-clock kill switch, so a runaway snippet can't hang the agent
@@ -29,7 +29,7 @@ eval_untrusted() {
   printf '%s\n  snippet: %s\n' "$label" "$snippet"
   # Disable errexit around the eval so a non-zero exit is DATA we capture, not a script abort.
   set +e
-  "$kern" box "eval-$$-$n" --image alpine --ro --network none \
+  "$kern" box "eval-$$-$n" --image alpine --read-only --network none \
     --memory 128m --cpus 0.5 --pids-limit 64 --timeout 5 -- \
     sh -c "$snippet"
   code=$?
