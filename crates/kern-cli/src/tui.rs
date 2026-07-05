@@ -74,6 +74,7 @@ struct Form {
     error: Option<String>,
 }
 
+#[derive(Clone)]
 struct Field {
     label: &'static str,
     /// Shown dim inside an empty field as a placeholder (text fields), or as the toggle's caption.
@@ -82,6 +83,13 @@ struct Field {
     /// A boolean switch (`[x]`/`[ ]`, Space flips) rather than free-text — for keys like `persistent`
     /// that are a bool, so a beginner never types "true"/"false". On = non-empty value; off = empty.
     toggle: bool,
+    /// Checkbox options: the host devices DETECTED for this field. Non-empty ⇒ a "pick" field — the
+    /// user toggles which are selected (←/→ to move, Space to check) instead of typing a `/dev/…`
+    /// path, so a wrong path is impossible. `value` (what `apply_form` saves) stays in sync = the
+    /// checked options, comma-joined. `cur` is the highlighted option.
+    options: Vec<String>,
+    sel: Vec<bool>,
+    cur: usize,
 }
 
 impl Field {
@@ -92,17 +100,74 @@ impl Field {
             hint,
             value: String::new(),
             toggle: false,
+            options: Vec::new(),
+            sel: Vec::new(),
+            cur: 0,
         }
     }
 
     /// A boolean toggle (off by default). Space/`y`/`n` set it; any non-empty value reads as on.
     fn toggle(label: &'static str, hint: &'static str) -> Self {
         Field {
-            label,
-            hint,
-            value: String::new(),
             toggle: true,
+            ..Field::text(label, hint)
         }
+    }
+
+    /// A checkbox picker over detected devices — foolproof: you can only choose what exists.
+    fn pick(label: &'static str, hint: &'static str, options: Vec<String>) -> Self {
+        let n = options.len();
+        Field {
+            options,
+            sel: vec![false; n],
+            ..Field::text(label, hint)
+        }
+    }
+
+    /// True for a checkbox picker (has detected device options).
+    fn is_pick(&self) -> bool {
+        !self.options.is_empty()
+    }
+
+    /// Re-derive `value` (comma-joined checked options) after a toggle, so `apply_form` sees it.
+    fn sync_pick_value(&mut self) {
+        self.value = self
+            .options
+            .iter()
+            .zip(&self.sel)
+            .filter(|(_, on)| **on)
+            .map(|(o, _)| o.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+
+    /// For an EDIT form: check the options that match a pre-filled comma/space `value`. A saved device
+    /// that ISN'T detected on this host (e.g. a profile authored on a Pi, edited on a desktop) is kept
+    /// as a checked extra option, so editing never silently drops it.
+    fn seed_pick_selection(&mut self) {
+        if !self.is_pick() {
+            return;
+        }
+        let want: Vec<String> = self
+            .value
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        for s in &mut self.sel {
+            *s = false;
+        }
+        for tok in want {
+            match self.options.iter().position(|o| *o == tok) {
+                Some(i) => self.sel[i] = true,
+                None => {
+                    self.options.push(tok);
+                    self.sel.push(true);
+                }
+            }
+        }
+        self.sync_pick_value();
     }
 }
 
@@ -840,28 +905,54 @@ fn section_fields(section: &str) -> Vec<Field> {
             Field::text("backend", "cpu/gpio id (optional)"),
             Field::text("extends", "base profile (optional)"),
         ],
-        "vgpio" => vec![
-            Field::text("name", "e.g. leds"),
-            Field::text("backend", "e.g. gpio:0"),
-            Field::text("pins", "e.g. 17,27,22"),
-            Field::text("pwm", "PWM lines, e.g. 12,13"),
-            Field::text("adc", "ADC channels"),
-            Field::text("onewire", "1-Wire lines"),
-            Field::text("i2c", "/dev/i2c-1,…"),
-            Field::text("spi", "/dev/spidev0.0,…"),
-            Field::text("uart", "/dev/ttyS0,…"),
-            Field::text("can", "/dev/can0,…"),
-            Field::text("camera", "/dev/video0,…"),
-            Field::text("audio", "/dev/snd/…"),
-            Field::text("leds", "led names/paths"),
-            Field::text("bluetooth", "hci ids"),
-            Field::text("usb", "usb paths"),
-            Field::text("input", "/dev/input/…"),
-            Field::text("midi", "/dev/midi…"),
-            Field::text("display", "display nodes"),
-            Field::text("net", "iface names"),
-            Field::text("extra", "other /dev paths"),
-        ],
+        "vgpio" => {
+            // Device-PATH kinds become a foolproof checkbox PICKER of what the host actually exposes
+            // (pick, don't type a /dev/ path). A kind with nothing detected falls back to a manual
+            // text field further down — same mechanism on every host, only the contents differ.
+            let mut picks = Vec::new();
+            let mut manual = Vec::new();
+            for (label, hint) in [
+                ("i2c", "/dev/i2c-1,…"),
+                ("spi", "/dev/spidev0.0,…"),
+                ("uart", "/dev/ttyS0,…"),
+                ("leds", "led names"),
+                ("bluetooth", "hci ids"),
+                ("audio", "/dev/snd/…"),
+                ("camera", "/dev/video0,…"),
+                ("input", "/dev/input/…"),
+                ("can", "/dev/can0,…"),
+            ] {
+                let opts = present_devices(label);
+                if opts.is_empty() {
+                    manual.push(Field::text(label, hint));
+                } else {
+                    picks.push(Field::pick(
+                        label,
+                        "Space select · ←→ move · pick what's here",
+                        opts,
+                    ));
+                }
+            }
+            // Number / not-auto-detectable kinds stay manual text (pins are GPIO line NUMBERS, etc.).
+            for (label, hint) in [
+                ("pins", "GPIO lines, e.g. 17,27,22"),
+                ("pwm", "PWM lines, e.g. 12,13"),
+                ("adc", "ADC channels"),
+                ("onewire", "1-Wire lines"),
+                ("usb", "usb paths"),
+                ("midi", "/dev/midi…"),
+                ("display", "display nodes"),
+                ("net", "iface names"),
+                ("backend", "e.g. gpio:0"),
+                ("extra", "other /dev paths"),
+            ] {
+                manual.push(Field::text(label, hint));
+            }
+            let mut v = vec![Field::text("name", "e.g. sensors")];
+            v.extend(picks); // detected pickers first (for-dummies)
+            v.extend(manual); // then everything manual (rare / numeric / not detected)
+            v
+        }
         "vdisk" => vec![
             Field::text("name", "e.g. scratch"),
             Field::text("size", "e.g. 2g"),
@@ -959,10 +1050,12 @@ fn bytes_to_size_str(n: u64) -> String {
     n.to_string()
 }
 
-/// Set a field's value by label (used to pre-fill edit forms).
+/// Set a field's value by label (used to pre-fill edit forms). For a pick field, check the boxes that
+/// match the pre-filled value so an edit shows the current selection.
 fn set_field(fields: &mut [Field], label: &str, val: String) {
     if let Some(f) = fields.iter_mut().find(|f| f.label == label) {
         f.value = val;
+        f.seed_pick_selection();
     }
 }
 
@@ -975,13 +1068,36 @@ enum FormOutcome {
 
 /// Edit a form with one keypress: type into the active field, navigate fields, submit or cancel.
 fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
-    // Arrow keys ↑/↓ move between fields.
+    // Arrow keys ↑/↓ move between fields; ←/→ move the highlighted checkbox inside a pick field.
     if key.len() >= 3 && key[0] == 0x1b && key[1] == b'[' {
         match key[2] {
             b'A' => form.active = form.active.saturating_sub(1),
             b'B' => form.active = (form.active + 1).min(form.fields.len().saturating_sub(1)),
+            b'C' => {
+                let f = &mut form.fields[form.active];
+                if f.is_pick() {
+                    f.cur = (f.cur + 1) % f.options.len();
+                }
+            }
+            b'D' => {
+                let f = &mut form.fields[form.active];
+                if f.is_pick() {
+                    f.cur = (f.cur + f.options.len() - 1) % f.options.len();
+                }
+            }
             _ => {}
         }
+        return FormOutcome::Stay(form);
+    }
+    // A pick field: Space checks/unchecks the highlighted option; typing never lands here.
+    if form.fields[form.active].is_pick() && !matches!(key[0], 0x1b | b'\t' | b'\r' | b'\n' | 0x13)
+    {
+        let f = &mut form.fields[form.active];
+        if key[0] == b' ' && f.cur < f.sel.len() {
+            f.sel[f.cur] = !f.sel[f.cur];
+            f.sync_pick_value();
+        }
+        form.error = None;
         return FormOutcome::Stay(form);
     }
     // A toggle field is driven by Space (flip) / `y` (on) / `n` (off); typing never lands in it.
@@ -1373,7 +1489,6 @@ fn host_mem() -> Option<(u64, u64)> {
 /// return many (e.g. 20 i2c DDC buses), so the form caps the visible count and keeps a manual field.
 // Wired into the vGPIO new/edit form (checkbox picker) in a follow-up; kept here as the shared,
 // host-uniform probe so every profile form uses one identical mechanism.
-#[allow(dead_code)]
 fn present_devices(kind: &str) -> Vec<String> {
     // Files under `dir` whose name starts with any of `prefixes`, mapped through `to_entry`.
     fn scan(dir: &str, prefixes: &[&str], to_entry: impl Fn(&str) -> String) -> Vec<String> {
@@ -1747,6 +1862,47 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
         } else {
             format!("{b}{:<9}{z}", f.label)
         };
+        // A pick field renders detected devices as checkboxes — ←/→ highlight one, Space checks it.
+        // No typing: the choices come from the host, so it's impossible to enter a wrong path.
+        if f.is_pick() {
+            let cap = if active {
+                format!("{d}←/→ move · Space checks{z}")
+            } else if f.value.is_empty() {
+                format!("{d}{}{z}", f.hint)
+            } else {
+                format!("{g}{}{z}", f.value)
+            };
+            s.push_str(&format!("  {caret} {label} {cap}\n"));
+            // Window the chips around the cursor so a busy host (many i2c buses) stays readable.
+            let n_opt = f.options.len();
+            const WIN: usize = 6;
+            let pstart = f.cur.saturating_sub(WIN / 2).min(n_opt.saturating_sub(WIN));
+            let pend = (pstart + WIN).min(n_opt);
+            let mut row = String::from("       ");
+            if pstart > 0 {
+                row.push_str(&format!("{d}‹ {pstart}  {z}"));
+            }
+            for i in pstart..pend {
+                let checked = f.sel.get(i).copied().unwrap_or(false);
+                let mark = if checked {
+                    format!("{g}✓{z}")
+                } else {
+                    " ".to_string()
+                };
+                let name = &f.options[i];
+                if active && i == f.cur {
+                    row.push_str(&format!("{c}[{z}{mark}{c}]{z}{c}{name}{z}  "));
+                } else {
+                    row.push_str(&format!("{d}[{z}{mark}{d}]{z}{name}  "));
+                }
+            }
+            if pend < n_opt {
+                row.push_str(&format!("{d} {} ›{z}", n_opt - pend));
+            }
+            s.push_str(&row);
+            s.push('\n');
+            continue;
+        }
         // A toggle renders as a checkbox `[x]`/`[ ]` with its hint as caption — no text box / cursor.
         if f.toggle {
             let on = !f.value.is_empty();
@@ -2793,5 +2949,55 @@ leds = [\"led0\"]
             cu > vi && cu <= vi + "heavy".len() + 1,
             "cursor follows the value"
         );
+    }
+
+    #[test]
+    fn pick_field_space_checks_and_assembles_value() {
+        // A pick field is driven ENTIRELY by the keyboard: →/← move the highlight, Space checks.
+        // Typing must never land in it (the whole point is "impossible to enter a wrong path").
+        let mut f = Field::pick(
+            "i2c",
+            "pick",
+            vec![
+                "/dev/i2c-0".into(),
+                "/dev/i2c-1".into(),
+                "/dev/i2c-2".into(),
+            ],
+        );
+        assert!(f.is_pick());
+        let mut form = Form {
+            title: "t".into(),
+            fields: vec![f.clone()],
+            active: 0,
+            submit: Submit::SaveProfile {
+                section: "vgpio",
+                orig_name: None,
+            },
+            error: None,
+        };
+        // Check option 0, move right twice, check option 2 → value is the two checked paths, in order.
+        let feed = |form: Form, k: &[u8]| match handle_form_key(form, k) {
+            FormOutcome::Stay(f) => f,
+            _ => panic!("pick nav should stay in the form"),
+        };
+        form = feed(form, b" "); // check i2c-0
+        form = feed(form, b"\x1b[C"); // →
+        form = feed(form, b"\x1b[C"); // →  (now on i2c-2)
+        form = feed(form, b" "); // check i2c-2
+        assert_eq!(form.fields[0].value, "/dev/i2c-0,/dev/i2c-2");
+        // A stray letter is ignored, not typed into the value.
+        form = feed(form, b"x");
+        assert_eq!(form.fields[0].value, "/dev/i2c-0,/dev/i2c-2");
+
+        // The pane renders the checked boxes as `[✓]` and the device names (no free-text box).
+        let pane = form_pane(&plain(), &form, 80, 24);
+        assert!(pane.contains("[✓]"), "checked options render as ticks:\n{pane}");
+        assert!(pane.contains("/dev/i2c-0"), "device names are shown:\n{pane}");
+
+        // seed_pick_selection re-checks the boxes matching a pre-filled value (edit path).
+        f.value = "/dev/i2c-1".into();
+        f.seed_pick_selection();
+        assert_eq!(f.sel, vec![false, true, false]);
+        assert_eq!(f.value, "/dev/i2c-1");
     }
 }
