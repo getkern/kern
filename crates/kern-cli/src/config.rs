@@ -789,14 +789,18 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
 /// 2. raw memory / I/O ports — mem, kmem, port, kmsg, fmem, mergemem
 /// 3. arbitrary DMA — VFIO device passthrough (`/dev/vfio/*`): can read/write ALL physical memory
 /// 4. host reboot / brick — watchdog\*, mtd\*, nvram (raw flash/firmware)
-/// 5. virtualization / hypervisor — kvm, vhost\* (vhost-net/vsock)
-/// 6. input injection — uinput (synthesise keystrokes into the host)
+/// 5. virtualization / hypervisor — kvm, vhost\* (vhost-net/vsock/vdpa), vboxdrv
+/// 6. input/HID injection — uinput AND hidraw\* (raw HID write injects keystrokes / reprograms a device)
 /// 7. host network creation — net/tun
 /// 8. display control — dri/card\* (the privileged KMS/modeset node)
 /// 9. mount confusion — fuse
+/// 10. raw USB — /dev/bus/usb/\* (reprogram/impersonate any device on the bus — BadUSB; escapes the
+///     deny-by-default intent since one node reaches the whole bus)
+/// 11. management engine — mei\* (Intel ME: privileged out-of-band host access)
 ///
-/// The render-only GPU node (`dri/renderD*`), rtc and hpet are legitimate peripherals and are allowed;
-/// only the privileged `card*` DRM node is refused.
+/// The render-only GPU node (`dri/renderD*`) is allowed — it's the real GPU-compute case — but note it
+/// is "safe *if* the IOMMU isolates" (a GPU is a DMA engine), NOT zero-risk like an i2c bus. rtc/hpet
+/// are allowed; only the privileged `card*` DRM node is refused.
 fn is_dangerous_dev(real: &std::path::Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     if std::fs::metadata(real).is_ok_and(|m| m.file_type().is_block_device()) {
@@ -825,12 +829,22 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
     ) {
         return true;
     }
-    // (4) reboot/brick families · (5) vhost-net/vsock
-    if name.starts_with("watchdog") || name.starts_with("mtd") || name.starts_with("vhost") {
+    // family prefixes: (4) reboot/brick · (5) vhost-net/vsock/vdpa + vbox* · (6) hidraw · (11) mei
+    if ["watchdog", "mtd", "vhost", "vbox", "hidraw", "mei"]
+        .iter()
+        .any(|p| name.starts_with(p))
+    {
         return true;
     }
     // (3) VFIO — arbitrary DMA, the worst: /dev/vfio/{vfio,<group>}
     if parent == "vfio" || name == "vfio" {
+        return true;
+    }
+    // (10) raw USB — any node under /dev/bus/usb/ reaches the whole USB bus, not one device.
+    if real
+        .to_str()
+        .is_some_and(|s| s.contains("/bus/usb/") || s.ends_with("/bus/usb"))
+    {
         return true;
     }
     // (8) the privileged DRM node (modeset); the render-only node renderD* stays allowed.
@@ -845,7 +859,7 @@ fn is_recognized_dev(real: &std::path::Path) -> bool {
     // buses / serial / gpio / sensors
     for p in [
         "i2c-", "spidev", "ttyS", "ttyUSB", "ttyACM", "ttyAMA", "gpiochip", "can", "video",
-        "media", "vchiq", "rtc", "hidraw", "input",
+        "media", "vchiq", "rtc", "input",
     ] {
         if name.starts_with(p) {
             return true;
@@ -1259,6 +1273,18 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
     use FieldState::*;
     if v.is_empty() {
         return Incomplete;
+    }
+    // `name`/`extends` are validated by `validate_profile_name`, not `profile_line` — but route them
+    // through the SAME dispatcher so they get the live three-state indicator and can't drift from the
+    // save rule (the bug that would otherwise re-open the two-implementations risk for names). A name
+    // prefix is either a valid name or has an unfixable problem (bad leading char, `..`, too long),
+    // so there's no incomplete middle state beyond empty.
+    if matches!(key, "name" | "extends") {
+        return if validate_profile_name(v).is_ok() {
+            Valid
+        } else {
+            Invalid
+        };
     }
     if let Ok(opt) = profile_line(key, v) {
         // Ok(None) = a value profile_line legitimately omits (e.g. `persistent = no`); still editable.
@@ -1807,13 +1833,18 @@ mod tests {
             "/dev/nvram",
             "/dev/net/tun",
             "/dev/fuse",
-            "/dev/kvm",         // hypervisor
-            "/dev/vhost-net",   // VM network backend
-            "/dev/vhost-vsock", // VM vsock backend
-            "/dev/uinput",      // input injection
-            "/dev/vfio/vfio",   // arbitrary DMA — the worst
-            "/dev/vfio/42",     // a vfio group
-            "/dev/dri/card0",   // privileged DRM (modeset)
+            "/dev/kvm",             // hypervisor
+            "/dev/vhost-net",       // VM network backend
+            "/dev/vhost-vsock",     // VM vsock backend
+            "/dev/uinput",          // input injection
+            "/dev/vfio/vfio",       // arbitrary DMA — the worst
+            "/dev/vfio/42",         // a vfio group
+            "/dev/dri/card0",       // privileged DRM (modeset)
+            "/dev/vhost-vdpa",      // vhost family (prefix) — vdpa
+            "/dev/vboxdrv",         // VirtualBox hypervisor driver
+            "/dev/hidraw0",         // raw HID — write injects keystrokes / reprograms (like uinput)
+            "/dev/mei0",            // Intel Management Engine
+            "/dev/bus/usb/001/002", // raw USB — reaches the whole bus (BadUSB)
         ] {
             assert!(is_dangerous_dev(std::path::Path::new(dev)), "{dev} refused");
         }
@@ -1934,6 +1965,25 @@ mod tests {
             ("vcpus", "1.2.3"),
         ] {
             assert_eq!(field_state(k, v), Invalid, "{k}={v}");
+        }
+        // `name`/`extends` route through the SAME dispatcher (not a second validator) — so they get the
+        // three-state too and can't drift from validate_profile_name at save.
+        assert_eq!(field_state("name", "sensors"), Valid);
+        assert_eq!(field_state("name", "a.b-c_1"), Valid);
+        assert_eq!(field_state("extends", "base"), Valid);
+        assert_eq!(field_state("name", ""), Incomplete);
+        assert_eq!(field_state("name", "-lead"), Invalid); // leading '-' is unfixable
+        assert_eq!(field_state("name", ".hidden"), Invalid); // leading '.'
+        assert_eq!(field_state("name", "a..b"), Invalid); // traversal
+        assert_eq!(field_state("name", &"x".repeat(65)), Invalid); // too long
+                                                                   // And the same anti-dead-end invariant for names: field_state Valid ⇒ validate accepts.
+        for v in ["a", "web-1", "a.b", "MyBox_2", "-x", ".x", "a/b", "a:b", ""] {
+            if field_state("name", v) == Valid {
+                assert!(
+                    validate_profile_name(v).is_ok(),
+                    "Valid name must save: {v:?}"
+                );
+            }
         }
         // THE invariant that kills the dead-end class: whatever field_state calls Valid, the SAVE
         // (profile_line) must accept. Otherwise the filter lets you type a value the save rejects.

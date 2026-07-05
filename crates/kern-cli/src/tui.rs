@@ -1187,7 +1187,9 @@ fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
                                                     // filter that let you type "1.5g" would dead-end at save (the parser rejects it). 512m / 2g / 16t.
     let size = digit || "kmgtKMGT".contains(ch);
     let cpus = digit || matches!(ch, '-' | ',' | ' '); // core list: "0-3", "0,2"
-    let ident = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'; // a profile name
+                                                       // a profile name / id — the char SET `validate_profile_name` allows (structural rules like the
+                                                       // leading-char ban live in field_state, the shared authority, so the char filter can't drift).
+    let ident = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
     let backend = ch.is_ascii_alphanumeric() || ch == ':' || ch == '-'; // gpio:0 / disk:0
     let path = ch.is_ascii_alphanumeric() || "/._-, ".contains(ch); // a /dev path
     match (section, label) {
@@ -1217,13 +1219,15 @@ fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
 /// numeric/size fields go through it; free-form fields (name/backend/extra) are governed by the char
 /// filter alone and impose no value restriction here.
 fn field_value_ok(_section: &str, label: &str, v: &str) -> bool {
-    !is_numeric_field(label)
+    !validated_field(label)
         || crate::config::field_state(label, v) != crate::config::FieldState::Invalid
 }
 
-/// Fields whose value is a NUMBER / range / size — governed by `config::field_state` (shared with save)
-/// and given the live three-state indicator. Free-form fields (name/backend/extra) are not here.
-fn is_numeric_field(label: &str) -> bool {
+/// Fields governed by `config::field_state` — the SINGLE rule shared with save — and given the live
+/// three-state indicator. Numbers/ranges/sizes AND the name/extends identifiers (both route through the
+/// same `field_state` dispatcher, so no field validates by a second, drift-prone path). `backend` is a
+/// pick, `extra` is the free-form escape — neither is here.
+fn validated_field(label: &str) -> bool {
     matches!(
         label,
         "pins"
@@ -1239,6 +1243,8 @@ fn is_numeric_field(label: &str) -> bool {
             | "size"
             | "bandwidth"
             | "iops"
+            | "name"
+            | "extends"
     )
 }
 
@@ -2368,7 +2374,7 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
         };
         // Three-state indicator on the ACTIVE numeric field: ✓ once the value is save-valid, a dim ‥
         // while it's still an incomplete-but-ok prefix (keep typing) — so "valid yet?" is never a guess.
-        let status = if active && !f.value.is_empty() && is_numeric_field(f.label) {
+        let status = if active && !f.value.is_empty() && validated_field(f.label) {
             match crate::config::field_state(f.label, &f.value) {
                 crate::config::FieldState::Valid => format!("  {g}✓{z}"),
                 crate::config::FieldState::Incomplete => format!("  {d}‥ keep typing{z}"),
@@ -3591,6 +3597,8 @@ leds = [\"led0\"]
             ("vdisk", "size"),
             ("vdisk", "bandwidth"),
             ("vdisk", "iops"),
+            ("vgpio", "name"), // name/extends now route through field_state too (round-4 fix)
+            ("vcpu", "extends"),
         ];
         let nines = "9".repeat(200);
         let inputs: &[&str] = &[
@@ -3642,7 +3650,13 @@ leds = [\"led0\"]
             "0-",
             "-",
             "2ggg",
-            "999t", // overflows when multiplied
+            "999t",     // overflows when multiplied
+            "-lead",    // name: leading dash (unfixable)
+            ".hidden",  // name: leading dot
+            "a..b",     // name: traversal
+            "a/b",      // name: slash (never allowed)
+            "a:b",      // name: colon
+            "My_Box-2", // name: valid identifier
         ];
         for &(section, label) in fields {
             for input in inputs {
@@ -3653,8 +3667,14 @@ leds = [\"led0\"]
                     "typing {input:?} into {section}:{label} left an INVALID value {v:?}"
                 );
                 if !v.is_empty() && field_state(label, &v) == FieldState::Valid {
+                    // The value the filter allowed must be accepted by its SAVE authority.
+                    let saves = if matches!(label, "name" | "extends") {
+                        crate::config::validate_profile_name(&v).is_ok()
+                    } else {
+                        profile_line(label, &v).unwrap().is_some()
+                    };
                     assert!(
-                        profile_line(label, &v).unwrap().is_some(),
+                        saves,
                         "a Valid typed value must save: {label}={v:?} (from {input:?})"
                     );
                 }
