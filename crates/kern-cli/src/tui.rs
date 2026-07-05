@@ -136,6 +136,9 @@ struct Field {
     /// path for hardware that isn't there. If an edited profile pre-fills a value, it becomes editable
     /// so the setting is still visible and removable.
     info: bool,
+    /// SINGLE-select pick (a radio group): a field that holds ONE value (e.g. `backend` = one GPIO id).
+    /// Ticking an option clears the others, so the invalid multi-value state is unrepresentable.
+    radio: bool,
 }
 
 impl Field {
@@ -152,6 +155,7 @@ impl Field {
             advanced: false,
             divider: false,
             info: false,
+            radio: false,
         }
     }
 
@@ -191,6 +195,15 @@ impl Field {
             options,
             sel: vec![false; n],
             ..Field::text(label, hint)
+        }
+    }
+
+    /// A SINGLE-select picker (radio group): holds one value. Ticking one option clears the rest, so a
+    /// field that must be one value (e.g. `backend`) can't be put into an invalid multi-value state.
+    fn radio(label: &'static str, hint: &'static str, options: Vec<String>) -> Self {
+        Field {
+            radio: true,
+            ..Field::pick(label, hint, options)
         }
     }
 
@@ -1099,7 +1112,8 @@ fn section_fields(section: &str) -> Vec<Field> {
                     "no GPIO backend configured (run: kern config setup)",
                 )
             } else {
-                Field::pick("backend", "the GPIO backend to use", backends)
+                // Single-select: a profile uses ONE backend, so ticking one clears the rest.
+                Field::radio("backend", "the GPIO backend to use", backends)
             });
             advanced.push(Field::text("extra", "any other /dev path"));
             let mut v = common;
@@ -1414,7 +1428,13 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
     {
         let f = &mut form.fields[form.active];
         if key[0] == b' ' && f.cur < f.sel.len() {
-            f.sel[f.cur] = !f.sel[f.cur];
+            let now_on = !f.sel[f.cur];
+            // A radio group holds ONE value: ticking one clears the others (invalid multi-value state
+            // is unrepresentable). A plain pick toggles independently.
+            if f.radio {
+                f.sel.iter_mut().for_each(|s| *s = false);
+            }
+            f.sel[f.cur] = now_on;
             f.sync_pick_value();
         }
         form.error = None;
@@ -2286,18 +2306,24 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
             if lo > 0 {
                 row.push_str(&format!("{d}‹{lo}  {z}"));
             }
+            // Radio (single-select) draws round `(•)` brackets; a multi-pick draws square `[✓]`.
+            let (lb, rb, on) = if f.radio {
+                ('(', ')', '•')
+            } else {
+                ('[', ']', '✓')
+            };
             for i in lo..hi {
                 let checked = f.sel.get(i).copied().unwrap_or(false);
                 let mark = if checked {
-                    format!("{g}✓{z}")
+                    format!("{g}{on}{z}")
                 } else {
                     " ".to_string()
                 };
                 let name = &f.options[i];
                 if active && i == f.cur {
-                    row.push_str(&format!("{c}[{z}{mark}{c}]{z}{c}{name}{z}  "));
+                    row.push_str(&format!("{c}{lb}{z}{mark}{c}{rb}{z}{c}{name}{z}  "));
                 } else {
-                    row.push_str(&format!("{d}[{z}{mark}{d}]{z}{name}  "));
+                    row.push_str(&format!("{d}{lb}{z}{mark}{d}{rb}{z}{name}  "));
                 }
             }
             if hi < n_opt {
@@ -3523,6 +3549,44 @@ leds = [\"led0\"]
             let help = field_help("vgpio", label).unwrap();
             assert!(pane.contains(help), "help for {label} shows:\n{pane}");
         }
+    }
+
+    #[test]
+    fn radio_field_holds_a_single_value() {
+        // A radio (single-select) pick — like `backend` — can never reach the invalid multi-value
+        // state: ticking a second option clears the first.
+        let mut form = Form {
+            title: "t".into(),
+            fields: vec![Field::radio(
+                "backend",
+                "pick one",
+                vec!["gpio:0".into(), "gpio:1".into()],
+            )],
+            active: 0,
+            submit: Submit::SaveProfile {
+                section: "vgpio",
+                orig_name: None,
+            },
+            error: None,
+            show_advanced: false,
+        };
+        let feed = |form: Form, k: &[u8]| match handle_form_key(form, k) {
+            FormOutcome::Stay(f) => f,
+            _ => panic!("stays"),
+        };
+        form = feed(form, b" "); // tick gpio:0
+        assert_eq!(form.fields[0].value, "gpio:0");
+        form = feed(form, b"\x1b[C"); // → to gpio:1
+        form = feed(form, b" "); // tick gpio:1 → gpio:0 cleared
+        assert_eq!(
+            form.fields[0].value, "gpio:1",
+            "single value, not gpio:0,gpio:1"
+        );
+        assert_eq!(form.fields[0].sel, vec![false, true]);
+        // The pane renders it as a radio, not a checkbox.
+        form.active = 0;
+        let pane = form_pane(&plain(), &form, 80, 24);
+        assert!(pane.contains("(•)"), "radio uses round brackets:\n{pane}");
     }
 
     #[test]
