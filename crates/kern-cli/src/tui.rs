@@ -3547,6 +3547,150 @@ leds = [\"led0\"]
         }
     }
 
+    /// Type an arbitrary byte string into a field through the REAL key handler, returning the value it
+    /// ended up holding (Enter keeps it, Esc stops early). Used by the extreme fuzz below.
+    fn type_into(section: &'static str, label: &'static str, input: &[u8]) -> String {
+        let mut form = Form {
+            title: "t".into(),
+            fields: vec![Field::text(label, "")],
+            active: 0,
+            submit: Submit::SaveProfile {
+                section,
+                orig_name: None,
+            },
+            error: None,
+            show_advanced: false,
+        };
+        for &b in input {
+            match handle_form_key(form, &[b]) {
+                FormOutcome::Stay(f) | FormOutcome::Submit(f) => form = f,
+                FormOutcome::Cancel => return String::new(), // Esc aborts — nothing typed
+            }
+        }
+        form.fields.into_iter().next().unwrap().value
+    }
+
+    #[test]
+    fn extreme_typing_never_reaches_an_invalid_or_unsavable_value() {
+        // Hammer every typed numeric/size field with adversarial byte strings and assert two things:
+        //  (1) the accumulated value is NEVER config::field_state == Invalid (the filter never lets a
+        //      dead value stick), and
+        //  (2) whenever it IS Valid, config::profile_line accepts it — no value can dead-end at save.
+        use crate::config::{field_state, profile_line, FieldState};
+        let fields: &[(&str, &str)] = &[
+            ("vgpio", "pins"),
+            ("vgpio", "pwm"),
+            ("vgpio", "adc"),
+            ("vgpio", "onewire"),
+            ("vcpu", "priority"),
+            ("vcpu", "numa"),
+            ("vcpu", "nice"),
+            ("vcpu", "vcpus"),
+            ("vcpu", "cpus"),
+            ("vcpu", "memory"),
+            ("vdisk", "size"),
+            ("vdisk", "bandwidth"),
+            ("vdisk", "iops"),
+        ];
+        let nines = "9".repeat(200);
+        let inputs: &[&str] = &[
+            "",
+            "0",
+            "1",
+            "17 27",
+            "0-3",
+            "512m",
+            "2g",
+            "16t",
+            "-20",
+            "0.5",
+            "1.5",
+            "1.5g",
+            ".5g",
+            "44545454545",
+            "999999999999999999999999999",
+            "100",
+            "-25",
+            "1.2.3.4",
+            "----",
+            "0-0-0-0",
+            "512mmm",
+            "5m2",
+            "abcdef",
+            "0x1F",
+            "  ",
+            " 1 2 ",
+            ",,,",
+            "1,,2",
+            "17,,27",
+            "٠١٢",    // arabic-indic digits (multibyte)
+            "１２３", // fullwidth digits (multibyte)
+            "1e9",
+            "nan",
+            "inf",
+            "-0",
+            "00",
+            "1 2 3 4 5",
+            &nines,
+            "g",
+            "m",
+            ".",
+            "-.-",
+            "\t\n\r",
+            "1\0",
+            "２0",
+            "0-",
+            "-",
+            "2ggg",
+            "999t", // overflows when multiplied
+        ];
+        for &(section, label) in fields {
+            for input in inputs {
+                let v = type_into(section, label, input.as_bytes());
+                assert_ne!(
+                    field_state(label, &v),
+                    FieldState::Invalid,
+                    "typing {input:?} into {section}:{label} left an INVALID value {v:?}"
+                );
+                if !v.is_empty() && field_state(label, &v) == FieldState::Valid {
+                    assert!(
+                        profile_line(label, &v).unwrap().is_some(),
+                        "a Valid typed value must save: {label}={v:?} (from {input:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_valid_values_type_through_unblocked() {
+        // The other direction: a legitimate value must be typable in full (no false blocking).
+        use crate::config::{field_state, FieldState};
+        for (label, good) in [
+            ("pins", "17 27 22"),
+            ("pwm", "12,13"),
+            ("priority", "99"),
+            ("numa", "3"),
+            ("nice", "-20"),
+            ("nice", "19"),
+            ("vcpus", "0.5"),
+            ("vcpus", "16"),
+            ("cpus", "0-3"),
+            ("cpus", "0,2,4"),
+            ("memory", "512m"),
+            ("size", "16t"),
+            ("iops", "5000"),
+        ] {
+            let v = type_into("vcpu", label, good.as_bytes());
+            assert_eq!(v, good, "'{good}' must type through {label} intact");
+            assert_eq!(
+                field_state(label, &v),
+                FieldState::Valid,
+                "{label}={good} is valid"
+            );
+        }
+    }
+
     #[test]
     fn active_numeric_field_shows_a_three_state_indicator() {
         let mk = |label: &'static str| Form {
