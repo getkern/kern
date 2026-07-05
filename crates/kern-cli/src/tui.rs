@@ -88,6 +88,15 @@ fn visible_fields(form: &Form) -> Vec<usize> {
         .collect()
 }
 
+/// The fields the cursor can actually land on: visible ones minus the read-only "none on this host"
+/// notes, so Tab/↑/↓ glide straight over hardware the machine doesn't have.
+fn nav_fields(form: &Form) -> Vec<usize> {
+    visible_fields(form)
+        .into_iter()
+        .filter(|&i| !form.fields[i].is_dead_info())
+        .collect()
+}
+
 #[derive(Clone)]
 struct Field {
     label: &'static str,
@@ -108,6 +117,11 @@ struct Field {
     advanced: bool,
     /// The "▸ Advanced" fold row itself (not an input) — Space/←→ expand or collapse the advanced group.
     divider: bool,
+    /// A device kind the host DOESN'T have: while its value is empty it's a read-only "none on this
+    /// host" note (nothing to type, skipped by navigation), so a beginner is never asked to invent a
+    /// path for hardware that isn't there. If an edited profile pre-fills a value, it becomes editable
+    /// so the setting is still visible and removable.
+    info: bool,
 }
 
 impl Field {
@@ -123,6 +137,7 @@ impl Field {
             cur: 0,
             advanced: false,
             divider: false,
+            info: false,
         }
     }
 
@@ -132,6 +147,19 @@ impl Field {
             divider: true,
             ..Field::text("", "")
         }
+    }
+
+    /// A read-only "this host has no such device" note (see `info`). `msg` shows dim after the label.
+    fn info(label: &'static str, msg: &'static str) -> Self {
+        Field {
+            info: true,
+            ..Field::text(label, msg)
+        }
+    }
+
+    /// True while this is a dead "none on this host" note — no value, nothing to edit, skip in nav.
+    fn is_dead_info(&self) -> bool {
+        self.info && self.value.is_empty()
     }
 
     /// A boolean toggle (off by default). Space/`y`/`n` set it; any non-empty value reads as on.
@@ -939,20 +967,21 @@ fn section_fields(section: &str) -> Vec<Field> {
             // guess: tick the device you want the box to reach, or leave it empty. Everything rare
             // (LEDs, CAN, PWM, backend, …) lives under the "Advanced" fold so the form stays short.
             //
-            // `pick(label, plain-language what-is-this)` when the host has that device; a manual text
-            // box only for the numeric/not-detectable kinds. Same mechanism on every host — only the
-            // detected contents differ.
+            // `pick(label, plain-language what-is-this)` when the host HAS that device — you tick it,
+            // you never type a path. When the host DOESN'T have it, there's nothing valid to type, so
+            // it becomes a read-only "none detected on this host" note instead of an empty box that
+            // invites garbage. Same mechanism on every host — only the detected contents differ.
             let mk = |label: &'static str, plain: &'static str| {
                 let opts = present_devices(label);
                 if opts.is_empty() {
-                    Field::text(label, plain)
+                    Field::info(label, "none detected on this host")
                 } else {
                     Field::pick(label, plain, opts)
                 }
             };
             // The everyday devices, in plain language (no /dev/ jargon in the hint).
             let mut common = vec![Field::text("name", "a short name, e.g. sensors")];
-            let mut absent = Vec::new(); // a common device the host doesn't have → tuck into Advanced
+            let mut absent = Vec::new(); // a common device the host lacks → a note under Advanced
             for (label, plain) in [
                 ("i2c", "I²C bus — sensors, small displays"),
                 ("spi", "SPI bus — displays, ADCs"),
@@ -963,16 +992,24 @@ fn section_fields(section: &str) -> Vec<Field> {
             ] {
                 let f = mk(label, plain);
                 if f.is_pick() {
-                    common.push(f); // present → show it up front
+                    common.push(f); // present → show it up front, tick to allow
                 } else {
-                    absent.push(f); // not on this host → Advanced, still editable by hand
+                    absent.push(f); // not on this host → a "none here" note, out of the way
                 }
             }
-            // GPIO pins are line NUMBERS (not a /dev node), so they stay a small typed field — but
-            // it's the one thing GPIO folks reach for, so it stays in the common set.
-            common.push(Field::text("pins", "GPIO pins, e.g. 17 27"));
-            // The rare / expert knobs — hidden until the user opens "Advanced".
+            // GPIO pins are line NUMBERS from YOUR wiring, so they're the one thing you legitimately
+            // type — but only when the host actually has a GPIO controller. No gpiochip ⇒ there's
+            // nothing to wire to, so it's a "none here" note, not an empty box inviting a guess.
+            let has_gpio = !present_devices("pins").is_empty();
             let mut advanced = absent;
+            if has_gpio {
+                common.push(Field::text("pins", "GPIO pins, e.g. 17 27"));
+            } else {
+                advanced.push(Field::info("pins", "no GPIO controller on this host"));
+            }
+            // The rare / expert knobs — hidden until the user opens "Advanced". Anything the host can
+            // enumerate is a pick (net interfaces, LEDs, …); a device it lacks is a note; pwm follows
+            // the same GPIO gate as pins; only the truly free-form escape (`extra`) stays typed.
             for (label, plain) in [
                 ("leds", "on-board LEDs"),
                 ("can", "CAN bus"),
@@ -980,14 +1017,18 @@ fn section_fields(section: &str) -> Vec<Field> {
                 ("usb", "specific USB devices"),
                 ("midi", "MIDI ports"),
                 ("display", "display nodes (DRI)"),
+                ("net", "network interfaces"),
             ] {
                 advanced.push(mk(label, plain));
             }
+            advanced.push(if has_gpio {
+                Field::text("pwm", "PWM lines, e.g. 12 13")
+            } else {
+                Field::info("pwm", "no GPIO controller on this host")
+            });
             for (label, plain) in [
-                ("pwm", "PWM lines, e.g. 12 13"),
                 ("adc", "ADC channels"),
                 ("onewire", "1-Wire lines"),
-                ("net", "network interface names"),
                 ("backend", "GPIO backend id, e.g. gpio:0"),
                 ("extra", "any other /dev path"),
             ] {
@@ -1011,6 +1052,46 @@ fn section_fields(section: &str) -> Vec<Field> {
         ],
         _ => vec![Field::text("name", "")],
     }
+}
+
+/// A concrete, plain-language "what is this field and when would I use it" line for the focused field,
+/// shown at the bottom of the form. This is the hand-holding: the user isn't expected to know what an
+/// I²C bus or a PWM line is — the help says it, with an everyday example. `None` = no help (e.g. the
+/// Advanced fold row). Kept short (≤ ~74 chars) so it never wraps an 80-column terminal.
+fn field_help(section: &str, label: &str) -> Option<&'static str> {
+    let h = match (section, label) {
+        ("vgpio", "name") => "A label for this hardware set — attach it to a box with  vgpio:NAME",
+        ("vgpio", "i2c") => "I²C bus for sensors & small displays. Tick the bus your part is on.",
+        ("vgpio", "spi") => "SPI bus for displays, ADCs, radios. Tick the port your part uses.",
+        ("vgpio", "uart") => "Serial port for GPS, modems, consoles. Tick the tty it's on.",
+        ("vgpio", "camera") => "A camera. Tick it to let the box capture video.",
+        ("vgpio", "audio") => "The sound card. Tick to let the box play or record audio.",
+        ("vgpio", "bluetooth") => "The Bluetooth adapter. Tick to let the box use Bluetooth/BLE.",
+        ("vgpio", "pins") => "Raw GPIO pin numbers (e.g. 17 27) for LEDs, buttons, relays.",
+        ("vgpio", "leds") => "On-board LEDs you want the box to control.",
+        ("vgpio", "can") => "CAN bus — vehicle & industrial networking.",
+        ("vgpio", "input") => "Input devices — keys, touchscreen, joystick.",
+        ("vgpio", "usb") => "A specific USB device node to pass through.",
+        ("vgpio", "midi") => "MIDI ports for music gear.",
+        ("vgpio", "display") => "GPU display nodes (DRI) for rendering.",
+        ("vgpio", "pwm") => "PWM outputs (e.g. 12 13) for servos, dimming, fans.",
+        ("vgpio", "adc") => "Analog inputs (ADC channels).",
+        ("vgpio", "onewire") => "1-Wire lines, e.g. a DS18B20 temperature sensor.",
+        ("vgpio", "net") => "Network interface names to expose to the box.",
+        ("vgpio", "backend") => "Which detected GPIO controller to use (default gpio:0).",
+        ("vgpio", "extra") => "Any other /dev path to pass, only if you know it exists.",
+        ("vcpu", "name") => "A label for this CPU/memory slice — attach with  vcpu:NAME",
+        ("vcpu", "vcpus") => "How many cores the box may use, e.g. 4 — or 0.5 for half a core.",
+        ("vcpu", "cpus") => "Pin to specific cores, e.g. 0-3. Leave blank to let it float.",
+        ("vcpu", "memory") => "Memory ceiling, e.g. 512m or 2g. The box is OOM-capped at this.",
+        ("vdisk", "name") => "A label for this scratch disk — attach with  vdisk:NAME",
+        ("vdisk", "size") => "Max size of the scratch disk, e.g. 2g. Writes past it fail.",
+        ("vdisk", "persistent") => {
+            "Keep the disk's data after the box is removed (default: wiped)."
+        }
+        _ => return None,
+    };
+    Some(h)
 }
 
 /// A blank form to create a new profile. `vgpio` pre-fills `backend = gpio:0` (the id
@@ -1126,8 +1207,12 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
     // Arrow keys ↑/↓ move between VISIBLE fields; ←/→ move the highlighted checkbox inside a pick
     // field, or open/close the Advanced fold when it's focused.
     if key.len() >= 3 && key[0] == 0x1b && key[1] == b'[' {
-        let vis = visible_fields(&form);
-        let vpos = vis.iter().position(|&i| i == form.active).unwrap_or(0);
+        let vis = nav_fields(&form);
+        let vpos = vis
+            .iter()
+            .position(|&i| i == form.active)
+            .unwrap_or(0)
+            .min(vis.len().saturating_sub(1));
         match key[2] {
             b'A' => form.active = vis[vpos.saturating_sub(1)],
             b'B' => form.active = vis[(vpos + 1).min(vis.len().saturating_sub(1))],
@@ -1162,13 +1247,20 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
             0x1b => return FormOutcome::Cancel,
             b'\r' | b'\n' | 0x13 => return FormOutcome::Submit(form),
             b'\t' => {
-                let vis = visible_fields(&form);
+                let vis = nav_fields(&form);
                 let vpos = vis.iter().position(|&i| i == form.active).unwrap_or(0);
                 form.active = vis[(vpos + 1) % vis.len()];
                 return FormOutcome::Stay(form);
             }
             _ => return FormOutcome::Stay(form),
         }
+    }
+    // A "none on this host" note never takes input — its value stays empty so it stays a note and a
+    // wrong path can't be typed. (Enter/Tab/Esc still work; nav already skips it anyway.)
+    if form.fields[form.active].is_dead_info()
+        && !matches!(key[0], 0x1b | b'\t' | b'\r' | b'\n' | 0x13)
+    {
+        return FormOutcome::Stay(form);
     }
     // A pick field: Space checks/unchecks the highlighted option; typing never lands here.
     if form.fields[form.active].is_pick() && !matches!(key[0], 0x1b | b'\t' | b'\r' | b'\n' | 0x13)
@@ -1202,7 +1294,7 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
     match key[0] {
         0x1b => FormOutcome::Cancel, // lone Esc
         b'\t' => {
-            let vis = visible_fields(&form);
+            let vis = nav_fields(&form);
             let vpos = vis.iter().position(|&i| i == form.active).unwrap_or(0);
             form.active = vis[(vpos + 1) % vis.len()];
             FormOutcome::Stay(form)
@@ -1601,6 +1693,7 @@ fn present_devices(kind: &str) -> Vec<String> {
         }),
         "leds" => scan("/sys/class/leds", &[""], |n| n.to_string()), // led NAMES, not paths
         "bluetooth" => scan("/sys/class/bluetooth", &["hci"], |n| n.to_string()),
+        "net" => scan("/sys/class/net", &[""], |n| n.to_string()), // interface NAMES (eth0, wlan0…)
         _ => Vec::new(),
     }
 }
@@ -1922,9 +2015,9 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
     // A one-line, plain-language explainer for the fiddly kinds so the user isn't left guessing.
     if let Submit::SaveProfile { section, .. } = &form.submit {
         let intro = match *section {
-            "vgpio" => Some(
-                "Tick the hardware this box may use. Nothing ticked = a pure sandbox. You can edit it later.",
-            ),
+            "vgpio" => {
+                Some("Give the box real hardware. Not doing hardware work? Leave it empty — that's fine.")
+            }
             _ => None,
         };
         if let Some(t) = intro {
@@ -1958,6 +2051,12 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
         } else {
             format!("{b}{:<9}{z}", f.label)
         };
+        // A "none on this host" note: dim label + dim message, no box. Nothing to type here, and the
+        // cursor never lands on it — it's there only so you can SEE the machine has no such device.
+        if f.is_dead_info() {
+            s.push_str(&format!("    {d}{:<9}{z} {d}— {} —{z}\n", f.label, f.hint));
+            continue;
+        }
         // The Advanced fold row: a single toggle line that hides the rare knobs. Collapsed, it lists a
         // few of what's inside so the user knows there's more (and that they can ignore it).
         if f.divider {
@@ -2098,6 +2197,14 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
     }
     if vend < nvis {
         s.push_str(&format!("  {d}  ↓ {} more{z}\n", nvis - vend));
+    }
+    // Contextual help: what the FOCUSED field is and when you'd use it, with an everyday example — so
+    // the user is guided to the right choice instead of guessing.
+    if let Submit::SaveProfile { section, .. } = &form.submit {
+        if let Some(h) = field_help(section, form.fields[form.active].label) {
+            let h: String = h.chars().take(width.saturating_sub(6)).collect();
+            s.push_str(&format!("\n  {c}❔{z} {d}{h}{z}\n"));
+        }
     }
     if let Some(e) = &form.error {
         s.push_str(&format!("\n  {r}✗ {e}{z}\n"));
@@ -3164,7 +3271,7 @@ leds = [\"led0\"]
         let collapsed = form_pane(&plain(), &form, 80, 40);
         assert!(collapsed.contains("Advanced"), "the fold is advertised");
         assert!(
-            collapsed.contains("Tick the hardware"),
+            collapsed.contains("Give the box real hardware"),
             "a plain-language explainer guides the user:\n{collapsed}"
         );
         assert!(
@@ -3183,6 +3290,77 @@ leds = [\"led0\"]
         assert!(
             opened.contains("backend"),
             "advanced fields show once opened:\n{opened}"
+        );
+    }
+
+    #[test]
+    fn focused_field_gets_a_plain_language_help_line() {
+        // Whatever field is focused, the form shows a concrete "what is this / when to use it" line at
+        // the bottom — the user is guided, never left guessing what to enter.
+        let mut form = new_profile_form("vgpio");
+        // Focus the name field: help explains it's a label + how to attach it.
+        assert_eq!(form.fields[0].label, "name");
+        let pane = form_pane(&plain(), &form, 80, 40);
+        assert!(
+            pane.contains("❔") && pane.contains("vgpio:NAME"),
+            "name field is explained:\n{pane}"
+        );
+        // Focus a pick (a detected bus) → its help + example shows.
+        if let Some(i) = form.fields.iter().position(|f| f.is_pick()) {
+            form.active = i;
+            let label = form.fields[i].label;
+            let pane = form_pane(&plain(), &form, 80, 40);
+            let help = field_help("vgpio", label).unwrap();
+            assert!(pane.contains(help), "help for {label} shows:\n{pane}");
+        }
+    }
+
+    #[test]
+    fn absent_device_is_a_read_only_note_you_cannot_type_into() {
+        // A device the host lacks is a "none on this host" note: the cursor skips it and typing does
+        // nothing — so a beginner can NEVER put garbage into, say, `spi` on a machine without SPI.
+        let mut form = Form {
+            title: "t".into(),
+            fields: vec![
+                Field::text("name", "n"),
+                Field::info("spi", "none detected on this host"),
+                Field::text("pins", "17 27"),
+            ],
+            active: 0,
+            submit: Submit::SaveProfile {
+                section: "vgpio",
+                orig_name: None,
+            },
+            error: None,
+            show_advanced: false,
+        };
+        // Tab from name skips the spi note and lands on pins.
+        form = match handle_form_key(form, b"\t") {
+            FormOutcome::Stay(f) => f,
+            _ => panic!("tab stays"),
+        };
+        assert_eq!(
+            form.fields[form.active].label, "pins",
+            "nav skipped the note"
+        );
+        // Even if focus somehow sat on the note, typing can't fill it (it has no value box).
+        form.active = 1;
+        form = match handle_form_key(form, b"x") {
+            FormOutcome::Stay(f) => f,
+            other => match other {
+                FormOutcome::Submit(f) => f,
+                _ => panic!("unexpected"),
+            },
+        };
+        assert!(
+            form.fields[1].value.is_empty(),
+            "a note never accepts typed text"
+        );
+        // The pane shows it as a dim note, not an input box.
+        let pane = form_pane(&plain(), &form, 80, 24);
+        assert!(
+            pane.contains("spi") && pane.contains("none detected on this host"),
+            "the note is visible:\n{pane}"
         );
     }
 }
