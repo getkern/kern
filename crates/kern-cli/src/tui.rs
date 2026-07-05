@@ -1169,7 +1169,9 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
 fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
     let digit = ch.is_ascii_digit();
     let num_list = digit || ch == ' ' || ch == ','; // GPIO line numbers: "17 27" / "12,13"
-    let size = digit || ch == '.' || "kmgtKMGT".contains(ch); // 512m, 2g, 1.5g
+                                                    // Sizes are WHOLE units only — parse_binary_size takes a u64, no decimals — so no '.' here. A
+                                                    // filter that let you type "1.5g" would dead-end at save (the parser rejects it). 512m / 2g / 16t.
+    let size = digit || "kmgtKMGT".contains(ch);
     let cpus = digit || matches!(ch, '-' | ',' | ' '); // core list: "0-3", "0,2"
     let ident = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'; // a profile name
     let backend = ch.is_ascii_alphanumeric() || ch == ':' || ch == '-'; // gpio:0 / disk:0
@@ -1198,9 +1200,10 @@ fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
 
 /// Value-level validation: the char filter stops letters, this stops out-of-RANGE / malformed NUMBERS
 /// — so you can't type `44545454545` (a pin > 1024) or `100` for a 0-99 field. It checks the WHOLE
-/// prospective value and stays lenient for half-typed input (a lone `-`, a trailing `.` or unit, an
-/// empty token after a comma) but rejects anything that can never become valid. Save-time
-/// (`config::profile_line`) is the backstop; this makes the mistake impossible at entry, on every host.
+/// prospective value and stays lenient for half-typed input (a lone `-`, a trailing unit, an empty
+/// token after a comma) but rejects anything that can never become valid. Every rule here must accept a
+/// prefix ONLY if some completion is accepted by the matching `config` parser (e.g. sizes are whole
+/// units because `parse_binary_size` takes a u64) — else the filter dead-ends at save.
 fn field_value_ok(section: &str, label: &str, v: &str) -> bool {
     // Every whitespace/comma token is empty (mid-typing) or a u32 strictly below `max`.
     let u32_list = |max: u32| {
@@ -1209,14 +1212,15 @@ fn field_value_ok(section: &str, label: &str, v: &str) -> bool {
             t.is_empty() || t.parse::<u32>().is_ok_and(|n| n < max)
         })
     };
-    // A size prefix: digits with ≤1 dot, then at most ONE trailing unit (k/m/g/t) at the very end.
+    // A size prefix that CAN complete to a `parse_binary_size`-valid value: whole digits, then at most
+    // ONE trailing unit (k/m/g/t) at the very end. No decimals — the parser takes a u64 — so a value
+    // like "1.5g" is rejected at ENTRY, not left to dead-end at save (the filter↔parser must agree).
     let size_prefix = || {
         let num = match v.as_bytes().last() {
             Some(b) if b"kmgtKMGT".contains(b) => &v[..v.len() - 1],
             _ => v,
         };
-        num.chars().filter(|c| *c == '.').count() <= 1
-            && num.chars().all(|c| c.is_ascii_digit() || c == '.')
+        num.chars().all(|c| c.is_ascii_digit())
     };
     match (section, label) {
         ("vgpio", "pins" | "pwm" | "adc") => u32_list(crate::config::MAX_GPIO_PIN),
@@ -3598,6 +3602,14 @@ leds = [\"led0\"]
         // memory / size: one unit at the end, nothing after it (`2gg` → `2g`, `5m2` → `5m`).
         assert_eq!(feed(mk("vcpu", "memory"), b"2gg").fields[0].value, "2g");
         assert_eq!(feed(mk("vdisk", "size"), b"5m2").fields[0].value, "5m");
+        // Sizes are whole units (parse_binary_size takes a u64): the '.' in "1.5g" is refused at ENTRY,
+        // not left to dead-end at save. So "1.5g" typed becomes "15g", a value the save DOES accept.
+        let sz = feed(mk("vdisk", "size"), b"1.5g").fields[0].value.clone();
+        assert_eq!(sz, "15g");
+        assert!(
+            crate::config::size_to_bytes(&sz).is_some(),
+            "what the filter allowed must parse at save: {sz:?}"
+        );
     }
 
     #[test]
