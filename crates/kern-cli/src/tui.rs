@@ -2060,9 +2060,9 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
     // Live rate is green while streaming, dim when idle (0/s) — the number is the honest "now".
     let rate_col = if host.runs_per_sec > 0.5 { g } else { d };
     s.push_str(&row(
-        "Throughput",
+        "Speed",
         format!(
-            "{rate_col}{} {d}/s{z}   {d}({}/min){z}",
+            "{rate_col}{} {d}runs/sec{z}   {d}({}/min){z}",
             human_count(rate),
             human_count(per_min)
         ),
@@ -2075,15 +2075,18 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
         ),
     ));
     s.push_str(&row(
-        "Peak",
+        "Peak speed",
         format!(
-            "{} {d}/s · session max{z}",
+            "{} {d}runs/sec · session max{z}",
             human_count(host.runs_peak.round().max(0.0) as u64)
         ),
     ));
     s.push_str(&row(
         "Total",
-        format!("{} {d}cumulative{z}", human_count(host.runs_total)),
+        format!(
+            "{} {d}runs, so far this session{z}",
+            human_count(host.runs_total)
+        ),
     ));
 
     // Recent-shape sparkline of runs/sec (the reader-side ring). When the whole window is idle, an
@@ -2094,13 +2097,13 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
         if host.runs_spark.iter().any(|&v| v > 0.0) {
             s.push_str(&format!(
                 "\n  {b}{:<14}{z}{g}{}{z}\n",
-                "Recent /s",
+                "Recent",
                 spark(&host.runs_spark)
             ));
         } else {
             s.push_str(&format!(
                 "\n  {b}{:<14}{z}{d}idle — no runs in the last window{z}\n",
-                "Recent /s"
+                "Recent"
             ));
         }
     }
