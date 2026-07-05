@@ -1465,8 +1465,16 @@ fn render(
             TAB_BUILDS => format!("{} ({})", TABS[i], builds.len()),
             TAB_PROFILES => format!("{} ({})", TABS[i], profs.len()),
             TAB_STORAGE => format!("{} ({})", TABS[i], vols.len()),
-            // Runs is aggregate (no per-row list) — a ⚡ marks live throughput instead of a stale count.
-            TAB_RUNS if host.runs_per_sec > 0.5 => format!("{} ⚡", TABS[i]),
+            // Runs has no per-row list — its count is the CUMULATIVE total (how many ran this session),
+            // so the tab reads like the others; a ⚡ also flags live throughput while streaming.
+            TAB_RUNS => {
+                let n = human_count(host.runs_total);
+                if host.runs_per_sec > 0.5 {
+                    format!("{} ({n}) ⚡", TABS[i])
+                } else {
+                    format!("{} ({n})", TABS[i])
+                }
+            }
             _ => TABS[i].to_string(),
         }
     };
