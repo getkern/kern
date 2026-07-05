@@ -1048,19 +1048,60 @@ fn section_fields(section: &str) -> Vec<Field> {
             ] {
                 advanced.push(mk(label, plain));
             }
-            advanced.push(if has_gpio {
-                Field::text("pwm", "PWM lines, e.g. 12 13")
+            // Number fields (pwm/adc/onewire are channel/line indices you'd type) only accept typing
+            // when the host actually HAS that controller; otherwise there's nothing to type, so it's a
+            // "none here" note — never an empty box asking you to guess. A gated helper keeps it uniform.
+            let dir_has = |dir: &str, prefix: &str| {
+                std::fs::read_dir(dir)
+                    .map(|rd| {
+                        rd.flatten().any(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| n.starts_with(prefix))
+                        })
+                    })
+                    .unwrap_or(false)
+            };
+            let gated = |label: &'static str, hint: &'static str, present: bool| {
+                if present {
+                    Field::text(label, hint)
+                } else {
+                    Field::info(label, "none detected on this host")
+                }
+            };
+            advanced.push(gated(
+                "pwm",
+                "PWM lines, e.g. 12 13",
+                dir_has("/sys/class/pwm", "pwmchip"),
+            ));
+            advanced.push(gated(
+                "adc",
+                "ADC channels, e.g. 0 1",
+                dir_has("/sys/bus/iio/devices", "iio:device"),
+            ));
+            advanced.push(gated(
+                "onewire",
+                "1-Wire line numbers",
+                std::path::Path::new("/sys/bus/w1/devices").exists(),
+            ));
+            // `backend` names a configured `[[gpio]]` id — so it's a SELECTION, not free text (that's
+            // how `gpio:0sfsf…` was possible). Offer the configured ids as a picker; if none are set up,
+            // say so instead of a blank box a beginner can't fill.
+            let backends: Vec<String> = crate::config::load(None)
+                .unwrap_or_default()
+                .gpio
+                .iter()
+                .map(|g| g.id.clone())
+                .collect();
+            advanced.push(if backends.is_empty() {
+                Field::info(
+                    "backend",
+                    "no GPIO backend configured (run: kern config setup)",
+                )
             } else {
-                Field::info("pwm", "no GPIO controller on this host")
+                Field::pick("backend", "the GPIO backend to use", backends)
             });
-            for (label, plain) in [
-                ("adc", "ADC channels"),
-                ("onewire", "1-Wire lines"),
-                ("backend", "GPIO backend id, e.g. gpio:0"),
-                ("extra", "any other /dev path"),
-            ] {
-                advanced.push(Field::text(label, plain));
-            }
+            advanced.push(Field::text("extra", "any other /dev path"));
             let mut v = common;
             v.push(Field::divider());
             for mut f in advanced {
@@ -1198,13 +1239,11 @@ fn field_value_ok(section: &str, label: &str, v: &str) -> bool {
     }
 }
 
-/// A blank form to create a new profile. `vgpio` pre-fills `backend = gpio:0` (the id
-/// `kern config setup` generates) so a beginner rarely has to touch it.
+/// A blank form to create a new profile. `backend` is no longer pre-filled: it's now a picker of the
+/// configured GPIO ids (or a "run kern config setup" note), and it's optional — the resolver binds the
+/// gpiochips from `pins` regardless — so a beginner leaves it alone.
 fn new_profile_form(section: &'static str) -> Form {
-    let mut fields = section_fields(section);
-    if section == "vgpio" {
-        set_field(&mut fields, "backend", "gpio:0".to_string());
-    }
+    let fields = section_fields(section);
     Form {
         title: format!("new {section} profile"),
         fields,
@@ -3445,6 +3484,18 @@ leds = [\"led0\"]
         assert!(
             opened.contains("backend"),
             "advanced fields show once opened:\n{opened}"
+        );
+    }
+
+    #[test]
+    fn backend_is_a_selection_never_a_free_text_box() {
+        // `backend` names a configured [[gpio]] id — so it must be a PICKER of those ids (or a "none
+        // configured" note), never a free-text box where `gpio:0sfsf…` could be typed.
+        let fields = section_fields("vgpio");
+        let backend = fields.iter().find(|f| f.label == "backend").unwrap();
+        assert!(
+            backend.is_pick() || backend.info,
+            "backend must be a picker or a note, not free text"
         );
     }
 
