@@ -1374,6 +1374,8 @@ fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
             )
         };
     } else {
+        // Create the target node inside the box-owned tmpfs (O_NOFOLLOW: a hostile image symlink at
+        // the target can't redirect where we create it).
         let f = unsafe {
             libc::open(
                 t.as_ptr(),
@@ -1384,15 +1386,38 @@ fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
         if f >= 0 {
             unsafe { libc::close(f) };
         }
-        unsafe {
-            libc::mount(
+        // TOCTOU-safe SOURCE: open the host device `O_PATH|O_NOFOLLOW` so the fd PINS this exact inode,
+        // then bind FROM the fd via /proc/self/fd — a name swapped between the resolver's check and this
+        // mount can't redirect us to a different device. `src` is already canonicalized, so its final
+        // component isn't a symlink and O_NOFOLLOW won't reject a legitimate node (but WILL reject one
+        // swapped to a symlink afterwards). Re-check on the pinned fd that it's not a BLOCK device (a
+        // host disk) — closing the window against a swap-to-/dev/sda between check and bind.
+        let sfd = unsafe {
+            libc::open(
                 s.as_ptr(),
-                t.as_ptr(),
-                ptr::null(),
-                libc::MS_BIND as libc::c_ulong,
-                ptr::null(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
+        if sfd < 0 {
+            return; // absent or swapped-to-symlink → skip (fail-safe)
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let is_block = unsafe { libc::fstat(sfd, &mut st) } == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFBLK;
+        if !is_block {
+            if let Ok(fdpath) = cstr(&format!("/proc/self/fd/{sfd}")) {
+                unsafe {
+                    libc::mount(
+                        fdpath.as_ptr(),
+                        t.as_ptr(),
+                        ptr::null(),
+                        libc::MS_BIND as libc::c_ulong,
+                        ptr::null(),
+                    )
+                };
+            }
+        }
+        unsafe { libc::close(sfd) };
     }
 }
 
