@@ -1366,6 +1366,47 @@ fn host_mem() -> Option<(u64, u64)> {
     Some((total.saturating_sub(avail) * 1024, total * 1024))
 }
 
+/// The host devices currently present for a vGPIO field `kind` — the options the new/edit form offers
+/// as checkboxes, so a user PICKS from what actually exists instead of typing a `/dev/…` path (which
+/// is easy to get wrong). Uniform for every host: the same probe runs everywhere, only the *contents*
+/// differ — a Pi shows its i2c/gpio, a mini-PC its bluetooth/usb. Returns sorted; a busy desktop can
+/// return many (e.g. 20 i2c DDC buses), so the form caps the visible count and keeps a manual field.
+// Wired into the vGPIO new/edit form (checkbox picker) in a follow-up; kept here as the shared,
+// host-uniform probe so every profile form uses one identical mechanism.
+#[allow(dead_code)]
+fn present_devices(kind: &str) -> Vec<String> {
+    // Files under `dir` whose name starts with any of `prefixes`, mapped through `to_entry`.
+    fn scan(dir: &str, prefixes: &[&str], to_entry: impl Fn(&str) -> String) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| prefixes.iter().any(|p| n.starts_with(p)))
+            .map(|n| to_entry(&n))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+    let dev = |prefixes: &[&str]| scan("/dev", prefixes, |n| format!("/dev/{n}"));
+    match kind {
+        "i2c" => dev(&["i2c-"]),
+        "pins" => dev(&["gpiochip"]), // pins are chip-granular → the gpiochip nodes
+        "spi" => dev(&["spidev"]),
+        "uart" => dev(&["ttyS", "ttyUSB", "ttyACM"]),
+        "can" => dev(&["can"]),
+        "camera" => dev(&["video"]),
+        "input" => scan("/dev/input", &["event"], |n| format!("/dev/input/{n}")),
+        "audio" => scan("/dev/snd", &["pcm", "controlC"], |n| {
+            format!("/dev/snd/{n}")
+        }),
+        "leds" => scan("/sys/class/leds", &[""], |n| n.to_string()), // led NAMES, not paths
+        "bluetooth" => scan("/sys/class/bluetooth", &["hci"], |n| n.to_string()),
+        _ => Vec::new(),
+    }
+}
+
 /// `(used, total)` bytes on the filesystem that backs the kern data root — `statvfs("/")`, matching
 /// `df` (used = blocks − free). This is the disk where images / volumes / vdisks physically live.
 fn host_disk() -> Option<(u64, u64)> {
