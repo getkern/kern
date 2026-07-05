@@ -1721,6 +1721,79 @@ mod tests {
     }
 
     #[test]
+    fn extreme_vgpio_never_binds_a_dangerous_device_via_any_field_or_path_trick() {
+        // A battery of host-control / raw devices, some with path tricks (../, ./, double-/dev), fed
+        // through `extra` — none may ever reach `devs`, whether present-and-refused or absent-and-skipped.
+        let dangerous = [
+            "/dev/mem",
+            "/dev/kmem",
+            "/dev/port",
+            "/dev/sda",
+            "/dev/sda1",
+            "/dev/nvme0n1",
+            "/dev/mmcblk0",
+            "/dev/dm-0",
+            "/dev/loop0",
+            "/dev/watchdog",
+            "/dev/watchdog0",
+            "/dev/mtd0",
+            "/dev/mtdblock0",
+            "/dev/nvram",
+            "/dev/kvm",
+            "/dev/vhost-net",
+            "/dev/vhost-vsock",
+            "/dev/uinput",
+            "/dev/vfio/vfio",
+            "/dev/vfio/10",
+            "/dev/dri/card0",
+            "/dev/fuse",
+            "/dev/../dev/mem",
+            "/dev/./mem",
+            "/dev/../dev/sda",
+        ];
+        let bad = |x: &str| {
+            [
+                "mem", "sda", "nvme", "mmcblk", "dm-", "loop", "watchdog", "mtd", "nvram", "kvm",
+                "vhost", "uinput", "vfio", "/card", "fuse",
+            ]
+            .iter()
+            .any(|k| x.contains(k))
+                || x.ends_with("/tun")
+        };
+        for d in dangerous {
+            let mut cfg = KernConfig::default();
+            cfg.vgpio.push(VGpioEntry {
+                name: "x".into(),
+                extra: vec![d.to_string()],
+                ..Default::default()
+            });
+            let r = resolve_vgpio(&cfg, "x").unwrap();
+            assert!(
+                !r.devs.iter().any(|x| bad(x)),
+                "dangerous device {d:?} leaked into devs: {:?}",
+                r.devs
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_i2c_normalization_rejects_tricks_and_is_the_shared_rule() {
+        // The one ambiguous form. All-digits validated BEFORE the path is built, so a traversal can't
+        // concatenate; a full path is left to the caller's canonicalize gate; junk is refused.
+        assert_eq!(canon_i2c_bus("1"), Some("/dev/i2c-1".into()));
+        assert_eq!(canon_i2c_bus("i2c-5"), Some("/dev/i2c-5".into()));
+        assert_eq!(canon_i2c_bus("0"), Some("/dev/i2c-0".into()));
+        assert_eq!(canon_i2c_bus("/dev/i2c-1"), None); // a full path → caller keeps it verbatim
+        assert_eq!(canon_i2c_bus("1/../spi0"), None); // NOT a bus number → refused (no /dev/spi0)
+        assert_eq!(canon_i2c_bus("i2c-"), None);
+        assert_eq!(canon_i2c_bus(""), None);
+        assert_eq!(canon_i2c_bus("abc"), None);
+        assert_eq!(canon_i2c_bus("-1"), None);
+        assert_eq!(canon_i2c_bus("1a"), None);
+        assert_eq!(canon_i2c_bus(" 1"), None); // a space is not a digit
+    }
+
+    #[test]
     fn vgpio_refuses_disk_and_raw_memory_devices() {
         // The security boundary: even though they live under /dev/, memory and disk nodes must never be
         // bound into a peripheral sandbox. Name-based denial is deterministic (no metadata needed).
