@@ -787,6 +787,19 @@ fn profile_rows(cfg: &crate::config::KernConfig) -> Vec<ProfRow> {
             summary: parts.join("  "),
         });
     }
+    // Group by category (compute → device → storage) and sort by name within each — so the list is
+    // predictable and grouped, not raw config-insertion order.
+    out.sort_by(|a, b| {
+        let rank = |s: &str| match s {
+            "vcpu" => 0,
+            "vgpio" => 1,
+            "vdisk" => 2,
+            _ => 3,
+        };
+        rank(a.section)
+            .cmp(&rank(b.section))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     out
 }
 
@@ -1965,9 +1978,16 @@ fn spark(samples: &[f64]) -> String {
 fn runs_table(p: &Palette, host: &HostStats) -> String {
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let row = |k: &str, v: String| format!("  {b}{:<14}{z}{v}\n", k);
-    let mut s = format!(
-        "\n  {d}capped processes — {z}{c}kern run -- <cmd>{z}{d} · ~1 ms, no sandbox, fire-and-forget{z}\n\n"
-    );
+    let mut s = String::new();
+    s.push_str(&format!(
+        "\n  {b}Runs{z}{d} = fast, CPU/memory-capped commands — {z}{c}kern run -- <cmd>{z}{d} — with {z}{b}no sandbox{z}{d}, gone in ~1 ms.{z}\n"
+    ));
+    s.push_str(&format!(
+        "  {d}A run is {z}{b}NOT a container{z}{d}: for an isolated box, use the {z}{c}Boxes{z}{d} tab. Runs are too fast/many to{z}\n"
+    ));
+    s.push_str(&format!(
+        "  {d}list one-by-one, so this tab {z}{b}counts{z}{d} them as live throughput (what Docker can't do at scale).{z}\n\n"
+    ));
 
     if host.runs_total == 0 {
         s.push_str(&format!(
@@ -2013,13 +2033,23 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
         format!("{} {d}cumulative{z}", human_count(host.runs_total)),
     ));
 
-    // Recent-shape sparkline of runs/sec (the reader-side ring) — only once we have a couple of samples.
+    // Recent-shape sparkline of runs/sec (the reader-side ring). When the whole window is idle, an
+    // all-`▁` baseline rendered green looks like a growing bar next to "0 /s" (confusing) — so show a
+    // green sparkline only when there's real recent activity, else a dim "idle" so a flat line never
+    // reads as throughput.
     if host.runs_spark.len() >= 2 {
-        s.push_str(&format!(
-            "\n  {b}{:<14}{z}{g}{}{z}\n",
-            "Recent /s",
-            spark(&host.runs_spark)
-        ));
+        if host.runs_spark.iter().any(|&v| v > 0.0) {
+            s.push_str(&format!(
+                "\n  {b}{:<14}{z}{g}{}{z}\n",
+                "Recent /s",
+                spark(&host.runs_spark)
+            ));
+        } else {
+            s.push_str(&format!(
+                "\n  {b}{:<14}{z}{d}idle — no runs in the last window{z}\n",
+                "Recent /s"
+            ));
+        }
     }
 
     s.push_str(&format!(
