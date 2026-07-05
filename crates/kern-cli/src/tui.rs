@@ -72,6 +72,20 @@ struct Form {
     active: usize,
     submit: Submit,
     error: Option<String>,
+    /// Whether the "Advanced" fold is expanded (advanced fields hidden until then).
+    show_advanced: bool,
+}
+
+/// Indices of the fields currently on screen: every common field + the fold row, plus the advanced
+/// fields only when the fold is open. Navigation and rendering both walk this list so a collapsed
+/// advanced group is truly skipped (you can't Tab into a hidden field).
+fn visible_fields(form: &Form) -> Vec<usize> {
+    form.fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.divider || !f.advanced || form.show_advanced)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 #[derive(Clone)]
@@ -90,6 +104,10 @@ struct Field {
     options: Vec<String>,
     sel: Vec<bool>,
     cur: usize,
+    /// A rare/expert knob: hidden under the "Advanced" fold so a beginner sees only the common fields.
+    advanced: bool,
+    /// The "▸ Advanced" fold row itself (not an input) — Space/←→ expand or collapse the advanced group.
+    divider: bool,
 }
 
 impl Field {
@@ -103,6 +121,16 @@ impl Field {
             options: Vec::new(),
             sel: Vec::new(),
             cur: 0,
+            advanced: false,
+            divider: false,
+        }
+    }
+
+    /// The "▸ Advanced" fold row that hides the rare fields until the user expands it.
+    fn divider() -> Self {
+        Field {
+            divider: true,
+            ..Field::text("", "")
         }
     }
 
@@ -906,51 +934,71 @@ fn section_fields(section: &str) -> Vec<Field> {
             Field::text("extends", "base profile (optional)"),
         ],
         "vgpio" => {
-            // Device-PATH kinds become a foolproof checkbox PICKER of what the host actually exposes
-            // (pick, don't type a /dev/ path). A kind with nothing detected falls back to a manual
-            // text field further down — same mechanism on every host, only the contents differ.
-            let mut picks = Vec::new();
-            let mut manual = Vec::new();
-            for (label, hint) in [
-                ("i2c", "/dev/i2c-1,…"),
-                ("spi", "/dev/spidev0.0,…"),
-                ("uart", "/dev/ttyS0,…"),
-                ("leds", "led names"),
-                ("bluetooth", "hci ids"),
-                ("audio", "/dev/snd/…"),
-                ("camera", "/dev/video0,…"),
-                ("input", "/dev/input/…"),
-                ("can", "/dev/can0,…"),
-            ] {
+            // For-dummies: the beginner sees only NAME + the everyday devices, each as a checkbox
+            // list of what THIS host actually exposes — so there's nothing to type and nothing to
+            // guess: tick the device you want the box to reach, or leave it empty. Everything rare
+            // (LEDs, CAN, PWM, backend, …) lives under the "Advanced" fold so the form stays short.
+            //
+            // `pick(label, plain-language what-is-this)` when the host has that device; a manual text
+            // box only for the numeric/not-detectable kinds. Same mechanism on every host — only the
+            // detected contents differ.
+            let mk = |label: &'static str, plain: &'static str| {
                 let opts = present_devices(label);
                 if opts.is_empty() {
-                    manual.push(Field::text(label, hint));
+                    Field::text(label, plain)
                 } else {
-                    picks.push(Field::pick(
-                        label,
-                        "Space select · ←→ move · pick what's here",
-                        opts,
-                    ));
+                    Field::pick(label, plain, opts)
+                }
+            };
+            // The everyday devices, in plain language (no /dev/ jargon in the hint).
+            let mut common = vec![Field::text("name", "a short name, e.g. sensors")];
+            let mut absent = Vec::new(); // a common device the host doesn't have → tuck into Advanced
+            for (label, plain) in [
+                ("i2c", "I²C bus — sensors, small displays"),
+                ("spi", "SPI bus — displays, ADCs"),
+                ("uart", "serial port"),
+                ("camera", "camera"),
+                ("audio", "sound card"),
+                ("bluetooth", "Bluetooth adapter"),
+            ] {
+                let f = mk(label, plain);
+                if f.is_pick() {
+                    common.push(f); // present → show it up front
+                } else {
+                    absent.push(f); // not on this host → Advanced, still editable by hand
                 }
             }
-            // Number / not-auto-detectable kinds stay manual text (pins are GPIO line NUMBERS, etc.).
-            for (label, hint) in [
-                ("pins", "GPIO lines, e.g. 17,27,22"),
-                ("pwm", "PWM lines, e.g. 12,13"),
+            // GPIO pins are line NUMBERS (not a /dev node), so they stay a small typed field — but
+            // it's the one thing GPIO folks reach for, so it stays in the common set.
+            common.push(Field::text("pins", "GPIO pins, e.g. 17 27"));
+            // The rare / expert knobs — hidden until the user opens "Advanced".
+            let mut advanced = absent;
+            for (label, plain) in [
+                ("leds", "on-board LEDs"),
+                ("can", "CAN bus"),
+                ("input", "input devices (keys, touch)"),
+                ("usb", "specific USB devices"),
+                ("midi", "MIDI ports"),
+                ("display", "display nodes (DRI)"),
+            ] {
+                advanced.push(mk(label, plain));
+            }
+            for (label, plain) in [
+                ("pwm", "PWM lines, e.g. 12 13"),
                 ("adc", "ADC channels"),
                 ("onewire", "1-Wire lines"),
-                ("usb", "usb paths"),
-                ("midi", "/dev/midi…"),
-                ("display", "display nodes"),
-                ("net", "iface names"),
-                ("backend", "e.g. gpio:0"),
-                ("extra", "other /dev paths"),
+                ("net", "network interface names"),
+                ("backend", "GPIO backend id, e.g. gpio:0"),
+                ("extra", "any other /dev path"),
             ] {
-                manual.push(Field::text(label, hint));
+                advanced.push(Field::text(label, plain));
             }
-            let mut v = vec![Field::text("name", "e.g. sensors")];
-            v.extend(picks); // detected pickers first (for-dummies)
-            v.extend(manual); // then everything manual (rare / numeric / not detected)
+            let mut v = common;
+            v.push(Field::divider());
+            for mut f in advanced {
+                f.advanced = true;
+                v.push(f);
+            }
             v
         }
         "vdisk" => vec![
@@ -981,6 +1029,7 @@ fn new_profile_form(section: &'static str) -> Form {
             orig_name: None,
         },
         error: None,
+        show_advanced: false,
     }
 }
 
@@ -992,6 +1041,9 @@ fn edit_profile_form(section: &'static str, name: &str, cfg: &crate::config::Ker
     for (k, v) in crate::config::profile_pairs(cfg, section, name) {
         set_field(&mut fields, &k, v);
     }
+    // If the profile already sets an advanced field, open the fold so the edit SHOWS it — nothing the
+    // user configured stays hidden.
+    let show_advanced = fields.iter().any(|f| f.advanced && !f.value.is_empty());
     Form {
         title: format!("edit {section}:{name}"),
         fields,
@@ -1001,6 +1053,7 @@ fn edit_profile_form(section: &'static str, name: &str, cfg: &crate::config::Ker
             orig_name: Some(name.to_string()),
         },
         error: None,
+        show_advanced,
     }
 }
 
@@ -1015,6 +1068,7 @@ fn new_volume_form() -> Form {
         active: 0,
         submit: Submit::CreateVolume,
         error: None,
+        show_advanced: false,
     }
 }
 
@@ -1035,6 +1089,7 @@ fn edit_volume_form(v: &crate::volume::VolInfo) -> Form {
             orig_name: v.name.clone(),
         },
         error: None,
+        show_advanced: false,
     }
 }
 
@@ -1068,26 +1123,52 @@ enum FormOutcome {
 
 /// Edit a form with one keypress: type into the active field, navigate fields, submit or cancel.
 fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
-    // Arrow keys ↑/↓ move between fields; ←/→ move the highlighted checkbox inside a pick field.
+    // Arrow keys ↑/↓ move between VISIBLE fields; ←/→ move the highlighted checkbox inside a pick
+    // field, or open/close the Advanced fold when it's focused.
     if key.len() >= 3 && key[0] == 0x1b && key[1] == b'[' {
+        let vis = visible_fields(&form);
+        let vpos = vis.iter().position(|&i| i == form.active).unwrap_or(0);
         match key[2] {
-            b'A' => form.active = form.active.saturating_sub(1),
-            b'B' => form.active = (form.active + 1).min(form.fields.len().saturating_sub(1)),
+            b'A' => form.active = vis[vpos.saturating_sub(1)],
+            b'B' => form.active = vis[(vpos + 1).min(vis.len().saturating_sub(1))],
             b'C' => {
                 let f = &mut form.fields[form.active];
-                if f.is_pick() {
+                if f.divider {
+                    form.show_advanced = true;
+                } else if f.is_pick() {
                     f.cur = (f.cur + 1) % f.options.len();
                 }
             }
             b'D' => {
                 let f = &mut form.fields[form.active];
-                if f.is_pick() {
+                if f.divider {
+                    form.show_advanced = false;
+                } else if f.is_pick() {
                     f.cur = (f.cur + f.options.len() - 1) % f.options.len();
                 }
             }
             _ => {}
         }
         return FormOutcome::Stay(form);
+    }
+    // The Advanced fold row: Space toggles it; Enter still saves, Esc cancels, Tab moves on — but a
+    // typed character never lands on it.
+    if form.fields[form.active].divider {
+        match key[0] {
+            b' ' => {
+                form.show_advanced = !form.show_advanced;
+                return FormOutcome::Stay(form);
+            }
+            0x1b => return FormOutcome::Cancel,
+            b'\r' | b'\n' | 0x13 => return FormOutcome::Submit(form),
+            b'\t' => {
+                let vis = visible_fields(&form);
+                let vpos = vis.iter().position(|&i| i == form.active).unwrap_or(0);
+                form.active = vis[(vpos + 1) % vis.len()];
+                return FormOutcome::Stay(form);
+            }
+            _ => return FormOutcome::Stay(form),
+        }
     }
     // A pick field: Space checks/unchecks the highlighted option; typing never lands here.
     if form.fields[form.active].is_pick() && !matches!(key[0], 0x1b | b'\t' | b'\r' | b'\n' | 0x13)
@@ -1121,7 +1202,9 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
     match key[0] {
         0x1b => FormOutcome::Cancel, // lone Esc
         b'\t' => {
-            form.active = (form.active + 1) % form.fields.len();
+            let vis = visible_fields(&form);
+            let vpos = vis.iter().position(|&i| i == form.active).unwrap_or(0);
+            form.active = vis[(vpos + 1) % vis.len()];
             FormOutcome::Stay(form)
         }
         b'\r' | b'\n' | 0x13 => FormOutcome::Submit(form), // Enter / Ctrl-S
@@ -1834,23 +1917,36 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
     let (b, c, d, g, r, z) = (p.b, p.c, p.d, p.g, p.r, p.z);
     let mut s = format!("\n  {b}{}{z}\n", form.title);
     s.push_str(&format!(
-        "  {d}type into the {z}{c}highlighted{z}{d} field · {z}{c}Tab{z}{d}/{z}{c}↑↓{z}{d} switch field · {z}{c}⏎{z}{d} save · {z}{c}Esc{z}{d} cancel{z}\n\n"
+        "  {d}{z}{c}↑↓{z}{d}/{z}{c}Tab{z}{d} move · {z}{c}Space{z}{d} tick a box · {z}{c}⏎{z}{d} save · {z}{c}Esc{z}{d} cancel{z}\n"
     ));
+    // A one-line, plain-language explainer for the fiddly kinds so the user isn't left guessing.
+    if let Submit::SaveProfile { section, .. } = &form.submit {
+        let intro = match *section {
+            "vgpio" => Some(
+                "Tick the hardware this box may use. Nothing ticked = a pure sandbox. You can edit it later.",
+            ),
+            _ => None,
+        };
+        if let Some(t) = intro {
+            s.push_str(&format!("  {d}{t}{z}\n"));
+        }
+    }
+    s.push('\n');
     // Inner width of the value box (chars). Kept modest so the box hugs the text, not the whole screen.
     let boxw = width.saturating_sub(24).clamp(14, 30);
-    // Scroll: show a window of fields that keeps the active one visible. Reserve rows for the title,
-    // hint, blank, the two "more" markers and the error line.
-    let n = form.fields.len();
-    let visible = body_rows.saturating_sub(6).max(3).min(n.max(1));
-    let start = form
-        .active
-        .saturating_sub(visible - 1)
-        .min(n.saturating_sub(visible));
-    let end = (start + visible).min(n);
-    if start > 0 {
-        s.push_str(&format!("  {d}  ↑ {start} more{z}\n"));
+    // Scroll over the VISIBLE fields (a collapsed Advanced group is skipped) so the active one stays on
+    // screen. Reserve rows for the title, hint, blank, the two "more" markers and the error line.
+    let vis = visible_fields(form);
+    let nvis = vis.len();
+    let win = body_rows.saturating_sub(7).max(3).min(nvis.max(1));
+    let vpos = vis.iter().position(|&i| i == form.active).unwrap_or(0);
+    let vstart = vpos.saturating_sub(win - 1).min(nvis.saturating_sub(win));
+    let vend = (vstart + win).min(nvis);
+    if vstart > 0 {
+        s.push_str(&format!("  {d}  ↑ {vstart} more{z}\n"));
     }
-    for (i, f) in form.fields.iter().enumerate().take(end).skip(start) {
+    for &i in &vis[vstart..vend] {
+        let f = &form.fields[i];
         let active = i == form.active;
         let caret = if active {
             format!("{c}▸{z}")
@@ -1862,6 +1958,35 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
         } else {
             format!("{b}{:<9}{z}", f.label)
         };
+        // The Advanced fold row: a single toggle line that hides the rare knobs. Collapsed, it lists a
+        // few of what's inside so the user knows there's more (and that they can ignore it).
+        if f.divider {
+            let n_adv = form.fields.iter().filter(|x| x.advanced).count();
+            let cap = if form.show_advanced {
+                "▾ Advanced — hide rare devices".to_string()
+            } else {
+                let names: Vec<&str> = form
+                    .fields
+                    .iter()
+                    .filter(|x| x.advanced)
+                    .map(|x| x.label)
+                    .take(4)
+                    .collect();
+                let more = if n_adv > names.len() { ", …" } else { "" };
+                format!("▸ Advanced — {n_adv} more: {}{more}", names.join(", "))
+            };
+            // No generic caret here — the ▸/▾ in the cap IS the pointer; accent colour shows focus.
+            let styled = if active {
+                format!(
+                    "{c}{cap}   Space to {}{z}",
+                    if form.show_advanced { "hide" } else { "open" }
+                )
+            } else {
+                format!("{d}{cap}{z}")
+            };
+            s.push_str(&format!("\n    {styled}\n"));
+            continue;
+        }
         // A pick field renders detected devices as checkboxes — ←/→ highlight one, Space checks it.
         // No typing: the choices come from the host, so it's impossible to enter a wrong path.
         if f.is_pick() {
@@ -1873,16 +1998,34 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
                 format!("{g}{}{z}", f.value)
             };
             s.push_str(&format!("  {caret} {label} {cap}\n"));
-            // Window the chips around the cursor so a busy host (many i2c buses) stays readable.
+            // Window the chips around the cursor and grow the window only while it FITS the terminal
+            // width, so a busy host (20+ i2c buses) never overflows into an ugly wrap. `‹N`/`N›` show
+            // how many are hidden on each side.
             let n_opt = f.options.len();
-            const WIN: usize = 6;
-            let pstart = f.cur.saturating_sub(WIN / 2).min(n_opt.saturating_sub(WIN));
-            let pend = (pstart + WIN).min(n_opt);
-            let mut row = String::from("       ");
-            if pstart > 0 {
-                row.push_str(&format!("{d}‹ {pstart}  {z}"));
+            let cw = |i: usize| f.options[i].chars().count() + 5; // "[ ]" + name + two spaces
+            let budget = width.saturating_sub(11); // 7-space indent + the ‹N / N› counters
+            let (mut lo, mut hi) = (f.cur, f.cur + 1);
+            let mut used = cw(f.cur);
+            loop {
+                let grow_hi = hi < n_opt && used + cw(hi) <= budget;
+                if grow_hi {
+                    used += cw(hi);
+                    hi += 1;
+                }
+                let grow_lo = lo > 0 && used + cw(lo - 1) <= budget;
+                if grow_lo {
+                    lo -= 1;
+                    used += cw(lo);
+                }
+                if !grow_hi && !grow_lo {
+                    break;
+                }
             }
-            for i in pstart..pend {
+            let mut row = String::from("       ");
+            if lo > 0 {
+                row.push_str(&format!("{d}‹{lo}  {z}"));
+            }
+            for i in lo..hi {
                 let checked = f.sel.get(i).copied().unwrap_or(false);
                 let mark = if checked {
                     format!("{g}✓{z}")
@@ -1896,8 +2039,8 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
                     row.push_str(&format!("{d}[{z}{mark}{d}]{z}{name}  "));
                 }
             }
-            if pend < n_opt {
-                row.push_str(&format!("{d} {} ›{z}", n_opt - pend));
+            if hi < n_opt {
+                row.push_str(&format!("{d}{} ›{z}", n_opt - hi));
             }
             s.push_str(&row);
             s.push('\n');
@@ -1953,8 +2096,8 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
         };
         s.push_str(&format!("  {caret} {label} {lb}{inner}{rb}\n"));
     }
-    if end < n {
-        s.push_str(&format!("  {d}  ↓ {} more{z}\n", n - end));
+    if vend < nvis {
+        s.push_str(&format!("  {d}  ↓ {} more{z}\n", nvis - vend));
     }
     if let Some(e) = &form.error {
         s.push_str(&format!("\n  {r}✗ {e}{z}\n"));
@@ -2974,6 +3117,7 @@ leds = [\"led0\"]
                 orig_name: None,
             },
             error: None,
+            show_advanced: false,
         };
         // Check option 0, move right twice, check option 2 → value is the two checked paths, in order.
         let feed = |form: Form, k: &[u8]| match handle_form_key(form, k) {
@@ -2991,13 +3135,54 @@ leds = [\"led0\"]
 
         // The pane renders the checked boxes as `[✓]` and the device names (no free-text box).
         let pane = form_pane(&plain(), &form, 80, 24);
-        assert!(pane.contains("[✓]"), "checked options render as ticks:\n{pane}");
-        assert!(pane.contains("/dev/i2c-0"), "device names are shown:\n{pane}");
+        assert!(
+            pane.contains("[✓]"),
+            "checked options render as ticks:\n{pane}"
+        );
+        assert!(
+            pane.contains("/dev/i2c-0"),
+            "device names are shown:\n{pane}"
+        );
 
         // seed_pick_selection re-checks the boxes matching a pre-filled value (edit path).
         f.value = "/dev/i2c-1".into();
         f.seed_pick_selection();
         assert_eq!(f.sel, vec![false, true, false]);
         assert_eq!(f.value, "/dev/i2c-1");
+    }
+
+    #[test]
+    fn vgpio_form_hides_rare_fields_until_advanced_is_opened() {
+        // A new vgpio form is short: the rare knob `backend` (pre-filled to gpio:0) lives under the
+        // collapsed Advanced fold, so a beginner doesn't see it at all until they ask.
+        let mut form = new_profile_form("vgpio");
+        assert!(!form.show_advanced, "advanced starts collapsed");
+        assert!(
+            form.fields.iter().any(|f| f.divider),
+            "there is an Advanced fold row"
+        );
+        let collapsed = form_pane(&plain(), &form, 80, 40);
+        assert!(collapsed.contains("Advanced"), "the fold is advertised");
+        assert!(
+            collapsed.contains("Tick the hardware"),
+            "a plain-language explainer guides the user:\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("backend"),
+            "a collapsed advanced field is hidden:\n{collapsed}"
+        );
+        // Focus the fold and press Space → it opens and the advanced fields appear.
+        let div = form.fields.iter().position(|f| f.divider).unwrap();
+        form.active = div;
+        form = match handle_form_key(form, b" ") {
+            FormOutcome::Stay(f) => f,
+            _ => panic!("space on the fold should stay in the form"),
+        };
+        assert!(form.show_advanced, "Space opened the fold");
+        let opened = form_pane(&plain(), &form, 80, 40);
+        assert!(
+            opened.contains("backend"),
+            "advanced fields show once opened:\n{opened}"
+        );
     }
 }
