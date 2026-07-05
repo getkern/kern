@@ -781,29 +781,60 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("/dev/i2c-{n}"))
 }
 
-/// A `/dev` node that must never be bound into a deny-by-default *peripheral* sandbox. The rule is not
-/// a list to chase but a category test: refuse anything that gives the box control over the HOST or raw
-/// access to memory/storage; allow plain I/O peripherals (gpio, i2c, spi, uart, can, dri, rtc, …).
+/// A `/dev` node that must never be bound into a deny-by-default *peripheral* sandbox. The rule is a
+/// finite CAPABILITY test, not a list to chase: refuse a node that grants any of the host-control
+/// capabilities below; allow plain I/O peripherals (gpio, i2c, spi, uart, can, render-GPU, rtc, …).
 ///
-/// - any BLOCK device → host storage (that's `vdisk`'s job): sda, nvme\*, mmcblk\*, dm-\*, loop\*
-/// - mem / kmem / port → raw physical memory & I/O ports
-/// - watchdog\* → can REBOOT the host
-/// - mtd\* / nvram → raw flash/firmware: can BRICK the board
-/// - net/tun (basename `tun`) → creates host network interfaces: escapes net isolation
-/// - fuse → mount user-controlled filesystems: mount-confusion vector
+/// 1. host storage — any BLOCK device (that's `vdisk`'s job): sda, nvme\*, mmcblk\*, dm-\*, loop\*
+/// 2. raw memory / I/O ports — mem, kmem, port, kmsg, fmem, mergemem
+/// 3. arbitrary DMA — VFIO device passthrough (`/dev/vfio/*`): can read/write ALL physical memory
+/// 4. host reboot / brick — watchdog\*, mtd\*, nvram (raw flash/firmware)
+/// 5. virtualization / hypervisor — kvm, vhost\* (vhost-net/vsock)
+/// 6. input injection — uinput (synthesise keystrokes into the host)
+/// 7. host network creation — net/tun
+/// 8. display control — dri/card\* (the privileged KMS/modeset node)
+/// 9. mount confusion — fuse
 ///
-/// GPU render nodes (dri/card\*, renderD\*) and rtc are legitimate peripherals and are NOT refused.
+/// The render-only GPU node (`dri/renderD*`), rtc and hpet are legitimate peripherals and are allowed;
+/// only the privileged `card*` DRM node is refused.
 fn is_dangerous_dev(real: &std::path::Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     if std::fs::metadata(real).is_ok_and(|m| m.file_type().is_block_device()) {
-        return true;
+        return true; // (1) host storage
     }
     let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    matches!(
+    let parent = real
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    // (2) raw memory · (4) nvram · (5) kvm · (6) uinput · (7) tun · (9) fuse
+    if matches!(
         name,
-        "mem" | "kmem" | "port" | "kmsg" | "fmem" | "mergemem" | "nvram" | "fuse" | "tun"
-    ) || name.starts_with("watchdog")
-        || name.starts_with("mtd")
+        "mem"
+            | "kmem"
+            | "port"
+            | "kmsg"
+            | "fmem"
+            | "mergemem"
+            | "nvram"
+            | "kvm"
+            | "uinput"
+            | "tun"
+            | "fuse"
+    ) {
+        return true;
+    }
+    // (4) reboot/brick families · (5) vhost-net/vsock
+    if name.starts_with("watchdog") || name.starts_with("mtd") || name.starts_with("vhost") {
+        return true;
+    }
+    // (3) VFIO — arbitrary DMA, the worst: /dev/vfio/{vfio,<group>}
+    if parent == "vfio" || name == "vfio" {
+        return true;
+    }
+    // (8) the privileged DRM node (modeset); the render-only node renderD* stays allowed.
+    parent == "dri" && name.starts_with("card")
 }
 
 /// A `/dev` node kind that vGPIO *recognizes* as a plain peripheral. Anything under `/dev/` that is
@@ -1651,15 +1682,22 @@ mod tests {
             "/dev/nvram",
             "/dev/net/tun",
             "/dev/fuse",
+            "/dev/kvm",         // hypervisor
+            "/dev/vhost-net",   // VM network backend
+            "/dev/vhost-vsock", // VM vsock backend
+            "/dev/uinput",      // input injection
+            "/dev/vfio/vfio",   // arbitrary DMA — the worst
+            "/dev/vfio/42",     // a vfio group
+            "/dev/dri/card0",   // privileged DRM (modeset)
         ] {
             assert!(is_dangerous_dev(std::path::Path::new(dev)), "{dev} refused");
         }
-        // Legitimate peripherals (including GPU render nodes and the RTC) must NOT be refused.
+        // Legitimate peripherals (the GPU RENDER node, rtc) must NOT be refused — only card* is.
         for dev in [
             "/dev/i2c-1",
             "/dev/null",
             "/dev/spidev0.0",
-            "/dev/dri/renderD128",
+            "/dev/dri/renderD128", // render-only GPU node — allowed
             "/dev/rtc0",
         ] {
             assert!(
