@@ -715,9 +715,21 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         push_sysfs(format!("/sys/class/leds/{led}"));
     }
 
-    // Direct `/dev/*` device nodes: canonicalize, then require the real path stays under `/dev/`.
+    // Direct `/dev/*` device nodes: canonicalize, require the real path stays under `/dev/`, AND
+    // refuse the dangerous ones. "Under /dev/" is NOT a sufficient boundary — it still includes
+    // `/dev/mem` (physical RAM), `/dev/sda` (the host disk), `/dev/kmem`, `/dev/port`. vGPIO passes
+    // *character peripherals* (buses, serial, cameras, sound), never storage or raw memory — so we
+    // deny every block device (that's `vdisk`'s job) and the raw-memory char nodes. This closes the
+    // hole where an `extra = "/dev/mem"` in a hand-written or imported profile would otherwise bind
+    // physical memory into a box.
     for path in vgpio_device_paths(e) {
         match std::fs::canonicalize(&path) {
+            Ok(real) if real.starts_with("/dev/") && is_dangerous_dev(&real) => {
+                eprintln!(
+                    "kern: vgpio device {path} → {} is a disk or raw-memory device — refused (vgpio passes peripherals, not storage/RAM)",
+                    real.display()
+                );
+            }
             Ok(real) if real.starts_with("/dev/") => {
                 devs.push(real.to_string_lossy().into_owned());
             }
@@ -731,12 +743,35 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         }
     }
 
+    // `net` is parsed and preserved for round-trip, but a vGPIO profile does not (yet) move a network
+    // interface into the box — so say so rather than silently doing nothing.
+    if !e.net.is_empty() {
+        eprintln!(
+            "kern: vgpio '{}' sets net={:?}, but vgpio does not attach network interfaces — ignored (use the box's --net)",
+            e.name, e.net
+        );
+    }
+
     Ok(ResolvedVgpio {
         name: e.name.clone(),
         devs,
         sysfs,
         pins: e.pins.clone(),
     })
+}
+
+/// A `/dev` node that must never be bound into a deny-by-default peripheral sandbox: any **block**
+/// device (the host disks — that's `vdisk`'s domain) or a raw-memory/port char device. Used to gate
+/// vGPIO device passthrough after canonicalization.
+fn is_dangerous_dev(real: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    if std::fs::metadata(real).is_ok_and(|m| m.file_type().is_block_device()) {
+        return true; // /dev/sda, /dev/nvme0n1, /dev/mmcblk0, /dev/dm-0, /dev/loop0, …
+    }
+    matches!(
+        real.file_name().and_then(|n| n.to_str()),
+        Some("mem" | "kmem" | "port" | "kmsg" | "fmem" | "mergemem")
+    )
 }
 
 /// The `/dev/*`-path fields of a vGPIO profile (everything except pins/pwm/adc/onewire/leds/net,
@@ -1551,6 +1586,31 @@ mod tests {
             r.sysfs
         );
         assert!(resolve_vgpio(&cfg, "ghost").is_err());
+    }
+
+    #[test]
+    fn vgpio_refuses_disk_and_raw_memory_devices() {
+        // The security boundary: even though they live under /dev/, memory and disk nodes must never be
+        // bound into a peripheral sandbox. Name-based denial is deterministic (no metadata needed).
+        assert!(is_dangerous_dev(std::path::Path::new("/dev/mem")));
+        assert!(is_dangerous_dev(std::path::Path::new("/dev/kmem")));
+        assert!(is_dangerous_dev(std::path::Path::new("/dev/port")));
+        assert!(!is_dangerous_dev(std::path::Path::new("/dev/i2c-1")));
+        assert!(!is_dangerous_dev(std::path::Path::new("/dev/null")));
+        // End to end: an `extra = "/dev/mem"` (hand-written / imported profile) never reaches `devs` —
+        // either the host lacks it (skipped) or it's present and refused. Both outcomes: not bound.
+        let mut cfg = KernConfig::default();
+        cfg.vgpio.push(VGpioEntry {
+            name: "danger".into(),
+            extra: vec!["/dev/mem".into(), "/dev/../dev/mem".into()],
+            ..Default::default()
+        });
+        let r = resolve_vgpio(&cfg, "danger").unwrap();
+        assert!(
+            !r.devs.iter().any(|d| d.ends_with("/mem")),
+            "physical memory must never be bound: {:?}",
+            r.devs
+        );
     }
 
     #[test]
