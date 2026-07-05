@@ -100,13 +100,12 @@ fn nav_fields(form: &Form) -> Vec<usize> {
 /// Canonicalize a pick option/value token for MATCHING (edit-seed dedup). Only i2c has an ambiguous
 /// short form: a bus may be saved bare (`"1"`) or as `"i2c-1"` but the host scan lists `"/dev/i2c-1"`
 /// — fold all three to the `/dev/` form so they compare equal. Everything else is returned unchanged.
-/// This mirrors the runtime's `vgpio_device_paths` normalization (validate all-digits before building
-/// the path), kept in sync so the form and the resolver agree on identity.
+/// Uses the resolver's `canon_i2c_bus` (SINGLE source of truth) so the form and the runtime can't
+/// drift on what counts as the same bus.
 fn canon_pick_token(label: &str, s: &str) -> String {
-    if label == "i2c" && !s.starts_with('/') {
-        let n = s.strip_prefix("i2c-").unwrap_or(s);
-        if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
-            return format!("/dev/i2c-{n}");
+    if label == "i2c" {
+        if let Some(p) = crate::config::canon_i2c_bus(s) {
+            return p;
         }
     }
     s.to_string()
