@@ -1308,6 +1308,8 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
 struct HostStats {
     mem_used: u64,
     mem_total: u64,
+    disk_used: u64,
+    disk_total: u64,
     cpu_pct: f64,
     cores: usize,
     load1: f64,
@@ -1364,6 +1366,20 @@ fn host_mem() -> Option<(u64, u64)> {
     Some((total.saturating_sub(avail) * 1024, total * 1024))
 }
 
+/// `(used, total)` bytes on the filesystem that backs the kern data root — `statvfs("/")`, matching
+/// `df` (used = blocks − free). This is the disk where images / volumes / vdisks physically live.
+fn host_disk() -> Option<(u64, u64)> {
+    let path = std::ffi::CString::new("/").ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let bs = st.f_frsize as u64;
+    let total = st.f_blocks as u64 * bs;
+    let used = (st.f_blocks as u64).saturating_sub(st.f_bfree as u64) * bs;
+    Some((used, total))
+}
+
 /// The host's logical CPU count (per-CPU lines in `/proc/stat`), resolved once — the core count is
 /// fixed for the process's life, so `top` needn't re-read `/proc/stat` for it every frame.
 fn host_cores() -> usize {
@@ -1403,11 +1419,14 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
         _ => 0.0,
     };
     let (mem_used, mem_total) = host_mem().unwrap_or((0, 0));
+    let (disk_used, disk_total) = host_disk().unwrap_or((0, 0));
     let (load1, cores) = host_load_cores();
     (
         HostStats {
             mem_used,
             mem_total,
+            disk_used,
+            disk_total,
             cpu_pct,
             cores,
             load1,
@@ -1437,17 +1456,24 @@ fn render(
     sel: usize,
     mode: &Mode,
 ) -> String {
-    let (b, c, d, z) = (p.b, p.c, p.d, p.z);
+    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let width = cols.clamp(40, 120);
     // Chrome around the content is ~8 lines (title 2 + tabs 1 + rule 1 + footer 3 + header 1); cap
     // the table so the frame never exceeds the screen and scrolls (which corrupts the alt-screen).
     let body_rows = term_rows.saturating_sub(9).max(1);
     let mut s = String::new();
 
-    // Title bar.
+    // Title bar — a live host header, always visible on every tab (CPU · RAM · Disk · Boxes),
+    // refreshed each frame. The green figures are the "now"; the dim ones the total/context.
     s.push_str(&format!(
-        "{b}{c} kern top{z}  {d}{} box(es) running{z}\n\n",
-        rows.len()
+        "{b}{c} kern top{z}   {d}CPU{z} {g}{:>3.0}%{z} {d}/ {} cores{z}   {d}RAM{z} {g}{}{z}{d} / {}{z}   {d}Disk{z} {g}{}{z}{d} / {}{z}   {d}Boxes{z} {g}{}{z}\n\n",
+        host.cpu_pct,
+        host.cores,
+        human_bytes(host.mem_used),
+        human_bytes(host.mem_total),
+        human_bytes(host.disk_used),
+        human_bytes(host.disk_total),
+        rows.len(),
     ));
 
     // Tab bar — active tab inverted, each data tab showing a LIVE count of its rows so you can see how
@@ -2383,6 +2409,8 @@ mod tests {
         let host = HostStats {
             mem_used: 0,
             mem_total: 1,
+            disk_used: 0,
+            disk_total: 1,
             cpu_pct: 0.0,
             cores: 1,
             load1: 0.0,
