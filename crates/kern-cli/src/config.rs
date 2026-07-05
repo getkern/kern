@@ -726,11 +726,19 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         match std::fs::canonicalize(&path) {
             Ok(real) if real.starts_with("/dev/") && is_dangerous_dev(&real) => {
                 eprintln!(
-                    "kern: vgpio device {path} → {} is a disk or raw-memory device — refused (vgpio passes peripherals, not storage/RAM)",
+                    "kern: vgpio device {path} → {} gives the box control over the host (disk / memory / watchdog / firmware / tun / fuse) — refused",
                     real.display()
                 );
             }
             Ok(real) if real.starts_with("/dev/") => {
+                // Not dangerous, but if it's an UNRECOGNIZED kind (only reachable via `extra`), bind it
+                // yet flag it — the expert escape hatch stays open, an accidental pick gets a heads-up.
+                if !is_recognized_dev(&real) {
+                    eprintln!(
+                        "kern: vgpio binding {} — not a recognized peripheral kind; ensure this is intended",
+                        real.display()
+                    );
+                }
                 devs.push(real.to_string_lossy().into_owned());
             }
             Ok(real) => {
@@ -760,18 +768,65 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
     })
 }
 
-/// A `/dev` node that must never be bound into a deny-by-default peripheral sandbox: any **block**
-/// device (the host disks — that's `vdisk`'s domain) or a raw-memory/port char device. Used to gate
-/// vGPIO device passthrough after canonicalization.
+/// The canonical `/dev` path of an i2c bus reference. `"1"` or `"i2c-1"` → `Some("/dev/i2c-1")`;
+/// a full `/dev/…` path or anything that isn't a plain bus number → `None` (the caller keeps it as-is
+/// or rejects it). The single source of truth for i2c normalization, shared by the resolver here and
+/// the TUI's edit-seed dedup so the two can't drift apart. Validates all-digits BEFORE building the
+/// path, so a crafted `"1/../spi0"` can never concatenate into `/dev/i2c-1/../spi0` → `/dev/spi0`.
+pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
+    if s.starts_with('/') {
+        return None;
+    }
+    let n = s.strip_prefix("i2c-").unwrap_or(s);
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("/dev/i2c-{n}"))
+}
+
+/// A `/dev` node that must never be bound into a deny-by-default *peripheral* sandbox. The rule is not
+/// a list to chase but a category test: refuse anything that gives the box control over the HOST or raw
+/// access to memory/storage; allow plain I/O peripherals (gpio, i2c, spi, uart, can, dri, rtc, …).
+///
+/// - any BLOCK device → host storage (that's `vdisk`'s job): sda, nvme\*, mmcblk\*, dm-\*, loop\*
+/// - mem / kmem / port → raw physical memory & I/O ports
+/// - watchdog\* → can REBOOT the host
+/// - mtd\* / nvram → raw flash/firmware: can BRICK the board
+/// - net/tun (basename `tun`) → creates host network interfaces: escapes net isolation
+/// - fuse → mount user-controlled filesystems: mount-confusion vector
+///
+/// GPU render nodes (dri/card\*, renderD\*) and rtc are legitimate peripherals and are NOT refused.
 fn is_dangerous_dev(real: &std::path::Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     if std::fs::metadata(real).is_ok_and(|m| m.file_type().is_block_device()) {
-        return true; // /dev/sda, /dev/nvme0n1, /dev/mmcblk0, /dev/dm-0, /dev/loop0, …
+        return true;
     }
+    let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
     matches!(
-        real.file_name().and_then(|n| n.to_str()),
-        Some("mem" | "kmem" | "port" | "kmsg" | "fmem" | "mergemem")
-    )
+        name,
+        "mem" | "kmem" | "port" | "kmsg" | "fmem" | "mergemem" | "nvram" | "fuse" | "tun"
+    ) || name.starts_with("watchdog")
+        || name.starts_with("mtd")
+}
+
+/// A `/dev` node kind that vGPIO *recognizes* as a plain peripheral. Anything under `/dev/` that is
+/// neither dangerous nor recognized still binds (via `extra`), but with a heads-up — so a beginner who
+/// lands there by accident is told, while the expert escape hatch stays open.
+fn is_recognized_dev(real: &std::path::Path) -> bool {
+    let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // buses / serial / gpio / sensors
+    for p in [
+        "i2c-", "spidev", "ttyS", "ttyUSB", "ttyACM", "ttyAMA", "gpiochip", "can", "video",
+        "media", "vchiq", "rtc", "hidraw", "input",
+    ] {
+        if name.starts_with(p) {
+            return true;
+        }
+    }
+    // camera/audio/dri/input live in subdirs — match on the parent directory instead
+    let parent = real
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    matches!(parent, "snd" | "dri" | "input" | "i2c")
 }
 
 /// The `/dev/*`-path fields of a vGPIO profile (everything except pins/pwm/adc/onewire/leds/net,
@@ -780,24 +835,18 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
 /// the other buses are taken as `/dev/*` paths verbatim.
 fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
     let i2c = e.i2c.iter().filter_map(|s| {
-        // A full path is taken verbatim — the `canonicalize` + `starts_with("/dev/")` gate at the
-        // call site is the confinement check (so `/dev/../etc/x` → `/etc/x` is rejected there). For
-        // a NON-path entry we require a plain bus NUMBER: validate all-digits BEFORE building the
-        // path, so a crafted `"1/../spi0"` can't concatenate into `/dev/i2c-1/../spi0` → `/dev/spi0`
-        // (a different device that would still pass the `/dev/` gate). Validate the property (a bus
-        // number), not the shape.
+        // A full path is taken verbatim — the `canonicalize` + `starts_with("/dev/")` gate at the call
+        // site is the confinement check. A NON-path entry must be a plain bus NUMBER (all-digits
+        // validated inside `canon_i2c_bus` before the path is built).
         if s.starts_with('/') {
             return Some(s.clone());
         }
-        let n = s.strip_prefix("i2c-").unwrap_or(s);
-        if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
-            Some(format!("/dev/i2c-{n}"))
-        } else {
+        canon_i2c_bus(s).or_else(|| {
             eprintln!(
                 "kern: vgpio i2c entry {s:?} is not a bus number (e.g. \"1\", \"i2c-1\") or a /dev/ path — skipped"
             );
             None
-        }
+        })
     });
     let rest = [
         &e.spi,
@@ -1592,11 +1641,32 @@ mod tests {
     fn vgpio_refuses_disk_and_raw_memory_devices() {
         // The security boundary: even though they live under /dev/, memory and disk nodes must never be
         // bound into a peripheral sandbox. Name-based denial is deterministic (no metadata needed).
-        assert!(is_dangerous_dev(std::path::Path::new("/dev/mem")));
-        assert!(is_dangerous_dev(std::path::Path::new("/dev/kmem")));
-        assert!(is_dangerous_dev(std::path::Path::new("/dev/port")));
-        assert!(!is_dangerous_dev(std::path::Path::new("/dev/i2c-1")));
-        assert!(!is_dangerous_dev(std::path::Path::new("/dev/null")));
+        for dev in [
+            "/dev/mem",
+            "/dev/kmem",
+            "/dev/port",
+            "/dev/watchdog",
+            "/dev/watchdog0",
+            "/dev/mtd0",
+            "/dev/nvram",
+            "/dev/net/tun",
+            "/dev/fuse",
+        ] {
+            assert!(is_dangerous_dev(std::path::Path::new(dev)), "{dev} refused");
+        }
+        // Legitimate peripherals (including GPU render nodes and the RTC) must NOT be refused.
+        for dev in [
+            "/dev/i2c-1",
+            "/dev/null",
+            "/dev/spidev0.0",
+            "/dev/dri/renderD128",
+            "/dev/rtc0",
+        ] {
+            assert!(
+                !is_dangerous_dev(std::path::Path::new(dev)),
+                "{dev} allowed"
+            );
+        }
         // End to end: an `extra = "/dev/mem"` (hand-written / imported profile) never reaches `devs` —
         // either the host lacks it (skipped) or it's present and refused. Both outcomes: not bound.
         let mut cfg = KernConfig::default();
