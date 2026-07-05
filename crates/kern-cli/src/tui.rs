@@ -1796,26 +1796,44 @@ fn disks_summary() -> Option<String> {
 fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -> String {
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let mut s = format!(
-        "\n  {d}reusable specs — attach to a box: {z}{c}kern box vcpu:heavy vgpio:leds vdisk:scratch …{z}\n\n"
+        "\n  {d}reusable specs — attach to a box: {z}{c}kern box vcpu:heavy vgpio:leds vdisk:scratch …{z}\n"
     );
-    s.push_str(&format!("  {b}{:<22}  {}{z}\n", "PROFILE", "SUMMARY"));
-    if profs.is_empty() {
-        s.push_str(&format!(
-            "  {d}no profiles yet — press {z}{g}n{z}{d} to add a vcpu / vgpio / vdisk profile{z}\n"
-        ));
-        return s;
-    }
-    let shown = profs.len().min(max_rows);
-    for (i, r) in profs[..shown].iter().enumerate() {
-        let (lead, col) = sel_marker(p, i == sel);
-        s.push_str(&format!(
-            "  {lead}{col}{:<22}{z}  {d}{}{z}\n",
-            trunc(&prof_label(r), 22),
-            r.summary
-        ));
-    }
-    if shown < profs.len() {
-        s.push_str(&format!("  {d}… {} more{z}\n", profs.len() - shown));
+    // One titled sub-table per category, in a fixed order — an empty category still shows its header
+    // + "none yet" so it's obvious the kind exists. `sel` is a flat index into `profs` (already sorted
+    // by category then name), so the caret lands on the right row across sections; navigation is
+    // unchanged. Headers are visual only — they don't consume a selection index.
+    const CATS: [(&str, &str, &str); 3] = [
+        ("vcpu", "vCPU", "CPU / memory slices"),
+        ("vgpio", "vGPIO", "GPIO · I²C · device passthrough"),
+        ("vdisk", "vDisk", "per-box scratch disks"),
+    ];
+    let mut budget = max_rows;
+    for (section, title, desc) in CATS {
+        s.push_str(&format!("\n  {b}{title}{z}  {d}— {desc}{z}\n"));
+        let rows: Vec<(usize, &ProfRow)> = profs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.section == section)
+            .collect();
+        if rows.is_empty() {
+            s.push_str(&format!(
+                "    {d}none yet — press {z}{g}n{z}{d} to add one{z}\n"
+            ));
+            continue;
+        }
+        for (i, r) in rows {
+            if budget == 0 {
+                s.push_str(&format!("    {d}…{z}\n"));
+                break;
+            }
+            budget -= 1;
+            let (lead, col) = sel_marker(p, i == sel);
+            s.push_str(&format!(
+                "  {lead}{col}{:<22}{z}  {d}{}{z}\n",
+                trunc(&prof_label(r), 22),
+                r.summary
+            ));
+        }
     }
     s
 }
