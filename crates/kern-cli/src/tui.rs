@@ -1156,6 +1156,49 @@ fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
     }
 }
 
+/// Value-level validation: the char filter stops letters, this stops out-of-RANGE / malformed NUMBERS
+/// — so you can't type `44545454545` (a pin > 1024) or `100` for a 0-99 field. It checks the WHOLE
+/// prospective value and stays lenient for half-typed input (a lone `-`, a trailing `.` or unit, an
+/// empty token after a comma) but rejects anything that can never become valid. Save-time
+/// (`config::profile_line`) is the backstop; this makes the mistake impossible at entry, on every host.
+fn field_value_ok(section: &str, label: &str, v: &str) -> bool {
+    // Every whitespace/comma token is empty (mid-typing) or a u32 strictly below `max`.
+    let u32_list = |max: u32| {
+        v.split([',', ' ']).all(|t| {
+            let t = t.trim();
+            t.is_empty() || t.parse::<u32>().is_ok_and(|n| n < max)
+        })
+    };
+    // A size prefix: digits with ≤1 dot, then at most ONE trailing unit (k/m/g/t) at the very end.
+    let size_prefix = || {
+        let num = match v.as_bytes().last() {
+            Some(b) if b"kmgtKMGT".contains(b) => &v[..v.len() - 1],
+            _ => v,
+        };
+        num.chars().filter(|c| *c == '.').count() <= 1
+            && num.chars().all(|c| c.is_ascii_digit() || c == '.')
+    };
+    match (section, label) {
+        ("vgpio", "pins" | "pwm" | "adc") => u32_list(crate::config::MAX_GPIO_PIN),
+        ("vcpu", "priority") => v.is_empty() || v.parse::<u32>().is_ok_and(|n| n <= 99),
+        ("vcpu", "numa") => v.is_empty() || v.parse::<u32>().is_ok(),
+        ("vcpu", "nice") => {
+            v.is_empty() || v == "-" || v.parse::<i32>().is_ok_and(|n| (-20..=19).contains(&n))
+        }
+        ("vcpu", "vcpus") => v.chars().filter(|c| *c == '.').count() <= 1,
+        ("vcpu", "cpus") => v.split([',', ' ']).all(|t| {
+            let parts: Vec<&str> = t.split('-').collect();
+            parts.len() <= 2
+                && parts
+                    .iter()
+                    .all(|p| p.is_empty() || p.parse::<u32>().is_ok_and(|n| n < 4096))
+        }),
+        (_, "memory" | "size" | "bandwidth") => size_prefix(),
+        ("vdisk", "iops") => v.is_empty() || v.parse::<u64>().is_ok(),
+        _ => true,
+    }
+}
+
 /// A blank form to create a new profile. `vgpio` pre-fills `backend = gpio:0` (the id
 /// `kern config setup` generates) so a beginner rarely has to touch it.
 fn new_profile_form(section: &'static str) -> Form {
@@ -1368,16 +1411,25 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
             FormOutcome::Stay(form)
         }
         _ => {
-            // Append typed printable ASCII, but only characters the field ACCEPTS — a number field
-            // silently ignores letters, so `pwm` can never hold `1dfdf`. The section drives the rule.
+            // Append typed printable ASCII, but a character only lands if it passes BOTH the char
+            // filter (no letters in a number field → `pwm` can't hold `1dfdf`) AND the value filter
+            // (the resulting value stays in range / well-formed → `pins` can't hold `44545454545`, a
+            // 0-99 field can't reach `100`). The section drives the rules. Mistakes are impossible at
+            // entry, uniformly for vgpio, vcpu and vdisk.
             let section = match &form.submit {
                 Submit::SaveProfile { section, .. } => *section,
                 Submit::CreateVolume | Submit::EditVolume { .. } => "volume",
             };
             let label = form.fields[form.active].label;
             for &b in key {
-                if (0x20..0x7f).contains(&b) && field_char_ok(section, label, b as char) {
-                    form.fields[form.active].value.push(b as char);
+                let ch = b as char;
+                if !(0x20..0x7f).contains(&b) || !field_char_ok(section, label, ch) {
+                    continue;
+                }
+                let mut candidate = form.fields[form.active].value.clone();
+                candidate.push(ch);
+                if field_value_ok(section, label, &candidate) {
+                    form.fields[form.active].value.push(ch);
                 }
             }
             form.error = None;
@@ -3450,6 +3502,52 @@ leds = [\"led0\"]
         form.active = 1;
         form = feed(form, b"my box!");
         assert_eq!(form.fields[1].value, "mybox");
+    }
+
+    #[test]
+    fn number_fields_reject_out_of_range_values_as_you_type() {
+        // The `44545454545` bug: a pin field must refuse a value that can never be a valid pin
+        // (>= MAX_GPIO_PIN 1024), not just wrong characters. Same guarantee for vcpu / vdisk ranges.
+        let feed = |mut form: Form, bytes: &[u8]| {
+            for &byte in bytes {
+                form = match handle_form_key(form, &[byte]) {
+                    FormOutcome::Stay(f) => f,
+                    _ => panic!("typing stays"),
+                };
+            }
+            form
+        };
+        let mk = |section: &'static str, label: &'static str| Form {
+            title: "t".into(),
+            fields: vec![Field::text(label, "")],
+            active: 0,
+            submit: Submit::SaveProfile {
+                section,
+                orig_name: None,
+            },
+            error: None,
+            show_advanced: false,
+        };
+        // pins: `44545454545` stops the moment the number would exceed the range — never the garbage.
+        let f = feed(mk("vgpio", "pins"), b"44545454545");
+        assert!(
+            f.fields[0].value.parse::<u32>().unwrap() < crate::config::MAX_GPIO_PIN,
+            "pins capped in range, got {:?}",
+            f.fields[0].value
+        );
+        assert_ne!(f.fields[0].value, "44545454545");
+        // A valid multi-pin list still types fine.
+        assert_eq!(feed(mk("vgpio", "pins"), b"17 27").fields[0].value, "17 27");
+        // priority 0-99: `100` can't be reached.
+        assert_eq!(feed(mk("vcpu", "priority"), b"100").fields[0].value, "10");
+        // nice -20..19: `20` can't be reached, but `-20` can.
+        assert_eq!(feed(mk("vcpu", "nice"), b"20").fields[0].value, "2");
+        assert_eq!(feed(mk("vcpu", "nice"), b"-20").fields[0].value, "-20");
+        // vcpus: a second dot is refused (`1.2.` → `1.2`).
+        assert_eq!(feed(mk("vcpu", "vcpus"), b"1.2.5").fields[0].value, "1.25");
+        // memory / size: one unit at the end, nothing after it (`2gg` → `2g`, `5m2` → `5m`).
+        assert_eq!(feed(mk("vcpu", "memory"), b"2gg").fields[0].value, "2g");
+        assert_eq!(feed(mk("vdisk", "size"), b"5m2").fields[0].value, "5m");
     }
 
     #[test]
