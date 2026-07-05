@@ -97,6 +97,21 @@ fn nav_fields(form: &Form) -> Vec<usize> {
         .collect()
 }
 
+/// Canonicalize a pick option/value token for MATCHING (edit-seed dedup). Only i2c has an ambiguous
+/// short form: a bus may be saved bare (`"1"`) or as `"i2c-1"` but the host scan lists `"/dev/i2c-1"`
+/// — fold all three to the `/dev/` form so they compare equal. Everything else is returned unchanged.
+/// This mirrors the runtime's `vgpio_device_paths` normalization (validate all-digits before building
+/// the path), kept in sync so the form and the resolver agree on identity.
+fn canon_pick_token(label: &str, s: &str) -> String {
+    if label == "i2c" && !s.starts_with('/') {
+        let n = s.strip_prefix("i2c-").unwrap_or(s);
+        if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("/dev/i2c-{n}");
+        }
+    }
+    s.to_string()
+}
+
 #[derive(Clone)]
 struct Field {
     label: &'static str,
@@ -200,22 +215,30 @@ impl Field {
     /// For an EDIT form: check the options that match a pre-filled comma/space `value`. A saved device
     /// that ISN'T detected on this host (e.g. a profile authored on a Pi, edited on a desktop) is kept
     /// as a checked extra option, so editing never silently drops it.
+    ///
+    /// Matching is done on a canonical form so an i2c bus saved bare (`"1"` or `"i2c-1"`) still matches
+    /// the host-scanned `"/dev/i2c-1"` instead of appending a DUPLICATE checkbox for the same bus.
     fn seed_pick_selection(&mut self) {
         if !self.is_pick() {
             return;
         }
+        let label = self.label;
         let want: Vec<String> = self
             .value
             .split([',', ' '])
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(String::from)
+            .map(|s| canon_pick_token(label, s))
             .collect();
         for s in &mut self.sel {
             *s = false;
         }
         for tok in want {
-            match self.options.iter().position(|o| *o == tok) {
+            match self
+                .options
+                .iter()
+                .position(|o| canon_pick_token(label, o) == tok)
+            {
                 Some(i) => self.sel[i] = true,
                 None => {
                     self.options.push(tok);
@@ -998,9 +1021,12 @@ fn section_fields(section: &str) -> Vec<Field> {
                 }
             }
             // GPIO pins are line NUMBERS from YOUR wiring, so they're the one thing you legitimately
-            // type — but only when the host actually has a GPIO controller. No gpiochip ⇒ there's
-            // nothing to wire to, so it's a "none here" note, not an empty box inviting a guess.
-            let has_gpio = !present_devices("pins").is_empty();
+            // type — but only when the host actually has a GPIO controller. Check the modern chardev
+            // (/dev/gpiochip*) AND the legacy sysfs interface (/sys/class/gpio), so a board that only
+            // exposes sysfs-GPIO isn't wrongly told it has none. No GPIO at all ⇒ a "none here" note,
+            // not an empty box inviting a guess.
+            let has_gpio = !present_devices("pins").is_empty()
+                || std::path::Path::new("/sys/class/gpio/export").exists();
             let mut advanced = absent;
             if has_gpio {
                 common.push(Field::text("pins", "GPIO pins, e.g. 17 27"));
@@ -1010,6 +1036,9 @@ fn section_fields(section: &str) -> Vec<Field> {
             // The rare / expert knobs — hidden until the user opens "Advanced". Anything the host can
             // enumerate is a pick (net interfaces, LEDs, …); a device it lacks is a note; pwm follows
             // the same GPIO gate as pins; only the truly free-form escape (`extra`) stays typed.
+            // NOTE: `net` is deliberately absent — a vgpio profile does NOT attach a network interface
+            // (the resolver ignores it), so offering it would be a lie. Network access is the box's
+            // own `--net`. If net-passthrough is ever wired in the resolver, add it back here.
             for (label, plain) in [
                 ("leds", "on-board LEDs"),
                 ("can", "CAN bus"),
@@ -1017,7 +1046,6 @@ fn section_fields(section: &str) -> Vec<Field> {
                 ("usb", "specific USB devices"),
                 ("midi", "MIDI ports"),
                 ("display", "display nodes (DRI)"),
-                ("net", "network interfaces"),
             ] {
                 advanced.push(mk(label, plain));
             }
@@ -1077,7 +1105,6 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
         ("vgpio", "pwm") => "PWM outputs (e.g. 12 13) for servos, dimming, fans.",
         ("vgpio", "adc") => "Analog inputs (ADC channels).",
         ("vgpio", "onewire") => "1-Wire lines, e.g. a DS18B20 temperature sensor.",
-        ("vgpio", "net") => "Network interface names to expose to the box.",
         ("vgpio", "backend") => "Which detected GPIO controller to use (default gpio:0).",
         ("vgpio", "extra") => "Any other /dev path to pass, only if you know it exists.",
         ("vcpu", "name") => "A label for this CPU/memory slice — attach with  vcpu:NAME",
@@ -3297,6 +3324,42 @@ leds = [\"led0\"]
         f.seed_pick_selection();
         assert_eq!(f.sel, vec![false, true, false]);
         assert_eq!(f.value, "/dev/i2c-1");
+    }
+
+    #[test]
+    fn i2c_bare_value_does_not_duplicate_a_detected_bus() {
+        // A profile saved with a BARE i2c bus ("1", the form the CLI writes) must tick the detected
+        // "/dev/i2c-1" instead of appending a second checkbox for the same physical bus.
+        let mut f = Field::pick("i2c", "h", vec!["/dev/i2c-0".into(), "/dev/i2c-1".into()]);
+        f.value = "1".into(); // bare form, as `kern config add ... i2c=1` stores it
+        f.seed_pick_selection();
+        assert_eq!(f.options.len(), 2, "no duplicate option was appended");
+        assert_eq!(f.sel, vec![false, true], "the detected bus is ticked");
+        assert_eq!(
+            f.value, "/dev/i2c-1",
+            "value canonicalizes to the /dev path"
+        );
+        // A bus NOT detected here is still kept (canonicalized) as a checked extra — lossless.
+        let mut g = Field::pick("i2c", "h", vec!["/dev/i2c-0".into()]);
+        g.value = "i2c-0, 9".into();
+        g.seed_pick_selection();
+        assert_eq!(g.options, vec!["/dev/i2c-0", "/dev/i2c-9"]);
+        assert_eq!(g.sel, vec![true, true]);
+    }
+
+    #[test]
+    fn vgpio_form_does_not_offer_net_a_field_the_resolver_ignores() {
+        // `net` in a vgpio profile is inert (the resolver never attaches an interface), so the form
+        // must not advertise it — offering a knob that does nothing is exactly the "misleading" trap.
+        let form = new_profile_form("vgpio");
+        assert!(
+            !form.fields.iter().any(|f| f.label == "net"),
+            "net must not be a vgpio form field"
+        );
+        assert!(
+            field_help("vgpio", "net").is_none(),
+            "no help entry for net"
+        );
     }
 
     #[test]
