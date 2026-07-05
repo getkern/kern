@@ -1094,6 +1094,41 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
     Some(h)
 }
 
+/// Minimal input validation: which characters a field accepts AS YOU TYPE, so a number field can't
+/// hold letters (you can't put `1dfdf` in `pwm`). It filters keystrokes at entry — the wrongness never
+/// makes it onto the screen — which beats a save-time error. Free-form fields (a profile name, an
+/// arbitrary /dev path) return `true` for everything. Detected-device fields are pickers, so no typing
+/// reaches here for them at all.
+fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
+    let digit = ch.is_ascii_digit();
+    let num_list = digit || ch == ' ' || ch == ','; // GPIO line numbers: "17 27" / "12,13"
+    let size = digit || ch == '.' || "kmgtKMGT".contains(ch); // 512m, 2g, 1.5g
+    let cpus = digit || matches!(ch, '-' | ',' | ' '); // core list: "0-3", "0,2"
+    let ident = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'; // a profile name
+    let backend = ch.is_ascii_alphanumeric() || ch == ':' || ch == '-'; // gpio:0 / disk:0
+    let path = ch.is_ascii_alphanumeric() || "/._-, ".contains(ch); // a /dev path
+    let hex_list = ch.is_ascii_hexdigit() || matches!(ch, '-' | ',' | ' '); // 1-Wire ids
+    match (section, label) {
+        ("vgpio", "pins" | "pwm" | "adc") => num_list,
+        ("vgpio", "onewire") => hex_list,
+        ("vgpio", "backend") => backend,
+        ("vgpio", "extra") => path,
+        ("vcpu", "vcpus") => digit || ch == '.',
+        ("vcpu", "cpus") => cpus,
+        ("vcpu", "memory") => size,
+        ("vcpu", "priority" | "numa") => digit,
+        ("vcpu", "nice") => digit || ch == '-',
+        ("vcpu", "backend") => backend,
+        ("vcpu", "extends") => ident,
+        ("vdisk", "size" | "bandwidth") => size,
+        ("vdisk", "iops") => digit,
+        ("vdisk", "backend") => backend,
+        ("volume", "size") => size,
+        (_, "name") => ident,
+        _ => true, // free-form / unknown → no restriction
+    }
+}
+
 /// A blank form to create a new profile. `vgpio` pre-fills `backend = gpio:0` (the id
 /// `kern config setup` generates) so a beginner rarely has to touch it.
 fn new_profile_form(section: &'static str) -> Form {
@@ -1306,9 +1341,15 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
             FormOutcome::Stay(form)
         }
         _ => {
-            // Append typed printable ASCII (text fields hold names / numbers / paths).
+            // Append typed printable ASCII, but only characters the field ACCEPTS — a number field
+            // silently ignores letters, so `pwm` can never hold `1dfdf`. The section drives the rule.
+            let section = match &form.submit {
+                Submit::SaveProfile { section, .. } => *section,
+                Submit::CreateVolume | Submit::EditVolume { .. } => "volume",
+            };
+            let label = form.fields[form.active].label;
             for &b in key {
-                if (0x20..0x7f).contains(&b) {
+                if (0x20..0x7f).contains(&b) && field_char_ok(section, label, b as char) {
                     form.fields[form.active].value.push(b as char);
                 }
             }
@@ -3313,6 +3354,39 @@ leds = [\"led0\"]
             let help = field_help("vgpio", label).unwrap();
             assert!(pane.contains(help), "help for {label} shows:\n{pane}");
         }
+    }
+
+    #[test]
+    fn number_fields_reject_letters_as_you_type() {
+        // pwm/pins/adc are line NUMBERS — typing letters must do nothing, so `1dfdf` can't happen.
+        let mut form = Form {
+            title: "t".into(),
+            fields: vec![Field::text("pwm", "PWM lines"), Field::text("name", "n")],
+            active: 0,
+            submit: Submit::SaveProfile {
+                section: "vgpio",
+                orig_name: None,
+            },
+            error: None,
+            show_advanced: false,
+        };
+        let feed = |mut form: Form, bytes: &[u8]| {
+            for &byte in bytes {
+                form = match handle_form_key(form, &[byte]) {
+                    FormOutcome::Stay(f) => f,
+                    _ => panic!("typing stays in the form"),
+                };
+            }
+            form
+        };
+        form = feed(form, b"1dfdf2"); // the exact garbage the user typed, plus a digit
+        assert_eq!(form.fields[0].value, "12", "letters dropped, digits kept");
+        form = feed(form, b" 3,4"); // a pin list may use spaces and commas
+        assert_eq!(form.fields[0].value, "12 3,4");
+        // A profile NAME rejects spaces and punctuation (it's an identifier).
+        form.active = 1;
+        form = feed(form, b"my box!");
+        assert_eq!(form.fields[1].value, "mybox");
     }
 
     #[test]
