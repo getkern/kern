@@ -1190,10 +1190,8 @@ fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
     let ident = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'; // a profile name
     let backend = ch.is_ascii_alphanumeric() || ch == ':' || ch == '-'; // gpio:0 / disk:0
     let path = ch.is_ascii_alphanumeric() || "/._-, ".contains(ch); // a /dev path
-    let hex_list = ch.is_ascii_hexdigit() || matches!(ch, '-' | ',' | ' '); // 1-Wire ids
     match (section, label) {
-        ("vgpio", "pins" | "pwm" | "adc") => num_list,
-        ("vgpio", "onewire") => hex_list,
+        ("vgpio", "pins" | "pwm" | "adc" | "onewire") => num_list, // all are u32 line/channel indices
         ("vgpio", "backend") => backend,
         ("vgpio", "extra") => path,
         ("vcpu", "vcpus") => digit || ch == '.',
@@ -1212,49 +1210,36 @@ fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
     }
 }
 
-/// Value-level validation: the char filter stops letters, this stops out-of-RANGE / malformed NUMBERS
-/// — so you can't type `44545454545` (a pin > 1024) or `100` for a 0-99 field. It checks the WHOLE
-/// prospective value and stays lenient for half-typed input (a lone `-`, a trailing unit, an empty
-/// token after a comma) but rejects anything that can never become valid. Every rule here must accept a
-/// prefix ONLY if some completion is accepted by the matching `config` parser (e.g. sizes are whole
-/// units because `parse_binary_size` takes a u64) — else the filter dead-ends at save.
-fn field_value_ok(section: &str, label: &str, v: &str) -> bool {
-    // Every whitespace/comma token is empty (mid-typing) or a u32 strictly below `max`.
-    let u32_list = |max: u32| {
-        v.split([',', ' ']).all(|t| {
-            let t = t.trim();
-            t.is_empty() || t.parse::<u32>().is_ok_and(|n| n < max)
-        })
-    };
-    // A size prefix that CAN complete to a `parse_binary_size`-valid value: whole digits, then at most
-    // ONE trailing unit (k/m/g/t) at the very end. No decimals — the parser takes a u64 — so a value
-    // like "1.5g" is rejected at ENTRY, not left to dead-end at save (the filter↔parser must agree).
-    let size_prefix = || {
-        let num = match v.as_bytes().last() {
-            Some(b) if b"kmgtKMGT".contains(b) => &v[..v.len() - 1],
-            _ => v,
-        };
-        num.chars().all(|c| c.is_ascii_digit())
-    };
-    match (section, label) {
-        ("vgpio", "pins" | "pwm" | "adc") => u32_list(crate::config::MAX_GPIO_PIN),
-        ("vcpu", "priority") => v.is_empty() || v.parse::<u32>().is_ok_and(|n| n <= 99),
-        ("vcpu", "numa") => v.is_empty() || v.parse::<u32>().is_ok(),
-        ("vcpu", "nice") => {
-            v.is_empty() || v == "-" || v.parse::<i32>().is_ok_and(|n| (-20..=19).contains(&n))
-        }
-        ("vcpu", "vcpus") => v.chars().filter(|c| *c == '.').count() <= 1,
-        ("vcpu", "cpus") => v.split([',', ' ']).all(|t| {
-            let parts: Vec<&str> = t.split('-').collect();
-            parts.len() <= 2
-                && parts
-                    .iter()
-                    .all(|p| p.is_empty() || p.parse::<u32>().is_ok_and(|n| n < 4096))
-        }),
-        (_, "memory" | "size" | "bandwidth") => size_prefix(),
-        ("vdisk", "iops") => v.is_empty() || v.parse::<u64>().is_ok(),
-        _ => true,
-    }
+/// Value-level validation — the "impossible to get wrong" numeric guard (a pin can't be `44545454545`,
+/// a 0-99 field can't reach `100`, a size can't be `1.5g`). It DELEGATES to `config::field_state`, the
+/// SAME rule the save uses (`profile_line`), so live-typing and save can never diverge — that shared
+/// source is what eliminates the dead-end class (a value the filter allows but the save rejects). The
+/// numeric/size fields go through it; free-form fields (name/backend/extra) are governed by the char
+/// filter alone and impose no value restriction here.
+fn field_value_ok(_section: &str, label: &str, v: &str) -> bool {
+    !is_numeric_field(label)
+        || crate::config::field_state(label, v) != crate::config::FieldState::Invalid
+}
+
+/// Fields whose value is a NUMBER / range / size — governed by `config::field_state` (shared with save)
+/// and given the live three-state indicator. Free-form fields (name/backend/extra) are not here.
+fn is_numeric_field(label: &str) -> bool {
+    matches!(
+        label,
+        "pins"
+            | "pwm"
+            | "adc"
+            | "onewire"
+            | "priority"
+            | "numa"
+            | "nice"
+            | "vcpus"
+            | "cpus"
+            | "memory"
+            | "size"
+            | "bandwidth"
+            | "iops"
+    )
 }
 
 /// A blank form to create a new profile. `backend` is no longer pre-filled: it's now a picker of the
@@ -2381,7 +2366,18 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
             let val: String = f.value.chars().take(boxw).collect();
             format!("{g}{val:<boxw$}{z}")
         };
-        s.push_str(&format!("  {caret} {label} {lb}{inner}{rb}\n"));
+        // Three-state indicator on the ACTIVE numeric field: ✓ once the value is save-valid, a dim ‥
+        // while it's still an incomplete-but-ok prefix (keep typing) — so "valid yet?" is never a guess.
+        let status = if active && !f.value.is_empty() && is_numeric_field(f.label) {
+            match crate::config::field_state(f.label, &f.value) {
+                crate::config::FieldState::Valid => format!("  {g}✓{z}"),
+                crate::config::FieldState::Incomplete => format!("  {d}‥ keep typing{z}"),
+                crate::config::FieldState::Invalid => format!("  {r}✗{z}"),
+            }
+        } else {
+            String::new()
+        };
+        s.push_str(&format!("  {caret} {label} {lb}{inner}{rb}{status}\n"));
     }
     if vend < nvis {
         s.push_str(&format!("  {d}  ↓ {} more{z}\n", nvis - vend));
@@ -3549,6 +3545,41 @@ leds = [\"led0\"]
             let help = field_help("vgpio", label).unwrap();
             assert!(pane.contains(help), "help for {label} shows:\n{pane}");
         }
+    }
+
+    #[test]
+    fn active_numeric_field_shows_a_three_state_indicator() {
+        let mk = |label: &'static str| Form {
+            title: "t".into(),
+            fields: vec![Field::text(label, "")],
+            active: 0,
+            submit: Submit::SaveProfile {
+                section: "vcpu",
+                orig_name: None,
+            },
+            error: None,
+            show_advanced: false,
+        };
+        let feed = |mut form: Form, bytes: &[u8]| {
+            for &b in bytes {
+                form = match handle_form_key(form, &[b]) {
+                    FormOutcome::Stay(f) => f,
+                    _ => panic!("stays"),
+                };
+            }
+            form
+        };
+        // vcpus "0" is an incomplete prefix (of "0.5") → "keep typing", not a green tick.
+        let form = feed(mk("vcpus"), b"0");
+        let pane = form_pane(&plain(), &form, 80, 24);
+        assert!(
+            pane.contains("keep typing"),
+            "incomplete shows a hint:\n{pane}"
+        );
+        // "0.5" is complete → a ✓.
+        let form = feed(mk("vcpus"), b"0.5");
+        let pane = form_pane(&plain(), &form, 80, 24);
+        assert!(pane.contains('✓'), "valid shows a tick:\n{pane}");
     }
 
     #[test]

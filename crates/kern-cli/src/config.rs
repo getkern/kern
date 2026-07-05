@@ -1238,6 +1238,58 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
     Ok(Some(line))
 }
 
+/// The live-validation state of a field value, so the TUI can accept/reject a keystroke and show a
+/// three-state hint. It is DERIVED from [`profile_line`] (the save-time authority) so live and save
+/// can never diverge — the class of bug behind the "1.5g" dead-end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldState {
+    /// A complete, save-acceptable value (`profile_line` would emit it).
+    Valid,
+    /// A prefix that isn't valid yet but could still become valid — keep typing (`-`, `0`, `0-`, …).
+    Incomplete,
+    /// No completion can ever be valid — the keystroke that produced it is refused.
+    Invalid,
+}
+
+/// Classify a field value for LIVE validation using the SAME rule as the save-time `profile_line`:
+/// `Valid` ⇔ `profile_line` accepts it. `Incomplete` = a prefix that could still complete (so a
+/// keystroke toward it is allowed, and a form can show "keep typing"). `Invalid` = unreachable, the
+/// keystroke is refused. ONE source of truth: the range/format lives once, in `profile_line`.
+pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
+    use FieldState::*;
+    if v.is_empty() {
+        return Incomplete;
+    }
+    if let Ok(opt) = profile_line(key, v) {
+        // Ok(None) = a value profile_line legitimately omits (e.g. `persistent = no`); still editable.
+        return if opt.is_some() { Valid } else { Incomplete };
+    }
+    // profile_line rejected the COMPLETE value — but is it a prefix that a further keystroke can fix?
+    let could_complete = match key {
+        // a lone minus is the start of a negative nice value
+        "nice" => v == "-",
+        // a float prefix (`0`, `0.`, `1.`) can still reach a valid vcpus like `0.5`
+        "vcpus" => {
+            v.bytes().filter(|b| *b == b'.').count() <= 1
+                && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+        }
+        // a partial cpulist (`0-`, `0,`) can still reach `0-3`
+        "cpus" => v.split([',', ' ']).all(|t| {
+            let parts: Vec<&str> = t.split('-').collect();
+            parts.len() <= 2
+                && parts
+                    .iter()
+                    .all(|p| p.is_empty() || p.parse::<u32>().is_ok_and(|n| n < 4096))
+        }),
+        _ => false, // pins/priority/size/… : an out-of-range or malformed complete value can't be fixed
+    };
+    if could_complete {
+        Incomplete
+    } else {
+        Invalid
+    }
+}
+
 /// Build the body lines of a `[[section]]` block from `(key, value)` pairs, validating each. The
 /// leading `name = "…"` is always first. Shared by the TUI forms and `kern config add`.
 pub(crate) fn profile_block(name: &str, pairs: &[(&str, &str)]) -> Result<Vec<String>, String> {
@@ -1774,6 +1826,59 @@ mod tests {
         assert!(profile_line("pins", "70000").is_err()); // out of GPIO range
         assert!(profile_line("size", "wat").is_err());
         assert!(profile_line("backend", "  ").unwrap().is_none()); // empty optional → skipped
+    }
+
+    #[test]
+    fn field_state_is_the_one_rule_shared_with_save() {
+        use FieldState::*;
+        // Valid: a complete, save-acceptable value.
+        for (k, v) in [
+            ("pins", "17"),
+            ("priority", "50"),
+            ("memory", "512m"),
+            ("vcpus", "0.5"),
+            ("nice", "-5"),
+            ("size", "2g"),
+            ("cpus", "0-3"),
+        ] {
+            assert_eq!(field_state(k, v), Valid, "{k}={v}");
+        }
+        // Incomplete: a prefix that can still complete — allowed live, not yet savable.
+        for (k, v) in [
+            ("nice", "-"),
+            ("vcpus", "0"),
+            ("cpus", "0-"),
+            ("priority", ""),
+        ] {
+            assert_eq!(field_state(k, v), Incomplete, "{k}={v:?}");
+        }
+        // Invalid: no completion can be valid — the keystroke that produced it is refused.
+        for (k, v) in [
+            ("pins", "44545454545"),
+            ("priority", "100"),
+            ("nice", "-25"),
+            ("memory", "1.5g"),
+            ("vcpus", "1.2.3"),
+        ] {
+            assert_eq!(field_state(k, v), Invalid, "{k}={v}");
+        }
+        // THE invariant that kills the dead-end class: whatever field_state calls Valid, the SAVE
+        // (profile_line) must accept. Otherwise the filter lets you type a value the save rejects.
+        for k in [
+            "pins", "priority", "numa", "nice", "vcpus", "cpus", "memory", "size", "iops",
+        ] {
+            for v in [
+                "0", "1", "5", "17", "50", "99", "100", "512", "2g", "16t", "1.5", "1.5g", ".5g",
+                "5m2", "-5", "0-3", "0-", "-", "1.2.3",
+            ] {
+                if field_state(k, v) == Valid {
+                    assert!(
+                        profile_line(k, v).unwrap().is_some(),
+                        "Valid must save: {k}={v}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
