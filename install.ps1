@@ -145,17 +145,35 @@ Fix that, then re-run this installer.
 }
 
 # ---- 2. import kern's own distro --------------------------------------------
+# The version this installer targets: KERN_VERSION if pinned, else the latest GitHub release tag.
+function Get-TargetVersion {
+    if ($env:KERN_VERSION) { return ($env:KERN_VERSION -replace '^v', '') }
+    try {
+        $t = (Invoke-RestMethod -TimeoutSec 8 https://api.github.com/repos/getkern/kern/releases/latest).tag_name
+        return ($t -replace '^v', '')
+    } catch { return $null }
+}
+
 function Import-Distro {
     $existing = ((wsl.exe -l -q) -replace "`0","") -split "`r?`n" | ForEach-Object { $_.Trim() }
     if ($existing -contains $DistroName) {
         # Present -- but is it HEALTHY? A previous half-import can register a distro that won't run;
         # skipping silently would end in 'done' + every kern command failing.
         wsl.exe -d $DistroName --exec /bin/true *> $null
-        if ($LASTEXITCODE -eq 0) {
-            Info "distro '$DistroName' already present and healthy -- skipping import. ('wsl --unregister $DistroName' to reinstall)"
+        if ($LASTEXITCODE -ne 0) {
+            Die "distro '$DistroName' exists but won't start (a previous import may have failed). Run 'wsl --unregister $DistroName', then re-run this installer."
+        }
+        # Healthy -- but is it CURRENT? Re-running the installer must UPGRADE, not silently keep an old
+        # kern. Compare the distro's kern version to the target; re-import only when they differ.
+        $have = ([regex]'\d+\.\d+\.\d+').Match(((wsl.exe -d $DistroName --exec kern --version 2>$null) | Out-String)).Value
+        $want = Get-TargetVersion
+        if (-not ($have -and $want -and $have -ne $want)) {
+            Info "distro '$DistroName' already present and up to date$(if ($have) { " (kern $have)" }) -- skipping import."
             return
         }
-        Die "distro '$DistroName' exists but won't start (a previous import may have failed). Run 'wsl --unregister $DistroName', then re-run this installer."
+        Info "kern distro is $have -> upgrading to $want (re-importing)..."
+        wsl.exe --unregister $DistroName *> $null
+        Remove-Item -Recurse -Force $DistroDir -ErrorAction SilentlyContinue
     }
     $tar = Join-Path $env:TEMP 'kern-wsl-rootfs.tar.gz'
     try {
