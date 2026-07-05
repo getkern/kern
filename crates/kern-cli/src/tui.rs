@@ -1491,15 +1491,16 @@ fn render(
             TAB_BUILDS => format!("{} ({})", TABS[i], builds.len()),
             TAB_PROFILES => format!("{} ({})", TABS[i], profs.len()),
             TAB_STORAGE => format!("{} ({})", TABS[i], vols.len()),
-            // Runs has no per-row list — its count is the CUMULATIVE total (how many ran this session),
-            // so the tab reads like the others; a ⚡ also flags live throughput while streaming.
-            TAB_RUNS => {
-                let n = human_count(host.runs_total);
-                if host.runs_per_sec > 0.5 {
-                    format!("{} ({n}) ⚡", TABS[i])
-                } else {
-                    format!("{} ({n})", TABS[i])
-                }
+            // Runs are fire-and-forget (~1 ms) — there's no "current items" set like the other tabs,
+            // so a cumulative count would mislead (it'd only grow). Show the LIVE rate while streaming
+            // (that's the only meaningful "now"); nothing when idle. The cumulative total lives on the
+            // tab body ("Total"), not here.
+            TAB_RUNS if host.runs_per_sec > 0.5 => {
+                format!(
+                    "{} ({}/s) ⚡",
+                    TABS[i],
+                    human_count(host.runs_per_sec.round() as u64)
+                )
             }
             _ => TABS[i].to_string(),
         }
