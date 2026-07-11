@@ -13,7 +13,7 @@ jobs:
     name: build + test (x86)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -30,7 +30,7 @@ jobs:
     name: cargo-audit + cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       # Install recent prebuilt binaries so tool versions match local dev: the
       # pinned cargo-deny-action@v1 shipped an old cargo-deny that rejected newer

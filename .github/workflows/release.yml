@@ -29,7 +29,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -64,7 +64,7 @@ jobs:
     # once for the whole project rather than per matrix target. On a tag push the action attaches
     # kern.spdx.json to the release itself (upload-release-assets defaults to true).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Generate SPDX SBOM (Syft) and attach to the release
         uses: anchore/sbom-action@v0
         with:
@@ -78,7 +78,7 @@ jobs:
     permissions:
       contents: write # attach the Windows assets to the release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-gnu, x86_64-unknown-linux-musl
