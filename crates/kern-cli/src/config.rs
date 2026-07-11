@@ -803,9 +803,29 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
 /// is "safe *if* the IOMMU isolates" (a GPU is a DMA engine), NOT zero-risk like an i2c bus. rtc/hpet
 /// are allowed; only the privileged `card*` DRM node is refused.
 fn is_dangerous_dev(real: &std::path::Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    if std::fs::metadata(real).is_ok_and(|m| m.file_type().is_block_device()) {
-        return true; // (1) host storage
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    // IDENTITY-based deny (major/minor), not name — a char node's major/minor is its REAL kernel
+    // identity; the name is only a udev label. This catches a dangerous node hidden behind an innocent
+    // name: a `/dev/i2c-x` that is actually `1:1` (/dev/mem) or major 21 (SCSI generic) would pass the
+    // name checks below but is refused here. Block devices are identity-checked too (a disk named like
+    // a peripheral is still a disk). (A pure allowlist-by-major isn't viable — gpiochip/rtc have DYNAMIC
+    // majors — so identity DENY of the fixed-major raw primitives is the robust part; the name/path
+    // layer covers the dynamic-major dangerous nodes.)
+    if let Ok(md) = std::fs::metadata(real) {
+        let ft = md.file_type();
+        if ft.is_block_device() {
+            return true; // (1) host storage — by identity, so a disk named like a peripheral is caught
+        }
+        if ft.is_char_device() {
+            let rdev = md.rdev();
+            let (maj, min) = (libc::major(rdev), libc::minor(rdev));
+            if maj == 1 && matches!(min, 1 | 2 | 4 | 11) {
+                return true; // /dev/mem, /dev/kmem, /dev/port, /dev/kmsg — raw memory / I/O ports
+            }
+            if maj == 21 {
+                return true; // /dev/sg* — SCSI generic (raw disk via SG_IO), regardless of its name
+            }
+        }
     }
     let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let parent = real
@@ -813,8 +833,10 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    // (2) raw memory · (4) nvram · (5) kvm · (6) uinput/uhid · (7) tun/ppp · (9) fuse · storage/dm/
-    //     loop CONTROL char nodes (map/format host storage via ioctl, not block devices themselves)
+    // NAME/prefix layer — belt-and-braces over the identity check, and the ONLY guard for the
+    // dynamic-major dangerous nodes (their major isn't fixed, so identity-by-major can't catch them).
+    // (2) raw memory · (2b) DAX direct-access (mmap physical NVDIMM) · (4) nvram · (5) kvm · (6) uinput/
+    //     uhid · (7) tun/ppp · (9) fuse · (3) udmabuf (dma-buf) · storage/dm/loop CONTROL char nodes.
     if matches!(
         name,
         "mem"
@@ -830,30 +852,29 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
             | "tun"
             | "ppp"
             | "fuse"
+            | "udmabuf"
             | "loop-control"
             | "btrfs-control"
     ) {
         return true;
     }
     // family prefixes: (4) reboot/brick · (5) vhost-net/vsock/vdpa + vbox* · (6) HID injection
-    // (hidraw + hiddev) · (11) mei
+    // (hidraw + hiddev) · (11) mei · (2b) dax\* · storage: NVMe char (nvme0 controller, nvme-generic,
+    // nvme-fabrics — all admin/control; the nvme0n1 block namespace is caught by the identity check).
     if [
-        "watchdog", "mtd", "vhost", "vbox", "hidraw", "hiddev", "mei",
+        "watchdog", "mtd", "vhost", "vbox", "hidraw", "hiddev", "mei", "dax", "nvme",
     ]
     .iter()
     .any(|p| name.starts_with(p))
     {
         return true;
     }
-    // (1b) SCSI-generic (`sg0`) and the NVMe CONTROLLER (`nvme0`) — CHARACTER nodes that reach the host
-    // disk via SG_IO / NVME_IOCTL_ADMIN_CMD, so the block-device check above misses them. Match the
-    // stem + digits so `nvme0` is refused but `sgx_enclave` / `nvme-fabrics` are not (and `nvme0n1` is
-    // a block device caught above).
-    let stem_digits = |stem: &str| {
-        name.strip_prefix(stem)
-            .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
-    };
-    if stem_digits("sg") || stem_digits("nvme") {
+    // SCSI-generic by name (`sg0`) as a fallback when the node is absent so the identity check can't run
+    // — stem+digits so `sgx_enclave` is not a false positive.
+    if name
+        .strip_prefix("sg")
+        .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+    {
         return true;
     }
     // path-ancestor families: (10) raw USB bus · (3) VFIO — ALL layouts incl. the 6.x cdev node
@@ -1318,13 +1339,15 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
             v.bytes().filter(|b| *b == b'.').count() <= 1
                 && v.chars().all(|c| c.is_ascii_digit() || c == '.')
         }
-        // a partial cpulist (`0-`, `0,`) can still reach `0-3`
-        "cpus" => v.split([',', ' ']).all(|t| {
+        // a partial cpulist (`0-`, `0,`) can still reach a valid list. Match `is_cpu_list`'s shape with
+        // NO upper bound (it has none — a portable profile may pin a high core, host-fit is launch-time),
+        // so a Valid value like `5000-9000` isn't blocked mid-typing at the `-`.
+        "cpus" => v.split(',').all(|t| {
             let parts: Vec<&str> = t.split('-').collect();
             parts.len() <= 2
                 && parts
                     .iter()
-                    .all(|p| p.is_empty() || p.parse::<u32>().is_ok_and(|n| n < 4096))
+                    .all(|p| p.is_empty() || p.parse::<u32>().is_ok())
         }),
         _ => false, // pins/priority/size/… : an out-of-range or malformed complete value can't be fixed
     };
@@ -1573,11 +1596,15 @@ pub(crate) fn save_named_block(
     // For a rename, the OLD block is rewritten in place under the new name (carrying its other keys).
     let source = orig_name.unwrap_or(name);
     let out = crate::toml_surgery::upsert_block_merge(&raw, section, source, name, managed, body);
-    // Whole-profile coherence on the RESULTING config: a field-valid profile whose backend/extends
-    // points at nothing is refused here, before the write — so a save never produces a broken profile.
-    if let Ok(cfg) = parse(&out) {
-        validate_profile_refs(&cfg, section, name)?;
-    }
+    // FAIL-CLOSED: never write a config we can't re-parse. If the merged output doesn't parse, writing
+    // it would CORRUPT kern.toml (the next load/launch fails to read ANYTHING) — worse than the
+    // pre-existing problem. Refuse instead, and tell the user their file needs fixing first.
+    let cfg = parse(&out).map_err(|e| {
+        format!("refusing to write: the resulting kern.toml would not parse ({e}) — your existing config may be malformed; fix it first")
+    })?;
+    // Whole-profile coherence: a field-valid profile whose backend/extends points at nothing is refused
+    // here, before the write — so a save never produces a broken profile.
+    validate_profile_refs(&cfg, section, name)?;
     write_atomic(&path, &out).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
@@ -1931,25 +1958,41 @@ mod tests {
             "/dev/loop-control", // create loop devices
             "/dev/ppp",     // create PPP network interfaces
             "/dev/vfio/devices/vfio0", // 6.x VFIO cdev — arbitrary DMA
+            "/dev/dax0.0",  // DAX — mmaps physical NVDIMM (raw memory)
+            "/dev/udmabuf", // dma-buf from user memory
+            "/dev/nvme-generic0", // NVMe admin passthrough (char)
+            "/dev/nvme-fabrics", // NVMe-oF connect node (char control)
         ] {
             assert!(is_dangerous_dev(std::path::Path::new(dev)), "{dev} refused");
         }
-        // Legitimate peripherals (the GPU RENDER node, rtc) must NOT be refused — and the stem+digits
-        // storage rule must NOT false-positive on SGX / NVMe-fabrics / a device merely starting "sg".
+        // Legitimate peripherals must NOT be refused; the name rules must not false-positive on SGX or a
+        // device merely starting "sg".
         for dev in [
             "/dev/i2c-1",
-            "/dev/null",
+            "/dev/null", // major 1 minor 3 — NOT in the raw-memory minor set, allowed
             "/dev/spidev0.0",
             "/dev/dri/renderD128", // render-only GPU node — allowed
             "/dev/rtc0",
-            "/dev/sgx_enclave",  // SGX (not sg+digits) — allowed
-            "/dev/nvme-fabrics", // NVMe-oF connect node (not nvme+digits) — allowed
+            "/dev/sgx_enclave", // SGX (not sg+digits) — allowed
         ] {
             assert!(
                 !is_dangerous_dev(std::path::Path::new(dev)),
                 "{dev} allowed"
             );
         }
+        // IDENTITY check (major/minor, not name): on hosts that actually HAVE these nodes, /dev/mem is
+        // refused by its 1:1 identity and /dev/null (1:3) stays allowed — so a name-spoof (a dangerous
+        // node under an innocent name) can't slip past.
+        if std::path::Path::new("/dev/mem").exists() {
+            assert!(
+                is_dangerous_dev(std::path::Path::new("/dev/mem")),
+                "mem by identity"
+            );
+        }
+        assert!(
+            !is_dangerous_dev(std::path::Path::new("/dev/null")),
+            "null (1:3) allowed by identity"
+        );
         // End to end: an `extra = "/dev/mem"` (hand-written / imported profile) never reaches `devs` —
         // either the host lacks it (skipped) or it's present and refused. Both outcomes: not bound.
         let mut cfg = KernConfig::default();
@@ -2074,10 +2117,16 @@ mod tests {
             ("nice", "-"),
             ("vcpus", "0"),
             ("cpus", "0-"),
+            ("cpus", "4095-"), // degenerate range 4095-4095 IS valid → not a dead-end
+            ("cpus", "5000-"), // no upper bound → 5000-9000 is reachable → typeable
             ("priority", ""),
         ] {
             assert_eq!(field_state(k, v), Incomplete, "{k}={v:?}");
         }
+        // A high-core range is a VALID cpulist (host-fit is launch-time) — it must not be blocked
+        // mid-typing: `5000-9000` types through, so `5000-` above is Incomplete, not Invalid.
+        assert_eq!(field_state("cpus", "4095-4095"), Valid);
+        assert_eq!(field_state("cpus", "5000-9000"), Valid);
         // Invalid: no completion can be valid — the keystroke that produced it is refused.
         for (k, v) in [
             ("pins", "44545454545"),
