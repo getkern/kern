@@ -1433,14 +1433,16 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
             // and `pins` can't reach `44545454545` — both because the value would be Invalid — with no
             // separate char-class list to drift. The `0x20..0x7f` gate blocks control / multibyte bytes.
             let label = form.fields[form.active].label;
+            let v = &mut form.fields[form.active].value;
             for &b in key {
                 if !(0x20..0x7f).contains(&b) {
                     continue;
                 }
-                let mut candidate = form.fields[form.active].value.clone();
-                candidate.push(b as char);
-                if field_value_ok(label, &candidate) {
-                    form.fields[form.active].value.push(b as char);
+                // Append then roll back on reject — no per-byte clone of the whole value, so pasting
+                // n chars stays O(n·len) instead of O(n²) clones.
+                v.push(b as char);
+                if !field_value_ok(label, v) {
+                    v.pop();
                 }
             }
             form.error = None;
