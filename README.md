@@ -81,20 +81,41 @@ slices **without** the sandbox. They compose — `run` inside `box`. Both ship t
 
 ## What you can do in one line
 
+### 📦 An isolated container, zero setup
+
+No daemon, no root — one ~1.5 MB binary.
+
 ```sh
-# an isolated OCI container, zero setup — no daemon, no root, one ~1.5 MB binary
 kern box try --image alpine -- sh
+```
 
-# give a container exactly one device — deny-by-default for everything else
-kern box iot --image alpine vgpio:sensor -- ./read.py     # only /dev/i2c-1 crosses in
+### 🔌 Exactly one device, nothing else
 
-# a fresh, isolated sandbox per request — serverless-style, on your own machine
+Deny-by-default — only the peripheral you name crosses the boundary.
+
+```sh
+kern box iot --image alpine vgpio:sensor -- ./read.py   # only /dev/i2c-1 crosses in
+```
+
+### ⚡ A fresh sandbox per request
+
+Serverless-style, on your own machine — one throwaway box per call.
+
+```sh
 echo "$payload" | kern box fn --image python -- handler.py
+```
 
-# the same box on a Pi or an Android-kernel board where Docker isn't installed
+### 🍓 Where Docker won't even install
+
+The same box on a Pi or an Android-kernel board — just copy the one binary.
+
+```sh
 scp kern pi:  &&  ssh pi 'kern box edge --image alpine -- ./agent'
+```
 
-# build a multi-stage image, tag it, push it — all daemonless
+### 🏗️ Build, tag, push — all daemonless
+
+```sh
 kern build -t app:1 . && kern tag app:1 registry.example/app:1 && kern push registry.example/app:1
 ```
 
