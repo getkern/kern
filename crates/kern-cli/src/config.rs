@@ -1261,6 +1261,18 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
                 }
             }
         }
+        // `i2c` accepts a bus NUMBER (`1`, `i2c-1`) or a full `/dev/…` path — reject anything else at
+        // SAVE (e.g. `1/../spi0`), matching the resolver's all-digits `canon_i2c_bus` guard, so a
+        // malformed bus can't be stored to silently do nothing at launch.
+        if key == "i2c" {
+            for t in &trimmed {
+                if canon_i2c_bus(t).is_none() && !is_dev_path(t) {
+                    return Err(format!(
+                        "i2c: {t:?} — a bus number (e.g. 1, i2c-1) or a /dev/… path"
+                    ));
+                }
+            }
+        }
         if trimmed.is_empty() {
             return Ok(None);
         }
@@ -1969,6 +1981,12 @@ mod tests {
         assert_eq!(canon_i2c_bus("-1"), None);
         assert_eq!(canon_i2c_bus("1a"), None);
         assert_eq!(canon_i2c_bus(" 1"), None); // a space is not a digit
+                                               // The SAVE path (profile_line) rejects the same junk the resolver would skip — one rule.
+        assert!(profile_line("i2c", "1").unwrap().is_some());
+        assert!(profile_line("i2c", "i2c-1").unwrap().is_some());
+        assert!(profile_line("i2c", "/dev/i2c-1").unwrap().is_some());
+        assert!(profile_line("i2c", "1/../spi0").is_err()); // traversal — refused at save
+        assert!(profile_line("i2c", "abc").is_err());
     }
 
     #[test]
