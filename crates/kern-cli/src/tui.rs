@@ -979,6 +979,30 @@ fn trim_f(v: f64) -> String {
     crate::ui::fmt_cpus(v)
 }
 
+/// The `backend` field for every profile kind — a SELECTION of the configured backends, never free text
+/// (that's how `disk:0sfsf…` / `gpio:0sfsf…` were possible). vgpio→`[[gpio]]` ids, vcpu→`[[cpu]]` ids,
+/// vdisk→`disk:<[[disk]] name>`. A single-select radio (a profile uses ONE backend); if none are
+/// configured, a "run kern config setup" note instead of a blank box. Optional — leave it unticked and
+/// the profile uses the default. One helper so all three kinds behave identically.
+fn backend_field(kind: &str) -> Field {
+    let cfg = crate::config::load(None).unwrap_or_default();
+    let ids: Vec<String> = match kind {
+        "vgpio" => cfg.gpio.iter().map(|g| g.id.clone()).collect(),
+        "vcpu" => cfg.cpu.iter().map(|c| c.id.clone()).collect(),
+        "vdisk" => cfg
+            .disk
+            .iter()
+            .map(|d| format!("disk:{}", d.name))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if ids.is_empty() {
+        Field::info("backend", "no backend configured (run: kern config setup)")
+    } else {
+        Field::radio("backend", "the backend to use (optional)", ids)
+    }
+}
+
 /// The editable fields for a compute/IO profile section (`vcpu`/`vgpio`) — used for new and edit.
 /// (Storage kinds — vdisk, volume — have their own forms.)
 fn section_fields(section: &str) -> Vec<Field> {
@@ -993,7 +1017,7 @@ fn section_fields(section: &str) -> Vec<Field> {
             Field::text("priority", "0-99 (optional)"),
             Field::text("numa", "NUMA node, e.g. 0 (optional)"),
             Field::text("nice", "-20..19 (optional)"),
-            Field::text("backend", "cpu/gpio id (optional)"),
+            backend_field("vcpu"),
             Field::text("extends", "base profile (optional)"),
         ],
         "vgpio" => {
@@ -1055,12 +1079,19 @@ fn section_fields(section: &str) -> Vec<Field> {
                 ("leds", "on-board LEDs"),
                 ("can", "CAN bus"),
                 ("input", "input devices (keys, touch)"),
-                ("usb", "specific USB devices"),
                 ("midi", "MIDI ports"),
                 ("display", "display nodes (DRI)"),
             ] {
                 advanced.push(mk(label, plain));
             }
+            // A USB peripheral is passed by its FUNCTION, not as a raw bus node: a USB-serial adapter is
+            // under 'serial' (ttyUSB), a webcam under 'camera' (video), a USB mic under 'sound card'.
+            // Raw /dev/bus/usb passthrough is refused by the resolver (it reaches the WHOLE bus — BadUSB),
+            // so a real usb pick would only ever be denied — an explanatory note instead of a lie.
+            advanced.push(Field::info(
+                "usb",
+                "passed by function: serial / camera / sound card above",
+            ));
             // Number fields (pwm/adc/onewire are channel/line indices you'd type) only accept typing
             // when the host actually HAS that controller; otherwise there's nothing to type, so it's a
             // "none here" note — never an empty box asking you to guess. A gated helper keeps it uniform.
@@ -1097,24 +1128,7 @@ fn section_fields(section: &str) -> Vec<Field> {
                 "1-Wire line numbers",
                 std::path::Path::new("/sys/bus/w1/devices").exists(),
             ));
-            // `backend` names a configured `[[gpio]]` id — so it's a SELECTION, not free text (that's
-            // how `gpio:0sfsf…` was possible). Offer the configured ids as a picker; if none are set up,
-            // say so instead of a blank box a beginner can't fill.
-            let backends: Vec<String> = crate::config::load(None)
-                .unwrap_or_default()
-                .gpio
-                .iter()
-                .map(|g| g.id.clone())
-                .collect();
-            advanced.push(if backends.is_empty() {
-                Field::info(
-                    "backend",
-                    "no GPIO backend configured (run: kern config setup)",
-                )
-            } else {
-                // Single-select: a profile uses ONE backend, so ticking one clears the rest.
-                Field::radio("backend", "the GPIO backend to use", backends)
-            });
+            advanced.push(backend_field("vgpio"));
             advanced.push(Field::text("extra", "any other /dev path"));
             let mut v = common;
             v.push(Field::divider());
@@ -1128,7 +1142,7 @@ fn section_fields(section: &str) -> Vec<Field> {
             Field::text("name", "e.g. scratch"),
             Field::text("size", "e.g. 2g"),
             Field::toggle("persistent", "survives box removal"),
-            Field::text("backend", "disk:0 (optional)"),
+            backend_field("vdisk"),
             Field::text("iops", "ops/s (optional)"),
             Field::text("bandwidth", "e.g. 100m (optional)"),
         ],
@@ -1153,7 +1167,6 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
         ("vgpio", "leds") => "On-board LEDs you want the box to control.",
         ("vgpio", "can") => "CAN bus — vehicle & industrial networking.",
         ("vgpio", "input") => "Input devices — keys, touchscreen, joystick.",
-        ("vgpio", "usb") => "A specific USB device node to pass through.",
         ("vgpio", "midi") => "MIDI ports for music gear.",
         ("vgpio", "display") => "GPU display nodes (DRI) for rendering.",
         ("vgpio", "pwm") => "PWM outputs (e.g. 12 13) for servos, dimming, fans.",
@@ -3481,14 +3494,17 @@ leds = [\"led0\"]
 
     #[test]
     fn backend_is_a_selection_never_a_free_text_box() {
-        // `backend` names a configured [[gpio]] id — so it must be a PICKER of those ids (or a "none
-        // configured" note), never a free-text box where `gpio:0sfsf…` could be typed.
-        let fields = section_fields("vgpio");
-        let backend = fields.iter().find(|f| f.label == "backend").unwrap();
-        assert!(
-            backend.is_pick() || backend.info,
-            "backend must be a picker or a note, not free text"
-        );
+        // `backend` names a configured id (gpio/cpu/disk) — so for EVERY kind it must be a picker of
+        // those ids (or a "none configured" note), never a free-text box where `disk:0sfsf…` could be
+        // typed. Regression: vcpu/vdisk backend used to be free text.
+        for kind in ["vgpio", "vcpu", "vdisk"] {
+            let fields = section_fields(kind);
+            let backend = fields.iter().find(|f| f.label == "backend").unwrap();
+            assert!(
+                backend.is_pick() || backend.info,
+                "{kind} backend must be a picker or a note, not free text"
+            );
+        }
     }
 
     #[test]
