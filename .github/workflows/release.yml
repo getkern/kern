@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to (re)build + attach assets for (e.g. v0.6.2)"
+        description: "Existing release tag to (re)build + attach assets for (e.g. v0.6.3)"
         required: true
 
 permissions:

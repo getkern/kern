@@ -15,7 +15,7 @@
 $ErrorActionPreference = 'Stop'
 
 # By default pull from the LATEST GitHub release (its Windows assets are CI-built + sha256-signed);
-# pin an exact release with KERN_VERSION=v0.6.2. GitHub's /releases/latest/download/<asset> redirects
+# pin an exact release with KERN_VERSION=v0.6.3. GitHub's /releases/latest/download/<asset> redirects
 # to the newest release's asset of that name.
 $RelBase    = if ($env:KERN_VERSION) { "https://github.com/getkern/kern/releases/download/$env:KERN_VERSION" } else { 'https://github.com/getkern/kern/releases/latest/download' }
 $InstallDir = Join-Path $env:LOCALAPPDATA 'kern'
