@@ -1340,6 +1340,53 @@ fn make_box_tmpfs(root: &str, leaf: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Open a `/dev/...` device node by walking the path ONE component at a time from `/dev`, each hop an
+/// `openat(O_PATH|O_NOFOLLOW)`. A plain `open(path, O_NOFOLLOW)` only guards the FINAL component — an
+/// intermediate symlink is still followed — so a component swapped to a symlink at any depth could
+/// redirect the bind. Walking each hop with `O_NOFOLLOW` closes that TOCTOU *by construction* (not by
+/// trusting a pre-canonicalized string): every hop is atomic against its parent fd, `..` is refused,
+/// and the walk can't leave `/dev`. Returns the pinned leaf fd (the caller fstat-checks it and binds
+/// from `/proc/self/fd`), or `None` if the path is absent / a component was swapped to a symlink.
+fn open_dev_pinned(src: &str) -> Option<i32> {
+    let rest = src.strip_prefix("/dev/")?;
+    let dev = cstr("/dev").ok()?;
+    let mut cur = unsafe {
+        libc::open(
+            dev.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if cur < 0 {
+        return None;
+    }
+    let comps: Vec<&str> = rest
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    for (i, comp) in comps.iter().enumerate() {
+        if *comp == ".." {
+            unsafe { libc::close(cur) };
+            return None; // never traverse out of /dev
+        }
+        let last = i + 1 == comps.len();
+        let mut flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        if !last {
+            flags |= libc::O_DIRECTORY; // every non-final hop must be a real directory
+        }
+        let Ok(c) = cstr(comp) else {
+            unsafe { libc::close(cur) };
+            return None;
+        };
+        let next = unsafe { libc::openat(cur, c.as_ptr(), flags) };
+        unsafe { libc::close(cur) };
+        if next < 0 {
+            return None; // absent, or a component swapped to a symlink (O_NOFOLLOW → ELOOP)
+        }
+        cur = next;
+    }
+    Some(cur)
+}
+
 /// Bind host `src` onto `<root>/<base>/<rel>`, creating the parent chain and leaf target inside the
 /// box-owned `<base>` tmpfs (so target creation can't be redirected by a hostile symlink). `is_dir`
 /// selects a recursive directory bind vs a device-node file bind. Best-effort; a `..`/empty
@@ -1386,21 +1433,14 @@ fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
         if f >= 0 {
             unsafe { libc::close(f) };
         }
-        // TOCTOU-safe SOURCE: open the host device `O_PATH|O_NOFOLLOW` so the fd PINS this exact inode,
-        // then bind FROM the fd via /proc/self/fd — a name swapped between the resolver's check and this
-        // mount can't redirect us to a different device. `src` is already canonicalized, so its final
-        // component isn't a symlink and O_NOFOLLOW won't reject a legitimate node (but WILL reject one
-        // swapped to a symlink afterwards). Re-check on the pinned fd that it's not a BLOCK device (a
-        // host disk) — closing the window against a swap-to-/dev/sda between check and bind.
-        let sfd = unsafe {
-            libc::open(
-                s.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        // TOCTOU-safe SOURCE: walk `/dev/...` one hop at a time (open_dev_pinned) so the fd PINS the
+        // exact inode with NO intermediate symlink followed at any depth, then bind FROM the fd via
+        // /proc/self/fd — a component swapped between the resolver's check and this mount can't redirect
+        // us. Re-check on the pinned fd that it's not a BLOCK device (a host disk).
+        let sfd = match open_dev_pinned(src) {
+            Some(fd) => fd,
+            None => return, // absent, escapes /dev, or a component was swapped to a symlink → skip
         };
-        if sfd < 0 {
-            return; // absent or swapped-to-symlink → skip (fail-safe)
-        }
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let is_block = unsafe { libc::fstat(sfd, &mut st) } == 0
             && (st.st_mode & libc::S_IFMT) == libc::S_IFBLK;
@@ -3174,5 +3214,36 @@ mod nesting_gate_tests {
         assert!(!uid_map_root_is_unprivileged(""));
         assert!(!uid_map_root_is_unprivileged("garbage\nnot a map"));
         assert!(!uid_map_root_is_unprivileged("0 0")); // truncated line
+    }
+}
+
+#[cfg(test)]
+mod open_dev_pinned_tests {
+    use super::open_dev_pinned;
+
+    #[test]
+    fn walks_dev_safely_and_refuses_traversal_and_symlinks() {
+        // A real char device opens; the returned fd is valid.
+        let fd = open_dev_pinned("/dev/null").expect("/dev/null opens");
+        assert!(fd >= 0);
+        unsafe { libc::close(fd) };
+        // Absent node → None (fail-safe skip).
+        assert!(open_dev_pinned("/dev/kern-nope-xyz-123").is_none());
+        // `..` mid-path → refused, never traverses out of /dev.
+        assert!(open_dev_pinned("/dev/../etc/passwd").is_none());
+        // Not under /dev → refused outright.
+        assert!(open_dev_pinned("/etc/passwd").is_none());
+        // An INTERMEDIATE symlink is not followed: /dev/fd is a symlink to /proc/self/fd, so walking
+        // `/dev/fd/0` must refuse at the `fd` hop (O_NOFOLLOW|O_DIRECTORY → ENOTDIR) rather than escape
+        // to /proc. This is the by-construction closure of the deep-symlink TOCTOU.
+        if std::fs::symlink_metadata("/dev/fd")
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            assert!(
+                open_dev_pinned("/dev/fd/0").is_none(),
+                "an intermediate symlink under /dev must not be followed"
+            );
+        }
     }
 }
