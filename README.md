@@ -257,7 +257,8 @@ kern box build --image alpine --memory 512M --cpus 1.5 -v "$PWD:/src" -w /src --
 Detached, a published port, restarts if it dies, health-checked — without a daemon.
 
 ```sh
-kern box svc --image alpine -d -p 8080:80 --restart -- httpd -f
+kern box svc --image alpine -d -p 8080:80 --restart \
+  --health-cmd 'wget -qO- localhost:80' -- httpd -f
 ```
 
 ### 🔎 See & control what's running
