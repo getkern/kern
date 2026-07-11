@@ -1803,6 +1803,21 @@ fn host_mem() -> Option<(u64, u64)> {
     Some((total.saturating_sub(avail) * 1024, total * 1024))
 }
 
+/// True for an on-board LED worth offering; false for the NOISE that dominates `/sys/class/leds` on a
+/// desktop — a netdev LED (`<iface>` or `<iface>-<port>` before `::`, e.g. `enp5s0-0::lan`, a NIC PHY
+/// light) or an input LED (`inputN::…`, a keyboard capslock light) — neither of which is a meaningful
+/// device to pass into a sandbox. Real board LEDs (`led0`, `ACT`, `PWR`, `mmc0::…`) pass.
+fn is_board_led(name: &str, nets: &[String]) -> bool {
+    let head = name.split("::").next().unwrap_or(name);
+    let is_input_led = head
+        .strip_prefix("input")
+        .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
+    let is_netdev_led = nets
+        .iter()
+        .any(|iface| head == iface || head.starts_with(&format!("{iface}-")));
+    !is_input_led && !is_netdev_led
+}
+
 /// The host devices currently present for a vGPIO field `kind` — the options the new/edit form offers
 /// as checkboxes, so a user PICKS from what actually exists instead of typing a `/dev/…` path (which
 /// is easy to get wrong). Uniform for every host: the same probe runs everywhere, only the *contents*
@@ -1837,7 +1852,18 @@ fn present_devices(kind: &str) -> Vec<String> {
         "audio" => scan("/dev/snd", &["pcm", "controlC"], |n| {
             format!("/dev/snd/{n}")
         }),
-        "leds" => scan("/sys/class/leds", &[""], |n| n.to_string()), // led NAMES, not paths
+        // On-board LED NAMES, but DROP the noise: `/sys/class/leds` on a desktop is dominated by
+        // netdev LEDs (`enp5s0-0::lan` — a NIC PHY link light) and input LEDs (`input3::capslock` — a
+        // keyboard light), which are meaningless to pass into a sandbox. A LED whose segment before
+        // `::` is a present network interface, or is `inputN`, is filtered; real board LEDs (`led0`,
+        // `ACT`, `PWR`, `mmc0::…`) remain.
+        "leds" => {
+            let nets = present_devices("net");
+            scan("/sys/class/leds", &[""], |n| n.to_string())
+                .into_iter()
+                .filter(|n| is_board_led(n, &nets))
+                .collect()
+        }
         "bluetooth" => scan("/sys/class/bluetooth", &["hci"], |n| n.to_string()),
         "net" => scan("/sys/class/net", &[""], |n| n.to_string()), // interface NAMES (eth0, wlan0…)
         _ => Vec::new(),
@@ -3490,6 +3516,24 @@ leds = [\"led0\"]
             opened.contains("backend"),
             "advanced fields show once opened:\n{opened}"
         );
+    }
+
+    #[test]
+    fn leds_picker_drops_netdev_and_input_noise_keeps_board_leds() {
+        let nets = vec!["enp5s0".to_string(), "lo".to_string(), "wlp4s0".to_string()];
+        // Noise: NIC PHY LEDs and keyboard LEDs — never a meaningful sandbox device.
+        for noise in [
+            "enp5s0-0::lan",
+            "enp5s0::act",
+            "wlp4s0-1::wlan",
+            "input3::capslock",
+        ] {
+            assert!(!is_board_led(noise, &nets), "{noise} should be dropped");
+        }
+        // Real board LEDs — kept. 'logo' starts with 'lo' but isn't the 'lo' iface → kept.
+        for led in ["led0", "ACT", "PWR", "mmc0::activity", "default-on", "logo"] {
+            assert!(is_board_led(led, &nets), "{led} should be kept");
+        }
     }
 
     #[test]
