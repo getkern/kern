@@ -17,6 +17,42 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.3] — 2026-07-13
+
+### Added
+- **Guided, "impossible to get wrong" profile forms in `kern top`.** Creating a vcpu/vgpio/vdisk
+  profile now picks from what the host actually exposes instead of typing `/dev/` paths: detected
+  devices are checkbox lists, absent kinds are read-only "none on this host" notes, `backend` is a
+  single-select radio of the configured `[[gpio]]`/`[[cpu]]`/`[[disk]]` ids, and every typed field
+  (numbers, sizes, names, the `extra` /dev path) is validated live with a three-state ✓ / "keep
+  typing" indicator — a plain-language help line explains each field.
+- **One validation rule shared by live-typing, save and load.** `config::field_state` is derived from
+  the save authority (`profile_line` / `validate_profile_name`), so a value that types cleanly always
+  saves and vice-versa — no per-field char-class list to drift, no dead-ends.
+- **Whole-profile validation at save.** A `backend`/`extends` that references no configured
+  `[[gpio]]`/`[[cpu]]`/`[[disk]]`/profile is refused before the write, with a clear message.
+
+### Security
+- **Capability-based `/dev` deny-list for vGPIO passthrough.** Refuses, by kernel IDENTITY
+  (major/minor) where fixed and by name/path otherwise, every node that grants host control or raw
+  memory/storage: block devices; mem/kmem/port/kmsg/oldmem; sg\*/nvme\* char storage controllers,
+  bsg, dm/loop/btrfs control; VFIO (incl. the 6.x cdev); kvm/vhost\*/vbox\*; uinput/uhid/hidraw\*/
+  hiddev\*; watchdog\*/mtd\*/nvram; net/tun, ppp; fuse/udmabuf; mei\*; dax\*; the privileged DRM
+  `card*` modeset node; console/virtual-consoles/vcs\*/cuse. Render-only GPU (`renderD*`), rtc and
+  serial ttys stay allowed. A specific USB device (`/dev/bus/usb/<bus>/<dev>`) is a scoped passthrough;
+  the whole bus is refused.
+- **fd-pinned device binds close the check→mount TOCTOU.** The runtime walks `/dev/…` one hop at a
+  time (`openat(O_PATH|O_NOFOLLOW)`), pins the exact inode and binds from `/proc/self/fd`, so a name
+  swapped at any depth between the resolver's check and the mount can't redirect it.
+- **`extra` is a validated `/dev` path** (not free text); `i2c` entries are validated at save; the
+  resolver still canonicalizes and re-checks every path under `/dev/` at launch.
+
+### Fixed
+- The `leds` picker drops netdev/keyboard-LED noise (`enp5s0-0::lan`, `input3::capslock`) and keeps
+  real board LEDs. `midi` and `display` now actually detect devices (`display` offers the allowed
+  `renderD*` GPU node) instead of always showing "none detected".
+- `save_named_block` is fail-closed: it refuses to write a `kern.toml` that would not re-parse.
+
 ## [0.6.2] — 2026-07-12
 
 ### Added
