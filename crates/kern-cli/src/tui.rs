@@ -1193,17 +1193,16 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
 /// the save parser (`profile_line` / `validate_profile_name`), so there is a SINGLE source of truth for
 /// what any field may hold, shared by live-typing AND save; a per-field char-class list (which could
 /// drift) no longer exists. A number field rejects a letter because the value would be `Invalid`; a
-/// name rejects a space for the same reason; a free-form `extra` accepts anything (never `Invalid`),
-/// with the resolver as its guard. The printable-ASCII gate at the call site still blocks control /
-/// multibyte bytes for every field.
+/// name rejects a space for the same reason; even `extra` rejects a non-`/dev/` string. The
+/// printable-ASCII gate at the call site still blocks control / multibyte bytes for every field.
 fn field_value_ok(label: &str, v: &str) -> bool {
     crate::config::field_state(label, v) != crate::config::FieldState::Invalid
 }
 
 /// Fields governed by `config::field_state` — the SINGLE rule shared with save — and given the live
-/// three-state indicator. Numbers/ranges/sizes AND the name/extends identifiers (both route through the
-/// same `field_state` dispatcher, so no field validates by a second, drift-prone path). `backend` is a
-/// pick, `extra` is the free-form escape — neither is here.
+/// three-state indicator. Numbers/ranges/sizes, the name/extends identifiers, AND the `extra` /dev-path
+/// escape (all route through the same `field_state` dispatcher, so no field validates by a second,
+/// drift-prone path). Only `backend` (a pick) isn't here.
 fn validated_field(label: &str) -> bool {
     matches!(
         label,
@@ -1222,6 +1221,7 @@ fn validated_field(label: &str) -> bool {
             | "iops"
             | "name"
             | "extends"
+            | "extra"
     )
 }
 
@@ -3551,8 +3551,7 @@ leds = [\"led0\"]
                 let guarded = f.is_pick()            // detected-device pick / backend radio
                     || f.toggle                       // a boolean
                     || f.info                         // a "none on this host" / explanatory note
-                    || validated_field(f.label)       // field_state governs it (numbers / name / size)
-                    || f.label == "extra"; // the one intentional free-form /dev escape
+                    || validated_field(f.label); // field_state governs it (numbers/name/size/extra path)
                 assert!(
                     guarded,
                     "{kind} field {:?} is UNGUARDED free text — make it validated / a pick / a note",
