@@ -889,15 +889,25 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
     {
         return true;
     }
-    // path-ancestor families: (10) raw USB bus · (3) VFIO — ALL layouts incl. the 6.x cdev node
-    // /dev/vfio/devices/vfioN · block-SCSI-generic /dev/bsg/* · device-mapper control /dev/mapper/control
-    // (a real /dev/mapper LV canonicalizes to /dev/dm-N, a block device, and is caught above).
+    // path-ancestor families: (3) VFIO — ALL layouts incl. the 6.x cdev node /dev/vfio/devices/vfioN ·
+    // block-SCSI-generic /dev/bsg/* · device-mapper control /dev/mapper/control (a real /dev/mapper LV
+    // canonicalizes to /dev/dm-N, a block device, and is caught above).
     if real.to_str().is_some_and(|s| {
-        ["/bus/usb/", "/vfio/", "/bsg/", "/mapper/"]
+        ["/vfio/", "/bsg/", "/mapper/"]
             .iter()
             .any(|p| s.contains(p))
     }) {
         return true;
+    }
+    // (10) raw USB: refuse the whole-BUS reach (/dev/bus/usb, or /dev/bus/usb/<bus> which reaches EVERY
+    // device on it — BadUSB), but ALLOW a SPECIFIC device node /dev/bus/usb/<bus>/<dev>: that's a scoped
+    // libusb passthrough of the one device the user chose (DFU flashing, an SDR, a programmer), no
+    // different in kind from handing over /dev/ttyUSB0. Depth 2 (bus/dev) = a device; fewer = a bus.
+    if let Some(rest) = real.to_str().and_then(|s| s.strip_prefix("/dev/bus/usb")) {
+        let depth = rest.split('/').filter(|c| !c.is_empty()).count();
+        if depth < 2 {
+            return true;
+        }
     }
     // (8) the privileged DRM node (modeset); the render-only node renderD* stays allowed.
     parent == "dri" && name.starts_with("card")
@@ -1988,7 +1998,8 @@ mod tests {
             "/dev/hiddev0", // HID injection (HIDIOCSREPORT)
             "/dev/uhid",    // create a virtual HID device
             "/dev/mei0",    // Intel Management Engine
-            "/dev/bus/usb/001/002", // raw USB — reaches the whole bus (BadUSB)
+            "/dev/bus/usb/001", // a whole USB BUS (reaches every device on it — BadUSB)
+            "/dev/bus/usb", // the USB bus root
             "/dev/sg0",     // SCSI generic (char) — SG_IO reaches the host disk
             "/dev/nvme0",   // NVMe CONTROLLER (char) — admin cmd formats/reads any namespace
             "/dev/bsg/0:0:0:0", // block-SCSI-generic (char) — SG_IO
@@ -2011,7 +2022,8 @@ mod tests {
             "/dev/spidev0.0",
             "/dev/dri/renderD128", // render-only GPU node — allowed
             "/dev/rtc0",
-            "/dev/sgx_enclave", // SGX (not sg+digits) — allowed
+            "/dev/sgx_enclave",     // SGX (not sg+digits) — allowed
+            "/dev/bus/usb/001/002", // a SPECIFIC USB device (scoped libusb, like ttyUSB) — allowed
         ] {
             assert!(
                 !is_dangerous_dev(std::path::Path::new(dev)),
