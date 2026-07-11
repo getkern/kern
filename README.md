@@ -235,32 +235,55 @@ git clone https://github.com/getkern/kern && cd kern && cargo build --release
 
 ## Quickstart
 
+### 🚀 Start here
+
+A sandboxed shell from any OCI image. The image stays read-only; your writes go to a scratch overlay that vanishes on exit.
+
 ```sh
-# Run a real OCI image in a writable overlay (image immutable; scratch discarded). -it = a PTY.
 kern box dev --image alpine -it -- sh
+```
 
-# Cap the slice: hard memory + CPU (cgroup v2), a bind mount, an env, host net for the build.
-kern box build --image alpine --memory 512M --cpus 1.5 \
-  -v "$PWD:/src" -w /src -e CI=1 --net -- sh -c 'apk add --no-cache make && make'
+### 🎚️ Cap what it can use
 
-# Governor only, no sandbox — a CPU + memory quota on a host command (the leanest path).
+Hard memory + CPU limits (cgroup v2). `kern run` is the leanest path — a quota on a host command, no sandbox.
+
+```sh
 kern run --memory 256M --cpus 0.5 -- ./crunch-numbers
+kern box build --image alpine --memory 512M --cpus 1.5 -v "$PWD:/src" -w /src --net -- make
+```
 
-# Detached service: publish a port, keep it up, health-check it — without a daemon.
-kern box svc --image alpine -d -p 8080:80 --restart \
-  --health-cmd 'wget -qO- localhost:80' --health-interval 5 -- httpd -f
-kern ps                       # running boxes, with PORTS + HEALTH
-kern top                      # interactive TUI (tabs, live mem/CPU)
-kern exec svc -it -- sh       # shell into a running box
-kern cp svc:/etc/app.conf .   # copy a file out (symlink-confined)
-kern logs svc ; kern stop svc # its output ; stop it (or: kern stop --all)
+### 🌐 Run it as a service
 
-# Deliver a secret (never in image or env) and drop to least-privilege.
+Detached, a published port, restarts if it dies, health-checked — without a daemon.
+
+```sh
+kern box svc --image alpine -d -p 8080:80 --restart -- httpd -f
+```
+
+### 🔎 See & control what's running
+
+```sh
+kern ps                   # running boxes — with PORTS + HEALTH
+kern top                  # live TUI: boxes, CPU/RAM, profiles
+kern exec svc -it -- sh   # shell into a running box
+kern logs svc             # its output
+kern stop svc             # stop it   (kern stop --all for everything)
+```
+
+### 🔐 Hand it a secret
+
+Never baked into the image or env — delivered on a pipe, readable only inside the box.
+
+```sh
 printf "$DB_TOKEN" | kern box job --image alpine --secret TOKEN=- --cap-drop ALL \
   -- sh -c 'curl -H "Authorization: Bearer $(cat /run/secrets/TOKEN)" https://api/…'
+```
 
-kern doctor                   # will boxes even run on this host? preflight it.
-kern compose stack.toml       # bring up a small stack in dependency order (TOML or compose.yml)
+### 🩺 Before you rely on it
+
+```sh
+kern doctor               # will boxes even run on this host? preflight it
+kern compose stack.toml   # bring up a stack in dependency order (TOML or compose.yml)
 ```
 
 ## Build & publish images
