@@ -785,17 +785,18 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
 /// finite CAPABILITY test, not a list to chase: refuse a node that grants any of the host-control
 /// capabilities below; allow plain I/O peripherals (gpio, i2c, spi, uart, can, render-GPU, rtc, …).
 ///
-/// 1. host storage — any BLOCK device (that's `vdisk`'s job): sda, nvme\*, mmcblk\*, dm-\*, loop\*
+/// 1. host storage — any BLOCK device (sda, mmcblk\*, dm-\*, loop\*) AND the CHARACTER nodes that
+///    reach a disk by ioctl: `sg*` (SG_IO), the `nvme0` controller (admin cmd), `/dev/bsg/*`,
+///    `/dev/mapper/control`, `loop-control`, `btrfs-control`
 /// 2. raw memory / I/O ports — mem, kmem, port, kmsg, fmem, mergemem
-/// 3. arbitrary DMA — VFIO device passthrough (`/dev/vfio/*`): can read/write ALL physical memory
+/// 3. arbitrary DMA — VFIO (`/dev/vfio/*`, incl. the 6.x cdev `/dev/vfio/devices/*`)
 /// 4. host reboot / brick — watchdog\*, mtd\*, nvram (raw flash/firmware)
 /// 5. virtualization / hypervisor — kvm, vhost\* (vhost-net/vsock/vdpa), vboxdrv
-/// 6. input/HID injection — uinput AND hidraw\* (raw HID write injects keystrokes / reprograms a device)
-/// 7. host network creation — net/tun
+/// 6. input/HID injection — uinput, uhid, hidraw\*, hiddev\* (raw HID write injects keystrokes)
+/// 7. host network creation — net/tun, ppp
 /// 8. display control — dri/card\* (the privileged KMS/modeset node)
 /// 9. mount confusion — fuse
-/// 10. raw USB — /dev/bus/usb/\* (reprogram/impersonate any device on the bus — BadUSB; escapes the
-///     deny-by-default intent since one node reaches the whole bus)
+/// 10. raw USB — /dev/bus/usb/\* (reprogram/impersonate any device on the bus — BadUSB)
 /// 11. management engine — mei\* (Intel ME: privileged out-of-band host access)
 ///
 /// The render-only GPU node (`dri/renderD*`) is allowed — it's the real GPU-compute case — but note it
@@ -812,7 +813,8 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    // (2) raw memory · (4) nvram · (5) kvm · (6) uinput · (7) tun · (9) fuse
+    // (2) raw memory · (4) nvram · (5) kvm · (6) uinput/uhid · (7) tun/ppp · (9) fuse · storage/dm/
+    //     loop CONTROL char nodes (map/format host storage via ioctl, not block devices themselves)
     if matches!(
         name,
         "mem"
@@ -824,27 +826,44 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
             | "nvram"
             | "kvm"
             | "uinput"
+            | "uhid"
             | "tun"
+            | "ppp"
             | "fuse"
+            | "loop-control"
+            | "btrfs-control"
     ) {
         return true;
     }
-    // family prefixes: (4) reboot/brick · (5) vhost-net/vsock/vdpa + vbox* · (6) hidraw · (11) mei
-    if ["watchdog", "mtd", "vhost", "vbox", "hidraw", "mei"]
-        .iter()
-        .any(|p| name.starts_with(p))
+    // family prefixes: (4) reboot/brick · (5) vhost-net/vsock/vdpa + vbox* · (6) HID injection
+    // (hidraw + hiddev) · (11) mei
+    if [
+        "watchdog", "mtd", "vhost", "vbox", "hidraw", "hiddev", "mei",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
     {
         return true;
     }
-    // (3) VFIO — arbitrary DMA, the worst: /dev/vfio/{vfio,<group>}
-    if parent == "vfio" || name == "vfio" {
+    // (1b) SCSI-generic (`sg0`) and the NVMe CONTROLLER (`nvme0`) — CHARACTER nodes that reach the host
+    // disk via SG_IO / NVME_IOCTL_ADMIN_CMD, so the block-device check above misses them. Match the
+    // stem + digits so `nvme0` is refused but `sgx_enclave` / `nvme-fabrics` are not (and `nvme0n1` is
+    // a block device caught above).
+    let stem_digits = |stem: &str| {
+        name.strip_prefix(stem)
+            .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if stem_digits("sg") || stem_digits("nvme") {
         return true;
     }
-    // (10) raw USB — any node under /dev/bus/usb/ reaches the whole USB bus, not one device.
-    if real
-        .to_str()
-        .is_some_and(|s| s.contains("/bus/usb/") || s.ends_with("/bus/usb"))
-    {
+    // path-ancestor families: (10) raw USB bus · (3) VFIO — ALL layouts incl. the 6.x cdev node
+    // /dev/vfio/devices/vfioN · block-SCSI-generic /dev/bsg/* · device-mapper control /dev/mapper/control
+    // (a real /dev/mapper LV canonicalizes to /dev/dm-N, a block device, and is caught above).
+    if real.to_str().is_some_and(|s| {
+        ["/bus/usb/", "/vfio/", "/bsg/", "/mapper/"]
+            .iter()
+            .any(|p| s.contains(p))
+    }) {
         return true;
     }
     // (8) the privileged DRM node (modeset); the render-only node renderD* stays allowed.
@@ -1891,28 +1910,40 @@ mod tests {
             "/dev/nvram",
             "/dev/net/tun",
             "/dev/fuse",
-            "/dev/kvm",             // hypervisor
-            "/dev/vhost-net",       // VM network backend
-            "/dev/vhost-vsock",     // VM vsock backend
-            "/dev/uinput",          // input injection
-            "/dev/vfio/vfio",       // arbitrary DMA — the worst
-            "/dev/vfio/42",         // a vfio group
-            "/dev/dri/card0",       // privileged DRM (modeset)
-            "/dev/vhost-vdpa",      // vhost family (prefix) — vdpa
-            "/dev/vboxdrv",         // VirtualBox hypervisor driver
-            "/dev/hidraw0",         // raw HID — write injects keystrokes / reprograms (like uinput)
-            "/dev/mei0",            // Intel Management Engine
+            "/dev/kvm",                // hypervisor
+            "/dev/vhost-net",          // VM network backend
+            "/dev/vhost-vsock",        // VM vsock backend
+            "/dev/uinput",             // input injection
+            "/dev/vfio/vfio",          // arbitrary DMA — the worst
+            "/dev/vfio/42",            // a vfio group
+            "/dev/dri/card0",          // privileged DRM (modeset)
+            "/dev/vhost-vdpa",         // vhost family (prefix) — vdpa
+            "/dev/vboxdrv",            // VirtualBox hypervisor driver
+            "/dev/hidraw0", // raw HID — write injects keystrokes / reprograms (like uinput)
+            "/dev/hiddev0", // HID injection (HIDIOCSREPORT)
+            "/dev/uhid",    // create a virtual HID device
+            "/dev/mei0",    // Intel Management Engine
             "/dev/bus/usb/001/002", // raw USB — reaches the whole bus (BadUSB)
+            "/dev/sg0",     // SCSI generic (char) — SG_IO reaches the host disk
+            "/dev/nvme0",   // NVMe CONTROLLER (char) — admin cmd formats/reads any namespace
+            "/dev/bsg/0:0:0:0", // block-SCSI-generic (char) — SG_IO
+            "/dev/mapper/control", // device-mapper control — maps arbitrary host block ranges
+            "/dev/loop-control", // create loop devices
+            "/dev/ppp",     // create PPP network interfaces
+            "/dev/vfio/devices/vfio0", // 6.x VFIO cdev — arbitrary DMA
         ] {
             assert!(is_dangerous_dev(std::path::Path::new(dev)), "{dev} refused");
         }
-        // Legitimate peripherals (the GPU RENDER node, rtc) must NOT be refused — only card* is.
+        // Legitimate peripherals (the GPU RENDER node, rtc) must NOT be refused — and the stem+digits
+        // storage rule must NOT false-positive on SGX / NVMe-fabrics / a device merely starting "sg".
         for dev in [
             "/dev/i2c-1",
             "/dev/null",
             "/dev/spidev0.0",
             "/dev/dri/renderD128", // render-only GPU node — allowed
             "/dev/rtc0",
+            "/dev/sgx_enclave",  // SGX (not sg+digits) — allowed
+            "/dev/nvme-fabrics", // NVMe-oF connect node (not nvme+digits) — allowed
         ] {
             assert!(
                 !is_dangerous_dev(std::path::Path::new(dev)),
