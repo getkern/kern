@@ -1175,52 +1175,16 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
     Some(h)
 }
 
-/// Minimal input validation: which characters a field accepts AS YOU TYPE, so a number field can't
-/// hold letters (you can't put `1dfdf` in `pwm`). It filters keystrokes at entry — the wrongness never
-/// makes it onto the screen — which beats a save-time error. Free-form fields (a profile name, an
-/// arbitrary /dev path) return `true` for everything. Detected-device fields are pickers, so no typing
-/// reaches here for them at all.
-fn field_char_ok(section: &str, label: &str, ch: char) -> bool {
-    let digit = ch.is_ascii_digit();
-    let num_list = digit || ch == ' ' || ch == ','; // GPIO line numbers: "17 27" / "12,13"
-                                                    // Sizes are WHOLE units only — parse_binary_size takes a u64, no decimals — so no '.' here. A
-                                                    // filter that let you type "1.5g" would dead-end at save (the parser rejects it). 512m / 2g / 16t.
-    let size = digit || "kmgtKMGT".contains(ch);
-    let cpus = digit || matches!(ch, '-' | ',' | ' '); // core list: "0-3", "0,2"
-                                                       // a profile name / id — the char SET `validate_profile_name` allows (structural rules like the
-                                                       // leading-char ban live in field_state, the shared authority, so the char filter can't drift).
-    let ident = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
-    let backend = ch.is_ascii_alphanumeric() || ch == ':' || ch == '-'; // gpio:0 / disk:0
-    let path = ch.is_ascii_alphanumeric() || "/._-, ".contains(ch); // a /dev path
-    match (section, label) {
-        ("vgpio", "pins" | "pwm" | "adc" | "onewire") => num_list, // all are u32 line/channel indices
-        ("vgpio", "backend") => backend,
-        ("vgpio", "extra") => path,
-        ("vcpu", "vcpus") => digit || ch == '.',
-        ("vcpu", "cpus") => cpus,
-        ("vcpu", "memory") => size,
-        ("vcpu", "priority" | "numa") => digit,
-        ("vcpu", "nice") => digit || ch == '-',
-        ("vcpu", "backend") => backend,
-        ("vcpu", "extends") => ident,
-        ("vdisk", "size" | "bandwidth") => size,
-        ("vdisk", "iops") => digit,
-        ("vdisk", "backend") => backend,
-        ("volume", "size") => size,
-        (_, "name") => ident,
-        _ => true, // free-form / unknown → no restriction
-    }
-}
-
-/// Value-level validation — the "impossible to get wrong" numeric guard (a pin can't be `44545454545`,
-/// a 0-99 field can't reach `100`, a size can't be `1.5g`). It DELEGATES to `config::field_state`, the
-/// SAME rule the save uses (`profile_line`), so live-typing and save can never diverge — that shared
-/// source is what eliminates the dead-end class (a value the filter allows but the save rejects). The
-/// numeric/size fields go through it; free-form fields (name/backend/extra) are governed by the char
-/// filter alone and impose no value restriction here.
-fn field_value_ok(_section: &str, label: &str, v: &str) -> bool {
-    !validated_field(label)
-        || crate::config::field_state(label, v) != crate::config::FieldState::Invalid
+/// The ONE validation authority for a typed keystroke — the derived "char filter": a character is
+/// accepted iff the resulting value isn't `field_state::Invalid`. `field_state` is itself derived from
+/// the save parser (`profile_line` / `validate_profile_name`), so there is a SINGLE source of truth for
+/// what any field may hold, shared by live-typing AND save; a per-field char-class list (which could
+/// drift) no longer exists. A number field rejects a letter because the value would be `Invalid`; a
+/// name rejects a space for the same reason; a free-form `extra` accepts anything (never `Invalid`),
+/// with the resolver as its guard. The printable-ASCII gate at the call site still blocks control /
+/// multibyte bytes for every field.
+fn field_value_ok(label: &str, v: &str) -> bool {
+    crate::config::field_state(label, v) != crate::config::FieldState::Invalid
 }
 
 /// Fields governed by `config::field_state` — the SINGLE rule shared with save — and given the live
@@ -1464,25 +1428,19 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
             FormOutcome::Stay(form)
         }
         _ => {
-            // Append typed printable ASCII, but a character only lands if it passes BOTH the char
-            // filter (no letters in a number field → `pwm` can't hold `1dfdf`) AND the value filter
-            // (the resulting value stays in range / well-formed → `pins` can't hold `44545454545`, a
-            // 0-99 field can't reach `100`). The section drives the rules. Mistakes are impossible at
-            // entry, uniformly for vgpio, vcpu and vdisk.
-            let section = match &form.submit {
-                Submit::SaveProfile { section, .. } => *section,
-                Submit::CreateVolume | Submit::EditVolume { .. } => "volume",
-            };
+            // Append typed printable ASCII, but ONLY if the resulting value isn't Invalid per the
+            // single `field_state` authority (shared with save). A letter can't land in a number field
+            // and `pins` can't reach `44545454545` — both because the value would be Invalid — with no
+            // separate char-class list to drift. The `0x20..0x7f` gate blocks control / multibyte bytes.
             let label = form.fields[form.active].label;
             for &b in key {
-                let ch = b as char;
-                if !(0x20..0x7f).contains(&b) || !field_char_ok(section, label, ch) {
+                if !(0x20..0x7f).contains(&b) {
                     continue;
                 }
                 let mut candidate = form.fields[form.active].value.clone();
-                candidate.push(ch);
-                if field_value_ok(section, label, &candidate) {
-                    form.fields[form.active].value.push(ch);
+                candidate.push(b as char);
+                if field_value_ok(label, &candidate) {
+                    form.fields[form.active].value.push(b as char);
                 }
             }
             form.error = None;
