@@ -52,19 +52,19 @@ print(r.stdout, r.success)                     # → a fresh 1.9 ms box, discard
 
 ## Why kern
 
-- **Daemonless & tiny.** No `dockerd`-style service. A ~1.5 MB static binary, **one Rust dependency**
+- ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.5 MB static binary, **one Rust dependency**
   (`libc`) — it shells out to the system's `curl`/`tar` only to *pull* images (running a box needs
   neither). Cold start **~1.9 ms** vs ~300 ms for `docker run`; **~7 MB** RSS per box vs an always-on
   ~186 MB daemon (`dockerd` + `containerd`). `kern ps` reads state straight from the kernel.
-- **Rootless by default.** Unprivileged user namespaces — your uid maps to root *inside* the box,
+- 👤 **Rootless by default.** Unprivileged user namespaces — your uid maps to root *inside* the box,
   and only there. Single-uid is the default and is `libc`-pure (no helper, smallest id surface);
   `--uid-range` opts into a full sub-id range (`apt`, `www-data`-style drops) via the standard
   `newuidmap` + `/etc/subuid` — we state plainly that path is not helper-free. No host privilege
   is gained either way.
-- **Correct by construction.** The mount sequence is a **typestate**: remounting the root read-only
+- 🧱 **Correct by construction.** The mount sequence is a **typestate**: remounting the root read-only
   *before* pivoting into it doesn't compile — a class of sandbox-escape bug is unrepresentable, not
   just untested. `--plan` prints the exact isolation sequence without running anything.
-- **Honest about its boundaries.** Filesystem / process / namespace isolation is a real kernel
+- 🔍 **Honest about its boundaries.** Filesystem / process / namespace isolation is a real kernel
   boundary — the right tool for your own or semi-trusted code (CI, dev, edge, your agents' code).
   For actively hostile multi-tenant code, reach for a microVM. [SECURITY.md](SECURITY.md) says
   exactly when to use which, and marks every guarantee that is cooperative or opt-in.
@@ -409,14 +409,14 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 
 ## When to use kern (and when not)
 
-**Use kern when you want:**
+**✅ Use kern when you want:**
 
 - a **fast, daemonless sandbox** for your own or **agent/LLM-generated** code (fresh box per call, embeddable from Rust/Python);
 - **CI / build** boxes, or a throwaway dev environment, without a background daemon;
 - containers on **edge / ARM** boards where Docker won't even install (Pi, Jetson, Android-kernel);
 - **resource slices** beyond containers — `vcpu:` / `vdisk:` / `vgpio:` (GPU on the roadmap).
 
-**Reach for something else when you need:**
+**🔀 Reach for something else when you need:**
 
 - a hard boundary against **actively hostile multi-tenant** code → a **microVM** (Firecracker) or gVisor. kern's FS/PID/namespace/cgroup isolation is a real kernel boundary for *your own or semi-trusted* code, not a VM;
 - the **Docker Engine API / Docker Desktop** workflow, or a true CLI drop-in → **Docker / Podman**;
