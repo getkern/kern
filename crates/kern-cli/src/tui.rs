@@ -3493,6 +3493,32 @@ leds = [\"led0\"]
     }
 
     #[test]
+    fn every_profile_field_is_guarded_for_all_kinds() {
+        // EXTREME, for all vprofiles: no field in ANY profile form is unguarded free text. Each field
+        // is validated by the field_state authority (numbers / name / sizes), a picker/radio selection,
+        // a boolean toggle, or a "none here / explanatory" note — with ONE documented exception, the
+        // free-form `extra` /dev-path escape (guarded downstream by the resolver). If a new field is
+        // added as free text, this fails.
+        for kind in ["vcpu", "vgpio", "vdisk"] {
+            for f in section_fields(kind) {
+                if f.divider {
+                    continue;
+                }
+                let guarded = f.is_pick()            // detected-device pick / backend radio
+                    || f.toggle                       // a boolean
+                    || f.info                         // a "none on this host" / explanatory note
+                    || validated_field(f.label)       // field_state governs it (numbers / name / size)
+                    || f.label == "extra"; // the one intentional free-form /dev escape
+                assert!(
+                    guarded,
+                    "{kind} field {:?} is UNGUARDED free text — make it validated / a pick / a note",
+                    f.label
+                );
+            }
+        }
+    }
+
+    #[test]
     fn backend_is_a_selection_never_a_free_text_box() {
         // `backend` names a configured id (gpio/cpu/disk) — so for EVERY kind it must be a picker of
         // those ids (or a "none configured" note), never a free-text box where `disk:0sfsf…` could be
