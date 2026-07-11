@@ -1814,7 +1814,7 @@ fn is_board_led(name: &str, nets: &[String]) -> bool {
         .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
     let is_netdev_led = nets
         .iter()
-        .any(|iface| head == iface || head.starts_with(&format!("{iface}-")));
+        .any(|iface| head == iface || head.strip_prefix(iface).is_some_and(|r| r.starts_with('-')));
     !is_input_led && !is_netdev_led
 }
 
@@ -1823,8 +1823,8 @@ fn is_board_led(name: &str, nets: &[String]) -> bool {
 /// is easy to get wrong). Uniform for every host: the same probe runs everywhere, only the *contents*
 /// differ — a Pi shows its i2c/gpio, a mini-PC its bluetooth/usb. Returns sorted; a busy desktop can
 /// return many (e.g. 20 i2c DDC buses), so the form caps the visible count and keeps a manual field.
-// Wired into the vGPIO new/edit form (checkbox picker) in a follow-up; kept here as the shared,
-// host-uniform probe so every profile form uses one identical mechanism.
+/// The shared, host-uniform probe: `section_fields` consumes it so every profile form picks devices
+/// through one identical mechanism.
 fn present_devices(kind: &str) -> Vec<String> {
     // Files under `dir` whose name starts with any of `prefixes`, mapped through `to_entry`.
     fn scan(dir: &str, prefixes: &[&str], to_entry: impl Fn(&str) -> String) -> Vec<String> {
