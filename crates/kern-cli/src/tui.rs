@@ -1090,7 +1090,7 @@ fn section_fields(section: &str) -> Vec<Field> {
             // so a real usb pick would only ever be denied — an explanatory note instead of a lie.
             advanced.push(Field::info(
                 "usb",
-                "passed by function: serial / camera / sound card above",
+                "by function (serial/camera/audio) — or a specific /dev/bus/usb/B/D in 'extra'",
             ));
             // Number fields (pwm/adc/onewire are channel/line indices you'd type) only accept typing
             // when the host actually HAS that controller; otherwise there's nothing to type, so it's a
