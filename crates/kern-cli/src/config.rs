@@ -1486,6 +1486,59 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Re
 /// and a managed key omitted from `body` is cleared. So a partial edit never drops what it didn't
 /// touch, whichever surface made it. The read-modify-write is serialised by [`config_lock`] so
 /// concurrent writers don't clobber each other.
+/// Whole-profile validation, AFTER each field is individually valid: a profile can be field-valid yet
+/// reference something that doesn't exist. Checks the internal, save-time coherence a single field
+/// can't (a `backend`/`extends` that points at no configured `[[cpu]]`/`[[gpio]]`/`[[disk]]`/profile).
+/// Host-fit checks (e.g. `cpus` ≤ this host's cores) are LAUNCH-time and live in the resolver — a
+/// profile is portable, so `cpus = "0-7"` is legal to author on a 4-core box for an 8-core target.
+pub(crate) fn validate_profile_refs(
+    cfg: &KernConfig,
+    section: &str,
+    name: &str,
+) -> Result<(), String> {
+    match section {
+        "vcpu" => {
+            if let Some(e) = cfg.vcpu.iter().find(|e| e.name == name) {
+                if let Some(b) = e.backend.as_deref().filter(|b| !b.is_empty()) {
+                    if !cfg.cpu.iter().any(|c| c.id == b) {
+                        return Err(format!("backend '{b}' is not a configured [[cpu]] id"));
+                    }
+                }
+                if let Some(x) = e.extends.as_deref().filter(|x| !x.is_empty()) {
+                    if !cfg.vcpu.iter().any(|v| v.name == x) {
+                        return Err(format!("extends '{x}' is not another vcpu profile"));
+                    }
+                }
+            }
+        }
+        "vgpio" => {
+            if let Some(e) = cfg.vgpio.iter().find(|e| e.name == name) {
+                if !e.backend.is_empty() && !cfg.gpio.iter().any(|g| g.id == e.backend) {
+                    return Err(format!(
+                        "backend '{}' is not a configured [[gpio]] id (run: kern config setup)",
+                        e.backend
+                    ));
+                }
+            }
+        }
+        "vdisk" => {
+            if let Some(e) = cfg.vdisk.iter().find(|e| e.name == name) {
+                if !e.backend.is_empty() {
+                    let want = e.backend.strip_prefix("disk:").unwrap_or(&e.backend);
+                    if !cfg.disk.iter().any(|d| d.name == want) {
+                        return Err(format!(
+                            "backend '{}' is not a configured [[disk]]",
+                            e.backend
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn save_named_block(
     section: &str,
     orig_name: Option<&str>,
@@ -1501,6 +1554,11 @@ pub(crate) fn save_named_block(
     // For a rename, the OLD block is rewritten in place under the new name (carrying its other keys).
     let source = orig_name.unwrap_or(name);
     let out = crate::toml_surgery::upsert_block_merge(&raw, section, source, name, managed, body);
+    // Whole-profile coherence on the RESULTING config: a field-valid profile whose backend/extends
+    // points at nothing is refused here, before the write — so a save never produces a broken profile.
+    if let Ok(cfg) = parse(&out) {
+        validate_profile_refs(&cfg, section, name)?;
+    }
     write_atomic(&path, &out).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
@@ -1890,6 +1948,39 @@ mod tests {
         assert!(r.persistent);
         assert_eq!(r.backend_dir.as_deref(), Some("/srv/disks"));
         assert!(resolve_vdisk(&cfg, "ghost").is_err());
+    }
+
+    #[test]
+    fn whole_profile_refs_are_validated() {
+        // vgpio backend must reference a configured [[gpio]] id.
+        let cfg = parse(
+            "[[gpio]]\nid=\"gpio:0\"\n[[vgpio]]\nname=\"ok\"\nbackend=\"gpio:0\"\n\
+             [[vgpio]]\nname=\"bad\"\nbackend=\"gpio:9\"\n",
+        )
+        .unwrap();
+        assert!(validate_profile_refs(&cfg, "vgpio", "ok").is_ok());
+        assert!(validate_profile_refs(&cfg, "vgpio", "bad").is_err());
+        // vcpu: backend → [[cpu]] id, extends → another vcpu profile.
+        let cfg2 = parse(
+            "[[cpu]]\nid=\"cpu:0\"\n[[vcpu]]\nname=\"base\"\nvcpus=2.0\n\
+             [[vcpu]]\nname=\"ok\"\nbackend=\"cpu:0\"\nextends=\"base\"\n\
+             [[vcpu]]\nname=\"bad\"\nextends=\"nope\"\n",
+        )
+        .unwrap();
+        assert!(validate_profile_refs(&cfg2, "vcpu", "ok").is_ok());
+        assert!(validate_profile_refs(&cfg2, "vcpu", "bad").is_err());
+        // vdisk backend → [[disk]] name.
+        let cfg3 = parse(
+            "[[disk]]\nname=\"pool\"\npath=\"/srv\"\n\
+             [[vdisk]]\nname=\"ok\"\nbackend=\"disk:pool\"\nsize=\"1g\"\n\
+             [[vdisk]]\nname=\"bad\"\nbackend=\"disk:ghost\"\nsize=\"1g\"\n",
+        )
+        .unwrap();
+        assert!(validate_profile_refs(&cfg3, "vdisk", "ok").is_ok());
+        assert!(validate_profile_refs(&cfg3, "vdisk", "bad").is_err());
+        // No backend set → nothing to resolve → fine.
+        let cfg4 = parse("[[vgpio]]\nname=\"n\"\npins=[17]\n").unwrap();
+        assert!(validate_profile_refs(&cfg4, "vgpio", "n").is_ok());
     }
 
     // ── shared profile schema: the single source of truth the TUI form and `kern config add` share ──
