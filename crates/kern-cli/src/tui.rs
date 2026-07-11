@@ -1080,7 +1080,7 @@ fn section_fields(section: &str) -> Vec<Field> {
                 ("can", "CAN bus"),
                 ("input", "input devices (keys, touch)"),
                 ("midi", "MIDI ports"),
-                ("display", "display nodes (DRI)"),
+                ("display", "GPU render node (renderD)"),
             ] {
                 advanced.push(mk(label, plain));
             }
@@ -1156,7 +1156,7 @@ fn section_fields(section: &str) -> Vec<Field> {
 /// Advanced fold row). Kept short (≤ ~74 chars) so it never wraps an 80-column terminal.
 fn field_help(section: &str, label: &str) -> Option<&'static str> {
     let h = match (section, label) {
-        ("vgpio", "name") => "A label for this hardware set — attach it to a box with  vgpio:NAME",
+        ("vgpio", "name") => "A label for this hardware set — attach with  vgpio:NAME",
         ("vgpio", "i2c") => "I²C bus for sensors & small displays. Tick the bus your part is on.",
         ("vgpio", "spi") => "SPI bus for displays, ADCs, radios. Tick the port your part uses.",
         ("vgpio", "uart") => "Serial port for GPS, modems, consoles. Tick the tty it's on.",
@@ -1168,11 +1168,15 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
         ("vgpio", "can") => "CAN bus — vehicle & industrial networking.",
         ("vgpio", "input") => "Input devices — keys, touchscreen, joystick.",
         ("vgpio", "midi") => "MIDI ports for music gear.",
-        ("vgpio", "display") => "GPU display nodes (DRI) for rendering.",
+        ("vgpio", "display") => {
+            "GPU render node (renderD) for compute/video; card modeset is refused."
+        }
         ("vgpio", "pwm") => "PWM outputs (e.g. 12 13) for servos, dimming, fans.",
         ("vgpio", "adc") => "Analog inputs (ADC channels).",
         ("vgpio", "onewire") => "1-Wire lines, e.g. a DS18B20 temperature sensor.",
-        ("vgpio", "backend") => "Which detected GPIO controller to use (default gpio:0).",
+        ("vgpio", "backend") => {
+            "The configured [[gpio]] backend (optional; run kern config setup to add one)."
+        }
         ("vgpio", "extra") => "Any other /dev path to pass, only if you know it exists.",
         ("vcpu", "name") => "A label for this CPU/memory slice — attach with  vcpu:NAME",
         ("vcpu", "vcpus") => "How many cores the box may use, e.g. 4 — or 0.5 for half a core.",
@@ -1866,6 +1870,10 @@ fn present_devices(kind: &str) -> Vec<String> {
         }
         "bluetooth" => scan("/sys/class/bluetooth", &["hci"], |n| n.to_string()),
         "net" => scan("/sys/class/net", &[""], |n| n.to_string()), // interface NAMES (eth0, wlan0…)
+        "midi" => scan("/dev/snd", &["midi"], |n| format!("/dev/snd/{n}")), // ALSA MIDI nodes
+        // GPU: offer the RENDER node (renderD*, allowed for compute/video) — the privileged card*
+        // modeset node is refused by the resolver, so it isn't offered.
+        "display" => scan("/dev/dri", &["renderD"], |n| format!("/dev/dri/{n}")),
         _ => Vec::new(),
     }
 }
