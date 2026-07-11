@@ -781,6 +781,18 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("/dev/i2c-{n}"))
 }
 
+/// Is `s` a well-formed `/dev/…` path (SHAPE only — not existence)? `/dev/` then a non-empty run of
+/// path chars (alnum `/ . _ -`), no spaces/junk. The single rule shared by the `extra` field's save
+/// validation and its live filter, so the CLI, a hand-edited file and the TUI all agree.
+pub(crate) fn is_dev_path(s: &str) -> bool {
+    s.strip_prefix("/dev/").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    })
+}
+
 /// A `/dev` node that must never be bound into a deny-by-default *peripheral* sandbox. The rule is a
 /// finite CAPABILITY test, not a list to chase: refuse a node that grants any of the host-control
 /// capabilities below; allow plain I/O peripherals (gpio, i2c, spi, uart, can, render-GPU, rtc, …).
@@ -1224,15 +1236,25 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
         return Ok(Some(format!("{key} = [{joined}]")));
     }
     if field_in(STR_LIST_FIELDS, key) {
-        let items: Vec<String> = v
+        let trimmed: Vec<&str> = v
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(toml_quote)
             .collect();
-        if items.is_empty() {
+        // `extra` is the /dev-path escape — each entry MUST be a `/dev/…` path (not free text), so the
+        // CLI and a hand-edited file reject garbage exactly as the TUI live filter does (one rule). The
+        // resolver still does the existence/safety check at launch.
+        if key == "extra" {
+            for t in &trimmed {
+                if !is_dev_path(t) {
+                    return Err(format!("extra: {t:?} is not a /dev/… path"));
+                }
+            }
+        }
+        if trimmed.is_empty() {
             return Ok(None);
         }
+        let items: Vec<String> = trimmed.into_iter().map(toml_quote).collect();
         return Ok(Some(format!("{key} = [{}]", items.join(", "))));
     }
     let line = match key {
@@ -1324,6 +1346,22 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
             Valid
         } else {
             Invalid
+        };
+    }
+    // `extra` is the /dev-path escape — but it's still a `/dev/…` path, not free text. Each comma token
+    // must be a valid `/dev/…` path (shared `is_dev_path`, the same rule the save uses) or a prefix of
+    // `/dev/` mid-typing; a first non-`/` char (`rftre…`) is refused. The resolver does the real
+    // existence/safety check at launch.
+    if key == "extra" {
+        for tok in v.split(',') {
+            if !is_dev_path(tok) && !"/dev/".starts_with(tok) {
+                return Invalid;
+            }
+        }
+        return if is_dev_path(v.rsplit(',').next().unwrap_or("")) {
+            Valid
+        } else {
+            Incomplete // last token still being typed (`/de…`, a trailing comma)
         };
     }
     if let Ok(opt) = profile_line(key, v) {
@@ -2134,9 +2172,19 @@ mod tests {
             ("nice", "-25"),
             ("memory", "1.5g"),
             ("vcpus", "1.2.3"),
+            ("extra", "rftre errte"), // garbage — not a /dev path (the reported bug)
+            ("extra", "/etc/passwd"), // a path, but not under /dev
         ] {
             assert_eq!(field_state(k, v), Invalid, "{k}={v}");
         }
+        // `extra` is a /dev-path list, not free text: a `/dev/…` path is Valid, a prefix Incomplete,
+        // and its Valid values save (shared is_dev_path rule) — no more `rftre errte`.
+        assert_eq!(field_state("extra", "/dev/foo"), Valid);
+        assert_eq!(field_state("extra", "/dev/a,/dev/b"), Valid);
+        assert_eq!(field_state("extra", "/de"), Incomplete); // prefix of /dev/
+        assert_eq!(field_state("extra", "/dev/a,"), Incomplete); // last token mid-typing
+        assert!(profile_line("extra", "/dev/foo").unwrap().is_some());
+        assert!(profile_line("extra", "rftre").is_err());
         // `name`/`extends` route through the SAME dispatcher (not a second validator) — so they get the
         // three-state too and can't drift from validate_profile_name at save.
         assert_eq!(field_state("name", "sensors"), Valid);
