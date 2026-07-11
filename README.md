@@ -467,7 +467,7 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 ## Project status
 
 **0.6.3 — a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (**398 tests**, clippy-clean,
+Everything in [Features](#features) works today and is tested (**419 tests**, clippy-clean,
 `cargo-deny`-clean, security-audited slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem) — the point is a small, fast, honest core. The
 CLI and config surface are **not frozen until 1.0**.
@@ -477,6 +477,13 @@ CLI and config surface are **not frozen until 1.0**.
 pods (`--pod` / `--no-outbound`), and the **Python** binding. `build`/`push` are the newest, deepest
 surface — audited (COPY-from confinement, setuid/opaque hardening) and, where a rootless-overlay
 kernel can't persist an opaque dir, they **fail closed** to a safe path rather than leak.
+
+**New in 0.6.3:** a guided, *"impossible to get wrong"* profile editor in `kern top` (pick the devices
+the host actually exposes; every typed field validated live against the same rule the save uses), and a
+**capability-based device deny-list** for `vgpio:` — a `/dev` node that grants raw memory/storage or
+host control (mem, disks, VFIO/DMA, kvm, HID injection, the console, …) is refused by kernel identity,
+and each bound device is fd-pinned to close a check→mount race. Verified on all four boards, including
+GPU-compute passthrough on the Jetson.
 
 **Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
 overlay networking.
