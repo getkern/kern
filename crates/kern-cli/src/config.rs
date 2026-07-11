@@ -831,8 +831,8 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
         if ft.is_char_device() {
             let rdev = md.rdev();
             let (maj, min) = (libc::major(rdev), libc::minor(rdev));
-            if maj == 1 && matches!(min, 1 | 2 | 4 | 11) {
-                return true; // /dev/mem, /dev/kmem, /dev/port, /dev/kmsg — raw memory / I/O ports
+            if maj == 1 && matches!(min, 1 | 2 | 4 | 11 | 12) {
+                return true; // mem, kmem, port, kmsg, oldmem (12) — raw memory / I/O ports
             }
             if maj == 21 {
                 return true; // /dev/sg* — SCSI generic (raw disk via SG_IO), regardless of its name
@@ -847,14 +847,16 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
         .unwrap_or("");
     // NAME/prefix layer — belt-and-braces over the identity check, and the ONLY guard for the
     // dynamic-major dangerous nodes (their major isn't fixed, so identity-by-major can't catch them).
-    // (2) raw memory · (2b) DAX direct-access (mmap physical NVDIMM) · (4) nvram · (5) kvm · (6) uinput/
-    //     uhid · (7) tun/ppp · (9) fuse · (3) udmabuf (dma-buf) · storage/dm/loop CONTROL char nodes.
+    // (2) raw memory + oldmem · (2b) DAX direct-access · (4) nvram · (5) kvm · (6) uinput/uhid ·
+    //     (7) tun/ppp · (9) fuse · (3) udmabuf · storage/dm/loop CONTROL · (12) host console/VC
+    //     (TIOCSTI keystroke injection): console + tty0..N (VCs) + vcs\* · (13) cuse (register a host cdev).
     if matches!(
         name,
         "mem"
             | "kmem"
             | "port"
             | "kmsg"
+            | "oldmem"
             | "fmem"
             | "mergemem"
             | "nvram"
@@ -867,6 +869,8 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
             | "udmabuf"
             | "loop-control"
             | "btrfs-control"
+            | "console"
+            | "cuse"
     ) {
         return true;
     }
@@ -874,19 +878,20 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
     // (hidraw + hiddev) · (11) mei · (2b) dax\* · storage: NVMe char (nvme0 controller, nvme-generic,
     // nvme-fabrics — all admin/control; the nvme0n1 block namespace is caught by the identity check).
     if [
-        "watchdog", "mtd", "vhost", "vbox", "hidraw", "hiddev", "mei", "dax", "nvme",
+        "watchdog", "mtd", "vhost", "vbox", "hidraw", "hiddev", "mei", "dax", "nvme", "vcs",
     ]
     .iter()
     .any(|p| name.starts_with(p))
     {
-        return true;
+        return true; // …+ vcs\*/vcsa\* (virtual-console memory — read the host console back)
     }
-    // SCSI-generic by name (`sg0`) as a fallback when the node is absent so the identity check can't run
-    // — stem+digits so `sgx_enclave` is not a false positive.
-    if name
-        .strip_prefix("sg")
-        .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
-    {
+    // SCSI-generic (`sg0`) and the VIRTUAL CONSOLES (`tty0..N`) by stem+digits — `sgx_enclave`,
+    // `ttyS0`/`ttyUSB0`/`ttyACM0` (real serial) keep a non-digit tail and are NOT matched.
+    let stem_digits = |stem: &str| {
+        name.strip_prefix(stem)
+            .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if stem_digits("sg") || stem_digits("tty") {
         return true;
     }
     // path-ancestor families: (3) VFIO — ALL layouts incl. the 6.x cdev node /dev/vfio/devices/vfioN ·
@@ -2029,11 +2034,18 @@ mod tests {
             "/dev/udmabuf", // dma-buf from user memory
             "/dev/nvme-generic0", // NVMe admin passthrough (char)
             "/dev/nvme-fabrics", // NVMe-oF connect node (char control)
+            "/dev/console", // host console (TIOCSTI keystroke injection)
+            "/dev/tty0",    // virtual console 0
+            "/dev/tty63",   // a virtual console
+            "/dev/vcs1",    // virtual-console memory
+            "/dev/vcsa1",   // virtual-console memory (attributes)
+            "/dev/oldmem",  // previous kernel's physical RAM (kdump)
+            "/dev/cuse",    // register a host-visible char device from userspace
         ] {
             assert!(is_dangerous_dev(std::path::Path::new(dev)), "{dev} refused");
         }
-        // Legitimate peripherals must NOT be refused; the name rules must not false-positive on SGX or a
-        // device merely starting "sg".
+        // Legitimate peripherals must NOT be refused; the name rules must not false-positive on SGX, a
+        // device merely starting "sg", or SERIAL ttys (vs the virtual consoles tty0..N).
         for dev in [
             "/dev/i2c-1",
             "/dev/null", // major 1 minor 3 — NOT in the raw-memory minor set, allowed
@@ -2042,6 +2054,9 @@ mod tests {
             "/dev/rtc0",
             "/dev/sgx_enclave",     // SGX (not sg+digits) — allowed
             "/dev/bus/usb/001/002", // a SPECIFIC USB device (scoped libusb, like ttyUSB) — allowed
+            "/dev/ttyS0",           // serial — allowed (not tty+pure-digits)
+            "/dev/ttyUSB0",         // USB serial — allowed
+            "/dev/ttyACM0",         // USB CDC serial — allowed
         ] {
             assert!(
                 !is_dangerous_dev(std::path::Path::new(dev)),
