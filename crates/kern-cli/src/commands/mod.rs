@@ -7264,7 +7264,13 @@ fn copy_into_rootfs(
     if src.is_dir() {
         if let Some(ig) = crate::dockerignore::DockerIgnore::load(ctx) {
             let _ = std::fs::create_dir_all(&target);
-            return copy_dir_filtered(&src, &target, ctx, &ig)
+            // Match ignore paths relative to the CANONICAL context root: `src` is already canonicalized,
+            // so a symlinked context path (e.g. `/tmp` -> `/private/tmp`, or a symlinked project dir)
+            // would otherwise make `strip_prefix` fail and silently disable filtering — a fail-OPEN
+            // that would leak the very secrets the ignore file exists to keep out. Falls back to raw
+            // `ctx` only if canonicalize fails (then the walk fails CLOSED on any un-strippable entry).
+            let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
+            return copy_dir_filtered(&src, &target, &ctx_root, &ig)
                 .map_err(|e| Error::Sandbox(format!("COPY '{src_rel}' → '{dst}': {e}")));
         }
     }
@@ -7315,12 +7321,13 @@ fn copy_dir_filtered(
         let path = entry.path();
         let md = std::fs::symlink_metadata(&path)?;
         let ft = md.file_type();
-        // The path RELATIVE TO THE CONTEXT ROOT drives ignore matching (dockerignore is context-relative).
-        let rel = path
-            .strip_prefix(ctx)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        // The path RELATIVE TO THE CONTEXT ROOT drives ignore matching (dockerignore is context-
+        // relative). If it can't be made relative (shouldn't happen — `src` and `ctx` are both
+        // canonical), fail CLOSED (skip) rather than copy an un-vetted file.
+        let Ok(rel) = path.strip_prefix(ctx) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
         let dest = target.join(entry.file_name());
         if ft.is_dir() {
             // Prune a wholly-excluded subtree only when no `!` rule could re-include a descendant.
@@ -7329,17 +7336,18 @@ fn copy_dir_filtered(
             }
             std::fs::create_dir_all(&dest)?;
             copy_dir_filtered(&path, &dest, ctx, ig)?;
+        } else if ig.excluded(&rel) {
+            continue;
         } else if ft.is_symlink() {
-            if ig.excluded(&rel) {
-                continue;
-            }
+            // Recreate the symlink verbatim — NEVER follow it (a `leak -> /host/secret` in the context
+            // must land dangling, its target never read at build time).
             let link = std::fs::read_link(&path)?;
             let _ = std::fs::remove_file(&dest);
             std::os::unix::fs::symlink(&link, &dest)?;
         } else if ft.is_file() {
-            if ig.excluded(&rel) {
-                continue;
-            }
+            // Unlink any pre-existing dest first, so a symlink planted at that path (e.g. by the base
+            // image) can't make `fs::copy` write THROUGH it out of the rootfs — stricter than `cp -a`.
+            let _ = std::fs::remove_file(&dest);
             std::fs::copy(&path, &dest)?;
             std::fs::set_permissions(
                 &dest,
