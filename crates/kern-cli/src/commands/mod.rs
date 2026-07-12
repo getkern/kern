@@ -6448,9 +6448,6 @@ fn build_run(
             Instr::AddUrl { url, dst, checksum } => {
                 announce(step, format!("ADD {url} {dst}"));
                 let dl = work.join(format!("addurl{step}"));
-                let _ = std::fs::remove_dir_all(&dl);
-                std::fs::create_dir_all(&dl)
-                    .map_err(|e| Error::Sandbox(format!("ADD download dir: {e}")))?;
                 let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
                 copy_into_rootfs(&dl, &name, &write_dir, dst, config.workdir.as_deref(), &[])?;
                 i += 1;
@@ -6514,9 +6511,23 @@ fn build_run(
     Ok(())
 }
 
+/// The local filename an `ADD <url>` downloads to: the URL's last path segment minus any
+/// query/fragment. SANITIZED — a URL ending in `/..` or `/.`, an empty segment (bare host), or a
+/// segment bearing a path separator / NUL would let `dir.join(name)` escape the scratch dir (and feed
+/// `..` into the copy as a source), so those fall back to a fixed safe name. Pure, so it's unit-tested.
+fn add_url_basename(url: &str) -> &str {
+    let tail = url.rsplit('/').next().unwrap_or("");
+    let name = tail.split(['?', '#']).next().unwrap_or("");
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        "download"
+    } else {
+        name
+    }
+}
+
 /// Fetch `url` into `dir` for a Dockerfile `ADD <url> <dst>`, returning the basename written. HTTPS
-/// only (`--proto '=https'`) — an `http://` URL is refused rather than silently downgrading build
-/// integrity — via `curl`, matching kern's dependency-free (curl/tar/cp) posture. When `checksum`
+/// only (`--proto '=https'`, incl. redirects) — an `http://` URL is refused rather than silently
+/// downgrading build integrity — via `curl`, matching kern's dependency-free (curl/tar/cp) posture. When `checksum`
 /// (`<algo>:<hex>`) is given it's verified and a mismatch fails the build.
 fn fetch_add_url(
     url: &str,
@@ -6529,13 +6540,24 @@ fn fetch_add_url(
              the file and COPY it)"
         )));
     }
-    // Basename from the URL path, minus any query/fragment; fall back to a fixed name for a bare host.
-    let tail = url.rsplit('/').next().unwrap_or("");
-    let name = tail.split(['?', '#']).next().unwrap_or("");
-    let name = if name.is_empty() { "download" } else { name };
+    // Fresh scratch dir to download into (owned by the caller's `work`); it holds only this file.
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| Error::Sandbox(format!("ADD download dir: {e}")))?;
+    let name = add_url_basename(url);
     let out = dir.join(name);
+    // HTTPS only, on the initial request AND across redirects (`--proto-redir`), so a 302 can't
+    // silently downgrade the fetch to cleartext http.
     let status = std::process::Command::new("curl")
-        .args(["-fSL", "--proto", "=https", "--connect-timeout", "20", "-o"])
+        .args([
+            "-fSL",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--connect-timeout",
+            "20",
+            "-o",
+        ])
         .arg(&out)
         .arg(url)
         .status()
@@ -6785,9 +6807,6 @@ fn build_layered_cached(
                     own_only_dir(&fresh)
                         .map_err(|e| Error::Sandbox(format!("build layer: {e}")))?;
                     let dl = work.join(format!("addurl{unit}"));
-                    let _ = std::fs::remove_dir_all(&dl);
-                    std::fs::create_dir_all(&dl)
-                        .map_err(|e| Error::Sandbox(format!("ADD download dir: {e}")))?;
                     let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
                     copy_into_rootfs(&dl, &name, &fresh, dst, config.workdir.as_deref(), &chain)?;
                     commit_layer(&fresh, &lc, &key)?;
@@ -9442,6 +9461,31 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(&canary);
+    }
+}
+
+#[cfg(test)]
+mod add_url_tests {
+    use super::add_url_basename;
+
+    #[test]
+    fn add_url_basename_is_a_safe_filename() {
+        // Normal cases: the last path segment, query/fragment stripped.
+        assert_eq!(
+            add_url_basename("https://x.io/dl/tool-1.2.3.tar.gz"),
+            "tool-1.2.3.tar.gz"
+        );
+        assert_eq!(add_url_basename("https://x.io/f?token=abc"), "f");
+        assert_eq!(add_url_basename("https://x.io/f#frag"), "f");
+        // Traversal / degenerate segments must NOT escape the scratch dir → fixed safe name.
+        assert_eq!(add_url_basename("https://x.io/.."), "download");
+        assert_eq!(add_url_basename("https://x.io/."), "download");
+        assert_eq!(add_url_basename("https://x.io/"), "download");
+        // A bare host with no path segment yields the host as a (harmless, non-escaping) name.
+        assert_eq!(add_url_basename("https://x.io"), "x.io");
+                                                                  // A separator or NUL smuggled into the last segment (defensive) → safe name.
+        assert_eq!(add_url_basename("https://x.io/a\\b"), "download");
+        assert_eq!(add_url_basename("https://x.io/a\0b"), "download");
     }
 }
 
