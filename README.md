@@ -9,7 +9,7 @@ a single **~1.5 MB** rootless binary, **no daemon**. **Runs everywhere Linux doe
 Windows (via WSL2), and ARM boards** — Raspberry Pi, NVIDIA Jetson, Arduino UNO Q — where Docker won't
 even install. Embed it from Python or Rust, or drive it from the CLI.
 
-**~1.9 ms** cold start (vs **~300 ms** `docker run`) · **~1.5 MB** static binary · **0 RAM at rest** · **rootless**
+**~1.9 ms** cold start (vs **~308 ms** `docker run`) · **~1.5 MB** static binary · **0 RAM at rest** · **rootless**
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -17,7 +17,7 @@ even install. Embed it from Python or Rust, or drive it from the CLI.
 [![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~300 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1.5 MB static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1.5 MB static binary, no daemon.">
 </p>
 
 [Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python)](#embed-it) · [How it works](#how-it-works) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
@@ -54,7 +54,7 @@ print(r.stdout, r.success)                     # → a fresh 1.9 ms box, discard
 
 - ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.5 MB static binary, **one Rust dependency**
   (`libc`) — it shells out to the system's `curl`/`tar` only to *pull* images (running a box needs
-  neither). Cold start **~1.9 ms** vs ~300 ms for `docker run`; **~7 MB** RSS per box vs an always-on
+  neither). Cold start **~1.9 ms** vs ~308 ms for `docker run`; **~7 MB** RSS per box vs an always-on
   ~186 MB daemon (`dockerd` + `containerd`). `kern ps` reads state straight from the kernel.
 - 👤 **Rootless by default.** Unprivileged user namespaces — your uid maps to root *inside* the box,
   and only there. Single-uid is the default and is `libc`-pure (no helper, smallest id surface);
