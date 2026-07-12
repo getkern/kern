@@ -68,13 +68,19 @@ impl DockerIgnore {
             if body.is_empty() {
                 continue;
             }
+            // Collapse redundant separators (`foo///bar` == `foo/bar`) by dropping empty segments.
+            let segs: Vec<String> = body
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if segs.is_empty() {
+                continue;
+            }
             if negated {
                 has_negation = true;
             }
-            rules.push(Rule {
-                negated,
-                segs: body.split('/').map(str::to_string).collect(),
-            });
+            rules.push(Rule { negated, segs });
         }
         DockerIgnore {
             rules,
@@ -222,6 +228,21 @@ mod tests {
         assert!(i.can_prune_dir(".git")); // no negations → prunable
         let j = ig(".git\n!.git/keep\n");
         assert!(!j.can_prune_dir(".git")); // a negation exists → must descend
+    }
+
+    #[test]
+    fn redundant_slashes_and_degenerate_lines() {
+        // Redundant separators collapse (`foo///bar` == `foo/bar`); a `///`/`!`/`#`-only line makes
+        // no rule (and must not panic or match everything).
+        let i = ig("//foo///bar//\n");
+        assert!(i.excluded("foo/bar"));
+        assert!(i.excluded("foo/bar/x"));
+        let j = ig("///\n!\n#\n   \n");
+        assert!(!j.excluded("anything"));
+        // `**` in the middle, and a single-`*` segment matching exactly one path segment.
+        assert!(ig("foo/**/bar\n").excluded("foo/x/y/bar"));
+        assert!(ig("a/*/c\n").excluded("a/b/c"));
+        assert!(!ig("a/*/c\n").excluded("a/b/x/c"));
     }
 
     #[test]
