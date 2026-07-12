@@ -99,6 +99,11 @@ pub struct ComposeBox {
     /// the profile-less services. Empty = always active. `parse` drops inactive services from the
     /// returned set (with a warning) so a profiled service can never be started by accident.
     pub profiles: Vec<String>,
+    /// Network aliases from a service's `networks.<net>.aliases` — extra names the service is reachable
+    /// by inside the stack pod (Docker gives each service DNS for its aliases). `kern compose` adds
+    /// each to the pod's shared `/etc/hosts` (→ `127.0.0.1`), so a peer that connects to an alias
+    /// resolves it exactly like the service name. Empty for the common (no-alias) case.
+    pub net_aliases: Vec<String>,
 }
 
 impl ComposeBox {

@@ -8218,6 +8218,14 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
         if !status.success() {
             return Err(Error::Compose(format!("box '{}' failed to start", b.name)));
         }
+        // Register this service's `networks.*.aliases` in the pod's shared /etc/hosts (→ 127.0.0.1),
+        // so a peer that connects by ALIAS resolves it like the service name. Done after the box joins
+        // (which seeds its own name) and in start order, so later-started dependents already see it.
+        if use_pod && !b.net {
+            for alias in &b.net_aliases {
+                crate::pod::add_member(&pod, alias)?;
+            }
+        }
     }
     println!(
         "compose up: {} box(es) started. track with `kern ps`.",
