@@ -5511,6 +5511,17 @@ fn resolve_image_depth(image: &str, depth: u32) -> Result<(String, kern_oci::Ima
         ));
     }
     let cache = cache_dir();
+    // `scratch` is Docker's reserved EMPTY base (no layers, empty config): materialize a shared empty
+    // directory as the overlay lower so `FROM scratch` builds — the standard base for minimal images
+    // (a single static binary, distroless-style, sentry's `FROM scratch AS odiff-*`).
+    if image == "scratch" {
+        let empty = cache.join(".scratch-empty");
+        own_only_dir(&empty).map_err(|e| Error::Oci(format!("scratch base: {e}")))?;
+        return Ok((
+            empty.to_string_lossy().into_owned(),
+            kern_oci::ImageConfig::default(),
+        ));
+    }
     let safe = sanitize_ref(image);
     // A cache-built (multi-layer) image: `<tag>.layers` = base ref, then one layer key per line.
     let layers_file = cache.join(format!("{safe}.layers"));
