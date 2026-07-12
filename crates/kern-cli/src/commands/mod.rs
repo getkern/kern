@@ -6434,6 +6434,23 @@ fn build_run(
                 }
                 i += 1;
             }
+            Instr::AddUrl { url, dst, checksum } => {
+                announce(step, format!("ADD {url} {dst}"));
+                let dl = work.join(format!("addurl{step}"));
+                let _ = std::fs::remove_dir_all(&dl);
+                std::fs::create_dir_all(&dl)
+                    .map_err(|e| Error::Sandbox(format!("ADD download dir: {e}")))?;
+                let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
+                copy_into_rootfs(&dl, &name, &write_dir, dst, config.workdir.as_deref(), &[])?;
+                i += 1;
+            }
+            Instr::WriteFile { content, dst } => {
+                announce(step, format!("COPY (inline heredoc) {dst}"));
+                let dl = work.join(format!("inline{step}"));
+                write_inline_file(&dl, content)?;
+                copy_into_rootfs(&dl, "f", &write_dir, dst, config.workdir.as_deref(), &[])?;
+                i += 1;
+            }
             Instr::Env(k, v) => {
                 set_config_env(&mut config.env, k, v);
                 i += 1;
@@ -6483,6 +6500,88 @@ fn build_run(
     write_image_config(&cache.join(format!("{safe}.image")), &config);
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
     announce_built(tag);
+    Ok(())
+}
+
+/// Fetch `url` into `dir` for a Dockerfile `ADD <url> <dst>`, returning the basename written. HTTPS
+/// only (`--proto '=https'`) — an `http://` URL is refused rather than silently downgrading build
+/// integrity — via `curl`, matching kern's dependency-free (curl/tar/cp) posture. When `checksum`
+/// (`<algo>:<hex>`) is given it's verified and a mismatch fails the build.
+fn fetch_add_url(
+    url: &str,
+    checksum: Option<&str>,
+    dir: &std::path::Path,
+) -> Result<String, Error> {
+    if !url.starts_with("https://") {
+        return Err(Error::Sandbox(format!(
+            "ADD {url}: only https:// URLs are fetched (http is refused; download over TLS or vendor \
+             the file and COPY it)"
+        )));
+    }
+    // Basename from the URL path, minus any query/fragment; fall back to a fixed name for a bare host.
+    let tail = url.rsplit('/').next().unwrap_or("");
+    let name = tail.split(['?', '#']).next().unwrap_or("");
+    let name = if name.is_empty() { "download" } else { name };
+    let out = dir.join(name);
+    let status = std::process::Command::new("curl")
+        .args(["-fSL", "--proto", "=https", "--connect-timeout", "20", "-o"])
+        .arg(&out)
+        .arg(url)
+        .status()
+        .map_err(|e| Error::Sandbox(format!("ADD {url}: curl: {e}")))?;
+    if !status.success() {
+        return Err(Error::Sandbox(format!("ADD {url}: download failed")));
+    }
+    if let Some(cs) = checksum {
+        verify_download_checksum(&out, cs)?;
+    }
+    Ok(name.to_string())
+}
+
+/// Write an inline `COPY <<heredoc` body to a scratch file `dir/f` (a fresh dir), so the same
+/// confined `copy_into_rootfs` path that a real COPY uses places it at the destination. Returns the
+/// scratch dir ready with the single file `f`.
+fn write_inline_file(dir: &std::path::Path, content: &str) -> Result<(), Error> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| Error::Sandbox(format!("inline COPY dir: {e}")))?;
+    std::fs::write(dir.join("f"), content)
+        .map_err(|e| Error::Sandbox(format!("inline COPY write: {e}")))?;
+    Ok(())
+}
+
+/// Verify a downloaded file against a BuildKit `--checksum=<algo>:<hex>` using coreutils
+/// `sha{256,384,512}sum`. A malformed spec, unsupported algorithm, or digest mismatch fails the build.
+fn verify_download_checksum(path: &std::path::Path, checksum: &str) -> Result<(), Error> {
+    let (algo, want) = checksum.split_once(':').ok_or_else(|| {
+        Error::Sandbox(format!(
+            "ADD --checksum must be '<algo>:<hex>' (e.g. sha256:…), got '{checksum}'"
+        ))
+    })?;
+    let tool = match algo {
+        "sha256" => "sha256sum",
+        "sha384" => "sha384sum",
+        "sha512" => "sha512sum",
+        other => {
+            return Err(Error::Sandbox(format!(
+                "ADD --checksum: unsupported algorithm '{other}' (use sha256/sha384/sha512)"
+            )))
+        }
+    };
+    let out = std::process::Command::new(tool)
+        .arg("--")
+        .arg(path)
+        .output()
+        .map_err(|e| Error::Sandbox(format!("ADD --checksum: {tool}: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Sandbox(format!("ADD --checksum: {tool} failed")));
+    }
+    let got = String::from_utf8_lossy(&out.stdout);
+    let got = got.split_whitespace().next().unwrap_or("");
+    if !got.eq_ignore_ascii_case(want) {
+        return Err(Error::Sandbox(format!(
+            "ADD checksum mismatch: expected {algo}:{want}, got {algo}:{got}"
+        )));
+    }
     Ok(())
 }
 
@@ -6645,6 +6744,71 @@ fn build_layered_cached(
                     for s in srcs {
                         copy_into_rootfs(ctx, s, &fresh, dst, config.workdir.as_deref(), &chain)?;
                     }
+                    commit_layer(&fresh, &lc, &key)?;
+                    unit += 1;
+                }
+                chain.push(lc.join(&key).to_string_lossy().into_owned());
+                layer_keys.push(key.clone());
+                i += 1;
+            }
+            Instr::AddUrl { url, dst, checksum } => {
+                // Key on url + checksum + dst: with a `--checksum` this layer is fully
+                // content-addressed; without one, the URL string identifies it (a changed remote
+                // won't bust the cache — the documented BuildKit behaviour, so pin with --checksum).
+                key = layer_key(
+                    &key,
+                    &format!(
+                        "ADDURL\u{0}{url}\u{0}{}\u{0}{dst}\u{0}WD\u{0}{}",
+                        checksum.as_deref().unwrap_or(""),
+                        config.workdir.as_deref().unwrap_or(""),
+                    ),
+                );
+                let hit = layer_cached(&lc, &key);
+                announce(
+                    step,
+                    format!("ADD {url} {dst}{}", if hit { " (cached)" } else { "" }),
+                );
+                if !hit {
+                    let fresh = work.join(format!("u{unit}"));
+                    let _ = std::fs::remove_dir_all(&fresh);
+                    own_only_dir(&fresh)
+                        .map_err(|e| Error::Sandbox(format!("build layer: {e}")))?;
+                    let dl = work.join(format!("addurl{unit}"));
+                    let _ = std::fs::remove_dir_all(&dl);
+                    std::fs::create_dir_all(&dl)
+                        .map_err(|e| Error::Sandbox(format!("ADD download dir: {e}")))?;
+                    let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
+                    copy_into_rootfs(&dl, &name, &fresh, dst, config.workdir.as_deref(), &chain)?;
+                    commit_layer(&fresh, &lc, &key)?;
+                    unit += 1;
+                }
+                chain.push(lc.join(&key).to_string_lossy().into_owned());
+                layer_keys.push(key.clone());
+                i += 1;
+            }
+            Instr::WriteFile { content, dst } => {
+                // Content-addressed: the full body is folded into the layer key (layer_key hashes its
+                // whole repr), so editing the heredoc busts the cache.
+                key = layer_key(
+                    &key,
+                    &format!(
+                        "WRITEFILE\u{0}{dst}\u{0}WD\u{0}{}\u{0}{content}",
+                        config.workdir.as_deref().unwrap_or(""),
+                    ),
+                );
+                let hit = layer_cached(&lc, &key);
+                announce(
+                    step,
+                    format!("COPY (inline) {dst}{}", if hit { " (cached)" } else { "" }),
+                );
+                if !hit {
+                    let fresh = work.join(format!("u{unit}"));
+                    let _ = std::fs::remove_dir_all(&fresh);
+                    own_only_dir(&fresh)
+                        .map_err(|e| Error::Sandbox(format!("build layer: {e}")))?;
+                    let dl = work.join(format!("inline{unit}"));
+                    write_inline_file(&dl, content)?;
+                    copy_into_rootfs(&dl, "f", &fresh, dst, config.workdir.as_deref(), &chain)?;
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
                 }
