@@ -427,7 +427,8 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 
 - a hard boundary against **actively hostile multi-tenant** code → a **microVM** (Firecracker) or gVisor. kern's FS/PID/namespace/cgroup isolation is a real kernel boundary for *your own or semi-trusted* code, not a VM;
 - the **Docker Engine API / Docker Desktop** workflow, or a true CLI drop-in → **Docker / Podman**;
-- **Kubernetes CRI** integration → containerd / CRI-O.
+- **Kubernetes CRI** integration → containerd / CRI-O;
+- a **low-level OCI runtime** to slot *under* containerd/podman (the runc layer) → **crun**, **youki** (also Rust), or runc. kern isn't a runc-replacement — it's the *whole* daemonless UX (pull, build, run, compose) in one binary, not a runtime another engine drives.
 
 kern states every boundary that is cooperative or opt-in plainly in **[SECURITY.md](SECURITY.md)** — being honest about the edges is the point.
 
