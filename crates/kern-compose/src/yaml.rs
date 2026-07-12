@@ -1212,6 +1212,24 @@ fn split_top_commas(s: &str) -> Vec<String> {
 }
 
 /// A list value for a compose key: either the inline `[…]` scalar or the block `- ` items.
+/// Collect `networks.<net>.aliases` across every network of a service's `networks:` node (the map
+/// form `networks: {net: {aliases: [db, …]}}`). The list form (`networks: [net]`) has no aliases →
+/// empty. Order-stable and de-duplicated.
+fn collect_net_aliases(networks: &Node) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_net, def) in &networks.children {
+        if let Some(aliases) = def.child("aliases") {
+            for a in list_value(aliases) {
+                let a = a.trim().to_string();
+                if !a.is_empty() && !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn list_value(node: &Node) -> Vec<String> {
     if let Some(sc) = &node.scalar {
         if sc.trim_start().starts_with('[') {
@@ -1359,8 +1377,16 @@ fn service_to_box(
             // flags, and Docker rootless famously IGNORES them without cgroup-v2+systemd, so this is a
             // place kern is *stronger*, not weaker. A silently-dropped cap is worse than a visible gap.
             "deploy" => apply_deploy(&mut b, node, name),
-            "networks" | "configs" | "labels" | "logging" | "expose" | "extends" | "init"
-            | "stdin_open" | "tty" | "domainname" => {
+            // `networks:` itself is ignored (kern uses a shared-netns pod, not per-network bridges),
+            // but a service's `networks.<net>.aliases` ARE honoured: each alias is another name the
+            // service answers to inside the pod, so we collect them for `kern compose` to add to the
+            // shared /etc/hosts. The map form (`networks: {net: {aliases: [db]}}`) carries them; the
+            // list form (`networks: [net]`) has none.
+            "networks" => {
+                b.net_aliases = collect_net_aliases(node);
+            }
+            "configs" | "labels" | "logging" | "expose" | "extends" | "init" | "stdin_open"
+            | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
             other => warn(&format!(
@@ -3176,6 +3202,25 @@ services:
         // stack still comes up. A normal `- K=v` alongside it is unaffected.
         let b = parse("services:\n  w:\n    image: alpine\n    environment:\n      - MYSQL_DATABASE: nextcloud\n      - NORMAL=ok\n").unwrap();
         assert_eq!(b[0].env, vec!["MYSQL_DATABASE=nextcloud", "NORMAL=ok"]);
+    }
+
+    #[test]
+    fn network_aliases_are_collected_map_form_only() {
+        // The map form `networks: {net: {aliases: [db]}}` yields the aliases; the list form has none.
+        // (kern ignores the network itself — shared-netns pod — but honours the alias names so a peer
+        // can reach the service by alias too.)
+        let y = "services:\n  postgres:\n    image: x\n    networks:\n      usbim:\n        aliases:\n          - db\n          - primary\n  rest:\n    image: y\n    networks:\n      - usbim\n";
+        let b = parse(y).unwrap();
+        assert_eq!(
+            b.iter().find(|x| x.name == "postgres").unwrap().net_aliases,
+            vec!["db", "primary"]
+        );
+        assert!(b
+            .iter()
+            .find(|x| x.name == "rest")
+            .unwrap()
+            .net_aliases
+            .is_empty());
     }
 
     #[test]
