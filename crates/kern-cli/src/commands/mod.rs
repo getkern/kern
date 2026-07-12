@@ -1529,11 +1529,14 @@ fn prepare_vdisk(
             vd.name
         );
     }
-    // The tmpfs is RAM-backed, so `size` counts against RAM — bound a large one with `--memory`.
+    // The tmpfs is RAM-backed, so `size` counts against RAM (correctly charged to the box's memory
+    // cgroup — a write past `--memory` OOM-kills the box, exit 137; verified) AND its data is
+    // EPHEMERAL — gone when the box exits. Say both, so a large scratch isn't mistaken for a disk.
     if vd.size.is_some_and(|b| b >= 1 << 30) {
         eprintln!(
-            "kern: vdisk:{} is RAM-backed (tmpfs) rootless — its size counts against RAM; pair a \
-             large vdisk with --memory (or run a foreground box as root for the ext4 backend)",
+            "kern: vdisk:{} is RAM-backed (tmpfs) rootless — its data is EPHEMERAL (gone when the box \
+             exits) and its size counts against RAM; pair a large vdisk with --memory (or run a \
+             foreground box as root for the persistent ext4 backend)",
             vd.name
         );
     }
