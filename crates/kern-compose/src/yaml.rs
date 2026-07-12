@@ -38,17 +38,21 @@ const MAX_ANCHOR_NODES: usize = 10_000;
 /// YAML vs TOML first). The `yaml` module itself is private, so this was never externally reachable —
 /// the narrower marker just says so.
 pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
+    // Fold multi-line block scalars (`|`/`>`) and multi-line flow collections onto single logical lines
+    // first, so the rest of the pipeline stays line-at-a-time (block-scalar bodies become opaque values).
+    let folded = fold_multiline(text)?;
+
     // Refuse structural YAML we deliberately don't support, BEFORE any parsing — so a billion-laughs
     // or a tab-indented file fails fast with a clear reason, never reaches the line scanner.
-    prescreen(text)?;
+    prescreen(&folded)?;
 
     // Interpolate `${VAR}` / `${VAR:-default}` at the DOCUMENT level, like Docker — so it works
     // everywhere (ports, command, volumes, environment, build.args), not just in a couple of fields. A
     // per-field pass would miss `ports: ["${PORT}:80"]`; Docker substitutes over the whole file before
     // parsing, and so do we. Unset with no default → empty + warn (Docker semantics), never a literal
     // `${VAR}` left to confuse a downstream tool.
-    let text = interpolate_document(text);
-    let text = text.as_str();
+    let interpolated = interpolate_document(&folded);
+    let text = interpolated.as_str();
 
     let lines = lex(text)?;
     let mut root = build_tree(&lines)?;
@@ -199,6 +203,180 @@ fn any_profile_active(profiles: &[String]) -> bool {
     profiles.iter().any(|p| set.contains(&p.as_str()))
 }
 
+/// Private newline sentinel. A folded block scalar keeps its line breaks in a SINGLE-line value as
+/// U+0001, decoded back to `\n` by [`scalar_str`]. This keeps block scalars inside the one-line-per-node
+/// model without losing real newlines (the verbatim unquoting never expands a `\n` escape), and marks
+/// a line as an opaque scalar so prescreen/lex don't scan its shell-script bytes as YAML structure.
+const BLOCK_NL: char = '\u{1}';
+
+/// Fold the multi-line YAML the line scanner can't span, before prescreen/lex:
+///  * BLOCK SCALARS — `key: |`/`>` and the list form `- |`/`- >` (with `-`/`+`/indent indicators): the
+///    indented body becomes ONE value; `|` (literal) keeps line breaks as [`BLOCK_NL`], `>` (folded)
+///    joins with spaces; trailing blank lines are clipped. Comments inside the body are LITERAL (a `#`
+///    in a shell script is kept), so the body lines are taken raw.
+///  * MULTI-LINE FLOW — `key: [ … ]` / `{ … }` (or `- [ … ]`) spanning lines: joined onto one line.
+///
+/// Each consumed line is emitted BLANK so downstream error line numbers stay exact.
+fn fold_multiline(text: &str) -> Result<String, String> {
+    if text.contains(BLOCK_NL) {
+        return Err("control character U+0001 is not allowed in a compose file".into());
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
+        let code = split_at_comment(raw).0;
+        let indent = code.len() - code.trim_start_matches(' ').len();
+
+        // Block scalar: gather the indented body (raw — comments literal) until a dedent.
+        if let Some((prefix, folded)) = block_intro(code) {
+            let mut body: Vec<String> = Vec::new();
+            let mut base: Option<usize> = None;
+            let mut j = i + 1;
+            while j < lines.len() {
+                let l = lines[j];
+                if l.trim().is_empty() {
+                    body.push(String::new());
+                    j += 1;
+                    continue;
+                }
+                let li = l.len() - l.trim_start_matches(' ').len();
+                if li <= indent {
+                    break;
+                }
+                let b = *base.get_or_insert(li);
+                body.push(l[b.min(l.len())..].to_string());
+                j += 1;
+            }
+            while body.last().is_some_and(String::is_empty) {
+                body.pop(); // clip trailing blanks (default/`-` chomp — enough for compose)
+            }
+            let sep = if folded {
+                " ".to_string()
+            } else {
+                BLOCK_NL.to_string()
+            };
+            out.push(format!("{prefix}{}", body.join(&sep)));
+            for _ in (i + 1)..j {
+                out.push(String::new());
+            }
+            i = j;
+            continue;
+        }
+
+        // Multi-line flow collection on the SAME line: join until the brackets balance.
+        if let Some((prefix, first)) = flow_intro(code) {
+            let mut acc = first;
+            let mut j = i;
+            while !brackets_balanced(acc.trim()) && j + 1 < lines.len() {
+                j += 1;
+                acc.push(' ');
+                acc.push_str(split_at_comment(lines[j]).0.trim());
+            }
+            out.push(format!("{prefix}{acc}"));
+            for _ in (i + 1)..=j {
+                out.push(String::new());
+            }
+            i = j + 1;
+            continue;
+        }
+
+        // A bare `key:` whose value is a FLOW collection on the FOLLOWING line(s) — `command:` then an
+        // indented `["postgres"]`. Fold it up (only a pure flow value with no top-level `:`, so a real
+        // nested mapping/sequence is untouched).
+        if let Some(prefix) = key_only(code) {
+            let mut k = i + 1;
+            while k < lines.len() && lines[k].trim().is_empty() {
+                k += 1;
+            }
+            if let Some(nl) = lines.get(k) {
+                let nc = split_at_comment(nl).0;
+                let ni = nc.len() - nc.trim_start_matches(' ').len();
+                let nv = nc.trim();
+                if ni > indent
+                    && (nv.starts_with('[') || nv.starts_with('{'))
+                    && colon_index(nc).is_none()
+                {
+                    let mut acc = nv.to_string();
+                    let mut j = k;
+                    while !brackets_balanced(acc.trim()) && j + 1 < lines.len() {
+                        j += 1;
+                        acc.push(' ');
+                        acc.push_str(split_at_comment(lines[j]).0.trim());
+                    }
+                    out.push(format!("{prefix}{acc}"));
+                    for _ in (i + 1)..=j {
+                        out.push(String::new());
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        out.push(raw.to_string());
+        i += 1;
+    }
+    Ok(out.join("\n"))
+}
+
+/// A block-scalar introducer → (line prefix up to & including the `key:`/`- ` marker, is-folded `>`).
+fn block_intro(code: &str) -> Option<(String, bool)> {
+    let indicator = |v: &str| -> Option<bool> {
+        let mut c = v.chars();
+        let folded = match c.next()? {
+            '|' => false,
+            '>' => true,
+            _ => return None,
+        };
+        c.all(|ch| ch == '-' || ch == '+' || ch.is_ascii_digit())
+            .then_some(folded)
+    };
+    if let Some(ci) = colon_index(code) {
+        if let Some(f) = indicator(code[ci + 1..].trim()) {
+            return Some((format!("{}: ", &code[..ci]), f));
+        }
+    }
+    let trimmed = code.trim_start();
+    let indent = &code[..code.len() - trimmed.len()];
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        if let Some(f) = indicator(rest.trim()) {
+            return Some((format!("{indent}- "), f));
+        }
+    }
+    None
+}
+
+/// A bare `key:` (no inline value) → its `"key: "` prefix, for folding a following-line value onto it.
+fn key_only(code: &str) -> Option<String> {
+    let ci = colon_index(code)?;
+    code[ci + 1..]
+        .trim()
+        .is_empty()
+        .then(|| format!("{}: ", &code[..ci]))
+}
+
+/// A value that opens a flow collection `[`/`{` unbalanced on its line → (prefix, opening fragment).
+fn flow_intro(code: &str) -> Option<(String, String)> {
+    let opens = |v: &str| (v.starts_with('[') || v.starts_with('{')) && !brackets_balanced(v);
+    if let Some(ci) = colon_index(code) {
+        let v = code[ci + 1..].trim();
+        if opens(v) {
+            return Some((format!("{}: ", &code[..ci]), v.to_string()));
+        }
+    }
+    let trimmed = code.trim_start();
+    let indent = &code[..code.len() - trimmed.len()];
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        let v = rest.trim();
+        if opens(v) {
+            return Some((format!("{indent}- "), v.to_string()));
+        }
+    }
+    None
+}
+
 /// Reject structural YAML we don't support, up front, with a precise reason. This is the billion-laughs
 /// / tab-indent / multi-doc guard — cheaper and safer than parsing-then-detecting.
 fn prescreen(text: &str) -> Result<(), String> {
@@ -232,13 +410,16 @@ fn prescreen(text: &str) -> Result<(), String> {
             ));
         }
         seen_content = true;
+        // A folded block scalar (`fold_multiline` marked it with U+0001) is an OPAQUE value — its bytes
+        // are shell-script text, not YAML structure. Skip every value-scanning check for it.
+        if line.contains(BLOCK_NL) {
+            continue;
+        }
         // Block-level anchors (`key: &c`), aliases (`key: *c`) and merge keys (`<<: *c` / `<<: [*a,*b]`)
         // ARE supported — `resolve_anchors` expands them after the tree is built, under a hard node
         // budget (`MAX_ANCHOR_NODES`) that defuses the billion-laughs bomb the old refusal guarded
         // against. Only anchors/aliases nested INSIDE a flow collection (`[*x]`, `{k: *x}`) remain
         // unsupported — `line_has_inline_anchor` below still refuses those.
-        //
-        // Block scalars — the `|`/`>` at value position introduces multi-line text we don't parse.
         if let Some(v) = value_after_colon(line) {
             let vt = v.trim();
             if vt == "|"
@@ -264,8 +445,10 @@ fn prescreen(text: &str) -> Result<(), String> {
                 "line {ln}: YAML anchors/aliases not supported (rewrite the value inline)"
             ));
         }
-        // Explicit type tags.
-        if t.contains("!!") {
+        // Explicit type tags (`!!str`, `!!float`, …) — refuse ONLY when the tag is at value position
+        // (right after `key:`), not when `!!` appears inside a value's text (a `WARNING!!!` in a shell
+        // command, an image tag, …), which is a plain scalar and perfectly fine.
+        if value_after_colon(line).is_some_and(|v| v.trim_start().starts_with("!!")) {
             return Err(format!("line {ln}: YAML type tags (`!!`) not supported"));
         }
         // Unbalanced inline collection at value position — a `[` / `{` that doesn't close on the same
@@ -459,7 +642,13 @@ fn lex(text: &str) -> Result<Vec<Line>, String> {
         if raw.trim() == "---" || raw.trim() == "..." {
             continue; // document markers (prescreen already bounded to the first doc)
         }
-        let stripped = strip_comment_precise(raw);
+        // A folded block scalar carries literal `#`s (shell comments) inside its U+0001-joined body —
+        // do NOT run the comment scanner over it, or the body would be truncated at the first `#`.
+        let stripped = if raw.contains(BLOCK_NL) {
+            raw.to_string()
+        } else {
+            strip_comment_precise(raw)
+        };
         if stripped.trim().is_empty() {
             continue;
         }
@@ -805,7 +994,8 @@ fn strip_quotes(s: &str) -> &str {
 
 /// A scalar value as an owned, unquoted string.
 fn scalar_str(s: &str) -> String {
-    strip_quotes(s.trim()).to_string()
+    // Decode a folded block scalar's U+0001 line-break sentinel back to a real newline.
+    strip_quotes(s.trim()).replace(BLOCK_NL, "\n")
 }
 
 /// Parse a YAML inline table `{k: v, k2: {…}, k3: [a, b]}` into a [`Node`] with `children`. Values that
@@ -2558,6 +2748,35 @@ services:
             parse(&y).is_err(),
             "billion-laughs must be refused by the node budget"
         );
+    }
+
+    #[test]
+    fn block_scalar_literal_list_form_keeps_newlines() {
+        // Apache Airflow's form: a `- |` list-item block scalar carrying a multi-line shell script,
+        // whose `#` comments are LITERAL and whose line breaks are preserved.
+        let y = "services:\n  a:\n    image: alpine\n    command:\n      - -c\n      - |\n        echo one   # not a yaml comment\n        echo two\n";
+        let c = &boxes(y)[0].command;
+        assert_eq!(c[0], "-c");
+        assert_eq!(
+            c[1], "echo one   # not a yaml comment\necho two",
+            "literal | keeps newlines and inline #"
+        );
+    }
+
+    #[test]
+    fn block_scalar_folded_joins_with_spaces() {
+        let y = "services:\n  a:\n    image: alpine\n    command: >\n      echo\n      hello\n      world\n";
+        // folded `>` → one line; a scalar command is wrapped in `sh -c`.
+        assert_eq!(boxes(y)[0].command, ["sh", "-c", "echo hello world"]);
+    }
+
+    #[test]
+    fn multi_line_flow_and_following_line_flow_value() {
+        // Sentry's forms: a `[ … ]` split across lines, and a flow value on the line AFTER the key.
+        let a = "services:\n  a:\n    image: alpine\n    command: [\n      \"postgres\",\n      \"-c\",\n    ]\n";
+        assert_eq!(boxes(a)[0].command, ["postgres", "-c"]);
+        let b = "services:\n  a:\n    image: alpine\n    command:\n      [\"postgres\"]\n";
+        assert_eq!(boxes(b)[0].command, ["postgres"]);
     }
 
     #[test]
