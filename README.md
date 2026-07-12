@@ -457,23 +457,22 @@ travel off-argv. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Performance
 
-One isolated `/bin/true`, warm image cache, one box per run. The x86_64 row is **re-measured on an
-Intel i7-14700KF, Linux 6.17**, pinned to a P-core to isolate the hybrid P/E-core scheduler (an
-`/bin/true` box that lands on an E-core runs ~2.1 ms — same class): median of 200 (kern) / 20 (engines)
-sequential runs. kern here: **median 1.7 ms, avg 1.9 ms, best 1.6 ms** (~1.9 ms unpinned/typical). Your
-numbers vary with hardware and load. Board rows are from on-device runs; full method in
-**[BENCHMARKS.md](BENCHMARKS.md)**.
+One isolated `/bin/true`, warm image cache, one box per run. The x86_64 comparison is the **28-core,
+Linux 6.17, NVMe, systemd-user** host in **[BENCHMARKS.md](BENCHMARKS.md)** (exact per-runtime commands
+there). kern's figure is corroborated on a second machine — an **Intel i7-14700KF** — where a P-core-pinned
+`/bin/true` box runs **median 1.7 ms, avg 1.9 ms, best 1.6 ms** (an E-core lands ~2.1 ms, same class). Your
+numbers vary with hardware and load; board rows are from on-device runs.
 
 | host | kernel | **kern** | bubblewrap | crun | runc | podman | docker |
 |---|---|---:|---:|---:|---:|---:|---:|
-| x86_64 desktop | 6.17 | **1.9 ms** | 3.2 ms | 5.2 ms\* | 16 ms | ~300 ms | ~307 ms |
+| x86_64 desktop | 6.17 | **1.9 ms** | 2.6 ms | 5.2 ms | 12.2 ms | 155 ms | 308 ms |
 | Jetson Orin Nano | 5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
 | Raspberry Pi 5 | 6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Arduino UNO Q | **6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
 
-✗ = not installed (nor readily installable) on that board · \* crun not installed on this host, figure
-from BENCHMARKS.md. On the **Pi 5, kern is the only runtime present at all** — one ~1.5 MB static binary
-just works where the others are each a setup step (Docker alone is a ~186 MB daemon stack).
+✗ = not installed (nor readily installable) on that board. On the **Pi 5, kern is the only runtime
+present at all** — one ~1.5 MB static binary just works where the others are each a setup step (Docker
+alone is a ~186 MB daemon stack).
 
 kern is the fastest sandbox here at **~1.9 ms** (ahead of bubblewrap). Its *own* box setup is **~1 ms**
 (the `KERN_TIMING` phases — `unshare` + overlay + `/dev` + pivot + seccomp, each sub-ms); the rest is
@@ -481,7 +480,7 @@ process start + teardown. Adding a hard cgroup cap (the row above doesn't) bring
 **~4 ms of that is external `systemd-run` + D-Bus scope creation, not kern** (`systemd-run --user --scope
 -- true` alone is ~4 ms), opt-out with `KERN_NO_SCOPE` (back to ~1.9 ms, best-effort in-process cgroup). The
 top tier is all within a few ms — *nobody* wins single-shot latency outright. The real gap is to the
-**engines**: **~120–150× faster** than podman/Docker (~300 ms), which round-trip a daemon every run — yet
+**engines**: **~80–160× faster** than podman (~155 ms) / Docker (~308 ms), which round-trip a daemon every run — yet
 kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start: **~500 boxes/s**, **~7 MB**
 RSS/box, **0 resident** (Docker keeps ~186 MB resident before you run anything).
 
