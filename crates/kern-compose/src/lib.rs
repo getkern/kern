@@ -255,6 +255,10 @@ impl ComposeBox {
 /// long tail — see `yaml::parse`). Auto-detect is deliberate: the two grammars are unambiguous at the
 /// first non-comment line (`[` opens a TOML table; a bare `key:` opens a YAML mapping).
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
+    // Strip a leading UTF-8 BOM (Windows editors add one) so the first key/table header is recognized
+    // — Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
+    // "has no services".
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if is_yaml(text) {
         yaml::parse(text)
     } else {

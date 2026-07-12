@@ -60,6 +60,9 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     // DRY pattern real compose files use — under a hard node budget (billion-laughs-safe). After this,
     // the tree holds only concrete values.
     resolve_anchors(&mut root)?;
+    // Resolve `extends:` (a service inheriting another service's fields) — a real Compose feature the
+    // `x-`/anchor pattern doesn't cover, since it references another SERVICE by name. Same-file only.
+    resolve_extends(&mut root)?;
 
     // Top level must have `services:`. `volumes:`/`networks:`/`version:`/`name:` are recognized;
     // everything else at the top is warned and ignored.
@@ -967,6 +970,105 @@ fn apply_anchors(
     Ok(())
 }
 
+/// Resolve Compose `extends:` — a service inheriting another service's fields. Same-file only
+/// (`extends: base` or `extends: {service: base}`); a `{file: …}` cross-file extends is a clear error
+/// (inline the service instead). Merge is SHALLOW and the extending service WINS on a key conflict —
+/// the same rule kern uses for `<<` merge — resolved transitively (A extends B extends C) with a
+/// cycle guard.
+fn resolve_extends(root: &mut Node) -> Result<(), String> {
+    let Some(si) = root.children.iter().position(|(k, _)| k == "services") else {
+        return Ok(());
+    };
+    let names: Vec<String> = root.children[si]
+        .1
+        .children
+        .iter()
+        .map(|(k, _)| k.clone())
+        .collect();
+    for name in &names {
+        resolve_service_extends(&mut root.children[si].1, name, &mut Vec::new())?;
+    }
+    Ok(())
+}
+
+/// The target service name of an `extends` node: the scalar short form, or the `service:` key of the
+/// map form. A `file:` key (cross-file) is rejected clearly.
+fn extends_target(n: &Node) -> Result<String, String> {
+    if let Some(s) = n.scalar.as_deref().map(str::trim) {
+        if !s.is_empty() {
+            return Ok(s.to_string());
+        }
+    }
+    if n.children.iter().any(|(k, _)| k == "file") {
+        return Err(
+            "cross-file `extends: {file: …}` isn't supported yet — inline the base service into this \
+             compose file"
+                .to_string(),
+        );
+    }
+    if let Some((_, sv)) = n.children.iter().find(|(k, _)| k == "service") {
+        if let Some(s) = sv.scalar.as_deref().map(str::trim) {
+            if !s.is_empty() {
+                return Ok(s.to_string());
+            }
+        }
+    }
+    Err(
+        "`extends` needs a service name (`extends: base` or `extends: {service: base}`)"
+            .to_string(),
+    )
+}
+
+/// Resolve one service's `extends`, first expanding the target (so chains fully flatten), then folding
+/// the target's keys in where this service doesn't already define them.
+fn resolve_service_extends(
+    services: &mut Node,
+    name: &str,
+    seen: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(idx) = services.children.iter().position(|(k, _)| k == name) else {
+        return Ok(());
+    };
+    let Some(ep) = services.children[idx]
+        .1
+        .children
+        .iter()
+        .position(|(k, _)| k == "extends")
+    else {
+        return Ok(());
+    };
+    let target = extends_target(&services.children[idx].1.children[ep].1)?;
+    if target == name || seen.iter().any(|s| s == name) {
+        return Err(format!("circular `extends` involving service '{name}'"));
+    }
+    seen.push(name.to_string());
+    resolve_service_extends(services, &target, seen)?;
+    seen.pop();
+    let Some(tidx) = services.children.iter().position(|(k, _)| k == &target) else {
+        return Err(format!(
+            "service '{name}' extends unknown service '{target}'"
+        ));
+    };
+    let parent = services.children[tidx].1.children.clone();
+    // Drop the `extends` key now that it's being resolved, then fold in the parent's keys the child
+    // doesn't already set (child wins — Compose's override semantics).
+    services.children[idx].1.children.remove(ep);
+    for (pk, pv) in parent {
+        if pk == "extends" {
+            continue;
+        }
+        if !services.children[idx]
+            .1
+            .children
+            .iter()
+            .any(|(ck, _)| *ck == pk)
+        {
+            services.children[idx].1.children.push((pk, pv));
+        }
+    }
+    Ok(())
+}
+
 /// Split a `key: value` line into `(key, Some(value))` or a bare `key:` into `(key, Some(""))`.
 /// Quote-aware on the key side so a quoted key with a `:` is handled; the value keeps its raw form
 /// (unquoted here — `scalar_str` unquotes at use).
@@ -1372,7 +1474,17 @@ fn kv_pairs(node: &Node) -> Vec<String> {
     let mut out = Vec::new();
     for it in &node.items {
         let entry = scalar_str(it);
-        if entry.contains('=') {
+        let trimmed = entry.trim();
+        if trimmed.starts_with('{') {
+            // A list item written as `- KEY: value` (the map form leaked into the list form) was folded
+            // into an inline-map item `{KEY: value}` by the tree builder. Docker PANICS on this mix
+            // (`interface conversion: … not map`); we salvage each pair as `KEY=value` so the stack
+            // still comes up.
+            for (k, v) in parse_inline_table(trimmed).children {
+                let raw = v.scalar.as_deref().map(scalar_str).unwrap_or_default();
+                out.push(format!("{k}={raw}"));
+            }
+        } else if entry.contains('=') {
             out.push(entry);
         } else if let Ok(val) = std::env::var(&entry) {
             // bare `- KEY` present in the host env → pass its value through.
@@ -3019,5 +3131,58 @@ services:
                                                                        // And through the real public entry point, as a healthcheck.interval — parse must not panic.
         let y = "services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      interval: 6000000000000000h\n";
         let _ = parse(y); // Ok or Err, never a panic
+    }
+
+    #[test]
+    fn extends_same_file_short_and_map_form() {
+        // `extends: base` (short) and `extends: {service: base}` (map) both inherit the base's fields;
+        // the extending service wins on a key conflict.
+        let short = parse(
+            "services:\n  base:\n    image: alpine\n    read_only: true\n  w:\n    extends: base\n",
+        )
+        .unwrap();
+        let w = short.iter().find(|b| b.name == "w").unwrap();
+        assert_eq!(w.image.as_deref(), Some("alpine"));
+        assert!(w.read_only);
+        // Map form + child override: child keeps its own read_only=false, inherits image.
+        let mapf = parse("services:\n  base:\n    image: alpine\n    read_only: true\n  w:\n    extends:\n      service: base\n    read_only: false\n").unwrap();
+        let w = mapf.iter().find(|b| b.name == "w").unwrap();
+        assert_eq!(w.image.as_deref(), Some("alpine"));
+        assert!(!w.read_only);
+        // Transitive chain a<-b<-c.
+        assert!(parse(
+            "services:\n  a:\n    image: alpine\n  b:\n    extends: a\n  c:\n    extends: b\n"
+        )
+        .is_ok());
+        // Cycle, unknown target, and cross-file each give a clear error (never an opaque "no image").
+        assert!(parse(
+            "services:\n  a:\n    extends: b\n    image: x\n  b:\n    extends: a\n    image: y\n"
+        )
+        .unwrap_err()
+        .contains("circular"));
+        assert!(parse("services:\n  w:\n    extends: ghost\n    image: x\n")
+            .unwrap_err()
+            .contains("unknown service"));
+        assert!(
+            parse("services:\n  w:\n    extends:\n      file: base.yml\n      service: b\n")
+                .unwrap_err()
+                .contains("cross-file")
+        );
+    }
+
+    #[test]
+    fn mixed_list_map_environment_is_salvaged_not_a_panic() {
+        // Docker PANICS on `- KEY: value` (list/map mix); kern reads the intent as `KEY=value` and the
+        // stack still comes up. A normal `- K=v` alongside it is unaffected.
+        let b = parse("services:\n  w:\n    image: alpine\n    environment:\n      - MYSQL_DATABASE: nextcloud\n      - NORMAL=ok\n").unwrap();
+        assert_eq!(b[0].env, vec!["MYSQL_DATABASE=nextcloud", "NORMAL=ok"]);
+    }
+
+    #[test]
+    fn utf8_bom_is_stripped() {
+        // A leading BOM (Windows editors) must not hide the `services:` block.
+        let b = super::super::parse("\u{feff}services:\n  w:\n    image: alpine\n").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].image.as_deref(), Some("alpine"));
     }
 }
