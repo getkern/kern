@@ -207,24 +207,52 @@ enum Ctx {
 pub fn parse(text: &str) -> Result<KernConfig, String> {
     let mut cfg = KernConfig::default();
     let mut ctx = Ctx::None;
-    for (i, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let n = i + 1;
+        let line = strip_comment(lines[i]).trim();
         if line.is_empty() {
+            i += 1;
             continue;
         }
-        let n = i + 1;
         if let Some((_double, path)) = section_header(line) {
             ctx = enter_section(&mut cfg, path, n)?;
+            i += 1;
             continue;
         }
         // A line that is neither a `[section]` nor `key = value` is unsupported syntax — skip it
-        // rather than fail. A kern.toml from another edition can carry TOML this hand-rolled reader
-        // doesn't model (a multi-line array, an inline table like `{bus=1, …}`); dropping those lines
-        // keeps the rest of the config usable.
+        // rather than fail. A kern.toml can carry TOML this hand-rolled reader doesn't model (an
+        // inline table like `{bus=1, …}`); dropping those lines keeps the rest of the config usable.
         let Some((key, val)) = line.split_once('=') else {
+            i += 1;
             continue;
         };
-        let (key, val) = (key.trim(), val.trim());
+        let key = key.trim();
+        // Multi-line array: `key = [` whose closing `]` is on a later line (as `kern setup -c` itself
+        // writes for long device lists — e.g. a `[[gpio]]`'s `i2c`/`spi`). Gather the following
+        // comment-stripped lines up to the `]` into one array literal so the reader accepts it,
+        // instead of failing the whole config. The error still points at the array's opening line.
+        let first = val.trim();
+        let joined;
+        let val: &str = if first.starts_with('[') && !first.contains(']') {
+            let mut buf = String::from(first);
+            while i + 1 < lines.len() {
+                i += 1;
+                let more = strip_comment(lines[i]).trim();
+                if !more.is_empty() {
+                    buf.push(' ');
+                    buf.push_str(more);
+                }
+                if more.contains(']') {
+                    break;
+                }
+            }
+            joined = buf;
+            joined.as_str()
+        } else {
+            first
+        };
         let at = |e: String| format!("line {n}: {e}");
         match ctx {
             Ctx::None => {} // a key before any section — ignore (tolerant of foreign layouts)
@@ -241,6 +269,7 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
             Ctx::Disk => apply_disk(cfg.disk.last_mut().unwrap(), key, val).map_err(at)?,
             Ctx::Vdisk => apply_vdisk(cfg.vdisk.last_mut().unwrap(), key, val).map_err(at)?,
         }
+        i += 1;
     }
     Ok(cfg)
 }
@@ -1781,6 +1810,24 @@ mod tests {
         // A BAD VALUE for a RECOGNIZED key is still a real error — tolerance ignores unknowns, it does
         // not swallow malformed values of keys we do implement.
         assert!(parse("[[vcpu]]\nname = \"x\"\nvcpus = abc").is_err());
+    }
+
+    #[test]
+    fn parses_multiline_arrays_for_recognized_keys() {
+        // `kern setup -c` writes long device lists as MULTI-LINE arrays (a `[[gpio]]`'s `i2c`/`spi`).
+        // The hand-rolled reader must gather the lines up to `]` — it used to error on `= [`, failing
+        // the WHOLE config, so a board kern itself set up couldn't load its own profiles (real Jetson).
+        let c = parse(
+            "[[gpio]]\nid = \"0\"\ni2c = [\n    \"/dev/i2c-0\",\n    \"/dev/i2c-1\",\n    \"/dev/i2c-2\",\n]\n\n[[vcpu]]\nname = \"after\"\nvcpus = 1.0",
+        )
+        .unwrap();
+        assert_eq!(c.gpio[0].i2c, ["/dev/i2c-0", "/dev/i2c-1", "/dev/i2c-2"]);
+        // ...and parsing CONTINUES past the multi-line array — the profile after it still loads.
+        assert_eq!(c.vcpu[0].name, "after");
+        assert_eq!(c.vcpu[0].vcpus, Some(1.0));
+        // A multi-line INT array (pins) works too, with a trailing comma.
+        let c2 = parse("[[gpio]]\nid=\"0\"\npins = [\n  1,\n  2,\n  3,\n]").unwrap();
+        assert_eq!(c2.gpio[0].pins, [1, 2, 3]);
     }
 
     #[test]
