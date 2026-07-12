@@ -582,5 +582,7 @@ reports: follow [SECURITY.md](SECURITY.md) (don't open a public issue).
 tree is deliberately tiny (`libc` only on the Rust side; standard-library-only on the Python side) and
 copyleft-free — `cargo deny check licenses` is clean.
 
-**kern** and **getkern** are trademarks of the project: the *code* is yours to use under Apache-2.0, but
-please don't ship a fork or a competing service under the name.
+**Trademark.** The *code* is free under [Apache-2.0](LICENSE) — fork it, embed it, run it, no strings.
+But **"kern" and "getkern" are trademarks** of the project: please don't use the names for a fork, a
+modified build, or a competing product/service without permission — see [TRADEMARK.md](TRADEMARK.md).
+Open code, protected name — the same split Rust and Firefox use.
