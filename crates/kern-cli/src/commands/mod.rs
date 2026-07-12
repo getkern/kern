@@ -7256,6 +7256,18 @@ fn copy_into_rootfs(
             let _ = std::fs::remove_file(&target);
         }
     }
+    // When the build context carries a `.dockerignore`/`.kernignore`, a directory COPY must skip the
+    // excluded paths (so `COPY . /app` doesn't bake `.git`/secrets). The filter needs re-include
+    // (`!`) and last-match-wins semantics that `cp`/`tar --exclude` can't express, so a directory copy
+    // with an ignore file present goes through a no-follow Rust walk instead of `cp -a`. With NO ignore
+    // file (the common case) the fast `cp -a` path below is unchanged.
+    if src.is_dir() {
+        if let Some(ig) = crate::dockerignore::DockerIgnore::load(ctx) {
+            let _ = std::fs::create_dir_all(&target);
+            return copy_dir_filtered(&src, &target, ctx, &ig)
+                .map_err(|e| Error::Sandbox(format!("COPY '{src_rel}' → '{dst}': {e}")));
+        }
+    }
     let arg = if src.is_dir() {
         let _ = std::fs::create_dir_all(&target);
         format!("{}/.", src.display())
@@ -7283,6 +7295,59 @@ fn copy_into_rootfs(
     } else {
         Err(Error::Sandbox(format!("COPY '{src_rel}' → '{dst}' failed")))
     }
+}
+
+/// Recursively copy directory `src` into `target`, SKIPPING paths the context's ignore rules exclude
+/// (matched relative to `ctx`, the context root). NO-FOLLOW — the same confinement invariant as the
+/// `cp -a` path: a symlink is recreated as a symlink, never traversed, so a `leak -> /host/secret` in
+/// the context lands dangling in the image and its host target is never read. File MODE is preserved
+/// (an executable script stays executable). Non-regular entries (fifo/socket/device — which don't
+/// belong in a build context) are skipped.
+fn copy_dir_filtered(
+    src: &std::path::Path,
+    target: &std::path::Path,
+    ctx: &std::path::Path,
+    ig: &crate::dockerignore::DockerIgnore,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let md = std::fs::symlink_metadata(&path)?;
+        let ft = md.file_type();
+        // The path RELATIVE TO THE CONTEXT ROOT drives ignore matching (dockerignore is context-relative).
+        let rel = path
+            .strip_prefix(ctx)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let dest = target.join(entry.file_name());
+        if ft.is_dir() {
+            // Prune a wholly-excluded subtree only when no `!` rule could re-include a descendant.
+            if ig.can_prune_dir(&rel) {
+                continue;
+            }
+            std::fs::create_dir_all(&dest)?;
+            copy_dir_filtered(&path, &dest, ctx, ig)?;
+        } else if ft.is_symlink() {
+            if ig.excluded(&rel) {
+                continue;
+            }
+            let link = std::fs::read_link(&path)?;
+            let _ = std::fs::remove_file(&dest);
+            std::os::unix::fs::symlink(&link, &dest)?;
+        } else if ft.is_file() {
+            if ig.excluded(&rel) {
+                continue;
+            }
+            std::fs::copy(&path, &dest)?;
+            std::fs::set_permissions(
+                &dest,
+                std::fs::Permissions::from_mode(md.permissions().mode()),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Set (replace or append) `K=V` in an image-config env list.

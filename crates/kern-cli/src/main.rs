@@ -25,6 +25,7 @@ mod completions;
 use kern_compose as compose;
 mod config;
 mod dockerfile;
+mod dockerignore;
 mod doctor;
 mod error;
 mod openat2;
