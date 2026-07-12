@@ -357,9 +357,13 @@ fn key_only(code: &str) -> Option<String> {
         .then(|| format!("{}: ", &code[..ci]))
 }
 
-/// A value that opens a flow collection `[`/`{` unbalanced on its line → (prefix, opening fragment).
+/// A value that spans lines: a flow collection `[`/`{` unbalanced on its line, OR a quoted string whose
+/// closing quote is on a later line (YAML folds the break to a space). → (prefix, opening fragment).
 fn flow_intro(code: &str) -> Option<(String, String)> {
-    let opens = |v: &str| (v.starts_with('[') || v.starts_with('{')) && !brackets_balanced(v);
+    let opens = |v: &str| {
+        ((v.starts_with('[') || v.starts_with('{')) && !brackets_balanced(v))
+            || ((v.starts_with('"') || v.starts_with('\'')) && has_unterminated_quote(v))
+    };
     if let Some(ci) = colon_index(code) {
         let v = code[ci + 1..].trim();
         if opens(v) {
@@ -2777,6 +2781,16 @@ services:
         assert_eq!(boxes(a)[0].command, ["postgres", "-c"]);
         let b = "services:\n  a:\n    image: alpine\n    command:\n      [\"postgres\"]\n";
         assert_eq!(boxes(b)[0].command, ["postgres"]);
+    }
+
+    #[test]
+    fn multi_line_quoted_scalar_folds_to_a_space() {
+        // Appwrite's form: a single-quoted list item whose closing quote is on the NEXT line — YAML
+        // folds the line break to a space.
+        let y = "services:\n  a:\n    image: alpine\n    command:\n      - -c\n      - 'curl http://x/health\n          >/dev/null'\n";
+        let c = &boxes(y)[0].command;
+        assert_eq!(c[0], "-c");
+        assert_eq!(c[1], "curl http://x/health >/dev/null");
     }
 
     #[test]
