@@ -25,6 +25,11 @@ use super::{BuildDirective, ComposeBox};
 /// Max indentation depth we track — a compose service tree is 3-4 deep; anything past this is refused
 /// rather than parsed, bounding work and stack (we're iterative, but this caps pathological input).
 const MAX_DEPTH: usize = 32;
+/// Total nodes an anchor/alias/merge expansion may materialize. Every aliased clone spends from this
+/// budget; exhausting it is the billion-laughs defence (a `&a [*a,*a]`…`&z [*y,*y]` bomb blows the
+/// budget long before it blows memory), so anchors are supported WITHOUT reintroducing the DoS the
+/// old blanket refusal guarded against. A real compose's `x-*` templates spend a handful.
+const MAX_ANCHOR_NODES: usize = 10_000;
 
 /// Parse a compose YAML document into boxes. Warnings for the degraded long tail go to stderr; the
 /// return is the mappable boxes (or a hard error for a malformed / unsupported-structural document).
@@ -46,7 +51,11 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     let text = text.as_str();
 
     let lines = lex(text)?;
-    let root = build_tree(&lines)?;
+    let mut root = build_tree(&lines)?;
+    // Expand YAML anchors (`&x`), aliases (`*x`) and merge keys (`<<: *x`) — the common `x-*` template
+    // DRY pattern real compose files use — under a hard node budget (billion-laughs-safe). After this,
+    // the tree holds only concrete values.
+    resolve_anchors(&mut root)?;
 
     // Top level must have `services:`. `volumes:`/`networks:`/`version:`/`name:` are recognized;
     // everything else at the top is warned and ignored.
@@ -219,30 +228,12 @@ fn prescreen(text: &str) -> Result<(), String> {
                 "line {ln}: multi-document YAML not supported (kern reads one compose per file)"
             ));
         }
-        // Anchors / aliases / tags / merge keys: refuse on sight, never expand (billion-laughs guard).
-        // `after_seq_markers` strips leading `- ` sequence markers first, so a `- *alias` LIST ITEM
-        // is caught too — not only a mapping value. (Regression: an alias in list position, e.g.
-        // `command:\n  - *boom`, used to slip through `t` (which starts with `- `) AND
-        // `value_after_colon` (a list item has no `:`), reaching the box as the literal string
-        // `*boom` — a silent mis-conversion, exactly what the module header promises never happens.)
-        let structural = after_seq_markers(t);
-        if structural.starts_with('&')
-            || structural.starts_with('*')
-            || structural.starts_with("<<")
-        {
-            return Err(format!(
-                "line {ln}: YAML anchors/aliases/merge-keys not supported (rewrite the value inline)"
-            ));
-        }
-        // A `&anchor`/`*alias` after a `:` (value position) — scan the unquoted part of the value.
-        if let Some(v) = value_after_colon(line) {
-            let vt = v.trim_start();
-            if vt.starts_with('&') || vt.starts_with('*') {
-                return Err(format!(
-                    "line {ln}: YAML anchors/aliases not supported (rewrite the value inline)"
-                ));
-            }
-        }
+        // Block-level anchors (`key: &c`), aliases (`key: *c`) and merge keys (`<<: *c` / `<<: [*a,*b]`)
+        // ARE supported — `resolve_anchors` expands them after the tree is built, under a hard node
+        // budget (`MAX_ANCHOR_NODES`) that defuses the billion-laughs bomb the old refusal guarded
+        // against. Only anchors/aliases nested INSIDE a flow collection (`[*x]`, `{k: *x}`) remain
+        // unsupported — `line_has_inline_anchor` below still refuses those.
+        //
         // Block scalars — the `|`/`>` at value position introduces multi-line text we don't parse.
         if let Some(v) = value_after_colon(line) {
             let vt = v.trim();
@@ -403,6 +394,7 @@ fn line_has_inline_anchor(line: &str) -> bool {
     }
     let mut q = 0u8; // active quote char, else 0
     let mut prev_content = false; // was the last non-space significant byte scalar content?
+    let mut depth = 0i32; // flow-collection nesting: inside `[…]` / `{…}`
     for &c in line.as_bytes() {
         if q != 0 {
             if c == q {
@@ -417,30 +409,27 @@ fn line_has_inline_anchor(line: &str) -> bool {
                 prev_content = false; // an opening quote starts a NEW scalar, not a continuation
             }
             b' ' | b'\t' => {} // spaces don't change whether the last token was content
+            b'[' | b'{' => {
+                depth += 1;
+                prev_content = false;
+            }
+            b']' | b'}' => {
+                depth = (depth - 1).max(0);
+                prev_content = true; // a closed collection is content-like
+            }
             b'&' | b'*' => {
-                if !prev_content {
-                    return true; // token-opening & / * outside quotes → anchor/alias
+                // A token-opening `&`/`*` INSIDE a flow collection (`[*x]`, `{k: *x}`) is an anchor/alias
+                // we still don't expand — refuse it. A block-level one (`<<: *c`, `key: *c`, `k: &c`) is
+                // now supported (see `resolve_anchors`), so at depth 0 it is NOT flagged here.
+                if !prev_content && depth > 0 {
+                    return true;
                 }
-                prev_content = true; // part of a scalar value (e.g. `a*b`)
+                prev_content = true;
             }
             other => prev_content = is_scalar_content(other),
         }
     }
     false
-}
-
-/// Strip leading YAML block-sequence markers (`- `, possibly nested `- - `) and surrounding spaces,
-/// returning the content that actually starts the node. Used by the prescreen so a structural
-/// anchor/alias in LIST-ITEM position (`- *alias`) is seen, not just one in mapping-value position.
-/// `-` is ASCII, so every slice is on a char boundary.
-fn after_seq_markers(s: &str) -> &str {
-    let mut rest = s.trim_start();
-    // A bare `-` (empty list item on its own line) is not a marker to strip past — only `- ` (marker
-    // followed by content) is. Loop to peel nested `- - x`.
-    while let Some(after) = rest.strip_prefix("- ") {
-        rest = after.trim_start();
-    }
-    rest
 }
 
 /// The code part of `line` with any trailing `#` comment removed (quote-aware, `#` at BOL or after
@@ -487,7 +476,7 @@ fn strip_comment_precise(line: &str) -> String {
 
 /// A parsed node: a scalar value and/or child mappings and/or list items. YAML is a tree; we model the
 /// slice we need — a mapping (`children`) whose values may be scalars, nested mappings, or sequences.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Node {
     /// Inline scalar on the same line as the key (`image: alpine` → `"alpine"`), if any.
     scalar: Option<String>,
@@ -495,6 +484,10 @@ struct Node {
     children: Vec<(String, Node)>,
     /// Sequence items (`- x`) as raw scalar strings, in order.
     items: Vec<String>,
+    /// A YAML anchor `&name` declared on this node (stripped from the value at parse time). Resolved
+    /// away by [`resolve_anchors`] into aliases (`*name`) and merge keys (`<<: *name`); never survives
+    /// into a `ComposeBox`.
+    anchor: Option<String>,
 }
 
 impl Node {
@@ -583,8 +576,22 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
 
         // `key:` or `key: value`.
         let (key, val) = split_key(&ln.content, ln.lineno)?;
-        let inline = val.filter(|v| !v.is_empty());
         let mut node = Node::default();
+        // Peel a leading anchor `&name` off the value. What remains is the real value — often empty
+        // (`x-common: &common` then a nested mapping on the following lines), so it must reset `inline`
+        // to `None` and let the key open a mapping as usual. `resolve_anchors` consumes `node.anchor`.
+        let val = match val {
+            Some(v) if v.trim_start().starts_with('&') => {
+                let after = v.trim_start()[1..].trim_start();
+                let name_len = after
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(after.len());
+                node.anchor = Some(after[..name_len].to_string());
+                Some(after[name_len..].trim_start())
+            }
+            other => other,
+        };
+        let inline = val.filter(|v| !v.is_empty());
         if let Some(v) = inline {
             let vt = v.trim();
             // ALWAYS keep the raw value as `scalar` — a converter that wants the verbatim value
@@ -623,6 +630,133 @@ fn descend_mut<'a>(root: &'a mut Node, path: &[usize]) -> &'a mut Node {
         cur = &mut cur.children[idx].1;
     }
     cur
+}
+
+/// Expand YAML anchors/aliases/merge keys in the built tree, in place — so no converter ever sees a raw
+/// `*alias`. Pass 1 records every `&name` node (children-first, so a nested anchor is known before an
+/// outer one merges it), stripping the marker. Pass 2 substitutes each `*name` value and folds each
+/// `<<: *name` mapping, cloning the recorded node and resolving IT too — all spending one shared
+/// `MAX_ANCHOR_NODES` budget, so a self-referential bomb is refused rather than followed.
+fn resolve_anchors(root: &mut Node) -> Result<(), String> {
+    let mut anchors: std::collections::HashMap<String, Node> = std::collections::HashMap::new();
+    collect_anchors(root, &mut anchors);
+    // Always apply — even with no anchors defined, a stray `*alias` must surface as a clear "unknown
+    // anchor" error, never reach a box as the literal string `*alias`.
+    let mut budget = MAX_ANCHOR_NODES;
+    apply_anchors(root, &anchors, &mut budget)
+}
+
+/// Record `&name` → the node it decorates (its children already stripped of their own markers),
+/// removing the marker from the live tree. Children-first so an inner anchor is registered first.
+fn collect_anchors(node: &mut Node, anchors: &mut std::collections::HashMap<String, Node>) {
+    for (_, child) in &mut node.children {
+        collect_anchors(child, anchors);
+    }
+    if let Some(name) = node.anchor.take() {
+        anchors.insert(name, node.clone());
+    }
+}
+
+/// Nodes in a subtree (mappings + sequence items) — what an expansion spends from the budget.
+fn count_nodes(node: &Node) -> usize {
+    1 + node.items.len()
+        + node
+            .children
+            .iter()
+            .map(|(_, c)| count_nodes(c))
+            .sum::<usize>()
+}
+
+fn spend(budget: &mut usize, n: usize) -> Result<(), String> {
+    *budget = budget.checked_sub(n).ok_or_else(|| {
+        "YAML anchor expansion too large (possible billion-laughs bomb) — refused".to_string()
+    })?;
+    Ok(())
+}
+
+/// The anchor names a merge value references: `*c` → `["c"]`, `[*a, *b]` → `["a","b"]`.
+fn merge_alias_names(scalar: &str) -> Vec<String> {
+    let s = scalar.trim();
+    let inner = s
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(s);
+    inner
+        .split(',')
+        .filter_map(|t| t.trim().strip_prefix('*'))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// In-place alias substitution + `<<` merge, recursively, against the collected `anchors`.
+fn apply_anchors(
+    node: &mut Node,
+    anchors: &std::collections::HashMap<String, Node>,
+    budget: &mut usize,
+) -> Result<(), String> {
+    // Merge keys: fold each `<<: *name` (or `<<: [*a, *b]`) into this node. A key ALREADY on the node
+    // wins over the merged one (YAML merge semantics); among sources the earlier alias wins. `<<` is
+    // then dropped. `src` is resolved before merging, so its own aliases/merges are already gone.
+    let mut i = 0;
+    while i < node.children.len() {
+        if node.children[i].0 == "<<" {
+            let scalar = node.children[i].1.scalar.clone().unwrap_or_default();
+            node.children.remove(i);
+            for name in merge_alias_names(&scalar) {
+                let src = anchors
+                    .get(&name)
+                    .ok_or_else(|| format!("unknown YAML anchor `*{name}` in a `<<` merge"))?;
+                let mut src = src.clone();
+                spend(budget, count_nodes(&src))?;
+                apply_anchors(&mut src, anchors, budget)?;
+                for (ck, cv) in src.children {
+                    if !node.children.iter().any(|(ek, _)| *ek == ck) {
+                        node.children.push((ck, cv));
+                    }
+                }
+            }
+            continue; // children[i] is now the next sibling
+        }
+        i += 1;
+    }
+    // Value aliases (`key: *name`) and recursion into ordinary children.
+    for (_, child) in &mut node.children {
+        let alias = child
+            .scalar
+            .as_deref()
+            .and_then(|s| s.trim().strip_prefix('*').map(|n| n.trim().to_string()));
+        if let Some(name) = alias {
+            let src = anchors
+                .get(&name)
+                .ok_or_else(|| format!("unknown YAML anchor `*{name}`"))?;
+            let mut src = src.clone();
+            spend(budget, count_nodes(&src))?;
+            apply_anchors(&mut src, anchors, budget)?;
+            *child = src;
+        } else {
+            apply_anchors(child, anchors, budget)?;
+        }
+    }
+    // Sequence-item aliases (`- *name`): inline a SCALAR anchor's value. An unknown alias, an alias to
+    // a MAPPING (no scalar to inline), or an ANCHOR in list position (`- &x …`) are all hard errors —
+    // never left as the literal `*name`/`&x` string (the silent mis-conversion the module forbids).
+    for item in &mut node.items {
+        let t = item.trim();
+        if let Some(rest) = t.strip_prefix('*') {
+            let name = rest.trim().to_string();
+            let src = anchors
+                .get(&name)
+                .ok_or_else(|| format!("unknown YAML anchor `*{name}`"))?;
+            let sc = src.scalar.clone().ok_or_else(|| {
+                format!("YAML alias `*{name}` refers to a mapping — not usable as a list item")
+            })?;
+            *item = sc;
+        } else if t.starts_with('&') {
+            return Err("YAML anchors in a sequence item are not supported".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Split a `key: value` line into `(key, Some(value))` or a bare `key:` into `(key, Some(""))`.
@@ -2190,7 +2324,11 @@ mod tests {
 
     #[test]
     fn rejects_anchors_aliases_tabs_multidoc_blockscalar() {
-        assert!(parse("services:\n  a: &anchor\n    image: alpine\n").is_err());
+        // Block-level anchors are SUPPORTED now (see yaml_anchors_and_merge_keys_expand_with_override):
+        // an anchored service with no alias just parses.
+        assert!(parse("services:\n  a: &anchor\n    image: alpine\n").is_ok());
+        // A block-level alias to an UNDEFINED anchor is still an error — a clear "unknown anchor", never
+        // the literal `*alias` reaching the box.
         assert!(parse("services:\n  a:\n    image: *alias\n").is_err());
         assert!(parse("services:\n\timage: alpine\n").is_err()); // tab
         assert!(
@@ -2260,6 +2398,21 @@ mod tests {
                 }
                 i += 1;
             }
+            // Flow-collection depth entering each byte (outside quotes). A token-opening `&`/`*` is only
+            // refused when it sits INSIDE a `[…]`/`{…}` — block-level anchors/aliases are supported.
+            let mut depth_at = vec![0i32; b.len()];
+            let mut d = 0i32;
+            for (idx, &c) in b.iter().enumerate() {
+                depth_at[idx] = d;
+                if inq[idx] {
+                    continue;
+                }
+                match c {
+                    b'[' | b'{' => d += 1,
+                    b']' | b'}' => d = (d - 1).max(0),
+                    _ => {}
+                }
+            }
             let is_content = |c: u8| {
                 c.is_ascii_alphanumeric()
                     || matches!(c, b'_' | b'-' | b'.' | b'/' | b'%' | b'@' | b'+' | b'~')
@@ -2286,9 +2439,14 @@ mod tests {
                         if b[j] == b'&' || b[j] == b'*' {
                             continue; // part of the same scalar run — keep walking back
                         }
+                        if !inq[j] && (b[j] == b']' || b[j] == b'}') {
+                            break true; // a CLOSED flow collection is content-like (the guard latches
+                                        // prev_content=true on `]`/`}`), so a following `&`/`*` is not
+                                        // a token opener
+                        }
                         break !inq[j] && is_content(b[j]);
                     };
-                    if !prev_is_content {
+                    if !prev_is_content && depth_at[idx] > 0 {
                         return true;
                     }
                 }
@@ -2320,6 +2478,71 @@ mod tests {
     #[test]
     fn no_services_is_an_error() {
         assert!(parse("version: \"3\"\nvolumes:\n  data:\n").is_err());
+    }
+
+    #[test]
+    fn yaml_anchors_and_merge_keys_expand_with_override() {
+        // The DRY pattern real compose files use: an `x-*` template anchored with `&`, merged into
+        // services with `<<: *name`, plus a per-service key that OVERRIDES a merged one.
+        let y = r#"x-common: &common
+  restart: always
+  environment:
+    - SHARED=yes
+
+services:
+  a:
+    <<: *common
+    image: alpine
+    command: echo a
+  b:
+    <<: *common
+    image: nginx
+    restart: "no"
+"#;
+        let b = boxes(y);
+        assert_eq!(b.len(), 2);
+        let a = b.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(a.image.as_deref(), Some("alpine"));
+        assert!(a.restart, "a inherits `restart: always` from the merge");
+        assert_eq!(a.env, ["SHARED=yes"]);
+        let bb = b.iter().find(|x| x.name == "b").unwrap();
+        assert_eq!(bb.image.as_deref(), Some("nginx"));
+        assert!(
+            !bb.restart,
+            "b's own `restart: no` WINS over the merged `always`"
+        );
+        assert_eq!(bb.env, ["SHARED=yes"], "b still inherits the merged env");
+    }
+
+    #[test]
+    fn yaml_value_alias_expands() {
+        let y =
+            "x-img: &img alpine:3.19\nservices:\n  a:\n    image: *img\n    command: \"true\"\n";
+        assert_eq!(boxes(y)[0].image.as_deref(), Some("alpine:3.19"));
+    }
+
+    #[test]
+    fn unknown_alias_is_a_clear_error_not_a_silent_literal() {
+        assert!(parse("services:\n  a:\n    image: alpine\n    command: *nope\n").is_err());
+    }
+
+    #[test]
+    fn billion_laughs_bomb_is_refused_by_the_budget_not_followed() {
+        // A block-level alias-of-alias chain that would expand to 10^4 nodes: each level references the
+        // previous anchor ten times. The node budget must REFUSE it (bounded time/memory), not
+        // materialize the bomb. (Flow-collection aliases like `&b [*a,*a]` are refused earlier still.)
+        let mut y = String::from("x-a0: &a0\n  k: v\n");
+        for lvl in 1..=4 {
+            y.push_str(&format!("x-a{lvl}: &a{lvl}\n"));
+            for k in 0..10 {
+                y.push_str(&format!("  k{k}: *a{}\n", lvl - 1));
+            }
+        }
+        y.push_str("services:\n  boom:\n    image: alpine\n    command: *a4\n");
+        assert!(
+            parse(&y).is_err(),
+            "billion-laughs must be refused by the node budget"
+        );
     }
 
     #[test]
