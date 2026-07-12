@@ -202,6 +202,7 @@ fn any_profile_active(profiles: &[String]) -> bool {
 /// Reject structural YAML we don't support, up front, with a precise reason. This is the billion-laughs
 /// / tab-indent / multi-doc guard — cheaper and safer than parsing-then-detecting.
 fn prescreen(text: &str) -> Result<(), String> {
+    let mut seen_content = false; // has a real (non-comment, non-marker) line appeared yet?
     for (i, raw) in text.lines().enumerate() {
         let ln = i + 1;
         // Strip a trailing comment for this scan (a `#` inside quotes is handled by the lexer; here we
@@ -219,15 +220,18 @@ fn prescreen(text: &str) -> Result<(), String> {
                 "line {ln}: tab indentation not supported (use spaces)"
             ));
         }
-        // 2nd+ document — parse only the first.
+        // A `---`/`...` marker: a LEADING one (only comments/blanks before it — as a licensed header
+        // like Apache Airflow's produces) is a document-start and fine; one AFTER real content begins a
+        // SECOND document, which we don't read.
         if t == "---" || t == "..." {
-            if i == 0 {
-                continue; // a leading `---` is fine
+            if !seen_content {
+                continue;
             }
             return Err(format!(
                 "line {ln}: multi-document YAML not supported (kern reads one compose per file)"
             ));
         }
+        seen_content = true;
         // Block-level anchors (`key: &c`), aliases (`key: *c`) and merge keys (`<<: *c` / `<<: [*a,*b]`)
         // ARE supported — `resolve_anchors` expands them after the tree is built, under a hard node
         // budget (`MAX_ANCHOR_NODES`) that defuses the billion-laughs bomb the old refusal guarded
@@ -249,12 +253,13 @@ fn prescreen(text: &str) -> Result<(), String> {
                 ));
             }
         }
-        // An anchor/alias as a TOKEN inside an inline collection — `[*x]`, `[a, *x]`, `{k: *x}`. The
-        // two checks above only see the START of the line or the char right after the key `:`; an alias
-        // nested inside `[…]`/`{…}` would slip through and reach the box as the literal `*x` (same silent
-        // mis-conversion as the list-item case). Scan the whole line (outside quotes) for a `&`/`*` that
-        // opens a token: preceded by `[`, `{`, `,` or `:` (with optional spaces).
-        if line_has_inline_anchor(line) {
+        // An anchor/alias as a TOKEN inside an inline collection — `[*x]`, `[a, *x]`, `{k: *x}`. An alias
+        // nested inside `[…]`/`{…}` would otherwise reach the box as the literal `*x`. EXCEPTION: a merge
+        // key with an alias-LIST value (`<<: [*a, *b]`, and the `<< :` spacing) is the standard way to
+        // merge several templates — `resolve_anchors` expands it, so it's allowed. Everything else with
+        // an aliased flow token is refused.
+        let is_merge_line = colon_index(line).map(|ci| line[..ci].trim()) == Some("<<");
+        if !is_merge_line && line_has_inline_anchor(line) {
             return Err(format!(
                 "line {ln}: YAML anchors/aliases not supported (rewrite the value inline)"
             ));
@@ -571,6 +576,16 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
             } else {
                 cur.items.push(item.to_string());
             }
+            continue;
+        }
+
+        // A bare `&anchor` on its OWN line anchors the currently-open mapping. This is the form Apache
+        // Airflow (and others) use: `x-common:` then an indented `&common` then the mapping's keys —
+        // the anchor decorates the node, not a `key: value`. `resolve_anchors` consumes it.
+        if ln.content.starts_with('&') && colon_index(&ln.content).is_none() {
+            let after = ln.content[1..].trim();
+            let name_len = after.find(char::is_whitespace).unwrap_or(after.len());
+            descend_mut(&mut root, &path).anchor = Some(after[..name_len].to_string());
             continue;
         }
 
@@ -2542,6 +2557,47 @@ services:
         assert!(
             parse(&y).is_err(),
             "billion-laughs must be refused by the node budget"
+        );
+    }
+
+    #[test]
+    fn multi_alias_merge_and_bare_anchor_line_the_airflow_sentry_forms() {
+        // Real files (Apache Airflow, Sentry, Penpot) put the anchor on its OWN line and merge SEVERAL
+        // templates at once: `<<: [*a, *b]`. A per-service key still wins over every merged one.
+        let y = "\
+x-a:
+  &a
+  restart: always
+  environment:
+    - A=1
+x-b: &b
+  environment:
+    - B=2
+services:
+  web:
+    <<: [*a, *b]
+    image: nginx
+    environment:
+      - C=3
+";
+        let w = &boxes(y)[0];
+        assert!(w.restart, "web inherits `restart: always` from *a");
+        assert_eq!(
+            w.env,
+            ["C=3"],
+            "web's own `environment` wins over both merges"
+        );
+    }
+
+    #[test]
+    fn leading_document_marker_after_comments_is_ok_but_a_second_doc_is_not() {
+        // Airflow's file opens with a licensed comment header, then a `---` document-start — fine.
+        let y = "# a licensed header\n#\n---\nservices:\n  a:\n    image: alpine\n";
+        assert_eq!(boxes(y)[0].name, "a");
+        // A `---` AFTER real content still begins a second document, which we don't read.
+        assert!(
+            parse("services:\n  a:\n    image: alpine\n---\nservices:\n  b:\n    image: x\n")
+                .is_err()
         );
     }
 
