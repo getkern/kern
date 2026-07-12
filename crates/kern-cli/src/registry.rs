@@ -774,8 +774,21 @@ mod tests {
     // inert — its pid belongs to a now-dead process, so `is_alive` skips it — and a developer's real
     // running boxes have different pids and are never touched.)
     static REG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn reg_guard() -> std::sync::MutexGuard<'static, ()> {
-        REG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Registry tests resolve the claims/instances dir through `runtime_subdir`, which READS
+    /// `$XDG_RUNTIME_DIR`. Other modules' tests (e.g. `runstats`) repoint that var — process-global —
+    /// under [`crate::TEST_ENV_LOCK`]. Holding only `REG_LOCK` left the two uncoordinated: a concurrent
+    /// env flip mid-test split the 16-thread contention test across two runtime dirs, so each half took
+    /// its own `.lock` and BOTH "won" (flaky `claim_name_one_winner_under_contention`). Hold BOTH locks,
+    /// always env-then-reg (one consistent order → no deadlock, since no path takes them reversed).
+    fn reg_guard() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let reg = REG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        (env, reg)
     }
 
     #[test]
