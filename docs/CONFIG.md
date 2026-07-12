@@ -1,32 +1,104 @@
 # kern config & profile schema
 
-kern reads box definitions from TOML in two places today, and one more later — all sharing **one
-schema**:
+kern reads TOML from `~/.config/kern/kern.toml` and from compose files. Two kinds of definition live
+there, sharing **one schema philosophy** (every key mirrors a CLI flag):
 
-- **`kern compose <file>`** — a stack of `[box.NAME]` tables, brought up in `depends_on` order.
-- **A future `--profile`** (0.5.x) — a single named box definition reusable by `kern box` and
-  `kern run`. It will parse the *same* `[box.NAME]` table.
+- **Resource profiles** — reusable `[[vcpu]]` / `[[vgpio]]` / `[[vdisk]]` tables, attached to any
+  `kern box` or `kern run` by **prefix**: `kern run vcpu:heavy vgpio:sensors vdisk:data -- ./job`.
+  Managed with `kern config`, and edited live (guided, validated) in `kern top`.
+- **Compose stacks** — `[box.NAME]` tables in a compose file, brought up by `kern compose` in
+  `depends_on` order.
 
-Because both consume the same table, the schema below is **frozen from 0.5.0**: once you write a
-profile, the format won't shift under you. Changes follow the [deprecation
-policy](../CHANGELOG.md) (a renamed key keeps working as a warned alias for ≥2 minors; a key whose
-meaning changes is rejected with a pointer, never silently reinterpreted).
+The parser is hand-rolled (no `serde`/`toml`) and **tolerant**: an unrecognized section or key, or a
+line of TOML it doesn't model, is **ignored, not rejected**, so a `kern.toml` shared with another kern
+edition still loads. A *malformed value* of a key it DOES implement is always an error, with its line.
 
-## The one rule: TOML mirrors the CLI
+---
 
-Every key maps to a `kern box` flag one-to-one. There is nothing to learn twice — if you know the
-flag, you know the key.
+## Resource profiles
 
-- **Scalar** → a **quoted string** carrying the exact CLI argument: `memory = "512m"`,
-  `cpus = "1.5"`, `cpuset = "0-3"`. (Sizes keep their unit; numbers stay quoted — the value is
-  handed to the same parser the flag uses, so validation and error messages are identical.)
-- **Switch** → a **TOML bool**: `read_only = true`. A `false` (or absent) key emits no flag.
-- **Repeatable flag** → an **array of those same strings**: `volumes = ["src:dst:ro"]`.
+Profiles are **resource-centric**: you declare a named slice once, then attach it to as many boxes as
+you like by its prefix. This mirrors the private runtime's model exactly, so a profile written for one
+is readable by the other (minus the GPU family, which stays private — see [Roadmap](../README.md#roadmap)).
 
-`compose` shells out to `kern box`, so a value can never mean something different from its flag —
-the two surfaces cannot drift.
+### `[[vcpu]]` — a CPU + memory slice · attach with `vcpu:<name>`
 
-## Box table — implemented in 0.5.0
+```toml
+[[vcpu]]
+name     = "heavy"
+vcpus    = 4.0         # core QUOTA (cgroup cpu.max): 4.0 = four cores, 0.5 = half a core
+memory   = "2 GB"      # RAM limit (cgroup memory.max)
+cpus     = "0-7"       # optional CPU PINNING (cpulist); mutually exclusive with `numa`
+numa     = 0           # optional: pin to this NUMA node's CPUs
+priority = 80          # optional: 0 (low) – 99 (high), mapped to nice
+backend  = "cpu:0"     # optional: reference a [[cpu]] declaration to carve from; omit = standalone
+extends  = "base"      # optional: inherit another [[vcpu]] by name
+```
+
+> Note the deliberate spelling: in a profile, **`vcpus` = quota** and **`cpus` = pinning** (same as
+> the private runtime). The CLI flags stay Docker-aligned — `--cpus` = quota, `--cpuset-cpus` = pinning.
+
+### `[[vgpio]]` — device passthrough · attach with `vgpio:<name>`
+
+Deny-by-default: **only** the peripherals you list cross into the box; every other `/dev` node is
+refused. Each device is fd-pinned at bind time to close a check→mount race.
+
+```toml
+[[vgpio]]
+name    = "sensors"
+backend = "gpio:0"     # references a [[gpio]] controller (required)
+pins    = [17, 27]     # GPIO lines
+pwm     = [18]         # PWM channels
+i2c     = ["1"]        # /dev/i2c-1
+spi     = ["0.0"]      # /dev/spidev0.0
+adc     = [0]
+onewire = [4]
+# also available: uart, can, camera, audio, leds, bluetooth, usb, input, midi, display, net, extra
+# `extra` takes explicit /dev paths (validated); everything is refused unless a capability-based
+# deny-list (raw memory, disks, VFIO/DMA, kvm, HID injection, the console, …) rejects it first.
+```
+
+### `[[vdisk]]` — a size-capped disk · attach with `vdisk:<name>`
+
+```toml
+[[vdisk]]
+name       = "data"
+size       = "2g"          # quota
+backend    = "disk:pool"   # optional: place it on a declared [[disk]] pool; omit = standalone scratch
+iops       = 1000          # optional I/O-ops limit
+bandwidth  = "50m"         # optional throughput limit
+persistent = true          # survive box removal (default: false → scratch, discarded)
+```
+
+A `vdisk:` appears in the box at `/vdisk/<name>`: a RAM tmpfs when rootless, or an ext4-on-loop image
+with a real quota when privileged.
+
+### Physical declarations — what a profile's `backend` points at
+
+Optional. Declare the host resources your profiles carve from; a profile with no `backend` is
+standalone. Field shapes:
+
+```toml
+[[cpu]]   # a physical CPU budget a [[vcpu]] splits
+id = "0"; vcpus = 16.0; memory = "32 GB"; cpus = "0-15"; numa = 0
+
+[[gpio]]  # a physical GPIO / peripheral controller a [[vgpio]] draws from
+id = "0"; total_pins = 40; pins = [2, 3, 4, 17, 27]; i2c = ["1"]; leds = ["led0"]
+# a specific USB port can be reserved on a controller:
+[[gpio.usb_ports]]
+bus = 1; port = 2; name = "sensor-hub"
+
+[[disk]]  # a physical disk pool a [[vdisk]] places volumes on
+name = "pool"; path = "/var/lib/kern/disks"; default = true; size = "100g"; iops = 5000
+```
+
+---
+
+## Compose — `[box.NAME]` tables
+
+`kern compose <file>` brings up a stack of `[box.NAME]` tables in `depends_on` order (it also reads a
+`docker-compose.yml`). Every key maps to a `kern box` flag one-to-one — `compose` shells out to
+`kern box`, so a value can never mean something different from its flag.
 
 ```toml
 [box.api]
@@ -36,8 +108,8 @@ rootfs     = "/var/lib/rootfs"    # --rootfs   (mutually: image OR rootfs)
 
 # command & ordering
 command    = ["/bin/sh", "-c", "exec app"]   # -- <command...>
-depends_on = ["db"]               # compose-only: start after these boxes
-# conditional dependencies (compose-only) — up WAITS for the condition before starting this box:
+depends_on = ["db"]               # start after these boxes
+# conditional dependencies — `up` WAITS for the condition before starting this box:
 depends_healthy   = ["db"]        # wait until each named box's health_cmd reports healthy
 depends_completed = ["migrate"]   # wait until each named box exits 0 (init-container / migration job)
 # Docker long-syntax is accepted verbatim too, so a docker-compose.yml block pastes in as-is:
@@ -57,13 +129,15 @@ tmpfs      = ["/tmp:64m"]         # --tmpfs  (repeatable; PATH[:size])
 
 # resources
 memory     = "512m"               # --memory / -m
-cpus       = "1.5"                # --cpus
-cpuset     = "0-3"                # --cpuset-cpus (CPU pinning via sched_setaffinity — works
-                                  #   rootless, no cgroup cpuset delegation needed)
+cpus       = "1.5"                # --cpus                (quota)
+cpuset     = "0-3"                # --cpuset-cpus         (pinning, via sched_setaffinity — rootless)
 swap_max   = "1g"                 # --memory-swap-max
 pids_limit = "512"                # --pids-limit
 io_weight  = "200"                # --io-weight (cgroup v2 io.weight, 1–10000)
 nice       = "5"                  # --nice (-20..19)
+# (Resource profiles attach on the CLI — `kern run vcpu:heavy vgpio:sensors -- cmd` — not via a box
+#  key yet. Docker's `profiles: [...]` service-gating key IS honored: a service with a non-empty
+#  profile list stays inactive unless enabled via COMPOSE_PROFILES, exactly like Docker.)
 
 # networking
 net        = false                # --net   (share host net; no isolation)
@@ -97,17 +171,17 @@ volumes    = ["/data:/data:ro", "/etc/app:/app"]  # --volume / -v  (repeatable)
 
 ### Key → flag map (the non-obvious ones)
 
-| TOML key      | CLI flag             |
-|---------------|----------------------|
-| `cpuset`      | `--cpuset-cpus`      |
-| `swap_max`    | `--memory-swap-max`  |
-| `ssh`         | `--ssh`              |
-| `user`        | `--user`             |
-| `volumes`     | `--volume` / `-v`    |
-| `env`         | `--env` / `-e`       |
-| `secrets`     | `--secret`           |
-| `ports`       | `--publish` / `-p`   |
-| `net`         | `--net`              |
+| TOML key   | CLI flag            |
+|------------|---------------------|
+| `cpuset`   | `--cpuset-cpus`     |
+| `swap_max` | `--memory-swap-max` |
+| `ssh`      | `--ssh`             |
+| `user`     | `--user`            |
+| `volumes`  | `--volume` / `-v`   |
+| `env`      | `--env` / `-e`      |
+| `secrets`  | `--secret`          |
+| `ports`    | `--publish` / `-p`  |
+| `net`      | `--net`             |
 
 Everything else shares the flag's long name (`memory`, `cpus`, `workdir`, `read_only`, `uid_range`,
 `bind_rootfs`, `restart`, `timeout`, `nice`, `tun`, `hostname`, `pids_limit`, `io_weight`, `tmpfs`,
@@ -115,61 +189,38 @@ Everything else shares the flag's long name (`memory`, `cpus`, `workdir`, `read_
 `health_cmd`/`health_interval`/`health_retries`/`health_start_period`/`health_timeout`/`health_action`
 family).
 
-## Reserved keys — shape frozen now, parsing lands in a later 0.5.x slice
+---
 
-These are **decided but not yet accepted**. A key kern-public doesn't implement yet is **ignored,
-not rejected** — the parser is deliberately tolerant, so a `kern.toml` shared with another kern
-edition (or a newer slice) still loads; the keys below simply do nothing until their slice ships.
-Their **names and array-vs-table shape are fixed now** so that when the owning slice lands, existing
-profiles don't have to change.
+## The one rule: TOML mirrors the CLI
 
-Scalars (0.5.x):
+Every key maps to a flag one-to-one — nothing to learn twice. If you know the flag, you know the key.
 
-```toml
-network  = "backend"     # --network NAME (inter-box; may require a helper — see SECURITY.md)
-```
-
-Arrays of tables (structured resources, 0.5.x) — one table per device. **Field names mirror the
-private runtime's `[[vgpio]]` / `[[vdisk]]` entries** (minus the GPU family), so a profile written
-against one is readable by the other:
-
-```toml
-[[box.api.vgpio]]        # I/O passthrough — per-pin/LED/I2C/SPI/UART/cam/audio (0.5.6)
-name    = "sensors"
-backend = "gpio:0"       # references a host GPIO controller
-pins    = [17, 27]       # plus: pwm, i2c, spi, uart, adc, onewire, can, camera,
-i2c     = ["1"]          #       audio, leds, bluetooth, usb, input, midi, display, net
-
-[[box.api.vdisk]]        # a named/quota disk volume (0.5.1)
-name       = "data"
-backend    = "disk:0"
-size       = "2g"        # quota
-iops       = 1000        # optional I/O limit
-bandwidth  = "50m"       # optional throughput limit
-persistent = true        # survive box removal
-```
-
-> **Deliberate divergences from the private (decided, not accidental):** the CPU/mem *flat* keys use
-> Docker-standard names — `cpus` = quota, `cpuset` = pinning — whereas the private uses
-> `vcpus` = quota, `cpus` = pinning. Public follows Docker here on purpose. There is **no
-> `seccomp = "off"` / `no_seccomp` / `no_cgroup` key** — the seccomp filter and the cgroup caps are
-> always on and cannot be disabled from a compose file (hardening over blind parity, by design). kern-public is also
-> dependency-free (hand-rolled parser), so it does **not** import the private's `serde`/`toml`
-> schema; and it is **box-centric** (`[box.NAME]` bundles a box) rather than the private's
-> resource-centric model (named `[[vcpu]]`/`[[vgpu]]` profiles attached by `vcpu:`/`vgpu:` prefix).
->
-> **Never public in 0.5:** the `[[vgpu]]`/`[[gpu]]` family (VRAM/compute/GPU access), the
-> `intelligence`, `pool`, and physical-resource-declaration sections are out of the 0.5 schema
-> entirely. See the roadmap.
+- **Scalar** → a **quoted string** carrying the exact CLI argument: `memory = "512m"`, `cpus = "1.5"`,
+  `cpuset = "0-3"`. (Numeric profile fields like `vcpus = 4.0` / `iops = 1000` / `priority = 80` are
+  bare numbers, as shown above.)
+- **Switch** → a **TOML bool**: `read_only = true`. A `false` (or absent) key emits no flag.
+- **Repeatable flag** → an **array**: `volumes = ["src:dst:ro"]`, `pins = [17, 27]`.
 
 ## Types & tolerance
 
 - Strings are double-quoted. An unquoted scalar (`memory = 512m`) for a key kern **implements** is a
   parse error — quote it. A *malformed value* of a recognized key is always caught, with its line.
-- Bools are bare `true` / `false`. Integers are bare (`health_interval = 30`).
-- Arrays are `["a", "b"]`; a comma inside a quoted element does not split it.
+- Bools are bare `true` / `false`. Integers/floats are bare (`health_interval = 30`, `vcpus = 4.0`).
+- Arrays are `["a", "b"]` / `[17, 27]`; a comma inside a quoted element does not split it.
 - `#` starts a comment outside a string.
 - **Unknown keys and sections are ignored, not rejected** — a `kern.toml` written for another kern
-  edition (with sections, keys, or TOML syntax this build doesn't model) still loads, so the config
-  is portable across editions. The trade-off is deliberate: a typo in a key name is silently skipped
-  rather than flagged, so lean on `kern validate` when authoring a profile.
+  edition still loads, so config is portable across editions. The trade-off is deliberate: a typo in a
+  key name is silently skipped, so lean on `kern config` / `kern top` (which validate live) when authoring.
+
+## Deliberate divergences from the private runtime
+
+- **Profiles are resource-centric and identical in shape** to the private (`[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]`
+  attached by prefix) — a profile file is portable between the two. Compose is the box-centric surface
+  (`[box.NAME]`), a public addition.
+- **CPU/mem flat compose keys use Docker names** — `cpus` = quota, `cpuset` = pinning — while a
+  `[[vcpu]]` *profile* uses `vcpus` = quota, `cpus` = pinning (private spelling). Chosen on purpose.
+- **No `seccomp = "off"` / `no_seccomp` / `no_cgroup` key** — the seccomp filter and the cgroup caps
+  are always on and cannot be disabled from config (hardening over blind parity, by design).
+- **Not public:** the `[[vgpu]]` / `[[gpu]]` family (VRAM/compute/GPU slices), and the `intelligence`
+  / `pool` sections, are on the [roadmap](../README.md#roadmap), not in the schema yet. A config that
+  declares them still loads (the keys are ignored) so it stays portable.

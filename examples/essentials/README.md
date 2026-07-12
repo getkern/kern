@@ -1,7 +1,7 @@
 # Essential workflows
 
 The everyday container tasks — a throwaway box, a service on a port, your code
-in a clean image, hard resource caps — daemonless, rootless, in one ~1 MB binary.
+in a clean image, hard resource caps — daemonless, rootless, in one ~1.5 MB binary.
 
 | Task | kern |
 |---|---|
