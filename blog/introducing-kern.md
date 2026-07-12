@@ -117,7 +117,7 @@ kern doctor                                    # will boxes even run on this hos
 
 kern deliberately skips a lot that Docker has — overlay networks, a plugin ecosystem — because the
 point is a small, fast, honest core you can read, embed, and put anywhere. Everything above works
-today and is tested (398 tests, clippy-clean, security-audited slice by slice). The CLI isn't frozen
+today and is tested (419 tests, clippy-clean, security-audited slice by slice). The CLI isn't frozen
 until 1.0.
 
 Code, benchmarks, and the honest security account:
