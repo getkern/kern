@@ -4,8 +4,10 @@
 //! `VOLUME`, `HEALTHCHECK` and `STOPSIGNAL` are ACCEPTED (parsed, no build-time effect) so stock
 //! upstream Dockerfiles build instead of failing; `HEALTHCHECK` nudges the user to kern's runtime
 //! `--health-cmd`. `SHELL [...]` swaps the shell that wraps shell-form RUN/CMD/ENTRYPOINT.
-//! Real-world flags are accepted and dropped: `FROM --platform=`, BuildKit `RUN --mount/--network/
-//! --security`, and `COPY`/`ADD --chown/--chmod/--link/--checksum/--exclude/--parents/--keep-git-dir`.
+//! Real-world flags are accepted: `FROM --platform=`, BuildKit `RUN --mount/--network/--security`,
+//! and `COPY`/`ADD --chown/--link/--exclude/--parents/--keep-git-dir` are dropped; `--checksum` and
+//! `--chmod` are HONOURED for the file an `ADD <url>` / `COPY <<heredoc` creates (so a fetched binary
+//! lands executable), and dropped for a local-file COPY/ADD (source mode is kept).
 //! Whole-line `#` comments are honoured even INSIDE a `\` continuation (Docker strips them before
 //! joining), so a `RUN a \` … `# note` … `&& b` folds to one instruction.
 //! Multi-stage builds are supported: `FROM … AS <name>` and `COPY --from=<stage>` are parsed here
@@ -56,18 +58,23 @@ pub enum Instr {
     Entrypoint(Vec<String>),
     Expose(String),
     /// `ADD <url> <dst>` — fetch a remote file into the image at build time. `checksum` is the
-    /// optional BuildKit `--checksum=<algo>:<hex>` the executor verifies after download. Only the
-    /// URL form of `ADD` produces this; a local-file `ADD`/`COPY` is an [`Instr::Copy`].
+    /// optional BuildKit `--checksum=<algo>:<hex>` the executor verifies after download; `chmod` is the
+    /// optional `--chmod=<octal>` mode (needed for the download-a-binary-and-run-it pattern, where the
+    /// fetched file must be executable). Only the URL form of `ADD` produces this; a local-file
+    /// `ADD`/`COPY` is an [`Instr::Copy`].
     AddUrl {
         url: String,
         dst: String,
         checksum: Option<String>,
+        chmod: Option<String>,
     },
     /// `COPY <<DELIM … DELIM <dst>` — BuildKit's inline-file COPY: the heredoc body is written
-    /// verbatim to `dst` in the image, no build context needed.
+    /// verbatim to `dst` in the image, no build context needed. `chmod` is the optional `--chmod=<octal>`
+    /// (a heredoc script commonly needs `--chmod=755`).
     WriteFile {
         content: String,
         dst: String,
+        chmod: Option<String>,
     },
 }
 
@@ -446,8 +453,17 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         return err(&format!("unterminated heredoc `<<{}`", hd.delim));
                     }
                     // The opener minus any flags and the `<<DELIM` operator token is the destination.
+                    // A `--chmod=<octal>` is captured (a heredoc script usually needs `--chmod=755`);
+                    // other flags are dropped.
                     let mut toks = split_ws(&subst(rest, &vars));
-                    while toks.first().is_some_and(|t| t.starts_with("--")) {
+                    let mut hd_chmod: Option<String> = None;
+                    while let Some(t) = toks.first() {
+                        let Some(flag) = t.strip_prefix("--") else {
+                            break;
+                        };
+                        if let Some(m) = flag.strip_prefix("chmod=") {
+                            hd_chmod = Some(m.to_string());
+                        }
                         toks.remove(0);
                     }
                     toks.retain(|t| !t.contains("<<"));
@@ -457,6 +473,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     out.push(Instr::WriteFile {
                         content: hd.body.clone(),
                         dst: toks.pop().unwrap(),
+                        chmod: hd_chmod,
                     });
                     continue;
                 }
@@ -466,13 +483,17 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 // `--link`, `--checksum`, `--exclude`, `--parents`, ADD's `--keep-git-dir` — are
                 // accepted and dropped (kern copies as-is). Anything else, or `--from` on `ADD`, errors.
                 let mut from: Option<CopyFrom> = None;
-                // `ADD --checksum=<algo>:<hex> <url> <dst>` — captured so the executor can verify the
-                // downloaded file (dropped for a local-file ADD/COPY, where it has no effect).
+                // `--checksum=<algo>:<hex>` (verify a downloaded ADD url) and `--chmod=<octal>` (the mode
+                // for a file this instruction CREATES — an ADD url or a COPY heredoc) are captured so the
+                // executor can apply them. For a local-file COPY/ADD they're dropped (source mode is kept).
                 let mut checksum: Option<String> = None;
+                let mut chmod: Option<String> = None;
                 while toks.first().is_some_and(|t| t.starts_with("--")) {
                     let flag = toks.remove(0);
                     if let Some(cs) = flag.strip_prefix("--checksum=") {
                         checksum = Some(cs.to_string());
+                    } else if let Some(m) = flag.strip_prefix("--chmod=") {
+                        chmod = Some(m.to_string());
                     } else if kw == "COPY" && flag.starts_with("--from=") {
                         let x = flag["--from=".len()..].to_string();
                         // Resolve `--from=<X>` at parse time. A build STAGE wins over an image of the same
@@ -520,7 +541,12 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     }
                     let dst = toks.pop().unwrap();
                     let url = toks.pop().unwrap();
-                    out.push(Instr::AddUrl { url, dst, checksum });
+                    out.push(Instr::AddUrl {
+                        url,
+                        dst,
+                        checksum,
+                        chmod,
+                    });
                     continue;
                 }
                 if toks.len() < 2 {
@@ -1416,16 +1442,18 @@ mod tests {
             Instr::WriteFile {
                 content: "hello\nworld".into(),
                 dst: "/app/x".into(),
+                chmod: None,
             }
         );
-        // A quoted delimiter + a leading `--chmod` flag: the flag is dropped, dst still resolved,
-        // body kept verbatim (no `${VAR}` expansion inside).
+        // A quoted delimiter + a leading `--chmod` flag: the mode is CAPTURED (a heredoc script needs
+        // it), dst still resolved, body kept verbatim (no `${VAR}` expansion inside).
         let df2 = "FROM alpine\nCOPY --chmod=755 <<\"EOF\" /run.sh\n#!/bin/sh\necho ${NOPE}\nEOF\n";
         assert_eq!(
             parse(df2, &ba()).unwrap()[1],
             Instr::WriteFile {
                 content: "#!/bin/sh\necho ${NOPE}".into(),
                 dst: "/run.sh".into(),
+                chmod: Some("755".into()),
             }
         );
         // ADD heredoc (extract-to-dir) is still rejected clearly.
@@ -1580,9 +1608,10 @@ mod tests {
                 url: "https://example.com/f.tar.gz".into(),
                 dst: "/tmp/f.tar.gz".into(),
                 checksum: None,
+                chmod: None,
             }
         );
-        // With a BuildKit `--checksum` (captured for the executor to verify).
+        // With BuildKit `--checksum` (verified) and `--chmod` (applied — the download-a-binary pattern).
         let df2 = "FROM alpine\nADD --chmod=755 --checksum=sha256:abc123 https://x/y /y\n";
         assert_eq!(
             parse(df2, &ba()).unwrap()[1],
@@ -1590,6 +1619,7 @@ mod tests {
                 url: "https://x/y".into(),
                 dst: "/y".into(),
                 checksum: Some("sha256:abc123".into()),
+                chmod: Some("755".into()),
             }
         );
         // A local-file ADD stays a Copy (no URL).

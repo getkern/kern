@@ -6445,17 +6445,28 @@ fn build_run(
                 }
                 i += 1;
             }
-            Instr::AddUrl { url, dst, checksum } => {
+            Instr::AddUrl {
+                url,
+                dst,
+                checksum,
+                chmod,
+            } => {
                 announce(step, format!("ADD {url} {dst}"));
                 let dl = work.join(format!("addurl{step}"));
                 let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
+                apply_chmod(&dl.join(&name), chmod.as_deref())?;
                 copy_into_rootfs(&dl, &name, &write_dir, dst, config.workdir.as_deref(), &[])?;
                 i += 1;
             }
-            Instr::WriteFile { content, dst } => {
+            Instr::WriteFile {
+                content,
+                dst,
+                chmod,
+            } => {
                 announce(step, format!("COPY (inline heredoc) {dst}"));
                 let dl = work.join(format!("inline{step}"));
                 write_inline_file(&dl, content)?;
+                apply_chmod(&dl.join("f"), chmod.as_deref())?;
                 copy_into_rootfs(&dl, "f", &write_dir, dst, config.workdir.as_deref(), &[])?;
                 i += 1;
             }
@@ -6569,6 +6580,23 @@ fn fetch_add_url(
         verify_download_checksum(&out, cs)?;
     }
     Ok(name.to_string())
+}
+
+/// Apply a Dockerfile `--chmod=<octal>` to a file the build just CREATED (an ADD-url download or a
+/// COPY-heredoc body), so `ADD --chmod=755 <url> /bin/tool` lands executable (the download-and-run
+/// pattern) — curl/`std::fs::write` create it 0644 otherwise. `None` = no flag, leave the mode as-is.
+/// The octal is parsed leniently (`755`, `0755`, `0o755`); a non-octal mode is a clear error.
+fn apply_chmod(path: &std::path::Path, mode: Option<&str>) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = mode else { return Ok(()) };
+    let cleaned = mode.trim().trim_start_matches("0o");
+    let bits = u32::from_str_radix(cleaned, 8).map_err(|_| {
+        Error::Sandbox(format!(
+            "--chmod: invalid mode '{mode}' (use an octal mode like 755 or 0644)"
+        ))
+    })?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits))
+        .map_err(|e| Error::Sandbox(format!("--chmod {mode}: {e}")))
 }
 
 /// Write an inline `COPY <<heredoc` body to a scratch file `dir/f` (a fresh dir), so the same
@@ -6784,15 +6812,21 @@ fn build_layered_cached(
                 layer_keys.push(key.clone());
                 i += 1;
             }
-            Instr::AddUrl { url, dst, checksum } => {
-                // Key on url + checksum + dst: with a `--checksum` this layer is fully
+            Instr::AddUrl {
+                url,
+                dst,
+                checksum,
+                chmod,
+            } => {
+                // Key on url + checksum + chmod + dst: with a `--checksum` this layer is fully
                 // content-addressed; without one, the URL string identifies it (a changed remote
                 // won't bust the cache — the documented BuildKit behaviour, so pin with --checksum).
                 key = layer_key(
                     &key,
                     &format!(
-                        "ADDURL\u{0}{url}\u{0}{}\u{0}{dst}\u{0}WD\u{0}{}",
+                        "ADDURL\u{0}{url}\u{0}{}\u{0}{}\u{0}{dst}\u{0}WD\u{0}{}",
                         checksum.as_deref().unwrap_or(""),
+                        chmod.as_deref().unwrap_or(""),
                         config.workdir.as_deref().unwrap_or(""),
                     ),
                 );
@@ -6808,6 +6842,7 @@ fn build_layered_cached(
                         .map_err(|e| Error::Sandbox(format!("build layer: {e}")))?;
                     let dl = work.join(format!("addurl{unit}"));
                     let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
+                    apply_chmod(&dl.join(&name), chmod.as_deref())?;
                     copy_into_rootfs(&dl, &name, &fresh, dst, config.workdir.as_deref(), &chain)?;
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
@@ -6816,13 +6851,18 @@ fn build_layered_cached(
                 layer_keys.push(key.clone());
                 i += 1;
             }
-            Instr::WriteFile { content, dst } => {
-                // Content-addressed: the full body is folded into the layer key (layer_key hashes its
-                // whole repr), so editing the heredoc busts the cache.
+            Instr::WriteFile {
+                content,
+                dst,
+                chmod,
+            } => {
+                // Content-addressed: the full body (+ chmod) is folded into the layer key (layer_key
+                // hashes its whole repr), so editing the heredoc or its mode busts the cache.
                 key = layer_key(
                     &key,
                     &format!(
-                        "WRITEFILE\u{0}{dst}\u{0}WD\u{0}{}\u{0}{content}",
+                        "WRITEFILE\u{0}{dst}\u{0}{}\u{0}WD\u{0}{}\u{0}{content}",
+                        chmod.as_deref().unwrap_or(""),
                         config.workdir.as_deref().unwrap_or(""),
                     ),
                 );
@@ -6838,6 +6878,7 @@ fn build_layered_cached(
                         .map_err(|e| Error::Sandbox(format!("build layer: {e}")))?;
                     let dl = work.join(format!("inline{unit}"));
                     write_inline_file(&dl, content)?;
+                    apply_chmod(&dl.join("f"), chmod.as_deref())?;
                     copy_into_rootfs(&dl, "f", &fresh, dst, config.workdir.as_deref(), &chain)?;
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
@@ -9466,7 +9507,36 @@ mod net_resource_tests {
 
 #[cfg(test)]
 mod add_url_tests {
-    use super::add_url_basename;
+    use super::{add_url_basename, apply_chmod};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn apply_chmod_sets_the_mode_and_rejects_garbage() {
+        let dir = std::env::temp_dir().join(format!("kern-chmod-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        // None → leave as-is (no error).
+        assert!(apply_chmod(&f, None).is_ok());
+        // Octal forms: 755, 0755, 0o755 all → rwxr-xr-x (0o755).
+        for m in ["755", "0755", "0o755"] {
+            apply_chmod(&f, Some(m)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o755,
+                "mode {m}"
+            );
+        }
+        apply_chmod(&f, Some("644")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        // A non-octal mode is a clear error, not a silent no-op.
+        assert!(apply_chmod(&f, Some("rwx")).is_err());
+        assert!(apply_chmod(&f, Some("999")).is_err()); // 9 isn't an octal digit
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn add_url_basename_is_a_safe_filename() {
@@ -9483,7 +9553,7 @@ mod add_url_tests {
         assert_eq!(add_url_basename("https://x.io/"), "download");
         // A bare host with no path segment yields the host as a (harmless, non-escaping) name.
         assert_eq!(add_url_basename("https://x.io"), "x.io");
-                                                                  // A separator or NUL smuggled into the last segment (defensive) → safe name.
+        // A separator or NUL smuggled into the last segment (defensive) → safe name.
         assert_eq!(add_url_basename("https://x.io/a\\b"), "download");
         assert_eq!(add_url_basename("https://x.io/a\0b"), "download");
     }
