@@ -280,6 +280,12 @@ fn heredoc_run_argv(rest: &str, heredocs: &[Heredoc]) -> Result<Vec<String>, Str
 /// table (they override any in-file `ARG` default). Returns a human-readable error on the first
 /// malformed or unsupported line, tagged with the 1-based line number.
 pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Instr>, String> {
+    // A leading UTF-8 BOM (editors on Windows add one) would glue onto the first `FROM`; strip it so
+    // the file parses like Docker, which ignores a BOM.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // Parser directives (`# escape=…`, `# syntax=…`) sit at the very top as comments; `escape` selects
+    // the line-continuation char (default `\`, or a backtick for Windows-style Dockerfiles).
+    let esc = escape_directive(text);
     let mut out = Vec::new();
     // Substitution table: `ARG` defaults + `--build-arg` overrides + `ENV` values, applied to later
     // instruction operands. `build_args` win over in-file `ARG` defaults (Docker semantics).
@@ -299,7 +305,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
     // `COPY --from=<name-or-index>` against EARLIER stages only (no forward-ref, no self-ref).
     let mut stage_names: Vec<Option<String>> = Vec::new();
 
-    for ll in logical_lines(text).into_iter() {
+    for ll in logical_lines(text, esc).into_iter() {
         let Logical {
             lineno,
             text: logical,
@@ -625,12 +631,40 @@ pub fn resolve_from(from: &str, stage_names: &[Option<String>], upto: usize) -> 
         .position(|n| n.as_deref() == Some(want.as_str()))
 }
 
-/// Fold physical lines into logical ones: drop full-line comments, honour a trailing `\`
-/// continuation, and — for a RUN/COPY/ADD line that OPENS a heredoc (`<<DELIM`) — consume the
-/// following physical lines VERBATIM (no comment stripping, no continuation) as the heredoc body,
+/// The line-continuation char selected by a `# escape=` parser directive: `\` (default) or a
+/// backtick (Windows-style Dockerfiles). Only a directive at the very top counts — Docker stops
+/// scanning directives at the first line that isn't one (a blank line, a normal comment, or an
+/// instruction), so a mid-file `# escape=` is just a comment.
+fn escape_directive(text: &str) -> char {
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(body) = line.strip_prefix('#') else {
+            break; // first non-comment line ends the directive block
+        };
+        let body = body.trim();
+        let Some((key, val)) = body.split_once('=') else {
+            break; // a normal comment (no `key=value`) ends the directive block
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "escape" => match val.trim() {
+                "`" => return '`',
+                "\\" => return '\\',
+                _ => return '\\', // invalid value → Docker keeps the default
+            },
+            // Other known directives (`syntax`, `check`) don't affect us; keep scanning.
+            "syntax" | "check" => continue,
+            _ => break, // unknown `key=value` isn't a parser directive → end of block
+        }
+    }
+    '\\'
+}
+
+/// Fold physical lines into logical ones: drop full-line comments, honour a trailing continuation
+/// (`esc`, normally `\`), and — for a RUN/COPY/ADD line that OPENS a heredoc (`<<DELIM`) — consume
+/// the following physical lines VERBATIM (no comment stripping, no continuation) as the heredoc body,
 /// up to the closing delimiter (tab-indented close allowed for `<<-`). Each `Logical` carries the
 /// opener text plus any attached heredoc bodies.
-fn logical_lines(text: &str) -> Vec<Logical> {
+fn logical_lines(text: &str, esc: char) -> Vec<Logical> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     let mut idx = 0;
@@ -664,7 +698,7 @@ fn logical_lines(text: &str) -> Vec<Logical> {
             let raw = lines[idx];
             let trimmed_end = raw.trim_end();
             idx += 1;
-            if let Some(stripped) = trimmed_end.strip_suffix('\\') {
+            if let Some(stripped) = trimmed_end.strip_suffix(esc) {
                 cur.push_str(stripped);
                 cur.push(' ');
                 if idx >= lines.len() {
@@ -1410,6 +1444,38 @@ mod tests {
             run_script(&got[1]).split_whitespace().collect::<Vec<_>>(),
             ["set", "-x", "&&", "echo", "hi", "&&", "echo", "bye"]
         );
+    }
+
+    #[test]
+    fn bom_and_escape_parser_directive() {
+        // A leading UTF-8 BOM is stripped (Windows editors add one) — the file parses like Docker.
+        assert_eq!(
+            parse("\u{feff}FROM alpine\nRUN echo hi\n", &ba()).unwrap()[0],
+            from("alpine")
+        );
+        // `# escape=\`` flips the line-continuation char to a backtick; `\` is then literal.
+        let df = "# escape=`\nFROM alpine\nRUN echo a `\n  && echo b\n";
+        assert_eq!(
+            run_script(&parse(df, &ba()).unwrap()[1])
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["echo", "a", "&&", "echo", "b"]
+        );
+        // The directive must be at the very top: after a normal comment it's just a comment (one-shot
+        // rule), so the DEFAULT `\` continuation still applies.
+        let after = "# a comment\n# escape=`\nFROM alpine\nRUN echo a \\\n  && echo b\n";
+        assert_eq!(
+            run_script(&parse(after, &ba()).unwrap()[1])
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["echo", "a", "&&", "echo", "b"]
+        );
+        // `# syntax=` before `# escape=` doesn't end the directive block.
+        assert!(parse(
+            "# syntax=docker/dockerfile:1\n# escape=`\nFROM alpine\nRUN echo a `\n  && echo b\n",
+            &ba()
+        )
+        .is_ok());
     }
 
     #[test]
