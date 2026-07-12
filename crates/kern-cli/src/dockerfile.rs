@@ -645,16 +645,20 @@ fn logical_lines(text: &str) -> Vec<Logical> {
         let mut cur = String::new();
         let mut first = true;
         loop {
-            // A whole-line `#` comment INSIDE a continuation is dropped and the continuation carries
-            // on (Docker removes comment lines before joining, and a trailing `\` in a comment does
-            // NOT continue). The opener itself (`first`) is guaranteed non-comment by the outer check,
-            // so real content like `RUN echo '# not a comment'` is never mistaken for one.
-            if !first && lines[idx].trim_start().starts_with('#') {
-                idx += 1;
-                if idx >= lines.len() {
-                    break;
+            // A whole-line `#` comment OR a blank line INSIDE a continuation is skipped and the
+            // continuation carries on — BuildKit ignores both while accumulating a `\`-continued line
+            // (a trailing `\` in a comment does NOT itself continue). The opener (`first`) is
+            // guaranteed non-comment/non-blank by the outer loop, so real content like
+            // `RUN echo '# not a comment'` is never mistaken for one.
+            if !first {
+                let t = lines[idx].trim_start();
+                if t.is_empty() || t.starts_with('#') {
+                    idx += 1;
+                    if idx >= lines.len() {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
             }
             first = false;
             let raw = lines[idx];
@@ -1406,6 +1410,21 @@ mod tests {
             run_script(&got[1]).split_whitespace().collect::<Vec<_>>(),
             ["set", "-x", "&&", "echo", "hi", "&&", "echo", "bye"]
         );
+    }
+
+    #[test]
+    fn blank_line_inside_a_continuation_keeps_folding() {
+        // BuildKit skips BOTH blank and comment lines while accumulating a `\`-continued line, so an
+        // explicit trailing `\` continues across an empty line (author's evident intent).
+        let df = "FROM alpine\nRUN echo a \\\n\n# mid comment\n\n    && echo b \\\n    && echo c\n";
+        assert_eq!(
+            run_script(&parse(df, &ba()).unwrap()[1])
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["echo", "a", "&&", "echo", "b", "&&", "echo", "c"]
+        );
+        // A trailing `\` right before EOF (after a blank) doesn't panic and just ends the instruction.
+        assert!(parse("FROM alpine\nRUN echo x \\\n\n", &ba()).is_ok());
     }
 
     #[test]
