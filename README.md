@@ -35,7 +35,7 @@ It's built around one idea — *virtual resources*. A container is the first res
 (isolation); the same model extends to **CPU, memory, disk (`vdisk:`) and GPIO (`vgpio:`)** slices
 today, and to GPU slices on the roadmap. A full daemonless container UX — OCI pull **and build**,
 overlay, volumes, secrets, in-box SSH, `cp`/`pause`/`attach`, `ps`/`exec`/`logs`, compose, health,
-`tag`/`push` — in ~1.5 MB.
+`tag`/`push`, `save`/`load` — in ~1.5 MB.
 
 ```sh
 kern box dev --image alpine -- sh        # a throwaway, isolated Alpine shell — in a few ms
@@ -314,18 +314,23 @@ kern builds OCI images from a Dockerfile **without a daemon** — each `RUN` is 
 step a content-addressed layer, reused on an unchanged rebuild.
 
 ```sh
-kern build -t app:1 -f Dockerfile .          # FROM / RUN / COPY / WORKDIR / ENV / CMD / ENTRYPOINT …
+kern build -t app:1 -f Dockerfile .          # FROM RUN COPY ADD ENV WORKDIR USER CMD ENTRYPOINT SHELL …
 kern build -t app:1 --build-arg VER=9 .       # build args; multi-stage (FROM … AS b; COPY --from=b)
+kern save app:1 -o app.tar                    # export a docker-load-compatible image tar …
+kern load -i app.tar                          # … and import one (docker save format)
 kern tag app:1 registry.example/app:1         # give a cached image a second name
 kern login registry.example                   # (private) — creds stored 0600
 kern push registry.example/app:1              # publish as a single-layer OCI image
 ```
 
-**Multi-stage** builds run each stage in its own box and confine `COPY --from=<stage>` to that stage's
-filesystem (a hostile source path or symlink can't read the host). Layers pull as gzip **or zstd**.
-`push` normalizes ownership and strips setuid/setgid, so an untrusted base can't smuggle a
-privilege-bit into what you publish. (`build`/`push` are the newest surface — see
-[Project status](#project-status).)
+kern parses **real-world Dockerfiles** as-is — comments inside `\` continuations, `SHELL`, BuildKit
+`RUN --mount`/`ADD <url>` (with `--checksum`/`--chmod`) / `COPY <<heredoc`, `FROM scratch`, `# escape`
+and BOM — and honours **`.dockerignore`** (also `.kernignore`), so a `COPY . /app` won't bake your
+`.git`, `.env` or secrets into the image. **Multi-stage** builds run each stage in its own box and
+confine `COPY --from=<stage>` to that stage's filesystem (a hostile source path or symlink can't read
+the host). Layers pull as gzip **or zstd**. `push` normalizes ownership and strips setuid/setgid, so an
+untrusted base can't smuggle a privilege-bit into what you publish. (`build`/`push` are the newest
+surface — see [Project status](#project-status).)
 
 ## Embed it
 
@@ -401,8 +406,10 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 | From your Docker setup | kern |
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run — multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd** |
-| **`docker-compose.yml`** | ✅ `kern compose` reads it — `depends_on`, `healthcheck`, `deploy.resources.limits` |
-| **Dockerfile** `build` | ✅ `kern build` — all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), BuildKit **heredocs**, `--build-arg`, layer cache. Daemonless: each `RUN` is a real box |
+| **`docker-compose.yml`** | ✅ `kern compose` reads real-world files as-is — `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `${VAR:-default}` interpolation, network **aliases** |
+| **Dockerfile** `build` | ✅ `kern build` — all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod`, `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, layer cache — and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box |
+| **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context — keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
+| **`docker save` / `load` archives** | ✅ `kern save` / `kern load` — export/import an image tar, `docker load`-compatible |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
 | **Docker Engine API** / `docker.sock` | ❌ — tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
 | **Swarm** | ❌ — use `compose` / `--pod` |
@@ -510,8 +517,8 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 
 ## Project status
 
-**0.6.3 — a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (**419 tests**, clippy-clean,
+**0.6.4 — a daemonless container + resource runtime that does less than Docker, on purpose.**
+Everything in [Features](#features) works today and is tested (**450 tests**, clippy-clean,
 `cargo-deny`-clean, security-audited slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem) — the point is a small, fast, honest core. The
 CLI and config surface are **not frozen until 1.0**.
@@ -521,6 +528,13 @@ CLI and config surface are **not frozen until 1.0**.
 pods (`--pod` / `--no-outbound`), and the **Python** binding. `build`/`push` are the newest, deepest
 surface — audited (COPY-from confinement, setuid/opaque hardening) and, where a rootless-overlay
 kernel can't persist an opaque dir, they **fail closed** to a safe path rather than leak.
+
+**New in 0.6.4:** `kern build` now parses **real-world Dockerfiles** (comments inside `\`
+continuations, `SHELL`, `ADD <url>` with `--checksum`/`--chmod`, `COPY <<heredoc`, `FROM scratch`,
+`# escape`/BOM, BuildKit `RUN --mount` flags, auto `TARGETARCH`) and honours **`.dockerignore`** /
+`.kernignore` (so `COPY . /app` stops leaking `.git`/secrets — a no-follow filtered copy); `kern
+compose` reads real `docker-compose.yml` files as-is (YAML **anchors/merge**, **`extends`**, network
+**aliases**, `${VAR:-default}`, block scalars) instead of demanding a rewrite.
 
 **New in 0.6.3:** a guided, *"impossible to get wrong"* profile editor in `kern top` (pick the devices
 the host actually exposes; every typed field validated live against the same rule the save uses), and a
