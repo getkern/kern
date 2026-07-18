@@ -18,25 +18,26 @@ edition still loads. A *malformed value* of a key it DOES implement is always an
 ## Resource profiles
 
 Profiles are **resource-centric**: you declare a named slice once, then attach it to as many boxes as
-you like by its prefix. This mirrors the private runtime's model exactly, so a profile written for one
-is readable by the other (minus the GPU family, which stays private — see [Roadmap](../README.md#roadmap)).
+you like by its prefix. This mirrors the private runtime's model (declare-then-carve, attach-by-prefix);
+the CPU field names are spelled to match the CLI flags here — see the divergence note at the end. The
+GPU family stays private — see [Roadmap](../README.md#roadmap).
 
 ### `[[vcpu]]` — a CPU + memory slice · attach with `vcpu:<name>`
 
 ```toml
 [[vcpu]]
 name     = "heavy"
-vcpus    = 4.0         # core QUOTA (cgroup cpu.max): 4.0 = four cores, 0.5 = half a core
-memory   = "2 GB"      # RAM limit (cgroup memory.max)
-cpus     = "0-7"       # optional CPU PINNING (cpulist); mutually exclusive with `numa`
+cpus     = 4.0         # core QUOTA (cgroup cpu.max), like --cpus: 4.0 = four cores, 0.5 = half a core
+memory   = "2 GB"      # RAM limit (cgroup memory.max), like --memory
+cpuset   = "0-7"       # optional CPU PINNING (cpulist), like --cpuset-cpus; exclusive with `numa`
 numa     = 0           # optional: pin to this NUMA node's CPUs
-priority = 80          # optional: 0 (low) – 99 (high), mapped to nice
+nice     = -5          # optional: scheduling priority, like --nice (-20 high … 19 low)
 backend  = "cpu:0"     # optional: reference a [[cpu]] declaration to carve from; omit = standalone
 extends  = "base"      # optional: inherit another [[vcpu]] by name
 ```
 
-> Note the deliberate spelling: in a profile, **`vcpus` = quota** and **`cpus` = pinning** (same as
-> the private runtime). The CLI flags stay Docker-aligned — `--cpus` = quota, `--cpuset-cpus` = pinning.
+> Profile fields match the CLI flags **1:1** — `cpus` = `--cpus` (quota), `cpuset` = `--cpuset-cpus`
+> (pinning), `memory` = `--memory`, `nice` = `--nice`. Know the flag, know the field.
 
 ### `[[vgpio]]` — device passthrough · attach with `vgpio:<name>`
 
@@ -80,7 +81,7 @@ standalone. Field shapes:
 
 ```toml
 [[cpu]]   # a physical CPU budget a [[vcpu]] splits
-id = "0"; vcpus = 16.0; memory = "32 GB"; cpus = "0-15"; numa = 0
+id = "0"; cores = 16.0; memory = "32 GB"; cpuset = "0-15"; numa = 0
 
 [[gpio]]  # a physical GPIO / peripheral controller a [[vgpio]] draws from
 id = "0"; total_pins = 40; pins = [2, 3, 4, 17, 27]; i2c = ["1"]; leds = ["led0"]
@@ -196,7 +197,7 @@ family).
 Every key maps to a flag one-to-one — nothing to learn twice. If you know the flag, you know the key.
 
 - **Scalar** → a **quoted string** carrying the exact CLI argument: `memory = "512m"`, `cpus = "1.5"`,
-  `cpuset = "0-3"`. (Numeric profile fields like `vcpus = 4.0` / `iops = 1000` / `priority = 80` are
+  `cpuset = "0-3"`. (Numeric profile fields like `cpus = 4.0` / `iops = 1000` / `nice = -5` are
   bare numbers, as shown above.)
 - **Switch** → a **TOML bool**: `read_only = true`. A `false` (or absent) key emits no flag.
 - **Repeatable flag** → an **array**: `volumes = ["src:dst:ro"]`, `pins = [17, 27]`.
@@ -205,7 +206,7 @@ Every key maps to a flag one-to-one — nothing to learn twice. If you know the 
 
 - Strings are double-quoted. An unquoted scalar (`memory = 512m`) for a key kern **implements** is a
   parse error — quote it. A *malformed value* of a recognized key is always caught, with its line.
-- Bools are bare `true` / `false`. Integers/floats are bare (`health_interval = 30`, `vcpus = 4.0`).
+- Bools are bare `true` / `false`. Integers/floats are bare (`health_interval = 30`, `cpus = 4.0`).
 - Arrays are `["a", "b"]` / `[17, 27]`; a comma inside a quoted element does not split it.
 - `#` starts a comment outside a string.
 - **Unknown keys and sections are ignored, not rejected** — a `kern.toml` written for another kern
@@ -217,8 +218,9 @@ Every key maps to a flag one-to-one — nothing to learn twice. If you know the 
 - **Profiles are resource-centric and identical in shape** to the private (`[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]`
   attached by prefix) — a profile file is portable between the two. Compose is the box-centric surface
   (`[box.NAME]`), a public addition.
-- **CPU/mem flat compose keys use Docker names** — `cpus` = quota, `cpuset` = pinning — while a
-  `[[vcpu]]` *profile* uses `vcpus` = quota, `cpus` = pinning (private spelling). Chosen on purpose.
+- **CPU field names match the CLI everywhere** — `cpus` = quota, `cpuset` = pinning in both the flat
+  compose keys AND the `[[vcpu]]` profile. This aligns the public schema with the flags 1:1, diverging
+  from the private runtime's older `vcpus` = quota / `cpus` = pinning spelling. Chosen on purpose.
 - **No `seccomp = "off"` / `no_seccomp` / `no_cgroup` key** — the seccomp filter and the cgroup caps
   are always on and cannot be disabled from config (hardening over blind parity, by design).
 - **Not public:** the `[[vgpu]]` / `[[gpu]]` family (VRAM/compute/GPU slices), and the `intelligence`

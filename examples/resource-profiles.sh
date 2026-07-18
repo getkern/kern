@@ -30,7 +30,7 @@ echo "── 1. it's valid kern.toml:"
 
 echo
 echo "── 2. attach vcpu:slim and see it RESOLVE into concrete caps (--show-config is a dry run):"
-echo "     (memory in bytes, cpus = quota, cpuset = pinning, nice from priority)"
+echo "     (memory in bytes, cpus = quota, cpuset = pinning, nice = scheduling priority)"
 "$kern" box rp-slim --image "$img" --config "$cfg" vcpu:slim vdisk:scratch --show-config \
   | grep -E '^(name|memory|cpus|cpuset|nice):' | sed 's/^/   /'
 

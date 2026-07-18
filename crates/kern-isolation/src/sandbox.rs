@@ -68,7 +68,7 @@
 //! // "use vcpu:small, but bump CPU to 4 cores for this run":
 //! let out = Sandbox::builder()
 //!     .rootfs("/rootfs").config("./kern.toml")
-//!     .profile("vcpu:small")   // e.g. vcpus=1.5, memory=256m
+//!     .profile("vcpu:small")   // e.g. cpus=1.5, memory=256m
 //!     .cpus(4.0)               // WINS over the profile's 1.5; memory stays 256m
 //!     .build().unwrap()
 //!     .run("true", &[]).unwrap();

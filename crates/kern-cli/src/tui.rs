@@ -893,10 +893,10 @@ fn profile_rows(cfg: &crate::config::KernConfig) -> Vec<ProfRow> {
     let mut out = Vec::new();
     for e in &cfg.vcpu {
         let mut parts = Vec::new();
-        if let Some(q) = e.vcpus {
+        if let Some(q) = e.cpus {
             parts.push(format!("{} cores", trim_f(q)));
         }
-        if let Some(c) = &e.cpus {
+        if let Some(c) = &e.cpuset {
             parts.push(format!("pin {c}"));
         }
         if let Some(m) = &e.memory {
@@ -1011,12 +1011,11 @@ fn section_fields(section: &str) -> Vec<Field> {
     match section {
         "vcpu" => vec![
             Field::text("name", "e.g. heavy"),
-            Field::text("vcpus", "cores, e.g. 4 or 0.5"),
-            Field::text("cpus", "pin list, e.g. 0-3"),
-            Field::text("memory", "e.g. 512m, 2g"),
-            Field::text("priority", "0-99 (optional)"),
+            Field::text("cpus", "cores, e.g. 4 or 0.5 (= --cpus)"),
+            Field::text("cpuset", "pin list, e.g. 0-3 (= --cpuset-cpus)"),
+            Field::text("memory", "e.g. 512m, 2g (= --memory)"),
+            Field::text("nice", "-20..19 (optional, = --nice)"),
             Field::text("numa", "NUMA node, e.g. 0 (optional)"),
-            Field::text("nice", "-20..19 (optional)"),
             backend_field("vcpu"),
             Field::text("extends", "base profile (optional)"),
         ],
@@ -1179,8 +1178,12 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
         }
         ("vgpio", "extra") => "Any other /dev path to pass, only if you know it exists.",
         ("vcpu", "name") => "A label for this CPU/memory slice — attach with  vcpu:NAME",
-        ("vcpu", "vcpus") => "How many cores the box may use, e.g. 4 — or 0.5 for half a core.",
-        ("vcpu", "cpus") => "Pin to specific cores, e.g. 0-3. Leave blank to let it float.",
+        ("vcpu", "cpus") => {
+            "How many cores the box may use, e.g. 4 — or 0.5 for half a core (= --cpus)."
+        }
+        ("vcpu", "cpuset") => {
+            "Pin to specific cores, e.g. 0-3 (= --cpuset-cpus). Leave blank to let it float."
+        }
         ("vcpu", "memory") => "Memory ceiling, e.g. 512m or 2g. The box is OOM-capped at this.",
         ("vdisk", "name") => "A label for this scratch disk — attach with  vdisk:NAME",
         ("vdisk", "size") => "Max size of the scratch disk, e.g. 2g. Writes past it fail.",
@@ -1214,11 +1217,10 @@ fn validated_field(label: &str) -> bool {
             | "pwm"
             | "adc"
             | "onewire"
-            | "priority"
             | "numa"
             | "nice"
-            | "vcpus"
             | "cpus"
+            | "cpuset"
             | "memory"
             | "size"
             | "bandwidth"
@@ -3225,24 +3227,24 @@ mod tests {
     fn form_body_serialises_and_validates() {
         let fields = vec![
             tf("name", "heavy"),
-            tf("vcpus", "4"),
-            tf("cpus", "0-3"),
+            tf("cpus", "4"),
+            tf("cpuset", "0-3"),
             tf("memory", ""), // empty → skipped
-            tf("priority", "10"),
+            tf("nice", "10"),
         ];
         let (name, body) = form_to_body(&fields).unwrap();
         assert_eq!(name, "heavy");
         assert!(body.contains(&"name = \"heavy\"".to_string()));
-        assert!(body.contains(&"vcpus = 4".to_string()));
-        assert!(body.contains(&"cpus = \"0-3\"".to_string()));
-        assert!(body.contains(&"priority = 10".to_string()));
+        assert!(body.contains(&"cpus = 4".to_string()));
+        assert!(body.contains(&"cpuset = \"0-3\"".to_string()));
+        assert!(body.contains(&"nice = 10".to_string()));
         assert!(
             !body.iter().any(|l| l.starts_with("memory")),
             "empty field skipped"
         );
 
         // A bad number is rejected with a message, not silently written.
-        let bad = vec![tf("name", "x"), tf("vcpus", "abc")];
+        let bad = vec![tf("name", "x"), tf("cpus", "abc")];
         assert!(form_to_body(&bad).is_err());
 
         // A missing name is rejected.
@@ -3313,19 +3315,19 @@ mod tests {
         // through config::profile_block. This pins that the two paths can never drift.
         let fields = vec![
             tf("name", "heavy"),
-            tf("vcpus", "4"),
-            tf("cpus", "0-3"),
+            tf("cpus", "4"),
+            tf("cpuset", "0-3"),
             tf("memory", "512m"),
-            tf("priority", "10"),
+            tf("nice", "10"),
         ];
         let (_name, from_form) = form_to_body(&fields).unwrap();
         let from_cli = crate::config::profile_block(
             "heavy",
             &[
-                ("vcpus", "4"),
-                ("cpus", "0-3"),
+                ("cpus", "4"),
+                ("cpuset", "0-3"),
                 ("memory", "512m"),
-                ("priority", "10"),
+                ("nice", "10"),
             ],
         )
         .unwrap();
@@ -3366,11 +3368,11 @@ leds = [\"led0\"]
 
         // Same for a vcpu carrying its advanced fields.
         let cfg2 = crate::config::parse(
-            "[[vcpu]]\nname=\"h\"\nvcpus=4\nnuma=1\nnice=-5\nextends=\"base\"\n",
+            "[[vcpu]]\nname=\"h\"\ncpus=4\nnuma=1\nnice=-5\nextends=\"base\"\n",
         )
         .unwrap();
         let (_n, b2) = form_to_body(&edit_profile_form("vcpu", "h", &cfg2).fields).unwrap();
-        for e in ["vcpus = 4", "numa = 1", "nice = -5", "extends = \"base\""] {
+        for e in ["cpus = 4", "numa = 1", "nice = -5", "extends = \"base\""] {
             assert!(b2.iter().any(|l| l == e), "vcpu lost {e}: {b2:?}");
         }
     }
@@ -3641,11 +3643,10 @@ leds = [\"led0\"]
             ("vgpio", "pwm"),
             ("vgpio", "adc"),
             ("vgpio", "onewire"),
-            ("vcpu", "priority"),
             ("vcpu", "numa"),
             ("vcpu", "nice"),
-            ("vcpu", "vcpus"),
             ("vcpu", "cpus"),
+            ("vcpu", "cpuset"),
             ("vcpu", "memory"),
             ("vdisk", "size"),
             ("vdisk", "bandwidth"),
@@ -3742,14 +3743,13 @@ leds = [\"led0\"]
         for (label, good) in [
             ("pins", "17 27 22"),
             ("pwm", "12,13"),
-            ("priority", "99"),
             ("numa", "3"),
             ("nice", "-20"),
             ("nice", "19"),
-            ("vcpus", "0.5"),
-            ("vcpus", "16"),
-            ("cpus", "0-3"),
-            ("cpus", "0,2,4"),
+            ("cpus", "0.5"),
+            ("cpus", "16"),
+            ("cpuset", "0-3"),
+            ("cpuset", "0,2,4"),
             ("memory", "512m"),
             ("size", "16t"),
             ("iops", "5000"),
@@ -3786,15 +3786,15 @@ leds = [\"led0\"]
             }
             form
         };
-        // vcpus "0" is an incomplete prefix (of "0.5") → "keep typing", not a green tick.
-        let form = feed(mk("vcpus"), b"0");
+        // cpus "0" is an incomplete prefix (of "0.5") → "keep typing", not a green tick.
+        let form = feed(mk("cpus"), b"0");
         let pane = form_pane(&plain(), &form, 80, 24);
         assert!(
             pane.contains("keep typing"),
             "incomplete shows a hint:\n{pane}"
         );
         // "0.5" is complete → a ✓.
-        let form = feed(mk("vcpus"), b"0.5");
+        let form = feed(mk("cpus"), b"0.5");
         let pane = form_pane(&plain(), &form, 80, 24);
         assert!(pane.contains('✓'), "valid shows a tick:\n{pane}");
     }
@@ -3904,13 +3904,11 @@ leds = [\"led0\"]
         assert_ne!(f.fields[0].value, "44545454545");
         // A valid multi-pin list still types fine.
         assert_eq!(feed(mk("vgpio", "pins"), b"17 27").fields[0].value, "17 27");
-        // priority 0-99: `100` can't be reached.
-        assert_eq!(feed(mk("vcpu", "priority"), b"100").fields[0].value, "10");
         // nice -20..19: `20` can't be reached, but `-20` can.
         assert_eq!(feed(mk("vcpu", "nice"), b"20").fields[0].value, "2");
         assert_eq!(feed(mk("vcpu", "nice"), b"-20").fields[0].value, "-20");
-        // vcpus: a second dot is refused (`1.2.` → `1.2`).
-        assert_eq!(feed(mk("vcpu", "vcpus"), b"1.2.5").fields[0].value, "1.25");
+        // cpus quota: a second dot is refused (`1.2.` → `1.2`).
+        assert_eq!(feed(mk("vcpu", "cpus"), b"1.2.5").fields[0].value, "1.25");
         // memory / size: one unit at the end, nothing after it (`2gg` → `2g`, `5m2` → `5m`).
         assert_eq!(feed(mk("vcpu", "memory"), b"2gg").fields[0].value, "2g");
         assert_eq!(feed(mk("vdisk", "size"), b"5m2").fields[0].value, "5m");

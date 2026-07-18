@@ -13,22 +13,22 @@
 config_version = 1
 
 # ── virtual CPU slices ([[vcpu]]) ─────────────────────────────────────────────────────────────
-# NOTE the field spellings (they differ from the Docker-style CLI flags on purpose):
-#   vcpus = core QUOTA (cgroup cpu.max)      — the CLI flag for this is --cpus
-#   cpus  = CPU PINNING list (cgroup cpuset) — the CLI flag for this is --cpuset-cpus
-# priority (0 low .. 99 high) maps to nice; or set `nice` (-20..19) directly.
+# Field names match the CLI flags 1:1:
+#   cpus   = core QUOTA (cgroup cpu.max)      — the CLI flag is --cpus
+#   cpuset = CPU PINNING list (cgroup cpuset) — the CLI flag is --cpuset-cpus
+#   nice   = scheduling priority (-20 high .. 19 low) — the CLI flag is --nice
 [[vcpu]]
 name = "slim"
-vcpus = 0.5          # half a core of quota
-cpus = "0"           # pin to CPU 0
+cpus = 0.5           # half a core of quota
+cpuset = "0"         # pin to CPU 0
 memory = "256 MB"    # RAM ceiling (cgroup memory.max)
-priority = 20        # low-ish scheduling priority -> nice
+nice = 10            # low-ish scheduling priority
 
 # `extends` inherits another [[vcpu]] and overrides selected fields.
 [[vcpu]]
 name = "burst"
 extends = "slim"     # start from slim...
-vcpus = 2.0          # ...but allow up to 2 cores
+cpus = 2.0           # ...but allow up to 2 cores
 memory = "512 MB"
 
 # ── virtual disk ([[vdisk]]) ──────────────────────────────────────────────────────────────────
@@ -39,7 +39,8 @@ memory = "512 MB"
 name = "scratch"
 size = "32m"
 # persistent = false   # (default) don't survive box removal
-# backend = "disk:0"   # optional: place the image on a declared [[disk]] pool
+# backend = "disk:pool"  # optional: place the image on a declared [[disk]] named "pool"
+#                         # (add a matching `[[disk]]\nname = "pool"\npath = "/var/lib/kern/disks"`)
 
 # ── virtual GPIO / peripherals ([[vgpio]]) ────────────────────────────────────────────────────
 # Device exposure is host-dependent (real gpiochips / /dev nodes / sysfs). This profile is inert

@@ -805,7 +805,31 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--plan" => plan = true,
                 "-d" | "--detach" => detached = true,
                 "--read-only" | "--ro" => read_only = true,
-                "--net" => share_net = true,
+                // `--net` is Docker-shaped and value-OPTIONAL: bare `--net` shares the host network
+                // (back-compat), and `--net host`/`--net none` are honored too. Before, `--net none`
+                // set share=true and silently dropped the `none` token — a Docker user's muscle-memory
+                // isolation request produced a LESS-isolated box with no error.
+                "--net" => match rest.get(i + 1).copied() {
+                    Some("host") => {
+                        share_net = true;
+                        i += 1;
+                    }
+                    Some("none") => {
+                        share_net = false;
+                        i += 1;
+                    }
+                    // A non-flag token that isn't host|none is a Docker network mode kern has no
+                    // concept of (`bridge`, a named network, …): reject it with the same message
+                    // `--network` gives, instead of sharing the host net and swallowing it as the box
+                    // name — the box name goes FIRST (`kern box NAME --net`).
+                    Some(v) if !v.starts_with('-') => {
+                        return Err(Error::Usage(
+                            "--net <host|none> (host = share host net; none = isolated)",
+                        ));
+                    }
+                    // Bare `--net`, or `--net` before another flag / `--` / end-of-args = share host net.
+                    _ => share_net = true,
+                },
                 "--pod" => {
                     i += 1;
                     pod = Some(rest.get(i).ok_or(Error::Usage("--pod <name>"))?.to_string());
@@ -1157,7 +1181,14 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // A `vcpu:`/`vgpio:`/`vdisk:`/`vgpu:` token is a resource profile, not the box name.
                 s if crate::config::classify(s).is_some() => profiles.push(s.to_string()),
                 s if name.is_none() => name = Some(s),
-                _ => {}
+                // A SECOND bare token (name already set, not a flag, not a profile) is junk — almost
+                // always a command the user forgot to put after `--`. Reject it rather than silently
+                // dropping it (same anti-footgun rule as the unknown-flag arm above).
+                _ => {
+                    return Err(Error::Usage(
+                        "box: unexpected argument (did you forget `--` before the command?)",
+                    ))
+                }
             }
         }
         i += 1;
