@@ -1468,15 +1468,32 @@ fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
         // TOCTOU-safe SOURCE: walk `/dev/...` one hop at a time (open_dev_pinned) so the fd PINS the
         // exact inode with NO intermediate symlink followed at any depth, then bind FROM the fd via
         // /proc/self/fd — a component swapped between the resolver's check and this mount can't redirect
-        // us. Re-check on the pinned fd that it's not a BLOCK device (a host disk).
+        // us. Re-check on the pinned fd that it's neither a BLOCK device (a host disk) nor a dangerous
+        // raw CHAR node.
         let sfd = match open_dev_pinned(src) {
             Some(fd) => fd,
             None => return, // absent, escapes /dev, or a component was swapped to a symlink → skip
         };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let is_block = unsafe { libc::fstat(sfd, &mut st) } == 0
-            && (st.st_mode & libc::S_IFMT) == libc::S_IFBLK;
-        if !is_block {
+        let fstat_ok = unsafe { libc::fstat(sfd, &mut st) } == 0;
+        let mode = st.st_mode & libc::S_IFMT;
+        let is_block = mode == libc::S_IFBLK;
+        // Mirror the resolver's `is_dangerous_dev` FIXED-identity deny at BIND time: raw memory (major
+        // 1, minors mem/kmem/port/kmsg = {1,2,4,11,12}), generic SCSI (major 21), and the stable misc
+        // majors `/dev/kvm` (10:232) and `/dev/net/tun` (10:200). If host root swapped a vetted char
+        // node for a dangerous one between the parent's resolve and this child's bind, the pinned-fd
+        // re-check still refuses it — so this gate matches its claim, not just block nodes. (Only the
+        // stable major:minor identities can be re-checked here; name/dynamic-major nodes rely on the
+        // resolve-time check + no-symlink-follow pin. Legit vgpio devices — gpiochip, i2c 89, spi — are
+        // unaffected.)
+        let is_dangerous_char = mode == libc::S_IFCHR && {
+            let maj = libc::major(st.st_rdev);
+            let min = libc::minor(st.st_rdev);
+            (maj == 1 && matches!(min, 1 | 2 | 4 | 11 | 12))
+                || maj == 21
+                || (maj == 10 && matches!(min, 232 | 200))
+        };
+        if fstat_ok && !is_block && !is_dangerous_char {
             if let Ok(fdpath) = cstr(&format!("/proc/self/fd/{sfd}")) {
                 unsafe {
                     libc::mount(
