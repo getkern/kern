@@ -45,7 +45,7 @@ no KVM. The sandbox for an agent's dev loop, a CI step, or an air-gapped host.
 
 ## Performance
 
-Measured on one x86_64 laptop (kern 0.6.4, `python:3.12-slim`), not aspirational. Your hardware will
+Measured on one x86_64 laptop (kern 0.6.5, `python:3.12-slim`), not aspirational. Your hardware will
 differ — measure and claim your own number.
 
 **Single call, sequential** (p50):

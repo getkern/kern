@@ -844,6 +844,14 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 - Project docs: README, SECURITY, ARCHITECTURE, CONTRIBUTING, CLA, CODE_OF_CONDUCT.
 - CI: build + test + clippy + fmt + cargo-audit + cargo-deny on x86 (skip-graceful for HW).
 
+[0.6.5]: https://github.com/getkern/kern/releases/tag/v0.6.5
+[0.6.4]: https://github.com/getkern/kern/releases/tag/v0.6.4
+[0.6.3]: https://github.com/getkern/kern/releases/tag/v0.6.3
+[0.6.2]: https://github.com/getkern/kern/releases/tag/v0.6.2
+[0.5.7]: https://github.com/getkern/kern/releases/tag/v0.5.7
+[0.3.3]: https://github.com/getkern/kern/releases/tag/v0.3.3
+[0.3.2]: https://github.com/getkern/kern/releases/tag/v0.3.2
+[0.3.1]: https://github.com/getkern/kern/releases/tag/v0.3.1
 [0.4.0]: https://github.com/getkern/kern/releases/tag/v0.4.0
 [0.3.0]: https://github.com/getkern/kern/releases/tag/v0.3.0
 [0.2.0]: https://github.com/getkern/kern/releases/tag/v0.2.0

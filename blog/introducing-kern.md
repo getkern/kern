@@ -6,7 +6,7 @@ Rust, and runs the same on a laptop, in CI, or on a Raspberry Pi.*
 
 Most container tooling is built around a daemon. You install a service that stays resident, holds the
 image store and the network, and every `run` is a round-trip to it. That buys a lot of features — and
-it costs a resident process, a socket to secure, ~300 ms of start latency, and a footprint that keeps
+it costs a resident process, a socket to secure, ~308 ms of start latency, and a footprint that keeps
 kern off a lot of small machines entirely.
 
 kern is the other trade. There is no daemon. `kern box` forks one short-lived process, sets up Linux
@@ -117,7 +117,7 @@ kern doctor                                    # will boxes even run on this hos
 
 kern deliberately skips a lot that Docker has — overlay networks, a plugin ecosystem — because the
 point is a small, fast, honest core you can read, embed, and put anywhere. Everything above works
-today and is tested (419 tests, clippy-clean, security-audited slice by slice). The CLI isn't frozen
+today and is tested (453 tests, clippy-clean, security-audited slice by slice). The CLI isn't frozen
 until 1.0.
 
 Code, benchmarks, and the honest security account:
