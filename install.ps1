@@ -190,7 +190,9 @@ function Update-DistroBinary($want) {
         $dest = (wsl.exe -d $DistroName -u root -- sh -lc 'command -v kern' 2>$null | Out-String).Trim()
         if (-not $dest) { $dest = '/usr/local/bin/kern' }
         # The distro's view of the downloaded Windows file, then an atomic in-place swap (keeps the cache).
-        $src = (wsl.exe -d $DistroName -- wslpath -u "$winBin" 2>$null | Out-String).Trim()
+        # NB: pass the path with FORWARD slashes — `wsl -- wslpath` eats backslashes in a Windows path
+        # ("C:\a\b" -> "C:ab"), so a backslashed path returns empty and would wrongly force a re-import.
+        $src = (wsl.exe -d $DistroName -- wslpath -u "$($winBin -replace '\\','/')" 2>$null | Out-String).Trim()
         if (-not $src) { return $false }
         wsl.exe -d $DistroName -u root -- sh -c "cp '$src' '$dest.new' && chmod 0755 '$dest.new' && mv -f '$dest.new' '$dest'" *> $null
         if ($LASTEXITCODE -ne 0) { return $false }
