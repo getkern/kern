@@ -222,8 +222,12 @@ is a short alias. On macOS, run it inside a Linux VM.)
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
-kern runs inside **WSL2** — a real Linux kernel — so hard caps (`--memory`/`--cpus`) are enforced for
-real. The installer ensures the WSL2 engine (self-elevating for the one reboot it may need, then
+kern runs inside **WSL2** — a real Linux kernel — so the isolation (namespaces + seccomp) and `--cpus`
+cap work for real. **One honest exception:** `--memory` needs the cgroup v2 *memory* controller, which
+Microsoft's default WSL2 kernel doesn't enable — kern **warns** and points you to the one-time fix
+(`kernelCommandLine = cgroup_enable=memory cgroup_memory=1` under `[wsl2]` in `%UserProfile%\.wslconfig`,
+then `wsl --shutdown`). Same limit as Docker/Podman on WSL; on a native Linux host `--memory` is
+enforced out of the box. The installer ensures the WSL2 engine (self-elevating for the one reboot it may need, then
 resuming on its own), imports kern's **own** pre-baked distro (a tiny Alpine + kern — no Ubuntu, no
 manual steps), drops the `kern.exe` shim on your PATH, and verifies end-to-end. Every download is
 sha256-checked. After it finishes: `kern box dev --image alpine -it -- sh`. Honest caveat: kern runs
@@ -392,9 +396,10 @@ crates.io).
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroups v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter — kern runs even on an *Android kernel* with a Linux
 userland (the Arduino UNO Q). **On Windows, WSL2 *is* that Linux kernel** — the one-line PowerShell
-installer sets up WSL2 and drops in a pre-baked kern distro, so hard caps (`--memory`/`--cpus`) are
-enforced for real (the honest caveat: you're inside the WSL2 VM, so it's "no Docker Desktop", not "no
-VM"). kern does **not** run on stock Android-the-OS (Bionic, SELinux, userns off). Daemonless is a big
+installer sets up WSL2 and drops in a pre-baked kern distro, so isolation and `--cpus` are enforced
+for real (`--memory` needs `cgroup_enable=memory` in the WSL kernel, which the default doesn't set —
+kern warns and shows the one-line `.wslconfig` fix; enforced natively on real Linux). Honest caveat:
+you're inside the WSL2 VM, so it's "no Docker Desktop", not "no VM". kern does **not** run on stock Android-the-OS (Bionic, SELinux, userns off). Daemonless is a big
 win on RAM-constrained boards (0 resident vs ~186 MB) — see **[EDGE.md](EDGE.md)**. ARM CI is tracked
 in the issues.
 
