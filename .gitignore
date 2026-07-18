@@ -23,3 +23,35 @@
 
 # Whitepaper draft — provenance/authorship lives on Zenodo, not in the code repo
 /paper/
+
+# --- Secrets & sensitive material — NEVER commit (defensive: a stray `git add -A` can't sweep these
+# in). .gitignore only guards UNTRACKED files, which is exactly the accidental-add case. ---
+# Private keys / certs / keystores
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+# GPG/PGP private keyrings (the public tag signatures live in git, never the secret key)
+secring.*
+*.gpg
+# SSH private keys
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+# Environment / credential files
+.env
+.env.*
+*.env
+.netrc
+.npmrc
+.pgpass
+credentials
+*.credentials
+# Known one-off sensitive names + tool backups (NB: keep .ots tracked, drop only its .bak)
+win-key*
+*.ots.bak
+*.bak
