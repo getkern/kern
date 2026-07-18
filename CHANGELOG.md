@@ -20,6 +20,11 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 ## [Unreleased]
 
 ### Fixed
+- **`COPY <dir> <dest>/` now copies the directory's CONTENTS into `<dest>`, matching Docker** (verified
+  against `docker build`), instead of nesting them under `<dest>/<dirname>/`. A directory source always
+  has its contents copied (`COPY d /target/` → `/target/f1`, never `/target/d/f1`); a file copied into a
+  directory still keeps its basename. Previously `COPY . /app/` (and any `COPY dir /existing-dir/`)
+  wrongly nested the whole tree one level deep.
 - **`COPY --chmod=<octal>` is now honoured for a context `COPY` and a `COPY --from`**, not only for
   `ADD <url>` / `COPY <<heredoc`. The mode is applied recursively to every copied file and directory
   (matching Docker); without `--chmod` the source mode is still preserved. Previously a
