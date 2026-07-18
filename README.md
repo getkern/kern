@@ -493,7 +493,7 @@ kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start: **
 RSS/box, **0 resident** (Docker keeps ~186 MB resident before you run anything).
 
 † On the Arduino's Android kernel an overlayfs *mount* is ~31 ms (a kernel quirk — sub-ms elsewhere),
-so the default overlay box is ~34 ms there; `--bind-rootfs` starts in **9.9 ms, ahead of bubblewrap**.
+so the default overlay box is ~33 ms there; `--bind-rootfs` starts in **9.9 ms, ahead of bubblewrap**.
 
 Reproduce with **[`examples/benchmark.py`](examples/benchmark.py)** (auto-detects the runtimes you
 have). kern does *less* than Docker (no overlay networks yet — see [Roadmap](#roadmap)); this compares
