@@ -18,8 +18,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-CI runs the above on x86 plus `cargo-audit` / `cargo-deny`. ARM and real-GPU tests run on
-self-hosted runners; locally they **skip gracefully** when the precondition is absent.
+CI runs the above on x86 plus `cargo-audit` / `cargo-deny`. ARM is manually validated on real
+boards (not yet in CI — tracked in the issues); hardware-dependent tests **skip gracefully** when
+the precondition is absent.
 
 ## Tests are not optional
 

@@ -1,6 +1,6 @@
 # kern on Windows (via WSL2)
 
-kern is a Linux runtime — it uses Linux user namespaces, seccomp and cgroups v2. On Windows it runs
+kern is a Linux runtime — it uses Linux user namespaces, seccomp and cgroup v2. On Windows it runs
 **inside WSL2**, which is a real Linux kernel that Windows already ships. There is nothing to
 emulate: kern in WSL2 is kern on Linux.
 

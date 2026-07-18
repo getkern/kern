@@ -29,6 +29,9 @@ background service; each isolated, daemonless, and gone when it's done.
 (PID / filesystem / capability / device isolation, read-only root, and 50 boxes at once) that
 shows the boundaries holding.
 
+A tighter **minimal set** — start a box, a service, mounts, resource limits — lives in
+[`essentials/`](essentials/), if you want the four-line version before the full tour.
+
 | Example | What it shows |
 |---|---|
 | [run-an-image.sh](run-an-image.sh) | Pull a real OCI image and run a command in an isolated, writable box |
@@ -67,7 +70,7 @@ shows the boundaries holding.
 | Example | What it shows |
 |---|---|
 | [copy-files.sh](copy-files.sh) | `kern cp` a single file host↔box, resolved inside the box's root (`openat2` — symlinks can't escape to host paths) |
-| [pause-and-attach.sh](pause-and-attach.sh) | `kern pause` / `unpause` freeze & thaw a box (cgroup-v2 freezer), and `kern attach` to reconnect a detached box's live output |
+| [pause-and-attach.sh](pause-and-attach.sh) | `kern pause` / `unpause` freeze & thaw a box (cgroup v2 freezer), and `kern attach` to reconnect a detached box's live output |
 | [monitor-top-stats.sh](monitor-top-stats.sh) | Daemonless observability: `kern stats --json` (per-box CPU/mem), a `kern top` snapshot, `kern inspect --json` |
 | [gc-prune-doctor.sh](gc-prune-doctor.sh) | Housekeeping: `kern doctor` preflight, `kern prune` (stopped-box leftovers), `kern gc` (reap dead boxes) |
 

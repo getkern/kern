@@ -97,7 +97,7 @@ def main():
 
     work = tempfile.mkdtemp(prefix="kern-bench-")
     rootfs = args.rootfs or get_rootfs(kern, work)
-    bare_env = dict(os.environ, KERN_SCOPE="1")  # KERN_SCOPE=1 = skip the systemd cgroup scope
+    bare_env = dict(os.environ, KERN_NO_SCOPE="1")  # KERN_NO_SCOPE=1 = skip the systemd cgroup scope
 
     # (label, command-builder, env) for each available runtime; `skipped` records the rest with a
     # reason. On an edge board (Jetson / Pi / Android-kernel SBC) the engines often can't be
