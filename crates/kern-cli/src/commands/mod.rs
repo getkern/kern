@@ -6106,6 +6106,7 @@ fn prepare_stage(
                     srcs,
                     dst,
                     from: Some(cf),
+                    chmod,
                 } => {
                     // Resolve the source's overlay chain (top-first list of layer dirs), pulling an
                     // external image on demand. A build STAGE takes precedence over an image of the same
@@ -6165,6 +6166,7 @@ fn prepare_stage(
                         srcs: names,
                         dst: dst.clone(),
                         from: None,
+                        chmod: chmod.clone(),
                     });
                 }
                 // A context COPY (from: None) — the stage references the real build context.
@@ -6432,7 +6434,12 @@ fn build_run(
                 )?;
                 i = next;
             }
-            Instr::Copy { srcs, dst, from: _ } => {
+            Instr::Copy {
+                srcs,
+                dst,
+                from: _,
+                chmod,
+            } => {
                 announce(step, format!("COPY {} {dst}", srcs.join(" ")));
                 // Copying multiple sources requires a directory destination (else each would clobber
                 // the same name) — error rather than silently keep only the last, like Docker.
@@ -6444,7 +6451,15 @@ fn build_run(
                     )));
                 }
                 for s in srcs {
-                    copy_into_rootfs(ctx, s, &write_dir, dst, config.workdir.as_deref(), &[])?;
+                    copy_into_rootfs(
+                        ctx,
+                        s,
+                        &write_dir,
+                        dst,
+                        config.workdir.as_deref(),
+                        &[],
+                        chmod.as_deref(),
+                    )?;
                 }
                 i += 1;
             }
@@ -6458,7 +6473,15 @@ fn build_run(
                 let dl = work.join(format!("addurl{step}"));
                 let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
                 apply_chmod(&dl.join(&name), chmod.as_deref())?;
-                copy_into_rootfs(&dl, &name, &write_dir, dst, config.workdir.as_deref(), &[])?;
+                copy_into_rootfs(
+                    &dl,
+                    &name,
+                    &write_dir,
+                    dst,
+                    config.workdir.as_deref(),
+                    &[],
+                    None,
+                )?;
                 i += 1;
             }
             Instr::WriteFile {
@@ -6470,7 +6493,15 @@ fn build_run(
                 let dl = work.join(format!("inline{step}"));
                 write_inline_file(&dl, content)?;
                 apply_chmod(&dl.join("f"), chmod.as_deref())?;
-                copy_into_rootfs(&dl, "f", &write_dir, dst, config.workdir.as_deref(), &[])?;
+                copy_into_rootfs(
+                    &dl,
+                    "f",
+                    &write_dir,
+                    dst,
+                    config.workdir.as_deref(),
+                    &[],
+                    None,
+                )?;
                 i += 1;
             }
             Instr::Env(k, v) => {
@@ -6600,6 +6631,42 @@ fn apply_chmod(path: &std::path::Path, mode: Option<&str>) -> Result<(), Error> 
     })?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits))
         .map_err(|e| Error::Sandbox(format!("--chmod {mode}: {e}")))
+}
+
+/// Apply a context/`--from` COPY's `--chmod=<octal>` to everything just copied at `target`: the file,
+/// or a directory AND its whole subtree — Docker's `--chmod` is recursive. `None` = no flag, leave the
+/// copied modes as-is. Symlinks are SKIPPED (never chmod THROUGH a symlink — the same no-follow
+/// invariant the `cp -a`/`copy_dir_filtered` copy upholds, so a `leak -> /host` in the context can't be
+/// used to chmod a host file). Directories are chmod'd AFTER their children so a restrictive mode
+/// (e.g. 0644) on the dir can't block our own descent.
+fn apply_chmod_tree(target: &std::path::Path, mode: Option<&str>) -> Result<(), Error> {
+    let Some(mode) = mode else { return Ok(()) };
+    let cleaned = mode.trim().trim_start_matches("0o");
+    let bits = u32::from_str_radix(cleaned, 8).map_err(|_| {
+        Error::Sandbox(format!(
+            "--chmod: invalid mode '{mode}' (use an octal mode like 755 or 0644)"
+        ))
+    })?;
+    chmod_tree_bits(target, bits);
+    Ok(())
+}
+
+fn chmod_tree_bits(path: &std::path::Path, bits: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if md.file_type().is_symlink() {
+        return; // never follow/chmod a symlink
+    }
+    if md.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for e in rd.flatten() {
+                chmod_tree_bits(&e.path(), bits);
+            }
+        }
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits));
 }
 
 /// Write an inline `COPY <<heredoc` body to a scratch file `dir/f` (a fresh dir), so the same
@@ -6772,13 +6839,21 @@ fn build_layered_cached(
                 layer_keys.push(key.clone());
                 i = next;
             }
-            Instr::Copy { srcs, dst, from: _ } => {
+            Instr::Copy {
+                srcs,
+                dst,
+                from: _,
+                chmod,
+            } => {
                 let content: Vec<String> =
                     srcs.iter().map(|s| content_hash(&ctx.join(s))).collect();
+                // `chmod` is part of the cache key: two builds identical but for `--chmod` must NOT
+                // share a layer (else the second would inherit the first's mode).
                 key = layer_key(
                     &key,
                     &format!(
-                        "COPY\u{0}{dst}\u{0}WD\u{0}{}\u{0}{}",
+                        "COPY\u{0}{dst}\u{0}CHMOD\u{0}{}\u{0}WD\u{0}{}\u{0}{}",
+                        chmod.as_deref().unwrap_or(""),
                         config.workdir.as_deref().unwrap_or(""),
                         content.join(","),
                     ),
@@ -6806,7 +6881,15 @@ fn build_layered_cached(
                         )));
                     }
                     for s in srcs {
-                        copy_into_rootfs(ctx, s, &fresh, dst, config.workdir.as_deref(), &chain)?;
+                        copy_into_rootfs(
+                            ctx,
+                            s,
+                            &fresh,
+                            dst,
+                            config.workdir.as_deref(),
+                            &chain,
+                            chmod.as_deref(),
+                        )?;
                     }
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
@@ -6846,7 +6929,15 @@ fn build_layered_cached(
                     let dl = work.join(format!("addurl{unit}"));
                     let name = fetch_add_url(url, checksum.as_deref(), &dl)?;
                     apply_chmod(&dl.join(&name), chmod.as_deref())?;
-                    copy_into_rootfs(&dl, &name, &fresh, dst, config.workdir.as_deref(), &chain)?;
+                    copy_into_rootfs(
+                        &dl,
+                        &name,
+                        &fresh,
+                        dst,
+                        config.workdir.as_deref(),
+                        &chain,
+                        None,
+                    )?;
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
                 }
@@ -6882,7 +6973,15 @@ fn build_layered_cached(
                     let dl = work.join(format!("inline{unit}"));
                     write_inline_file(&dl, content)?;
                     apply_chmod(&dl.join("f"), chmod.as_deref())?;
-                    copy_into_rootfs(&dl, "f", &fresh, dst, config.workdir.as_deref(), &chain)?;
+                    copy_into_rootfs(
+                        &dl,
+                        "f",
+                        &fresh,
+                        dst,
+                        config.workdir.as_deref(),
+                        &chain,
+                        None,
+                    )?;
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
                 }
@@ -7200,6 +7299,7 @@ fn copy_into_rootfs(
     dst: &str,
     workdir: Option<&str>,
     chain: &[String],
+    chmod: Option<&str>,
 ) -> Result<(), Error> {
     // Source must resolve to a real path INSIDE the context (no `../`, no symlink pointing out).
     let src = std::fs::canonicalize(ctx.join(src_rel))
@@ -7273,8 +7373,9 @@ fn copy_into_rootfs(
             // that would leak the very secrets the ignore file exists to keep out. Falls back to raw
             // `ctx` only if canonicalize fails (then the walk fails CLOSED on any un-strippable entry).
             let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
-            return copy_dir_filtered(&src, &target, &ctx_root, &ig)
-                .map_err(|e| Error::Sandbox(format!("COPY '{src_rel}' → '{dst}': {e}")));
+            copy_dir_filtered(&src, &target, &ctx_root, &ig)
+                .map_err(|e| Error::Sandbox(format!("COPY '{src_rel}' → '{dst}': {e}")))?;
+            return apply_chmod_tree(&target, chmod);
         }
     }
     let arg = if src.is_dir() {
@@ -7300,7 +7401,7 @@ fn copy_into_rootfs(
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
-        Ok(())
+        apply_chmod_tree(&target, chmod)
     } else {
         Err(Error::Sandbox(format!("COPY '{src_rel}' → '{dst}' failed")))
     }
