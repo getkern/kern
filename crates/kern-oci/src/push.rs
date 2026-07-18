@@ -180,47 +180,15 @@ fn pack_layer(
     work: &Path,
 ) -> Result<(std::path::PathBuf, String, String, u64), OciError> {
     let tar_path = work.join("layer.tar");
-    // SECURITY (privilege-escalation via ownership normalization): we tar with `--owner=0 --group=0`
-    // (below), forcing every file root-owned. Correct for ownership (Docker layers are root-owned) but
-    // DANGEROUS combined with a preserved setuid bit: a `-rwsr-xr-x` binary owned by a NON-root uid means
-    // "run as that uid"; rewriting its owner to 0 turns it into **setuid-ROOT** in the pushed image — an
-    // escalation the original image never had, introduced by our push. So strip setuid/setgid from the
-    // rootfs (a throwaway temp squash) BEFORE tarring. Unconditional: kern's model treats in-image setuid
-    // as inert anyway (the box root mount is MS_NOSUID, and pull normalizes ownership via
-    // `--no-same-owner`). File-capabilities are the SAME class of privilege channel and are handled the
-    // same way — the build copier deliberately does NOT propagate `security.capability` (it would inject
-    // an untrusted image's caps), so the two escalation vectors, setuid and file-caps, are both closed.
-    let stripped = Command::new("find")
-        .arg(rootfs)
-        .args([
-            "-type", "f", "-perm", "/6000", "-exec", "chmod", "a-s", "{}", "+",
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !stripped {
-        return Err(OciError::Extract(
-            "stripping setuid/setgid before push failed".into(),
-        ));
-    }
-    // Tar the rootfs contents (`.`) as an image layer, NORMALIZING ownership to root (0:0). The rootfs
-    // on disk is owned by the invoking (unprivileged) user; without `--owner=0 --group=0` every file in
-    // the pushed layer would carry that host UID/GID (e.g. 1000), which surprises anyone who then pulls
-    // and runs the image — real Docker layers are root-owned. `--numeric-owner` keeps it portable (no
-    // /etc/passwd name resolution). We don't need bit-for-bit reproducibility, only a valid, sane layer.
-    // Fail loudly if tar errors.
-    let ok = Command::new("tar")
-        .args(["-C"])
-        .arg(rootfs)
-        .args(["--numeric-owner", "--owner=0", "--group=0", "-cf"])
-        .arg(&tar_path)
-        .arg(".")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return Err(OciError::Extract("tar of rootfs failed".into()));
-    }
+    // SECURITY (privilege-escalation via ownership normalization): the layer is tarred root-owned
+    // (Docker layers are root-owned), but forcing owner 0 on a NON-root-owned `-rwsr-xr-x` binary would
+    // turn it into **setuid-ROOT** in the pushed image — an escalation the original never had. So the
+    // shared packer strips setuid/setgid BEFORE tarring (kern treats in-image setuid as inert anyway —
+    // the box root mount is MS_NOSUID and pull uses `--no-same-owner`; file-capabilities are closed the
+    // same way, the build copier never propagates `security.capability`). It also handles the tar-flavour
+    // split: GNU `--owner=0 --group=0`, or BusyBox `--numeric-owner` (which is already 0:0 for a
+    // root-run build) — the fix for `save`/`push` erroring on Alpine/WSL's BusyBox tar.
+    crate::archive::tar_rootfs_root_owned(rootfs, &tar_path)?;
     let diff_id = sha256_file(&tar_path)?; // uncompressed digest = diff_id
 
     // gzip the tar → layer.tar.gz.

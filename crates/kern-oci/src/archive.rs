@@ -61,7 +61,7 @@ pub fn save(
     // 1. Pack the rootfs into an UNCOMPRESSED layer.tar (root-owned, setuid-stripped — same
     //    normalization as push), and take its sha256 (= the layer's diff_id).
     let layer_tar = work.join("layer.tar");
-    pack_plain_layer(rootfs, &layer_tar)?;
+    tar_rootfs_root_owned(rootfs, &layer_tar)?;
     let diff_id = sha256_file(&layer_tar)?;
     let layer_id = hex_of(&diff_id).to_string();
 
@@ -115,10 +115,28 @@ pub fn save(
     Ok(())
 }
 
-/// Tar `rootfs` into `out` (uncompressed), root-owned and setuid/setgid-stripped — the exact ownership
-/// normalization the push layer packer applies (a preserved setuid bit + `--owner=0` would forge a
-/// setuid-root binary in the exported image).
-fn pack_plain_layer(rootfs: &Path, out: &Path) -> Result<(), OciError> {
+/// Is the system `tar` GNU tar? Only GNU tar supports `--owner=`/`--group=` to force ownership at
+/// create time; BusyBox tar (Alpine, many WSL distros) does NOT and errors on them (the exact failure
+/// that broke `kern save` on WSL). Probed once per process.
+fn tar_is_gnu() -> bool {
+    use std::sync::OnceLock;
+    static GNU: OnceLock<bool> = OnceLock::new();
+    *GNU.get_or_init(|| {
+        Command::new("tar")
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
+            .unwrap_or(false)
+    })
+}
+
+/// Tar `rootfs`'s contents (`.`) into `out` (uncompressed), setuid/setgid-STRIPPED and ownership
+/// normalized to root — the layer form both `push` and `save` need. GNU tar forces it with
+/// `--owner=0 --group=0`; BusyBox tar (no such flags) gets `--numeric-owner` only, which records the
+/// on-disk owners: root(0) for a root-run build/save (the WSL case → still root-owned layers), or the
+/// real uid for a rootless BusyBox save (functional, just not renumbered). The setuid strip runs on
+/// BOTH paths FIRST, so normalizing owner to 0 can never forge a setuid-root binary.
+pub(crate) fn tar_rootfs_root_owned(rootfs: &Path, out: &Path) -> Result<(), OciError> {
     let stripped = Command::new("find")
         .arg(rootfs)
         .args([
@@ -129,13 +147,16 @@ fn pack_plain_layer(rootfs: &Path, out: &Path) -> Result<(), OciError> {
         .unwrap_or(false);
     if !stripped {
         return Err(OciError::Extract(
-            "stripping setuid before save failed".into(),
+            "stripping setuid before archiving failed".into(),
         ));
     }
-    let ok = Command::new("tar")
-        .args(["-C"])
-        .arg(rootfs)
-        .args(["--numeric-owner", "--owner=0", "--group=0", "-cf"])
+    let mut cmd = Command::new("tar");
+    cmd.arg("-C").arg(rootfs).arg("--numeric-owner");
+    if tar_is_gnu() {
+        cmd.args(["--owner=0", "--group=0"]);
+    }
+    let ok = cmd
+        .arg("-cf")
         .arg(out)
         .arg(".")
         .status()
