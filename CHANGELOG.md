@@ -19,6 +19,13 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+### Added
+- **`COPY`/`ADD` expand `*`, `?` and `[…]` globs against the build context** (Docker parity, verified
+  against `docker build`): `COPY *.txt /app/`, `COPY src/* /app/`, `COPY [ab].conf /etc/` now copy each
+  match into the destination directory; an unmatched glob is a clear error. Previously a glob source was
+  taken literally and failed with "No such file". (A build-context *symlink* matched by a glob is still
+  resolved/confined rather than preserved verbatim — kern's stricter no-leak copy behaviour.)
+
 ### Fixed
 - **`COPY <dir> <dest>/` now copies the directory's CONTENTS into `<dest>`, matching Docker** (verified
   against `docker build`), instead of nesting them under `<dest>/<dirname>/`. A directory source always

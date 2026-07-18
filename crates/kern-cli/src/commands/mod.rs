@@ -6441,6 +6441,9 @@ fn build_run(
                 chmod,
             } => {
                 announce(step, format!("COPY {} {dst}", srcs.join(" ")));
+                // Expand `*`/`?`/`[…]` globs against the context (Docker does), so `COPY *.txt /d/`
+                // copies each match; a literal source passes through. Errors if a glob matches nothing.
+                let srcs = expand_copy_srcs(ctx, srcs)?;
                 // Copying multiple sources requires a directory destination (else each would clobber
                 // the same name) — error rather than silently keep only the last, like Docker.
                 if srcs.len() > 1
@@ -6450,7 +6453,7 @@ fn build_run(
                         "COPY with multiple sources needs a directory destination (end '{dst}' with '/')"
                     )));
                 }
-                for s in srcs {
+                for s in &srcs {
                     copy_into_rootfs(
                         ctx,
                         s,
@@ -6845,8 +6848,13 @@ fn build_layered_cached(
                 from: _,
                 chmod,
             } => {
-                let content: Vec<String> =
-                    srcs.iter().map(|s| content_hash(&ctx.join(s))).collect();
+                // Expand `*`/`?`/`[…]` globs against the context before hashing, so the cache key
+                // reflects the ACTUAL matched files (a new match must miss the cache).
+                let expanded = expand_copy_srcs(ctx, srcs)?;
+                let content: Vec<String> = expanded
+                    .iter()
+                    .map(|s| content_hash(&ctx.join(s)))
+                    .collect();
                 // `chmod` is part of the cache key: two builds identical but for `--chmod` must NOT
                 // share a layer (else the second would inherit the first's mode).
                 key = layer_key(
@@ -6872,7 +6880,7 @@ fn build_layered_cached(
                     let _ = std::fs::remove_dir_all(&fresh);
                     own_only_dir(&fresh)
                         .map_err(|e| Error::Sandbox(format!("build layer: {e}")))?;
-                    if srcs.len() > 1
+                    if expanded.len() > 1
                         && !(dst.ends_with('/')
                             || chain_has_dir(&chain, dst.trim_start_matches('/')))
                     {
@@ -6880,7 +6888,7 @@ fn build_layered_cached(
                             "COPY with multiple sources needs a directory destination (end '{dst}' with '/')"
                         )));
                     }
-                    for s in srcs {
+                    for s in &expanded {
                         copy_into_rootfs(
                             ctx,
                             s,
@@ -7287,6 +7295,120 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Error> 
             "copying the base rootfs failed (is `cp` available?)".into(),
         ))
     }
+}
+
+/// Whether a COPY/ADD source token carries a glob metacharacter Docker expands (`*`, `?`, `[`).
+fn has_glob_meta(s: &str) -> bool {
+    s.bytes().any(|b| b == b'*' || b == b'?' || b == b'[')
+}
+
+/// `filepath.Match`-style match of ONE path component (never spans `/`, like Docker's COPY glob):
+/// `*` = any run, `?` = one char, `[set]`/`[!set]` = a class (with `a-z` ranges). Patterns are short.
+fn glob_match_component(pat: &[u8], name: &[u8]) -> bool {
+    if pat.is_empty() {
+        return name.is_empty();
+    }
+    match pat[0] {
+        b'*' => {
+            glob_match_component(&pat[1..], name)
+                || (!name.is_empty() && glob_match_component(pat, &name[1..]))
+        }
+        b'?' => !name.is_empty() && glob_match_component(&pat[1..], &name[1..]),
+        b'[' => {
+            if name.is_empty() {
+                return false;
+            }
+            let neg = pat.get(1) == Some(&b'!');
+            let mut i = if neg { 2 } else { 1 };
+            let start = i;
+            let mut hit = false;
+            while i < pat.len() && (pat[i] != b']' || i == start) {
+                if i + 2 < pat.len() && pat[i + 1] == b'-' && pat[i + 2] != b']' {
+                    if name[0] >= pat[i] && name[0] <= pat[i + 2] {
+                        hit = true;
+                    }
+                    i += 3;
+                } else {
+                    if pat[i] == name[0] {
+                        hit = true;
+                    }
+                    i += 1;
+                }
+            }
+            if i >= pat.len() {
+                return false; // unterminated class → no match
+            }
+            (hit != neg) && glob_match_component(&pat[i + 1..], &name[1..])
+        }
+        c => !name.is_empty() && name[0] == c && glob_match_component(&pat[1..], &name[1..]),
+    }
+}
+
+/// Expand a COPY source pattern (context-relative, `/`-separated) into matching relative paths, one
+/// component at a time (Docker matches `filepath.Match` per component). A component with no glob meta
+/// is taken literally. Sorted; empty if nothing matched.
+fn glob_expand_ctx(ctx: &std::path::Path, pattern: &str) -> Vec<String> {
+    let comps: Vec<&str> = pattern
+        .trim_start_matches("./")
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mut cur = vec![String::new()];
+    for comp in comps {
+        let mut next = Vec::new();
+        for base in &cur {
+            let base_dir = if base.is_empty() {
+                ctx.to_path_buf()
+            } else {
+                ctx.join(base)
+            };
+            if has_glob_meta(comp) {
+                if let Ok(rd) = std::fs::read_dir(&base_dir) {
+                    for e in rd.flatten() {
+                        let nm = e.file_name();
+                        let nm = nm.to_string_lossy();
+                        if glob_match_component(comp.as_bytes(), nm.as_bytes()) {
+                            next.push(if base.is_empty() {
+                                nm.into_owned()
+                            } else {
+                                format!("{base}/{nm}")
+                            });
+                        }
+                    }
+                }
+            } else {
+                let cand = if base.is_empty() {
+                    comp.to_string()
+                } else {
+                    format!("{base}/{comp}")
+                };
+                if ctx.join(&cand).symlink_metadata().is_ok() {
+                    next.push(cand);
+                }
+            }
+        }
+        cur = next;
+    }
+    cur.sort();
+    cur
+}
+
+/// Expand any glob sources in a context COPY/ADD `srcs` list against `ctx`; literal sources pass
+/// through unchanged. Errors if a glob matches nothing (Docker: "no source files were specified").
+fn expand_copy_srcs(ctx: &std::path::Path, srcs: &[String]) -> Result<Vec<String>, Error> {
+    let mut out = Vec::new();
+    for s in srcs {
+        if has_glob_meta(s) {
+            let m = glob_expand_ctx(ctx, s);
+            if m.is_empty() {
+                return Err(Error::Sandbox(format!("COPY: no source files match '{s}'")));
+            }
+            out.extend(m);
+        } else {
+            out.push(s.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Copy `src_rel` (relative to the build context) into the build `rootfs` at `dst`, refusing to
@@ -9691,6 +9813,50 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(&canary);
+    }
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::{expand_copy_srcs, glob_expand_ctx, glob_match_component, has_glob_meta};
+
+    fn m(p: &str, n: &str) -> bool {
+        glob_match_component(p.as_bytes(), n.as_bytes())
+    }
+
+    #[test]
+    fn glob_component_matcher() {
+        assert!(m("*.txt", "a.txt") && m("*.txt", "f.txt") && !m("*.txt", "a.md"));
+        assert!(m("?.txt", "a.txt") && !m("?.txt", "ab.txt"));
+        assert!(m("[fg].txt", "f.txt") && m("[fg].txt", "g.txt") && !m("[fg].txt", "h.txt"));
+        assert!(m("[!f].txt", "g.txt") && !m("[!f].txt", "f.txt"));
+        assert!(m("[a-z]1", "b1") && !m("[a-z]1", "B1"));
+        assert!(m("*", "anything.at.all") && m("abc", "abc") && !m("abc", "abd"));
+        // `*` does not span a component (matcher is per-component), and matches an empty run.
+        assert!(m("a*", "a") && m("*z", "z"));
+        assert!(has_glob_meta("*.txt") && has_glob_meta("a?b") && !has_glob_meta("plain.txt"));
+    }
+
+    #[test]
+    fn expand_against_a_context() {
+        let dir = std::env::temp_dir().join(format!("kern-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        for f in ["f.txt", "g.txt", "h.md"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        std::fs::write(dir.join("d/a.txt"), b"x").unwrap();
+        let mut got = glob_expand_ctx(&dir, "*.txt");
+        got.sort();
+        assert_eq!(got, vec!["f.txt".to_string(), "g.txt".to_string()]);
+        assert_eq!(glob_expand_ctx(&dir, "d/*.txt"), vec!["d/a.txt".to_string()]);
+        // A literal source passes through expand_copy_srcs; an unmatched glob is an error.
+        assert_eq!(
+            expand_copy_srcs(&dir, &["f.txt".to_string()]).unwrap(),
+            vec!["f.txt".to_string()]
+        );
+        assert!(expand_copy_srcs(&dir, &["*.zzz".to_string()]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
