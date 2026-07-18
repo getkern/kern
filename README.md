@@ -100,7 +100,7 @@ cgroup v2 or kernel control; devices are deny-by-default. GPU slices are on the 
 
 ## What you can do in one line
 
-### 📦 An isolated container, zero setup
+### An isolated container, zero setup
 
 No daemon, no root — one ~1.6 MB binary.
 
@@ -108,7 +108,7 @@ No daemon, no root — one ~1.6 MB binary.
 kern box try --image alpine -- sh
 ```
 
-### 🔌 Exactly one device, nothing else
+### Exactly one device, nothing else
 
 Deny-by-default — only the peripheral you name crosses the boundary.
 
@@ -116,7 +116,7 @@ Deny-by-default — only the peripheral you name crosses the boundary.
 kern box iot --image alpine vgpio:sensor -- ./read.py   # only /dev/i2c-1 crosses in
 ```
 
-### ⚡ A fresh sandbox per request
+### A fresh sandbox per request
 
 Serverless-style, on your own machine — one throwaway box per call.
 
@@ -124,7 +124,7 @@ Serverless-style, on your own machine — one throwaway box per call.
 echo "$payload" | kern box fn --image python -- handler.py
 ```
 
-### 🍓 Where a Docker daemon is too heavy
+### Where a Docker daemon is too heavy
 
 The same box on a Pi or an Android-kernel board — just copy the one binary.
 
@@ -132,7 +132,7 @@ The same box on a Pi or an Android-kernel board — just copy the one binary.
 scp kern pi:  &&  ssh pi 'kern box edge --image alpine -- ./agent'
 ```
 
-### 🏗️ Build, tag, push — all daemonless
+### Build, tag, push — all daemonless
 
 ```sh
 kern build -t app:1 . && kern tag app:1 registry.example/app:1 && kern push registry.example/app:1
@@ -142,12 +142,12 @@ kern build -t app:1 . && kern tag app:1 registry.example/app:1 && kern push regi
 
 Daemonless, rootless, and complete — the full container UX plus resource slices, in one binary:
 
-- 📦 **Run anything, isolated** — OCI images from any registry (v2 auth, multi-arch, gzip **+ zstd**) or a `--rootfs`; CoW overlay (image immutable, scratch discarded) or `--read-only`; `-it` TTY; `--init` PID-1 reaper.
-- 🎚️ **Governed slices** — hard cgroup v2 caps on any `box`/`run`: `--memory` · `--cpus` · `--cpuset-cpus` · `--memory-swap-max` · `--pids-limit` · `--io-weight` · `--nice`. `kern run` is the governor with no sandbox.
-- 💾 **Data & devices** — `-v` volumes (symlink-safe) · named volumes with a `--size` quota · network volumes (`nfs`/`smb`/`sshfs`) · `--secret` → `/run/secrets` (RAM, `0400`) · `vdisk:` scratch · `vgpio:` device passthrough (deny-by-default) · `--tmpfs`.
-- 🌐 **Network & identity** — isolated by default; `--network host` for outbound; `-p` rootless publish (loopback unless you ask); in-box `--ssh`; `--pod` shared-net pods (`--no-outbound`); `--tun`; `--user`.
-- 🔒 **Least privilege** — 13 dangerous caps always dropped (`--cap-add`/`--cap-drop`); an always-on **seccomp** denylist (kexec, modules, ptrace, mount API, `setns`, …) that also kills wrong-arch + x86_64 x32-ABI aliases.
-- ♻️ **Lifecycle, no daemon** — `--restart` + `--health-cmd`; `cp`/`pause`/`attach`/`exec`; `ps`/`top`/`stats`/`logs`/`inspect`/`prune`/`gc`/`history`/`recover`; `compose` (reads `docker-compose.yml` too); reusable `[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]` profiles; `kern doctor`.
+- **Run anything, isolated** — OCI images from any registry (v2 auth, multi-arch, gzip **+ zstd**) or a `--rootfs`; CoW overlay (image immutable, scratch discarded) or `--read-only`; `-it` TTY; `--init` PID-1 reaper.
+- **Governed slices** — hard cgroup v2 caps on any `box`/`run`: `--memory` · `--cpus` · `--cpuset-cpus` · `--memory-swap-max` · `--pids-limit` · `--io-weight` · `--nice`. `kern run` is the governor with no sandbox.
+- **Data & devices** — `-v` volumes (symlink-safe) · named volumes with a `--size` quota · network volumes (`nfs`/`smb`/`sshfs`) · `--secret` → `/run/secrets` (RAM, `0400`) · `vdisk:` scratch · `vgpio:` device passthrough (deny-by-default) · `--tmpfs`.
+- **Network & identity** — isolated by default; `--network host` for outbound; `-p` rootless publish (loopback unless you ask); in-box `--ssh`; `--pod` shared-net pods (`--no-outbound`); `--tun`; `--user`.
+- **Least privilege** — 13 dangerous caps always dropped (`--cap-add`/`--cap-drop`); an always-on **seccomp** denylist (kexec, modules, ptrace, mount API, `setns`, …) that also kills wrong-arch + x86_64 x32-ABI aliases.
+- **Lifecycle, no daemon** — `--restart` + `--health-cmd`; `cp`/`pause`/`attach`/`exec`; `ps`/`top`/`stats`/`logs`/`inspect`/`prune`/`gc`/`history`/`recover`; `compose` (reads `docker-compose.yml` too); reusable `[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]` profiles; `kern doctor`.
 
 <details>
 <summary><b>Every flag &amp; command, grouped</b></summary>
@@ -279,7 +279,7 @@ git clone https://github.com/getkern/kern && cd kern && cargo build --release
 
 ## Quickstart
 
-### 🚀 Start here
+### Start here
 
 A sandboxed shell from any OCI image. The image stays read-only; your writes go to a scratch overlay that vanishes on exit.
 
@@ -287,7 +287,7 @@ A sandboxed shell from any OCI image. The image stays read-only; your writes go 
 kern box dev --image alpine -it -- sh
 ```
 
-### 🎚️ Cap what it can use
+### Cap what it can use
 
 Hard memory + CPU limits (cgroup v2). `kern run` is the leanest path — a quota on a host command, no sandbox.
 
@@ -296,7 +296,7 @@ kern run --memory 256M --cpus 0.5 -- ./crunch-numbers
 kern box build --image alpine --memory 512M --cpus 1.5 -v "$PWD:/src" -w /src --net -- make
 ```
 
-### 🌐 Run it as a service
+### Run it as a service
 
 Detached, a published port, restarts if it dies, health-checked — without a daemon.
 
@@ -305,7 +305,7 @@ kern box svc --image alpine -d -p 8080:80 --restart \
   --health-cmd 'wget -qO- localhost:80' -- httpd -f
 ```
 
-### 🔎 See & control what's running
+### See & control what's running
 
 ```sh
 kern ps                   # running boxes — with PORTS + HEALTH
@@ -315,7 +315,7 @@ kern logs svc             # its output
 kern stop svc             # stop it   (kern stop --all for everything)
 ```
 
-### 🔐 Hand it a secret
+### Hand it a secret
 
 Never baked into the image or env — delivered on a pipe, readable only inside the box.
 
@@ -324,7 +324,7 @@ printf "$DB_TOKEN" | kern box job --image alpine --secret TOKEN=- --cap-drop ALL
   -- sh -c 'curl -H "Authorization: Bearer $(cat /run/secrets/TOKEN)" https://api/…'
 ```
 
-### 🩺 Before you rely on it
+### Before you rely on it
 
 ```sh
 kern doctor               # will boxes even run on this host? preflight it
@@ -544,37 +544,15 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 
 **0.6.5 — a daemonless container + resource runtime that does less than Docker, on purpose.**
 Everything in [Features](#features) works today and is tested (**454 tests**, clippy-clean,
-`cargo-deny`-clean, security-audited slice by slice); the isolation is real. It deliberately skips a
+`cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem) — the point is a small, fast, honest core. The
 CLI and config surface are **not frozen until 1.0**.
 
-**New since 0.5:** local image **build** (multi-stage, `--build-arg`, cached layers), **`tag`** +
-**`push`** to any registry, **zstd** layer pull, **`--init`** PID-1 reaper, **`--platform`** select,
-pods (`--pod` / `--no-outbound`), and the **Python** binding. `build`/`push` are the newest, deepest
-surface — audited (COPY-from confinement, setuid/opaque hardening) and, where a rootless-overlay
-kernel can't persist an opaque dir, they **fail closed** to a safe path rather than leak.
-
-**New in 0.6.5:** `kern build` is closer to Docker — verified with a `docker build` differential:
-**`COPY`/`ADD` globs** (`COPY *.txt /app/`, `src/*`, `[ab].conf`) expand against the context;
-`COPY <dir> /dst/` copies the directory's **contents** into `/dst` (not nested under its name); and
-**`COPY --chmod`** is honoured on a context `COPY`/`COPY --from` (applied recursively), not only on
-`ADD <url>`/heredoc. On Windows the `install.ps1` **in-place update** now works (keeps the image cache
-instead of re-importing the distro).
-
-**New in 0.6.4:** `kern build` now parses **real-world Dockerfiles** (comments inside `\`
-continuations, `SHELL`, `ADD <url>` with `--checksum`/`--chmod`, `COPY <<heredoc`, `FROM scratch`,
-`# escape`/BOM, BuildKit `RUN --mount` flags, auto `TARGETARCH`) and honours **`.dockerignore`** /
-`.kernignore` (so `COPY . /app` stops leaking `.git`/secrets — a no-follow filtered copy); `kern
-compose` reads real `docker-compose.yml` files as-is (YAML **anchors/merge**, **`extends`**, network
-**aliases**, `${VAR:-default}`, block scalars) instead of demanding a rewrite.
-
-**New in 0.6.3:** a guided, *"impossible to get wrong"* profile editor in `kern top` (pick the devices
-the host actually exposes; every typed field validated live against the same rule the save uses), and a
-**capability-based device deny-list** for `vgpio:` — a `/dev` node that grants raw memory/storage or
-host control (mem, disks, VFIO/DMA, kvm, HID injection, the console, …) is refused by kernel identity,
-and each bound device is fd-pinned to close a check→mount race. Verified on all four boards — including
-that `vgpio:` still passes a legitimate accelerator device node through on the Jetson (device-node
-passthrough, **not** GPU slicing — that stays on the [Roadmap](#roadmap)).
+**Recent work:** local image **build** + **`tag`**/**`push`** to any registry, **zstd** layers,
+**`--init`**, **`--platform`** select, pods, the **Python** binding, and a Dockerfile/compose parser
+verified against a real `docker build` differential — with the newest `build`/`push` surface audited
+(COPY-from confinement, setuid/opaque hardening, fail-closed on a rootless-overlay kernel). The
+per-release detail is in **[CHANGELOG.md](CHANGELOG.md)**.
 
 **Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
 overlay networking.
