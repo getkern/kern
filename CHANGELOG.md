@@ -13,13 +13,25 @@ flag or config key changes:
 - **Different meaning** → the old name is **rejected with an error** that explains the change and
   names the replacement (never silently reinterpreted, which would corrupt behaviour). Example:
   `--memory-swap` (Docker's mem+swap *total*) is refused with a pointer to `--memory-swap-max`
-  (the cgroup-v2 swap *allowance*) — the two mean different things, so aliasing would lie.
+  (the cgroup v2 swap *allowance*) — the two mean different things, so aliasing would lie.
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [Unreleased]
+## [0.6.5] — 2026-07-18
+
+### Added
+- **`COPY`/`ADD` expand `*`, `?` and `[…]` globs against the build context** (Docker parity, verified
+  against `docker build`): `COPY *.txt /app/`, `COPY src/* /app/`, `COPY [ab].conf /etc/` now copy each
+  match into the destination directory; an unmatched glob is a clear error. Previously a glob source was
+  taken literally and failed with "No such file". (A build-context *symlink* matched by a glob is still
+  resolved/confined rather than preserved verbatim — kern's stricter no-leak copy behaviour.)
 
 ### Changed
+- **Resource-profile keys are now spelled exactly like their CLI flags (BREAKING — see Rejected below).**
+  `[[vcpu]]`: `vcpus` → `cpus` (CPU-time quota), `cpus` → `cpuset` (core pinning), `priority` → `nice`;
+  `[[cpu]]`: `vcpus` → `cores`. The field in a profile now matches the flag you'd pass 1:1, removing a
+  config-vs-flag inversion footgun. A `kern.toml` written for ≤ 0.6.4 must rename these keys (the old
+  names are refused with a pointer, not silently reinterpreted — see **Rejected**).
 - **`--memory` now warns, once and clearly, when the kernel can't enforce it.** On kernels that don't
   delegate the cgroup v2 `memory` controller — Microsoft's default WSL2 kernel, or Raspberry Pi OS
   without `cgroup_enable=memory` — a `memory.max` write is accepted but never bites, so the box would
@@ -30,6 +42,14 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   enforced as before.
 
 ### Fixed
+- **Pod holder no longer hangs a piped `compose up` / `pod create`.** The `__pod-holder` daemon inherited
+  the caller's stderr and, being long-lived, held it open for the pod's whole life — so `kern compose up
+  2>&1 | …`, `$(kern pod create …)`, or a CI log pipe never saw EOF and appeared to hang. The holder now
+  redirects stdout + stderr to `/dev/null` once it prints `pod-ready`, and the parent's readiness wait is
+  bounded (a wedged holder can't hang `pod create`).
+- **`kern push` packs an owner-safe tar on a BusyBox host.** GNU tar takes `--owner=0`/`--group=0`;
+  BusyBox tar rejects them, so pushing from Alpine or WSL errored. kern now detects the tar flavour and
+  packs root-owned layers either way.
 - **`kern box` now works out-of-the-box INSIDE a Docker/Podman container (CI runners).** The box
   overlay scratch defaults to `/run/user/<uid>`/`/tmp`, which inside a container sit on the
   container's own overlayfs — and the kernel rejects a nested-overlay upperdir with a bare
@@ -37,17 +57,6 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   back to `/dev/shm` (a real tmpfs even in Docker; size-capped, announced on stderr). If every
   candidate is overlayfs the mount error is now actionable — "set `XDG_RUNTIME_DIR` to a tmpfs/disk
   path, or in Docker add `--tmpfs /run`" — instead of `Invalid argument`.
-
-## [0.6.5] — 2026-07-15
-
-### Added
-- **`COPY`/`ADD` expand `*`, `?` and `[…]` globs against the build context** (Docker parity, verified
-  against `docker build`): `COPY *.txt /app/`, `COPY src/* /app/`, `COPY [ab].conf /etc/` now copy each
-  match into the destination directory; an unmatched glob is a clear error. Previously a glob source was
-  taken literally and failed with "No such file". (A build-context *symlink* matched by a glob is still
-  resolved/confined rather than preserved verbatim — kern's stricter no-leak copy behaviour.)
-
-### Fixed
 - **`COPY <dir> <dest>/` now copies the directory's CONTENTS into `<dest>`, matching Docker** (verified
   against `docker build`), instead of nesting them under `<dest>/<dirname>/`. A directory source always
   has its contents copied (`COPY d /target/` → `/target/f1`, never `/target/d/f1`); a file copied into a
@@ -61,6 +70,20 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 - **Windows `install.ps1`: the in-place update now actually runs** (was always falling back to a
   cache-wiping re-import). `wsl -- wslpath` eats backslashes in a Windows path, so the swap target
   resolved empty; the path is now passed with forward slashes.
+
+### Security
+- **Dangerous character devices are refused at bind time**, mirroring the resolver's fixed-identity deny
+  on the pinned fd: raw memory (major 1: mem/kmem/port/kmsg), generic SCSI (major 21), and the stable
+  misc majors `/dev/kvm` (10:232) and `/dev/net/tun` (10:200). If host root swaps a vetted char node for
+  a dangerous one between the parent's resolve and the child's bind, the pinned-fd re-check still refuses
+  it. Legitimate `vgpio:` devices (gpiochip, i2c, spi) are unaffected.
+
+### Rejected (not aliased)
+- **The pre-0.6.5 resource-profile key names are refused with a clear error, not silently reinterpreted.**
+  Under the new scheme a bare `cpus` means the *quota* where it used to mean the *pinset*, so aliasing
+  would change behaviour silently. Per the deprecation policy above, `[[vcpu]]` `vcpus`/`priority` and
+  `[[cpu]]` `vcpus` are rejected with a message naming the replacement. Update `kern.toml`: `[[vcpu]]`
+  `vcpus`→`cpus`, `cpus`→`cpuset`, `priority`→`nice`; `[[cpu]]` `vcpus`→`cores`.
 
 ## [0.6.4] — 2026-07-15
 
@@ -145,7 +168,7 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   always wins over a same-named image; the image is pulled with the full hardening and its files are
   copied through the same confined (`openat2 RESOLVE_IN_ROOT`, no-follow, `..`-reject) path as a stage.
 - **`kern compose`: Docker v3 `deploy.resources.limits`** (`memory`/`cpus`/`pids`) are now honoured as
-  hard caps — where rootless Docker ignores them without cgroup-v2+systemd, kern enforces them. A
+  hard caps — where rootless Docker ignores them without cgroup v2+systemd, kern enforces them. A
   `limits:` block that maps nothing (a typo) warns instead of silently running uncapped.
 - **`kern compose`: multi-line arrays** (`command = [\n …\n]`) in a native TOML stack now parse.
 
@@ -329,7 +352,7 @@ deliberately out — see the README roadmap.)
 - **`--timeout <sec>`** — auto-stop a box after N seconds (foreground, `-it`, and detached). The
   watchdog runs in the host namespace so it can reliably terminate the box's PID-namespace init.
 - **`--env-file <file>`** (repeatable, `K=V` lines, `#` comments) — layered under `--env` (explicit
-  wins); **`--nice <n>`** (-20..19); **`--io-weight <n>`** (cgroup-v2 `io.weight`, best-effort);
+  wins); **`--nice <n>`** (-20..19); **`--io-weight <n>`** (cgroup v2 `io.weight`, best-effort);
   **`--config <path>`** (a specific `kern.toml` for `vcpu:`/`vgpio:`/`vdisk:` profile tokens);
   **`--show-config`** (print the resolved configuration and exit — a dry run); **`-q`/`--quiet`**
   (suppress the foreground status panel).
@@ -403,7 +426,7 @@ deliberately out — see the README roadmap.)
   silently yield an unpinned box and nothing arbitrary reaches the kernel file. (Cooperative for the
   trust model — a hostile workload could widen its own affinity; `--memory`/`--cpus` are the hard,
   cgroup-enforced governance.)
-- **`--memory-swap-max <size>`** (on `box` and `run`) — swap allowance, mapped 1:1 to cgroup-v2
+- **`--memory-swap-max <size>`** (on `box` and `run`) — swap allowance, mapped 1:1 to cgroup v2
   `memory.swap.max` (a *separate* limit from `--memory`; default `0` = swap off). This is the
   honest v2-native knob, **not** Docker's combined mem+swap total. Accepts an explicit `0` (swap off).
 - **`kern run --config <kern.toml>`** — a specific config for `run`'s profile tokens (`vcpu:`/…),
@@ -614,7 +637,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 
 ### Added
 - **`kern box <name> (--image <ref>|--rootfs <dir>) [-- cmd...]` runs a command in a real
-  sandbox**: a fresh user + PID + net + UTS + IPC + mount namespace (single-UID map, no host
+  sandbox**: a fresh user + PID + net + UTS + IPC + mount namespace (single-uid map, no host
   privilege gained), an overlay root `pivot_root`-ed in (writable by default; `--read-only`
   remounts it read-only), a private `/proc`, then `exec`. Exit code propagated. Defaults to
   `/bin/sh`.
