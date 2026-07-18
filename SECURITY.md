@@ -37,7 +37,7 @@ that surface is an accepted, patched risk — not an adversary's playground.
 ## kern vs a microVM — when to use what
 
 kern isolates with Linux **namespaces + seccomp + a read-only pivot**: microsecond-to-millisecond
-start, ~1.5 MB, no VM, no daemon. That shared-kernel boundary is real, but its attack surface is the
+start, ~1.6 MB, no VM, no daemon. That shared-kernel boundary is real, but its attack surface is the
 host **kernel** — a kernel privilege-escalation bug is an escape.
 
 - **Reach for kern** when the code is **yours or semi-trusted** and you want speed, density and
@@ -245,8 +245,12 @@ OCI pull (`kern pull` / `--image`):
   stdin), never taken as a flag. When kern authenticates a pull, the credential is handed to `curl`
   via a `-K -` **stdin config**, *not* a `--user` argument — so it never appears in `/proc/<pid>/cmdline`
   where another same-uid process could read it; control characters are stripped so a crafted credential
-  can't inject a curl directive. `kern` does not **push** images to a registry (it pulls, builds
-  locally, and runs) — use a dedicated builder for registry push.
+  can't inject a curl directive.
+- **Registry push** (`kern push`, shipped since 0.6.1): kern packs the local rootfs as a single OCI
+  layer with ownership normalized to `uid/gid 0` and setuid/setgid bits stripped, so an untrusted base
+  can't smuggle a privilege bit into what you publish. The auth realm is pinned and a **cross-host
+  redirect during upload is refused** (a CVE-2020-15157-class credential-leak guard); every request is
+  TLS-pinned and credentials travel off-argv, exactly as on pull.
 
 ## vGPIO device passthrough (opt-in, honest scope)
 
