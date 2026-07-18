@@ -117,10 +117,10 @@ per run = total ÷ N):
 
 | host | kernel | **kern** | bubblewrap | crun | runc | podman | docker |
 |---|---|---:|---:|---:|---:|---:|---:|
-| x86_64 desktop | 6.17 | **1.9 ms** | 2.6 ms | 5.2 ms | 12.2 ms | 155 ms | 308 ms |
-| Jetson Orin Nano | 5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
-| Raspberry Pi 5 | 6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Arduino UNO Q | **6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
+| x86_64 desktop | v6.17 | **1.9 ms** | 2.6 ms | 5.2 ms | 12.2 ms | 155 ms | 308 ms |
+| Jetson Orin Nano | v5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
+| Raspberry Pi 5 | v6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Arduino UNO Q | **v6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
 
 ✗ = **not installed (nor readily installable) on that board.** The standout row is the **Raspberry
 Pi 5: `kern` is the ONLY runtime that runs at all** — bubblewrap, crun, runc, podman and Docker are
@@ -133,8 +133,8 @@ overlayfs pathology, see below).
 
 kern is **first on every board** — and the one place it took work is itself the most interesting.
 Profiled with `KERN_TIMING=1`, kern's *default* (overlay) startup on the Arduino breaks down as:
-overlay mount **~22.8 ms**, everything else (unshare, /dev, pivot, proc, seccomp) **~1.9 ms**
-combined. The overlay *mount syscall itself* is the whole gap: on this Android-derived 6.16 kernel
+overlay mount **~31 ms** (highly variable on this kernel — ~25–95 ms across runs), everything else
+(unshare, /dev, pivot, proc, seccomp) **~1.9 ms** combined. The overlay *mount syscall itself* is the whole gap: on this Android-derived 6.16 kernel
 an overlayfs mount takes ~31 ms (vs ~8 ms for a plain bind) — yet only **104 µs on x86** and ~1 ms
 on the Pi/Jetson. It's a property of that kernel's overlayfs, not of kern; kern uses an overlay so
 the rootfs/image stays immutable and shareable, which is sub-millisecond on every normal kernel and
@@ -157,8 +157,9 @@ only one that ships OCI images + caps + `ps`/`exec`/`logs`/compose. That reach i
 | runc binary | ~10 MB |
 | **Docker** resident | **~186 MB RSS** always on (`dockerd` ~121 MB + `containerd` ~65 MB) |
 
-kern is **~15× smaller than runc** and needs no bundle scaffolding; bwrap is smaller still but is
-only a launcher (no images/caps/lifecycle). Docker keeps ~186 MB resident before you run anything.
+kern is **~7× smaller than runc** (1.5 MB vs ~10 MB) and needs no bundle scaffolding; bwrap is
+smaller still but is only a launcher (no images/caps/lifecycle). Docker keeps ~186 MB resident
+before you run anything.
 
 > Reproduce: `ls -l $(command -v kern)` (binary); `ps -o rss= -C dockerd -C containerd` (Docker
 > resident, sum the KB); the per-box RSS is the box pid1's RSS while a box is up.
