@@ -7,7 +7,7 @@
 # (needs the mingw-w64 toolchain + `rustup target add x86_64-pc-windows-gnu`).
 [package]
 name = "kern-win"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 description = "Windows->WSL2 forwarder for kern (the Windows edge is a thin shim over one Linux kern)"
 license = "Apache-2.0"

@@ -17,6 +17,32 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.4] — 2026-07-15
+
+### Added
+- **`kern build` parses real-world Dockerfiles.** Comments inside `\` line-continuations, the `SHELL`
+  instruction, BuildKit flags (`RUN --mount=…`, `FROM --platform=…`, `COPY/ADD --chown/--chmod/--link/
+  --checksum`), the `# escape=` directive, a leading BOM, automatic `TARGETARCH`/`TARGETOS` build args,
+  multi-name `ARG`, `FROM scratch`, and blank lines inside a continuation now parse instead of erroring.
+- **`ADD <url>` and `COPY <<heredoc`.** `ADD` from an HTTPS URL (HTTPS-only, `--checksum` verified,
+  `--chmod` honoured so a fetched binary is executable) and heredoc `COPY <<FILE … FILE` (the
+  write-a-file-inline pattern) are supported — matching the common "download a static binary" recipe.
+- **`.dockerignore` + `.kernignore`.** Build-context filtering with faithful Docker semantics:
+  last-match-wins, `!` re-include, `*` non-recursive vs `**`, a filtered copy that does not follow
+  symlinks out of the context, and a canonical context root (fail-closed, never fail-open).
+- **Compose: real-world YAML.** Anchors/aliases/merge keys (`<<: *x`), the anchor forms real stacks use
+  (Airflow/Sentry/Penpot), block scalars (`|`/`>`), multi-line & following-line flow, multi-line quoted
+  scalars, same-file `extends`, `networks.*.aliases`, and mixed list/map `environment` salvage (which
+  makes some engines panic). Real-world compose files now parse essentially 100%.
+
+### Fixed
+- **Windows `install.ps1` updates in place and keeps the image cache.** The updater no longer
+  `wsl --unregister`s the distro (which wiped every cached image on each update); it swaps the binary
+  in place and only falls back to a re-import, with a warning, if that is not possible.
+- **`kern.toml` multi-line TOML arrays** (as `kern setup` writes them) now parse.
+- The RAM-backed (tmpfs) vdisk scratch warning now says it is **EPHEMERAL**, not merely that it
+  "counts against RAM".
+
 ## [0.6.3] — 2026-07-13
 
 ### Added
