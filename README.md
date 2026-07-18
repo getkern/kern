@@ -518,8 +518,8 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 
 ## Project status
 
-**0.6.4 — a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (**450 tests**, clippy-clean,
+**0.6.5 — a daemonless container + resource runtime that does less than Docker, on purpose.**
+Everything in [Features](#features) works today and is tested (**453 tests**, clippy-clean,
 `cargo-deny`-clean, security-audited slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem) — the point is a small, fast, honest core. The
 CLI and config surface are **not frozen until 1.0**.
@@ -529,6 +529,13 @@ CLI and config surface are **not frozen until 1.0**.
 pods (`--pod` / `--no-outbound`), and the **Python** binding. `build`/`push` are the newest, deepest
 surface — audited (COPY-from confinement, setuid/opaque hardening) and, where a rootless-overlay
 kernel can't persist an opaque dir, they **fail closed** to a safe path rather than leak.
+
+**New in 0.6.5:** `kern build` is closer to Docker — verified with a `docker build` differential:
+**`COPY`/`ADD` globs** (`COPY *.txt /app/`, `src/*`, `[ab].conf`) expand against the context;
+`COPY <dir> /dst/` copies the directory's **contents** into `/dst` (not nested under its name); and
+**`COPY --chmod`** is honoured on a context `COPY`/`COPY --from` (applied recursively), not only on
+`ADD <url>`/heredoc. On Windows the `install.ps1` **in-place update** now works (keeps the image cache
+instead of re-importing the distro).
 
 **New in 0.6.4:** `kern build` now parses **real-world Dockerfiles** (comments inside `\`
 continuations, `SHELL`, `ADD <url>` with `--checksum`/`--chmod`, `COPY <<heredoc`, `FROM scratch`,
