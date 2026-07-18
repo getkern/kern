@@ -6,8 +6,8 @@ which are *not* covered by the code license.
 
 ## The marks
 
-**"kern"** and **"getkern"**, the kern logo, and the `getkern.dev` identity are trademarks of the kern
-project. Trademark law protects users from confusion about *who stands behind* a piece of software — it
+**"kern"** and the kern logo are trademarks of the kern project (`getkern.dev` is its official
+domain). Trademark law protects users from confusion about *who stands behind* a piece of software — it
 is separate from, and does not restrict, your rights to the code.
 
 ## What you can do without asking (nominative / fair use)
@@ -20,7 +20,7 @@ is separate from, and does not restrict, your rights to the code.
 
 - Naming a **fork or a modified build** "kern" (or a confusingly similar name). If you distribute a
   modified version, **rename it** so users aren't misled — e.g. `open-sandbox`, `myco-runtime`.
-- Using "kern"/"getkern" (or a confusingly similar mark) in the **name of a product, company, or
+- Using "kern" (or a confusingly similar mark) in the **name of a product, company, or
   service**, or in a **domain name**, especially for a competing offering.
 - Using the logo in a way that implies **official endorsement** or affiliation.
 

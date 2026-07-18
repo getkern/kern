@@ -407,7 +407,7 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run — multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd** |
 | **`docker-compose.yml`** | ✅ `kern compose` reads real-world files as-is — `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `${VAR:-default}` interpolation, network **aliases** |
-| **Dockerfile** `build` | ✅ `kern build` — all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod`, `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, layer cache — and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box |
+| **Dockerfile** `build` | ✅ `kern build` — all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), **COPY globs** (`*.txt`, `src/*`, `[ab].conf`), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, layer cache — and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context — keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load` — export/import an image tar, `docker load`-compatible |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
@@ -473,10 +473,10 @@ numbers vary with hardware and load; board rows are from on-device runs.
 
 | host | kernel | **kern** | bubblewrap | crun | runc | podman | docker |
 |---|---|---:|---:|---:|---:|---:|---:|
-| x86_64 desktop | 6.17 | **1.9 ms** | 2.6 ms | 5.2 ms | 12.2 ms | 155 ms | 308 ms |
-| Jetson Orin Nano | 5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
-| Raspberry Pi 5 | 6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Arduino UNO Q | **6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
+| x86_64 desktop | v6.17 | **1.9 ms** | 2.6 ms | 5.2 ms | 12.2 ms | 155 ms | 308 ms |
+| Jetson Orin Nano | v5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
+| Raspberry Pi 5 | v6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Arduino UNO Q | **v6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
 
 ✗ = not installed (nor readily installable) on that board. On the **Pi 5, kern is the only runtime
 present at all** — one ~1.5 MB static binary just works where the others are each a setup step (Docker
@@ -605,6 +605,6 @@ tree is deliberately tiny (`libc` only on the Rust side; standard-library-only o
 copyleft-free — `cargo deny check licenses` is clean.
 
 **Trademark.** The *code* is free under [Apache-2.0](LICENSE) — fork it, embed it, run it, no strings.
-But **"kern" and "getkern" are trademarks** of the project: please don't use the names for a fork, a
+But **"kern" is a trademark** of the project: please don't use the name for a fork, a
 modified build, or a competing product/service without permission — see [TRADEMARK.md](TRADEMARK.md).
 Open code, protected name — the same split Rust and Firefox use.
