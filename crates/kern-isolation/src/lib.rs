@@ -22,12 +22,23 @@ mod ssh;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 pub use cgroup::apply_limits as apply_cgroup_limits;
+/// Resolve a box's exact direct-path cgroup dir from `/proc/<pid1>/cgroup` — the immediate, targeted
+/// counterpart to [`gc_orphan_box_cgroups`]: `kern stop`/`compose down` capture the dir while the box is
+/// alive and `rmdir` it after the SIGKILL, so the empty dir is gone at once instead of waiting for `gc`
+/// or the next box start. See [`cgroup::box_cgroup_dir`].
+pub use cgroup::box_cgroup_dir;
+/// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
+/// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
+pub use cgroup::gc_orphan_box_cgroups;
 /// Whether a `--memory` cap can actually be ENFORCED here (the `memory` controller is available in
 /// the cgroup tree). False on kernels that don't delegate it — a stock Raspberry Pi OS and the
 /// default WSL2 kernel — where a `memory.max` write is accepted but never bites. Used only to warn.
 pub use cgroup::memory_cap_enforceable;
-/// Is a user systemd manager present (a `systemd` dir under `$XDG_RUNTIME_DIR`)? The single
-/// definition — the scope re-exec gate and `kern doctor` both call it, so they can't drift.
+/// The systemd manager kern drives for its scope/slice: `--system` as real root, else `--user`. See
+/// [`cgroup::systemd_scope_mode`].
+pub use cgroup::systemd_scope_mode;
+/// Is the systemd manager kern would use present? (root → the system manager `/run/systemd/system`,
+/// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
 /// records itself in an in-process marker) and the scrub of an INHERITED marker (a nested kern must

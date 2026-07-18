@@ -447,6 +447,74 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
     Ok(order)
 }
 
+/// Like [`topo_order`], but grouped into dependency LEVELS: every box in level `k` depends only on
+/// boxes in levels `< k`, so all boxes WITHIN one level are independent and can be started
+/// concurrently — a barrier between levels preserves `depends_on`. Same deterministic file-order
+/// tie-break, same unknown-dep / cycle errors as [`topo_order`].
+pub fn topo_levels(boxes: &[ComposeBox]) -> Result<Vec<Vec<String>>, String> {
+    let names: HashSet<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
+    let mut indeg: HashMap<&str, usize> = boxes.iter().map(|b| (b.name.as_str(), 0)).collect();
+    let mut succ: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in boxes {
+        for d in b.all_deps() {
+            if !names.contains(d) {
+                return Err(format!("box '{}' depends on unknown box '{d}'", b.name));
+            }
+            succ.entry(d).or_default().push(b.name.as_str());
+            *indeg.get_mut(b.name.as_str()).unwrap() += 1;
+        }
+    }
+    // Level 0 = every indegree-0 box, in file order. Then repeatedly: emit the current level, decrement
+    // successors, and the boxes that hit indegree 0 form the next level (a box lands one level after
+    // its LAST-satisfied dependency — standard levelised Kahn).
+    // A precomputed name→file-index map keeps the per-level `sort_by_key` at O(k log k): looking the
+    // index up here is O(1), vs an O(N) `position` scan that would make the sort O(N·k log k).
+    let index: HashMap<&str, usize> = boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.name.as_str(), i))
+        .collect();
+    let pos = |n: &str| index.get(n).copied().unwrap_or(usize::MAX);
+    let mut level: Vec<&str> = boxes
+        .iter()
+        .map(|b| b.name.as_str())
+        .filter(|n| indeg[n] == 0)
+        .collect();
+    let mut levels: Vec<Vec<String>> = Vec::new();
+    let mut placed = 0usize;
+    while !level.is_empty() {
+        placed += level.len();
+        let mut next: Vec<&str> = Vec::new();
+        for &n in &level {
+            if let Some(ms) = succ.get(n) {
+                for &m in ms {
+                    let e = indeg.get_mut(m).unwrap();
+                    *e -= 1;
+                    if *e == 0 {
+                        next.push(m);
+                    }
+                }
+            }
+        }
+        levels.push(level.iter().map(|s| s.to_string()).collect());
+        next.sort_by_key(|n| pos(n)); // deterministic order within the next level
+        level = next;
+    }
+    if placed != boxes.len() {
+        let mut stuck: Vec<&str> = boxes
+            .iter()
+            .map(|b| b.name.as_str())
+            .filter(|n| indeg[n] > 0)
+            .collect();
+        stuck.sort_by_key(|n| pos(n));
+        return Err(format!(
+            "dependency cycle detected among: {}",
+            stuck.join(", ")
+        ));
+    }
+    Ok(levels)
+}
+
 /// Parse a `depends_on` value into the box's dependency buckets. Two accepted shapes:
 ///
 ///   * Array (Docker short syntax): `["db", "redis"]` → start-order edges only.
@@ -742,6 +810,27 @@ mod tests {
         assert!(topo_order(&parse(cyc).unwrap()).is_err());
         let unknown = "[box.a]\nimage=\"x\"\ndepends_on=[\"ghost\"]";
         assert!(topo_order(&parse(unknown).unwrap()).is_err());
+        // topo_levels rejects the same bad graphs.
+        assert!(topo_levels(&parse(cyc).unwrap()).is_err());
+        assert!(topo_levels(&parse(unknown).unwrap()).is_err());
+    }
+
+    #[test]
+    fn topo_levels_group_independent_services() {
+        // a (no deps) and c (no deps) are level 0; b depends on a; d depends on b and c. So:
+        // level 0 = {a, c}, level 1 = {b}, level 2 = {d}. Independent services share a level.
+        let doc = "[box.a]\nimage=\"x\"\n\
+                   [box.c]\nimage=\"x\"\n\
+                   [box.b]\nimage=\"x\"\ndepends_on=[\"a\"]\n\
+                   [box.d]\nimage=\"x\"\ndepends_on=[\"b\",\"c\"]";
+        let levels = topo_levels(&parse(doc).unwrap()).unwrap();
+        assert_eq!(levels.len(), 3, "three levels: {levels:?}");
+        assert!(levels[0].contains(&"a".to_string()) && levels[0].contains(&"c".to_string()));
+        assert_eq!(levels[1], vec!["b".to_string()]);
+        assert_eq!(levels[2], vec!["d".to_string()]);
+        // Every box appears exactly once across all levels.
+        let total: usize = levels.iter().map(|l| l.len()).sum();
+        assert_eq!(total, 4);
     }
 
     #[test]

@@ -1,8 +1,12 @@
 //! `kern.toml` — the resource-centric config schema.
 //!
-//! The implemented sections mirror the private runtime's `kern.toml` field-for-field (same names,
-//! same keys), so a profile written for one is readable by the other with no migration. It is parsed
-//! by kern's own dependency-free TOML reader (no `serde`/`toml` crates) — see [`parse`].
+//! The implemented sections mirror the private runtime's `kern.toml` model (same sections, same
+//! resource-centric shape). The CPU **field names are spelled to match the CLI flags 1:1** here
+//! (`cpus` = `--cpus` quota, `cpuset` = `--cpuset-cpus` pin, `cores` = host capacity, `nice`), a
+//! deliberate divergence from the private runtime's older `vcpus`/`priority` spelling; those legacy
+//! keys are REJECTED with a migration hint (not silently ignored) so a stale config can't apply a
+//! silently-wrong limit. It is parsed by kern's own dependency-free TOML reader (no `serde`/`toml`
+//! crates) — see [`parse`].
 //!
 //! The model is **resource-centric**, not box-centric: you *declare* the host resources you want
 //! kern to consider (`[[cpu]]`, `[[gpio]]`, `[[disk]]`) and *define* named virtual profiles that
@@ -50,33 +54,32 @@ pub struct KernSettings {
 #[derive(Debug, Clone, Default)]
 pub struct CpuEntry {
     pub id: String,
-    pub vcpus: Option<f64>,
+    /// Physical core budget this host CPU can hand out.
+    pub cores: Option<f64>,
     pub memory: Option<String>,
-    pub cpus: Option<String>,
+    /// CPU pinning range, e.g. `"0-7"`, `"0,2,4"`.
+    pub cpuset: Option<String>,
     pub numa: Option<i32>,
     pub name: Option<String>,
 }
 
-/// `[[vcpu]]` — a virtual CPU profile. Field names are identical to the private runtime; note that
-/// here `vcpus` is the core *quota* (cgroup `cpu.max`) and `cpus` is CPU *pinning* — the opposite
-/// spelling of the Docker-aligned CLI flags (`--cpus` = quota, `--cpuset-cpus` = pinning), which
-/// stay as they are.
+/// `[[vcpu]]` — a virtual CPU profile. Field names match the CLI flags 1:1, so a profile reads like
+/// the command line: `cpus` = the core *quota* (`--cpus`, cgroup `cpu.max`), `cpuset` = CPU *pinning*
+/// (`--cpuset-cpus`), `memory` = `--memory`, `nice` = `--nice`.
 #[derive(Debug, Clone, Default)]
 pub struct VCpuEntry {
     pub name: String,
     /// `backend = "cpu:0"` → a `[[cpu]]` id. `None` = standalone.
     pub backend: Option<String>,
-    /// CPU pinning range, e.g. `"0-7"`, `"0,2,4"`.
-    pub cpus: Option<String>,
-    /// Core quota (K8s/Docker units): `4.0` = 4 cores, `0.5` = half. cgroup `cpu.max`.
-    pub vcpus: Option<f64>,
-    /// NUMA node; CPUs auto-detected from its cpulist. Mutually exclusive with `cpus`.
+    /// CPU pinning range, e.g. `"0-7"`, `"0,2,4"` — like `--cpuset-cpus`.
+    pub cpuset: Option<String>,
+    /// Core quota (K8s/Docker units): `4.0` = 4 cores, `0.5` = half — like `--cpus`. cgroup `cpu.max`.
+    pub cpus: Option<f64>,
+    /// NUMA node; CPUs auto-detected from its cpulist. Mutually exclusive with `cpuset`.
     pub numa: Option<i32>,
-    /// RAM limit, e.g. `"512 MB"`, `"16 GB"`. cgroup `memory.max`.
+    /// RAM limit, e.g. `"512 MB"`, `"16 GB"` — like `--memory`. cgroup `memory.max`.
     pub memory: Option<String>,
-    /// Scheduling priority 0 (low) – 99 (high); mapped to `nice`.
-    pub priority: Option<u32>,
-    /// Raw `nice` (-20..19). Deprecated in favour of `priority`.
+    /// Scheduling niceness (-20 high … 19 low) — like `--nice`.
     pub nice: i32,
     /// Inherit another `[[vcpu]]` by name.
     pub extends: Option<String>,
@@ -333,11 +336,20 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
 fn apply_cpu(e: &mut CpuEntry, key: &str, v: &str) -> Result<(), String> {
     match key {
         "id" => e.id = value_string(v)?,
-        "vcpus" => e.vcpus = Some(value_f64(v)?),
+        "cores" => e.cores = Some(value_f64(v)?),
         "memory" => e.memory = Some(value_string(v)?),
-        "cpus" => e.cpus = Some(value_string(v)?),
+        "cpuset" => e.cpuset = Some(value_string(v)?),
         "numa" => e.numa = Some(value_i32(v)?),
         "name" => e.name = Some(value_string(v)?),
+        // Keys RENAMED in this schema: reject with a migration hint instead of silently ignoring
+        // them (unknown-key tolerance) — an ignored capacity key would misstate the host budget.
+        "vcpus" => return Err("[[cpu]] 'vcpus' was renamed to 'cores'".into()),
+        "cpus" => {
+            return Err(
+                "[[cpu]] 'cpus' was renamed: use 'cores' for capacity or 'cpuset' for CPU pinning"
+                    .into(),
+            )
+        }
         _ => {} // unrecognized key: ignored (forward/cross-version config compat)
     }
     Ok(())
@@ -347,13 +359,40 @@ fn apply_vcpu(e: &mut VCpuEntry, key: &str, v: &str) -> Result<(), String> {
     match key {
         "name" => e.name = value_string(v)?,
         "backend" => e.backend = Some(value_string(v)?),
-        "cpus" => e.cpus = Some(value_string(v)?),
-        "vcpus" => e.vcpus = Some(value_f64(v)?),
+        "cpuset" => e.cpuset = Some(value_string(v)?),
+        "cpus" => {
+            e.cpus = Some(value_f64(v).map_err(|orig| {
+                // A LEGACY string pin (`cpus = "0-3"`) can't parse as the new f64 quota — point at the
+                // rename (`cpus` = quota, pin moved to `cpuset`) instead of a bare "expected a number".
+                let unq = v.trim().trim_matches(['"', '\'']);
+                if is_cpu_list(unq) {
+                    "'cpus' is now the core quota (a number, like --cpus); the CPU pin list moved to \
+                     'cpuset' (--cpuset-cpus)"
+                        .to_string()
+                } else {
+                    orig
+                }
+            })?);
+        }
         "numa" => e.numa = Some(value_i32(v)?),
         "memory" => e.memory = Some(value_string(v)?),
-        "priority" => e.priority = Some(value_u32(v)?),
         "nice" => e.nice = value_i32(v)?,
         "extends" => e.extends = Some(value_string(v)?),
+        // Keys RENAMED in this schema: reject with a migration hint rather than silently ignoring
+        // them. Silence here is dangerous — an ignored `vcpus` drops the CPU quota, and a legacy
+        // `cpus` pin would be re-read as a quota: a silently-WRONG resource limit, no error.
+        "vcpus" => {
+            return Err(
+                "'vcpus' was renamed: use 'cpus' for the core quota (--cpus) and \
+                        'cpuset' for CPU pinning (--cpuset-cpus)"
+                    .into(),
+            )
+        }
+        "priority" => {
+            return Err(
+                "'priority' was removed: use 'nice' (-20 high .. 19 low, the --nice flag)".into(),
+            )
+        }
         _ => {} // unrecognized key: ignored (forward/cross-version config compat)
     }
     Ok(())
@@ -606,8 +645,8 @@ pub struct ResolvedCpu {
     pub nice: Option<i32>,
 }
 
-/// Resolve a `[[vcpu]]` entry to concrete limits: `vcpus`→cpus quota, `cpus`/`numa`→cpuset pinning,
-/// `memory`→bytes, `priority`/`nice`→nice. `extends` is followed one level (a base profile).
+/// Resolve a `[[vcpu]]` entry to concrete limits: `cpus`→quota, `cpuset`/`numa`→pinning,
+/// `memory`→bytes, `nice`→nice. `extends` is followed one level (a base profile).
 pub fn resolve_vcpu(cfg: &KernConfig, name: &str) -> Result<ResolvedCpu, String> {
     resolve_vcpu_seen(cfg, name, &mut Vec::new())
 }
@@ -634,10 +673,7 @@ fn resolve_vcpu_seen(
     // value fails HERE with a clear message rather than silently doing nothing.
     let ctx = |m: String| format!("[[vcpu]] '{name}': {m}");
     validate_profile_name(&e.name).map_err(ctx)?;
-    if let Some(p) = e.priority {
-        check_priority(p).map_err(ctx)?;
-    }
-    if let Some(c) = &e.cpus {
+    if let Some(c) = &e.cpuset {
         check_cpus(c).map_err(ctx)?;
     }
     // Base (extends) first, then this entry overrides.
@@ -645,26 +681,32 @@ fn resolve_vcpu_seen(
     if let Some(base) = &e.extends {
         r = resolve_vcpu_seen(cfg, base, seen)?;
     }
-    if let Some(q) = e.vcpus {
+    if let Some(q) = e.cpus {
+        // Same positivity rule the form / `config add` enforce (`profile_line`): a hand-edited
+        // `cpus = 0` / `-4` / `inf` would otherwise resolve to a quota the cgroup backend floors to
+        // ~1% of a core — a silent near-freeze rather than the clear error this resolver promises.
+        if !q.is_finite() || q <= 0.0 {
+            return Err(ctx(format!(
+                "cpus must be a positive number of cores (got {q})"
+            )));
+        }
         r.cpus = Some(q);
     }
     if let Some(m) = &e.memory {
         r.memory =
             Some(size_to_bytes(m).ok_or_else(|| format!("bad memory '{m}' in [[vcpu]] '{name}'"))?);
     }
-    // Pinning: explicit `cpus`, else derive from `numa` node's cpulist.
-    if let Some(c) = &e.cpus {
+    // Pinning: explicit `cpuset`, else derive from `numa` node's cpulist.
+    if let Some(c) = &e.cpuset {
         r.cpuset = Some(c.clone());
     } else if let Some(node) = e.numa {
         if let Some(list) = numa_cpulist(node) {
             r.cpuset = Some(list);
         }
     }
-    // Priority 0..99 → nice 19..0 (no root); raw `nice` wins if given.
+    // Scheduling niceness (-20 high … 19 low), like `--nice`.
     if e.nice != 0 {
         r.nice = Some(e.nice.clamp(-20, 19));
-    } else if let Some(p) = e.priority {
-        r.nice = Some(19 - (p.min(99) as i32 * 19 / 99));
     }
     Ok(r)
 }
@@ -781,10 +823,12 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
     }
 
     // `net` is parsed and preserved for round-trip, but a vGPIO profile does not (yet) move a network
-    // interface into the box — so say so rather than silently doing nothing.
+    // interface into the box — so say so rather than silently doing nothing. (Note: this is interface
+    // passthrough, NOT the box's `--net`/`--network` host-network SHARING — a different mechanism; we
+    // deliberately don't point at `--net` here to avoid conflating the two.)
     if !e.net.is_empty() {
         eprintln!(
-            "kern: vgpio '{}' sets net={:?}, but vgpio does not attach network interfaces — ignored (use the box's --net)",
+            "kern: vgpio '{}' sets net={:?}, but vgpio does not attach network interfaces yet — ignored",
             e.name, e.net
         );
     }
@@ -1124,15 +1168,6 @@ pub(crate) fn check_size(field: &str, v: &str) -> Result<(), String> {
     }
 }
 
-/// `priority` maps to `nice`, so it must be 0–99.
-pub(crate) fn check_priority(p: u32) -> Result<(), String> {
-    if p <= 99 {
-        Ok(())
-    } else {
-        Err(format!("priority: must be 0-99 (got {p})"))
-    }
-}
-
 /// A cpuset list like `0-3,7`: each token is `N` or `A-B` with `A <= B`. The single rule shared by
 /// the `--cpuset-cpus` flag, the profile forms and `kern config add`.
 pub(crate) fn is_cpu_list(s: &str) -> bool {
@@ -1152,7 +1187,7 @@ pub(crate) fn check_cpus(v: &str) -> Result<(), String> {
     if is_cpu_list(v) {
         Ok(())
     } else {
-        Err("cpus: a CPU list like 0-3 or 0,2,4 (start ≤ end)".into())
+        Err("cpuset: a CPU list like 0-3 or 0,2,4 (start ≤ end)".into())
     }
 }
 
@@ -1199,7 +1234,7 @@ pub(crate) fn toml_quote(s: &str) -> String {
 pub(crate) fn profile_fields(kind: &str) -> &'static [&'static str] {
     match kind {
         "vcpu" => &[
-            "vcpus", "cpus", "memory", "priority", "numa", "nice", "backend", "extends",
+            "cpus", "cpuset", "memory", "numa", "nice", "backend", "extends",
         ],
         "vgpio" => &[
             "backend",
@@ -1314,9 +1349,19 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
         return Ok(Some(format!("{key} = [{}]", items.join(", "))));
     }
     let line = match key {
+        // CPU *quota* — like `--cpus` (fractional cores → cgroup cpu.max).
         "cpus" => {
+            let n: f64 = v.parse().map_err(|_| "cpus: a number — e.g. 4 or 0.5")?;
+            // `!is_finite()` rejects both `nan` and `inf` (which would write a nonsense `cpus = inf`).
+            if !n.is_finite() || n <= 0.0 {
+                return Err("cpus: must be a finite number greater than 0".into());
+            }
+            format!("cpus = {}", crate::ui::fmt_cpus(n))
+        }
+        // CPU *pinning* — like `--cpuset-cpus` (a cpulist: `0-3`, `0,2,4`).
+        "cpuset" => {
             check_cpus(v)?;
-            format!("cpus = {}", toml_quote(v))
+            format!("cpuset = {}", toml_quote(v))
         }
         "memory" | "size" | "bandwidth" => {
             check_size(key, v)?;
@@ -1328,19 +1373,6 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
         "extends" => {
             validate_profile_name(v).map_err(|m| format!("extends: {m}"))?;
             format!("extends = {}", toml_quote(v))
-        }
-        "vcpus" => {
-            let n: f64 = v.parse().map_err(|_| "vcpus: a number — e.g. 4 or 0.5")?;
-            // `!is_finite()` rejects both `nan` and `inf` (which would write a nonsense `vcpus = inf`).
-            if !n.is_finite() || n <= 0.0 {
-                return Err("vcpus: must be a finite number greater than 0".into());
-            }
-            format!("vcpus = {}", crate::ui::fmt_cpus(n))
-        }
-        "priority" => {
-            let n: u32 = v.parse().map_err(|_| "priority: a whole number 0-99")?;
-            check_priority(n)?;
-            format!("priority = {n}")
         }
         "numa" => {
             let n: i32 = v.parse().map_err(|_| "numa: a node number (0, 1, …)")?;
@@ -1428,15 +1460,15 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
     let could_complete = match key {
         // a lone minus is the start of a negative nice value
         "nice" => v == "-",
-        // a float prefix (`0`, `0.`, `1.`) can still reach a valid vcpus like `0.5`
-        "vcpus" => {
+        // a float prefix (`0`, `0.`, `1.`) can still reach a valid cpus quota like `0.5`
+        "cpus" => {
             v.bytes().filter(|b| *b == b'.').count() <= 1
                 && v.chars().all(|c| c.is_ascii_digit() || c == '.')
         }
-        // a partial cpulist (`0-`, `0,`) can still reach a valid list. Match `is_cpu_list`'s shape with
+        // a partial cpulist (`0-`, `0,`) can still reach a valid cpuset. Match `is_cpu_list`'s shape with
         // NO upper bound (it has none — a portable profile may pin a high core, host-fit is launch-time),
         // so a Valid value like `5000-9000` isn't blocked mid-typing at the `-`.
-        "cpus" => v.split(',').all(|t| {
+        "cpuset" => v.split(',').all(|t| {
             let parts: Vec<&str> = t.split('-').collect();
             parts.len() <= 2
                 && parts
@@ -1474,17 +1506,14 @@ pub(crate) fn profile_pairs(cfg: &KernConfig, kind: &str, name: &str) -> Vec<(St
     match kind {
         "vcpu" => {
             if let Some(e) = cfg.vcpu.iter().find(|e| e.name == name) {
-                if let Some(v) = e.vcpus {
-                    out.push(("vcpus".into(), crate::ui::fmt_cpus(v)));
+                if let Some(v) = e.cpus {
+                    out.push(("cpus".into(), crate::ui::fmt_cpus(v)));
                 }
-                if let Some(c) = &e.cpus {
-                    out.push(("cpus".into(), c.clone()));
+                if let Some(c) = &e.cpuset {
+                    out.push(("cpuset".into(), c.clone()));
                 }
                 if let Some(m) = &e.memory {
                     out.push(("memory".into(), m.clone()));
-                }
-                if let Some(p) = e.priority {
-                    out.push(("priority".into(), p.to_string()));
                 }
                 if let Some(n) = e.numa {
                     out.push(("numa".into(), n.to_string()));
@@ -1626,7 +1655,7 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Re
 /// reference something that doesn't exist. Checks the internal, save-time coherence a single field
 /// can't (a `backend`/`extends` that points at no configured `[[cpu]]`/`[[gpio]]`/`[[disk]]`/profile).
 /// Host-fit checks (e.g. `cpus` ≤ this host's cores) are LAUNCH-time and live in the resolver — a
-/// profile is portable, so `cpus = "0-7"` is legal to author on a 4-core box for an 8-core target.
+/// profile is portable, so `cpuset = "0-7"` is legal to author on a 4-core box for an 8-core target.
 pub(crate) fn validate_profile_refs(
     cfg: &KernConfig,
     section: &str,
@@ -1636,7 +1665,11 @@ pub(crate) fn validate_profile_refs(
         "vcpu" => {
             if let Some(e) = cfg.vcpu.iter().find(|e| e.name == name) {
                 if let Some(b) = e.backend.as_deref().filter(|b| !b.is_empty()) {
-                    if !cfg.cpu.iter().any(|c| c.id == b) {
+                    if !cfg
+                        .cpu
+                        .iter()
+                        .any(|c| backend_ref_matches(b, "cpu:", &c.id))
+                    {
                         return Err(format!("backend '{b}' is not a configured [[cpu]] id"));
                     }
                 }
@@ -1649,7 +1682,12 @@ pub(crate) fn validate_profile_refs(
         }
         "vgpio" => {
             if let Some(e) = cfg.vgpio.iter().find(|e| e.name == name) {
-                if !e.backend.is_empty() && !cfg.gpio.iter().any(|g| g.id == e.backend) {
+                if !e.backend.is_empty()
+                    && !cfg
+                        .gpio
+                        .iter()
+                        .any(|g| backend_ref_matches(&e.backend, "gpio:", &g.id))
+                {
                     return Err(format!(
                         "backend '{}' is not a configured [[gpio]] id (run: kern config setup)",
                         e.backend
@@ -1659,20 +1697,32 @@ pub(crate) fn validate_profile_refs(
         }
         "vdisk" => {
             if let Some(e) = cfg.vdisk.iter().find(|e| e.name == name) {
-                if !e.backend.is_empty() {
-                    let want = e.backend.strip_prefix("disk:").unwrap_or(&e.backend);
-                    if !cfg.disk.iter().any(|d| d.name == want) {
-                        return Err(format!(
-                            "backend '{}' is not a configured [[disk]]",
-                            e.backend
-                        ));
-                    }
+                if !e.backend.is_empty()
+                    && !cfg
+                        .disk
+                        .iter()
+                        .any(|d| backend_ref_matches(&e.backend, "disk:", &d.name))
+                {
+                    return Err(format!(
+                        "backend '{}' is not a configured [[disk]]",
+                        e.backend
+                    ));
                 }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Match a `backend = "kind:name"` reference against a declared `[[cpu]]`/`[[gpio]]`/`[[disk]]`
+/// id/name, tolerating the optional `kind:` prefix on EITHER side. The docs show `[[cpu]] id = "0"`
+/// while the shipped example bakes in `id = "cpu:0"`, and a user may write `backend = "cpu:0"` or a
+/// bare `backend = "0"` — all of these resolve, so the same-looking token means the same thing across
+/// every kind (previously cpu/gpio needed a literal match and only disk stripped the prefix).
+fn backend_ref_matches(reference: &str, prefix: &str, declared: &str) -> bool {
+    reference.strip_prefix(prefix).unwrap_or(reference)
+        == declared.strip_prefix(prefix).unwrap_or(declared)
 }
 
 pub(crate) fn save_named_block(
@@ -1725,15 +1775,15 @@ mod tests {
 
         [[cpu]]
         id = "cpu:0"
-        vcpus = 8.0
+        cores = 8.0
 
         [[vcpu]]
         name = "heavy"
         backend = "cpu:0"
-        vcpus = 4.0
-        cpus = "0-3"
+        cpus = 4.0
+        cpuset = "0-3"
         memory = "2g"
-        priority = 80
+        nice = -5
 
         [[gpio]]
         id = "gpio:0"
@@ -1763,13 +1813,13 @@ mod tests {
         assert_eq!(c.kern.config_version, Some(1));
         assert_eq!(c.kern.log_level.as_deref(), Some("debug"));
         assert_eq!(c.cpu[0].id, "cpu:0");
-        assert_eq!(c.cpu[0].vcpus, Some(8.0));
+        assert_eq!(c.cpu[0].cores, Some(8.0));
         let v = &c.vcpu[0];
         assert_eq!(v.name, "heavy");
         assert_eq!(v.backend.as_deref(), Some("cpu:0"));
-        assert_eq!(v.vcpus, Some(4.0));
-        assert_eq!(v.cpus.as_deref(), Some("0-3"));
-        assert_eq!(v.priority, Some(80));
+        assert_eq!(v.cpus, Some(4.0));
+        assert_eq!(v.cpuset.as_deref(), Some("0-3"));
+        assert_eq!(v.nice, -5);
         assert_eq!(c.gpio[0].pins, [17, 27, 22]);
         assert_eq!(c.gpio[0].i2c, ["1"]);
         assert_eq!(c.gpio[0].usb_ports[0].bus, 1);
@@ -1809,7 +1859,43 @@ mod tests {
         assert_eq!(c.vcpu[0].name, "ok");
         // A BAD VALUE for a RECOGNIZED key is still a real error — tolerance ignores unknowns, it does
         // not swallow malformed values of keys we do implement.
-        assert!(parse("[[vcpu]]\nname = \"x\"\nvcpus = abc").is_err());
+        assert!(parse("[[vcpu]]\nname = \"x\"\ncpus = abc").is_err());
+    }
+
+    #[test]
+    fn legacy_renamed_cpu_keys_are_rejected_not_silently_ignored() {
+        // The renamed keys must NOT fall through the unknown-key tolerance (that would drop/misread a
+        // resource limit in silence). They error with a migration hint pointing at the new spelling.
+        let e = parse("[[vcpu]]\nname = \"x\"\nvcpus = 4").unwrap_err();
+        assert!(
+            e.contains("cpus"),
+            "vcpus error should point to 'cpus': {e}"
+        );
+        assert!(parse("[[vcpu]]\nname = \"x\"\npriority = 80").is_err());
+        let ec = parse("[[cpu]]\nid = \"0\"\nvcpus = 8").unwrap_err();
+        assert!(
+            ec.contains("cores"),
+            "[[cpu]] vcpus should point to 'cores': {ec}"
+        );
+        // `[[cpu]] cpus` was renamed — the hint offers BOTH intents (capacity `cores` / pin `cpuset`),
+        // since a new user might mean either.
+        let ecc = parse("[[cpu]]\nid = \"0\"\ncpus = \"0-7\"").unwrap_err();
+        assert!(
+            ecc.contains("cores") && ecc.contains("cpuset"),
+            "[[cpu]] cpus hint should mention both cores and cpuset: {ecc}"
+        );
+        // A LEGACY `[[vcpu]]` string pin (`cpus = "0-3"`) can't parse as the new f64 quota → the error
+        // points at `cpuset`, not a bare "expected a number". A genuinely bad value stays generic.
+        let ep = parse("[[vcpu]]\nname = \"x\"\ncpus = \"0-3\"").unwrap_err();
+        assert!(
+            ep.contains("cpuset"),
+            "legacy vcpu cpus pin should point to 'cpuset': {ep}"
+        );
+        let eb = parse("[[vcpu]]\nname = \"x\"\ncpus = abc").unwrap_err();
+        assert!(
+            !eb.contains("cpuset") && eb.contains("number"),
+            "a non-cpulist bad quota stays a generic number error: {eb}"
+        );
     }
 
     #[test]
@@ -1818,13 +1904,13 @@ mod tests {
         // The hand-rolled reader must gather the lines up to `]` — it used to error on `= [`, failing
         // the WHOLE config, so a board kern itself set up couldn't load its own profiles (real Jetson).
         let c = parse(
-            "[[gpio]]\nid = \"0\"\ni2c = [\n    \"/dev/i2c-0\",\n    \"/dev/i2c-1\",\n    \"/dev/i2c-2\",\n]\n\n[[vcpu]]\nname = \"after\"\nvcpus = 1.0",
+            "[[gpio]]\nid = \"0\"\ni2c = [\n    \"/dev/i2c-0\",\n    \"/dev/i2c-1\",\n    \"/dev/i2c-2\",\n]\n\n[[vcpu]]\nname = \"after\"\ncpus = 1.0",
         )
         .unwrap();
         assert_eq!(c.gpio[0].i2c, ["/dev/i2c-0", "/dev/i2c-1", "/dev/i2c-2"]);
         // ...and parsing CONTINUES past the multi-line array — the profile after it still loads.
         assert_eq!(c.vcpu[0].name, "after");
-        assert_eq!(c.vcpu[0].vcpus, Some(1.0));
+        assert_eq!(c.vcpu[0].cpus, Some(1.0));
         // A multi-line INT array (pins) works too, with a trailing comma.
         let c2 = parse("[[gpio]]\nid=\"0\"\npins = [\n  1,\n  2,\n  3,\n]").unwrap();
         assert_eq!(c2.gpio[0].pins, [1, 2, 3]);
@@ -1855,16 +1941,16 @@ mod tests {
     fn resolves_vcpu_to_concrete_limits() {
         let c = parse(DOC).unwrap();
         let r = resolve_vcpu(&c, "heavy").unwrap();
-        assert_eq!(r.cpus, Some(4.0)); // vcpus → quota
-        assert_eq!(r.cpuset.as_deref(), Some("0-3")); // cpus → pinning
+        assert_eq!(r.cpus, Some(4.0)); // cpus → quota (= --cpus)
+        assert_eq!(r.cpuset.as_deref(), Some("0-3")); // cpuset → pinning (= --cpuset-cpus)
         assert_eq!(r.memory, Some(2 * 1024 * 1024 * 1024)); // "2g"
-        assert_eq!(r.nice, Some(19 - (80 * 19 / 99))); // priority 80 → nice
+        assert_eq!(r.nice, Some(-5)); // nice → nice (= --nice)
         assert!(resolve_vcpu(&c, "ghost").is_err());
     }
 
     #[test]
     fn vcpu_extends_inherits_then_overrides() {
-        let doc = "[[vcpu]]\nname = \"base\"\nvcpus = 1.0\nmemory = \"1g\"\n\
+        let doc = "[[vcpu]]\nname = \"base\"\ncpus = 1.0\nmemory = \"1g\"\n\
                    [[vcpu]]\nname = \"big\"\nextends = \"base\"\nmemory = \"4g\"";
         let c = parse(doc).unwrap();
         let r = resolve_vcpu(&c, "big").unwrap();
@@ -1879,7 +1965,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mk = |n: &str, cpu: &str| {
             let f = dir.join(n);
-            std::fs::write(&f, format!("[[vcpu]]\nname=\"p\"\nvcpus={cpu}\n")).unwrap();
+            std::fs::write(&f, format!("[[vcpu]]\nname=\"p\"\ncpus={cpu}\n")).unwrap();
             f
         };
         let cfg_file = mk("a.toml", "1.0");
@@ -2166,7 +2252,7 @@ mod tests {
         assert!(validate_profile_refs(&cfg, "vgpio", "bad").is_err());
         // vcpu: backend → [[cpu]] id, extends → another vcpu profile.
         let cfg2 = parse(
-            "[[cpu]]\nid=\"cpu:0\"\n[[vcpu]]\nname=\"base\"\nvcpus=2.0\n\
+            "[[cpu]]\nid=\"cpu:0\"\n[[vcpu]]\nname=\"base\"\ncpus=2.0\n\
              [[vcpu]]\nname=\"ok\"\nbackend=\"cpu:0\"\nextends=\"base\"\n\
              [[vcpu]]\nname=\"bad\"\nextends=\"nope\"\n",
         )
@@ -2185,21 +2271,27 @@ mod tests {
         // No backend set → nothing to resolve → fine.
         let cfg4 = parse("[[vgpio]]\nname=\"n\"\npins=[17]\n").unwrap();
         assert!(validate_profile_refs(&cfg4, "vgpio", "n").is_ok());
+        // The `kind:` prefix is tolerated on EITHER side: the docs form (`[[cpu]] id = "0"` +
+        // `backend = "cpu:0"`) and a bare `backend = "0"` both resolve, not just the literal match.
+        let cfg5 = parse(
+            "[[cpu]]\nid=\"0\"\n[[vcpu]]\nname=\"pfx\"\nbackend=\"cpu:0\"\n\
+             [[vcpu]]\nname=\"bare\"\nbackend=\"0\"\n",
+        )
+        .unwrap();
+        assert!(validate_profile_refs(&cfg5, "vcpu", "pfx").is_ok());
+        assert!(validate_profile_refs(&cfg5, "vcpu", "bare").is_ok());
     }
 
     // ── shared profile schema: the single source of truth the TUI form and `kern config add` share ──
 
     #[test]
     fn profile_line_validates_every_field() {
-        // Good values emit the expected TOML.
-        assert_eq!(profile_line("vcpus", "4").unwrap().unwrap(), "vcpus = 4");
+        // Good values emit the expected TOML. `cpus` = quota (float), `cpuset` = pinning (cpulist).
+        assert_eq!(profile_line("cpus", "4").unwrap().unwrap(), "cpus = 4");
+        assert_eq!(profile_line("cpus", "0.5").unwrap().unwrap(), "cpus = 0.5");
         assert_eq!(
-            profile_line("vcpus", "0.5").unwrap().unwrap(),
-            "vcpus = 0.5"
-        );
-        assert_eq!(
-            profile_line("cpus", "0-3").unwrap().unwrap(),
-            r#"cpus = "0-3""#
+            profile_line("cpuset", "0-3").unwrap().unwrap(),
+            r#"cpuset = "0-3""#
         );
         assert_eq!(
             profile_line("memory", "512m").unwrap().unwrap(),
@@ -2218,10 +2310,9 @@ mod tests {
         assert!(profile_line("persistent", "no").unwrap().is_none());
         // Bad values are REJECTED — the same rejections the loader would give.
         assert!(profile_line("memory", "banana").is_err());
-        assert!(profile_line("cpus", "99-0").is_err()); // reversed range
-        assert!(profile_line("priority", "999").is_err()); // out of 0-99
-        assert!(profile_line("vcpus", "-5").is_err()); // must be > 0
-        assert!(profile_line("vcpus", "abc").is_err());
+        assert!(profile_line("cpuset", "99-0").is_err()); // reversed range
+        assert!(profile_line("cpus", "-5").is_err()); // quota must be > 0
+        assert!(profile_line("cpus", "abc").is_err());
         assert!(profile_line("pins", "70000").is_err()); // out of GPIO range
         assert!(profile_line("size", "wat").is_err());
         assert!(profile_line("backend", "  ").unwrap().is_none()); // empty optional → skipped
@@ -2233,37 +2324,34 @@ mod tests {
         // Valid: a complete, save-acceptable value.
         for (k, v) in [
             ("pins", "17"),
-            ("priority", "50"),
             ("memory", "512m"),
-            ("vcpus", "0.5"),
+            ("cpus", "0.5"),
             ("nice", "-5"),
             ("size", "2g"),
-            ("cpus", "0-3"),
+            ("cpuset", "0-3"),
         ] {
             assert_eq!(field_state(k, v), Valid, "{k}={v}");
         }
         // Incomplete: a prefix that can still complete — allowed live, not yet savable.
         for (k, v) in [
             ("nice", "-"),
-            ("vcpus", "0"),
-            ("cpus", "0-"),
-            ("cpus", "4095-"), // degenerate range 4095-4095 IS valid → not a dead-end
-            ("cpus", "5000-"), // no upper bound → 5000-9000 is reachable → typeable
-            ("priority", ""),
+            ("cpus", "0"),
+            ("cpuset", "0-"),
+            ("cpuset", "4095-"), // degenerate range 4095-4095 IS valid → not a dead-end
+            ("cpuset", "5000-"), // no upper bound → 5000-9000 is reachable → typeable
         ] {
             assert_eq!(field_state(k, v), Incomplete, "{k}={v:?}");
         }
         // A high-core range is a VALID cpulist (host-fit is launch-time) — it must not be blocked
         // mid-typing: `5000-9000` types through, so `5000-` above is Incomplete, not Invalid.
-        assert_eq!(field_state("cpus", "4095-4095"), Valid);
-        assert_eq!(field_state("cpus", "5000-9000"), Valid);
+        assert_eq!(field_state("cpuset", "4095-4095"), Valid);
+        assert_eq!(field_state("cpuset", "5000-9000"), Valid);
         // Invalid: no completion can be valid — the keystroke that produced it is refused.
         for (k, v) in [
             ("pins", "44545454545"),
-            ("priority", "100"),
             ("nice", "-25"),
             ("memory", "1.5g"),
-            ("vcpus", "1.2.3"),
+            ("cpus", "1.2.3"),
             ("extra", "rftre errte"), // garbage — not a /dev path (the reported bug)
             ("extra", "/etc/passwd"), // a path, but not under /dev
         ] {
@@ -2299,7 +2387,7 @@ mod tests {
         // THE invariant that kills the dead-end class: whatever field_state calls Valid, the SAVE
         // (profile_line) must accept. Otherwise the filter lets you type a value the save rejects.
         for k in [
-            "pins", "priority", "numa", "nice", "vcpus", "cpus", "memory", "size", "iops",
+            "pins", "numa", "nice", "cpus", "cpuset", "memory", "size", "iops",
         ] {
             for v in [
                 "0", "1", "5", "17", "50", "99", "100", "512", "2g", "16t", "1.5", "1.5g", ".5g",
@@ -2345,9 +2433,9 @@ mod tests {
         assert!(profile_line("numa", "-1").is_err());
         assert!(profile_line("extends", "a:b").is_err());
         assert!(profile_line("adc", "70000").is_err()); // line-index range
-                                                        // A non-finite vcpus (`inf`/`nan`) is rejected — it would write a nonsense `vcpus = inf`.
-        assert!(profile_line("vcpus", "inf").is_err());
-        assert!(profile_line("vcpus", "nan").is_err());
+                                                        // A non-finite cpus quota (`inf`/`nan`) is rejected — it would write a nonsense `cpus = inf`.
+        assert!(profile_line("cpus", "inf").is_err());
+        assert!(profile_line("cpus", "nan").is_err());
     }
 
     #[test]
@@ -2364,12 +2452,12 @@ mod tests {
 
     #[test]
     fn resolve_rejects_a_hand_edited_out_of_range_profile() {
-        // A file the TUI would never have written (priority > 99) fails at attach with a clear message.
-        let cfg = parse("[[vcpu]]\nname=\"p\"\nvcpus=1\npriority=999\n").unwrap();
+        // A file the TUI would never have written (a reversed cpuset range) fails at attach with a clear message.
+        let cfg = parse("[[vcpu]]\nname=\"p\"\ncpus=1\ncpuset=\"9-0\"\n").unwrap();
         let e = resolve_vcpu(&cfg, "p").unwrap_err();
-        assert!(e.contains("priority"), "got: {e}");
+        assert!(e.contains("cpuset"), "got: {e}");
         // A ':' in a name is refused at resolve too, matching the form.
-        let cfg2 = parse("[[vcpu]]\nname=\"a:b\"\nvcpus=1\n").unwrap();
+        let cfg2 = parse("[[vcpu]]\nname=\"a:b\"\ncpus=1\n").unwrap();
         assert!(resolve_vcpu(&cfg2, "a:b").is_err());
         // A GPIO pin far out of range is refused.
         let cfg3 = parse("[[vgpio]]\nname=\"g\"\nbackend=\"gpio:0\"\npins=[70000]\n").unwrap();

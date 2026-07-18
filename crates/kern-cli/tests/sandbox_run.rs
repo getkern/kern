@@ -720,7 +720,7 @@ fn box_applies_vcpu_profile() {
     let _ = fs::create_dir_all(cfgdir.join("kern"));
     fs::write(
         cfgdir.join("kern/kern.toml"),
-        "[[vcpu]]\nname = \"pin0\"\ncpus = \"0\"\nmemory = \"64m\"\n",
+        "[[vcpu]]\nname = \"pin0\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
     )
     .unwrap();
     let root = build_rootfs(&busybox, "boxprof");
@@ -782,7 +782,7 @@ fn examples_output_validates_and_lists() {
     // A BAD VALUE for a recognized key fails validation with a non-zero exit and a line number.
     // (An unknown key would be tolerated/ignored — the parser only errors on malformed values of
     // keys it implements.)
-    fs::write(&toml, "[[vcpu]]\nname = \"x\"\nvcpus = abc\n").unwrap();
+    fs::write(&toml, "[[vcpu]]\nname = \"x\"\ncpus = abc\n").unwrap();
     let bad = kern()
         .args(["validate", toml.to_str().unwrap()])
         .output()
@@ -801,7 +801,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
     let _ = fs::create_dir_all(cfgdir.join("kern"));
     fs::write(
         cfgdir.join("kern/kern.toml"),
-        "[[vcpu]]\nname = \"pinned\"\ncpus = \"0\"\nmemory = \"64m\"\n",
+        "[[vcpu]]\nname = \"pinned\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
     )
     .unwrap();
     // Retry on empty stdout — `kern run` re-execs into a systemd scope whose piped output can come

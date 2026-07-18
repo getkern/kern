@@ -69,9 +69,36 @@ pub fn direct_caps_available() -> bool {
 }
 
 /// Is a user systemd manager present (so `reexec` could put a box in a `--scope` / a delegated slice)?
-/// A `systemd` dir under `$XDG_RUNTIME_DIR`. The SINGLE definition — both the scope-skip decision and the
-/// fail-closed gate call it, so they can't drift.
+/// Running as REAL root? Then kern drives the SYSTEM systemd manager (`systemd-run --system`), which
+/// gets the full controller set + a persistent, properly-delegated `kern.slice` — the fast direct-cap
+/// path. A rootless kern (the common case) uses its per-user manager (`--user`). This is the ONE
+/// root/rootless split on the cgroup surface; everything else (box isolation) is identical.
+fn as_root() -> bool {
+    // Deliberately the REAL uid (`getuid`), not the effective (`geteuid` that `real.rs` uses for the
+    // box uid map): this gates the root-only GLOBAL side-effect (a top-level `kern.slice` + a write to
+    // the cgroup-v2 root `subtree_control`), so a setuid-root binary launched by a normal user
+    // (getuid≠0) stays on the conservative rootless path instead of touching the host's root cgroup.
+    // Don't "fix" toward geteuid. (Safe either way — the writes are kernel-permission-gated and the
+    // caps are read-back / fail-closed verified — but getuid is the safer trigger for the global write.)
+    (unsafe { libc::getuid() }) == 0
+}
+
+/// `--system` when kern is real root, else `--user` — the systemd manager kern's scope/slice live under.
+pub fn systemd_scope_mode() -> &'static str {
+    if as_root() {
+        "--system"
+    } else {
+        "--user"
+    }
+}
+
+/// Is the systemd manager kern would use actually present? As root → the SYSTEM manager (`/run/systemd/
+/// system`, i.e. pid-1 systemd on a systemd host). Rootless → a `systemd` dir under `$XDG_RUNTIME_DIR`.
+/// The SINGLE definition — both the scope-skip decision and the fail-closed gate call it, no drift.
 pub fn user_systemd_present() -> bool {
+    if as_root() {
+        return std::path::Path::new("/run/systemd/system").exists();
+    }
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(|d| std::path::Path::new(&d).join("systemd").exists())
         .unwrap_or(false)
@@ -216,9 +243,15 @@ fn has_controller(dir: &std::path::Path, ctrl: &str) -> bool {
         .is_ok_and(|c| c.split_whitespace().any(|t| t == ctrl))
 }
 
-/// Path of kern's own slice, a sibling under our `user@<uid>.service` delegation root (derived from our
-/// own cgroup so it tracks the real user manager). `None` if there's no such root (no systemd-user).
+/// Path of kern's own slice. As real root it's a TOP-LEVEL system slice (`/sys/fs/cgroup/kern.slice`,
+/// where `systemd-run --system --slice=kern.slice` lands it). Rootless it's a sibling under our
+/// `user@<uid>.service` delegation root (derived from our own cgroup so it tracks the real user
+/// manager). `None` rootless if there's no such root (no systemd-user).
 fn kern_slice_path() -> Option<PathBuf> {
+    if as_root() {
+        // `systemd-run --system --slice=kern.slice` lands the slice at the top of the cgroup-v2 mount.
+        return Some(PathBuf::from("/sys/fs/cgroup/kern.slice"));
+    }
     let cur = current_v2_cgroup()?;
     let root = cur.ancestors().find(|p| {
         p.file_name().is_some_and(|n| {
@@ -235,9 +268,18 @@ fn kern_slice_path() -> Option<PathBuf> {
 /// pid is alive (`/proc/<pid>` exists) → skipped, including one mid-creation; only dead-owner dirs are
 /// `rmdir`'d, and `rmdir` itself fails on any still-populated cgroup. Cheap (one readdir + a stat/entry),
 /// run once per box start when kern.slice is confirmed usable.
-fn sweep_orphan_boxes(slice: &std::path::Path) {
+/// Reap dead-supervisor `kern-box-<tag>-<pid>` cgroup dirs under `slice`. `limit` caps how many entries
+/// are examined (a `/proc/<pid>` stat each) so the PER-BOX-START call (kern is daemonless → once per box
+/// process) stays O(1) instead of O(entries) — Σ over an N-box burst would otherwise be O(N²). Orphans
+/// past the cap are cleared by a later start or by `kern gc` (which passes `0` = unbounded). The
+/// `/proc/<pid>` check (not a bare rmdir-if-empty) is deliberate: a box is momentarily EMPTY between its
+/// cgroup `mkdir` and the `cgroup.procs` write, so only a truly dead pid is reaped.
+fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
     let Ok(rd) = fs::read_dir(slice) else { return };
-    for e in rd.flatten() {
+    for (seen, e) in rd.flatten().enumerate() {
+        if limit != 0 && seen >= limit {
+            break;
+        }
         let name = e.file_name();
         let name = name.to_string_lossy();
         // trailing `-<pid>` of `kern-box-<tag>-<pid>` (tag may contain '-', pid is always the last field).
@@ -250,6 +292,65 @@ fn sweep_orphan_boxes(slice: &std::path::Path) {
             let _ = fs::remove_dir(e.path());
         }
     }
+}
+
+/// The per-box-start orphan-sweep cap — bounds the hot-path cost; the tail is cleaned by later starts / gc.
+const SWEEP_LIMIT: usize = 128;
+
+/// `kern gc`: reap orphaned box cgroup dirs under kern.slice and return how many were removed. A
+/// direct-path box that `killall`/`stop` SIGKILLs leaves its now-empty `kern-box-*` cgroup dir behind
+/// (the next box start's sweep clears it, but a user may `gc` between bursts). No-op when kern.slice
+/// isn't in use (a rootless scope host never populates it).
+pub fn gc_orphan_box_cgroups() -> usize {
+    let Some(slice) = kern_slice_path() else {
+        return 0;
+    };
+    if !slice.is_dir() {
+        return 0;
+    }
+    let count = || {
+        fs::read_dir(&slice)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("kern-box-"))
+            .count()
+    };
+    let before = count();
+    sweep_orphan_boxes(&slice, 0); // gc is cold → unbounded, reap ALL orphans
+    before.saturating_sub(count())
+}
+
+/// The box cgroup dir that host-pid `pid` belongs to RIGHT NOW, read from `/proc/<pid>/cgroup` — so
+/// `kern stop`/`compose down` can capture a box's exact direct-path `kern-box-<tag>-<pid>` dir (while it's
+/// still alive) and `rmdir` it after the SIGKILL, WITHOUT guessing the dir's internal setup-pid suffix
+/// (which is a forked child's pid, not the registry's supervisor pid) or its `--hostname`-overridable tag.
+///
+/// Pass the box's **PID-namespace init** (`pid1`): it's a genuine member of the box cgroup, whereas the
+/// supervisor process forks the cgroup owner and stays in the parent cgroup. cgroup v2 gives one
+/// `0::<path>` line. Returns the absolute `/sys/fs/cgroup<path>` ONLY when it names one of kern's own
+/// `kern-box-*` dirs (never the shared kern.slice/root, so a stray read can't target a parent). `None`
+/// if the proc entry is gone, unparseable, or not a kern box cgroup.
+///
+/// The eager counterpart to [`gc_orphan_box_cgroups`]: the RAII [`CgroupGuard`] `Drop` can't run under
+/// SIGKILL, and the general [`sweep_orphan_boxes`] SKIPS a just-killed box whose pid lingers as a ZOMBIE
+/// (`/proc/<pid>` still present until the parent reaps it), so a post-stop `gc` wouldn't clear it yet —
+/// but a dead process is no longer a cgroup member, so the dir is EMPTY and `rmdir`-able immediately, and
+/// `rmdir`'s own empty-only semantics are the safety valve against ever removing a live box's dir.
+pub fn box_cgroup_dir(pid: i32) -> Option<PathBuf> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    parse_box_cgroup_line(&raw)
+}
+
+/// Parse a cgroup-v2 `/proc/<pid>/cgroup` body (`0::<path>`) into kern's own box-cgroup dir, or `None`.
+/// Split out from [`box_cgroup_dir`] so the parse + kern-box gate is unit-testable without a live box.
+fn parse_box_cgroup_line(raw: &str) -> Option<PathBuf> {
+    let rel = raw.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let leaf = rel.rsplit('/').next()?;
+    if !leaf.starts_with("kern-box-") {
+        return None; // only ever a box leaf — never the shared slice/root
+    }
+    Some(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }
 
 /// Ensure kern's own DELEGATED slice exists and return its cgroup path, or `None` if unavailable.
@@ -275,20 +376,46 @@ fn ensure_kern_slice() -> Option<PathBuf> {
 
 fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     let slice = kern_slice_path()?;
-    // Already present + delegated? (its `cgroup.controllers` is populated only when systemd delegated it.)
+    // Already present + delegated? (its `cgroup.controllers` is populated only when delegated.)
     if slice_can_cap(&slice) {
-        sweep_orphan_boxes(&slice); // reap any dead-supervisor leftovers (e.g. a SIGKILL'd detached box)
+        sweep_orphan_boxes(&slice, SWEEP_LIMIT); // reap dead-supervisor leftovers (bounded on the hot path)
         return Some(slice);
     }
-    // Create it once. Only systemd can make a *delegated* slice; best-effort — a failure (no systemd-run,
-    // policy) returns None → the caller uses the per-box scope / best-effort path, never uncapped-silently.
-    // Resolve `systemd-run` by trusted ABSOLUTE path (not `$PATH`) — same policy as the reexec scope spawn,
-    // so a `~/.local/bin/systemd-run` can't shadow the real one on this cap-establishing path.
+    // As REAL ROOT kern OWNS the cgroup tree, so it creates a persistent, fully-controlled `kern.slice`
+    // DIRECTLY — no `systemd-run` round-trip and no transient scope that systemd GCs the instant it
+    // exits (exactly why `--user` delegation never stuck as root under `user@0`, forcing the ~40 ms/box
+    // scope fallback that D-Bus-serializes at scale). `mkdir` the slice, and only if it didn't inherit
+    // the caps, pull the controllers down from the cgroup-v2 root (best-effort; a no-op on a host that
+    // already delegates cpu/memory/pids). This gives root the same fast direct-cap path rootless gets.
+    //
+    // SAFETY of the two root writes (audited): `kern.slice` is an INTENTIONALLY systemd-unmanaged
+    // top-level slice — systemd only GCs cgroups for units it created, so it won't delete or fight it,
+    // and a later `systemd-run --system --slice=kern.slice` cleanly adopts it. The root
+    // `subtree_control` write only ADDS controllers (idempotent, never removes; the v2 root is exempt
+    // from the no-internal-process rule) — it makes controllers *available* to children but sets no
+    // limit, so nothing is throttled/starved. Both are best-effort and gated on `as_root()`, so a box
+    // payload can never reach them.
+    if as_root() {
+        let _ = fs::create_dir_all(&slice);
+        if !slice_can_cap(&slice) {
+            if let Some(root) = slice.parent() {
+                enable_subtree_controllers(root);
+            }
+        }
+        if slice_can_cap(&slice) {
+            sweep_orphan_boxes(&slice, SWEEP_LIMIT);
+            return Some(slice);
+        }
+    }
+    // Rootless (or a root host that refused direct control): only systemd can make a *delegated* slice;
+    // best-effort — a failure (no systemd-run, policy) returns None → the caller uses the per-box scope /
+    // best-effort path, never uncapped-silently. Resolve `systemd-run` by trusted ABSOLUTE path (not
+    // `$PATH`), same policy as the reexec scope spawn, so a `~/.local/bin/systemd-run` can't shadow it.
     let systemd_run =
         crate::trusted_helper("systemd-run").unwrap_or_else(|| PathBuf::from("systemd-run"));
     let created = Command::new(systemd_run)
         .args([
-            "--user",
+            systemd_scope_mode(),
             "-p",
             "Delegate=yes",
             "--slice=kern.slice",
@@ -635,6 +762,31 @@ mod tests {
             !d.exists(),
             "guard's Drop must remove the (empty) cgroup dir"
         );
+    }
+
+    #[test]
+    fn parse_box_cgroup_line_extracts_only_kern_box_leaves() {
+        // The eager-reap path resolves a box's exact dir from `/proc/<pid1>/cgroup` (v2 `0::<path>`).
+        // A box leaf → the absolute dir; the shared slice/root, a non-kern leaf, or a v1-style body → None,
+        // so a stray read can NEVER target a parent cgroup for rmdir.
+        assert_eq!(
+            parse_box_cgroup_line("0::/kern.slice/kern-box-db-193325\n"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/kern.slice/kern-box-db-193325"
+            ))
+        );
+        // Tag with a '-' and a deeper path still resolves to the right leaf.
+        assert_eq!(
+            parse_box_cgroup_line("0::/kern.slice/kern-box-web-1-42\n"),
+            Some(PathBuf::from("/sys/fs/cgroup/kern.slice/kern-box-web-1-42"))
+        );
+        // NOT a box leaf → never reaped.
+        assert_eq!(parse_box_cgroup_line("0::/kern.slice\n"), None);
+        assert_eq!(parse_box_cgroup_line("0::/\n"), None);
+        assert_eq!(parse_box_cgroup_line("0::/user.slice/foo.scope\n"), None);
+        // A cgroup-v1 multi-line body (no `0::`) → None, not a panic.
+        assert_eq!(parse_box_cgroup_line("12:pids:/kern-box-db-1\n0::\n"), None);
+        assert_eq!(parse_box_cgroup_line(""), None);
     }
 
     #[test]

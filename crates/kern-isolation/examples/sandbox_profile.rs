@@ -121,7 +121,7 @@ fn main() {
     //     the box must still run fine (explicit wins, no crash).
     if let Some(t) = write_toml(
         "p5",
-        "[[vcpu]]\nname = \"m\"\nmemory = \"64m\"\nvcpus = 1.0\n",
+        "[[vcpu]]\nname = \"m\"\nmemory = \"64m\"\ncpus = 1.0\n",
     ) {
         let sb = base()
             .config(&t)

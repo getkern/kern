@@ -59,9 +59,9 @@ pub fn help() -> Result<(), Error> {
     {c}pause{z} <name>... | --all                                        Freeze box(es) (cgroup freezer)
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
     {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
-    {c}prune{z}                                                          Remove leftovers of stopped boxes
-    {c}gc{z} [--images]                                                  Prune (+ reclaim the image cache)
-    {c}recover{z}                                                        Clean orphaned scratch of dead boxes
+    {c}prune{z}                                                          Remove stopped-box sidecar files (logs/health)
+    {c}gc{z} [--images]                                                  Full cleanup: prune + scratch + build layers (+ --images)
+    {c}recover{z}                                                        Reclaim orphaned scratch of dead boxes (also done by gc)
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
@@ -117,7 +117,7 @@ pub fn help() -> Result<(), Error> {
     --health-timeout N  Kill a single check that exceeds N seconds (default 0 = none)
     --health-action A   On unhealthy: restart | stop | none (default none)
     --timeout N         Auto-stop the box after N seconds (0 = no timeout)
-    --net               Share the host network (outbound; no network isolation)
+    --net [host|none]   Share the host network (bare/host); none = isolated (default)
     --network <mode>    host = share host net (= --net); none = isolated (default)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
     --hostname <name>   Set the box's hostname (default: the box name)
@@ -367,16 +367,28 @@ fn host_primary_ipv4() -> Option<String> {
     }
 }
 
+/// The host's online CPU count (`processor` lines in `/proc/cpuinfo`), floored at 1. Memoized — the
+/// single reader, so a box passing BOTH `--cpus` and `--cpuset-cpus` reads `/proc/cpuinfo` once, not
+/// twice. (Counts online CPUs on purpose: `available_parallelism()` respects kern's own affinity mask
+/// and would undercount the `0..host` pin range if kern were itself pinned.)
+fn host_cpu_count() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
 /// Clamp a `--cpus` request to the host's physical CPU count (from `/proc/cpuinfo`), so the cap
 /// is consistent across the systemd scope AND the in-namespace cgroup. The warning fires once — in
 /// the original process, before the scope re-exec (which sets `KERN_SCOPE`) runs the parse again.
 fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
     let c = cpus?;
-    let host = std::fs::read_to_string("/proc/cpuinfo")
-        .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
-        .ok()
-        .filter(|&n| n > 0)
-        .unwrap_or(1) as f64;
+    let host = host_cpu_count() as f64;
     if c > host {
         if std::env::var_os("KERN_SCOPE").is_none() {
             eprintln!(
@@ -386,6 +398,57 @@ fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
         return Some(host);
     }
     Some(c)
+}
+
+/// Clamp a `--cpuset-cpus` list to the host's CPU range (`0..host`), so an over-wide pin (`0-9999` on
+/// a 4-CPU box) becomes the valid subset (`0-3`) instead of a raw `systemd`/kernel "Failed to parse
+/// AllowedCPUs" that aborts the box start. Each range/single is intersected with `[0, host-1]`;
+/// out-of-range items are dropped. Returns the ORIGINAL untouched if nothing in it exists (so the
+/// backend still rejects an all-invalid pin loudly rather than us silently running unpinned) or if the
+/// format is unparseable (the CLI validator already vetted it). Warns once, like `clamp_cpus`.
+fn clamp_cpuset(set: Option<String>) -> Option<String> {
+    let s = set?;
+    let host = host_cpu_count();
+    let max = host - 1;
+    let mut out: Vec<String> = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else {
+                    return Some(s); // unparseable — leave it (format was validated at the CLI boundary)
+                };
+                let (lo, hi) = (a.min(b), a.max(b));
+                if lo > max {
+                    continue; // wholly above the host range → drop
+                }
+                let hi = hi.min(max);
+                out.push(if lo == hi {
+                    lo.to_string()
+                } else {
+                    format!("{lo}-{hi}")
+                });
+            }
+            None => match part.parse::<usize>() {
+                Ok(n) if n <= max => out.push(n.to_string()),
+                Ok(_) => {} // single CPU out of range → drop
+                Err(_) => return Some(s),
+            },
+        }
+    }
+    if out.is_empty() {
+        return Some(s); // nothing requested exists → let the backend reject it loudly
+    }
+    let clamped = out.join(",");
+    if clamped != s && std::env::var_os("KERN_SCOPE").is_none() {
+        eprintln!(
+            "kern: --cpuset-cpus {s} exceeds the {host} available CPUs — clamping to {clamped}"
+        );
+    }
+    Some(clamped)
 }
 
 /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-v ...] [--env ...] [-- cmd...]` — run
@@ -502,7 +565,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         vgpio,
         vdisk,
     } = ap;
-    // `--nice` (an explicit flag) overrides a profile's `priority`/`nice`.
+    // `--nice` (an explicit flag) overrides a profile's `nice`.
     let nice: Option<i32> = args.nice.map(|n| n as i32).or(nice);
     // Flatten the resolved vGPIO profiles into the device/sysfs paths the box will expose.
     let mut vgpio_devs: Vec<String> = Vec::new();
@@ -512,6 +575,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         vgpio_sysfs.extend(vg.sysfs);
     }
     let cpus = clamp_cpus(cpus);
+    // Clamp the pin list to the host CPUs too (flag OR profile), so an over-wide `0-9999` becomes the
+    // valid subset instead of aborting the box with systemd's raw "Failed to parse AllowedCPUs".
+    let cpuset = clamp_cpuset(cpuset);
     // `--show-config`: a dry run — print the resolved box configuration and exit BEFORE any host-side
     // mount or the systemd-scope re-exec, so nothing is created or torn down.
     if args.show_config {
@@ -1235,6 +1301,7 @@ pub fn run(
     // re-execs once and returns here under KERN_SCOPE. Where systemd --user isn't present it's a
     // no-op and the best-effort in-process cgroup below applies the same caps.
     let cpus = clamp_cpus(cpus);
+    let cpuset = clamp_cpuset(cpuset);
     // `kern run` exec()s in place (no supervisor to reap the cgroup) → `false`: it must use the systemd
     // `--scope --collect` path (which auto-removes the cgroup on exit), never the direct kern.slice path.
     reexec_in_scope_if_possible(
@@ -3182,6 +3249,8 @@ fn reexec_in_scope_if_possible(
         // silently dropping the whole scope (matches the persistent-unit path).
         props.push(format!("CPUQuota={}%", ((c * 100.0).round() as u64).max(1)));
     }
+    // `cpuset` is already clamped to the host CPUs at the box/run entry (`clamp_cpuset`), so it can't
+    // be an over-wide `0-9999` that systemd would reject with a raw "Failed to parse AllowedCPUs".
     if let Some(set) = cpuset {
         props.push("-p".into());
         props.push(format!("AllowedCPUs={set}"));
@@ -3193,7 +3262,8 @@ fn reexec_in_scope_if_possible(
     let systemd_run = kern_isolation::trusted_helper("systemd-run")
         .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
     let mut cmd = std::process::Command::new(systemd_run);
-    cmd.args(["--user", "--scope", "--quiet", "--collect"])
+    cmd.arg(kern_isolation::systemd_scope_mode()) // `--system` as root, else `--user`
+        .args(["--scope", "--quiet", "--collect"])
         .args(&props)
         .arg("--")
         .arg(self_exe)
@@ -3581,6 +3651,32 @@ pub fn gc(images: bool) -> Result<(), Error> {
             human_bytes(freed)
         );
     }
+    // Reclaim orphaned box scratch too (the piece `recover` used to own alone) so `gc` is the single
+    // full local cleanup and crashed-box overlay dirs don't accumulate unnoticed.
+    let (rec, rfreed) = sweep_orphan_scratch();
+    if rec > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}recovered{} {rec} orphaned box scratch dir{}, freed {}",
+            p.g,
+            p.z,
+            if rec == 1 { "" } else { "s" },
+            human_bytes(rfreed)
+        );
+    }
+    // Reap orphaned box CGROUP dirs under kern.slice too (the direct-cap path leaves an empty
+    // `kern-box-*` cgroup when a box is SIGKILL'd; normally the next box start sweeps it, but `gc`
+    // should too so they don't linger between bursts).
+    let boxc = kern_isolation::gc_orphan_box_cgroups();
+    if boxc > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}reaped{} {boxc} orphaned box cgroup{}",
+            p.g,
+            p.z,
+            if boxc == 1 { "" } else { "s" }
+        );
+    }
     if images {
         let p = crate::ui::Palette::detect();
         let cache = cache_dir();
@@ -3721,16 +3817,16 @@ pub fn bench(rootfs: Option<&str>, count: u32) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern recover` — reconcile the runtime state: drop registry entries for boxes whose process is
-/// gone (a crash/kill that skipped the supervisor's cleanup) and remove the orphaned overlay scratch
-/// they left behind. Never touches a live box.
-pub fn recover() -> Result<(), Error> {
+/// Sweep orphaned overlay scratch: `<scratch>/<name>-<pid>/` dirs whose box is no longer live.
+/// Returns `(dirs_removed, bytes_freed)`. Shared by `recover` (its whole job) and `gc` (folded in so
+/// `gc` is the ONE full local cleanup — previously only `recover` reclaimed scratch, and it was easy
+/// to miss, so crashed-box overlay dirs quietly piled up).
+fn sweep_orphan_scratch() -> (u32, u64) {
     // `registry::list()` already prunes entries whose process is dead on read; call it to get the
     // set of *live* boxes and to trigger that cleanup.
     let live = registry::list();
     let live_scratch: std::collections::HashSet<String> =
         live.iter().map(|b| b.rootfs.clone()).collect();
-    // Orphaned overlay scratch: `<scratch>/<name>-<pid>/` dirs whose box isn't live.
     let mut recovered = 0u32;
     let mut freed = 0u64;
     let scratch = scratch_dir();
@@ -3751,6 +3847,14 @@ pub fn recover() -> Result<(), Error> {
             }
         }
     }
+    (recovered, freed)
+}
+
+/// `kern recover` — reconcile the runtime state: drop registry entries for boxes whose process is
+/// gone (a crash/kill that skipped the supervisor's cleanup) and remove the orphaned overlay scratch
+/// they left behind. Never touches a live box.
+pub fn recover() -> Result<(), Error> {
+    let (recovered, freed) = sweep_orphan_scratch();
     let p = crate::ui::Palette::detect();
     if recovered == 0 {
         println!(
@@ -4000,7 +4104,7 @@ fn is_safe_stem(s: &str) -> bool {
 fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
     let _ = std::fs::remove_dir_all(cache.join(stem));
     let _ = std::fs::remove_dir_all(cache.join(format!("{stem}.diff")));
-    for suffix in [".layers", ".base", ".image", ".ok", ".lock"] {
+    for suffix in [".layers", ".base", ".image", ".ok", ".lock", ".flatkey"] {
         let _ = std::fs::remove_file(cache.join(format!("{stem}{suffix}")));
     }
 }
@@ -5676,13 +5780,52 @@ fn layer_key(prev: &str, repr: &str) -> String {
 /// Hash a COPY/ADD source's tree (paths + file bytes + symlink targets, order-stable) into the
 /// layer key, so editing a copied file busts the cache. Best-effort: an unreadable entry still
 /// contributes a marker so its absence/failure changes the key.
-fn content_hash(path: &std::path::Path) -> String {
+///
+/// `ig` (the context's `.dockerignore`, matched relative to `ctx_root`) is applied to a dir source's
+/// DESCENDANTS exactly as `copy_into_rootfs` does, so the key reflects only what actually gets copied
+/// — a change to an ignored `node_modules`/`.git`/secret neither busts the cache nor costs a hash pass
+/// (previously this walk hashed the WHOLE context on every build). Fail-OPEN: if a path can't be made
+/// context-relative we hash it anyway — worst case a spurious rebuild, never a stale/wrong layer.
+fn content_hash(
+    path: &std::path::Path,
+    ctx_root: &std::path::Path,
+    ig: Option<&crate::dockerignore::DockerIgnore>,
+) -> String {
     fn feed(h: &mut u64, bytes: &[u8]) {
         for &b in bytes {
             *h = (*h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    fn walk(h: &mut u64, p: &std::path::Path, rel: &str) {
+    // Does the context ignore exclude this descendant? Mirrors `copy_dir_filtered`: prune a dir only
+    // when no `!` re-include could match inside it, else exclude a leaf. The ROOT source is never
+    // filtered here (a single-file `COPY secret.txt` isn't ignore-gated, matching the copy path).
+    fn skip(
+        ctx_root: &std::path::Path,
+        p: &std::path::Path,
+        is_dir: bool,
+        ig: Option<&crate::dockerignore::DockerIgnore>,
+    ) -> bool {
+        let Some(ig) = ig else { return false };
+        let Ok(rel) = p.strip_prefix(ctx_root) else {
+            return false; // fail-open: can't match → hash it (extra rebuild at worst)
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() {
+            return false;
+        }
+        if is_dir {
+            ig.can_prune_dir(&rel)
+        } else {
+            ig.excluded(&rel)
+        }
+    }
+    fn walk(
+        h: &mut u64,
+        p: &std::path::Path,
+        rel: &str,
+        ctx_root: &std::path::Path,
+        ig: Option<&crate::dockerignore::DockerIgnore>,
+    ) {
         match std::fs::symlink_metadata(p) {
             Ok(m) if m.file_type().is_symlink() => {
                 feed(h, b"L");
@@ -5694,19 +5837,37 @@ fn content_hash(path: &std::path::Path) -> String {
             Ok(m) if m.is_dir() => {
                 feed(h, b"D");
                 feed(h, rel.as_bytes());
-                let mut names: Vec<_> = std::fs::read_dir(p)
+                // (name, is_dir) straight from readdir: `DirEntry::file_type()` reads d_type from the
+                // readdir buffer (no extra stat on Linux ext4/xfs/btrfs/tmpfs), and a symlink reports
+                // is_dir()==false so it's routed through the leaf `excluded` check exactly like
+                // `copy_dir_filtered` — avoids the second `symlink_metadata` per child.
+                let mut names: Vec<(std::ffi::OsString, bool)> = std::fs::read_dir(p)
                     .into_iter()
                     .flatten()
                     .flatten()
-                    .map(|e| e.file_name())
+                    .map(|e| {
+                        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        (e.file_name(), is_dir)
+                    })
                     .collect();
                 names.sort();
-                for n in names {
+                for (n, child_is_dir) in names {
                     let child = p.join(&n);
-                    walk(h, &child, &format!("{rel}/{}", n.to_string_lossy()));
+                    // Skip ignored descendants (dir prune / leaf exclude) so the key mirrors the copy;
+                    // `skip` is a no-op when no ignore file is present (the common case pays nothing).
+                    if skip(ctx_root, &child, child_is_dir, ig) {
+                        continue;
+                    }
+                    walk(
+                        h,
+                        &child,
+                        &format!("{rel}/{}", n.to_string_lossy()),
+                        ctx_root,
+                        ig,
+                    );
                 }
             }
-            Ok(m) => {
+            Ok(m) if m.is_file() => {
                 use std::os::unix::fs::PermissionsExt;
                 feed(h, b"F");
                 feed(h, rel.as_bytes());
@@ -5737,11 +5898,18 @@ fn content_hash(path: &std::path::Path) -> String {
                     Err(_) => feed(h, b"?"),
                 }
             }
+            Ok(_) => {
+                // A non-regular node (fifo/socket/device/block): `copy_dir_filtered` SKIPS these, so we
+                // must NOT open it — a writer-less FIFO would block the whole cache-key computation.
+                // Feed just a type marker so a regular↔special transition still busts the key.
+                feed(h, b"O");
+                feed(h, rel.as_bytes());
+            }
             Err(_) => feed(h, b"?"),
         }
     }
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    walk(&mut h, path, "");
+    walk(&mut h, path, "", ctx_root, ig);
     format!("{h:016x}")
 }
 
@@ -6026,6 +6194,25 @@ fn build_multi_stage(
         }
     };
 
+    // WHOLE-BUILD flat cache. Intermediate stages get throwaway pid-based temp tags (below) that are
+    // deleted at the end, so they can't cache individually — but we CAN cache the final result: key the
+    // whole multi-stage build by ALL instructions (every FROM ref, RUN, COPY dst — captured by `Debug`)
+    // + the bytes of every context COPY source (`.dockerignore`-aware). If the final tag already holds
+    // exactly this build, skip it entirely. Content-addressed → any change to any stage / file / FROM
+    // rebuilds; never serves a stale image. Only hits when the final image is FLAT (`<safe>` dir); a
+    // LAYERED final stage already caches per-layer, and the `is_dir` guard means a stale `.flatkey`
+    // there can't false-hit. (Base-image *tag mutation* isn't detected — same as Docker's own build.)
+    let ms_ig = crate::dockerignore::DockerIgnore::load(ctx);
+    let ms_ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
+    let ms_key = flat_image_key("multistage", instrs, ctx, &ms_ctx_root, ms_ig.as_ref());
+    if flat_cache_hit(tag, &ms_key) {
+        if !quiet {
+            eprintln!("  [cached · multi-stage image unchanged]");
+        }
+        announce_built(tag);
+        return Ok(());
+    }
+
     for si in 0..n {
         let start = from_idxs[si];
         let end = from_idxs.get(si + 1).copied().unwrap_or(instrs.len());
@@ -6085,6 +6272,10 @@ fn build_multi_stage(
         }
     }
     cleanup_stage_tags(&stage_tags);
+    // Stamp the whole-build key on the final tag so the NEXT identical multi-stage build hits the cache
+    // above (overwrites the last stage's per-stage key that its `build_run` wrote). Harmless on a
+    // layered final image — the `is_dir` guard in `flat_cache_hit` never false-hits on it.
+    write_flat_key(tag, &ms_key);
     Ok(())
 }
 
@@ -6326,6 +6517,66 @@ fn drop_cached_image(image: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// A flat-build cache HIT: `tag` holds a flat image (its `<safe>` rootfs dir exists) whose stored
+/// content key matches `key`. Shared by the single-stage and multi-stage build paths so they can't
+/// drift on the suffix or the `is_dir` guard.
+fn flat_cache_hit(tag: &str, key: &str) -> bool {
+    let cache = cache_dir();
+    let safe = sanitize_ref(tag);
+    cache.join(&safe).is_dir()
+        && std::fs::read_to_string(cache.join(format!("{safe}.flatkey")))
+            .ok()
+            .as_deref()
+            == Some(key)
+}
+
+/// Record a flat-build content key on `tag` so the next identical build hits [`flat_cache_hit`].
+fn write_flat_key(tag: &str, key: &str) {
+    let _ = std::fs::write(
+        cache_dir().join(format!("{}.flatkey", sanitize_ref(tag))),
+        key,
+    );
+}
+
+/// A content-addressed key for a FLAT-built image: an opaque `domain` tag (the resolved base lower for
+/// a single-stage flat build, a constant like `"multistage"` for the whole-build multi-stage key —
+/// which domain-separates the two on the same tag) + EVERY instruction (derived `Debug`
+/// captures all fields — build-args are already `${VAR}`-baked into `instrs` at parse time, so a
+/// build-arg change shows here; RUN argv, ENV, CMD, WORKDIR, heredoc bodies and ADD URLs are all in) +
+/// the byte hashes of the context files a COPY would keep (honouring `.dockerignore`, which the paths
+/// in `Debug` alone don't capture). The flat executor has no per-layer cache, so an UNCHANGED rebuild —
+/// the common case on WSL / older kernels without unprivileged overlay — can reuse the tag's existing
+/// image instead of redoing the base-copy + RUN + COPY. Content-addressed, so it NEVER reuses a stale
+/// image: any change to the Dockerfile, a build-arg, or a copied file busts the key. (An `ADD <url>` is
+/// keyed by its URL like Docker — a changed remote file isn't caught without `--checksum`, exactly
+/// Docker's own ADD-url cache semantics.)
+fn flat_image_key(
+    domain: &str,
+    instrs: &[crate::dockerfile::Instr],
+    ctx: &std::path::Path,
+    ctx_root: &std::path::Path,
+    ig: Option<&crate::dockerignore::DockerIgnore>,
+) -> String {
+    use crate::dockerfile::Instr;
+    let mut acc = format!("{domain}\0{instrs:?}");
+    for instr in instrs {
+        // Only a context COPY (`from: None`) reads build-context files whose BYTES aren't in `Debug`;
+        // fold their content hash in so an edit to a copied file busts the key.
+        if let Instr::Copy {
+            srcs, from: None, ..
+        } = instr
+        {
+            if let Ok(expanded) = expand_copy_srcs(ctx, srcs) {
+                for s in &expanded {
+                    acc.push('\0');
+                    acc.push_str(&content_hash(&ctx.join(s), ctx_root, ig));
+                }
+            }
+        }
+    }
+    format!("{:016x}", fnv1a(&acc))
+}
+
 /// The build body — separated so [`build`] can always clean up the work tree, success or error.
 ///
 /// Prefers a **layered** build: the base stays a shared read-only overlay lower, and RUN/COPY writes
@@ -6386,25 +6637,37 @@ fn build_run(
                 .into(),
         ));
     }
-    // Feedback-first: say which strategy ran, so a silent flat fallback (slower + a full base copy)
-    // never looks like "layered but big".
-    if !quiet {
-        eprintln!(
-            "  [{}]",
-            if layered {
-                "layered · base shared, no copy"
-            } else {
-                "flat · unprivileged overlay unavailable, copying the base"
-            }
-        );
-    }
     // Layered mode: per-unit **cached** layers (each RUN batch / COPY / WORKDIR is a content-addressed
-    // overlay layer reused on an unchanged rebuild). The flat fallback below has no per-layer cache.
+    // overlay layer reused on an unchanged rebuild). Feedback-first: name the strategy so a silent flat
+    // fallback (slower + a full base copy) never looks like "layered but big".
     if layered {
+        if !quiet {
+            eprintln!("  [layered · base shared, no copy]");
+        }
         return build_layered_cached(quiet, tag, ctx, work, instrs, base_ref, &base_lower, config);
     }
     // From here on this is the FLAT fallback only (layered returned above). The whole image is a full
     // copy of the base that COPY/WORKDIR/RUN mutate in place; a bind-mounted box runs each RUN.
+    //
+    // FLAT CACHE: the flat path has no per-layer cache, so without this an UNCHANGED rebuild (the common
+    // case on WSL / kernels without unprivileged overlay) redoes the whole base-copy + RUN + COPY. Key
+    // the finished image by its content and, if the tag already holds exactly that image, skip the
+    // build. Content-addressed (`flat_image_key`), so a changed Dockerfile / build-arg / copied file
+    // busts the key and rebuilds — it never serves a stale image.
+    let ig = crate::dockerignore::DockerIgnore::load(ctx);
+    let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
+    let flat_key = flat_image_key(&base_lower, instrs, ctx, &ctx_root, ig.as_ref());
+    if flat_cache_hit(tag, &flat_key) {
+        if !quiet {
+            eprintln!("  [cached · flat image unchanged]");
+        }
+        announce_built(tag);
+        return Ok(());
+    }
+    // A real flat build (cache miss) — now note the base copy (slower than layered).
+    if !quiet {
+        eprintln!("  [flat · unprivileged overlay unavailable, copying the base]");
+    }
     let write_dir = work.join("rootfs");
     copy_tree(std::path::Path::new(&base_lower), &write_dir)?;
     // DNS for RUN: seed the host resolv.conf into the copied rootfs so apk/apt resolve; stripped
@@ -6578,6 +6841,8 @@ fn build_run(
     let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
     write_image_config(&cache.join(format!("{safe}.image")), &config);
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
+    // Record the content key so the NEXT identical build hits the flat cache above and skips the rebuild.
+    write_flat_key(tag, &flat_key);
     announce_built(tag);
     Ok(())
 }
@@ -6791,6 +7056,10 @@ fn build_layered_cached(
     let mut layer_keys: Vec<String> = Vec::new();
     let mut cmd_from_dockerfile = false;
     let mut unit = 0usize;
+    // `.dockerignore`/`.kernignore` and the canonical context root are BUILD-INVARIANT — load + resolve
+    // them ONCE here instead of re-opening/re-parsing/re-canonicalizing on every COPY instruction.
+    let ig = crate::dockerignore::DockerIgnore::load(ctx);
+    let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
     let mut i = 1;
     while i < instrs.len() {
         // The overlay `lowerdir=` string (all layers + base) must fit ~one kernel page. Stop with a
@@ -6874,9 +7143,12 @@ fn build_layered_cached(
                 // Expand `*`/`?`/`[…]` globs against the context before hashing, so the cache key
                 // reflects the ACTUAL matched files (a new match must miss the cache).
                 let expanded = expand_copy_srcs(ctx, srcs)?;
+                // Hash only what a real COPY would keep: apply the context `.dockerignore` (loaded once
+                // above, matched against the CANONICAL context root, like `copy_into_rootfs`) so an
+                // ignored `node_modules`/`.git`/secret neither busts the key nor gets hashed at all.
                 let content: Vec<String> = expanded
                     .iter()
-                    .map(|s| content_hash(&ctx.join(s)))
+                    .map(|s| content_hash(&ctx.join(s), &ctx_root, ig.as_ref()))
                     .collect();
                 // `chmod` is part of the cache key: two builds identical but for `--chmod` must NOT
                 // share a layer (else the second would inherit the first's mode).
@@ -7914,15 +8186,29 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         // systemd's `Restart=always`. Otherwise kill the box's PID-namespace init directly — see
         // `kill_box`; a bare `kill(-pid)` reaches only a detached, `setsid`-ed supervisor's group,
         // never a foreground box whose init isn't in that group.
+        // Capture the box's exact direct-path cgroup dir NOW, while pid1 is still alive and a member of
+        // it (`/proc/<pid1>/cgroup`). After the SIGKILL below the pid1 lingers as a zombie, so the general
+        // orphan-sweep would skip the dir until it's reaped; we `rmdir` the (now-empty) dir ourselves right
+        // after. No-op for a systemd-scope box (not a `kern-box-*` leaf → `None`). See `box_cgroup_dir`.
+        let box_cgroup = (b.pid1 > 0)
+            .then(|| kern_isolation::box_cgroup_dir(b.pid1))
+            .flatten();
         let killed = if stop_managed_unit(&b.name) {
             true // systemd owns the lifecycle and has torn the unit down
         } else {
             kill_box(b.pid, b.pid1)
         };
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
-        registry::clear_health(&b.name, b.pid); // a kill/SIGTERM skips the supervisor's own cleanup
+        registry::clear_health(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
         if killed {
+            // Eagerly rmdir the box's now-empty cgroup dir (captured above) — the SIGKILL skipped the
+            // supervisor's RAII guard, so it would otherwise linger until `gc`/the next box start. rmdir is
+            // empty-only, so a (vanishingly unlikely) reused-pid live box is safe. Covers `compose down`
+            // too — it tears the stack down via this same `stop`.
+            if let Some(cg) = &box_cgroup {
+                let _ = std::fs::remove_dir(cg);
+            }
             println!("stopped '{}' (pid {})", b.name, b.pid);
         } else {
             // Don't report success while alive: the SIGKILL went out but the box wasn't confirmed
@@ -8389,7 +8675,7 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
         return Ok(());
     }
 
-    let order = crate::compose::topo_order(&boxes).map_err(Error::Compose)?;
+    let levels = crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
     // Static rejection of conditions that can NEVER be satisfied — caught here, not left to time out
     // at runtime (adversarial-review 2d). `topo_order` above already rejects cycles and unknown deps.
     validate_conditions(&boxes)?;
@@ -8455,78 +8741,123 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
         }
     }
 
+    let total = boxes.len();
     eprintln!(
-        "→ bringing up {} box(es) in order: {}",
-        order.len(),
-        order.join(" → ")
-    );
-    for (i, name) in order.iter().enumerate() {
-        let b = boxes.iter().find(|b| &b.name == name).unwrap();
-        // Docker's `depends_on: {condition: ...}`. Before starting this box, WAIT for each dependency
-        // it named with a condition: `depends_healthy` → the dep's health check must pass;
-        // `depends_completed` → the dep must have run to exit 0. Topo order guarantees those deps are
-        // already started. A timeout, a dead dependency, or a failed completion aborts with a reason.
-        wait_for_conditions(b, &pod, &up_token)?;
-
-        let dep = if b.depends_on.is_empty() {
-            String::new()
-        } else {
-            format!(" (after {})", b.depends_on.join(", "))
-        };
-        let src = b
-            .image
-            .as_deref()
-            .or(b.rootfs.as_deref())
-            .unwrap_or("(no source)");
-        eprintln!(
-            "→ [{}/{}] starting '{name}'  {src}{dep}",
-            i + 1,
-            order.len()
-        );
-        let mut cmd = std::process::Command::new(&self_exe);
-        cmd.arg("box").arg(&b.name);
-        b.push_box_flags(&mut cmd);
-        // A box that isn't on the host net joins the stack pod → reachable by name from its peers.
-        if use_pod && !b.net {
-            cmd.arg("--pod").arg(&pod);
-        }
-        // If any peer waits on THIS box's completion, hand it the stack+run-scoped exit KEY
-        // (`<pod>-<token>-<name>`) via env, and CLEAR that exact key BEFORE the spawn (the clear
-        // causally precedes the launch and every later poll). Because the key carries this `up`'s
-        // token, a concurrent `up` of the same stack uses a DIFFERENT key — its clear/write can't
-        // touch ours (review round 2). Env, not a flag, so the security-reviewed `kern box` arg
-        // surface is untouched.
-        let is_completion_target = boxes
+        "→ bringing up {total} box(es) in {} dependency {}: {}",
+        levels.len(),
+        if levels.len() == 1 { "level" } else { "levels" },
+        levels
             .iter()
-            .any(|other| other.depends_completed.iter().any(|d| d == &b.name));
-        if is_completion_target {
-            let key = exit_key(&pod, &up_token, &b.name);
-            registry::clear_exit(&key);
-            cmd.env("KERN_EXIT_KEY", &key);
+            .map(|l| format!("[{}]", l.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" → ")
+    );
+    // Bring each dependency LEVEL up CONCURRENTLY — every box in a level is independent (its deps live
+    // in earlier levels) — with a barrier before the next level so `depends_on` still holds. Wall-clock
+    // becomes Σ-per-LEVEL instead of Σ-per-box: a wide flat stack starts in one shot, not one-by-one.
+    let started = std::sync::atomic::AtomicUsize::new(0);
+    // Cap concurrent starts so a very WIDE level (100s of independent services) doesn't fork a
+    // thundering herd of simultaneous overlay-mount/cgroup/userns setups (and reserve 100s of thread
+    // stacks on a small board). A normal stack (≤cap services in a level) runs fully parallel as a
+    // single chunk; a huge level is barriered into cap-sized chunks. I/O-bound starts want generous
+    // concurrency (kern handles 200 parallel boxes), so cap = 4×CPUs clamped to [8, 32].
+    let start_cap = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_mul(4)
+        .clamp(8, 32);
+    for level in &levels {
+        for chunk in level.chunks(start_cap) {
+            // One worker per service in this chunk; `thread::scope` joins them ALL (the barrier) before
+            // we advance. Each worker runs the exact same start sequence the old serial loop did.
+            let results: Vec<Result<(), Error>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|name| {
+                        let b = boxes.iter().find(|b| &b.name == name).unwrap();
+                        let (started, pod, up_token, self_exe, boxes) =
+                            (&started, &pod, &up_token, &self_exe, &boxes);
+                        scope.spawn(move || -> Result<(), Error> {
+                            // Conditional deps (healthy/completed) live in an earlier, already-started
+                            // level; plain `depends_on` is honored by the level barrier itself.
+                            wait_for_conditions(b, pod, up_token)?;
+                            let n = started.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            let dep = if b.depends_on.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (after {})", b.depends_on.join(", "))
+                            };
+                            let src = b
+                                .image
+                                .as_deref()
+                                .or(b.rootfs.as_deref())
+                                .unwrap_or("(no source)");
+                            eprintln!("→ [{n}/{total}] starting '{}'  {src}{dep}", b.name);
+                            let mut cmd = std::process::Command::new(self_exe);
+                            cmd.arg("box").arg(&b.name);
+                            b.push_box_flags(&mut cmd);
+                            // A box not on the host net joins the stack pod → reachable by name from peers.
+                            if use_pod && !b.net {
+                                cmd.arg("--pod").arg(pod);
+                            }
+                            // If a peer waits on THIS box's completion, hand it the stack+run-scoped exit
+                            // KEY via env and CLEAR that exact key BEFORE the spawn. Each box owns a UNIQUE
+                            // key (carries this `up`'s token), so concurrent workers never touch each
+                            // other's — the review-round-2 invariant holds under parallelism too.
+                            let is_completion_target = boxes
+                                .iter()
+                                .any(|other| other.depends_completed.iter().any(|d| d == &b.name));
+                            if is_completion_target {
+                                let key = exit_key(pod, up_token, &b.name);
+                                registry::clear_exit(&key);
+                                cmd.env("KERN_EXIT_KEY", &key);
+                            }
+                            cmd.arg("-d");
+                            if !b.command.is_empty() {
+                                cmd.arg("--").args(&b.command);
+                            }
+                            let status = cmd.status().map_err(|e| {
+                                Error::Compose(format!("starting '{}': {e}", b.name))
+                            })?;
+                            if !status.success() {
+                                return Err(Error::Compose(format!(
+                                    "box '{}' failed to start",
+                                    b.name
+                                )));
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(Error::Compose("compose worker panicked".into()))
+                        })
+                    })
+                    .collect()
+            });
+            // Abort the whole `up` on the first failure in this chunk (peers already started stay up,
+            // like Docker's partial bring-up).
+            for r in results {
+                r?;
+            }
         }
-        cmd.arg("-d");
-        if !b.command.is_empty() {
-            cmd.arg("--").args(&b.command);
-        }
-        let status = cmd
-            .status()
-            .map_err(|e| Error::Compose(format!("starting '{}': {e}", b.name)))?;
-        if !status.success() {
-            return Err(Error::Compose(format!("box '{}' failed to start", b.name)));
-        }
-        // Register this service's `networks.*.aliases` in the pod's shared /etc/hosts (→ 127.0.0.1),
-        // so a peer that connects by ALIAS resolves it like the service name. Done after the box joins
-        // (which seeds its own name) and in start order, so later-started dependents already see it.
-        if use_pod && !b.net {
-            for alias in &b.net_aliases {
-                crate::pod::add_member(&pod, alias)?;
+        // Register this level's pod aliases AFTER the barrier — serial, so the racy /etc/hosts
+        // read-modify-write in `add_member` never runs concurrently, and the NEXT level resolves them.
+        if use_pod {
+            for name in level {
+                let b = boxes.iter().find(|b| &b.name == name).unwrap();
+                if !b.net {
+                    for alias in &b.net_aliases {
+                        crate::pod::add_member(&pod, alias)?;
+                    }
+                }
             }
         }
     }
-    println!(
-        "compose up: {} box(es) started. track with `kern ps`.",
-        order.len()
-    );
+    println!("compose up: {total} box(es) started. track with `kern ps`.");
     if use_pod {
         println!(
             "  pod '{pod}': services reach each other by name. tear down with `kern compose {file} down`."
@@ -8617,7 +8948,7 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
         }
         let raw = a.strip_prefix("--").ok_or_else(|| {
             Error::Config(format!(
-                "unexpected argument '{a}' (flags look like --vcpus 4)"
+                "unexpected argument '{a}' (flags look like --cpus 4)"
             ))
         })?;
         // Accept both `--flag value` and `--flag=value` (GNU/Docker style).
@@ -8625,18 +8956,12 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
             Some((f, v)) => (f, Some(v)),
             None => (raw, None),
         };
-        // Alias the Docker-aligned CLI flag names onto the kern.toml FIELD names for `vcpu` profiles,
-        // where they're spelled the OPPOSITE way: `vcpus` is the cpu.max QUOTA, `cpus` is the cpuset
-        // PIN. Without this, `config add vcpu:x --cpus 2` silently sets the PIN (like `kern box
-        // --cpuset-cpus 2`), not the 2-core quota a `kern box --cpus 2` user expects — a real footgun.
-        // So `--cpus`→`vcpus` (quota) and `--cpuset-cpus`/`--cpuset`→`cpus` (pin), making `config add`
-        // consistent with `kern box`. (The raw field names still work for anyone editing by schema.)
-        let field = if kind == "vcpu" {
-            match field {
-                "cpus" => "vcpus",
-                "cpuset-cpus" | "cpuset" => "cpus",
-                other => other,
-            }
+        // Profile field names match the CLI flags 1:1 (`--cpus` = the core quota, `--cpuset` = the
+        // pin list), so no remapping is needed — a `config add vcpu:x --cpus 2` sets the same field a
+        // `kern box --cpus 2` user expects. The one alias: accept Docker's long `--cpuset-cpus`
+        // spelling for the `cpuset` field, matching `kern box --cpuset-cpus`.
+        let field = if kind == "vcpu" && field == "cpuset-cpus" {
+            "cpuset"
         } else {
             field
         };
@@ -8835,10 +9160,11 @@ fn tailored_kern_toml(h: &HostInv) -> String {
         "# ~/.config/kern/kern.toml — generated by `kern config setup` for this host \
          ({n} cores, {ram}).\n# Attach a profile by prefix:  kern run vcpu:heavy -- ./train.sh   \
          ·  edit with `kern config edit`\n\n[kern]\nlog_level = \"info\"\n\n\
-         # ── CPU ──\n[[cpu]]\nid = \"cpu:0\"\nvcpus = {n}.0\n\n\
+         # ── CPU ──  (profile fields match the CLI flags: cpus=--cpus, cpuset=--cpuset-cpus, memory=--memory, nice=--nice)\n\
+         [[cpu]]\nid = \"cpu:0\"\ncores = {n}.0\n\n\
          [[vcpu]]\nname = \"heavy\"     # ~half this host, pinned to the first cores\n\
-         vcpus = {half}\ncpus = \"0-{pin_hi}\"\nmemory = \"512 MB\"\n\n\
-         [[vcpu]]\nname = \"lean\"\nvcpus = 0.5\nmemory = \"256m\"\n",
+         cpus = {half}\ncpuset = \"0-{pin_hi}\"\nmemory = \"512 MB\"\n\n\
+         [[vcpu]]\nname = \"lean\"\ncpus = 0.5\nmemory = \"256m\"\n",
         ram = h.ram
     );
     // A [[disk]] pool + a vdisk profile that references it, seeded from this host's primary disk, so
@@ -9019,10 +9345,10 @@ pub fn config_show() -> Result<(), Error> {
     println!("{d}{}{z}", path.display(), d = p.d, z = p.z);
     for e in &cfg.vcpu {
         let mut parts = Vec::new();
-        if let Some(q) = e.vcpus {
+        if let Some(q) = e.cpus {
             parts.push(format!("{q} cores"));
         }
-        if let Some(c) = &e.cpus {
+        if let Some(c) = &e.cpuset {
             parts.push(format!("pin {c}"));
         }
         if let Some(m) = &e.memory {
@@ -9152,19 +9478,18 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         d = p.d,
         z = p.z
     );
-    // Warn about a `[[vcpu]]` that carries NO limit at all (none of vcpus/cpus/numa/nice/priority/
-    // memory): it parses fine but has zero effect — attaching it is a silent no-op, exactly the "looks
-    // configured, does nothing" trap. The file is still valid (parses), so this is a warning, not error.
+    // Warn about a `[[vcpu]]` that carries NO limit at all (none of cpus/cpuset/numa/nice/memory): it
+    // parses fine but has zero effect — attaching it is a silent no-op, exactly the "looks configured,
+    // does nothing" trap. The file is still valid (parses), so this is a warning, not error.
     for e in &cfg.vcpu {
-        let has_effect = e.vcpus.is_some()
-            || e.cpus.is_some()
+        let has_effect = e.cpus.is_some()
+            || e.cpuset.is_some()
             || e.numa.is_some()
             || e.nice != 0
-            || e.priority.is_some()
             || e.memory.is_some();
         if !has_effect {
             eprintln!(
-                "{y}warning{z}: vcpu profile '{}' sets no limit (vcpus/cpus/numa/nice/priority/memory) — attaching it does nothing",
+                "{y}warning{z}: vcpu profile '{}' sets no limit (cpus/cpuset/numa/nice/memory) — attaching it does nothing",
                 e.name,
                 y = p.y,
                 z = p.z
@@ -9192,19 +9517,19 @@ log_level = "info"
 # Declare the host CPU budget (optional), then carve named vCPU profiles.
 [[cpu]]
 id = "cpu:0"
-vcpus = 8.0
+cores = 8.0           # host capacity (physical cores)
 
 [[vcpu]]
 name = "heavy"
 backend = "cpu:0"     # optional link to a [[cpu]]
-vcpus = 4.0           # core quota (like --cpus): 4 cores
-cpus = "0-3"          # pin to CPUs 0-3 (like --cpuset-cpus)
+cpus = 4.0            # core quota (like --cpus): 4 cores
+cpuset = "0-3"        # pin to CPUs 0-3 (like --cpuset-cpus)
 memory = "2g"         # RAM cap (like --memory)
-priority = 80         # 0..99 -> nice
+nice = -5             # scheduling priority (like --nice): -20..19
 
 [[vcpu]]
 name = "lean"
-vcpus = 0.5
+cpus = 0.5
 memory = "256m"
 
 # ── GPIO / I/O — `kern box vgpio:leds …` binds ONLY these devices into the box ──
@@ -9531,10 +9856,134 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(format!("{d}/a"), b"one").unwrap();
-        let h1 = content_hash(std::path::Path::new(&d));
-        assert_eq!(h1, content_hash(std::path::Path::new(&d))); // stable
+        let p = std::path::Path::new(&d);
+        let h1 = content_hash(p, p, None);
+        assert_eq!(h1, content_hash(p, p, None)); // stable
         std::fs::write(format!("{d}/a"), b"two").unwrap();
-        assert_ne!(h1, content_hash(std::path::Path::new(&d))); // content changed
+        assert_ne!(h1, content_hash(p, p, None)); // content changed
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn content_hash_respects_dockerignore() {
+        // An ignored file must NOT contribute to the key (mirrors what COPY actually keeps): editing
+        // `secret.env` when `.dockerignore` excludes it leaves the key unchanged, and a real file does
+        // change it. Guards the cache-correctness + don't-hash-ignored-bytes fix.
+        let d = format!("/tmp/.kern-chi-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(format!("{d}/.dockerignore"), b"secret.env\nnode_modules\n").unwrap();
+        std::fs::write(format!("{d}/app.txt"), b"code").unwrap();
+        std::fs::write(format!("{d}/secret.env"), b"KEY=1").unwrap();
+        std::fs::create_dir_all(format!("{d}/node_modules/x")).unwrap();
+        std::fs::write(format!("{d}/node_modules/x/big"), b"junk").unwrap();
+        let p = std::path::Path::new(&d);
+        let ig = crate::dockerignore::DockerIgnore::load(p);
+        assert!(ig.is_some(), "the .dockerignore should load");
+        let base = content_hash(p, p, ig.as_ref());
+        // Changing an IGNORED file leaves the key unchanged.
+        std::fs::write(format!("{d}/secret.env"), b"KEY=changed").unwrap();
+        std::fs::write(format!("{d}/node_modules/x/big"), b"junk-changed").unwrap();
+        assert_eq!(
+            base,
+            content_hash(p, p, ig.as_ref()),
+            "ignored change must not bust"
+        );
+        // Changing a KEPT file does bust the key.
+        std::fs::write(format!("{d}/app.txt"), b"code2").unwrap();
+        assert_ne!(
+            base,
+            content_hash(p, p, ig.as_ref()),
+            "kept change must bust"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clamp_cpuset_narrows_overwide_pins() {
+        // Host CPU count (same source as the fn) — the test is host-agnostic.
+        let host = std::fs::read_to_string("/proc/cpuinfo")
+            .map(|t| t.lines().filter(|l| l.starts_with("processor")).count())
+            .unwrap_or(1)
+            .max(1);
+        let max = host - 1;
+        // An over-wide range is capped to the host's max CPU (never a raw `0-9999`).
+        let want = if max == 0 {
+            "0".to_string()
+        } else {
+            format!("0-{max}")
+        };
+        assert_eq!(
+            clamp_cpuset(Some("0-9999".into())).as_deref(),
+            Some(want.as_str())
+        );
+        // An in-range single is untouched; `None` passes through.
+        assert_eq!(clamp_cpuset(Some("0".into())).as_deref(), Some("0"));
+        assert!(clamp_cpuset(None).is_none());
+        // A single CPU far out of range is dropped → nothing valid → original kept (backend rejects).
+        assert_eq!(clamp_cpuset(Some("9999".into())).as_deref(), Some("9999"));
+    }
+
+    #[test]
+    fn flat_image_key_is_content_addressed_and_ignore_aware() {
+        // Guards the flat-build cache key: content-addressed (a changed Dockerfile / copied file busts
+        // it → never a stale image) yet ignore-aware (an ignored file's change does NOT bust it).
+        use crate::dockerfile::Instr;
+        let d = format!("/tmp/.kern-fk-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(format!("{d}/node_modules")).unwrap();
+        std::fs::write(format!("{d}/app.txt"), b"v1").unwrap();
+        std::fs::write(format!("{d}/secret.env"), b"S").unwrap();
+        std::fs::write(format!("{d}/node_modules/big"), b"junk").unwrap();
+        std::fs::write(format!("{d}/.dockerignore"), b"node_modules\nsecret.env\n").unwrap();
+        let ctx = std::path::Path::new(&d);
+        let ig = crate::dockerignore::DockerIgnore::load(ctx);
+        let instrs = vec![
+            Instr::From {
+                image: "scratch".into(),
+                as_name: None,
+            },
+            Instr::Copy {
+                srcs: vec![".".into()],
+                dst: "/app".into(),
+                from: None,
+                chmod: None,
+            },
+        ];
+        let key = |c: &std::path::Path| flat_image_key("base", &instrs, c, c, ig.as_ref());
+        let k0 = key(ctx);
+        assert_eq!(k0, key(ctx), "stable across calls");
+        // Changing an IGNORED file must NOT move the key.
+        std::fs::write(format!("{d}/secret.env"), b"CHANGED").unwrap();
+        std::fs::write(format!("{d}/node_modules/big"), b"CHANGED").unwrap();
+        assert_eq!(k0, key(ctx), "ignored change must not move the key");
+        // Changing a KEPT file MUST move the key.
+        std::fs::write(format!("{d}/app.txt"), b"v2").unwrap();
+        assert_ne!(k0, key(ctx), "kept change must move the key");
+        // A different instruction set (different dst) MUST move the key even with identical files.
+        let instrs2 = vec![
+            Instr::From {
+                image: "scratch".into(),
+                as_name: None,
+            },
+            Instr::Copy {
+                srcs: vec![".".into()],
+                dst: "/other".into(),
+                from: None,
+                chmod: None,
+            },
+        ];
+        assert_ne!(
+            key(ctx),
+            flat_image_key("base", &instrs2, ctx, ctx, ig.as_ref()),
+            "different instructions → different key"
+        );
+        // A different base lower MUST move the key.
+        assert_ne!(
+            key(ctx),
+            flat_image_key("base2", &instrs, ctx, ctx, ig.as_ref()),
+            "different base → different key"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

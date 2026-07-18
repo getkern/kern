@@ -214,19 +214,19 @@ mod tests {
 # my config
 [[vcpu]]
 name = \"heavy\"
-vcpus = 8.0
+cpus = 8.0
 
 [[vcpu]]
 name = \"light\"
-vcpus = 2.0
+cpus = 2.0
 
 [gpu]
 model = \"secret\"
 ";
-        let body = vec!["name = \"heavy\"".to_string(), "vcpus = 4.0".to_string()];
+        let body = vec!["name = \"heavy\"".to_string(), "cpus = 4.0".to_string()];
         let out = upsert_block(raw, "vcpu", "heavy", &body);
-        assert!(out.contains("vcpus = 4.0"));
-        assert!(!out.contains("vcpus = 8.0"), "old value replaced");
+        assert!(out.contains("cpus = 4.0"));
+        assert!(!out.contains("cpus = 8.0"), "old value replaced");
         assert!(out.contains("name = \"light\""), "sibling untouched");
         assert!(out.contains("[gpu]"), "unknown section preserved");
         assert!(out.contains("model = \"secret\""), "unknown key preserved");
@@ -252,8 +252,8 @@ model = \"secret\"
 
     #[test]
     fn upsert_appends_a_new_block_when_absent() {
-        let raw = "[[vcpu]]\nname = \"a\"\nvcpus = 1.0\n";
-        let body = vec!["name = \"b\"".to_string(), "vcpus = 2.0".to_string()];
+        let raw = "[[vcpu]]\nname = \"a\"\ncpus = 1.0\n";
+        let body = vec!["name = \"b\"".to_string(), "cpus = 2.0".to_string()];
         let out = upsert_block(raw, "vcpu", "b", &body);
         assert!(out.contains("name = \"a\""));
         assert!(out.contains("name = \"b\""));
@@ -262,9 +262,9 @@ model = \"secret\"
 
     #[test]
     fn upsert_into_empty_file() {
-        let body = vec!["name = \"x\"".to_string(), "vcpus = 1.0".to_string()];
+        let body = vec!["name = \"x\"".to_string(), "cpus = 1.0".to_string()];
         let out = upsert_block("", "vcpu", "x", &body);
-        assert_eq!(out, "[[vcpu]]\nname = \"x\"\nvcpus = 1.0\n");
+        assert_eq!(out, "[[vcpu]]\nname = \"x\"\ncpus = 1.0\n");
     }
 
     #[test]
@@ -272,11 +272,11 @@ model = \"secret\"
         let raw = "\
 [[vcpu]]
 name = \"a\"
-vcpus = 1.0
+cpus = 1.0
 
 [[vcpu]]
 name = \"b\"
-vcpus = 2.0
+cpus = 2.0
 
 [intelligence]
 mode = \"auto\"
@@ -311,7 +311,7 @@ mode = \"auto\"
         assert_eq!(name_value(r#"name = "ok""#), Some("ok"));
         assert_eq!(name_value("notname = \"x\""), None);
         // And through block_exists on a setup-style commented line.
-        let raw = "[[vcpu]]\nname = \"heavy\"   # half the host\nvcpus = 4\n";
+        let raw = "[[vcpu]]\nname = \"heavy\"   # half the host\ncpus = 4\n";
         assert!(
             block_exists(raw, "vcpu", "heavy"),
             "commented name must be found"
@@ -329,17 +329,17 @@ mode = \"auto\"
         let raw = "\
 [[vcpu]]
 name = \"h\"
-vcpus = 4
+cpus = 4
 memory = \"512m\"
 numa = 1
 nice = -5
 ";
-        let managed = ["vcpus", "cpus", "memory", "priority"];
-        // Edit: change vcpus, OMIT memory (cleared), keep the unmanaged numa/nice.
-        let body = vec!["name = \"h\"".to_string(), "vcpus = 8".to_string()];
+        let managed = ["cpus", "cpuset", "memory", "backend"];
+        // Edit: change cpus, OMIT memory (cleared), keep the unmanaged numa/nice.
+        let body = vec!["name = \"h\"".to_string(), "cpus = 8".to_string()];
         let out = upsert_block_merge(raw, "vcpu", "h", "h", &managed, &body);
-        assert!(out.contains("vcpus = 8"));
-        assert!(!out.contains("vcpus = 4"), "managed field replaced");
+        assert!(out.contains("cpus = 8"));
+        assert!(!out.contains("cpus = 4"), "managed field replaced");
         assert!(
             !out.contains("memory"),
             "omitted managed field is cleared:\n{out}"
@@ -350,9 +350,9 @@ nice = -5
 
     #[test]
     fn merge_rename_carries_unmanaged_fields() {
-        let raw = "[[vcpu]]\nname = \"h\"\nvcpus = 4\nnuma = 1\n";
-        let managed = ["vcpus", "cpus", "memory", "priority"];
-        let body = vec!["name = \"beast\"".to_string(), "vcpus = 4".to_string()];
+        let raw = "[[vcpu]]\nname = \"h\"\ncpus = 4\nnuma = 1\n";
+        let managed = ["cpus", "cpuset", "memory", "backend"];
+        let body = vec!["name = \"beast\"".to_string(), "cpus = 4".to_string()];
         let out = upsert_block_merge(raw, "vcpu", "h", "beast", &managed, &body);
         assert!(out.contains("name = \"beast\""));
         assert!(!out.contains("name = \"h\""), "old name gone after rename");
@@ -370,23 +370,23 @@ nice = -5
             "vcpu",
             "x",
             "x",
-            &["vcpus"],
-            &["name = \"x\"".into(), "vcpus = 2".into()],
+            &["cpus"],
+            &["name = \"x\"".into(), "cpus = 2".into()],
         );
-        assert!(out.contains("[[vcpu]]") && out.contains("vcpus = 2"));
+        assert!(out.contains("[[vcpu]]") && out.contains("cpus = 2"));
     }
 
     #[test]
     fn different_sections_with_same_name_are_distinct() {
-        let raw = "[[vcpu]]\nname = \"x\"\nvcpus = 1.0\n\n[[vdisk]]\nname = \"x\"\nsize = \"2g\"\n";
+        let raw = "[[vcpu]]\nname = \"x\"\ncpus = 1.0\n\n[[vdisk]]\nname = \"x\"\nsize = \"2g\"\n";
         // Editing the vcpu:x must not touch vdisk:x.
         let out = upsert_block(
             raw,
             "vcpu",
             "x",
-            &["name = \"x\"".into(), "vcpus = 9.0".into()],
+            &["name = \"x\"".into(), "cpus = 9.0".into()],
         );
-        assert!(out.contains("vcpus = 9.0"));
+        assert!(out.contains("cpus = 9.0"));
         assert!(out.contains("size = \"2g\""), "vdisk:x untouched");
     }
 }
