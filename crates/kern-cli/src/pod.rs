@@ -184,15 +184,20 @@ pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Re
         .spawn()
         .map_err(|e| Error::Sandbox(format!("pod holder: {e}")))?;
     let pid = child.id() as i32;
-    let ready = child
-        .stdout
-        .take()
-        .map(|mut out| {
+    // Wait for the holder's `pod-ready` line, but BOUNDED: a holder that wedges during namespace setup
+    // (a host/kernel quirk) must NOT hang `pod create` — and with it the whole `compose up` — forever.
+    // A reader thread does the blocking `read_line`; if no answer arrives within the timeout we treat
+    // the holder as failed, kill it, and error, instead of an unbounded wait on a child's readiness.
+    let ready = child.stdout.take().is_some_and(|mut out| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut line = String::new();
             std::io::BufReader::new(&mut out).read_line(&mut line).ok();
-            line.trim() == "pod-ready"
-        })
-        .unwrap_or(false);
+            let _ = tx.send(line.trim() == "pod-ready"); // receiver may be gone on timeout — ignore
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or(false)
+    });
     if !ready {
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&dir); // also drops the `starting` marker

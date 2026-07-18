@@ -2711,8 +2711,22 @@ pub fn run_pod_holder() -> ! {
     // Signal readiness (the parent waits for this line on our stdout) so `kern pod create` only
     // records the holder once its namespaces are actually set up.
     println!("pod-ready");
+    // Release the caller's inherited stdio: we're now a detached daemon that `pause()`s for the pod's
+    // whole lifetime. If we kept the inherited stderr (fd 2) open, ANY caller reading our parent's
+    // combined output — `kern compose up 2>&1 | …`, `$(kern pod create …)`, a CI log pipe — would never
+    // see EOF and would appear to hang for as long as the pod lives. Point fd 1 and fd 2 at /dev/null so
+    // those pipes close now, while keeping the descriptors valid for the rest of our life.
     unsafe {
-        libc::close(libc::STDOUT_FILENO);
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if devnull >= 0 {
+            libc::dup2(devnull, libc::STDOUT_FILENO);
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            if devnull > libc::STDERR_FILENO {
+                libc::close(devnull);
+            }
+        } else {
+            libc::close(libc::STDOUT_FILENO);
+        }
     }
     loop {
         unsafe { libc::pause() };
