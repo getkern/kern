@@ -12,7 +12,7 @@ That difference is the whole game on a device where memory is the scarce resourc
 |---|---|---|
 | resident memory at rest | **0** | ~186 MB (dockerd + containerd) |
 | per box | ~7 MB, gone on exit | shared daemon state |
-| binary | ~1.5 MB static (musl) | tens of MB + daemon |
+| binary | ~1.3 MB static (musl aarch64; ~1.6 MB x86_64) | tens of MB + daemon |
 | install | drop one static binary | service + socket + root setup |
 | privileges | rootless (user namespaces) | typically a root daemon/group |
 
@@ -22,7 +22,7 @@ itself** without standing up an always-on engine.
 
 ## What's validated
 
-kern's isolation (namespaces + cgroups v2 + seccomp + pivot/overlay) is **architecture-neutral**.
+kern's isolation (namespaces + cgroup v2 + seccomp + pivot/overlay) is **architecture-neutral**.
 It has been run by hand (static `aarch64-musl` binary) on:
 
 - **x86_64** — primary, plus automated CI.
@@ -43,7 +43,7 @@ It has been run by hand (static `aarch64-musl` binary) on:
 > here yet.
 >
 > **"Android kernel" ≠ "Android the OS".** kern runs on a board whose *kernel* is Android's as
-> long as the **userland is Linux** (glibc/musl, a shell) with userns + cgroups v2 — the Arduino
+> long as the **userland is Linux** (glibc/musl, a shell) with userns + cgroup v2 — the Arduino
 > UNO Q is exactly that (Android kernel + Debian userland). It does **not** run on a stock Android
 > phone/tablet (Bionic userland, SELinux enforcing, unprivileged userns usually disabled).
 >
@@ -56,7 +56,7 @@ It has been run by hand (static `aarch64-musl` binary) on:
 ## Requirements on a board
 
 - A Linux kernel with **unprivileged user namespaces** enabled
-  (`/proc/sys/kernel/unprivileged_userns_clone` = 1, or the modern default), plus **cgroups v2**.
+  (`/proc/sys/kernel/unprivileged_userns_clone` = 1, or the modern default), plus **cgroup v2**.
 - For hard memory/PID caps, a **systemd user manager** (`systemd-run --user`). Without it kern
   still runs and isolates; caps degrade to best-effort (see [SECURITY.md](SECURITY.md)).
 - `curl` + GNU `tar` for `--image` pulls (or bring a rootfs with `--rootfs`).

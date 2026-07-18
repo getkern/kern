@@ -5,11 +5,11 @@
 **A fast, lightweight sandbox & virtual resource manager.**
 
 Run untrusted or agent-generated code in a real, kernel-enforced sandbox that starts in **~1.9 ms** —
-a single **~1.5 MB** rootless binary, **no daemon**. **Runs everywhere Linux does: bare Linux,
-Windows (via WSL2), and ARM boards** — Raspberry Pi, NVIDIA Jetson, Arduino UNO Q — where Docker won't
-even install. Embed it from Python or Rust, or drive it from the CLI.
+a single **~1.6 MB** rootless binary, **no daemon**. **Runs everywhere Linux does: bare Linux,
+Windows (via WSL2), and ARM boards** — Raspberry Pi, NVIDIA Jetson, Arduino UNO Q — where a 186 MB Docker daemon
+is a poor fit (on the Pi 5 tested here, no engine was installed at all). Embed it from Python or Rust, or drive it from the CLI.
 
-**~1.9 ms** cold start (vs **~308 ms** `docker run`) · **~1.5 MB** static binary · **0 RAM at rest** · **rootless**
+**~1.9 ms** cold start (vs **~308 ms** `docker run`) · **~1.6 MB** static binary · **0 RAM at rest** · **rootless**
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -17,10 +17,10 @@ even install. Embed it from Python or Rust, or drive it from the CLI.
 [![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1.5 MB static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes — CPU, memory, disk and devices, sliced per box, in one ~1.6 MB static binary, no daemon.">
 </p>
 
-[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python)](#embed-it) · [How it works](#how-it-works) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
+[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -35,24 +35,24 @@ It's built around one idea — *virtual resources*. A container is the first res
 (isolation); the same model extends to **CPU, memory, disk (`vdisk:`) and GPIO (`vgpio:`)** slices
 today, and to GPU slices on the roadmap. A full daemonless container UX — OCI pull **and build**,
 overlay, volumes, secrets, in-box SSH, `cp`/`pause`/`attach`, `ps`/`exec`/`logs`, compose, health,
-`tag`/`push`, `save`/`load` — in ~1.5 MB.
+`tag`/`push`, `save`/`load` — in ~1.6 MB.
 
 ```sh
 kern box dev --image alpine -- sh        # a throwaway, isolated Alpine shell — in a few ms
 ```
 
 …or embed it — a fresh, isolated box per call, for untrusted or agent-generated code (E2B/Firecracker
-territory, but *local* and ~1.5 MB — no cloud, no account, no VM):
+territory, but *local* and ~1.6 MB — no cloud, no account, no VM):
 
 ```python
-import kern_sandbox as kern
+import kern_sandbox as kern                     # pip install kern-sandbox
 r = kern.run_code("print(sum(range(100)))")   # network OFF, hard caps, a timeout the binding enforces
-print(r.stdout, r.success)                     # → a fresh 1.9 ms box, discarded after
+print(r.stdout, r.success)                     # → a fresh, discarded-after box
 ```
 
 ## Why kern
 
-- ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.5 MB static binary, **one Rust dependency**
+- ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.6 MB static binary, **one Rust dependency**
   (`libc`) — it shells out to the system's `curl`/`tar` only to *pull* images (running a box needs
   neither). Cold start **~1.9 ms** vs ~308 ms for `docker run`; **~7 MB** RSS per box vs an always-on
   ~186 MB daemon (`dockerd` + `containerd`). `kern ps` reads state straight from the kernel.
@@ -79,11 +79,30 @@ print(r.stdout, r.success)                     # → a fresh 1.9 ms box, discard
 **Both take resource slices** — the difference is the sandbox. `box` = isolation **+** slices; `run` =
 slices **without** the sandbox. They compose — `run` inside `box`. Both ship today.
 
+## Virtual resources
+
+One model — a box (or a bare `run`) gets *only* the resources you slice for it. Every cap is a real
+cgroup v2 or kernel control; devices are deny-by-default. GPU slices are on the [Roadmap](#roadmap).
+
+| Resource | Flag / profile | What the box gets | Enforcement |
+|---|---|---|---|
+| **CPU** | `--cpus` · `--cpuset-cpus` · `--nice` · `vcpu:` | Fractional CPU-time quota, core pinning, priority | cgroup `cpu.max` / `cpuset` — hard |
+| **Memory** | `--memory` · `--memory-swap-max` | Hard RAM ceiling (+ swap allowance) | cgroup `memory.max` — hard¹ |
+| **Disk** | `vdisk:` · `--size` (named volumes) | Size-capped scratch at `/vdisk/<name>` | tmpfs charged to the box cgroup (rootless), or ext4-on-loop quota (privileged) |
+| **Devices** | `vgpio:` | *Only* the named GPIO/I²C/SPI/LED nodes — nothing else | fresh `/dev` + fd-pinned bind + capability deny-list (raw-mem/disk/kvm refused) |
+| **PIDs** | `--pids-limit` | Fork-bomb ceiling | cgroup `pids.max` — hard |
+| **Block I/O** | `--io-weight` | I/O bandwidth weight | cgroup `io` |
+| **GPU** | *(roadmap)* | A *slice* of a GPU (VRAM cap, then time-slice) | 🚧 cooperative governor — first-party / noisy-neighbour, **not** a hard boundary |
+
+¹ On the default WSL2 kernel the `memory` controller isn't delegated — kern warns and shows the one-line
+`.wslconfig` fix; enforced natively on Linux. Profiles (`vcpu:`/`vdisk:`/`vgpio:`) are reusable presets in
+`~/.config/kern/kern.toml` — see [docs/CONFIG.md](docs/CONFIG.md).
+
 ## What you can do in one line
 
 ### 📦 An isolated container, zero setup
 
-No daemon, no root — one ~1.5 MB binary.
+No daemon, no root — one ~1.6 MB binary.
 
 ```sh
 kern box try --image alpine -- sh
@@ -105,7 +124,7 @@ Serverless-style, on your own machine — one throwaway box per call.
 echo "$payload" | kern box fn --image python -- handler.py
 ```
 
-### 🍓 Where Docker won't even install
+### 🍓 Where a Docker daemon is too heavy
 
 The same box on a Pi or an Android-kernel board — just copy the one binary.
 
@@ -124,7 +143,7 @@ kern build -t app:1 . && kern tag app:1 registry.example/app:1 && kern push regi
 Daemonless, rootless, and complete — the full container UX plus resource slices, in one binary:
 
 - 📦 **Run anything, isolated** — OCI images from any registry (v2 auth, multi-arch, gzip **+ zstd**) or a `--rootfs`; CoW overlay (image immutable, scratch discarded) or `--read-only`; `-it` TTY; `--init` PID-1 reaper.
-- 🎚️ **Governed slices** — hard cgroup-v2 caps on any `box`/`run`: `--memory` · `--cpus` · `--cpuset-cpus` · `--memory-swap-max` · `--pids-limit` · `--io-weight` · `--nice`. `kern run` is the governor with no sandbox.
+- 🎚️ **Governed slices** — hard cgroup v2 caps on any `box`/`run`: `--memory` · `--cpus` · `--cpuset-cpus` · `--memory-swap-max` · `--pids-limit` · `--io-weight` · `--nice`. `kern run` is the governor with no sandbox.
 - 💾 **Data & devices** — `-v` volumes (symlink-safe) · named volumes with a `--size` quota · network volumes (`nfs`/`smb`/`sshfs`) · `--secret` → `/run/secrets` (RAM, `0400`) · `vdisk:` scratch · `vgpio:` device passthrough (deny-by-default) · `--tmpfs`.
 - 🌐 **Network & identity** — isolated by default; `--network host` for outbound; `-p` rootless publish (loopback unless you ask); in-box `--ssh`; `--pod` shared-net pods (`--no-outbound`); `--tun`; `--user`.
 - 🔒 **Least privilege** — 13 dangerous caps always dropped (`--cap-add`/`--cap-drop`); an always-on **seccomp** denylist (kexec, modules, ptrace, mount API, `setns`, …) that also kills wrong-arch + x86_64 x32-ABI aliases.
@@ -142,7 +161,7 @@ Daemonless, rootless, and complete — the full container UX plus resource slice
   `kern pull --platform os/arch`, then run it.
 - **Governed slices** — `kern run` caps a command with **no sandbox**; `--memory` / `--cpus` /
   `--cpuset-cpus` (pin) / `--memory-swap-max` / `--pids-limit` / `--io-weight` / `--nice` set hard
-  cgroup-v2 caps on any `box` or `run` (kern warns if a controller isn't delegated).
+  cgroup v2 caps on any `box` or `run` (kern warns if a controller isn't delegated).
 - **Writable by default** — a copy-on-write overlay; the image stays immutable, scratch is discarded
   on exit. `--read-only` for a read-only root. **Interactive TTY** with `-it` (raw mode, resize-aware).
 - **`--init`** — a built-in PID-1 reaper (no zombies, forwards SIGTERM) without bundling `tini`.
@@ -156,7 +175,7 @@ Daemonless, rootless, and complete — the full container UX plus resource slice
   (mode `0400`) on a RAM tmpfs, never in the image or env.
 - **vDisk** (`vdisk:`) — a size-capped scratch at `/vdisk/<name>`: RAM tmpfs rootless, or an
   ext4-on-loop image (persistent, real quota) when privileged.
-- **vGPIO** (`vgpio:`) — expose *only* the listed GPIO/I2C/SPI/LED peripherals into a box
+- **vGPIO** (`vgpio:`) — expose *only* the listed GPIO/I²C/SPI/LED peripherals into a box
   (deny-by-default for the rest) — for edge/IoT.
 - **`--tmpfs PATH[:size]`** — a fresh `nosuid,nodev` tmpfs (refused over hardened mounts).
 
@@ -202,7 +221,7 @@ Daemonless, rootless, and complete — the full container UX plus resource slice
 root, always-on seccomp, least-privilege caps, hard cgroup caps (via `systemd-run` where present);
 every pulled blob sha256-verified and every layer vetted in-process (no `..`/absolute/device escapes,
 decompression- & inode-bomb caps) before an isolated no-follow merge. Where a guarantee is cooperative
-or opt-in (the GPU cap, vGPIO/vdisk trust scope, network volumes), [SECURITY.md](SECURITY.md) says so.
+or opt-in (vGPIO/vDisk trust scope, network volumes), [SECURITY.md](SECURITY.md) says so.
 
 ## Install
 
@@ -235,7 +254,7 @@ sha256-checked. After it finishes: `kern box dev --image alpine -it -- sh`. Hone
 Desktop", not "no VM".
 
 **📦 Offline / air-gapped** (a board or locked-down server with no internet) — kern is a single
-~1.5 MB static binary, so copying that one file *is* the install:
+~1.6 MB static binary, so copying that one file *is* the install:
 
 ```sh
 scp kern pi@raspberrypi:~/          # then:  ssh pi@raspberrypi kern box dev --image alpine -- sh
@@ -357,7 +376,7 @@ let out = Sandbox::builder()
 assert!(out.success());              // + out.stdout / .stderr / .exit_code / .wall_ms
 ```
 
-**Python** — the `kern_sandbox` package, built for *"run this untrusted / agent-generated code safely"*:
+**Python** — the `kern_sandbox` package (`pip install kern-sandbox`), built for *"run this untrusted / agent-generated code safely"*:
 
 ```python
 import kern_sandbox as kern
@@ -382,7 +401,7 @@ crates.io).
 ## Platforms
 
 **Linux, multi-architecture.** Prebuilt static (musl) binaries for **`linux-x86_64`** and
-**`linux-aarch64`** — one ~1.5 MB file, no Rust deps beyond `libc` (the pull path shells out to system
+**`linux-aarch64`** — one ~1.6 MB file, no Rust deps beyond `libc` (the pull path shells out to system
 `curl`/`tar`).
 
 | Platform | Arch | Status |
@@ -393,7 +412,7 @@ crates.io).
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
 
-kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroups v2**, and a **Linux
+kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter — kern runs even on an *Android kernel* with a Linux
 userland (the Arduino UNO Q). **On Windows, WSL2 *is* that Linux kernel** — the one-line PowerShell
 installer sets up WSL2 and drops in a pre-baked kern distro, so isolation and `--cpus` are enforced
@@ -425,7 +444,7 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 
 - a **fast, daemonless sandbox** for your own or **agent/LLM-generated** code (fresh box per call, embeddable from Rust/Python);
 - **CI / build** boxes, or a throwaway dev environment, without a background daemon;
-- containers on **edge / ARM** boards where Docker won't even install (Pi, Jetson, Android-kernel);
+- containers on **edge / ARM** boards where a Docker daemon is too heavy or absent (Pi, Jetson, Android-kernel);
 - **resource slices** beyond containers — `vcpu:` / `vdisk:` / `vgpio:` (GPU on the roadmap).
 
 **🔀 Reach for something else when you need:**
@@ -443,7 +462,7 @@ A `kern box` is one short-lived process tree — no daemon, no shared state:
 
 1. **Namespaces.** `unshare` into a fresh user + PID + UTS + IPC namespace (and, by default, an
    isolated loopback-only net namespace; `--net` shares the host's — opt-in, flagged in the status
-   panel). A single-UID map makes your uid root *inside* the box only; `--uid-range` opts into a full
+   panel). A single-uid map makes your uid root *inside* the box only; `--uid-range` opts into a full
    sub-id range.
 2. **Root filesystem.** An **overlay** by default (image = read-only lower, a private upper takes
    writes); `--read-only` remounts it read-only *after* a self-pivot (`pivot_root(".", ".")`), which
@@ -472,8 +491,8 @@ travel off-argv. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 One isolated `/bin/true`, warm image cache, one box per run. The x86_64 comparison is the **28-core,
 Linux 6.17, NVMe, systemd-user** host in **[BENCHMARKS.md](BENCHMARKS.md)** (exact per-runtime commands
-there). kern's figure is corroborated on a second machine — an **Intel i7-14700KF** — where a P-core-pinned
-`/bin/true` box runs **median 1.7 ms, avg 1.9 ms, best 1.6 ms** (an E-core lands ~2.1 ms, same class). Your
+there). kern's figure is informally reproduced on a second machine — an **Intel i7-14700KF**, same class — where a P-core-pinned
+`/bin/true` box lands in the low-single-digit-ms range (an E-core is slightly higher). Your
 numbers vary with hardware and load; board rows are from on-device runs.
 
 | host | kernel | **kern** | bubblewrap | crun | runc | podman | docker |
@@ -484,17 +503,17 @@ numbers vary with hardware and load; board rows are from on-device runs.
 | Arduino UNO Q | **v6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
 
 ✗ = not installed (nor readily installable) on that board. On the **Pi 5, kern is the only runtime
-present at all** — one ~1.5 MB static binary just works where the others are each a setup step (Docker
+present at all** — one ~1.6 MB static binary just works where the others are each a setup step (Docker
 alone is a ~186 MB daemon stack).
 
 kern is the fastest sandbox here at **~1.9 ms** (ahead of bubblewrap). Its *own* box setup is **~1 ms**
 (the `KERN_TIMING` phases — `unshare` + overlay + `/dev` + pivot + seccomp, each sub-ms); the rest is
-process start + teardown. Adding a hard cgroup cap (the row above doesn't) brings it to **~6 ms** — but
-**~4 ms of that is external `systemd-run` + D-Bus scope creation, not kern** (`systemd-run --user --scope
+process start + teardown. Adding a hard cgroup cap (the row above doesn't) brings it to **~5.5 ms** — but
+**most of that is external `systemd-run` + D-Bus scope creation, not kern** (`systemd-run --user --scope
 -- true` alone is ~4 ms), opt-out with `KERN_NO_SCOPE` (back to ~1.9 ms, best-effort in-process cgroup). The
 top tier is all within a few ms — *nobody* wins single-shot latency outright. The real gap is to the
 **engines**: **~80–160× faster** than podman (~155 ms) / Docker (~308 ms), which round-trip a daemon every run — yet
-kern alone ships a full daemonless container UX in ~1.5 MB. Beyond one start: **~500 boxes/s**, **~7 MB**
+kern alone ships a full daemonless container UX in ~1.6 MB. Beyond one start: **~500 boxes/s**, **~7 MB**
 RSS/box, **0 resident** (Docker keeps ~186 MB resident before you run anything).
 
 † On the Arduino's Android kernel an overlayfs *mount* is ~31 ms (a kernel quirk — sub-ms elsewhere),
@@ -524,7 +543,7 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 ## Project status
 
 **0.6.5 — a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (**453 tests**, clippy-clean,
+Everything in [Features](#features) works today and is tested (**454 tests**, clippy-clean,
 `cargo-deny`-clean, security-audited slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem) — the point is a small, fast, honest core. The
 CLI and config surface are **not frozen until 1.0**.
@@ -553,8 +572,9 @@ compose` reads real `docker-compose.yml` files as-is (YAML **anchors/merge**, **
 the host actually exposes; every typed field validated live against the same rule the save uses), and a
 **capability-based device deny-list** for `vgpio:` — a `/dev` node that grants raw memory/storage or
 host control (mem, disks, VFIO/DMA, kvm, HID injection, the console, …) is refused by kernel identity,
-and each bound device is fd-pinned to close a check→mount race. Verified on all four boards, including
-GPU-compute passthrough on the Jetson.
+and each bound device is fd-pinned to close a check→mount race. Verified on all four boards — including
+that `vgpio:` still passes a legitimate accelerator device node through on the Jetson (device-node
+passthrough, **not** GPU slicing — that stays on the [Roadmap](#roadmap)).
 
 **Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
 overlay networking.
@@ -591,7 +611,7 @@ kern isolates with Linux **namespaces + seccomp + a read-only userns root** — 
 deny-by-default on devices, with the host's sysfs/procfs masked. That's strong for first-party and
 noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
 hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't — a deliberate trade for
-~1.9 ms starts and a ~1.5 MB footprint.
+~1.9 ms starts and a ~1.6 MB footprint.
 
 The full threat model, per-feature notes, and the honest *"kern vs a microVM — when to use what"*
 guidance live in [SECURITY.md](SECURITY.md). Found a vulnerability? Report it **privately** via GitHub

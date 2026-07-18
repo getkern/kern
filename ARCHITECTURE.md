@@ -47,5 +47,6 @@ default**, so the core carries zero EULA exposure.
 Four layers (Rust-standard): unit (inline `#[cfg(test)]`), integration (`tests/`, black-box
 binary), the characterization seam (deterministic, privilege-free), and real-syscall
 correctness tests (skip-graceful where namespaces/HW are unavailable). CI x86 stays
-always-green via skip-graceful gates; ARM and real-GPU tests run on self-hosted runners. See
+always-green via skip-graceful gates; ARM is manually validated on real boards (not yet in CI —
+tracked in the issues), and the real-GPU tests land with the GPU layer (roadmap). See
 `CONTRIBUTING.md`.
