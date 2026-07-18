@@ -5,9 +5,10 @@
 //! upstream Dockerfiles build instead of failing; `HEALTHCHECK` nudges the user to kern's runtime
 //! `--health-cmd`. `SHELL [...]` swaps the shell that wraps shell-form RUN/CMD/ENTRYPOINT.
 //! Real-world flags are accepted: `FROM --platform=`, BuildKit `RUN --mount/--network/--security`,
-//! and `COPY`/`ADD --chown/--link/--exclude/--parents/--keep-git-dir` are dropped; `--checksum` and
-//! `--chmod` are HONOURED for the file an `ADD <url>` / `COPY <<heredoc` creates (so a fetched binary
-//! lands executable), and dropped for a local-file COPY/ADD (source mode is kept).
+//! and `COPY`/`ADD --chown/--link/--exclude/--parents/--keep-git-dir` are dropped; `--checksum` is
+//! HONOURED for the file an `ADD <url>` creates, and `--chmod` is HONOURED for EVERY copied file/dir —
+//! a context `COPY`, a `COPY --from`, an `ADD <url>`, and a `COPY <<heredoc` (Docker applies it
+//! recursively). Without `--chmod` the source mode is kept (`cp -a`).
 //! Whole-line `#` comments are honoured even INSIDE a `\` continuation (Docker strips them before
 //! joining), so a `RUN a \` … `# note` … `&& b` folds to one instruction.
 //! Multi-stage builds are supported: `FROM … AS <name>` and `COPY --from=<stage>` are parsed here
@@ -50,6 +51,9 @@ pub enum Instr {
         srcs: Vec<String>,
         dst: String,
         from: Option<CopyFrom>,
+        /// Optional `--chmod=<octal>`: the mode applied to every copied file/dir (like Docker), for
+        /// a context COPY and a `COPY --from`. `None` preserves the source mode (`cp -a`).
+        chmod: Option<String>,
     },
     Env(String, String),
     Workdir(String),
@@ -557,6 +561,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     srcs: toks,
                     dst,
                     from,
+                    chmod,
                 });
             }
             "EXPOSE" => {
@@ -814,8 +819,9 @@ fn strip_run_flags(rest: &str) -> &str {
 }
 
 /// Whether a `COPY`/`ADD` `--flag` is one kern accepts and drops (no bearing on kern's copy, which
-/// preserves source ownership/mode as-is): `--chown`, `--chmod`, `--link`, `--checksum`,
-/// `--exclude`, `--parents`, and ADD's `--keep-git-dir`. `--from` is handled by the caller.
+/// preserves source ownership as-is): `--chown`, `--link`, `--exclude`, `--parents`, and ADD's
+/// `--keep-git-dir`. `--chmod` and `--checksum` are captured (not dropped) by the caller BEFORE this
+/// check; `--from` is handled by the caller too.
 fn is_accepted_copy_flag(flag: &str) -> bool {
     let name = flag.trim_start_matches('-');
     let name = name.split('=').next().unwrap_or(name);
@@ -1131,8 +1137,36 @@ mod tests {
                 srcs: vec!["a.txt".into(), "b.txt".into()],
                 dst: "/dst/".into(),
                 from: None,
+                chmod: None,
             }
         );
+    }
+
+    #[test]
+    fn copy_chmod_is_captured_on_a_context_copy() {
+        // A plain `COPY --chmod=<octal>` (not a heredoc/ADD-url) must CAPTURE the mode so the executor
+        // applies it — Docker chmods every copied file. Regression guard for the "COPY --chmod ignored
+        // on a context file (stayed 0644)" bug found on Windows.
+        let got = parse("FROM alpine\nCOPY --chmod=755 app /app\n", &ba()).unwrap();
+        assert_eq!(
+            got[1],
+            Instr::Copy {
+                srcs: vec!["app".into()],
+                dst: "/app".into(),
+                from: None,
+                chmod: Some("755".into()),
+            }
+        );
+        // And on a `COPY --from` too (flag order independent; needs a real earlier stage).
+        let got2 = parse(
+            "FROM alpine AS build\nFROM alpine\nCOPY --from=build --chmod=0640 /a /a\n",
+            &ba(),
+        )
+        .unwrap();
+        assert!(matches!(
+            &got2[2],
+            Instr::Copy { chmod: Some(m), from: Some(CopyFrom::Stage(s)), .. } if m == "0640" && s == "build"
+        ));
     }
 
     #[test]
@@ -1236,6 +1270,7 @@ mod tests {
                 srcs: vec!["/app".into()],
                 dst: "/app".into(),
                 from: Some(CopyFrom::Stage("build".into())),
+                chmod: None,
             }
         );
     }
@@ -1292,6 +1327,7 @@ mod tests {
                 srcs: vec!["/bin/busybox".into()],
                 dst: "/bb".into(),
                 from: Some(CopyFrom::Image("busybox".into())),
+                chmod: None,
             }
         );
         // A tagged/registry-qualified ref is fine too.
@@ -1321,6 +1357,7 @@ mod tests {
                 srcs: vec!["/a".into()],
                 dst: "/a".into(),
                 from: Some(CopyFrom::Stage("busybox".into())),
+                chmod: None,
             }
         );
     }
@@ -1523,8 +1560,8 @@ mod tests {
 
     #[test]
     fn from_run_copy_buildkit_flags_are_accepted_and_dropped() {
-        // `FROM --platform=…`, `RUN --mount=…`, and `COPY --chown/--chmod/--link` all parse; the
-        // flags carry no semantic here, so they're dropped, not errors.
+        // `FROM --platform=…`, `RUN --mount=…`, and `COPY --chown/--link` all parse and drop; `--chmod`
+        // parses too but is CAPTURED (the executor applies it), not dropped.
         let df = "FROM --platform=$BUILDPLATFORM alpine AS b\n\
                   RUN --mount=type=cache,target=/c --network=none echo hi\n\
                   COPY --chown=1000:1000 --chmod=644 --link a b /dst/\n";
@@ -1543,6 +1580,7 @@ mod tests {
                 srcs: vec!["a".into(), "b".into()],
                 dst: "/dst/".into(),
                 from: None,
+                chmod: Some("644".into()),
             }
         );
         // An unknown COPY flag is still rejected (never silently ignored).

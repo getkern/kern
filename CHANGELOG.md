@@ -17,6 +17,18 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [Unreleased]
+
+### Fixed
+- **`COPY --chmod=<octal>` is now honoured for a context `COPY` and a `COPY --from`**, not only for
+  `ADD <url>` / `COPY <<heredoc`. The mode is applied recursively to every copied file and directory
+  (matching Docker); without `--chmod` the source mode is still preserved. Previously a
+  `COPY --chmod=755 app /app` silently kept the source's mode (e.g. 0644). `--chmod` is now part of a
+  cached layer's key, so two builds that differ only in `--chmod` no longer share a layer.
+- **Windows `install.ps1`: the in-place update now actually runs** (was always falling back to a
+  cache-wiping re-import). `wsl -- wslpath` eats backslashes in a Windows path, so the swap target
+  resolved empty; the path is now passed with forward slashes.
+
 ## [0.6.4] — 2026-07-15
 
 ### Added
