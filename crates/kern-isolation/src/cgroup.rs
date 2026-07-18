@@ -133,6 +133,18 @@ pub fn took_direct_cap_path() -> bool {
     std::env::var_os(DIRECT_MARKER).is_some()
 }
 
+/// Could a `--memory` cap actually be ENFORCED on this host — i.e. is the `memory` controller
+/// available somewhere in this process's cgroup v2 tree? A `memory.max` write is ACCEPTED even where
+/// the controller isn't delegated/enabled, but then it never bites (no OOM kill). This is false on a
+/// kernel that doesn't expose the memory controller to us: Raspberry Pi OS without
+/// `cgroup_enable=memory`, and **Microsoft's default WSL2 kernel** (which doesn't delegate `memory`).
+/// Env-independent (reads `cgroup.controllers` up the tree); used only to WARN honestly, never to
+/// refuse — the namespace/seccomp isolation is unaffected, only the resource cap is. Same failure on
+/// these kernels for Docker/Podman; it's the environment, not the runtime.
+pub fn memory_cap_enforceable() -> bool {
+    current_v2_cgroup().is_some_and(|c| controller_available_in_tree(&c, "memory"))
+}
+
 /// Does an env var CLAIM an outer enforcer while NO real memory cap is actually in force up-tree?
 /// A caller launching `kern box` can FORGE `KERN_SCOPE`/`KERN_MANAGED` to disarm the fail-closed —
 /// but a genuine scope ALWAYS sets a `MemoryMax` (see `reexec`'s props) and a genuine managed unit

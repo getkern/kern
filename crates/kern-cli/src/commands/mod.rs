@@ -3100,6 +3100,29 @@ fn reexec_in_scope_if_possible(
     if std::env::var_os("KERN_SCOPE").is_some() {
         return; // already inside our scope
     }
+    // Honest heads-up (a warning, NOT a refusal): the user asked for `--memory` but this kernel
+    // doesn't expose the cgroup v2 `memory` controller to us, so the cap is accepted-but-never-bites.
+    // True on Microsoft's DEFAULT WSL2 kernel and a stock Raspberry Pi OS (no `cgroup_enable=memory`)
+    // — the SAME limitation Docker/Podman hit there; it's the environment, not kern. Isolation
+    // (namespaces + seccomp) is unaffected — ONLY the resource cap is. Printed once, in the original
+    // invocation (the scope re-exec returned above), and never on a normal host, where the controller
+    // IS available up the tree so `memory_cap_enforceable()` is true.
+    if (memory.is_some() || memory_swap_max.is_some())
+        && std::env::var_os("KERN_BUILD_STEP").is_none()
+        && !kern_isolation::memory_cap_enforceable()
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "kern: warning: --memory is not enforced on this host — the kernel doesn't delegate \
+                 the cgroup v2 `memory` controller (Microsoft's default WSL2 kernel, or Raspberry Pi \
+                 OS without `cgroup_enable=memory`). The box still runs and stays isolated \
+                 (namespaces + seccomp), but its RAM is UNCAPPED. Fix on WSL: add \
+                 `kernelCommandLine = cgroup_enable=memory cgroup_memory=1` under `[wsl2]` in \
+                 `%UserProfile%\\.wslconfig`, then `wsl --shutdown`. Same limit as Docker/Podman here."
+            );
+        });
+    }
     if std::env::var_os("KERN_NO_SCOPE").is_some() {
         // Opt-out fast path: skip the systemd transient scope (which costs a `systemd-run` spawn +
         // a D-Bus round-trip + a second kern re-exec — several ms). Resource caps then fall through
