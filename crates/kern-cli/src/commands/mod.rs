@@ -9849,7 +9849,10 @@ mod glob_tests {
         let mut got = glob_expand_ctx(&dir, "*.txt");
         got.sort();
         assert_eq!(got, vec!["f.txt".to_string(), "g.txt".to_string()]);
-        assert_eq!(glob_expand_ctx(&dir, "d/*.txt"), vec!["d/a.txt".to_string()]);
+        assert_eq!(
+            glob_expand_ctx(&dir, "d/*.txt"),
+            vec!["d/a.txt".to_string()]
+        );
         // A literal source passes through expand_copy_srcs; an unmatched glob is an error.
         assert_eq!(
             expand_copy_srcs(&dir, &["f.txt".to_string()]).unwrap(),
