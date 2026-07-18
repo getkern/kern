@@ -289,9 +289,41 @@ fn mount_overlay(lower: &str, upper: &str, work: &str, merged: &str) -> Result<(
         )
     };
     if r != 0 {
-        return Err(Error::last("mount(overlay)"));
+        let e = std::io::Error::last_os_error();
+        // kern inside a Docker/Podman container: the scratch dir (default `/run/user/<uid>` or
+        // `/tmp`) sits on the CONTAINER's overlayfs rootfs, and the kernel refuses an overlayfs
+        // upperdir that itself lives on overlayfs with a bare EINVAL ("not supported as upperdir"
+        // only in dmesg). Turn that into an actionable message instead of "Invalid argument".
+        if e.raw_os_error() == Some(libc::EINVAL) && fs_is_overlayfs(upper) {
+            return Err(Error::Unsupported(
+                "mount(overlay): the box scratch dir is on an overlayfs filesystem — the kernel \
+                 rejects nested-overlay upperdirs (typical when kern runs INSIDE a Docker/CI \
+                 container). Point XDG_RUNTIME_DIR at a tmpfs/disk path, or in Docker add \
+                 `--tmpfs /run`",
+            ));
+        }
+        return Err(Error::Syscall("mount(overlay)", e));
     }
     Ok(())
+}
+
+/// Whether `path` (or its deepest existing ancestor) lives on an overlayfs — the one filesystem the
+/// kernel refuses as an overlay UPPER layer. Used only to turn a bare `EINVAL` into a clear error.
+fn fs_is_overlayfs(path: &str) -> bool {
+    const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+    let mut p = std::path::Path::new(path);
+    loop {
+        if let Ok(c) = cstr(&p.to_string_lossy()) {
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 {
+                return st.f_type as i64 == OVERLAYFS_SUPER_MAGIC;
+            }
+        }
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => return false,
+        }
+    }
 }
 
 /// Mount a fresh procfs for the new PID namespace (so `ps` etc. see only sandbox processes).

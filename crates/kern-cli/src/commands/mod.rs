@@ -7740,15 +7740,58 @@ fn display_run(argv: &[String]) -> String {
 /// overlay-mount / cleanup RAM-fast and keeps the writable layer ephemeral; its pages count
 /// against the box's memory cap. Created mode 0700 by the caller.
 fn scratch_dir() -> PathBuf {
+    // An explicit XDG_RUNTIME_DIR always wins — it is the documented override.
     if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(x).join("kern/scratch");
     }
     let uid = unsafe { libc::getuid() };
+    // The scratch holds each box's overlay upper/work — and the kernel refuses an overlay UPPER
+    // that itself lives on overlayfs. On a normal host `/run/user/<uid>` (tmpfs) or `/tmp` is fine;
+    // when kern runs INSIDE a Docker/CI container BOTH sit on the container's overlay rootfs, so
+    // probe the candidates and take the first non-overlay one. `/dev/shm` is a real tmpfs even
+    // inside Docker (size-capped — last resort, announced on stderr so an ENOSPC later isn't a
+    // mystery). If everything is overlayfs, fall through to /tmp and let the mount fail with the
+    // actionable nested-overlay error from kern-isolation.
     let run = PathBuf::from(format!("/run/user/{uid}"));
+    let mut cands: Vec<(PathBuf, &str)> = Vec::new();
     if run.is_dir() {
-        return run.join("kern/scratch");
+        cands.push((run.join("kern/scratch"), "run"));
+    }
+    cands.push((PathBuf::from(format!("/tmp/kern-{uid}/scratch")), "tmp"));
+    cands.push((PathBuf::from(format!("/dev/shm/kern-{uid}/scratch")), "shm"));
+    for (cand, kind) in &cands {
+        if fs_magic_of(cand) != Some(OVERLAYFS_SUPER_MAGIC) {
+            if *kind == "shm" {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "kern: note: /run and /tmp are on overlayfs (container?) — using the \
+                         size-capped /dev/shm for box scratch; set XDG_RUNTIME_DIR to a tmpfs/disk \
+                         path for full capacity"
+                    );
+                });
+            }
+            return cand.clone();
+        }
     }
     PathBuf::from(format!("/tmp/kern-{uid}/scratch"))
+}
+
+const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+
+/// Filesystem magic (`statfs.f_type`) of `p`'s deepest EXISTING ancestor — the path itself usually
+/// doesn't exist yet (the scratch is created later). `None` only if nothing up to `/` can be stat'd.
+fn fs_magic_of(p: &std::path::Path) -> Option<i64> {
+    let mut cur = p;
+    loop {
+        if let Ok(c) = std::ffi::CString::new(cur.as_os_str().as_encoded_bytes()) {
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 {
+                return Some(st.f_type as i64);
+            }
+        }
+        cur = cur.parent()?;
+    }
 }
 
 /// `kern stop <name>... | --all` — stop running box(es): SIGKILL each target supervisor's process
@@ -9813,6 +9856,24 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(&canary);
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::{fs_magic_of, OVERLAYFS_SUPER_MAGIC};
+
+    #[test]
+    fn fs_magic_probes_the_deepest_existing_ancestor() {
+        // /tmp exists → Some(magic), and on a dev host it is never overlayfs.
+        let m = fs_magic_of(std::path::Path::new("/tmp")).expect("statfs /tmp");
+        assert_ne!(
+            m, OVERLAYFS_SUPER_MAGIC,
+            "/tmp must not read as overlayfs on a host"
+        );
+        // A path that does not exist yet resolves via its ancestors (same magic as /tmp itself).
+        let ghost = std::path::Path::new("/tmp/kern-test-does-not-exist-xyz/scratch/deeper");
+        assert_eq!(fs_magic_of(ghost), Some(m));
     }
 }
 

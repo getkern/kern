@@ -17,6 +17,17 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [Unreleased]
+
+### Fixed
+- **`kern box` now works out-of-the-box INSIDE a Docker/Podman container (CI runners).** The box
+  overlay scratch defaults to `/run/user/<uid>`/`/tmp`, which inside a container sit on the
+  container's own overlayfs — and the kernel rejects a nested-overlay upperdir with a bare
+  `EINVAL`. kern now probes the scratch candidates and skips any that live on overlayfs, falling
+  back to `/dev/shm` (a real tmpfs even in Docker; size-capped, announced on stderr). If every
+  candidate is overlayfs the mount error is now actionable — "set `XDG_RUNTIME_DIR` to a tmpfs/disk
+  path, or in Docker add `--tmpfs /run`" — instead of `Invalid argument`.
+
 ## [0.6.5] — 2026-07-15
 
 ### Added
