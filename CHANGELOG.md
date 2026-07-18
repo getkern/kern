@@ -17,7 +17,7 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [Unreleased]
+## [0.6.5] — 2026-07-15
 
 ### Added
 - **`COPY`/`ADD` expand `*`, `?` and `[…]` globs against the build context** (Docker parity, verified

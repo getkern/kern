@@ -16,9 +16,9 @@ name = "kern"
 path = "src/main.rs"
 
 [dependencies]
-kern-common = { path = "../kern-common", version = "0.6.4" }
-kern-compose = { path = "../kern-compose", version = "0.6.4" }
-kern-oci = { path = "../kern-oci", version = "0.6.4" }
-kern-isolation = { path = "../kern-isolation", version = "0.6.4" }
+kern-common = { path = "../kern-common", version = "0.6.5" }
+kern-compose = { path = "../kern-compose", version = "0.6.5" }
+kern-oci = { path = "../kern-oci", version = "0.6.5" }
+kern-isolation = { path = "../kern-isolation", version = "0.6.5" }
 # Already in the tree via kern-isolation; used here for detach (fork/setsid) + liveness (kill).
 libc = "0.2"
