@@ -22,6 +22,10 @@ mod ssh;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 pub use cgroup::apply_limits as apply_cgroup_limits;
+/// Whether a `--memory` cap can actually be ENFORCED here (the `memory` controller is available in
+/// the cgroup tree). False on kernels that don't delegate it — a stock Raspberry Pi OS and the
+/// default WSL2 kernel — where a `memory.max` write is accepted but never bites. Used only to warn.
+pub use cgroup::memory_cap_enforceable;
 /// Is a user systemd manager present (a `systemd` dir under `$XDG_RUNTIME_DIR`)? The single
 /// definition — the scope re-exec gate and `kern doctor` both call it, so they can't drift.
 pub use cgroup::user_systemd_present;

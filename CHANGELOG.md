@@ -19,6 +19,16 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+### Changed
+- **`--memory` now warns, once and clearly, when the kernel can't enforce it.** On kernels that don't
+  delegate the cgroup v2 `memory` controller — Microsoft's default WSL2 kernel, or Raspberry Pi OS
+  without `cgroup_enable=memory` — a `memory.max` write is accepted but never bites, so the box would
+  silently run uncapped. kern now detects the missing controller (env-independent) and prints an
+  actionable heads-up (how to enable it on WSL, and that Docker/Podman hit the same limit there),
+  instead of implying the cap is in force. The box still runs and stays fully isolated (namespaces +
+  seccomp are unaffected); only the RAM cap is skipped. No change on a normal host, where the cap is
+  enforced as before.
+
 ### Fixed
 - **`kern box` now works out-of-the-box INSIDE a Docker/Podman container (CI runners).** The box
   overlay scratch defaults to `/run/user/<uid>`/`/tmp`, which inside a container sit on the
