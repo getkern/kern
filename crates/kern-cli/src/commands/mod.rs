@@ -7315,13 +7315,17 @@ fn copy_into_rootfs(
     } else {
         format!("{}/{}", workdir.unwrap_or("/").trim_end_matches('/'), dst)
     };
-    // Destination: if it names (or ends like) a directory, copy INTO it under the source basename.
-    // `rootfs` is this unit's fresh (empty) layer, so a dir that exists only in a LOWER layer is
-    // found via `chain` (the cached-layer build); the flat build passes an empty chain.
+    // Destination resolution (Docker semantics, verified against `docker build`):
+    //   - a FILE into a directory dest keeps its basename → `dst/<file>`.
+    //   - a DIRECTORY source has its CONTENTS copied into dest (`COPY dir /d/` → `/d/<contents>`,
+    //     NEVER `/d/dir`); the `cp -a src/.` below fills `dst` directly, so a dir targets `dst` itself.
+    //   - a FILE to a non-dir dest is a rename → `dst`.
+    // `rootfs` is this unit's fresh (empty) layer, so a dir that exists only in a LOWER layer is found
+    // via `chain` (the cached-layer build); the flat build passes an empty chain.
     let dst_clean = dst_abs.trim_start_matches('/');
     let dst_is_dir =
         dst.ends_with('/') || rootfs.join(dst_clean).is_dir() || chain_has_dir(chain, dst_clean);
-    let target_rel = if dst_is_dir {
+    let target_rel = if dst_is_dir && !src.is_dir() {
         let base = src
             .file_name()
             .ok_or(Error::Sandbox("COPY source has no file name".into()))?;
@@ -7331,7 +7335,7 @@ fn copy_into_rootfs(
             base.to_string_lossy()
         )
     } else {
-        dst_clean.to_string()
+        dst_clean.trim_end_matches('/').to_string()
     };
     // Reject `..` (and re-strip any leading `/` the dir-branch reintroduced): a `..` component is a
     // real directory, so `whiteout_dir_symlink_free` (symlinks only) waves it through, and
