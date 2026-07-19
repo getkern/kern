@@ -39,6 +39,8 @@ pub enum Command {
         env: Vec<String>,
         /// `--egress-allow d1,d2` (repeatable / comma-separated): outbound restricted to these domains.
         egress_allow: Vec<String>,
+        /// `--landlock-rw <path>` (repeatable): a Landlock write-allowlist (box RO except these paths).
+        landlock_rw: Vec<String>,
         /// `--workdir <dir>` / `-w <dir>`: working directory inside the box.
         workdir: Option<String>,
         /// `--net`: share the host network namespace (outbound networking; no net isolation).
@@ -825,6 +827,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut volumes: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
     let mut egress_allow: Vec<String> = Vec::new();
+    let mut landlock_rw: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
     let mut profiles: Vec<String> = Vec::new();
@@ -1125,6 +1128,16 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         );
                     }
                 }
+                "--landlock-rw" => {
+                    i += 1;
+                    if let Some(v) = rest.get(i) {
+                        // one absolute path per flag; repeatable.
+                        let p = v.trim();
+                        if !p.is_empty() {
+                            landlock_rw.push(p.to_string());
+                        }
+                    }
+                }
                 "-w" | "--workdir" => {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
@@ -1272,6 +1285,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             volumes,
             env,
             egress_allow,
+            landlock_rw,
             workdir,
             share_net,
             pod,
@@ -1710,6 +1724,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             volumes,
             env,
             egress_allow,
+            landlock_rw,
             workdir,
             share_net,
             pod,
@@ -1762,6 +1777,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             volumes: &volumes,
             env: &env,
             egress_allow: &egress_allow,
+            landlock_rw: &landlock_rw,
             workdir: workdir.as_deref(),
             share_net,
             pod: pod.as_deref(),

@@ -249,6 +249,9 @@ pub struct BoxRunArgs<'a> {
     /// `--egress-allow d1,d2`: outbound network restricted to these domains (+ subdomains) via a
     /// kern-run filtering proxy; empty = the default (no outbound unless `--net`/`--pod`).
     pub egress_allow: &'a [String],
+    /// `--landlock-rw <path>` (repeatable): a Landlock (LSM) write-allowlist; the box root is read+exec
+    /// and writes are confined to these paths (+ box scratch dirs). Empty = no Landlock.
+    pub landlock_rw: &'a [String],
     pub workdir: Option<&'a str>,
     pub share_net: bool,
     /// `--pod <name>`: join this pod's shared network (created by `kern pod create`).
@@ -937,6 +940,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         lower,
         cmd,
         read_only: args.read_only,
+        landlock_rw: args.landlock_rw.to_vec(),
         volumes,
         env,
         // `--workdir` wins; otherwise the image's `config.WorkingDir`.
@@ -1730,6 +1734,7 @@ struct BuildSpec<'a> {
     lower: String,
     cmd: Vec<String>,
     read_only: bool,
+    landlock_rw: Vec<String>,
     volumes: Vec<Volume>,
     env: Vec<(String, String)>,
     workdir: Option<String>,
@@ -1883,6 +1888,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         mode,
         overlay,
         read_only: b.read_only,
+        landlock_rw: b.landlock_rw,
         command: b.cmd,
         hostname,
         volumes: b.volumes,

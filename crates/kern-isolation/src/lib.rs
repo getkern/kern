@@ -13,6 +13,7 @@
 use std::marker::PhantomData;
 
 mod cgroup;
+mod landlock;
 mod outcome;
 mod ports;
 mod real;

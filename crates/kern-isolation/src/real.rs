@@ -39,6 +39,11 @@ pub struct SandboxSpec {
     /// overlay RO (works in a user namespace even where a bind remount-RO is denied, e.g. some
     /// Android-kernel boards). Default boxes leave this false — the upper is the writable surface.
     pub read_only: bool,
+    /// `--landlock-rw <path>` (repeatable): apply a Landlock (LSM) write-allowlist. When non-empty the
+    /// box root is read+exec only and writes are permitted ONLY under these paths (plus the box scratch
+    /// dirs), enforced by the kernel and unliftable by the workload. Empty = no Landlock (namespaces +
+    /// seccomp only). Best-effort: a kernel without Landlock degrades to a no-op with a warning.
+    pub landlock_rw: Vec<String>,
     /// argv of the command to run inside the sandbox (must be non-empty).
     pub command: Vec<String>,
     /// Hostname to set inside the (isolated) UTS namespace.
@@ -743,6 +748,22 @@ fn child_setup_and_exec(
     //    already emptied them; this covers a root box and is otherwise a harmless no-op.
     clear_caps_from_sets(cap_mask);
 
+    // Landlock (LSM) write-allowlist, applied BEFORE seccomp (whose filter would otherwise block the
+    // `landlock_*` syscalls). Defense-in-depth over the mount namespace: the box root is read+exec and
+    // writes are confined to `--landlock-rw` paths + the box scratch dirs, enforced by the kernel and
+    // unliftable by the workload. Best-effort on a kernel without Landlock (warn, keep namespaces +
+    // seccomp); fail CLOSED on a real ruleset error so a box that asked for it never runs unprotected.
+    if !spec.landlock_rw.is_empty() {
+        match crate::landlock::apply_rw_allowlist(&spec.landlock_rw) {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "kern: warning: --landlock-rw requested but this kernel has no Landlock; the box runs \
+                 with namespaces + seccomp only (no path write-allowlist)"
+            ),
+            Err(e) => return Err(e),
+        }
+        t.mark("landlock");
+    }
     // Install the seccomp filter LAST — after all setup syscalls (mount/pivot) are done, so it
     // only constrains the workload. Then exec (or hand off to the built-in init). `allow_nesting`
     // (a rootless `--privileged` box) leaves the namespace + classic-mount syscalls allowed so a
