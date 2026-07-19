@@ -1,5 +1,13 @@
 # Egress allowlist (`--egress-allow`): threat model & design
 
+> ⚠️ **EXPERIMENTAL, not in the shippable set yet.** Three known gaps must close first: (1) a foreground
+> box may not exit cleanly (a helper-lifecycle bug, the box does its work and filters correctly but can
+> linger until `--timeout`); (2) the allowlist gates domain NAMES only, so an allowlisted name that
+> resolves to a loopback / link-local / `169.254.169.254` / RFC-1918 IP is reachable via the host-netns
+> proxy (SSRF), until a resolved-IP guard is added; (3) any PORT on an allowlisted host is reachable.
+> The enforceable core below (the box has no route except the proxy, and the proxy dials exactly the
+> allowlisted name) is real and verified, but treat the feature as experimental until gaps (1) to (3) are fixed.
+
 > Written **before** the code, on purpose. Egress filtering is the one feature where a half-honest
 > implementation is worse than none: it invites a false sense of safety. This document states exactly
 > what the allowlist enforces, what it does **not**, and why.
