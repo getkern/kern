@@ -309,6 +309,13 @@ fn connect_port(request_line: &str) -> Option<u16> {
 /// The box-netns pump: join the box's user+net ns, listen on `127.0.0.1:box_port` inside the box, and
 /// relay every accepted connection to the host-side UNIX socket where the proxy listens.
 fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path) -> ! {
+    // CRITICAL: this is a plain fork of the (foreground) box_run process, so it inherited every open fd,
+    // including the box's stdout/stderr CAPTURE PIPES. Held open in the accept loop below they would keep
+    // those pipes from ever reaching EOF, so the launcher waiting on the box's output hangs until the
+    // --timeout backstop fires (a box running `true` would appear to hang for the whole timeout). Close
+    // every inherited fd >= 3 first; the pump opens everything it needs (the netns handle, the listener,
+    // the unix socket) fresh below.
+    kern_isolation::shed_inherited_fds(-1);
     if !enter_box_ns(box_pid1) {
         eprintln!(
             "kern: egress pump: cannot join box netns: {}",

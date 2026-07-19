@@ -41,10 +41,10 @@ The proxy is not a suggestion; it is the only door.
 - **Domain fronting / shared-CDN egress.** The client asks to `CONNECT allowed.com:443`, the proxy dials
   `allowed.com`, and then the client speaks TLS with `SNI=evil.com` inside that tunnel. If `evil.com` and
   `allowed.com` are served by the *same* front (a shared CDN / IP), data can reach `evil.com`. The proxy
-  can optionally parse the TLS ClientHello SNI and require it to equal the `CONNECT` host (kern does this
-  when it can read the ClientHello), which closes the *naive* case, but ECH/ESNI and true same-endpoint
-  fronting remain out of scope. **If your allowlist includes a big CDN domain, treat egress as open to
-  everything on that CDN.**
+  today does NOT parse the TLS ClientHello, so it does not check that the SNI equals the `CONNECT` host:
+  domain fronting on a shared endpoint is NOT defended against (a ClientHello-SNI-equals-CONNECT check is
+  a planned hardening). **If your allowlist includes a big CDN domain, treat egress as open to everything
+  on that CDN.**
 - **DNS exfiltration** is not a channel here (the box has no DNS; the proxy resolves), but a covert
   channel *inside* an allowed TLS session (timing, payload to an allowed host that then forwards) is not
   something a network allowlist can see. This is an allowlist, not a DLP.
@@ -61,7 +61,9 @@ The proxy is not a suggestion; it is the only door.
 | Box has no egress except the proxy | **Hard** (isolated netns; kernel-enforced) |
 | Non-allowlisted domain refused | **Hard** for a normal client (proxy refuses `CONNECT`, no dial) |
 | IP-literal target refused | **Hard** (never matches a domain entry) |
-| SNI ≠ CONNECT host on a shared CDN | **Soft** (best-effort SNI check; fronting on a shared endpoint remains) |
+| Connecting an allowlisted NAME that resolves to a private/loopback/metadata IP | **Not addressed yet** (the allowlist gates names, not resolved IP ranges; a resolved-IP guard is planned) |
+| Restricting the PORT on an allowlisted host | **Not addressed yet** (any port on an allowlisted host is reachable) |
+| SNI ≠ CONNECT host on a shared CDN (domain fronting) | **Not addressed** (no ClientHello parsing today) |
 | Covert channel inside an allowed session | **Not addressed** (this is an allowlist, not DLP) |
 
 The rule of thumb kern states everywhere applies here too: this is a strong control for first-party and
