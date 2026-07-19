@@ -27,6 +27,7 @@ mod config;
 mod dockerfile;
 mod dockerignore;
 mod doctor;
+mod egress;
 mod error;
 mod openat2;
 mod pod;
