@@ -4993,6 +4993,14 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
 /// manual layer-flattening. The copy stays on the rootfs's own filesystem, so every separate mount (the
 /// box's `/proc`, `/sys`, `/dev`, `/dev/shm`, and every `-v` volume / workspace / secret) is skipped
 /// automatically: the snapshot is the image content, never a bind-mounted host path.
+///
+/// Consistency under active writes: where the box has a dedicated cgroup (systemd-user delegation, or
+/// root), commit FREEZES it for the snapshot so files are captured whole. Where it does NOT (a host
+/// without cgroup delegation), the freeze is a no-op and a file the workload is actively rewriting can be
+/// captured MID-WRITE, i.e. TRUNCATED to a valid prefix, not byte-corrupted (a `commit` of a box in the
+/// middle of `echo … > big` may yield a shorter `big`). It is never a torn mix of old+new bytes; for a
+/// structured file (a DB, a tar) that truncation still means "quiesce the box, or use --memory-backed
+/// scratch, before committing under heavy write load". Freeze support is what the boards/prod provide.
 pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     let inst = registry::find_ref(box_ref).ok_or_else(|| {
         Error::Sandbox(format!("no running box '{box_ref}'; `kern ps` lists them"))
