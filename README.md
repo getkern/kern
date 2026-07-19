@@ -5,13 +5,14 @@
 **A fast, lightweight sandbox & virtual resource manager.**
 
 kern is a daemonless **virtual resource manager**: it partitions CPU, memory, disk, devices — and
-isolation itself — into lightweight, per-process allocations, provisioned in single-digit milliseconds
-from one **~1.6 MB** rootless binary. Isolation is the first resource: run untrusted or
-agent-generated code in a real, kernel-enforced box that starts in **~1.9 ms**. The same model caps a
-bare process's CPU, memory or disk (`vdisk:`), or grants it exactly one device (`vgpio:`) — with or
-without a full box. **Runs everywhere Linux does: bare Linux,
-Windows (via WSL2), and ARM boards** — Raspberry Pi, NVIDIA Jetson, Arduino UNO Q — where a 186 MB Docker daemon
-is a poor fit (on the Pi 5 tested here, no engine was installed at all). Embed it from Python or Rust, or drive it from the CLI.
+isolation itself — into lightweight, per-process allocations, provisioned in single-digit
+milliseconds from one **~1.6 MB** rootless binary. Isolation is the first resource: run untrusted
+or agent-generated code in a real, kernel-enforced box that starts in **~1.9 ms**. The same model
+caps a bare process's CPU (`vcpu:`), memory or disk (`vdisk:`), or grants it exactly one device
+(`vgpio:`) — with or without a full box. **Runs everywhere Linux does: bare Linux, Windows (via
+WSL2), and ARM boards** — Raspberry Pi, NVIDIA Jetson, Arduino UNO Q — where a 186 MB Docker daemon
+is a poor fit (on the Pi 5 tested here, no engine was installed at all). Embed it from Python or
+Rust, or drive it from the CLI.
 
 **~1.9 ms** cold start (vs **~308 ms** `docker run`) · **~1.6 MB** static binary · **0 RAM at rest** · **rootless**
 
@@ -35,12 +36,12 @@ UTS + IPC namespaces, an overlay or read-only root pivoted in, an always-on secc
 cgroup limits. It pulls OCI images, builds them, runs them, and gets out of the way: **no background
 daemon, one short-lived process per box, started in single-digit milliseconds.**
 
-It's built around one idea — *virtual resources* — exposed as **two verbs**: `box` wraps a process in a
-full isolated slice; `run` caps a resource on a process you launch yourself. Isolation is just the first
-resource; the same model virtualizes **CPU, memory, disk (`vdisk:`) and GPIO devices (`vgpio:`)** today,
-with GPU on the roadmap. On the `box` side that's a full daemonless container UX — OCI pull **and build**,
-overlay, volumes, secrets, in-box SSH, `cp`/`pause`/`attach`, `ps`/`exec`/`logs`, compose, health,
-`tag`/`push`, `save`/`load` — in ~1.6 MB.
+It's built around one idea — *virtual resources* — exposed as **two verbs**: `box` wraps a process
+in a full isolated slice; `run` caps a resource on a process you launch yourself. Isolation is just
+the first resource; the same model virtualizes **CPU (`vcpu:`), memory, disk (`vdisk:`) and GPIO
+devices (`vgpio:`)** today, with GPU on the roadmap. On the `box` side that's a full daemonless
+container UX — OCI pull **and build**, overlay, volumes, secrets, in-box SSH, `cp`/`pause`/`attach`,
+`ps`/`exec`/`logs`, compose, health, `tag`/`push`, `save`/`load` — in ~1.6 MB.
 
 ```sh
 kern box dev --image alpine -- sh        # a throwaway, isolated Alpine shell — in a few ms
