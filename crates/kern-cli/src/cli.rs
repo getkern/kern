@@ -196,10 +196,11 @@ pub enum Command {
         build_args: Vec<String>,
         quiet: bool,
     },
-    /// `kern pod create <name> [--no-outbound]` / `pod ls` / `pod rm <name>`: shared-network pods.
+    /// `kern pod create <name> [--no-outbound] [--uid-range]` / `pod ls` / `pod rm <name>`: shared-network pods.
     PodCreate {
         name: String,
         outbound: bool,
+        uid_range: bool,
     },
     PodList,
     PodRemove {
@@ -1499,10 +1500,16 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
                 .iter()
                 .skip(2)
                 .find(|a| !a.starts_with('-'))
-                .ok_or(Error::Usage("pod create <name> [--no-outbound]"))?;
+                .ok_or(Error::Usage(
+                    "pod create <name> [--no-outbound] [--uid-range]",
+                ))?;
             Ok(Command::PodCreate {
                 name: name.to_string(),
                 outbound: !rest.contains(&"--no-outbound"),
+                // Map a subordinate uid range into the pod's shared user namespace, so member OCI
+                // images that drop privilege / chown to a fixed uid (postgres, mysql, …) work inside
+                // the pod. Without it the holder maps a single uid and such entrypoints fail closed.
+                uid_range: rest.contains(&"--uid-range"),
             })
         }
         Some("ls" | "list" | "ps") => Ok(Command::PodList),
@@ -1784,7 +1791,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             build_args: &build_args,
             quiet,
         }),
-        Command::PodCreate { name, outbound } => crate::pod::create(&name, outbound),
+        Command::PodCreate {
+            name,
+            outbound,
+            uid_range,
+        } => crate::pod::create_with_range(&name, outbound, uid_range),
         Command::PodList => crate::pod::list(),
         Command::PodRemove { names } => crate::pod::remove(&names),
         Command::PodHolder => crate::pod::run_holder(),

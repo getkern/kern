@@ -67,7 +67,7 @@ pub fn help() -> Result<(), Error> {
   {d}Multi-box{z}
     {c}compose{z} <file>                                                 Bring up a stack (kern TOML or docker-compose.yml)
     {c}up{z} [--no-pod] / {c}down{z}                                          Bring up / tear down the compose file in this dir
-    {c}pod{z} create <name> [--no-outbound] / pod ls / pod rm <name>     Shared-network pod (boxes reach each other by name)
+    {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls / pod rm <name>     Shared-network pod (boxes reach each other by name)
 
   {d}Config & storage{z}
     {c}config{z} [list|edit|setup|probe|clear]                          List resource profiles; manage kern.toml
