@@ -1,13 +1,13 @@
 //! `-p [ip:]host:box` parsing. The forwarder itself lives in `kern_isolation` (it must fork before
 //! the sandbox `unshare`, where only the isolation crate has the host-namespace context).
 
-/// Longest port range a single `-p` may expand to — a guard so `-p 1-65535:…` can't fork tens of
+/// Longest port range a single `-p` may expand to - a guard so `-p 1-65535:…` can't fork tens of
 /// thousands of forwarder processes.
 const MAX_RANGE: usize = 1024;
 
 /// Parse a `-p` spec: `[ip:]hostport:boxport[/tcp|/udp]`, where either port may be a `START-END` RANGE
 /// (e.g. `8000-8010:9000-9010`). Ports are 1..=65535. The optional leading IPv4 is the host bind
-/// address; it defaults to **`127.0.0.1`** (loopback only) — secure by default, so a published service
+/// address; it defaults to **`127.0.0.1`** (loopback only) - secure by default, so a published service
 /// isn't accidentally exposed to the LAN. Use `0.0.0.0:…` to bind every interface deliberately. A
 /// trailing `/tcp` (default) or `/udp` selects the protocol. Returns the EXPANDED list of [`PortMap`]s
 /// (one for a single port, N for a range); `None` if malformed, if the host/box ranges differ in
@@ -67,7 +67,7 @@ fn parse_port_or_range(s: &str) -> Option<(u16, u16)> {
 }
 
 /// Format a [`PortMap`] for display (the inverse of [`parse`], e.g. `127.0.0.1:8080->80` or
-/// `…->53/udp`) — always showing the bind address so the exposure is visible.
+/// `…->53/udp`) - always showing the bind address so the exposure is visible.
 pub fn fmt(m: &kern_isolation::PortMap) -> String {
     format!(
         "{}.{}.{}.{}:{}->{}{}",

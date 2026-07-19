@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fan a per-FILE job across a directory: each input file is processed in its OWN
 # capped, isolated box. Because every file gets a throwaway sandbox, a crash or a
-# timeout on ONE file cannot take down the batch — the other boxes keep going.
+# timeout on ONE file cannot take down the batch - the other boxes keep going.
 # Results are collected back on the host via `-v` (the input dir is mounted :ro,
 # so a job can never mutate your source data).
 #
@@ -15,7 +15,7 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/in" "$work/out"
 
 # Four inputs. Each is "valid" (contains the marker OK) EXCEPT poison.txt, whose
-# job will exit non-zero — standing in for a real crash/bad record. Its box fails
+# job will exit non-zero - standing in for a real crash/bad record. Its box fails
 # in isolation; the other three still produce output.
 printf 'OK alpha\nOK beta\n'   > "$work/in/one.txt"
 printf 'OK gamma\n'            > "$work/in/two.txt"
@@ -28,7 +28,7 @@ for path in "$work/in"/*; do
   name="$(basename "$path")"
   # Each file gets its own box, capped in memory/CPU and time-bounded so a hang
   # can't wedge the batch. The job VALIDATES (grep -q OK) then transforms: files
-  # without the marker exit 1 and their box fails — deliberately, in isolation.
+  # without the marker exit 1 and their box fails - deliberately, in isolation.
   #
   # `set -e` would abort the whole script on the first failing box, so we guard
   # the call with `if` and tally the outcome ourselves.
@@ -52,5 +52,5 @@ for f in "$work/out"/*; do
   echo "  --- $(basename "$f") ---"; sed 's/^/    /' "$f"
 done
 echo
-echo "done — poison.txt's box failed alone; the input dir was :ro and untouched;"
+echo "done - poison.txt's box failed alone; the input dir was :ro and untouched;"
 echo "the throwaway boxes are already gone."

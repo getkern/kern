@@ -1,5 +1,5 @@
 #!/bin/sh
-# "curl https://.../install.sh | sh" — but safely. Before trusting an install script, run it in a
+# "curl https://.../install.sh | sh" - but safely. Before trusting an install script, run it in a
 # disposable kern box: a writable overlay it can scribble on, but NO network and NO host mounts,
 # so it can't phone home or touch your real machine. Watch what it does; the box vanishes after.
 #
@@ -21,4 +21,4 @@ echo "==> running the untrusted script in an isolated box (no --net, no -v):"
 
 echo
 echo "It ran in a throwaway overlay with no network and no access to your files."
-echo "The /usr/local/bin/backdoor it wrote is gone — it only existed inside the box."
+echo "The /usr/local/bin/backdoor it wrote is gone - it only existed inside the box."

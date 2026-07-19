@@ -1,4 +1,4 @@
-//! `kern.toml` — the resource-centric config schema.
+//! `kern.toml` - the resource-centric config schema.
 //!
 //! The implemented sections mirror the private runtime's `kern.toml` model (same sections, same
 //! resource-centric shape). The CPU **field names are spelled to match the CLI flags 1:1** here
@@ -6,12 +6,12 @@
 //! deliberate divergence from the private runtime's older `vcpus`/`priority` spelling; those legacy
 //! keys are REJECTED with a migration hint (not silently ignored) so a stale config can't apply a
 //! silently-wrong limit. It is parsed by kern's own dependency-free TOML reader (no `serde`/`toml`
-//! crates) — see [`parse`].
+//! crates) - see [`parse`].
 //!
 //! The model is **resource-centric**, not box-centric: you *declare* the host resources you want
 //! kern to consider (`[[cpu]]`, `[[gpio]]`, `[[disk]]`) and *define* named virtual profiles that
 //! carve them up (`[[vcpu]]`, `[[vgpio]]`, `[[vdisk]]`). A profile is then attached to a command by
-//! its prefix — `kern run vcpu:heavy vgpio:leds -- cmd` — exactly as in the private runtime.
+//! its prefix - `kern run vcpu:heavy vgpio:leds -- cmd` - exactly as in the private runtime.
 //!
 //! kern-public models **CPU, GPIO and disk** resources only; there is no GPU concept here. The
 //! parser is deliberately **tolerant**: a `kern.toml` shared with another kern edition may carry
@@ -21,23 +21,23 @@
 /// Top-level `kern.toml`. Section names are identical to the private runtime.
 #[derive(Debug, Clone, Default)]
 pub struct KernConfig {
-    /// `[kern]` — global settings.
+    /// `[kern]` - global settings.
     pub kern: KernSettings,
-    /// `[[cpu]]` — physical CPU resource declarations that `[[vcpu]]` profiles split.
+    /// `[[cpu]]` - physical CPU resource declarations that `[[vcpu]]` profiles split.
     pub cpu: Vec<CpuEntry>,
-    /// `[[vcpu]]` — virtual CPU profiles (`vcpu:<name>`).
+    /// `[[vcpu]]` - virtual CPU profiles (`vcpu:<name>`).
     pub vcpu: Vec<VCpuEntry>,
-    /// `[[gpio]]` — physical GPIO/peripheral declarations that `[[vgpio]]` profiles reference.
+    /// `[[gpio]]` - physical GPIO/peripheral declarations that `[[vgpio]]` profiles reference.
     pub gpio: Vec<GpioEntry>,
-    /// `[[vgpio]]` — virtual GPIO / I/O peripheral profiles (`vgpio:<name>`).
+    /// `[[vgpio]]` - virtual GPIO / I/O peripheral profiles (`vgpio:<name>`).
     pub vgpio: Vec<VGpioEntry>,
-    /// `[[disk]]` — physical disk pools that `[[vdisk]]` profiles place volumes on.
+    /// `[[disk]]` - physical disk pools that `[[vdisk]]` profiles place volumes on.
     pub disk: Vec<DiskEntry>,
-    /// `[[vdisk]]` — virtual disk profiles: size quota + I/O limits (`vdisk:<name>`).
+    /// `[[vdisk]]` - virtual disk profiles: size quota + I/O limits (`vdisk:<name>`).
     pub vdisk: Vec<VDiskEntry>,
 }
 
-/// `[kern]` — global settings.
+/// `[kern]` - global settings.
 #[derive(Debug, Clone, Default)]
 pub struct KernSettings {
     /// Config schema version (currently 1).
@@ -50,7 +50,7 @@ pub struct KernSettings {
 
 // ─────────────────────────────── CPU (implemented) ───────────────────────────────
 
-/// `[[cpu]]` — a physical CPU resource declaration (the budget a `[[vcpu]]` splits).
+/// `[[cpu]]` - a physical CPU resource declaration (the budget a `[[vcpu]]` splits).
 #[derive(Debug, Clone, Default)]
 pub struct CpuEntry {
     pub id: String,
@@ -63,7 +63,7 @@ pub struct CpuEntry {
     pub name: Option<String>,
 }
 
-/// `[[vcpu]]` — a virtual CPU profile. Field names match the CLI flags 1:1, so a profile reads like
+/// `[[vcpu]]` - a virtual CPU profile. Field names match the CLI flags 1:1, so a profile reads like
 /// the command line: `cpus` = the core *quota* (`--cpus`, cgroup `cpu.max`), `cpuset` = CPU *pinning*
 /// (`--cpuset-cpus`), `memory` = `--memory`, `nice` = `--nice`.
 #[derive(Debug, Clone, Default)]
@@ -71,15 +71,15 @@ pub struct VCpuEntry {
     pub name: String,
     /// `backend = "cpu:0"` → a `[[cpu]]` id. `None` = standalone.
     pub backend: Option<String>,
-    /// CPU pinning range, e.g. `"0-7"`, `"0,2,4"` — like `--cpuset-cpus`.
+    /// CPU pinning range, e.g. `"0-7"`, `"0,2,4"` - like `--cpuset-cpus`.
     pub cpuset: Option<String>,
-    /// Core quota (K8s/Docker units): `4.0` = 4 cores, `0.5` = half — like `--cpus`. cgroup `cpu.max`.
+    /// Core quota (K8s/Docker units): `4.0` = 4 cores, `0.5` = half - like `--cpus`. cgroup `cpu.max`.
     pub cpus: Option<f64>,
     /// NUMA node; CPUs auto-detected from its cpulist. Mutually exclusive with `cpuset`.
     pub numa: Option<i32>,
-    /// RAM limit, e.g. `"512 MB"`, `"16 GB"` — like `--memory`. cgroup `memory.max`.
+    /// RAM limit, e.g. `"512 MB"`, `"16 GB"` - like `--memory`. cgroup `memory.max`.
     pub memory: Option<String>,
-    /// Scheduling niceness (-20 high … 19 low) — like `--nice`.
+    /// Scheduling niceness (-20 high … 19 low) - like `--nice`.
     pub nice: i32,
     /// Inherit another `[[vcpu]]` by name.
     pub extends: Option<String>,
@@ -87,7 +87,7 @@ pub struct VCpuEntry {
 
 // ─────────────────────────────── GPIO (implemented) ───────────────────────────────
 
-/// `[[gpio]]` — a physical GPIO / peripheral controller declaration.
+/// `[[gpio]]` - a physical GPIO / peripheral controller declaration.
 #[derive(Debug, Clone, Default)]
 pub struct GpioEntry {
     pub id: String,
@@ -124,7 +124,7 @@ pub struct UsbPortEntry {
     pub reserved: Option<String>,
 }
 
-/// `[[vgpio]]` — a virtual GPIO / I/O peripheral profile. Field names identical to the private.
+/// `[[vgpio]]` - a virtual GPIO / I/O peripheral profile. Field names identical to the private.
 #[derive(Debug, Clone, Default)]
 pub struct VGpioEntry {
     pub name: String,
@@ -152,7 +152,7 @@ pub struct VGpioEntry {
 
 // ─────────────────────────────── Disk (implemented) ───────────────────────────────
 
-/// `[[disk]]` — a physical disk pool volumes are placed on.
+/// `[[disk]]` - a physical disk pool volumes are placed on.
 #[derive(Debug, Clone, Default)]
 pub struct DiskEntry {
     pub name: String,
@@ -165,7 +165,7 @@ pub struct DiskEntry {
     pub model: Option<String>,
 }
 
-/// `[[vdisk]]` — a virtual disk profile: size quota + optional I/O limits. Identical to the private.
+/// `[[vdisk]]` - a virtual disk profile: size quota + optional I/O limits. Identical to the private.
 #[derive(Debug, Clone, Default)]
 pub struct VDiskEntry {
     pub name: String,
@@ -186,7 +186,7 @@ pub struct VDiskEntry {
 // strings / ints. Hand-rolled (no serde/toml). It is deliberately TOLERANT for cross-edition
 // portability: an unrecognized section, an unrecognized key, or a line of TOML this reader doesn't
 // model (a multi-line array, an inline table) is ignored rather than rejected. A *malformed value*
-// of a key we DO implement is still an error (with its line) — tolerance skips unknowns, it doesn't
+// of a key we DO implement is still an error (with its line) - tolerance skips unknowns, it doesn't
 // swallow real mistakes.
 
 /// Which section the current `key = value` lines belong to.
@@ -200,7 +200,7 @@ enum Ctx {
     Vgpio,
     Disk,
     Vdisk,
-    /// A section kern-public recognizes in the schema but does not implement — its keys are ignored
+    /// A section kern-public recognizes in the schema but does not implement - its keys are ignored
     /// so an existing `kern.toml` (e.g. one that also targets the private runtime) still loads. No
     /// output mentions it.
     Skip,
@@ -224,7 +224,7 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
             i += 1;
             continue;
         }
-        // A line that is neither a `[section]` nor `key = value` is unsupported syntax — skip it
+        // A line that is neither a `[section]` nor `key = value` is unsupported syntax - skip it
         // rather than fail. A kern.toml can carry TOML this hand-rolled reader doesn't model (an
         // inline table like `{bus=1, …}`); dropping those lines keeps the rest of the config usable.
         let Some((key, val)) = line.split_once('=') else {
@@ -233,7 +233,7 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
         };
         let key = key.trim();
         // Multi-line array: `key = [` whose closing `]` is on a later line (as `kern setup -c` itself
-        // writes for long device lists — e.g. a `[[gpio]]`'s `i2c`/`spi`). Gather the following
+        // writes for long device lists - e.g. a `[[gpio]]`'s `i2c`/`spi`). Gather the following
         // comment-stripped lines up to the `]` into one array literal so the reader accepts it,
         // instead of failing the whole config. The error still points at the array's opening line.
         let first = val.trim();
@@ -258,8 +258,8 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
         };
         let at = |e: String| format!("line {n}: {e}");
         match ctx {
-            Ctx::None => {} // a key before any section — ignore (tolerant of foreign layouts)
-            Ctx::Skip => {} // an unimplemented section — ignore its keys (schema-compat, no output)
+            Ctx::None => {} // a key before any section - ignore (tolerant of foreign layouts)
+            Ctx::Skip => {} // an unimplemented section - ignore its keys (schema-compat, no output)
             Ctx::Kern => apply_kern(&mut cfg.kern, key, val).map_err(at)?,
             Ctx::Cpu => apply_cpu(cfg.cpu.last_mut().unwrap(), key, val).map_err(at)?,
             Ctx::Vcpu => apply_vcpu(cfg.vcpu.last_mut().unwrap(), key, val).map_err(at)?,
@@ -313,7 +313,7 @@ fn enter_section(cfg: &mut KernConfig, path: &str, n: usize) -> Result<Ctx, Stri
             cfg.vdisk.push(VDiskEntry::default());
             Ctx::Vdisk
         }
-        // Any other section is unrecognized — ignore it (and its keys) rather than fail. A kern.toml
+        // Any other section is unrecognized - ignore it (and its keys) rather than fail. A kern.toml
         // is meant to be portable across kern editions, so one may carry sections this build doesn't
         // implement (e.g. a private-runtime GPU section); dropping them keeps the config loadable.
         _ => Ctx::Skip,
@@ -321,7 +321,7 @@ fn enter_section(cfg: &mut KernConfig, path: &str, n: usize) -> Result<Ctx, Stri
 }
 
 // ── per-section key handlers. An unrecognized key is ignored (not an error), so a kern.toml written
-//    by another kern edition — with keys this build doesn't model — still loads. ──
+//    by another kern edition - with keys this build doesn't model - still loads. ──
 
 fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
     match key {
@@ -342,7 +342,7 @@ fn apply_cpu(e: &mut CpuEntry, key: &str, v: &str) -> Result<(), String> {
         "numa" => e.numa = Some(value_i32(v)?),
         "name" => e.name = Some(value_string(v)?),
         // Keys RENAMED in this schema: reject with a migration hint instead of silently ignoring
-        // them (unknown-key tolerance) — an ignored capacity key would misstate the host budget.
+        // them (unknown-key tolerance) - an ignored capacity key would misstate the host budget.
         "vcpus" => return Err("[[cpu]] 'vcpus' was renamed to 'cores'".into()),
         "cpus" => {
             return Err(
@@ -362,7 +362,7 @@ fn apply_vcpu(e: &mut VCpuEntry, key: &str, v: &str) -> Result<(), String> {
         "cpuset" => e.cpuset = Some(value_string(v)?),
         "cpus" => {
             e.cpus = Some(value_f64(v).map_err(|orig| {
-                // A LEGACY string pin (`cpus = "0-3"`) can't parse as the new f64 quota — point at the
+                // A LEGACY string pin (`cpus = "0-3"`) can't parse as the new f64 quota - point at the
                 // rename (`cpus` = quota, pin moved to `cpuset`) instead of a bare "expected a number".
                 let unq = v.trim().trim_matches(['"', '\'']);
                 if is_cpu_list(unq) {
@@ -379,7 +379,7 @@ fn apply_vcpu(e: &mut VCpuEntry, key: &str, v: &str) -> Result<(), String> {
         "nice" => e.nice = value_i32(v)?,
         "extends" => e.extends = Some(value_string(v)?),
         // Keys RENAMED in this schema: reject with a migration hint rather than silently ignoring
-        // them. Silence here is dangerous — an ignored `vcpus` drops the CPU quota, and a legacy
+        // them. Silence here is dangerous - an ignored `vcpus` drops the CPU quota, and a legacy
         // `cpus` pin would be re-read as a quota: a silently-WRONG resource limit, no error.
         "vcpus" => {
             return Err(
@@ -576,7 +576,7 @@ fn value_u32_array(v: &str) -> Result<Vec<u32>, String> {
 /// Default config location: `$XDG_CONFIG_HOME/kern/kern.toml`, else `~/.config/kern/kern.toml`.
 /// Mirrors the private runtime's path.
 pub fn default_path() -> Option<std::path::PathBuf> {
-    // An empty `XDG_CONFIG_HOME` (exported but blank) must be treated as unset — otherwise it forms a
+    // An empty `XDG_CONFIG_HOME` (exported but blank) must be treated as unset - otherwise it forms a
     // *relative* `kern/kern.toml` and the config lands in the current directory.
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
         return Some(std::path::PathBuf::from(x).join("kern").join("kern.toml"));
@@ -586,7 +586,7 @@ pub fn default_path() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".config/kern/kern.toml"))
 }
 
-/// Load `kern.toml` from `path` (or the default location). A missing file is not an error — it
+/// Load `kern.toml` from `path` (or the default location). A missing file is not an error - it
 /// yields an empty config, so profiles are simply "not found". A present-but-malformed file IS an
 /// error (with its line).
 pub fn load(path: Option<&str>) -> Result<KernConfig, String> {
@@ -636,7 +636,7 @@ pub fn classify(token: &str) -> Option<ProfileRef<'_>> {
 }
 
 /// The CPU/memory limits a resolved `[[vcpu]]` profile contributes, in the same units the CLI flags
-/// use — so applying a profile is just "fill the flags the user didn't set".
+/// use - so applying a profile is just "fill the flags the user didn't set".
 #[derive(Debug, Default, PartialEq)]
 pub struct ResolvedCpu {
     pub memory: Option<u64>,
@@ -684,7 +684,7 @@ fn resolve_vcpu_seen(
     if let Some(q) = e.cpus {
         // Same positivity rule the form / `config add` enforce (`profile_line`): a hand-edited
         // `cpus = 0` / `-4` / `inf` would otherwise resolve to a quota the cgroup backend floors to
-        // ~1% of a core — a silent near-freeze rather than the clear error this resolver promises.
+        // ~1% of a core - a silent near-freeze rather than the clear error this resolver promises.
         if !q.is_finite() || q <= 0.0 {
             return Err(ctx(format!(
                 "cpus must be a positive number of cores (got {q})"
@@ -736,7 +736,7 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         .find(|e| e.name == name)
         .ok_or_else(|| format!("no [[vgpio]] profile named '{name}' in kern.toml"))?;
     // A vgpio may legitimately have no `backend` (e.g. an i2c/spi-only profile with no pins), so the
-    // backend is not required here — only the pin numbers are range-checked.
+    // backend is not required here - only the pin numbers are range-checked.
     let ctx = |m: String| format!("[[vgpio]] '{name}': {m}");
     validate_profile_name(&e.name).map_err(ctx)?;
     check_pins(&e.pins).map_err(ctx)?;
@@ -744,7 +744,7 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
     let mut sysfs = Vec::new();
 
     // pins → every gpiochip node (single readdir). HONEST LIMITATION (matches the private runtime):
-    // GPIO isolation is *chip-granular*, not per-line — a `/dev/gpiochipN` chardev exposes ALL lines
+    // GPIO isolation is *chip-granular*, not per-line - a `/dev/gpiochipN` chardev exposes ALL lines
     // of that controller via ioctl, and requesting any pin binds every gpiochip present. The per-pin
     // list is cooperative metadata (surfaced as `KERN_VGPIO_PINS`), not a kernel boundary. Documented
     // in SECURITY.md so a profile author isn't misled into thinking `pins = [17]` hands out only
@@ -762,7 +762,7 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         }
     }
 
-    // sysfs-backed peripherals — only if the dir exists.
+    // sysfs-backed peripherals - only if the dir exists.
     let mut push_sysfs = |p: String| {
         if std::path::Path::new(&p).is_dir() {
             sysfs.push(p);
@@ -778,18 +778,18 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         push_sysfs("/sys/bus/w1/devices".to_string());
     }
     for led in &e.leds {
-        // A LED is a simple name under /sys/class/leds — never a path (no traversal into the host).
+        // A LED is a simple name under /sys/class/leds - never a path (no traversal into the host).
         if led.is_empty() || led.contains('/') || led.contains("..") {
-            eprintln!("kern: vgpio led '{led}' is not a simple name — skipped");
+            eprintln!("kern: vgpio led '{led}' is not a simple name - skipped");
             continue;
         }
         push_sysfs(format!("/sys/class/leds/{led}"));
     }
 
     // Direct `/dev/*` device nodes: canonicalize, require the real path stays under `/dev/`, AND
-    // refuse the dangerous ones. "Under /dev/" is NOT a sufficient boundary — it still includes
+    // refuse the dangerous ones. "Under /dev/" is NOT a sufficient boundary - it still includes
     // `/dev/mem` (physical RAM), `/dev/sda` (the host disk), `/dev/kmem`, `/dev/port`. vGPIO passes
-    // *character peripherals* (buses, serial, cameras, sound), never storage or raw memory — so we
+    // *character peripherals* (buses, serial, cameras, sound), never storage or raw memory - so we
     // deny every block device (that's `vdisk`'s job) and the raw-memory char nodes. This closes the
     // hole where an `extra = "/dev/mem"` in a hand-written or imported profile would otherwise bind
     // physical memory into a box.
@@ -797,16 +797,16 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         match std::fs::canonicalize(&path) {
             Ok(real) if real.starts_with("/dev/") && is_dangerous_dev(&real) => {
                 eprintln!(
-                    "kern: vgpio device {path} → {} gives the box control over the host (disk / memory / watchdog / firmware / tun / fuse) — refused",
+                    "kern: vgpio device {path} → {} gives the box control over the host (disk / memory / watchdog / firmware / tun / fuse) - refused",
                     real.display()
                 );
             }
             Ok(real) if real.starts_with("/dev/") => {
                 // Not dangerous, but if it's an UNRECOGNIZED kind (only reachable via `extra`), bind it
-                // yet flag it — the expert escape hatch stays open, an accidental pick gets a heads-up.
+                // yet flag it - the expert escape hatch stays open, an accidental pick gets a heads-up.
                 if !is_recognized_dev(&real) {
                     eprintln!(
-                        "kern: vgpio binding {} — not a recognized peripheral kind; ensure this is intended",
+                        "kern: vgpio binding {} - not a recognized peripheral kind; ensure this is intended",
                         real.display()
                     );
                 }
@@ -814,21 +814,21 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
             }
             Ok(real) => {
                 eprintln!(
-                    "kern: vgpio device {path} resolves to {} (outside /dev/) — skipped",
+                    "kern: vgpio device {path} resolves to {} (outside /dev/) - skipped",
                     real.display()
                 );
             }
-            Err(_) => {} // device not present on this host — skip
+            Err(_) => {} // device not present on this host - skip
         }
     }
 
     // `net` is parsed and preserved for round-trip, but a vGPIO profile does not (yet) move a network
-    // interface into the box — so say so rather than silently doing nothing. (Note: this is interface
-    // passthrough, NOT the box's `--net`/`--network` host-network SHARING — a different mechanism; we
+    // interface into the box - so say so rather than silently doing nothing. (Note: this is interface
+    // passthrough, NOT the box's `--net`/`--network` host-network SHARING - a different mechanism; we
     // deliberately don't point at `--net` here to avoid conflating the two.)
     if !e.net.is_empty() {
         eprintln!(
-            "kern: vgpio '{}' sets net={:?}, but vgpio does not attach network interfaces yet — ignored",
+            "kern: vgpio '{}' sets net={:?}, but vgpio does not attach network interfaces yet - ignored",
             e.name, e.net
         );
     }
@@ -854,7 +854,7 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("/dev/i2c-{n}"))
 }
 
-/// Is `s` a well-formed `/dev/…` path (SHAPE only — not existence)? `/dev/` then a non-empty run of
+/// Is `s` a well-formed `/dev/…` path (SHAPE only - not existence)? `/dev/` then a non-empty run of
 /// path chars (alnum `/ . _ -`), no spaces/junk. The single rule shared by the `extra` field's save
 /// validation and its live filter, so the CLI, a hand-edited file and the TUI all agree.
 pub(crate) fn is_dev_path(s: &str) -> bool {
@@ -870,45 +870,45 @@ pub(crate) fn is_dev_path(s: &str) -> bool {
 /// finite CAPABILITY test, not a list to chase: refuse a node that grants any of the host-control
 /// capabilities below; allow plain I/O peripherals (gpio, i2c, spi, uart, can, render-GPU, rtc, …).
 ///
-/// 1. host storage — any BLOCK device (sda, mmcblk\*, dm-\*, loop\*) AND the CHARACTER nodes that
+/// 1. host storage - any BLOCK device (sda, mmcblk\*, dm-\*, loop\*) AND the CHARACTER nodes that
 ///    reach a disk by ioctl: `sg*` (SG_IO), the `nvme0` controller (admin cmd), `/dev/bsg/*`,
 ///    `/dev/mapper/control`, `loop-control`, `btrfs-control`
-/// 2. raw memory / I/O ports — mem, kmem, port, kmsg, fmem, mergemem
-/// 3. arbitrary DMA — VFIO (`/dev/vfio/*`, incl. the 6.x cdev `/dev/vfio/devices/*`)
-/// 4. host reboot / brick — watchdog\*, mtd\*, nvram (raw flash/firmware)
-/// 5. virtualization / hypervisor — kvm, vhost\* (vhost-net/vsock/vdpa), vboxdrv
-/// 6. input/HID injection — uinput, uhid, hidraw\*, hiddev\* (raw HID write injects keystrokes)
-/// 7. host network creation — net/tun, ppp
-/// 8. display control — dri/card\* (the privileged KMS/modeset node)
-/// 9. mount confusion — fuse
-/// 10. raw USB — /dev/bus/usb/\* (reprogram/impersonate any device on the bus — BadUSB)
-/// 11. management engine — mei\* (Intel ME: privileged out-of-band host access)
+/// 2. raw memory / I/O ports - mem, kmem, port, kmsg, fmem, mergemem
+/// 3. arbitrary DMA - VFIO (`/dev/vfio/*`, incl. the 6.x cdev `/dev/vfio/devices/*`)
+/// 4. host reboot / brick - watchdog\*, mtd\*, nvram (raw flash/firmware)
+/// 5. virtualization / hypervisor - kvm, vhost\* (vhost-net/vsock/vdpa), vboxdrv
+/// 6. input/HID injection - uinput, uhid, hidraw\*, hiddev\* (raw HID write injects keystrokes)
+/// 7. host network creation - net/tun, ppp
+/// 8. display control - dri/card\* (the privileged KMS/modeset node)
+/// 9. mount confusion - fuse
+/// 10. raw USB - /dev/bus/usb/\* (reprogram/impersonate any device on the bus - BadUSB)
+/// 11. management engine - mei\* (Intel ME: privileged out-of-band host access)
 ///
-/// The render-only GPU node (`dri/renderD*`) is allowed — it's the real GPU-compute case — but note it
+/// The render-only GPU node (`dri/renderD*`) is allowed - it's the real GPU-compute case - but note it
 /// is "safe *if* the IOMMU isolates" (a GPU is a DMA engine), NOT zero-risk like an i2c bus. rtc/hpet
 /// are allowed; only the privileged `card*` DRM node is refused.
 fn is_dangerous_dev(real: &std::path::Path) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    // IDENTITY-based deny (major/minor), not name — a char node's major/minor is its REAL kernel
+    // IDENTITY-based deny (major/minor), not name - a char node's major/minor is its REAL kernel
     // identity; the name is only a udev label. This catches a dangerous node hidden behind an innocent
     // name: a `/dev/i2c-x` that is actually `1:1` (/dev/mem) or major 21 (SCSI generic) would pass the
     // name checks below but is refused here. Block devices are identity-checked too (a disk named like
-    // a peripheral is still a disk). (A pure allowlist-by-major isn't viable — gpiochip/rtc have DYNAMIC
-    // majors — so identity DENY of the fixed-major raw primitives is the robust part; the name/path
+    // a peripheral is still a disk). (A pure allowlist-by-major isn't viable - gpiochip/rtc have DYNAMIC
+    // majors - so identity DENY of the fixed-major raw primitives is the robust part; the name/path
     // layer covers the dynamic-major dangerous nodes.)
     if let Ok(md) = std::fs::metadata(real) {
         let ft = md.file_type();
         if ft.is_block_device() {
-            return true; // (1) host storage — by identity, so a disk named like a peripheral is caught
+            return true; // (1) host storage - by identity, so a disk named like a peripheral is caught
         }
         if ft.is_char_device() {
             let rdev = md.rdev();
             let (maj, min) = (libc::major(rdev), libc::minor(rdev));
             if maj == 1 && matches!(min, 1 | 2 | 4 | 11 | 12) {
-                return true; // mem, kmem, port, kmsg, oldmem (12) — raw memory / I/O ports
+                return true; // mem, kmem, port, kmsg, oldmem (12) - raw memory / I/O ports
             }
             if maj == 21 {
-                return true; // /dev/sg* — SCSI generic (raw disk via SG_IO), regardless of its name
+                return true; // /dev/sg* - SCSI generic (raw disk via SG_IO), regardless of its name
             }
         }
     }
@@ -918,7 +918,7 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    // NAME/prefix layer — belt-and-braces over the identity check, and the ONLY guard for the
+    // NAME/prefix layer - belt-and-braces over the identity check, and the ONLY guard for the
     // dynamic-major dangerous nodes (their major isn't fixed, so identity-by-major can't catch them).
     // (2) raw memory + oldmem · (2b) DAX direct-access · (4) nvram · (5) kvm · (6) uinput/uhid ·
     //     (7) tun/ppp · (9) fuse · (3) udmabuf · storage/dm/loop CONTROL · (12) host console/VC
@@ -949,16 +949,16 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
     }
     // family prefixes: (4) reboot/brick · (5) vhost-net/vsock/vdpa + vbox* · (6) HID injection
     // (hidraw + hiddev) · (11) mei · (2b) dax\* · storage: NVMe char (nvme0 controller, nvme-generic,
-    // nvme-fabrics — all admin/control; the nvme0n1 block namespace is caught by the identity check).
+    // nvme-fabrics - all admin/control; the nvme0n1 block namespace is caught by the identity check).
     if [
         "watchdog", "mtd", "vhost", "vbox", "hidraw", "hiddev", "mei", "dax", "nvme", "vcs",
     ]
     .iter()
     .any(|p| name.starts_with(p))
     {
-        return true; // …+ vcs\*/vcsa\* (virtual-console memory — read the host console back)
+        return true; // …+ vcs\*/vcsa\* (virtual-console memory - read the host console back)
     }
-    // SCSI-generic (`sg0`) and the VIRTUAL CONSOLES (`tty0..N`) by stem+digits — `sgx_enclave`,
+    // SCSI-generic (`sg0`) and the VIRTUAL CONSOLES (`tty0..N`) by stem+digits - `sgx_enclave`,
     // `ttyS0`/`ttyUSB0`/`ttyACM0` (real serial) keep a non-digit tail and are NOT matched.
     let stem_digits = |stem: &str| {
         name.strip_prefix(stem)
@@ -967,7 +967,7 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
     if stem_digits("sg") || stem_digits("tty") {
         return true;
     }
-    // path-ancestor families: (3) VFIO — ALL layouts incl. the 6.x cdev node /dev/vfio/devices/vfioN ·
+    // path-ancestor families: (3) VFIO - ALL layouts incl. the 6.x cdev node /dev/vfio/devices/vfioN ·
     // block-SCSI-generic /dev/bsg/* · device-mapper control /dev/mapper/control (a real /dev/mapper LV
     // canonicalizes to /dev/dm-N, a block device, and is caught above).
     if real.to_str().is_some_and(|s| {
@@ -978,7 +978,7 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
         return true;
     }
     // (10) raw USB: refuse the whole-BUS reach (/dev/bus/usb, or /dev/bus/usb/<bus> which reaches EVERY
-    // device on it — BadUSB), but ALLOW a SPECIFIC device node /dev/bus/usb/<bus>/<dev>: that's a scoped
+    // device on it - BadUSB), but ALLOW a SPECIFIC device node /dev/bus/usb/<bus>/<dev>: that's a scoped
     // libusb passthrough of the one device the user chose (DFU flashing, an SDR, a programmer), no
     // different in kind from handing over /dev/ttyUSB0. Depth 2 (bus/dev) = a device; fewer = a bus.
     if let Some(rest) = real.to_str().and_then(|s| s.strip_prefix("/dev/bus/usb")) {
@@ -992,7 +992,7 @@ fn is_dangerous_dev(real: &std::path::Path) -> bool {
 }
 
 /// A `/dev` node kind that vGPIO *recognizes* as a plain peripheral. Anything under `/dev/` that is
-/// neither dangerous nor recognized still binds (via `extra`), but with a heads-up — so a beginner who
+/// neither dangerous nor recognized still binds (via `extra`), but with a heads-up - so a beginner who
 /// lands there by accident is told, while the expert escape hatch stays open.
 fn is_recognized_dev(real: &std::path::Path) -> bool {
     let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1005,7 +1005,7 @@ fn is_recognized_dev(real: &std::path::Path) -> bool {
             return true;
         }
     }
-    // camera/audio/dri/input live in subdirs — match on the parent directory instead
+    // camera/audio/dri/input live in subdirs - match on the parent directory instead
     let parent = real
         .parent()
         .and_then(|p| p.file_name())
@@ -1016,11 +1016,11 @@ fn is_recognized_dev(real: &std::path::Path) -> bool {
 
 /// The `/dev/*`-path fields of a vGPIO profile (everything except pins/pwm/adc/onewire/leds/net,
 /// which map to gpiochips or sysfs). Matches the private's `device_paths()`. An `i2c` entry may be a
-/// bare bus number (`"1"`) or `"i2c-1"` — both normalise to `/dev/i2c-1` — or a full `/dev/…` path;
+/// bare bus number (`"1"`) or `"i2c-1"` - both normalise to `/dev/i2c-1` - or a full `/dev/…` path;
 /// the other buses are taken as `/dev/*` paths verbatim.
 fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
     let i2c = e.i2c.iter().filter_map(|s| {
-        // A full path is taken verbatim — the `canonicalize` + `starts_with("/dev/")` gate at the call
+        // A full path is taken verbatim - the `canonicalize` + `starts_with("/dev/")` gate at the call
         // site is the confinement check. A NON-path entry must be a plain bus NUMBER (all-digits
         // validated inside `canon_i2c_bus` before the path is built).
         if s.starts_with('/') {
@@ -1028,7 +1028,7 @@ fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
         }
         canon_i2c_bus(s).or_else(|| {
             eprintln!(
-                "kern: vgpio i2c entry {s:?} is not a bus number (e.g. \"1\", \"i2c-1\") or a /dev/ path — skipped"
+                "kern: vgpio i2c entry {s:?} is not a bus number (e.g. \"1\", \"i2c-1\") or a /dev/ path - skipped"
             );
             None
         })
@@ -1055,7 +1055,7 @@ fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
 /// A resolved `[[vdisk]]` profile: a size-capped volume the box mounts at `/vdisk/<name>`. The
 /// `size` cap is enforced rootless by a `tmpfs size=` mount (RAM-backed, ephemeral); when kern runs
 /// privileged with loop devices available it is upgraded to an ext4-on-loop image (disk-backed,
-/// `persistent`, `iops`/`bandwidth`-limited) — mirroring the private runtime.
+/// `persistent`, `iops`/`bandwidth`-limited) - mirroring the private runtime.
 #[derive(Debug, Default, PartialEq)]
 pub struct ResolvedVdisk {
     pub name: String,
@@ -1121,14 +1121,14 @@ fn numa_cpulist(node: i32) -> Option<String> {
 
 /// Parse a memory/disk size for the profile schema: binary units up to terabytes, tolerant of a space
 /// and a trailing `b` (`"2g"`, `"512m"`, `"16 GB"`, `"16t"`, or bare bytes). The shared
-/// [`kern_common::parse_binary_size`] — one definition for the whole tree.
+/// [`kern_common::parse_binary_size`] - one definition for the whole tree.
 pub(crate) fn size_to_bytes(s: &str) -> Option<u64> {
     kern_common::parse_binary_size(s)
 }
 
 // ═══════════════════ profile field validation + emission (the shared schema) ═══════════════════
 //
-// ONE source of truth for what a profile field may hold and how it's written back to kern.toml —
+// ONE source of truth for what a profile field may hold and how it's written back to kern.toml -
 // used by BOTH `kern top`'s forms AND `kern config add`, and (for the semantic ranges) by the
 // resolve path. So the TUI, the CLI and a hand-edited file all agree on what is valid, and the TUI
 // can never save a value the loader would later reject.
@@ -1137,7 +1137,7 @@ pub(crate) fn size_to_bytes(s: &str) -> Option<u64> {
 /// rejects nonsense like `70000` while staying board-agnostic.
 pub(crate) const MAX_GPIO_PIN: u32 = 1024;
 
-/// A profile / vdisk name usable as a `kind:name` attach token: letters, digits, `_ - .` — no `:`
+/// A profile / vdisk name usable as a `kind:name` attach token: letters, digits, `_ - .` - no `:`
 /// (it would split the token) and no path separators. Enforced by the TUI form, `kern config add`
 /// AND the resolve path, so all three agree.
 pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
@@ -1145,7 +1145,7 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
     // traversal + leading-char rule to the shared [`kern_common::valid_resource_name`] so a profile/
     // vdisk name obeys exactly the same rule as a volume/secret/pod name. In particular `..` is
     // rejected so `vdisk:..` fails at create-time (a persistent vdisk interpolates the name into an
-    // image path) — no "created ok" then "fails".
+    // image path) - no "created ok" then "fails".
     if name.is_empty() {
         return Err("name is required".into());
     }
@@ -1164,7 +1164,7 @@ pub(crate) fn check_size(field: &str, v: &str) -> Result<(), String> {
     if size_to_bytes(v).is_some() {
         Ok(())
     } else {
-        Err(format!("{field}: not a size — e.g. 512m, 2g, 1g"))
+        Err(format!("{field}: not a size - e.g. 512m, 2g, 1g"))
     }
 }
 
@@ -1228,7 +1228,7 @@ pub(crate) fn toml_quote(s: &str) -> String {
     out
 }
 
-/// EVERY field a given profile kind accepts — `kern config add` exposes all of them, so there is no
+/// EVERY field a given profile kind accepts - `kern config add` exposes all of them, so there is no
 /// field you can only reach by hand-editing. `name` is handled separately. (The `kern top` form shows
 /// the common subset for a friendly UX, but the field-surgical merge means it never drops the rest.)
 pub(crate) fn profile_fields(kind: &str) -> &'static [&'static str] {
@@ -1300,7 +1300,7 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
         for p in v.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()) {
             nums.push(
                 p.parse::<u32>()
-                    .map_err(|_| format!("{key}: comma-separated numbers — e.g. 17,27"))?,
+                    .map_err(|_| format!("{key}: comma-separated numbers - e.g. 17,27"))?,
             );
         }
         // pin/pwm/adc/onewire are all line indices → same range guard, but name the actual field.
@@ -1320,7 +1320,7 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
-        // `extra` is the /dev-path escape — each entry MUST be a `/dev/…` path (not free text), so the
+        // `extra` is the /dev-path escape - each entry MUST be a `/dev/…` path (not free text), so the
         // CLI and a hand-edited file reject garbage exactly as the TUI live filter does (one rule). The
         // resolver still does the existence/safety check at launch.
         if key == "extra" {
@@ -1330,14 +1330,14 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
                 }
             }
         }
-        // `i2c` accepts a bus NUMBER (`1`, `i2c-1`) or a full `/dev/…` path — reject anything else at
+        // `i2c` accepts a bus NUMBER (`1`, `i2c-1`) or a full `/dev/…` path - reject anything else at
         // SAVE (e.g. `1/../spi0`), matching the resolver's all-digits `canon_i2c_bus` guard, so a
         // malformed bus can't be stored to silently do nothing at launch.
         if key == "i2c" {
             for t in &trimmed {
                 if canon_i2c_bus(t).is_none() && !is_dev_path(t) {
                     return Err(format!(
-                        "i2c: {t:?} — a bus number (e.g. 1, i2c-1) or a /dev/… path"
+                        "i2c: {t:?} - a bus number (e.g. 1, i2c-1) or a /dev/… path"
                     ));
                 }
             }
@@ -1349,16 +1349,16 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
         return Ok(Some(format!("{key} = [{}]", items.join(", "))));
     }
     let line = match key {
-        // CPU *quota* — like `--cpus` (fractional cores → cgroup cpu.max).
+        // CPU *quota* - like `--cpus` (fractional cores → cgroup cpu.max).
         "cpus" => {
-            let n: f64 = v.parse().map_err(|_| "cpus: a number — e.g. 4 or 0.5")?;
+            let n: f64 = v.parse().map_err(|_| "cpus: a number - e.g. 4 or 0.5")?;
             // `!is_finite()` rejects both `nan` and `inf` (which would write a nonsense `cpus = inf`).
             if !n.is_finite() || n <= 0.0 {
                 return Err("cpus: must be a finite number greater than 0".into());
             }
             format!("cpus = {}", crate::ui::fmt_cpus(n))
         }
-        // CPU *pinning* — like `--cpuset-cpus` (a cpulist: `0-3`, `0,2,4`).
+        // CPU *pinning* - like `--cpuset-cpus` (a cpulist: `0-3`, `0,2,4`).
         "cpuset" => {
             check_cpus(v)?;
             format!("cpuset = {}", toml_quote(v))
@@ -1367,7 +1367,7 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
             check_size(key, v)?;
             format!("{key} = {}", toml_quote(v))
         }
-        // Free string refs (`gpio:0`, `disk:0`) — quoted as-is (colons are legal here).
+        // Free string refs (`gpio:0`, `disk:0`) - quoted as-is (colons are legal here).
         "backend" => format!("backend = {}", toml_quote(v)),
         // `extends` names another profile, so it obeys the profile-name charset.
         "extends" => {
@@ -1404,14 +1404,14 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
 
 /// The live-validation state of a field value, so the TUI can accept/reject a keystroke and show a
 /// three-state hint. It is DERIVED from [`profile_line`] (the save-time authority) so live and save
-/// can never diverge — the class of bug behind the "1.5g" dead-end.
+/// can never diverge - the class of bug behind the "1.5g" dead-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FieldState {
     /// A complete, save-acceptable value (`profile_line` would emit it).
     Valid,
-    /// A prefix that isn't valid yet but could still become valid — keep typing (`-`, `0`, `0-`, …).
+    /// A prefix that isn't valid yet but could still become valid - keep typing (`-`, `0`, `0-`, …).
     Incomplete,
-    /// No completion can ever be valid — the keystroke that produced it is refused.
+    /// No completion can ever be valid - the keystroke that produced it is refused.
     Invalid,
 }
 
@@ -1424,7 +1424,7 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
     if v.is_empty() {
         return Incomplete;
     }
-    // `name`/`extends` are validated by `validate_profile_name`, not `profile_line` — but route them
+    // `name`/`extends` are validated by `validate_profile_name`, not `profile_line` - but route them
     // through the SAME dispatcher so they get the live three-state indicator and can't drift from the
     // save rule (the bug that would otherwise re-open the two-implementations risk for names). A name
     // prefix is either a valid name or has an unfixable problem (bad leading char, `..`, too long),
@@ -1436,7 +1436,7 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
             Invalid
         };
     }
-    // `extra` is the /dev-path escape — but it's still a `/dev/…` path, not free text. Each comma token
+    // `extra` is the /dev-path escape - but it's still a `/dev/…` path, not free text. Each comma token
     // must be a valid `/dev/…` path (shared `is_dev_path`, the same rule the save uses) or a prefix of
     // `/dev/` mid-typing; a first non-`/` char (`rftre…`) is refused. The resolver does the real
     // existence/safety check at launch.
@@ -1456,7 +1456,7 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
         // Ok(None) = a value profile_line legitimately omits (e.g. `persistent = no`); still editable.
         return if opt.is_some() { Valid } else { Incomplete };
     }
-    // profile_line rejected the COMPLETE value — but is it a prefix that a further keystroke can fix?
+    // profile_line rejected the COMPLETE value - but is it a prefix that a further keystroke can fix?
     let could_complete = match key {
         // a lone minus is the start of a negative nice value
         "nice" => v == "-",
@@ -1466,7 +1466,7 @@ pub(crate) fn field_state(key: &str, v: &str) -> FieldState {
                 && v.chars().all(|c| c.is_ascii_digit() || c == '.')
         }
         // a partial cpulist (`0-`, `0,`) can still reach a valid cpuset. Match `is_cpu_list`'s shape with
-        // NO upper bound (it has none — a portable profile may pin a high core, host-fit is launch-time),
+        // NO upper bound (it has none - a portable profile may pin a high core, host-fit is launch-time),
         // so a Valid value like `5000-9000` isn't blocked mid-typing at the `-`.
         "cpuset" => v.split(',').all(|t| {
             let parts: Vec<&str> = t.split('-').collect();
@@ -1497,7 +1497,7 @@ pub(crate) fn profile_block(name: &str, pairs: &[(&str, &str)]) -> Result<Vec<St
     Ok(body)
 }
 
-/// EVERY set field of an existing profile as `(key, value)` strings (lists comma-joined) — used to
+/// EVERY set field of an existing profile as `(key, value)` strings (lists comma-joined) - used to
 /// pre-fill the `kern top` edit form so it shows and preserves all fields, not a subset. The inverse
 /// of [`profile_line`]'s parsing: values here feed straight back through it on save.
 pub(crate) fn profile_pairs(cfg: &KernConfig, kind: &str, name: &str) -> Vec<(String, String)> {
@@ -1592,7 +1592,7 @@ pub(crate) fn profile_pairs(cfg: &KernConfig, kind: &str, name: &str) -> Vec<(St
 
 /// Take an exclusive advisory lock for the whole read-modify-write of `kern.toml`, held until the
 /// returned handle drops. Concurrent `config add`/`rm` (and the TUI) would otherwise each read the
-/// same base, splice their own block, and write — last-writer-wins, silently losing the others'
+/// same base, splice their own block, and write - last-writer-wins, silently losing the others'
 /// edits. A SEPARATE lock file (stable inode; kern.toml itself is replaced by rename) serialises
 /// them. Fail-open: if the lock can't be taken (e.g. a filesystem without `flock`), proceed unlocked.
 fn config_lock() -> Option<std::fs::File> {
@@ -1646,7 +1646,7 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Re
 }
 
 /// Splice a profile block into `kern.toml`. `managed` is the set of keys THIS caller controls (the
-/// form's fields, or the CLI flags actually passed) — a field-surgical merge replaces exactly those,
+/// form's fields, or the CLI flags actually passed) - a field-surgical merge replaces exactly those,
 /// keeps every other key already in the block (a hand-added `numa`/`i2c`, another surface's fields),
 /// and a managed key omitted from `body` is cleared. So a partial edit never drops what it didn't
 /// touch, whichever surface made it. The read-modify-write is serialised by [`config_lock`] so
@@ -1654,7 +1654,7 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Re
 /// Whole-profile validation, AFTER each field is individually valid: a profile can be field-valid yet
 /// reference something that doesn't exist. Checks the internal, save-time coherence a single field
 /// can't (a `backend`/`extends` that points at no configured `[[cpu]]`/`[[gpio]]`/`[[disk]]`/profile).
-/// Host-fit checks (e.g. `cpus` ≤ this host's cores) are LAUNCH-time and live in the resolver — a
+/// Host-fit checks (e.g. `cpus` ≤ this host's cores) are LAUNCH-time and live in the resolver - a
 /// profile is portable, so `cpuset = "0-7"` is legal to author on a 4-core box for an 8-core target.
 pub(crate) fn validate_profile_refs(
     cfg: &KernConfig,
@@ -1718,7 +1718,7 @@ pub(crate) fn validate_profile_refs(
 /// Match a `backend = "kind:name"` reference against a declared `[[cpu]]`/`[[gpio]]`/`[[disk]]`
 /// id/name, tolerating the optional `kind:` prefix on EITHER side. The docs show `[[cpu]] id = "0"`
 /// while the shipped example bakes in `id = "cpu:0"`, and a user may write `backend = "cpu:0"` or a
-/// bare `backend = "0"` — all of these resolve, so the same-looking token means the same thing across
+/// bare `backend = "0"` - all of these resolve, so the same-looking token means the same thing across
 /// every kind (previously cpu/gpio needed a literal match and only disk stripped the prefix).
 fn backend_ref_matches(reference: &str, prefix: &str, declared: &str) -> bool {
     reference.strip_prefix(prefix).unwrap_or(reference)
@@ -1741,13 +1741,13 @@ pub(crate) fn save_named_block(
     let source = orig_name.unwrap_or(name);
     let out = crate::toml_surgery::upsert_block_merge(&raw, section, source, name, managed, body);
     // FAIL-CLOSED: never write a config we can't re-parse. If the merged output doesn't parse, writing
-    // it would CORRUPT kern.toml (the next load/launch fails to read ANYTHING) — worse than the
+    // it would CORRUPT kern.toml (the next load/launch fails to read ANYTHING) - worse than the
     // pre-existing problem. Refuse instead, and tell the user their file needs fixing first.
     let cfg = parse(&out).map_err(|e| {
-        format!("refusing to write: the resulting kern.toml would not parse ({e}) — your existing config may be malformed; fix it first")
+        format!("refusing to write: the resulting kern.toml would not parse ({e}) - your existing config may be malformed; fix it first")
     })?;
     // Whole-profile coherence: a field-valid profile whose backend/extends points at nothing is refused
-    // here, before the write — so a save never produces a broken profile.
+    // here, before the write - so a save never produces a broken profile.
     validate_profile_refs(&cfg, section, name)?;
     write_atomic(&path, &out).map_err(|e| format!("writing {}: {e}", path.display()))
 }
@@ -1833,7 +1833,7 @@ mod tests {
     #[test]
     fn unimplemented_sections_load_leniently() {
         // A shared kern.toml that also targets the private runtime (with a [[vgpu]] section) still
-        // parses — the unimplemented section and its keys are ignored, not errored, so the file's
+        // parses - the unimplemented section and its keys are ignored, not errored, so the file's
         // implemented profiles (e.g. [[vcpu]]) load normally. Nothing about it is surfaced.
         let c = parse(
             "[[vgpu]]\nname = \"gaming\"\nvram = \"4g\"\ncompute = 0.5\n[[vcpu]]\nname = \"x\"",
@@ -1845,19 +1845,19 @@ mod tests {
     #[test]
     fn tolerant_of_unknown_keys_sections_and_stray_syntax() {
         // Forward/cross-version compat: an unknown key, an unknown section, a key before any section,
-        // and TOML this hand-rolled reader doesn't model are all IGNORED (not errors) — so a kern.toml
+        // and TOML this hand-rolled reader doesn't model are all IGNORED (not errors) - so a kern.toml
         // shared with another edition still loads.
         assert!(parse("[[vcpu]]\nname = \"x\"\nbogus = 1").is_ok());
         assert!(parse("[nope]\nx = 1").is_ok());
         assert!(parse("x = 1").is_ok());
-        // A multi-line array of inline tables (how the private writes usb_ports) — skipped, not fatal.
+        // A multi-line array of inline tables (how the private writes usb_ports) - skipped, not fatal.
         assert!(
             parse("[[gpio]]\nusb_ports = [\n  {bus=1, port=9},\n]\n[[vcpu]]\nname=\"y\"").is_ok()
         );
         // The implemented profile still loads despite the ignored noise around it.
         let c = parse("[nope]\nx=1\n[[vcpu]]\nname=\"ok\"\nbogus=2").unwrap();
         assert_eq!(c.vcpu[0].name, "ok");
-        // A BAD VALUE for a RECOGNIZED key is still a real error — tolerance ignores unknowns, it does
+        // A BAD VALUE for a RECOGNIZED key is still a real error - tolerance ignores unknowns, it does
         // not swallow malformed values of keys we do implement.
         assert!(parse("[[vcpu]]\nname = \"x\"\ncpus = abc").is_err());
     }
@@ -1877,7 +1877,7 @@ mod tests {
             ec.contains("cores"),
             "[[cpu]] vcpus should point to 'cores': {ec}"
         );
-        // `[[cpu]] cpus` was renamed — the hint offers BOTH intents (capacity `cores` / pin `cpuset`),
+        // `[[cpu]] cpus` was renamed - the hint offers BOTH intents (capacity `cores` / pin `cpuset`),
         // since a new user might mean either.
         let ecc = parse("[[cpu]]\nid = \"0\"\ncpus = \"0-7\"").unwrap_err();
         assert!(
@@ -1901,14 +1901,14 @@ mod tests {
     #[test]
     fn parses_multiline_arrays_for_recognized_keys() {
         // `kern setup -c` writes long device lists as MULTI-LINE arrays (a `[[gpio]]`'s `i2c`/`spi`).
-        // The hand-rolled reader must gather the lines up to `]` — it used to error on `= [`, failing
+        // The hand-rolled reader must gather the lines up to `]` - it used to error on `= [`, failing
         // the WHOLE config, so a board kern itself set up couldn't load its own profiles (real Jetson).
         let c = parse(
             "[[gpio]]\nid = \"0\"\ni2c = [\n    \"/dev/i2c-0\",\n    \"/dev/i2c-1\",\n    \"/dev/i2c-2\",\n]\n\n[[vcpu]]\nname = \"after\"\ncpus = 1.0",
         )
         .unwrap();
         assert_eq!(c.gpio[0].i2c, ["/dev/i2c-0", "/dev/i2c-1", "/dev/i2c-2"]);
-        // ...and parsing CONTINUES past the multi-line array — the profile after it still loads.
+        // ...and parsing CONTINUES past the multi-line array - the profile after it still loads.
         assert_eq!(c.vcpu[0].name, "after");
         assert_eq!(c.vcpu[0].cpus, Some(1.0));
         // A multi-line INT array (pins) works too, with a trailing comma.
@@ -1930,7 +1930,7 @@ mod tests {
             classify("vdisk:data"),
             Some(ProfileRef::Vdisk("data"))
         ));
-        // `vgpu:` is NOT a kern-public concept — it is not a profile prefix (GPU is out of this
+        // `vgpu:` is NOT a kern-public concept - it is not a profile prefix (GPU is out of this
         // edition), so it classifies as a plain command token, not a reserved profile.
         assert!(classify("vgpu:gaming").is_none());
         assert!(classify("echo").is_none());
@@ -2024,7 +2024,7 @@ mod tests {
         let mut cfg = KernConfig::default();
         cfg.vgpio.push(VGpioEntry {
             name: "t".into(),
-            // `/dev/null` exists everywhere and is under /dev — it must be taken.
+            // `/dev/null` exists everywhere and is under /dev - it must be taken.
             i2c: vec!["/dev/null".into()],
             // a device that doesn't exist is silently skipped, not an error.
             spi: vec!["/dev/kern-nope-xyz".into()],
@@ -2051,7 +2051,7 @@ mod tests {
     #[test]
     fn extreme_vgpio_never_binds_a_dangerous_device_via_any_field_or_path_trick() {
         // A battery of host-control / raw devices, some with path tricks (../, ./, double-/dev), fed
-        // through `extra` — none may ever reach `devs`, whether present-and-refused or absent-and-skipped.
+        // through `extra` - none may ever reach `devs`, whether present-and-refused or absent-and-skipped.
         let dangerous = [
             "/dev/mem",
             "/dev/kmem",
@@ -2119,11 +2119,11 @@ mod tests {
         assert_eq!(canon_i2c_bus("-1"), None);
         assert_eq!(canon_i2c_bus("1a"), None);
         assert_eq!(canon_i2c_bus(" 1"), None); // a space is not a digit
-                                               // The SAVE path (profile_line) rejects the same junk the resolver would skip — one rule.
+                                               // The SAVE path (profile_line) rejects the same junk the resolver would skip - one rule.
         assert!(profile_line("i2c", "1").unwrap().is_some());
         assert!(profile_line("i2c", "i2c-1").unwrap().is_some());
         assert!(profile_line("i2c", "/dev/i2c-1").unwrap().is_some());
-        assert!(profile_line("i2c", "1/../spi0").is_err()); // traversal — refused at save
+        assert!(profile_line("i2c", "1/../spi0").is_err()); // traversal - refused at save
         assert!(profile_line("i2c", "abc").is_err());
     }
 
@@ -2145,25 +2145,25 @@ mod tests {
             "/dev/vhost-net",          // VM network backend
             "/dev/vhost-vsock",        // VM vsock backend
             "/dev/uinput",             // input injection
-            "/dev/vfio/vfio",          // arbitrary DMA — the worst
+            "/dev/vfio/vfio",          // arbitrary DMA - the worst
             "/dev/vfio/42",            // a vfio group
             "/dev/dri/card0",          // privileged DRM (modeset)
-            "/dev/vhost-vdpa",         // vhost family (prefix) — vdpa
+            "/dev/vhost-vdpa",         // vhost family (prefix) - vdpa
             "/dev/vboxdrv",            // VirtualBox hypervisor driver
-            "/dev/hidraw0", // raw HID — write injects keystrokes / reprograms (like uinput)
+            "/dev/hidraw0", // raw HID - write injects keystrokes / reprograms (like uinput)
             "/dev/hiddev0", // HID injection (HIDIOCSREPORT)
             "/dev/uhid",    // create a virtual HID device
             "/dev/mei0",    // Intel Management Engine
-            "/dev/bus/usb/001", // a whole USB BUS (reaches every device on it — BadUSB)
+            "/dev/bus/usb/001", // a whole USB BUS (reaches every device on it - BadUSB)
             "/dev/bus/usb", // the USB bus root
-            "/dev/sg0",     // SCSI generic (char) — SG_IO reaches the host disk
-            "/dev/nvme0",   // NVMe CONTROLLER (char) — admin cmd formats/reads any namespace
-            "/dev/bsg/0:0:0:0", // block-SCSI-generic (char) — SG_IO
-            "/dev/mapper/control", // device-mapper control — maps arbitrary host block ranges
+            "/dev/sg0",     // SCSI generic (char) - SG_IO reaches the host disk
+            "/dev/nvme0",   // NVMe CONTROLLER (char) - admin cmd formats/reads any namespace
+            "/dev/bsg/0:0:0:0", // block-SCSI-generic (char) - SG_IO
+            "/dev/mapper/control", // device-mapper control - maps arbitrary host block ranges
             "/dev/loop-control", // create loop devices
             "/dev/ppp",     // create PPP network interfaces
-            "/dev/vfio/devices/vfio0", // 6.x VFIO cdev — arbitrary DMA
-            "/dev/dax0.0",  // DAX — mmaps physical NVDIMM (raw memory)
+            "/dev/vfio/devices/vfio0", // 6.x VFIO cdev - arbitrary DMA
+            "/dev/dax0.0",  // DAX - mmaps physical NVDIMM (raw memory)
             "/dev/udmabuf", // dma-buf from user memory
             "/dev/nvme-generic0", // NVMe admin passthrough (char)
             "/dev/nvme-fabrics", // NVMe-oF connect node (char control)
@@ -2181,15 +2181,15 @@ mod tests {
         // device merely starting "sg", or SERIAL ttys (vs the virtual consoles tty0..N).
         for dev in [
             "/dev/i2c-1",
-            "/dev/null", // major 1 minor 3 — NOT in the raw-memory minor set, allowed
+            "/dev/null", // major 1 minor 3 - NOT in the raw-memory minor set, allowed
             "/dev/spidev0.0",
-            "/dev/dri/renderD128", // render-only GPU node — allowed
+            "/dev/dri/renderD128", // render-only GPU node - allowed
             "/dev/rtc0",
-            "/dev/sgx_enclave",     // SGX (not sg+digits) — allowed
-            "/dev/bus/usb/001/002", // a SPECIFIC USB device (scoped libusb, like ttyUSB) — allowed
-            "/dev/ttyS0",           // serial — allowed (not tty+pure-digits)
-            "/dev/ttyUSB0",         // USB serial — allowed
-            "/dev/ttyACM0",         // USB CDC serial — allowed
+            "/dev/sgx_enclave",     // SGX (not sg+digits) - allowed
+            "/dev/bus/usb/001/002", // a SPECIFIC USB device (scoped libusb, like ttyUSB) - allowed
+            "/dev/ttyS0",           // serial - allowed (not tty+pure-digits)
+            "/dev/ttyUSB0",         // USB serial - allowed
+            "/dev/ttyACM0",         // USB CDC serial - allowed
         ] {
             assert!(
                 !is_dangerous_dev(std::path::Path::new(dev)),
@@ -2197,7 +2197,7 @@ mod tests {
             );
         }
         // IDENTITY check (major/minor, not name): on hosts that actually HAVE these nodes, /dev/mem is
-        // refused by its 1:1 identity and /dev/null (1:3) stays allowed — so a name-spoof (a dangerous
+        // refused by its 1:1 identity and /dev/null (1:3) stays allowed - so a name-spoof (a dangerous
         // node under an innocent name) can't slip past.
         if std::path::Path::new("/dev/mem").exists() {
             assert!(
@@ -2209,7 +2209,7 @@ mod tests {
             !is_dangerous_dev(std::path::Path::new("/dev/null")),
             "null (1:3) allowed by identity"
         );
-        // End to end: an `extra = "/dev/mem"` (hand-written / imported profile) never reaches `devs` —
+        // End to end: an `extra = "/dev/mem"` (hand-written / imported profile) never reaches `devs` -
         // either the host lacks it (skipped) or it's present and refused. Both outcomes: not bound.
         let mut cfg = KernConfig::default();
         cfg.vgpio.push(VGpioEntry {
@@ -2308,7 +2308,7 @@ mod tests {
         // Empty → nothing to emit; `persistent = no` → nothing.
         assert!(profile_line("memory", "  ").unwrap().is_none());
         assert!(profile_line("persistent", "no").unwrap().is_none());
-        // Bad values are REJECTED — the same rejections the loader would give.
+        // Bad values are REJECTED - the same rejections the loader would give.
         assert!(profile_line("memory", "banana").is_err());
         assert!(profile_line("cpuset", "99-0").is_err()); // reversed range
         assert!(profile_line("cpus", "-5").is_err()); // quota must be > 0
@@ -2332,7 +2332,7 @@ mod tests {
         ] {
             assert_eq!(field_state(k, v), Valid, "{k}={v}");
         }
-        // Incomplete: a prefix that can still complete — allowed live, not yet savable.
+        // Incomplete: a prefix that can still complete - allowed live, not yet savable.
         for (k, v) in [
             ("nice", "-"),
             ("cpus", "0"),
@@ -2342,30 +2342,30 @@ mod tests {
         ] {
             assert_eq!(field_state(k, v), Incomplete, "{k}={v:?}");
         }
-        // A high-core range is a VALID cpulist (host-fit is launch-time) — it must not be blocked
+        // A high-core range is a VALID cpulist (host-fit is launch-time) - it must not be blocked
         // mid-typing: `5000-9000` types through, so `5000-` above is Incomplete, not Invalid.
         assert_eq!(field_state("cpuset", "4095-4095"), Valid);
         assert_eq!(field_state("cpuset", "5000-9000"), Valid);
-        // Invalid: no completion can be valid — the keystroke that produced it is refused.
+        // Invalid: no completion can be valid - the keystroke that produced it is refused.
         for (k, v) in [
             ("pins", "44545454545"),
             ("nice", "-25"),
             ("memory", "1.5g"),
             ("cpus", "1.2.3"),
-            ("extra", "rftre errte"), // garbage — not a /dev path (the reported bug)
+            ("extra", "rftre errte"), // garbage - not a /dev path (the reported bug)
             ("extra", "/etc/passwd"), // a path, but not under /dev
         ] {
             assert_eq!(field_state(k, v), Invalid, "{k}={v}");
         }
         // `extra` is a /dev-path list, not free text: a `/dev/…` path is Valid, a prefix Incomplete,
-        // and its Valid values save (shared is_dev_path rule) — no more `rftre errte`.
+        // and its Valid values save (shared is_dev_path rule) - no more `rftre errte`.
         assert_eq!(field_state("extra", "/dev/foo"), Valid);
         assert_eq!(field_state("extra", "/dev/a,/dev/b"), Valid);
         assert_eq!(field_state("extra", "/de"), Incomplete); // prefix of /dev/
         assert_eq!(field_state("extra", "/dev/a,"), Incomplete); // last token mid-typing
         assert!(profile_line("extra", "/dev/foo").unwrap().is_some());
         assert!(profile_line("extra", "rftre").is_err());
-        // `name`/`extends` route through the SAME dispatcher (not a second validator) — so they get the
+        // `name`/`extends` route through the SAME dispatcher (not a second validator) - so they get the
         // three-state too and can't drift from validate_profile_name at save.
         assert_eq!(field_state("name", "sensors"), Valid);
         assert_eq!(field_state("name", "a.b-c_1"), Valid);
@@ -2405,7 +2405,7 @@ mod tests {
 
     #[test]
     fn profile_line_covers_every_field_type() {
-        // The extended field set — i32 ranges, u64, sizes, u32-lists and string-lists — every one
+        // The extended field set - i32 ranges, u64, sizes, u32-lists and string-lists - every one
         // reachable from `kern config add`, all through the single validated emitter.
         assert_eq!(profile_line("numa", "1").unwrap().unwrap(), "numa = 1");
         assert_eq!(profile_line("nice", "-5").unwrap().unwrap(), "nice = -5");
@@ -2433,7 +2433,7 @@ mod tests {
         assert!(profile_line("numa", "-1").is_err());
         assert!(profile_line("extends", "a:b").is_err());
         assert!(profile_line("adc", "70000").is_err()); // line-index range
-                                                        // A non-finite cpus quota (`inf`/`nan`) is rejected — it would write a nonsense `cpus = inf`.
+                                                        // A non-finite cpus quota (`inf`/`nan`) is rejected - it would write a nonsense `cpus = inf`.
         assert!(profile_line("cpus", "inf").is_err());
         assert!(profile_line("cpus", "nan").is_err());
     }

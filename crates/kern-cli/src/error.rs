@@ -1,8 +1,8 @@
 //! Error type for the CLI.
 //!
 //! A hand-rolled enum keeps the binary dependency-free. The roadmap target is a
-//! `thiserror`-derived enum per crate (see ARCHITECTURE.md); the *shape* — a typed error with
-//! an optional actionable hint, mapped to an exit code in one place — is already here.
+//! `thiserror`-derived enum per crate (see ARCHITECTURE.md); the *shape* - a typed error with
+//! an optional actionable hint, mapped to an exit code in one place - is already here.
 
 #[derive(Debug)]
 pub enum Error {
@@ -10,18 +10,18 @@ pub enum Error {
     /// A box name failed validation (path separator / traversal / empty).
     InvalidBox(&'static str),
     /// An operational/validation failure inside a box command (a bad `-v` spec, a secret, a `box cp`,
-    /// a pod op…). The message is self-explanatory, so it carries no generic hint — unlike [`Setup`],
+    /// a pod op…). The message is self-explanatory, so it carries no generic hint - unlike [`Setup`],
     /// which is the genuine "the sandbox couldn't start here" failure. ([`Setup`]: Error::Setup)
     Sandbox(String),
-    /// The sandbox itself could not be created/run (namespaces, mounts, exec) — an environment
+    /// The sandbox itself could not be created/run (namespaces, mounts, exec) - an environment
     /// problem, not bad input. Carries the "needs unprivileged user namespaces" hint.
     Setup(String),
-    /// A named box isn't running (or has no logs) — a lookup miss, not a setup failure.
+    /// A named box isn't running (or has no logs) - a lookup miss, not a setup failure.
     NotRunning(String),
-    /// A box name is already held by a live box — a naming conflict, not a setup failure.
+    /// A box name is already held by a live box - a naming conflict, not a setup failure.
     AlreadyRunning(String),
     /// A `kern volume` operation failed for a non-in-use reason (unknown name, bad name, I/O). The
-    /// hint points at `kern volume ls` — NOT at boxes (that's [`AlreadyRunning`], used when a volume
+    /// hint points at `kern volume ls` - NOT at boxes (that's [`AlreadyRunning`], used when a volume
     /// is in use). ([`AlreadyRunning`]: Error::AlreadyRunning)
     Volume(String),
     /// An OCI image pull/extract failed.
@@ -44,7 +44,7 @@ impl Error {
             Error::InvalidBox(_) => Some(
                 "box names: letters/digits/_/./- only, no leading '-' or '.', max 64 chars".into(),
             ),
-            // Operational/validation errors are self-explanatory — no generic hint (it used to
+            // Operational/validation errors are self-explanatory - no generic hint (it used to
             // wrongly show the userns/rootfs hint on `-v`/secret/port errors).
             Error::Sandbox(_) => None,
             Error::Setup(_) => {
@@ -55,14 +55,14 @@ impl Error {
                 Some("run `kern ps` to see running boxes; `kern stop <name>` frees the name".into())
             }
             Error::Volume(_) => Some("run `kern volume ls` to see existing volumes".into()),
-            // The right hint depends on *why* the pull failed — telling someone whose image name is
+            // The right hint depends on *why* the pull failed - telling someone whose image name is
             // wrong to "install curl and tar" sends them down the wrong path. Branch on the message.
             Error::Oci(msg) => Some(oci_hint(msg)),
             Error::Compose(_) => {
                 Some("compose: `[box.NAME]` tables with image/rootfs, command, depends_on".into())
             }
             // A build-history lookup miss (`build logs|inspect <id>`) is not a Dockerfile problem, so
-            // point it at the list — not the FROM/COPY hint, which would mislead. Same message-shape
+            // point it at the list - not the FROM/COPY hint, which would mislead. Same message-shape
             // routing as `oci_hint`.
             Error::Build(msg) if msg.starts_with("no build ") => {
                 Some("run `kern builds` to list build ids".into())
@@ -73,7 +73,7 @@ impl Error {
                     .into(),
             ),
             Error::Config(_) => {
-                Some("profiles live in ~/.config/kern/kern.toml — see docs/CONFIG.md".into())
+                Some("profiles live in ~/.config/kern/kern.toml - see docs/CONFIG.md".into())
             }
             Error::Usage(_) => Some("run `kern --help` for full usage".into()),
         }
@@ -110,7 +110,7 @@ impl std::fmt::Display for Error {
             Error::AlreadyRunning(why) => write!(f, "{why}"),
             Error::Volume(why) => write!(f, "{why}"),
             // The OCI error already carries its own kind prefix (`registry:`/`extract:`/`ref:` from
-            // `OciError`'s Display), so we don't add another — a doubled "registry: registry:" was the
+            // `OciError`'s Display), so we don't add another - a doubled "registry: registry:" was the
             // symptom. A local cache error (no OCI prefix) still reads fine on its own.
             Error::Oci(why) => write!(f, "{why}"),
             Error::Compose(why) => write!(f, "compose: {why}"),
@@ -153,7 +153,7 @@ mod tests {
         assert!(r.contains("image refs"));
         assert!(!r.contains("curl"));
         // A missing/private image → name/tag/login, not tooling.
-        let reg = oci_hint("registry: cannot access 'me/app' — it may be private");
+        let reg = oci_hint("registry: cannot access 'me/app' - it may be private");
         assert!(reg.contains("kern login"));
         assert!(!reg.contains("curl"));
         // "no manifest for <arch>" and local cache errors fall through to the same safe hint.

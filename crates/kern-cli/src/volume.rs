@@ -3,7 +3,7 @@
 //! A *named* volume is persistent storage referenced by name instead of a host path: `-v
 //! data:/work` mounts the volume `data` at `/work` in the box, and (like Docker) auto-creates it on
 //! first use. Volumes live under `$XDG_DATA_HOME/kern/volumes/<name>/data/` (or
-//! `~/.local/share/kern/volumes`), with a small `meta.json` sidecar. Fully rootless — a volume is a
+//! `~/.local/share/kern/volumes`), with a small `meta.json` sidecar. Fully rootless - a volume is a
 //! directory that gets bind-mounted, so it needs no privilege.
 //!
 //! Network volumes (`nfs://` / `smb://` / `sshfs://`) and per-volume quota are separate slices.
@@ -40,7 +40,7 @@ fn validate(name: &str) -> Result<(), Error> {
 }
 
 /// Resolve a named volume to its `data` directory, **auto-creating** it (with a `meta.json`) on
-/// first use — Docker's behaviour. Returns the absolute data path for the caller to bind-mount.
+/// first use - Docker's behaviour. Returns the absolute data path for the caller to bind-mount.
 pub fn resolve_named(name: &str) -> Result<String, Error> {
     validate(name)?;
     let base_dir = volumes_dir();
@@ -56,7 +56,7 @@ pub fn resolve_named(name: &str) -> Result<String, Error> {
     }
     // Return a canonical, symlink-free source (parity with the host-path `-v` branch) AND confine it:
     // if `<name>` was pre-planted as a symlink pointing outside the volumes dir, the real path won't
-    // stay under the (canonical) base — refuse it rather than bind an attacker-chosen host dir.
+    // stay under the (canonical) base - refuse it rather than bind an attacker-chosen host dir.
     let base =
         std::fs::canonicalize(&base_dir).map_err(|e| Error::Volume(format!("volumes dir: {e}")))?;
     let real =
@@ -103,7 +103,7 @@ fn split_net_spec(spec: &str) -> Result<(&str, &str, bool), Error> {
     let (url, container) = body
         .rsplit_once(':')
         .ok_or_else(|| Error::Sandbox(format!("-v '{spec}': network volume needs :/container")))?;
-    // The container is the bind TARGET inside the box: absolute, no `.`/`..`/NUL — same rules the
+    // The container is the bind TARGET inside the box: absolute, no `.`/`..`/NUL - same rules the
     // local `-v` path enforces (the in-box `open_in_root` re-checks per-component; this is fail-fast).
     if !container.starts_with('/') {
         return Err(Error::Sandbox(format!(
@@ -143,7 +143,7 @@ fn parse_network_url(url: &str) -> Option<(NetScheme, &str, &str)> {
     Some((scheme, host, path))
 }
 
-/// Reject control chars, whitespace and shell metacharacters in the host/path — these strings become
+/// Reject control chars, whitespace and shell metacharacters in the host/path - these strings become
 /// subprocess arguments (`sshfs`/`mount.nfs` via argv, no shell, but stay strict as defense-in-depth
 /// and to keep a hostile URL out of a GVFS scan). Mirrors the private runtime.
 fn validate_net(host: &str, path: &str) -> Result<(), Error> {
@@ -151,7 +151,7 @@ fn validate_net(host: &str, path: &str) -> Result<(), Error> {
         if val.is_empty() {
             return Err(Error::Sandbox(format!("network volume {label} is empty")));
         }
-        // A leading `-` would be parsed by `sshfs`/`mount.nfs` as an OPTION, not a positional arg —
+        // A leading `-` would be parsed by `sshfs`/`mount.nfs` as an OPTION, not a positional arg -
         // e.g. host `-oProxyCommand=…` = command injection. Refuse it (the path always starts `/`).
         if val.starts_with('-') {
             return Err(Error::Sandbox(format!(
@@ -319,7 +319,7 @@ pub fn setup_network(spec: &str, idx: usize) -> Result<(String, String, bool, Ne
             }
             cleanup(&staging);
             Err(Error::Sandbox(format!(
-                "{} mount of {url} failed — install gvfs-backends (gio){}",
+                "{} mount of {url} failed - install gvfs-backends (gio){}",
                 if scheme == NetScheme::Nfs {
                     "NFS"
                 } else {
@@ -351,7 +351,7 @@ fn find_gvfs_mount(scheme: NetScheme, host: &str) -> Option<String> {
         .flatten()
         .find_map(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            // GVFS names are `nfs:host=X,export=Y` — match `host=X` as a whole comma-delimited field
+            // GVFS names are `nfs:host=X,export=Y` - match `host=X` as a whole comma-delimited field
             // so `host=server` can't spuriously match `host=server.example`.
             let hit = n
                 .strip_prefix(prefix)
@@ -360,7 +360,7 @@ fn find_gvfs_mount(scheme: NetScheme, host: &str) -> Option<String> {
         })
 }
 
-/// Safety net for an error path (a `?` after the mount) that doesn't `exit` — the success path
+/// Safety net for an error path (a `?` after the mount) that doesn't `exit` - the success path
 /// unmounts explicitly before `std::process::exit` (which skips destructors), and `teardown` is
 /// idempotent, so both are needed and safe together.
 impl Drop for NetVolume {
@@ -462,7 +462,7 @@ pub fn edit(orig: &str, new_name: &str, size: Option<u64>) -> Result<(), Error> 
             .find(|b| b.volume_names().any(|v| v == orig))
         {
             return Err(Error::AlreadyRunning(format!(
-                "volume '{orig}' is in use by box '{}' — stop it first",
+                "volume '{orig}' is in use by box '{}' - stop it first",
                 b.name
             )));
         }
@@ -489,7 +489,7 @@ pub fn edit(orig: &str, new_name: &str, size: Option<u64>) -> Result<(), Error> 
     Ok(())
 }
 
-/// `kern volume edit <name> [--name NEW] [--size SIZE|--size 0=clear]` — CLI twin of the TUI edit.
+/// `kern volume edit <name> [--name NEW] [--size SIZE|--size 0=clear]` - CLI twin of the TUI edit.
 fn edit_cmd(args: &[String]) -> Result<(), Error> {
     const U: &str = "volume edit <name> [--name NEW] [--size N|0=clear]";
     let orig = args
@@ -520,7 +520,7 @@ fn edit_cmd(args: &[String]) -> Result<(), Error> {
             "nothing to change (pass --name and/or --size)".into(),
         ));
     }
-    // If `--size` wasn't given, KEEP the current quota — a rename must never silently drop it.
+    // If `--size` wasn't given, KEEP the current quota - a rename must never silently drop it.
     let final_size = if size_set { size } else { size_limit(orig) };
     edit(orig, &new_name, final_size)?;
     let p = crate::ui::Palette::detect();
@@ -555,7 +555,7 @@ pub fn parse_named_spec(spec: &str) -> Result<(&str, String, bool), Error> {
 }
 
 /// Upper bound on a vdisk/quota image, to reject an absurd (or hand-edited) size before it reaches
-/// `File::set_len` + `mkfs.ext4` — a multi-EB sparse image would churn `mkfs` writing fs metadata.
+/// `File::set_len` + `mkfs.ext4` - a multi-EB sparse image would churn `mkfs` writing fs metadata.
 /// 64 TiB is far above any legitimate rootless volume yet fences off the pathological values.
 pub const MAX_VDISK_BYTES: u64 = 64 << 40;
 
@@ -617,7 +617,7 @@ pub(crate) struct VolInfo {
     pub quota: Option<u64>,
 }
 
-/// The named volumes on disk, sorted by name — same `meta.json`-sidecar detection as `volume ls`.
+/// The named volumes on disk, sorted by name - same `meta.json`-sidecar detection as `volume ls`.
 /// Used by the TUI, which needs the data structured rather than printed.
 pub(crate) fn entries() -> Vec<VolInfo> {
     let dir = volumes_dir();
@@ -626,7 +626,7 @@ pub(crate) fn entries() -> Vec<VolInfo> {
         for e in rd.flatten() {
             let p = e.path();
             // A single read of meta.json both identifies a real volume (its presence) AND yields the
-            // quota — no separate `is_file()` stat before the read.
+            // quota - no separate `is_file()` stat before the read.
             let Ok(meta) = std::fs::read_to_string(p.join("meta.json")) else {
                 continue;
             };
@@ -647,7 +647,7 @@ pub(crate) fn entries() -> Vec<VolInfo> {
 
 fn list() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
-    // Same `meta.json`-sidecar detection, scrubbing and sort as the TUI — one scanner, `entries()`.
+    // Same `meta.json`-sidecar detection, scrubbing and sort as the TUI - one scanner, `entries()`.
     // SIZE is the data actually stored; QUOTA is the cap set at create (`--size`), shown so an empty
     // volume with a quota reads as `0 B / 2.0G` instead of a bare, confusing `0 B`.
     println!(
@@ -683,7 +683,7 @@ fn remove(names: &[String]) -> Result<(), Error> {
     }
     // Snapshot the running boxes once. Each box records the named volumes it mounts in the registry
     // BEFORE mounting them, so this in-use scan is race-free. Refusing an in-use volume is Docker's
-    // behaviour — deleting it would pull the box's bind mount out from under it.
+    // behaviour - deleting it would pull the box's bind mount out from under it.
     let running = crate::registry::list();
     let user_of = |name: &str| {
         running
@@ -693,9 +693,9 @@ fn remove(names: &[String]) -> Result<(), Error> {
     };
     let dir = volumes_dir();
     // Process every requested name independently (like `docker volume rm a b c`): remove what we can,
-    // collect the rest, and exit non-zero if any failed — never stop at the first problem. Removed
+    // collect the rest, and exit non-zero if any failed - never stop at the first problem. Removed
     // names go to stdout; the failures become one error (a single clean line for a single volume, a
-    // bulleted list for several), with a hint chosen by cause — boxes only when something is in use.
+    // bulleted list for several), with a hint chosen by cause - boxes only when something is in use.
     let mut fails: Vec<String> = Vec::new();
     let mut any_in_use = false;
     for name in names {
@@ -706,7 +706,7 @@ fn remove(names: &[String]) -> Result<(), Error> {
         } else if let Some(box_name) = user_of(name) {
             any_in_use = true;
             fails.push(format!(
-                "volume '{name}' is in use by box '{box_name}' — stop it first"
+                "volume '{name}' is in use by box '{box_name}' - stop it first"
             ));
         } else if let Err(e) = std::fs::remove_dir_all(dir.join(name)) {
             fails.push(format!("cannot remove volume '{name}': {e}"));
@@ -753,10 +753,10 @@ fn inspect(name: Option<&String>) -> Result<(), Error> {
 }
 
 fn prune() -> Result<(), Error> {
-    // Remove EMPTY volumes only (nothing written) — conservative; a non-empty volume is never
+    // Remove EMPTY volumes only (nothing written) - conservative; a non-empty volume is never
     // deleted implicitly.
     let dir = volumes_dir();
-    // Named volumes a running box still mounts — never prune these out from under a box.
+    // Named volumes a running box still mounts - never prune these out from under a box.
     let in_use = crate::registry::volumes_in_use();
     let mut removed = 0usize;
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -788,7 +788,7 @@ fn usage() {
     let z = p.z;
     println!(
         "\
-{b}kern volume{z} — named persistent volumes
+{b}kern volume{z} - named persistent volumes
 
     {c}create{z} <name>       Create a volume (also auto-created by `-v name:/dest`)
     {c}ls{z}                  List volumes with sizes
@@ -824,7 +824,7 @@ fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
-/// Human-readable byte size — the shared [`kern_common::fmt_bytes`] convention (one for the whole CLI).
+/// Human-readable byte size - the shared [`kern_common::fmt_bytes`] convention (one for the whole CLI).
 fn human_bytes(b: u64) -> String {
     kern_common::fmt_bytes(b)
 }
@@ -834,7 +834,7 @@ mod tests {
     use super::*;
 
     // `XDG_DATA_HOME` is process-global; the CRATE-WIDE lock serializes this against every other
-    // module's env-mutating tests (e.g. `builds`), which also repoint XDG_DATA_HOME — a per-module lock
+    // module's env-mutating tests (e.g. `builds`), which also repoint XDG_DATA_HOME - a per-module lock
     // wouldn't (they'd race across modules).
     use crate::TEST_ENV_LOCK as ENV_LOCK;
 

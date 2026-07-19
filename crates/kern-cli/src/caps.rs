@@ -1,4 +1,4 @@
-//! `--cap-add` / `--cap-drop` — resolve capability names to a [`kern_isolation::CapSpec`].
+//! `--cap-add` / `--cap-drop` - resolve capability names to a [`kern_isolation::CapSpec`].
 //!
 //! kern always drops a baseline of never-needed dangerous caps (module load, raw I/O, BPF, …). These
 //! flags layer on top, Docker-style: `--cap-drop CAP` drops one more (or `ALL` for everything),
@@ -53,7 +53,7 @@ const CAP_TABLE: &[(&str, u32)] = &[
     ("CHECKPOINT_RESTORE", 40),
 ];
 
-/// The highest cap number in [`CAP_TABLE`] — used to expand `--cap-add ALL`.
+/// The highest cap number in [`CAP_TABLE`] - used to expand `--cap-add ALL`.
 const CAP_MAX: u32 = 40;
 
 /// Resolve one capability name (case-insensitive, optional `CAP_` prefix) to its number.

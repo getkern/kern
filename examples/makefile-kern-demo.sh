@@ -10,7 +10,7 @@ proj="$(mktemp -d)"
 trap 'rm -rf "$proj"' EXIT
 echo "int main(void){return 0;}" > "$proj/main.c"
 
-echo "==> running lint, test, and build — each hermetically in its own box:"
+echo "==> running lint, test, and build - each hermetically in its own box:"
 # CURDIR (and thus the repo bind) is wherever make is invoked, so run make from the project dir.
 # KERN is passed through so the Makefile honors $KERN if you overrode it.
 ( cd "$proj" && make -f "$here/Makefile.kern" KERN="$kern" all )

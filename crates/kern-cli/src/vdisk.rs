@@ -1,10 +1,10 @@
 //! Host-side ext4-on-loop backend for `vdisk:` profiles (the privileged upgrade over the rootless
 //! `tmpfs` fallback). Faithful to the private runtime: a sparse ext4 image on a loop device gives a
-//! real **disk-backed** size quota, `persistent` storage, and (best-effort) I/O limits — none of
+//! real **disk-backed** size quota, `persistent` storage, and (best-effort) I/O limits - none of
 //! which a RAM-backed tmpfs can do.
 //!
 //! It needs privilege: `/dev/loop-control` (root or the `disk` group) to grab a loop device, and
-//! `CAP_SYS_ADMIN` to `mount` ext4. When any step is unavailable — the common rootless case — the
+//! `CAP_SYS_ADMIN` to `mount` ext4. When any step is unavailable - the common rootless case - the
 //! caller falls back to the tmpfs backend, so `vdisk:` always works.
 //!
 //! **Leak-safety:** the loop device is configured `LO_FLAGS_AUTOCLEAR`, so it detaches itself when
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 // linux/loop.h
 const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4C82;
-const LOOP_CONFIGURE: libc::c_ulong = 0x4C0A; // Linux 5.8+ — fd + status in one ioctl
+const LOOP_CONFIGURE: libc::c_ulong = 0x4C0A; // Linux 5.8+ - fd + status in one ioctl
 const LOOP_CLR_FD: libc::c_ulong = 0x4C01;
 const LO_FLAGS_AUTOCLEAR: u32 = 4;
 
@@ -75,7 +75,7 @@ impl Ext4Vdisk {
     }
 }
 
-/// The default home for **persistent** vdisk images when the profile names no `[[disk]]` backend —
+/// The default home for **persistent** vdisk images when the profile names no `[[disk]]` backend -
 /// a stable per-user dir (sibling of the named-volumes dir). This is the for-dummies default: a
 /// persistent vdisk survives without the user choosing where it lives (like a Docker volume location).
 fn default_vdisk_dir() -> PathBuf {
@@ -97,7 +97,7 @@ pub fn prepare(
     work: &Path,
 ) -> Option<Ext4Vdisk> {
     // Defense-in-depth: the box side already guards the name, but this host-side path interpolates it
-    // into the image/mount paths — refuse a name that could climb out (config is operator-owned here,
+    // into the image/mount paths - refuse a name that could climb out (config is operator-owned here,
     // but keep the two layers consistent).
     if name.is_empty() || name.contains('/') || name.contains("..") {
         return None;
@@ -114,7 +114,7 @@ pub fn prepare(
     }
 
     // Image path: a persistent disk lives under its [[disk]] backend dir (if the profile names one)
-    // or a stable per-user default (so `persistent` "just works" without choosing a disk — the
+    // or a stable per-user default (so `persistent` "just works" without choosing a disk - the
     // for-dummies default); an ephemeral one lives in the box scratch (removed with it).
     let img = match (persistent, backend_dir) {
         (true, Some(d)) => PathBuf::from(d).join(format!("kern-vdisk-{name}.img")),
@@ -177,7 +177,7 @@ pub fn prepare(
     // Ephemeral images live in a per-pid work dir and can't collide, so they don't need it.
     if persistent && unsafe { libc::flock(backing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
     {
-        eprintln!("kern: vdisk '{name}' is in use by another box — using a tmpfs backend this run");
+        eprintln!("kern: vdisk '{name}' is in use by another box - using a tmpfs backend this run");
         cleanup_image(&img, persistent, fresh);
         return None;
     }
@@ -196,11 +196,11 @@ pub fn prepare(
         return None;
     }
 
-    // Mount ext4 while the loop fd is STILL OPEN — with LO_FLAGS_AUTOCLEAR the device self-detaches
+    // Mount ext4 while the loop fd is STILL OPEN - with LO_FLAGS_AUTOCLEAR the device self-detaches
     // the moment its open count hits zero, so closing `ld` *before* a mount holds a reference would
     // race the loop away and the mount would fail. Mount first, then close: the mount now holds the
     // reference, and autoclear only fires once it (and the box's bind of it) are gone.
-    // Needs CAP_SYS_ADMIN — the step that fails on a non-root host → tmpfs fallback.
+    // Needs CAP_SYS_ADMIN - the step that fails on a non-root host → tmpfs fallback.
     let _ = std::fs::create_dir_all(&mount);
     // `nosuid`+`nodev`: a persistent/writable disk must not honour a device node or setuid binary
     // planted on it (parity with the private runtime). `noatime` for a small perf edge.
@@ -241,7 +241,7 @@ pub fn prepare(
 
 /// Safety net: an error path (a `?` after the vdisk was prepared) that does NOT `exit` runs this and
 /// cleans up. The success path calls `teardown()` explicitly before `std::process::exit`, which does
-/// not run destructors — so both are needed, and `teardown` is idempotent.
+/// not run destructors - so both are needed, and `teardown` is idempotent.
 impl Drop for Ext4Vdisk {
     fn drop(&mut self) {
         self.teardown();

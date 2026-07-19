@@ -1,7 +1,7 @@
 #!/bin/sh
 # A daemonless "cron-like" pattern: run a short job in a FRESH, capped box on an interval.
 #
-# HONEST: kern has NO built-in scheduler. This is just the shell pattern — a loop that starts a
+# HONEST: kern has NO built-in scheduler. This is just the shell pattern - a loop that starts a
 # throwaway box each tick. Each run is fully isolated (its own overlay + namespaces) and resource
 # capped, and leaves nothing behind (a foreground box removes itself when its command exits). For
 # REAL scheduling, drive this same one-shot `kern box ...` line from the host's cron or a
@@ -9,7 +9,7 @@
 #
 #   kern box <name> --image alpine --memory 64m --cpus 0.5 -- <job>   one isolated, capped run
 #
-# (`--restart always` keeps a service ALIVE by respawning it on exit — that's supervision, not
+# (`--restart always` keeps a service ALIVE by respawning it on exit - that's supervision, not
 #  interval scheduling; a job that should run "every N seconds and then stop" wants this loop.)
 set -eu
 kern="${KERN:-kern}"
@@ -41,6 +41,6 @@ while [ "$i" -le "$runs" ]; do
 done
 
 echo
-echo "==> done — no box, no daemon, no scheduler left running."
+echo "==> done - no box, no daemon, no scheduler left running."
 echo "    To run this for real on a schedule, add ONE line to the host's crontab, e.g.:"
 echo "      */5 * * * *  kern box nightly-report --image alpine --memory 64m --cpus 0.5 -- <job>"

@@ -1,7 +1,7 @@
 //! Extreme end-to-end exercise of the SDK's `kern.toml` compose feature:
 //! `.config()` / `.profile()` and the `.warnings()` advisory channel.
 //!
-//! Usage: `sandbox_profile <rootfs-dir>` — authors real `kern.toml` files and
+//! Usage: `sandbox_profile <rootfs-dir>` - authors real `kern.toml` files and
 //! drives the profile resolution through the SDK → box → real mounts, plus the
 //! adversarial paths (missing profile, missing config, traversal token) and the
 //! informed-override path (`.warnings()`). Prints `CASE <name> <PASS|FAIL>`.
@@ -158,7 +158,7 @@ fn main() {
         let _ = std::fs::create_dir_all(&dir);
         let p = format!("{dir}/kern.toml");
         if std::fs::write(&p, "[[vdisk]]\nname = \"deflt\"\nsize = \"8m\"\n").is_ok() {
-            let r = base() // note: NO .config() — default path is used
+            let r = base() // note: NO .config() - default path is used
                 .profile("vdisk:deflt")
                 .build()
                 .unwrap()

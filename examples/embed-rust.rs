@@ -3,10 +3,10 @@
 // `Sandbox::builder()...build()?.run(cmd, args)?` assembles a `kern box ...` invocation, runs it
 // with piped stdio, and hands back a structured `Outcome` (exit code, captured stdout/stderr with
 // truncation flags, wall time, best-effort resource figures). It shells out to the `kern` binary as
-// a privilege-separation layer — it does NOT re-implement isolation in Rust. Secure by default: a
+// a privilege-separation layer - it does NOT re-implement isolation in Rust. Secure by default: a
 // fresh box gets an isolated (loopback-only) netns, seccomp always-on, env NOT inherited.
 //
-// HOW TO RUN — the crate is internal to the kern workspace (`publish = false`), so depend on it by
+// HOW TO RUN - the crate is internal to the kern workspace (`publish = false`), so depend on it by
 // git or path from a small binary crate:
 //
 //     # Cargo.toml
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?
         .run("sh", &["-c", "echo hello from a kern box; id -u; nproc"])?;
 
-    // `Outcome` is structured — exactly what an agent platform / scheduler needs to decide next.
+    // `Outcome` is structured - exactly what an agent platform / scheduler needs to decide next.
     println!("success : {}", out.success()); // exit_code == 0
     println!("exit    : {}", out.exit_code);
     println!("wall_ms : {}", out.wall_ms);
@@ -46,11 +46,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Resource figures are Option + carry their source. On the public runtime the source is
-    // RusageFallback (getrusage(RUSAGE_CHILDREN)) — honest signal that they're not per-box-exact.
+    // RusageFallback (getrusage(RUSAGE_CHILDREN)) - honest signal that they're not per-box-exact.
     match out.resource_source {
         ResourceSource::Cgroup => println!("resource: from the box's own cgroup (per-box accurate)"),
         ResourceSource::RusageFallback => {
-            println!("resource: getrusage fallback (not per-box exact — see Outcome docs)")
+            println!("resource: getrusage fallback (not per-box exact - see Outcome docs)")
         }
         ResourceSource::Unavailable => println!("resource: unavailable"),
     }

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Bring up a richer `kern compose` stack — a cache with a health check + a web front-end that
-# waits for that health — then reach it from the host and tear it all down.
+# Bring up a richer `kern compose` stack - a cache with a health check + a web front-end that
+# waits for that health - then reach it from the host and tear it all down.
 #
 #   kern compose <file>          bring the stack up, in dependency + HEALTH order
 #   kern compose <file> down     stop every box and remove the stack's shared pod
@@ -24,7 +24,7 @@ echo "==> bringing up the stack (cache must go HEALTHY before web starts):"
 "$kern" compose "$stack"
 
 echo
-echo "==> kern ps — note the HEALTH column on 'cache' and the published PORT on 'web':"
+echo "==> kern ps - note the HEALTH column on 'cache' and the published PORT on 'web':"
 "$kern" ps | sed 's/^/   /'
 
 echo
@@ -48,4 +48,4 @@ echo "==> tearing the stack down (stops both boxes + removes the shared pod):"
 "$kern" compose "$stack" down
 
 echo
-echo "==> done — cleanup trap also runs a final compose down + kern gc, both idempotent."
+echo "==> done - cleanup trap also runs a final compose down + kern gc, both idempotent."

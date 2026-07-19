@@ -1,4 +1,4 @@
-"""Tests for kern_sandbox (v1 — the middle-way session model).
+"""Tests for kern_sandbox (v1 - the middle-way session model).
 
   * UNIT tests (always run): fail-closed defaults, mount/workspace guards, taxonomy plumbing. No kern.
   * INTEGRATION tests (skipped unless a runnable `kern` is present): the brief's acceptance criteria
@@ -103,7 +103,7 @@ def test_result_success_semantics():
 def test_classify_order_escape_not_masked_by_stderr_marker():
     # SECURITY REGRESSION: a workload can print kern's setup marker ("error: sandbox:") to its own
     # stderr and exit with SIGSYS. The classifier MUST still call it escape_blocked (decided by exit
-    # code), NOT startup_failed (the stderr-marker heuristic) — else a blocked escape hides behind a
+    # code), NOT startup_failed (the stderr-marker heuristic) - else a blocked escape hides behind a
     # benign "startup failed" label. Deterministic classes are checked before the stderr marker.
     s = _cfg()
     forged = "error: sandbox: totally not a real kern setup error\n"
@@ -126,7 +126,7 @@ def test_classify_signal_exit_codes():
 
 
 # ---------------------------------------------------------------------------
-# INTEGRATION — the brief's acceptance criteria
+# INTEGRATION - the brief's acceptance criteria
 # ---------------------------------------------------------------------------
 
 
@@ -173,9 +173,9 @@ def test_c4_infinite_loop_times_out():
 def test_c5a_write_outside_workspace_blocked_not_crash():
     with Sandbox(timeout_s=20) as s:
         r = s.run_code("open('/evil','w').write('x')")
-    # blocked in fact (read-only root), surfaced as the user's non-zero exit — NOT a sandbox crash,
+    # blocked in fact (read-only root), surfaced as the user's non-zero exit - NOT a sandbox crash,
     # NOT a silent success. (Filesystem denial is indistinguishable from a normal PermissionError, so
-    # it is not labelled escape_blocked — that label is reserved for SIGSYS; see c5b.)
+    # it is not labelled escape_blocked - that label is reserved for SIGSYS; see c5b.)
     assert not r.success and "Read-only" in r.stderr
 
 
@@ -249,7 +249,7 @@ def test_fork_bomb_contained_by_pids_limit():
 
 @integration
 def test_large_code_runs_via_file_not_argv():
-    # A big generated script must not hit ARG_MAX — run_code routes >128 KiB via a workspace file.
+    # A big generated script must not hit ARG_MAX - run_code routes >128 KiB via a workspace file.
     code = "# " + "padding " * 20000 + "\nprint('big-ok')"  # ~156 KiB, fast to execute
     with Sandbox(timeout_s=20) as s:
         r = s.run_code(code)

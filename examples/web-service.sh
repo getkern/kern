@@ -36,4 +36,4 @@ echo "==> kern ps (note the PORTS column):"
 "$kern" ps
 
 echo
-echo "==> stopping (via trap on exit) — nothing left running, no daemon."
+echo "==> stopping (via trap on exit) - nothing left running, no daemon."

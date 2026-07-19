@@ -6,7 +6,7 @@
 //! `--health-cmd`. `SHELL [...]` swaps the shell that wraps shell-form RUN/CMD/ENTRYPOINT.
 //! Real-world flags are accepted: `FROM --platform=`, BuildKit `RUN --mount/--network/--security`,
 //! and `COPY`/`ADD --chown/--link/--exclude/--parents/--keep-git-dir` are dropped; `--checksum` is
-//! HONOURED for the file an `ADD <url>` creates, and `--chmod` is HONOURED for EVERY copied file/dir —
+//! HONOURED for the file an `ADD <url>` creates, and `--chmod` is HONOURED for EVERY copied file/dir -
 //! a context `COPY`, a `COPY --from`, an `ADD <url>`, and a `COPY <<heredoc` (Docker applies it
 //! recursively). Without `--chmod` the source mode is kept (`cp -a`).
 //! Whole-line `#` comments are honoured even INSIDE a `\` continuation (Docker strips them before
@@ -61,7 +61,7 @@ pub enum Instr {
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
     Expose(String),
-    /// `ADD <url> <dst>` — fetch a remote file into the image at build time. `checksum` is the
+    /// `ADD <url> <dst>` - fetch a remote file into the image at build time. `checksum` is the
     /// optional BuildKit `--checksum=<algo>:<hex>` the executor verifies after download; `chmod` is the
     /// optional `--chmod=<octal>` mode (needed for the download-a-binary-and-run-it pattern, where the
     /// fetched file must be executable). Only the URL form of `ADD` produces this; a local-file
@@ -72,7 +72,7 @@ pub enum Instr {
         checksum: Option<String>,
         chmod: Option<String>,
     },
-    /// `COPY <<DELIM … DELIM <dst>` — BuildKit's inline-file COPY: the heredoc body is written
+    /// `COPY <<DELIM … DELIM <dst>` - BuildKit's inline-file COPY: the heredoc body is written
     /// verbatim to `dst` in the image, no build context needed. `chmod` is the optional `--chmod=<octal>`
     /// (a heredoc script commonly needs `--chmod=755`).
     WriteFile {
@@ -83,8 +83,8 @@ pub enum Instr {
 }
 
 /// The source of a `COPY --from=<X>`. `X` is resolved at parse time: it names an earlier build
-/// [`Stage`](CopyFrom::Stage) if it matches one (by name or numeric index), otherwise — if it's a
-/// syntactically valid OCI reference — it's an external [`Image`](CopyFrom::Image) to pull and copy
+/// [`Stage`](CopyFrom::Stage) if it matches one (by name or numeric index), otherwise - if it's a
+/// syntactically valid OCI reference - it's an external [`Image`](CopyFrom::Image) to pull and copy
 /// out of. A stage ALWAYS wins over an image of the same spelling (Docker's rule); anything that is
 /// neither is rejected. The distinction is preserved at the type level so the executor never has to
 /// re-guess which path to take.
@@ -98,7 +98,7 @@ pub enum CopyFrom {
 }
 
 /// Lint a parsed instruction list for common Dockerfile smells, returning a human-readable warning per
-/// finding (empty = clean). These are advisory only — they never fail a build — but drive the `warn`
+/// finding (empty = clean). These are advisory only - they never fail a build - but drive the `warn`
 /// status in the build history (`kern builds`). Deliberately a small, high-signal set (the same
 /// families `hadolint`/BuildKit surface most): unpinned base image, `apt-get`/`apk` without a
 /// no-recommends / `--no-cache` flag, a `RUN cd` that doesn't persist, and a missing final `CMD`.
@@ -107,12 +107,12 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
     for i in instrs {
         match i {
             Instr::From { image, .. } => {
-                // Unpinned tag: no `:tag`/`@digest`, or the mutable `:latest` — non-reproducible builds.
+                // Unpinned tag: no `:tag`/`@digest`, or the mutable `:latest` - non-reproducible builds.
                 let bare = image.rsplit('/').next().unwrap_or(image);
                 if !bare.contains(':') && !bare.contains('@') {
-                    warns.push(format!("FROM {image}: no tag pinned (implicit ':latest' — builds aren't reproducible); pin a version"));
+                    warns.push(format!("FROM {image}: no tag pinned (implicit ':latest' - builds aren't reproducible); pin a version"));
                 } else if image.ends_with(":latest") {
-                    warns.push(format!("FROM {image}: ':latest' is mutable — pin a specific version for reproducible builds"));
+                    warns.push(format!("FROM {image}: ':latest' is mutable - pin a specific version for reproducible builds"));
                 }
             }
             Instr::Run(argv) => {
@@ -135,13 +135,13 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
                         "RUN apk add without --no-cache (leaves the apk index in the layer)".into(),
                     );
                 }
-                // A `cd` in its own RUN doesn't persist to later instructions — a frequent footgun.
+                // A `cd` in its own RUN doesn't persist to later instructions - a frequent footgun.
                 let trimmed = joined.trim_start();
                 if (trimmed == "cd" || trimmed.starts_with("cd "))
                     && !joined.contains("&&")
                     && !joined.contains(';')
                 {
-                    warns.push("RUN cd <dir>: the directory change doesn't persist to later steps — use WORKDIR".into());
+                    warns.push("RUN cd <dir>: the directory change doesn't persist to later steps - use WORKDIR".into());
                 }
             }
             _ => {}
@@ -185,7 +185,7 @@ struct Logical {
 }
 
 /// Scan a string for heredoc operators in order. A `<<` is only an operator when a delimiter word
-/// (starting with a letter/`_`, optionally quoted, optionally `<<-`) follows — so a shell bit-shift
+/// (starting with a letter/`_`, optionally quoted, optionally `<<-`) follows - so a shell bit-shift
 /// like `1<<2` (a digit follows) is NOT mistaken for one.
 fn scan_heredoc_ops(s: &str) -> Vec<HeredocOp> {
     let b = s.as_bytes();
@@ -263,7 +263,7 @@ fn heredoc_run_argv(rest: &str, heredocs: &[Heredoc]) -> Result<Vec<String>, Str
     let ops = scan_heredoc_ops(rest);
     if ops.len() > 1 {
         return Err(
-            "multiple heredocs on one instruction aren't supported yet — use one `<<DELIM` per RUN"
+            "multiple heredocs on one instruction aren't supported yet - use one `<<DELIM` per RUN"
                 .to_string(),
         );
     }
@@ -339,7 +339,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 // trailing `AS <name>` so the AS keyword/name can't come from a variable's contents.
                 let expanded = subst(rest, &vars);
                 let mut toks = expanded.split_whitespace().peekable();
-                // Drop BuildKit `FROM` flags (e.g. `--platform=$BUILDPLATFORM`) — kern builds for the
+                // Drop BuildKit `FROM` flags (e.g. `--platform=$BUILDPLATFORM`) - kern builds for the
                 // host platform, so a cross-platform hint is accepted and ignored, not a parse error.
                 while toks.peek().is_some_and(|t| t.starts_with("--")) {
                     toks.next();
@@ -410,7 +410,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             "RUN" => {
                 // A BuildKit heredoc (`RUN <<EOF … EOF`) is folded here: `heredocs` holds the body
                 // lines the parser consumed verbatim. Reduce it to a single `/bin/sh -c` argv.
-                // Strip leading BuildKit RUN flags (`--mount=…`, `--network=…`, `--security=…`) — kern
+                // Strip leading BuildKit RUN flags (`--mount=…`, `--network=…`, `--security=…`) - kern
                 // runs the command without the cache/secret/network sandbox plumbing, so they're
                 // accepted and dropped rather than mistaken for the command.
                 let rest = strip_run_flags(rest);
@@ -483,12 +483,12 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 }
                 let mut toks = split_ws(&subst(rest, &vars));
                 // Strip the leading build flags. `COPY --from=<stage|image>` (multi-stage / external
-                // image) is captured; the metadata flags Docker/BuildKit allow — `--chown`, `--chmod`,
-                // `--link`, `--checksum`, `--exclude`, `--parents`, ADD's `--keep-git-dir` — are
+                // image) is captured; the metadata flags Docker/BuildKit allow - `--chown`, `--chmod`,
+                // `--link`, `--checksum`, `--exclude`, `--parents`, ADD's `--keep-git-dir` - are
                 // accepted and dropped (kern copies as-is). Anything else, or `--from` on `ADD`, errors.
                 let mut from: Option<CopyFrom> = None;
                 // `--checksum=<algo>:<hex>` (verify a downloaded ADD url) and `--chmod=<octal>` (the mode
-                // for a file this instruction CREATES — an ADD url or a COPY heredoc) are captured so the
+                // for a file this instruction CREATES - an ADD url or a COPY heredoc) are captured so the
                 // executor can apply them. For a local-file COPY/ADD they're dropped (source mode is kept).
                 let mut checksum: Option<String> = None;
                 let mut chmod: Option<String> = None;
@@ -511,7 +511,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                             CopyFrom::Stage(x)
                         } else if x.parse::<usize>().is_ok() || !kern_oci::valid_reference(&x) {
                             // A bare NUMBER is always a stage INDEX (never an external image), so an
-                            // out-of-range index is an error — as is anything that's neither a known
+                            // out-of-range index is an error - as is anything that's neither a known
                             // stage nor a syntactically valid image reference.
                             return err(
                                 "COPY --from must reference an earlier build stage (by name or index) \
@@ -523,7 +523,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     } else if flag.starts_with("--from") {
                         return err("--from is only supported on COPY (multi-stage)");
                     } else if is_accepted_copy_flag(&flag) {
-                        // metadata flag — accepted and dropped
+                        // metadata flag - accepted and dropped
                     } else {
                         return err(&format!("{kw} flag {flag} isn't supported yet"));
                     }
@@ -533,7 +533,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         .iter()
                         .any(|t| t.starts_with("http://") || t.starts_with("https://"))
                 {
-                    // `ADD <url> <dst>` — fetch a remote file at build time. Mixing a URL with local
+                    // `ADD <url> <dst>` - fetch a remote file at build time. Mixing a URL with local
                     // sources, or several URLs, in one ADD is rare and ambiguous, so require exactly
                     // one URL and one destination (the overwhelmingly common shape).
                     let n_urls = toks
@@ -569,18 +569,18 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     out.push(Instr::Expose(p));
                 }
             }
-            "LABEL" | "MAINTAINER" => { /* metadata — parsed and ignored */ }
+            "LABEL" | "MAINTAINER" => { /* metadata - parsed and ignored */ }
             // VOLUME/HEALTHCHECK are ACCEPTED (parsed, not fatal) so a real-world upstream Dockerfile that
-            // uses them builds instead of exploding — they were the two commonest reasons a `kern build`
+            // uses them builds instead of exploding - they were the two commonest reasons a `kern build`
             // of a stock image failed. They carry NO build-time filesystem effect, so we emit no Instr:
             //   VOLUME    → a runtime mount point; kern mounts volumes at run via `-v`, so it's advisory
-            //               at build (Docker also only *declares* it — the anonymous volume is a runtime
+            //               at build (Docker also only *declares* it - the anonymous volume is a runtime
             //               concern). Parsed and dropped.
             //   HEALTHCHECK → maps onto kern's runtime `--health-cmd`/`--health-interval`/… flags; kern
             //               doesn't yet BAKE it into the image config, so we accept it and (once, on the
             //               first HEALTHCHECK) tell the user to pass the health flags at `kern box` time,
             //               rather than silently dropping a health contract or failing the build.
-            "VOLUME" => { /* runtime mount point — advisory at build, mounted via `-v` at run */ }
+            "VOLUME" => { /* runtime mount point - advisory at build, mounted via `-v` at run */ }
             // `SHELL ["/bin/bash","-c"]` swaps the shell that wraps subsequent shell-form
             // RUN/CMD/ENTRYPOINT. Must be a JSON exec array (Docker's rule); anything else is an error.
             "SHELL" => {
@@ -592,21 +592,21 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         )
                     })?;
             }
-            // A runtime stop signal — no build-time filesystem effect, so accept and drop (like VOLUME)
+            // A runtime stop signal - no build-time filesystem effect, so accept and drop (like VOLUME)
             // rather than failing a stock Dockerfile that declares one.
-            "STOPSIGNAL" => { /* runtime signal — advisory at build */ }
+            "STOPSIGNAL" => { /* runtime signal - advisory at build */ }
             "HEALTHCHECK" => {
-                // Don't fail; nudge the user to the runtime flags. `HEALTHCHECK NONE` disables — nothing to say.
+                // Don't fail; nudge the user to the runtime flags. `HEALTHCHECK NONE` disables - nothing to say.
                 let body = subst(rest, &vars);
                 if !body.trim().eq_ignore_ascii_case("none") {
                     eprintln!(
-                        "kern build: HEALTHCHECK accepted but not baked into the image — add it at run \
+                        "kern build: HEALTHCHECK accepted but not baked into the image - add it at run \
                          with `kern box … --health-cmd '<cmd>'` (see `kern box --help`)"
                     );
                 }
             }
             // Still genuinely unsupported: ONBUILD changes DOWNSTREAM build behaviour (deferred
-            // triggers), so silently ignoring it would mis-build — fail clearly instead.
+            // triggers), so silently ignoring it would mis-build - fail clearly instead.
             "ONBUILD" => {
                 return err(&format!("{kw} isn't supported yet"));
             }
@@ -620,7 +620,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
 }
 
 /// BuildKit's automatic platform build args, populated for the HOST platform (kern builds for the
-/// host — it doesn't cross-compile). `TARGETARCH` uses Docker's arch spelling (`amd64`/`arm64`/…),
+/// host - it doesn't cross-compile). `TARGETARCH` uses Docker's arch spelling (`amd64`/`arm64`/…),
 /// not Rust's (`x86_64`/`aarch64`). Build and target are the same here, so `BUILD*` mirror `TARGET*`.
 fn automatic_platform_args() -> Vec<(&'static str, String)> {
     let arch = match std::env::consts::ARCH {
@@ -663,7 +663,7 @@ pub fn resolve_from(from: &str, stage_names: &[Option<String>], upto: usize) -> 
 }
 
 /// The line-continuation char selected by a `# escape=` parser directive: `\` (default) or a
-/// backtick (Windows-style Dockerfiles). Only a directive at the very top counts — Docker stops
+/// backtick (Windows-style Dockerfiles). Only a directive at the very top counts - Docker stops
 /// scanning directives at the first line that isn't one (a blank line, a normal comment, or an
 /// instruction), so a mid-file `# escape=` is just a comment.
 fn escape_directive(text: &str) -> char {
@@ -691,7 +691,7 @@ fn escape_directive(text: &str) -> char {
 }
 
 /// Fold physical lines into logical ones: drop full-line comments, honour a trailing continuation
-/// (`esc`, normally `\`), and — for a RUN/COPY/ADD line that OPENS a heredoc (`<<DELIM`) — consume
+/// (`esc`, normally `\`), and - for a RUN/COPY/ADD line that OPENS a heredoc (`<<DELIM`) - consume
 /// the following physical lines VERBATIM (no comment stripping, no continuation) as the heredoc body,
 /// up to the closing delimiter (tab-indented close allowed for `<<-`). Each `Logical` carries the
 /// opener text plus any attached heredoc bodies.
@@ -711,7 +711,7 @@ fn logical_lines(text: &str, esc: char) -> Vec<Logical> {
         let mut first = true;
         loop {
             // A whole-line `#` comment OR a blank line INSIDE a continuation is skipped and the
-            // continuation carries on — BuildKit ignores both while accumulating a `\`-continued line
+            // continuation carries on - BuildKit ignores both while accumulating a `\`-continued line
             // (a trailing `\` in a comment does NOT itself continue). The opener (`first`) is
             // guaranteed non-comment/non-blank by the outer loop, so real content like
             // `RUN echo '# not a comment'` is never mistaken for one.
@@ -773,7 +773,7 @@ fn logical_lines(text: &str, esc: char) -> Vec<Logical> {
                 body: body.join("\n"),
                 terminated,
             });
-            // A body that ran to EOF swallowed any later openers — stop; the RUN handler reports it.
+            // A body that ran to EOF swallowed any later openers - stop; the RUN handler reports it.
             if unterminated {
                 break;
             }
@@ -790,7 +790,7 @@ fn logical_lines(text: &str, esc: char) -> Vec<Logical> {
 /// Reduce a RUN/CMD/ENTRYPOINT operand to an argv. Exec form (`["a","b"]`) is honoured literally;
 /// shell form is wrapped in `/bin/sh -c`. Uses **soft** substitution: Docker doesn't env-expand
 /// these three, so unknown `$VAR`/`$1`/`$$` are left verbatim for the shell (only known ARG/ENV are
-/// filled) — otherwise `RUN echo $HOME` or `awk '{print $1}'` would be silently gutted.
+/// filled) - otherwise `RUN echo $HOME` or `awk '{print $1}'` would be silently gutted.
 fn cmd_argv(rest: &str, vars: &HashMap<String, String>, shell: &[String]) -> Vec<String> {
     let t = rest.trim();
     if t.starts_with('[') {
@@ -881,7 +881,7 @@ fn parse_env(rest: &str, vars: &HashMap<String, String>) -> Result<Vec<(String, 
     if t.is_empty() {
         return Err("ENV needs KEY=VALUE".to_string());
     }
-    // Legacy `ENV KEY value with spaces` — no `=` in the first token.
+    // Legacy `ENV KEY value with spaces` - no `=` in the first token.
     let first = t.split_whitespace().next().unwrap_or("");
     if !first.contains('=') {
         let (k, v) = t
@@ -889,7 +889,7 @@ fn parse_env(rest: &str, vars: &HashMap<String, String>) -> Result<Vec<(String, 
             .ok_or("ENV KEY needs a value")?;
         return Ok(vec![(k.to_string(), subst(v.trim(), vars))]);
     }
-    // Modern `K=V K2=V2` — split on unquoted whitespace, then each token on its first `=`.
+    // Modern `K=V K2=V2` - split on unquoted whitespace, then each token on its first `=`.
     let mut pairs = Vec::new();
     for tok in split_ws(t) {
         let (k, v) = tok.split_once('=').ok_or("ENV expects KEY=VALUE tokens")?;
@@ -940,7 +940,7 @@ fn subst(s: &str, vars: &HashMap<String, String>) -> String {
 }
 
 /// **Soft** substitution for RUN/CMD/ENTRYPOINT, which Docker does NOT env-expand: known ARG/ENV are
-/// filled, but an unknown `$VAR`/`${VAR}` and `$$` are left **verbatim** for the shell — so
+/// filled, but an unknown `$VAR`/`${VAR}` and `$$` are left **verbatim** for the shell - so
 /// `RUN echo $HOME`, `awk '{print $1}'` and `$$` (PID) keep working.
 fn subst_soft(s: &str, vars: &HashMap<String, String>) -> String {
     subst_impl(s, vars, true)
@@ -949,7 +949,7 @@ fn subst_soft(s: &str, vars: &HashMap<String, String>) -> String {
 /// Shared substitution engine; `soft` decides how unknown vars and `$$` are treated (see the two
 /// wrappers above).
 ///
-/// Accumulates BYTES (not `char`s) so multibyte UTF-8 in a value passes through intact — every byte
+/// Accumulates BYTES (not `char`s) so multibyte UTF-8 in a value passes through intact - every byte
 /// copied comes from a valid `&str`, so the final `from_utf8` never fails. The `$`/`{`/`}`/name
 /// bytes we branch on are all ASCII, and every `&s[..]` slice boundary lands on one, so no panic.
 fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool) -> String {
@@ -976,7 +976,7 @@ fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool) -> String {
             match s[i + 2..].find('}') {
                 Some(rel) => (&s[i + 2..i + 2 + rel], i + 2 + rel + 1),
                 None => {
-                    out.push(b'$'); // unterminated `${` — emit literally
+                    out.push(b'$'); // unterminated `${` - emit literally
                     i += 1;
                     continue;
                 }
@@ -1145,7 +1145,7 @@ mod tests {
     #[test]
     fn copy_chmod_is_captured_on_a_context_copy() {
         // A plain `COPY --chmod=<octal>` (not a heredoc/ADD-url) must CAPTURE the mode so the executor
-        // applies it — Docker chmods every copied file. Regression guard for the "COPY --chmod ignored
+        // applies it - Docker chmods every copied file. Regression guard for the "COPY --chmod ignored
         // on a context file (stayed 0644)" bug found on Windows.
         let got = parse("FROM alpine\nCOPY --chmod=755 app /app\n", &ba()).unwrap();
         assert_eq!(
@@ -1210,9 +1210,9 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_and_malformed() {
-        // `COPY --from=<garbage>` (neither an earlier stage nor a valid image ref) is rejected — an
+        // `COPY --from=<garbage>` (neither an earlier stage nor a valid image ref) is rejected - an
         // uppercase repo is not a legal OCI reference. (A bare lowercase `nope` IS a valid ref now, so
-        // it's accepted as an external image — see `copy_from_external_image_ref`.)
+        // it's accepted as an external image - see `copy_from_external_image_ref`.)
         assert!(parse("FROM a\nCOPY --from=NOPE /a /b\n", &ba())
             .unwrap_err()
             .contains("earlier build stage"));
@@ -1241,14 +1241,14 @@ mod tests {
     #[test]
     fn volume_and_healthcheck_are_accepted_not_fatal() {
         // A stock upstream Dockerfile with VOLUME/HEALTHCHECK must BUILD, not explode. They carry no
-        // build-time filesystem effect, so they produce no instruction — the FROM/RUN around them do.
+        // build-time filesystem effect, so they produce no instruction - the FROM/RUN around them do.
         let df = "FROM alpine\nVOLUME /data\nHEALTHCHECK --interval=30s CMD curl -f localhost || exit 1\nRUN echo hi\n";
         let got = parse(df, &ba()).expect("VOLUME/HEALTHCHECK must not fail the build");
         // Only FROM + RUN survive as instructions; VOLUME/HEALTHCHECK emit none.
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], from("alpine"));
         assert!(matches!(got[1], Instr::Run(_)));
-        // `HEALTHCHECK NONE` is also fine (disables — nothing to nudge).
+        // `HEALTHCHECK NONE` is also fine (disables - nothing to nudge).
         assert!(parse("FROM alpine\nHEALTHCHECK NONE\n", &ba()).is_ok());
     }
 
@@ -1513,7 +1513,7 @@ mod tests {
 
     #[test]
     fn bom_and_escape_parser_directive() {
-        // A leading UTF-8 BOM is stripped (Windows editors add one) — the file parses like Docker.
+        // A leading UTF-8 BOM is stripped (Windows editors add one) - the file parses like Docker.
         assert_eq!(
             parse("\u{feff}FROM alpine\nRUN echo hi\n", &ba()).unwrap()[0],
             from("alpine")
@@ -1649,7 +1649,7 @@ mod tests {
                 chmod: None,
             }
         );
-        // With BuildKit `--checksum` (verified) and `--chmod` (applied — the download-a-binary pattern).
+        // With BuildKit `--checksum` (verified) and `--chmod` (applied - the download-a-binary pattern).
         let df2 = "FROM alpine\nADD --chmod=755 --checksum=sha256:abc123 https://x/y /y\n";
         assert_eq!(
             parse(df2, &ba()).unwrap()[1],

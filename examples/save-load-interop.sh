@@ -6,7 +6,7 @@
 #
 # The tar `kern save` writes is loadable by Docker (`docker load -i file.tar`) and vice-versa, so
 # you can move images between kern and Docker, ship them to an air-gapped box, or check one into an
-# artifact store — no registry needed. Every loaded tar is vetted + extracted through the SAME
+# artifact store - no registry needed. Every loaded tar is vetted + extracted through the SAME
 # hardened path as `kern pull` (an archive is as untrusted as a registry image).
 set -eu
 kern="${KERN:-kern}"
@@ -35,4 +35,4 @@ echo "==> it's back in the image list, and runnable:"
 echo
 echo "==> cleanup:"
 rm -rf "$(dirname "$tar")"
-echo "done — images move as plain tars, interop with Docker both ways, no registry required."
+echo "done - images move as plain tars, interop with Docker both ways, no registry required."

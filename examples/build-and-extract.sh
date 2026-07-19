@@ -1,5 +1,5 @@
 #!/bin/sh
-# Compile in a clean, throwaway toolchain — your host never gets the compiler.
+# Compile in a clean, throwaway toolchain - your host never gets the compiler.
 # The image (with --net) installs gcc, builds your source bound in at /src, and writes the
 # artifact to a volume you keep. The toolchain disappears with the box.
 #
@@ -23,4 +23,4 @@ echo "==> building in alpine (gcc installed only inside the box):"
 echo "==> the artifact is on your host; run it (host has no gcc):"
 chmod +x "$work/out/hello"
 "$work/out/hello"
-command -v cc >/dev/null 2>&1 && echo "(host has cc)" || echo "(host has NO cc — the toolchain stayed in the box)"
+command -v cc >/dev/null 2>&1 && echo "(host has cc)" || echo "(host has NO cc - the toolchain stayed in the box)"

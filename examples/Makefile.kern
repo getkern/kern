@@ -1,7 +1,7 @@
 # Hermetic make targets: every target runs inside a kern box, so `make test` (or lint/build) needs
-# NO local toolchain — just kern and the base image. Same sandbox on every machine and in CI.
+# NO local toolchain - just kern and the base image. Same sandbox on every machine and in CI.
 #
-# kern is daemonless and rootless, so these are plain shell recipes calling `kern box` — no Docker
+# kern is daemonless and rootless, so these are plain shell recipes calling `kern box` - no Docker
 # daemon, no `sudo`. lint/test bind the repo READ-ONLY with no network (hermetic); build writes only
 # to ./dist via a separate writable bind.
 #
@@ -11,7 +11,7 @@
 
 KERN  ?= kern
 IMAGE ?= alpine
-# Repo bound read-only at /src, working dir there — the common case for lint/test.
+# Repo bound read-only at /src, working dir there - the common case for lint/test.
 SRC    = -v "$(CURDIR):/src:ro" -w /src
 BOX    = $(KERN) box
 

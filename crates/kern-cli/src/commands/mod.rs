@@ -154,7 +154,7 @@ pub fn help() -> Result<(), Error> {
     Ok(())
 }
 
-/// Bare `kern`: a short, friendly banner — the logo, the tagline, and the handful of commands most
+/// Bare `kern`: a short, friendly banner - the logo, the tagline, and the handful of commands most
 /// people reach for first. The full command + flag reference is `kern --help`.
 pub fn banner() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
@@ -178,7 +178,7 @@ pub fn banner() -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern box <name> --plan` — show the ordered mount/pivot/remount sequence the sandbox setup
+/// `kern box <name> --plan` - show the ordered mount/pivot/remount sequence the sandbox setup
 /// would perform. Privilege-free: it records the sequence via the isolation seam rather than
 /// executing it, so it works anywhere and exercises the 0.2 step-sequence + mount-ordering
 /// typestate end to end.
@@ -192,11 +192,11 @@ pub fn box_plan(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// `--restart [policy]` — what to do when a detached box exits. `no` (default) leaves it dead;
+/// `--restart [policy]` - what to do when a detached box exits. `no` (default) leaves it dead;
 /// `on-failure` re-runs it on a non-zero exit via kern's own in-process supervisor (dies with the
 /// host); `always`/`unless-stopped` hand supervision to the user's **systemd** (a generated
 /// `~/.config/systemd/user/kern-<name>.service` + linger) so the box restarts on ANY exit AND
-/// survives reboot — all WITHOUT a kern daemon.
+/// survives reboot - all WITHOUT a kern daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RestartPolicy {
     #[default]
@@ -294,7 +294,7 @@ pub struct BoxRunArgs<'a> {
     pub tun: bool,
     /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
     pub init: bool,
-    /// `--pids-limit N`: cap the box's task count (`pids.max`) — fork-bomb containment.
+    /// `--pids-limit N`: cap the box's task count (`pids.max`) - fork-bomb containment.
     pub pids_limit: Option<u64>,
     /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
     pub tmpfs: &'a [String],
@@ -341,7 +341,7 @@ pub struct BoxRunArgs<'a> {
     pub add_hosts: &'a [(String, String)],
 }
 
-/// Resolve `--add-host` entries: the `host-gateway` keyword becomes the host's reachable address —
+/// Resolve `--add-host` entries: the `host-gateway` keyword becomes the host's reachable address -
 /// `127.0.0.1` when the box shares the host network, else the host's primary (default-route) IPv4 (the
 /// address a box with egress uses to reach the host). Other values pass through verbatim.
 fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, String)> {
@@ -364,7 +364,7 @@ fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, 
 }
 
 /// The host's primary IPv4 (the source address the default route would use), found by `connect()`ing a
-/// UDP socket to a public address — no packet is sent; the kernel just picks the route's source IP. So
+/// UDP socket to a public address - no packet is sent; the kernel just picks the route's source IP. So
 /// it works offline as long as a default route exists. `None` if there's no usable route.
 fn host_primary_ipv4() -> Option<String> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -377,7 +377,7 @@ fn host_primary_ipv4() -> Option<String> {
     }
 }
 
-/// The host's online CPU count (`processor` lines in `/proc/cpuinfo`), floored at 1. Memoized — the
+/// The host's online CPU count (`processor` lines in `/proc/cpuinfo`), floored at 1. Memoized - the
 /// single reader, so a box passing BOTH `--cpus` and `--cpuset-cpus` reads `/proc/cpuinfo` once, not
 /// twice. (Counts online CPUs on purpose: `available_parallelism()` respects kern's own affinity mask
 /// and would undercount the `0..host` pin range if kern were itself pinned.)
@@ -394,7 +394,7 @@ fn host_cpu_count() -> usize {
 }
 
 /// Clamp a `--cpus` request to the host's physical CPU count (from `/proc/cpuinfo`), so the cap
-/// is consistent across the systemd scope AND the in-namespace cgroup. The warning fires once — in
+/// is consistent across the systemd scope AND the in-namespace cgroup. The warning fires once - in
 /// the original process, before the scope re-exec (which sets `KERN_SCOPE`) runs the parse again.
 fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
     let c = cpus?;
@@ -402,7 +402,7 @@ fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
     if c > host {
         if std::env::var_os("KERN_SCOPE").is_none() {
             eprintln!(
-                "kern: --cpus {c} exceeds the {host:.0} available CPUs — clamping to {host:.0}"
+                "kern: --cpus {c} exceeds the {host:.0} available CPUs - clamping to {host:.0}"
             );
         }
         return Some(host);
@@ -429,7 +429,7 @@ fn clamp_cpuset(set: Option<String>) -> Option<String> {
         match part.split_once('-') {
             Some((a, b)) => {
                 let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else {
-                    return Some(s); // unparseable — leave it (format was validated at the CLI boundary)
+                    return Some(s); // unparseable - leave it (format was validated at the CLI boundary)
                 };
                 let (lo, hi) = (a.min(b), a.max(b));
                 if lo > max {
@@ -455,13 +455,13 @@ fn clamp_cpuset(set: Option<String>) -> Option<String> {
     let clamped = out.join(",");
     if clamped != s && std::env::var_os("KERN_SCOPE").is_none() {
         eprintln!(
-            "kern: --cpuset-cpus {s} exceeds the {host} available CPUs — clamping to {clamped}"
+            "kern: --cpuset-cpus {s} exceeds the {host} available CPUs - clamping to {clamped}"
         );
     }
     Some(clamped)
 }
 
-/// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-v ...] [--env ...] [-- cmd...]` — run
+/// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-v ...] [--env ...] [-- cmd...]` - run
 /// a command in a real sandbox: a fresh user + PID + (net) + UTS + IPC + mount namespace, the
 /// rootfs pivoted in, seccomp-filtered, cgroup-capped. `--image` pulls an OCI image (cached).
 /// Defaults to `/bin/sh`. Foreground propagates the exit code; `-d` detaches (track via `kern ps`).
@@ -528,12 +528,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
     // start chose the direct path) is meaningless here and would arm the fail-closed refusal on a
-    // host that never chose it — scrub before any cap decision is read.
+    // host that never chose it - scrub before any cap decision is read.
     kern_isolation::scrub_direct_marker();
-    // Reject a name already held by a LIVE box — otherwise two boxes share a name and `stop`/`logs`/
+    // Reject a name already held by a LIVE box - otherwise two boxes share a name and `stop`/`logs`/
     // `exec` become ambiguous (and a repeated `compose up` would silently stack duplicates). `name_taken`
     // checks ONLY this name's entry (not the whole registry), so start stays fast at scale; it prunes a
-    // dead same-name entry, so a freed name is immediately reusable. ADVISORY fast-fail only — the
+    // dead same-name entry, so a freed name is immediately reusable. ADVISORY fast-fail only - the
     // authoritative check runs inside `claim_name` below; skipped on the scoped inner re-run
     // (`KERN_SCOPE`), which already passed it in the outer process.
     if std::env::var_os("KERN_SCOPE").is_none() && registry::name_taken(name.as_str()) {
@@ -550,7 +550,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--ssh` PREFLIGHT: sshd's privilege separation calls `setgroups()`, which a single-uid userns
     // forbids (`/proc/self/setgroups=deny`). It works only with a real uid RANGE via newuidmap/subuid.
     // On a host without those (common on edge boards), `--ssh` would leave a listening port whose auth
-    // silently closes with a confusing "Connection closed" — so say it up front instead of at handshake.
+    // silently closes with a confusing "Connection closed" - so say it up front instead of at handshake.
     if args.ssh_port.is_some() {
         let uid = unsafe { libc::getuid() };
         let uname = kern_isolation::username(uid);
@@ -565,9 +565,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }
     }
     // (The effective command is resolved AFTER the image is pulled, so an `--image`'s Entrypoint/Cmd
-    // can supply the default — see `resolve_image_command` below.)
+    // can supply the default - see `resolve_image_command` below.)
     // Split `-v` into local (host/named) and network (nfs/smb/sshfs) specs. Local ones are parsed
-    // (named auto-created); network ones are FUSE/GVFS-mounted to staging and bound in — foreground
+    // (named auto-created); network ones are FUSE/GVFS-mounted to staging and bound in - foreground
     // only, so their unmount is bounded to this call (detached network teardown lands later).
     let (net_specs, local_specs): (Vec<String>, Vec<String>) = args
         .volumes
@@ -580,7 +580,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 .to_string(),
         ));
     }
-    // Pull out named volumes that carry a recorded quota — those get an ext4-loop backing (real disk
+    // Pull out named volumes that carry a recorded quota - those get an ext4-loop backing (real disk
     // quota) in the mount section; the rest (host paths + non-quota named) parse normally here.
     let (quota_specs, plain_specs): (Vec<String>, Vec<String>) =
         local_specs.into_iter().partition(|s| {
@@ -595,7 +595,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         Some(pod) => {
             let holder = crate::pod::holder_pid(pod).ok_or_else(|| {
                 Error::Sandbox(format!(
-                    "no running pod '{pod}' — create it first with `kern pod create {pod}`"
+                    "no running pod '{pod}' - create it first with `kern pod create {pod}`"
                 ))
             })?;
             crate::pod::add_member(pod, name.as_str())?;
@@ -655,7 +655,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             env.push((k.to_string(), proxy.clone()));
         }
     }
-    // Fold resource profiles (`vcpu:name` …) into the caps — explicit flags win — before capping.
+    // Fold resource profiles (`vcpu:name` …) into the caps - explicit flags win - before capping.
     let mut ap = AppliedProfiles {
         memory: args.memory,
         cpus: args.cpus,
@@ -684,7 +684,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // Clamp the pin list to the host CPUs too (flag OR profile), so an over-wide `0-9999` becomes the
     // valid subset instead of aborting the box with systemd's raw "Failed to parse AllowedCPUs".
     let cpuset = clamp_cpuset(cpuset);
-    // `--show-config`: a dry run — print the resolved box configuration and exit BEFORE any host-side
+    // `--show-config`: a dry run - print the resolved box configuration and exit BEFORE any host-side
     // mount or the systemd-scope re-exec, so nothing is created or torn down.
     if args.show_config {
         print_resolved_config(&args, name.as_str(), memory, cpus, cpuset.as_deref(), nice);
@@ -693,7 +693,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // Validate `--health-action` up front (before any host-side mount) so a typo fails fast. A
     // `restart` action implies the on-failure restart policy (that's how it re-runs the box).
     let health_action = parse_health_action(args.health_action)?;
-    // In-process supervisor (dies with the host): only `on-failure` — or a `restart` health action.
+    // In-process supervisor (dies with the host): only `on-failure` - or a `restart` health action.
     // `always`/`unless-stopped` are persistent and handled by a systemd user unit below instead.
     let restart =
         args.restart == RestartPolicy::OnFailure || health_action == HealthAction::Restart;
@@ -702,13 +702,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // service cgroup) and register the foreground run so `kern ps`/`logs`/`stop` still see it.
     let managed = std::env::var_os("KERN_MANAGED").is_some();
     // A `kern build` RUN step (`KERN_BUILD_STEP=1`) is a transient, first-party box run many times in
-    // a row — the ~7ms transient-scope re-exec would dominate the build. Skip it (the best-effort
+    // a row - the ~7ms transient-scope re-exec would dominate the build. Skip it (the best-effort
     // in-process cgroup in run_in_sandbox still applies caps; isolation is unchanged).
     let build_step = std::env::var_os("KERN_BUILD_STEP").is_some();
     // Robust resource caps: re-exec this whole invocation inside a transient systemd user scope
     // with memory + task limits (proper cgroup delegation). The scope's caps track the effective
     // memory/cpu so the outer scope never strangles a box that asked for more. No-op if already
-    // scoped or if systemd --user isn't available — then the best-effort cgroup in run_in_sandbox
+    // scoped or if systemd --user isn't available - then the best-effort cgroup in run_in_sandbox
     // applies the same caps.
     if !managed && !build_step {
         reexec_in_scope_if_possible(
@@ -726,11 +726,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) };
     }
 
-    // Close the start/start race on the name (the `name_taken` check at the top is advisory —
-    // check-then-register): atomically CLAIM the name, in THIS process — i.e. after the scope
-    // re-exec, so the `exec()` can't orphan a claim — and hold it until the box is registered
+    // Close the start/start race on the name (the `name_taken` check at the top is advisory -
+    // check-then-register): atomically CLAIM the name, in THIS process - i.e. after the scope
+    // re-exec, so the `exec()` can't orphan a claim - and hold it until the box is registered
     // (dropped explicitly after `register`, or by RAII on any earlier error return; a fork
-    // inheriting it never releases — the claim is pid-owned). `claim_name` itself re-checks the
+    // inheriting it never releases - the claim is pid-owned). `claim_name` itself re-checks the
     // registry UNDER its lock, so `Ok(None)` covers both a concurrent starter and an already-
     // running box. Two concurrent same-name starts now serialize: one wins, the other fails fast
     // here instead of both passing `name_taken` and both coming up as ambiguous twins.
@@ -758,7 +758,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }
         if args.read_only {
             return Err(Error::Sandbox(
-                "--bind-rootfs is writable-only — a read-only bind remount is denied on the \
+                "--bind-rootfs is writable-only - a read-only bind remount is denied on the \
                  kernels where it helps; drop --bind-rootfs to get a read-only overlay root"
                     .to_string(),
             ));
@@ -768,7 +768,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--privileged` (relax seccomp so a NESTED `kern box` can create its namespaces) is honoured
     // ONLY rootless: as REAL host root the box's root maps to host root, where re-allowing `mount`
     // would re-open the host-privilege class (the core_pattern escape). Refuse loudly rather than
-    // silently ignore — the user asked for nesting; tell them it isn't safe here and why.
+    // silently ignore - the user asked for nesting; tell them it isn't safe here and why.
     if args.privileged && unsafe { libc::geteuid() } == 0 {
         return Err(Error::Sandbox(
             "--privileged (nested box) is rootless-only: run kern as a non-root user. As real \
@@ -780,12 +780,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     }
 
     // The lower/base rootfs: an explicit --rootfs, or pull --image into a local cache. An --image
-    // also yields its OCI runtime config (Entrypoint/Cmd/Env/WorkingDir/User) — the defaults below.
+    // also yields its OCI runtime config (Entrypoint/Cmd/Env/WorkingDir/User) - the defaults below.
     let (lower, image_config) = match (args.overlay_lower, args.rootfs, args.image) {
         // Build RUN step: an explicit (possibly colon-joined multi-) lower, no image config.
         (Some(ol), _, _) => (ol.to_string(), kern_oci::ImageConfig::default()),
         (None, Some(r), _) => (r.to_string(), kern_oci::ImageConfig::default()),
-        // `--image` may be a pulled (flat) OR a locally-built (layered) image — resolve both.
+        // `--image` may be a pulled (flat) OR a locally-built (layered) image - resolve both.
         (None, None, Some(img)) => resolve_image(img)?,
         (None, None, None) => return Err(Error::Sandbox("need --rootfs or --image".to_string())),
     };
@@ -801,7 +801,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         env = merged;
     }
 
-    // Host-side mounts happen HERE — AFTER the systemd-scope re-exec (above) and after every
+    // Host-side mounts happen HERE - AFTER the systemd-scope re-exec (above) and after every
     // fallible step (guards, pull), so each is done exactly once, in the process that also tears it
     // down, and a later `?` can't orphan one (the handles' `Drop` cleans up an error path; the
     // success path unmounts explicitly before `exit`). Network volumes: FUSE/GVFS mount → bind.
@@ -821,7 +821,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let vdisk_work = scratch_dir().join(format!("vdisk-{}-{}", name.as_str(), std::process::id()));
     let mut ext4_handles: Vec<crate::vdisk::Ext4Vdisk> = Vec::new();
     // cgroup `io.max` lines for `--iops`/`--bandwidth` on the ext4-loop backend (applied in the box's
-    // cgroup by `apply_limits` — best-effort, needs the `io` controller delegated).
+    // cgroup by `apply_limits` - best-effort, needs the `io` controller delegated).
     let mut vdisk_io_max: Vec<String> = Vec::new();
     let vdisks: Vec<kern_isolation::VdiskMount> = vdisk
         .into_iter()
@@ -894,13 +894,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let (ssh, eff_ports) = prepare_ssh(&name, args.ssh_port, args.ssh_key, args.ports)?;
     let ports: &[kern_isolation::PortMap] = &eff_ports;
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
-    // forwarder fails inside its fork — whose stderr a detached box swallows — and the box would
+    // forwarder fails inside its fork - whose stderr a detached box swallows - and the box would
     // print "started" while nothing actually listens.
     if let Err((hp, e)) = kern_isolation::preflight_ports(ports) {
         // AlreadyRunning (not Sandbox): the cause is a resource already in use, so its
-        // "run `kern ps` … `kern stop`" hint fits — not the sandbox's userns/rootfs hint.
+        // "run `kern ps` … `kern stop`" hint fits - not the sandbox's userns/rootfs hint.
         return Err(Error::AlreadyRunning(format!(
-            "cannot publish host port {hp}: {e} — already in use (another box, or a non-kern process)"
+            "cannot publish host port {hp}: {e} - already in use (another box, or a non-kern process)"
         )));
     }
 
@@ -908,14 +908,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // specs (blocking a tmpfs over the hardened mounts). `--user`: parse UID[:GID].
     let hostname = validate_hostname(args.hostname)?;
     let tmpfs = parse_tmpfs(args.tmpfs)?;
-    // `--user` wins; otherwise the image's `config.User` — but only if it's NUMERIC. A NAME (e.g.
+    // `--user` wins; otherwise the image's `config.User` - but only if it's NUMERIC. A NAME (e.g.
     // `USER nginx`) would need the image's `/etc/passwd`, which isn't resolved pre-pivot, so it's
     // skipped (the box runs as its root) with an honest note rather than failing the box.
     let image_user = match image_config.user.as_deref() {
         Some(u) if parse_user(Some(u)).is_ok() => Some(u),
         Some(u) if args.run_as.is_none() => {
             eprintln!(
-                "kern: image requests user '{u}' by name — running as box root \
+                "kern: image requests user '{u}' by name - running as box root \
                  (pass --user <uid[:gid]> to drop privilege)"
             );
             None
@@ -923,16 +923,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         _ => None,
     };
     let run_as = parse_user(args.run_as.or(image_user))?;
-    // COMPAT HEADS-UP (not a security check; not parsing the entrypoint — only the image's own declared
+    // COMPAT HEADS-UP (not a security check; not parsing the entrypoint - only the image's own declared
     // `User`). An OCI image that drops privilege to a non-root user (postgres/redis/nginx via `User` or
     // an entrypoint `setpriv`/`gosu`) needs uids beyond box-root. Two honest cases:
     //  - WITHOUT --uid-range (single-uid box): the drop's uid isn't mapped → the entrypoint's
     //    `chown`/`setuid` fails EINVAL. Tell the user to add --uid-range (which now makes these images
-    //    work — the box root is world-traversable and the range maps the service uid).
+    //    work - the box root is world-traversable and the range maps the service uid).
     //  - WITH --uid-range but the image declares a numeric `User` >= the mapped range size: the drop is
     //    to a uid the range doesn't cover → still fails. Tell the user to widen /etc/subuid. We NEVER
     //    silently clamp the uid into range (that would run the service as a DIFFERENT uid than the image
-    //    intends — a silent lie); we surface it and let the user fix the range.
+    //    intends - a silent lie); we surface it and let the user fix the range.
     let declared_user = image_config
         .user
         .as_deref()
@@ -940,7 +940,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if let Some(u) = declared_user {
         if !args.uid_range {
             eprintln!(
-                "kern: heads-up: image runs as non-root user '{u}' — under kern's rootless model a \
+                "kern: heads-up: image runs as non-root user '{u}' - under kern's rootless model a \
                  single-uid box can't map that uid, so the entrypoint may fail (chown/setuid EINVAL). \
                  Add --uid-range to run it (maps a subordinate uid range so the drop works)."
             );
@@ -962,7 +962,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // always-dropped dangerous baseline.
     let caps = crate::caps::resolve(args.cap_add, args.cap_drop)?;
     // A non-root `--user` needs its uid mapped into the box's namespace, which the single-uid map
-    // doesn't provide — so a non-zero `--user` (like `--ssh`) implies the uid/gid-range mapping.
+    // doesn't provide - so a non-zero `--user` (like `--ssh`) implies the uid/gid-range mapping.
     let non_root_user = matches!(run_as, Some((u, _)) if u != 0);
 
     // Always an overlay (image/rootfs = read-only lower, private upper takes writes).
@@ -1013,11 +1013,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
 
     if args.tty && args.detached {
         return Err(Error::Sandbox(
-            "-it can't combine with -d — a detached box has no terminal to attach".to_string(),
+            "-it can't combine with -d - a detached box has no terminal to attach".to_string(),
         ));
     }
     // `--restart always|unless-stopped` (detached): hand supervision to the user's systemd instead of
-    // kern's in-process supervisor — the box then restarts on ANY exit and survives reboot, with no
+    // kern's in-process supervisor - the box then restarts on ANY exit and survives reboot, with no
     // kern daemon. The generated unit re-runs THIS invocation in the foreground; the pull+mount we
     // just did warmed the image cache, so systemd's start is fast. We tear down this launcher's
     // scratch (the managed run makes its own) and return. Not reached in the managed run itself
@@ -1033,7 +1033,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         let _ = std::fs::remove_dir_all(&vdisk_work);
         // Release the start-claim BEFORE `systemctl enable --now`: the unit's own `kern box` run
         // claims the same name, and this launcher (still alive) holding it would fail the unit's
-        // FIRST start with 'already starting' — systemd would only succeed on the 1s restart retry,
+        // FIRST start with 'already starting' - systemd would only succeed on the 1s restart retry,
         // making every `--restart` install flaky. From here the unit is the name's owner.
         drop(name_claim);
         return install_persistent_box(
@@ -1046,7 +1046,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         );
     }
     // Each box records the named volumes it mounts (below, in the registry) BEFORE it mounts them, so
-    // `kern volume rm` sees an in-use volume and refuses — race-free without holding an fd open on the
+    // `kern volume rm` sees an in-use volume and refuses - race-free without holding an fd open on the
     // volume dir (which would disturb the sandbox's mount setup).
     let mounted_vols = mounted_named_volumes(args.volumes);
     if args.detached {
@@ -1069,7 +1069,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             args.timeout,
         );
     }
-    // Foreground/interactive: print the status panel — but only when stderr is a real terminal, so
+    // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
     // it stays out of pipes, scripts and `kern logs`. stderr (not stdout) keeps the box's own
     // stdout clean. Printed once: when a systemd scope re-execs us, only the inner process (which
     // actually reaches here) prints.
@@ -1078,18 +1078,18 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     }
     if args.tty {
         // Release the start-claim: `run_box_interactive` leaves via `process::exit` (raw-terminal
-        // teardown), which skips Drop — holding it here would leak one stale claim file per `-it`
+        // teardown), which skips Drop - holding it here would leak one stale claim file per `-it`
         // session. An interactive box never registers, so duplicate `-it` names stay allowed,
         // exactly as before the claim existed.
         drop(name_claim);
         return run_box_interactive(spec, scratch, ports, args.timeout);
     }
-    // A persistent box (`--restart always`) is started by systemd in the foreground — systemd is the
+    // A persistent box (`--restart always`) is started by systemd in the foreground - systemd is the
     // supervisor. Send its output to the per-box log and register it so `kern ps`/`logs`/`stop` still
     // see it; below we re-register with PID 1 once it's up (so `kern exec` works) and unregister on exit.
     // Register EVERY foreground box (Docker-parity: `kern ps`/`stop`/`volume rm` all see it), and
-    // unregister on exit below. Registering here — before the box binds its named volumes inside the
-    // sandbox — makes `volume rm`'s in-use check race-free. A *managed* (persistent, systemd-unit) box
+    // unregister on exit below. Registering here - before the box binds its named volumes inside the
+    // sandbox - makes `volume rm`'s in-use check race-free. A *managed* (persistent, systemd-unit) box
     // also redirects its stdio to a per-box log; a plain foreground box keeps its terminal. The entry
     // is removed on clean exit; a crash/kill leaves it, but `registry::list()` prunes it by start-time.
     let mut reg_state = {
@@ -1117,16 +1117,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     };
     // Registered → the registry entry guards the name from here on; release the start-claim
     // explicitly (this foreground path leaves via `process::exit`, which skips Drop). The detached
-    // path (`run_detached` above) instead drops it on `return` — after the supervisor has
+    // path (`run_detached` above) instead drops it on `return` - after the supervisor has
     // registered (readiness is signalled post-register, and `await_box_started` waits for it).
     drop(name_claim);
     // Foreground: run the box (the runtime forks `-p` forwarders before the unshare and tears them
     // down when the box exits). `--timeout N`: arm a watchdog that SIGKILLs the box's PID 1 after N
-    // seconds. The watchdog MUST be forked here — BEFORE `run_in_sandbox_with` does its
-    // `unshare(CLONE_NEWPID)` — so it lives in the host (ancestor) pid namespace; a process forked
+    // seconds. The watchdog MUST be forked here - BEFORE `run_in_sandbox_with` does its
+    // `unshare(CLONE_NEWPID)` - so it lives in the host (ancestor) pid namespace; a process forked
     // after the unshare would land INSIDE the box's namespace, where a non-init member can't signal
     // the ns-init. It learns the box's PID 1 over a pipe (written by `on_started`). Skipped for a
-    // managed box — a persistent box is meant to stay up; a timeout would just fight systemd's restart.
+    // managed box - a persistent box is meant to stay up; a timeout would just fight systemd's restart.
     let timeout_wd = (args.timeout > 0 && !managed)
         .then(|| spawn_foreground_timeout(args.timeout))
         .flatten();
@@ -1166,7 +1166,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         None,
         ports,
         // Foreground box: tie its lifetime to the launcher via PDEATHSIG, so a hard-killed launcher
-        // (SIGKILL/OOM) doesn't orphan the box until `--timeout`. NOT for a managed box — systemd is
+        // (SIGKILL/OOM) doesn't orphan the box until `--timeout`. NOT for a managed box - systemd is
         // its supervisor (KillMode=mixed tears it down); a PDEATHSIG relative to systemd is pointless.
         !managed,
     );
@@ -1190,14 +1190,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     }
     match result {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
-        // one place a non-0/1 exit code is produced — a deliberate terminal action.
+        // one place a non-0/1 exit code is produced - a deliberate terminal action.
         Ok(code) => std::process::exit(code),
         Err(e) => Err(Error::Setup(e.to_string())), // genuine sandbox-start failure → userns hint
     }
 }
 
 /// Print the `kern box` status panel (aligned isolation + resource posture, actionable warnings)
-/// to stderr — but ONLY when stderr is a terminal, so pipes/scripts/`kern logs` stay clean. `cpus`
+/// to stderr - but ONLY when stderr is a terminal, so pipes/scripts/`kern logs` stay clean. `cpus`
 /// is the already-clamped value, so the panel shows the cap that's actually enforced.
 fn print_box_status(args: &BoxRunArgs, cpus: Option<f64>) {
     if !std::io::stderr().is_terminal() {
@@ -1219,7 +1219,7 @@ fn print_box_status(args: &BoxRunArgs, cpus: Option<f64>) {
     };
     let p = crate::ui::Palette::detect_stderr();
     let gl = crate::ui::Glyphs::detect();
-    // Concise by default — a beginner running `kern box … -- cmd` wants their command's output, not a
+    // Concise by default - a beginner running `kern box … -- cmd` wants their command's output, not a
     // six-line posture panel. One line ("▸ box 'x' · alpine  ✔ isolated"); `--verbose` expands it to
     // the full panel (with the once-per-session wordmark, which would only be noise on the one-liner).
     if !args.verbose {
@@ -1252,7 +1252,7 @@ fn display_source_cmd<'a>(args: &'a BoxRunArgs) -> (&'a str, String) {
 }
 
 /// `--show-config`: print the resolved box configuration (after profiles, clamps and flag merges) to
-/// stdout as plain `key: value` lines, then the caller exits. A dry run — unlike the status panel it
+/// stdout as plain `key: value` lines, then the caller exits. A dry run - unlike the status panel it
 /// always prints (it's the whole point of the command) and goes to stdout so it can be captured.
 fn print_resolved_config(
     args: &BoxRunArgs,
@@ -1316,8 +1316,8 @@ fn nesting_active(privileged: bool) -> bool {
 
 /// True the first time a foreground box runs in this login session, recording a marker under
 /// `$XDG_RUNTIME_DIR` (tmpfs → cleared on logout, so "once per session") so the wordmark prints
-/// once and not before every box. Best-effort: with no runtime dir (can't track) it returns false
-/// — better to skip the logo than to reprint it every time. A lost race (two boxes at once) just
+/// once and not before every box. Best-effort: with no runtime dir (can't track) it returns false,
+/// better to skip the logo than to reprint it every time. A lost race (two boxes at once) just
 /// prints the logo twice, which is harmless.
 fn first_box_of_session() -> bool {
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
@@ -1335,7 +1335,7 @@ fn first_box_of_session() -> bool {
 
 /// Foreground `-it`: allocate a PTY, hand its slave to the box as a controlling terminal, put the
 /// host terminal in raw mode, and let `run_in_sandbox_with` pump bytes between them until the box
-/// exits — then restore the terminal and propagate the exit code.
+/// exits - then restore the terminal and propagate the exit code.
 fn run_box_interactive(
     mut spec: SandboxSpec,
     scratch: Option<PathBuf>,
@@ -1356,7 +1356,7 @@ fn run_box_interactive(
         |pid1| feed_timeout_pid(timeout_wd, pid1),
         Some(pty.master),
         ports,
-        // `-it`: leave the box tied to the controlling terminal/session, not to a launcher PDEATHSIG —
+        // `-it`: leave the box tied to the controlling terminal/session, not to a launcher PDEATHSIG -
         // the terminal owns the session and the pty pump already ends the box when the tty closes.
         false,
     );
@@ -1372,9 +1372,9 @@ fn run_box_interactive(
     }
 }
 
-/// `kern run [--memory M] [--cpus N] [--] <cmd...>` — run a command under cgroup CPU/memory caps
+/// `kern run [--memory M] [--cpus N] [--] <cmd...>` - run a command under cgroup CPU/memory caps
 /// WITHOUT a sandbox. The resource-governor verb: it governs *resources*, not isolation (that's
-/// `box`). It replaces this process with the command — no fork, no namespaces, no seccomp — so it's
+/// `box`). It replaces this process with the command - no fork, no namespaces, no seccomp - so it's
 /// the leanest possible path: a transient capped cgroup + `exec`. The command's exit code becomes
 /// kern's, exactly like a bare exec.
 pub fn run(
@@ -1386,7 +1386,7 @@ pub fn run(
     config: Option<&str>,
 ) -> Result<(), Error> {
     use std::os::unix::process::CommandExt;
-    // Fold any leading resource-profile tokens (`vcpu:name` …) into the caps — explicit flags win —
+    // Fold any leading resource-profile tokens (`vcpu:name` …) into the caps - explicit flags win -
     // and find where the real command begins.
     let mut ap = AppliedProfiles {
         memory,
@@ -1409,7 +1409,7 @@ pub fn run(
             "run [--memory M] [--cpus N] [--cpuset-cpus L] [--config F] [vcpu:PROFILE] [--] <cmd...>",
         ));
     }
-    // `run` has no sandbox, so a `vgpio:` profile can't confine devices — instead export it as env
+    // `run` has no sandbox, so a `vgpio:` profile can't confine devices - instead export it as env
     // (`KERN_VGPIO_NAME`/`_PINS`), like the private, so a cooperative workload can find its pins. To
     // actually *isolate* the peripherals, use `kern box vgpio:NAME …`.
     if !vgpio.is_empty() {
@@ -1422,10 +1422,10 @@ pub fn run(
         std::env::set_var("KERN_VGPIO_NAME", names.join(","));
         std::env::set_var("KERN_VGPIO_PINS", pins.join(","));
     }
-    // A `vdisk:` needs a mount namespace to isolate — `run` has none. Say so rather than pretend.
+    // A `vdisk:` needs a mount namespace to isolate - `run` has none. Say so rather than pretend.
     if !vdisk.is_empty() {
         eprintln!(
-            "kern: vdisk profile(s) ignored by `run` (no mount namespace) — use `kern box vdisk:NAME …`"
+            "kern: vdisk profile(s) ignored by `run` (no mount namespace) - use `kern box vdisk:NAME …`"
         );
     }
     // Robust caps via a transient systemd user scope whose MemoryMax/CPUQuota track the caps; this
@@ -1442,7 +1442,7 @@ pub fn run(
         cpus,
         None,
         false,
-        false, // `kern run` execs the workload in place — no box to tie to the launcher
+        false, // `kern run` execs the workload in place - no box to tie to the launcher
     );
     let cg = kern_isolation::apply_cgroup_limits(
         false, // allow_direct: `kern run` exec()s in place (no supervisor) → never relocate into kern.slice
@@ -1455,7 +1455,7 @@ pub fn run(
         &[],  // no vdisk io limits in `kern run`
         None, // no --io-weight in `kern run`
     );
-    // `kern run` is a cooperative GOVERNOR, not an isolation boundary — so unlike `kern box` it does NOT
+    // `kern run` is a cooperative GOVERNOR, not an isolation boundary - so unlike `kern box` it does NOT
     // fail-closed when a cap can't be applied. But make the drop VISIBLE, not silent: if the user asked
     // for a cap, no outer scope is enforcing it (`KERN_SCOPE` unset), and we couldn't apply it (`cg` None),
     // say so rather than let the workload quietly exceed it (there is no isolation here; only the limit).
@@ -1465,13 +1465,13 @@ pub fn run(
     {
         eprintln!(
             "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
-             delegation unavailable) — the command runs UNCAPPED."
+             delegation unavailable) - the command runs UNCAPPED."
         );
     }
-    // `kern run` exec()s the workload IN PLACE — there is no supervisor left to reap it and drop the
+    // `kern run` exec()s the workload IN PLACE - there is no supervisor left to reap it and drop the
     // guard afterwards. The guard's Drop would `rmdir` the cgroup we're about to exec into, which is
     // non-empty (we're in it) → EBUSY → a no-op anyway. Forget it so the intent is explicit: we do NOT
-    // tear down our own live cgroup here. (Same as the pre-guard behaviour — the `run` cgroup outlives
+    // tear down our own live cgroup here. (Same as the pre-guard behaviour - the `run` cgroup outlives
     // this call; it's removed when the whole systemd scope / caller lifecycle is collected.)
     std::mem::forget(cg);
     // Pin CPUs via affinity (works with no cgroup cpuset delegation), and apply a profile's `nice`.
@@ -1480,15 +1480,15 @@ pub fn run(
         unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) };
     }
     // Bump the daemonless run-throughput counter (one atomic on a shared mmap) so `kern top` can show
-    // live runs/sec — done here, in the final process that actually runs the workload (past any
+    // live runs/sec - done here, in the final process that actually runs the workload (past any
     // scope re-exec), so each `kern run` counts exactly once. Best-effort: never fails the run.
     crate::runstats::record();
     // exec() replaces this process with the command (which inherits the cgroup) and only returns on
-    // failure — so a successful run propagates the command's own exit code as kern's.
+    // failure - so a successful run propagates the command's own exit code as kern's.
     let err = std::process::Command::new(&command[0])
         .args(&command[1..])
         .exec();
-    // `kern run` is the resource governor — there is NO sandbox here — so don't wrap this in the
+    // `kern run` is the resource governor - there is NO sandbox here - so don't wrap this in the
     // "sandbox: …" error. Print a plain command-not-found message with a fitting hint and exit 127
     // (the conventional "command not found" code), mirroring the box path's exec-failure handling.
     eprintln!("kern: cannot run '{}': {err}", command[0]);
@@ -1538,7 +1538,7 @@ fn apply_profile_list(
                 out.vdisk
                     .push(crate::config::resolve_vdisk(&cfg, name).map_err(Error::Config)?);
             }
-            None => {} // not a profile token — ignored (callers pass only classified tokens)
+            None => {} // not a profile token - ignored (callers pass only classified tokens)
         }
     }
     Ok(())
@@ -1603,7 +1603,7 @@ fn prepare_ssh(
             let key = std::fs::read_to_string(path)
                 .map_err(|e| Error::Sandbox(format!("--ssh-key '{path}': {e}")))?;
             // Validate the key TYPE token (first whitespace-delimited field), not a bare `ssh-`
-            // substring — that wrongly rejected valid ECDSA keys (`ecdsa-sha2-nistp256`,
+            // substring - that wrongly rejected valid ECDSA keys (`ecdsa-sha2-nistp256`,
             // `sk-ecdsa-sha2-nistp256@openssh.com`), which contain no `ssh-`.
             let ktype = key.split_whitespace().next().unwrap_or("");
             let ok = ktype.starts_with("ssh-")
@@ -1636,7 +1636,7 @@ fn prepare_ssh(
                 .unwrap_or(false);
             if !ok {
                 return Err(Error::Sandbox(
-                    "--ssh: ssh-keygen failed on the host (install openssh-client) — or pass \
+                    "--ssh: ssh-keygen failed on the host (install openssh-client) - or pass \
                      --ssh-key <pubkey>"
                         .to_string(),
                 ));
@@ -1663,17 +1663,17 @@ fn prepare_ssh(
 }
 
 /// A quota'd named volume couldn't get its ext4-loop backing (unprivileged, or `-d`/`-it`): bind the
-/// plain data dir and say the quota isn't enforced — never silently.
+/// plain data dir and say the quota isn't enforced - never silently.
 fn quota_fallback(name: &str) -> Result<String, Error> {
     eprintln!(
-        "kern: volume '{name}' has a quota but it isn't enforced here — the ext4-loop backend needs \
+        "kern: volume '{name}' has a quota but it isn't enforced here - the ext4-loop backend needs \
          a plain foreground box as root (or `disk` group); mounted as a plain directory. Note the \
          enforced (ext4 image) and unenforced (data dir) backends hold data separately."
     );
     crate::volume::resolve_named(name)
 }
 
-/// Turn a resolved vDisk into a box mount. Rootless (the default): a `size=`-capped `tmpfs` — the box
+/// Turn a resolved vDisk into a box mount. Rootless (the default): a `size=`-capped `tmpfs` - the box
 /// gets a real size quota with no privilege (RAM-backed, ephemeral). `iops`/`bandwidth`/`persistent`
 /// need a disk-backed ext4-on-loop backend (root); rather than silently drop them, we say so. (The
 /// ext4-loop backend is the next increment; the tmpfs path means a `vdisk:` profile always works.)
@@ -1704,7 +1704,7 @@ fn prepare_vdisk(
                             io_max.push(io_max_line(maj, min, vd.iops, vd.bandwidth))
                         }
                         None => eprintln!(
-                            "kern: vdisk:{} — could not resolve the loop device for iops/bandwidth",
+                            "kern: vdisk:{} - could not resolve the loop device for iops/bandwidth",
                             vd.name
                         ),
                     }
@@ -1722,17 +1722,17 @@ fn prepare_vdisk(
     // Rootless fallback: a size-capped tmpfs. Be honest about what it can't do.
     if vd.iops.is_some() || vd.bandwidth.is_some() || vd.persistent {
         eprintln!(
-            "kern: vdisk:{} — iops/bandwidth/persistent need the ext4-loop backend (root, foreground \
+            "kern: vdisk:{} - iops/bandwidth/persistent need the ext4-loop backend (root, foreground \
              box); the rootless tmpfs backend applies only the size cap",
             vd.name
         );
     }
     // The tmpfs is RAM-backed, so `size` counts against RAM (correctly charged to the box's memory
-    // cgroup — a write past `--memory` OOM-kills the box, exit 137; verified) AND its data is
-    // EPHEMERAL — gone when the box exits. Say both, so a large scratch isn't mistaken for a disk.
+    // cgroup - a write past `--memory` OOM-kills the box, exit 137; verified) AND its data is
+    // EPHEMERAL - gone when the box exits. Say both, so a large scratch isn't mistaken for a disk.
     if vd.size.is_some_and(|b| b >= 1 << 30) {
         eprintln!(
-            "kern: vdisk:{} is RAM-backed (tmpfs) rootless — its data is EPHEMERAL (gone when the box \
+            "kern: vdisk:{} is RAM-backed (tmpfs) rootless - its data is EPHEMERAL (gone when the box \
              exits) and its size counts against RAM; pair a large vdisk with --memory (or run a \
              foreground box as root for the persistent ext4 backend)",
             vd.name
@@ -1805,7 +1805,7 @@ struct BuildSpec<'a> {
 ///
 /// Why overlay even for `--read-only` (rather than a plain bind + remount-ro): on some kernels a
 /// **bind** mount cannot be remounted read-only inside a user namespace (e.g. Android-kernel
-/// boards return EPERM — the bind inherits a lock from a host mount the child userns doesn't own),
+/// boards return EPERM - the bind inherits a lock from a host mount the child userns doesn't own),
 /// whereas an **overlay** has its own superblock created in the namespace and *can* be remounted
 /// read-only. Using overlay for both modes makes `--read-only` work everywhere and keeps the
 /// image immutable (writes, when allowed, only ever hit the discarded upper).
@@ -1821,8 +1821,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
 
     // `--bind-rootfs`: skip the overlay and bind the rootfs directly. On kernels with a slow
     // overlayfs mount (some Android-kernel boards: ~31 ms for an overlay vs ~8 ms for a bind) this
-    // is the difference between winning and losing on raw start. The trade-off — accepted by the
-    // explicit flag — is that the source is mutable and shared: writes land in the rootfs dir and
+    // is the difference between winning and losing on raw start. The trade-off - accepted by the
+    // explicit flag - is that the source is mutable and shared: writes land in the rootfs dir and
     // boxes sharing one rootfs are not isolated from each other. There is no overlay scratch.
     //
     // Unlike the overlay path, we deliberately do NOT inject `/etc/resolv.conf` here even with
@@ -1832,7 +1832,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
     // ships (`--net` still gives outbound networking; add a resolv.conf to the rootfs if needed).
     // The rootfs strategy is the ONLY thing that differs between bind and overlay: pick
     // `(root, mode, overlay, cleanup)` here, then build the one shared SandboxSpec below (its ~27
-    // other fields were duplicated field-for-field in both branches — a silent-drift hazard).
+    // other fields were duplicated field-for-field in both branches - a silent-drift hazard).
     let (root, mode, overlay, eph): (String, MountMode, Option<OverlayDirs>, Option<PathBuf>) = if b
         .bind_rootfs
     {
@@ -1842,11 +1842,11 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         // build` RUN step (`overlay_upper` set) the UPPER persists in the build tree so successive RUN/
         // COPY steps accumulate into it (the "diff" layer). overlayfs requires upperdir and workdir to be
         // on the SAME filesystem, so in build mode BOTH live under the build tree (work is cleared each
-        // step — overlay wants a fresh workdir); only `merged` (a bare mountpoint) stays ephemeral.
+        // step - overlay wants a fresh workdir); only `merged` (a bare mountpoint) stays ephemeral.
         let eph = scratch_dir().join(format!("{}-{}", b.name.as_str(), std::process::id()));
         // Create the ephemeral parent once (0700) so the per-leaf creates below (`upper`/`work`/`merged`,
         // all under `eph` in the common case) are a single bare mkdir each instead of each re-walking
-        // and re-stat-ing the shared parent chain — a few fewer serial pre-fork syscalls per box.
+        // and re-stat-ing the shared parent chain - a few fewer serial pre-fork syscalls per box.
         own_only_dir(&eph).map_err(|e| Error::Sandbox(format!("overlay scratch: {e}")))?;
         let merged = eph.join("merged");
         let (upper, work) = match &b.overlay_upper {
@@ -1863,17 +1863,17 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         // by default, which makes the box's `/` un-traversable by ANY dropped, cap-less non-root uid →
         // exec/read fails EACCES on `/` itself (the first path component). A `--user` uid hits this, but
         // so does the far more common case: an OCI image whose ENTRYPOINT drops privilege internally
-        // (postgres/redis/mysql/nginx `setpriv`/`gosu` to a service uid) — there is no `--user`, yet the
+        // (postgres/redis/mysql/nginx `setpriv`/`gosu` to a service uid) - there is no `--user`, yet the
         // workload still ends up non-root and needs a world-traversable `/`. So give the box a normal
         // 0755 root (exactly like a real rootfs) whenever privilege MIGHT be dropped: an explicit
         // non-root `--user`, OR a `--uid-range` box (which exists precisely to run such images). This is
         // the fix for the "official images don't start" gap. It's safe: the HOST scratch dir is still
-        // 0700 (no other host user can enter), and root=0755 is the norm for every real filesystem —
+        // 0700 (no other host user can enter), and root=0755 is the norm for every real filesystem -
         // it's the in-box view only, and the box's isolation is the namespace, not the root's mode.
         //
         // A POD MEMBER (`pod_holder` set) gets the same treatment: it joins a shared user namespace that
         // may map a subordinate uid range (`pod create --uid-range`), and its image may drop privilege to
-        // a service uid — but the box's own `uid_range` flag is false there (the range lives on the pod
+        // a service uid - but the box's own `uid_range` flag is false there (the range lives on the pod
         // holder, not this box), so it must be included explicitly or postgres/redis/… in a pod hit the
         // exact EACCES-on-`/` gap this whole block fixes. Harmless for a single-uid pod (no other uid to
         // traverse). Found via a live python+postgres pod stack: the entrypoint's `gosu postgres` drop
@@ -1981,10 +1981,10 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
         }
         // Refuse to shadow the box's own essential mounts: a `-v` exactly over `/`, `/proc`, `/sys` or
         // `/dev` would hide the sandbox's isolation setup (masked proc/sys, minimal dev). A SUBPATH
-        // (e.g. `/dev/foo`, `/data`) is fine — only these exact roots are protected. Normalize the way
+        // (e.g. `/dev/foo`, `/data`) is fine - only these exact roots are protected. Normalize the way
         // the mount actually resolves it (`open_in_root` splits on '/' and drops empty components), so
-        // a leading-double-slash target like `//dev` — which trims to a non-matching string but still
-        // resolves to `/dev` at mount time — can't slip past this guard.
+        // a leading-double-slash target like `//dev` - which trims to a non-matching string but still
+        // resolves to `/dev` at mount time - can't slip past this guard.
         let comps: Vec<&str> = target.split('/').filter(|c| !c.is_empty()).collect();
         if comps.is_empty() || matches!(comps.as_slice(), ["proc"] | ["sys"] | ["dev"]) {
             let shown = if comps.is_empty() {
@@ -1996,7 +1996,7 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
                 "-v '{s}': cannot mount over {shown} (a box essential mount)"
             )));
         }
-        // The source is either a NAMED volume (a bare name — resolved to its data dir, auto-created
+        // The source is either a NAMED volume (a bare name - resolved to its data dir, auto-created
         // like Docker) or an absolute host path (canonicalized symlink-free; a missing one is
         // rejected early rather than as an opaque post-fork mount failure).
         let source = if crate::volume::is_named(source) {
@@ -2036,7 +2036,7 @@ fn default_if_empty(command: &[String]) -> Vec<String> {
 /// style: the image `Entrypoint` is prepended to either the user's command or (if none) the image's
 /// `Cmd`; a shell is the fallback when nothing is set anywhere. `--ssh` with no command keeps the box
 /// alive instead (the sshd is a child of PID 1, which would otherwise exit). For `--rootfs` the
-/// config is empty, so this reduces to the user's command or a shell — the prior behaviour.
+/// config is empty, so this reduces to the user's command or a shell - the prior behaviour.
 fn resolve_image_command(
     user_command: &[String],
     ssh: bool,
@@ -2172,7 +2172,7 @@ fn validate_hostname(h: Option<&str>) -> Result<Option<String>, Error> {
     }
 }
 
-/// Parse `--tmpfs PATH[:size]` specs into `(path, size)` — `size` a tmpfs `size=` token (`"64m"`),
+/// Parse `--tmpfs PATH[:size]` specs into `(path, size)` - `size` a tmpfs `size=` token (`"64m"`),
 /// empty for the kernel default. The path must be absolute, `.`/`..`/NUL-free, and not shadow a
 /// hardened mount (`/proc`, `/sys`, `/dev`). A bad size (not digits + optional k/m/g/t) is rejected.
 fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
@@ -2215,7 +2215,7 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
 }
 
 /// Parse `--user UID[:GID]` into `(uid, gid)` (a bare `UID` uses `UID` for the gid too). Numeric only
-/// — a user namespace maps ids, not names. `None` → keep the box's namespace root.
+/// - a user namespace maps ids, not names. `None` → keep the box's namespace root.
 fn parse_user(spec: Option<&str>) -> Result<Option<(u32, u32)>, Error> {
     let Some(s) = spec else { return Ok(None) };
     let bad = || Error::Sandbox(format!("--user '{s}': expected UID or UID:GID (numeric)"));
@@ -2232,7 +2232,7 @@ fn parse_user(spec: Option<&str>) -> Result<Option<(u32, u32)>, Error> {
     Ok(Some((uid, gid)))
 }
 
-/// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]` — run a command inside an
+/// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]` - run a command inside an
 /// already-running box, joining its namespaces. Defaults to `/bin/sh`. Propagates the exit code.
 pub fn exec(
     name: &str,
@@ -2301,17 +2301,17 @@ fn cleanup_scratch(scratch: Option<&std::path::Path>) {
         }
         // remove_dir_all failed and the dir is still there: a `--uid-range` box (or a pod member) can
         // leave files owned by SUBORDINATE uids (an image that dropped to e.g. uid 472 → host subuid
-        // 100471) that we — as the plain host user, outside any userns — can't unlink (they sit under
+        // 100471) that we - as the plain host user, outside any userns - can't unlink (they sit under
         // subuid-owned dirs). Retry inside a `newuidmap`-mapped user namespace where those subuids map
         // back to ns-root, so the remove succeeds. This is what `podman unshare rm` does for the same
         // reason. Best-effort: if the range isn't available, we've already tried the plain remove.
         //
-        // TOCTOU (the ranged remove is PRIVILEGED — subuids map to ns-root — and descends a tree a box
+        // TOCTOU (the ranged remove is PRIVILEGED - subuids map to ns-root - and descends a tree a box
         // wrote): a box process surviving teardown could plant a symlink mid-descent to steer the
         // recursive remove outside the scratch tree. Two layers close it: (1) `remove_dir_all` is
         // no-follow at every level (openat+O_NOFOLLOW since Rust 1.26; our MSRV is 1.82, so guaranteed,
         // not toolchain-luck); (2) BEFORE removing, we re-open the target under kern's scratch-root with
-        // `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)` — a kernel-level check that no component is a
+        // `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)` - a kernel-level check that no component is a
         // symlink or escapes the root. If that open is refused, we do NOT run the ranged remove.
         if !scratch_path_is_confined(s) {
             return;
@@ -2321,7 +2321,7 @@ fn cleanup_scratch(scratch: Option<&std::path::Path>) {
 }
 
 /// True iff `dir` opens cleanly under kern's scratch-root with `openat2(RESOLVE_BENEATH |
-/// RESOLVE_NO_SYMLINKS)` — i.e. every path component stays beneath the root and none is a symlink.
+/// RESOLVE_NO_SYMLINKS)` - i.e. every path component stays beneath the root and none is a symlink.
 /// Kernel-enforced (Linux 5.6+ for openat2 / 5.3 for the resolve flags); if openat2 is unavailable the
 /// no-follow `remove_dir_all` + the canonicalized parent check are the fallback confinement.
 fn scratch_path_is_confined(dir: &std::path::Path) -> bool {
@@ -2473,17 +2473,17 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
         // The FIRST probe runs after a short fixed delay, NOT after a full `interval`: a dependent box
         // gated on `service_healthy` should start as soon as the dependency is actually ready, not wait
         // a whole interval for the first check. A service that boots in 50 ms was being held ~1 s just
-        // because `interval: 1s` slept before the first probe — a needless bottleneck in a `depends_on:
+        // because `interval: 1s` slept before the first probe - a needless bottleneck in a `depends_on:
         // condition: service_healthy` stack. Subsequent probes use the real interval.
         if first {
-            unsafe { libc::usleep(100_000) }; // 100 ms — let the process exec before the first probe
+            unsafe { libc::usleep(100_000) }; // 100 ms - let the process exec before the first probe
             first = false;
         } else {
             unsafe { libc::sleep(hc.interval as libc::c_uint) };
             elapsed = elapsed.saturating_add(hc.interval);
         }
         // Current box PID 1 (changes across `--restart`); read it from the registry by name. `find`
-        // opens ONLY this box's entry — critical here: this runs in a per-box checker loop forever, so a
+        // opens ONLY this box's entry - critical here: this runs in a per-box checker loop forever, so a
         // full `list()` would be O(running boxes) every interval → O(N²) steady-state across N checkers.
         let pid1 = registry::find(&name).map(|b| b.pid1).unwrap_or(0);
         let status = if pid1 > 0 {
@@ -2495,7 +2495,7 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
             } else {
                 fails = fails.saturating_add(1);
                 // During the start-period grace, a failure keeps the box "starting" (Docker
-                // semantics — a slow-booting service isn't flapped to unhealthy). After it, a box is
+                // semantics - a slow-booting service isn't flapped to unhealthy). After it, a box is
                 // "unhealthy" only once `retries` checks have failed in a row; until then hold
                 // "starting" so a single blip doesn't trip an orchestrator.
                 if elapsed <= hc.start_period || fails < hc.retries {
@@ -2527,7 +2527,7 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
                     }
                 }
                 // Stop: tear the whole box down (a detached stopper that has escaped this checker's
-                // process group, so the group-kill can't cut its own cleanup short), then exit — the
+                // process group, so the group-kill can't cut its own cleanup short), then exit - the
                 // box is going away, so there's nothing left to check.
                 HealthAction::Stop => {
                     spawn_detached_stop(name.clone());
@@ -2539,7 +2539,7 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
 }
 
 /// Fork a child that has left the caller's process group (`setsid`), with inherited fds shed and
-/// stdio detached — the common prologue of the detached stop/timeout helpers. Returns the child pid
+/// stdio detached - the common prologue of the detached stop/timeout helpers. Returns the child pid
 /// to the parent and `None` to the child (which then runs its body and `_exit`s). Escaping the group
 /// matters because these children call `stop()`, which group-kills the box; an in-group caller would
 /// otherwise be cut down mid-cleanup.
@@ -2563,11 +2563,11 @@ fn spawn_detached_stop(name: String) {
 }
 
 /// Fork a watchdog for a **foreground** `--timeout N`, returning `(watchdog_pid, write_fd)`. The
-/// watchdog is created in the caller's (host) pid namespace — it MUST be forked before the box's
+/// watchdog is created in the caller's (host) pid namespace - it MUST be forked before the box's
 /// `unshare(CLONE_NEWPID)`, so it is an *ancestor* of the box and can therefore signal the box's
 /// ns-init (a same-namespace member cannot). It blocks reading the box's PID 1 from the returned
-/// pipe (written by `on_started`); once it has it, it sleeps `secs`, then SIGTERMs and — after a 2 s
-/// grace — SIGKILLs the box's PID 1, tearing down the whole namespace. If the pipe closes first (the
+/// pipe (written by `on_started`); once it has it, it sleeps `secs`, then SIGTERMs and - after a 2 s
+/// grace - SIGKILLs the box's PID 1, tearing down the whole namespace. If the pipe closes first (the
 /// box exited on its own and the caller cancels), the read returns 0 and the watchdog just exits.
 /// Returns `None` if the pipe/fork failed (the box simply runs without a timeout).
 fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
@@ -2586,7 +2586,7 @@ fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
     }
     if child > 0 {
         // Parent keeps the write end. Mark it close-on-exec so the box's exec'd command doesn't
-        // inherit a live host pipe fd (the parent's own `on_started` write is unaffected — CLOEXEC
+        // inherit a live host pipe fd (the parent's own `on_started` write is unaffected - CLOEXEC
         // only fires on exec).
         unsafe {
             libc::close(rd);
@@ -2606,7 +2606,7 @@ fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
     while got < buf.len() {
         let n = unsafe { libc::read(rd, buf[got..].as_mut_ptr().cast(), buf.len() - got) };
         if n <= 0 {
-            unsafe { libc::_exit(0) }; // pipe closed before a pid arrived — box already gone
+            unsafe { libc::_exit(0) }; // pipe closed before a pid arrived - box already gone
         }
         got += n as usize;
     }
@@ -2614,7 +2614,7 @@ fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
     // Pin the target with a pidfd taken NOW, while the box is still alive: a pidfd refers to that
     // exact process for its whole life, so the delayed signals below can never land on a reused pid
     // (if the box exits during the sleep, the signal just fails with ESRCH). Fall back to plain
-    // `kill(pid1)` only on a kernel too old for pidfd (< 5.3) — the target boards are 5.15+.
+    // `kill(pid1)` only on a kernel too old for pidfd (< 5.3) - the target boards are 5.15+.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
     unsafe {
         libc::sleep(secs as libc::c_uint);
@@ -2626,7 +2626,7 @@ fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
 }
 
 /// Send `sig` to the box's PID 1: via its `pidfd` when we have one (reuse-proof), else plain `kill`.
-/// SAFETY: async-signal-safe — only raw syscalls, called from the post-fork watchdog child.
+/// SAFETY: async-signal-safe - only raw syscalls, called from the post-fork watchdog child.
 unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
     if pidfd >= 0 {
         libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig, 0, 0);
@@ -2638,8 +2638,8 @@ unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
 /// Tear a box down for `kern stop`: SIGKILL its **PID-namespace init** (`pid1`) directly, then sweep
 /// the supervisor's process group. Returns whether the box was **confirmed** gone.
 ///
-/// The kernel destroys the *entire* pid namespace the instant its PID 1 dies, so no workload — not
-/// even a `while True: pass` that ignores SIGTERM — can survive, and `setsid` can't dodge it (it moves
+/// The kernel destroys the *entire* pid namespace the instant its PID 1 dies, so no workload - not
+/// even a `while True: pass` that ignores SIGTERM - can survive, and `setsid` can't dodge it (it moves
 /// the session/process group, not the pid namespace). Signalling `pid1` is also what makes this reach
 /// a **foreground** box: its init is not in the caller's process group, so the historical `kill(-pid)`
 /// alone missed it (there's no group whose id is a non-leader supervisor's pid → a harmless ESRCH).
@@ -2664,7 +2664,7 @@ fn kill_box(pid: i32, pid1: i32) -> bool {
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
     if pidfd >= 0 {
-        // Wait (bounded) for the init to actually exit — POLLIN fires on termination.
+        // Wait (bounded) for the init to actually exit - POLLIN fires on termination.
         let mut pfd = libc::pollfd {
             fd: pidfd,
             events: libc::POLLIN,
@@ -2679,7 +2679,7 @@ fn kill_box(pid: i32, pid1: i32) -> bool {
         let probe = if pid1 > 0 { pid1 } else { pid };
         for _ in 0..100 {
             if unsafe { libc::kill(probe, 0) } != 0 {
-                return true; // ESRCH — the target is gone
+                return true; // ESRCH - the target is gone
             }
             unsafe { libc::usleep(10_000) };
         }
@@ -2721,7 +2721,7 @@ fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> i32 {
     }
     unsafe { libc::sleep(secs as libc::c_uint) };
     // Exact (name,pid)-PAIR probe: a by-name `find` would test the pid against whichever same-name
-    // entry readdir yields first — a duplicate entry (fail-open unclaimed start / pre-claim kern)
+    // entry readdir yields first - a duplicate entry (fail-open unclaimed start / pre-claim kern)
     // could shadow the tracked box and the timeout would silently never fire.
     if registry::pair_alive(&name, sup_pid) {
         let _ = stop(std::slice::from_ref(&name), false);
@@ -2752,7 +2752,7 @@ fn run_probe(pid1: i32, probe: &[String], timeout: u64) -> bool {
 
 /// Human-readable summary of `-p` mappings for `kern ps`, always showing the bind address so the
 /// exposure is visible at a glance (e.g. `127.0.0.1:8080->80, 0.0.0.0:443->443`).
-/// Comma-joined **named volumes** a box mounts (from its `-v name:/dst` specs) — recorded in the
+/// Comma-joined **named volumes** a box mounts (from its `-v name:/dst` specs) - recorded in the
 /// registry so `kern volume rm` can refuse to delete a volume still in use. Host paths and network
 /// URLs are skipped (only named volumes matter here).
 fn mounted_named_volumes(specs: &[String]) -> String {
@@ -2779,7 +2779,7 @@ fn ports_summary(ports: &[kern_isolation::PortMap]) -> String {
 
 /// Read the last `max` bytes of `path`, trimmed, or `None` if the file is missing/empty. Used to
 /// surface a failed detached box's reason inline (the box logged it to its own stderr sink). Reads
-/// the whole file — a box that "exited before starting" has only a few lines — and keeps the tail
+/// the whole file - a box that "exited before starting" has only a few lines - and keeps the tail
 /// lossily so non-UTF-8 output can't hide the reason.
 fn read_log_tail(path: &std::path::Path, max: usize) -> Option<String> {
     let data = std::fs::read(path).ok()?;
@@ -2816,7 +2816,7 @@ fn await_box_started(
             unsafe { libc::waitpid(child, &mut st, 0) };
             // The box's own error went to its per-box log (its stderr was detached there), so the
             // launcher only knows it died. `waitpid` above has reaped the supervisor, so the log is
-            // now fully written — surface its tail inline. This turns the failure from an opaque
+            // now fully written - surface its tail inline. This turns the failure from an opaque
             // "run `kern logs`" round-trip into a reason the user (and a skip-graceful test) can act
             // on immediately, e.g. "unprivileged user namespaces are unavailable" on a locked host.
             // The log is named `<name>-<supervisor pid>.log`, and `child` IS that supervisor pid.
@@ -2830,15 +2830,15 @@ fn await_box_started(
                     "box '{n}' exited before starting:\n{r}\n(run `kern logs {n}` for the full log)"
                 ),
                 None => {
-                    format!("box '{n}' exited before starting — run `kern logs {n}` for the reason")
+                    format!("box '{n}' exited before starting - run `kern logs {n}` for the reason")
                 }
             }));
         }
     } else {
         // No readiness pipe (fd exhaustion): the supervisor hasn't necessarily REGISTERED yet, and
-        // the caller releases its name-claim right after we return — an unlucky concurrent
+        // the caller releases its name-claim right after we return - an unlucky concurrent
         // same-name start could slip into that gap. Wait (bounded, best-effort) for the entry to
-        // appear so the claim's release contract — "after register" — holds on this path too.
+        // appear so the claim's release contract - "after register" - holds on this path too.
         for _ in 0..20 {
             if registry::name_taken(name.as_str()) {
                 break;
@@ -2862,7 +2862,7 @@ fn await_box_started(
 
 /// Supervisor loop: run the box and wait for it; with `--restart` (on-failure) re-run it on a
 /// non-zero exit, up to a cap with a 1 s backoff so a perpetually-crashing box eventually gives up.
-/// Each attempt is a FRESH child — `run_in_sandbox_with` unshares its *caller*, so it can't be
+/// Each attempt is a FRESH child - `run_in_sandbox_with` unshares its *caller*, so it can't be
 /// re-run in place (the second `unshare` would `EINVAL`); the supervisor stays un-namespaced and
 /// just waits. Readiness is signalled only on the first attempt (the launcher already returned by
 /// the time a restart happens). `inst` is re-registered with each attempt's box PID 1.
@@ -2877,10 +2877,10 @@ fn supervise_box(
 ) {
     const MAX_RESTARTS: u32 = 10;
     // `compose` hands a box that is a `depends_completed` target an exit KEY via env `KERN_EXIT_KEY`.
-    // The key is `<pod>-<token>-<name>` — it encodes both the stack AND the `up` epoch, so recording
+    // The key is `<pod>-<token>-<name>` - it encodes both the stack AND the `up` epoch, so recording
     // the final code under it can't collide with a same-named service in another stack, nor with the
     // SAME stack under a concurrent `up` (that run has a different token → a different filename). Absent
-    // for a plain `kern box` — no sidecar is written. Read ONCE at start; the box's own workload can't
+    // for a plain `kern box` - no sidecar is written. Read ONCE at start; the box's own workload can't
     // change our env.
     let exit_key = std::env::var("KERN_EXIT_KEY")
         .ok()
@@ -2904,7 +2904,7 @@ fn supervise_box(
                 None,  // detached boxes have no terminal to attach
                 ports, // the runtime forks `-p` forwarders before unshare, kills them on box exit
                 // Detached: the supervisor is the box's PERSISTENT owner (the launcher already
-                // returned from `await_box_started`), so NEVER arm a launcher PDEATHSIG here — it
+                // returned from `await_box_started`), so NEVER arm a launcher PDEATHSIG here - it
                 // would kill the box the instant the launcher exits. Teardown stays with `kern stop`.
                 false,
             ) {
@@ -2930,7 +2930,7 @@ fn supervise_box(
                 1
             }
         } else {
-            1 // fork or waitpid failed — treat as a failure, don't spin
+            1 // fork or waitpid failed - treat as a failure, don't spin
         };
         attempt += 1;
         if restart && code != 0 && attempt <= MAX_RESTARTS {
@@ -2954,7 +2954,7 @@ fn supervise_box(
 /// What to do when a box's health check turns it "unhealthy" (`--health-action`).
 #[derive(Clone, Copy, PartialEq)]
 enum HealthAction {
-    /// Record the status only (Docker's default) — an orchestrator decides what to do.
+    /// Record the status only (Docker's default) - an orchestrator decides what to do.
     None,
     /// Kill the box so the supervisor restarts it (implies the on-failure restart policy).
     Restart,
@@ -3030,7 +3030,7 @@ fn run_detached(
     }
     // ── Supervisor ──
     // SAFETY (fork): kern is single-threaded (std + libc only, no runtime threads), so running
-    // ordinary Rust — allocation, registry writes — after fork is sound. If a future change ever
+    // ordinary Rust - allocation, registry writes - after fork is sound. If a future change ever
     // spawns a startup thread, this child must be reduced to async-signal-safe calls (or re-exec).
     if have_pipe {
         unsafe { libc::close(rd) };
@@ -3078,7 +3078,7 @@ fn run_detached(
     // Run the box (re-registering with its PID 1 so `kern exec` can find it), restarting it per
     // `--restart`. Blocks for the box's whole lifetime.
     supervise_box(name, &spec, have_pipe, wr, ports, restart, &mut inst);
-    // Box is gone — cancel the sidecars and reap them (they're our children; setsid doesn't change
+    // Box is gone - cancel the sidecars and reap them (they're our children; setsid doesn't change
     // parentage) so we don't leave brief zombies behind before this supervisor exits.
     if let Some(tp) = timeout_pid {
         unsafe {
@@ -3110,7 +3110,7 @@ fn user_systemd_dir() -> Result<PathBuf, Error> {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .ok_or_else(|| {
-            Error::Sandbox("HOME not set — cannot locate the systemd user dir".into())
+            Error::Sandbox("HOME not set - cannot locate the systemd user dir".into())
         })?;
     Ok(PathBuf::from(home).join(".config/systemd/user"))
 }
@@ -3128,7 +3128,7 @@ fn systemctl_user(args: &[&str]) -> bool {
 }
 
 /// Quote one argv element for a systemd `ExecStart=` line: wrap in double quotes and escape the
-/// characters systemd would otherwise act on — `"`/`\` (C-escapes), `$` (env expansion → `$$`), and
+/// characters systemd would otherwise act on - `"`/`\` (C-escapes), `$` (env expansion → `$$`), and
 /// `%` (specifier → `%%`). Keeps arbitrary box names/commands/paths intact when systemd re-runs us.
 fn systemd_quote(arg: &str) -> String {
     let mut out = String::with_capacity(arg.len() + 2);
@@ -3149,7 +3149,7 @@ fn systemd_quote(arg: &str) -> String {
 }
 
 /// `--restart always|unless-stopped` + `-d`: write and enable a systemd **user** unit that supervises
-/// this box, so it restarts on any exit AND survives reboot — WITHOUT a kern daemon (systemd, already
+/// this box, so it restarts on any exit AND survives reboot - WITHOUT a kern daemon (systemd, already
 /// running, is the supervisor). The unit re-runs THIS binary in the foreground with `KERN_MANAGED=1`
 /// (which registers the box for `kern ps`/`logs`/`stop`); `enable --now` starts it immediately and
 /// `enable-linger` makes it come up at boot without a login session. Resource caps (`--memory`,
@@ -3173,7 +3173,7 @@ fn install_persistent_box(
         // Strip kern's own `-d`/`--restart` only among the flags BEFORE the `--` command separator.
         // After `--` the tokens are the box command and must be re-run verbatim (a `-d` there is the
         // workload's argument, not kern's). This can't distinguish a flag from an identical flag
-        // *value* before `--` (e.g. `--workdir -d`), but the CLI already parsed those — only the
+        // *value* before `--` (e.g. `--workdir -d`), but the CLI already parsed those - only the
         // command portion, which we now copy untouched, actually matters for the managed re-run.
         if !past_sep {
             match a.as_str() {
@@ -3190,7 +3190,7 @@ fn install_persistent_box(
         }
         // A newline/CR would break out of the quoted `ExecStart` line and could inject a systemd
         // directive. It can't come from a normal shell, so reject it rather than emit a corrupt unit
-        // (defence in depth — don't rely on systemd itself rejecting the malformed unit).
+        // (defence in depth - don't rely on systemd itself rejecting the malformed unit).
         if a.contains(['\n', '\r']) {
             return Err(Error::Sandbox(
                 "a newline in the command isn't allowed with --restart always \
@@ -3208,7 +3208,7 @@ fn install_persistent_box(
     svc.push_str("Environment=KERN_MANAGED=1\n");
     svc.push_str("Restart=always\nRestartSec=1\n");
     // On stop/restart, SIGTERM the kern wrapper (MainPID) so it tears the box down gracefully, then
-    // SIGKILL anything still in the cgroup after a bounded grace — otherwise a box whose init ignores
+    // SIGKILL anything still in the cgroup after a bounded grace - otherwise a box whose init ignores
     // SIGTERM (PID 1 in its own namespace) would stall the whole 90s default `TimeoutStopSec`.
     svc.push_str("KillMode=mixed\nTimeoutStopSec=10\n");
     if let Some(m) = memory {
@@ -3239,7 +3239,7 @@ fn install_persistent_box(
     let path = dir.join(&unit_name);
     std::fs::write(&path, unit)
         .map_err(|e| Error::Sandbox(format!("cannot write {}: {e}", path.display())))?;
-    // `enable-linger` so it starts at boot without a login session (best-effort — needs the session
+    // `enable-linger` so it starts at boot without a login session (best-effort - needs the session
     // bus); `enable --now` enables + starts it. systemd auto-loads a freshly-written unit on `start`,
     // so we SKIP the ~150ms `daemon-reload` in the common path and only fall back to it if the first
     // enable fails (e.g. a stale cached view of a same-named unit).
@@ -3256,7 +3256,7 @@ fn install_persistent_box(
             systemctl_user(&["reset-failed", &unit_name]);
             systemctl_user(&["daemon-reload"]);
             return Err(Error::Sandbox(
-                "systemctl --user enable failed — is a `systemd --user` manager available for this user?"
+                "systemctl --user enable failed - is a `systemd --user` manager available for this user?"
                     .into(),
             ));
         }
@@ -3266,7 +3266,7 @@ fn install_persistent_box(
     // ExecStart, an image that exits immediately). `is-active` is true for active|activating.
     if !systemctl_user(&["is-active", "--quiet", &unit_name]) {
         return Err(Error::Sandbox(format!(
-            "the box unit was installed but didn't start — check `systemctl --user status {unit_name}` \
+            "the box unit was installed but didn't start - check `systemctl --user status {unit_name}` \
              (then `kern stop {}` to remove it)",
             name.as_str(),
         )));
@@ -3286,7 +3286,7 @@ fn install_persistent_box(
 }
 
 /// Memory + task ceilings for a sandbox scope. `MemorySwapMax=0` makes `MemoryMax` a HARD total
-/// cap — without it, a workload over the RAM cap just swaps (on a host with swap) instead of OOM.
+/// cap - without it, a workload over the RAM cap just swaps (on a host with swap) instead of OOM.
 const SCOPE_MEMORY_MAX: &str = "MemoryMax=512M";
 const SCOPE_SWAP_MAX: &str = "MemorySwapMax=0";
 const SCOPE_TASKS_MAX: &str = "TasksMax=512";
@@ -3312,8 +3312,8 @@ fn reexec_in_scope_if_possible(
     // Honest heads-up (a warning, NOT a refusal): the user asked for `--memory` but this kernel
     // doesn't expose the cgroup v2 `memory` controller to us, so the cap is accepted-but-never-bites.
     // True on Microsoft's DEFAULT WSL2 kernel and a stock Raspberry Pi OS (no `cgroup_enable=memory`)
-    // — the SAME limitation Docker/Podman hit there; it's the environment, not kern. Isolation
-    // (namespaces + seccomp) is unaffected — ONLY the resource cap is. Printed once, in the original
+    // - the SAME limitation Docker/Podman hit there; it's the environment, not kern. Isolation
+    // (namespaces + seccomp) is unaffected - ONLY the resource cap is. Printed once, in the original
     // invocation (the scope re-exec returned above), and never on a normal host, where the controller
     // IS available up the tree so `memory_cap_enforceable()` is true.
     if (memory.is_some() || memory_swap_max.is_some())
@@ -3323,7 +3323,7 @@ fn reexec_in_scope_if_possible(
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             eprintln!(
-                "kern: warning: --memory is not enforced on this host — the kernel doesn't delegate \
+                "kern: warning: --memory is not enforced on this host - the kernel doesn't delegate \
                  the cgroup v2 `memory` controller (Microsoft's default WSL2 kernel, or Raspberry Pi \
                  OS without `cgroup_enable=memory`). The box still runs and stays isolated \
                  (namespaces + seccomp), but its RAM is UNCAPPED. Fix on WSL: add \
@@ -3334,7 +3334,7 @@ fn reexec_in_scope_if_possible(
     }
     if std::env::var_os("KERN_NO_SCOPE").is_some() {
         // Opt-out fast path: skip the systemd transient scope (which costs a `systemd-run` spawn +
-        // a D-Bus round-trip + a second kern re-exec — several ms). Resource caps then fall through
+        // a D-Bus round-trip + a second kern re-exec - several ms). Resource caps then fall through
         // to the best-effort cgroup path (same as when no user systemd is present). For latency-
         // critical callers (e.g. an agent dev loop firing many short boxes) that accept best-effort
         // instead of hard-delegated caps. Safe: it's the already-exercised no-user-systemd branch.
@@ -3345,12 +3345,12 @@ fn reexec_in_scope_if_possible(
         return;
     }
     // FAST PATH (box only): if kern's delegated `kern.slice` is usable, SKIP the per-box `systemd-run
-    // --scope` and let `apply_limits` cap DIRECTLY under it — ~4 ms less/box, same hard kernel caps; a
+    // --scope` and let `apply_limits` cap DIRECTLY under it - ~4 ms less/box, same hard kernel caps; a
     // downstream fail-closed refuses the box if the cap doesn't bite, so it never silently runs uncapped.
     // `choose_direct_cap_path` is THE decision site: it also rules out an outer enforcer
-    // (KERN_MANAGED/KERN_BUILD_STEP — their ancestor already caps, and `apply_limits` wouldn't use
+    // (KERN_MANAGED/KERN_BUILD_STEP - their ancestor already caps, and `apply_limits` wouldn't use
     // kern.slice anyway) and RECORDS the decision, so the fail-closed refusal downstream fires only
-    // when this return was actually taken — never on the `exec()`-failed fall-through below, which
+    // when this return was actually taken - never on the `exec()`-failed fall-through below, which
     // keeps its historical best-effort behavior. NOT for `kern run` (`allow_direct=false`): it
     // exec()s in place with no supervisor to run the guard's Drop, so without the scope's
     // `--collect` its `kern.slice/kern-box-run-*` cgroup would leak forever.
@@ -3387,7 +3387,7 @@ fn reexec_in_scope_if_possible(
     ];
     if let Some(c) = cpus {
         props.push("-p".into());
-        // Floor at 1% — a sub-1% `--cpus` would round to `CPUQuota=0%`, which systemd rejects,
+        // Floor at 1% - a sub-1% `--cpus` would round to `CPUQuota=0%`, which systemd rejects,
         // silently dropping the whole scope (matches the persistent-unit path).
         props.push(format!("CPUQuota={}%", ((c * 100.0).round() as u64).max(1)));
     }
@@ -3399,7 +3399,7 @@ fn reexec_in_scope_if_possible(
     }
     // Resolve `systemd-run` by trusted absolute path, NOT via `$PATH`: on a box start this spawn is on
     // the critical path, and a long user `$PATH` (cargo/nvm/local/…) makes the kernel try execve in each
-    // dir until it finds it — several failed execves per box. The absolute path is one execve. (Same
+    // dir until it finds it - several failed execves per box. The absolute path is one execve. (Same
     // trusted-bin policy as the id-map helpers.)
     let systemd_run = kern_isolation::trusted_helper("systemd-run")
         .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
@@ -3413,7 +3413,7 @@ fn reexec_in_scope_if_possible(
         .env("KERN_SCOPE", "1");
     // A FOREGROUND box must die with its launcher (the SDK's per-request pattern). systemd-run
     // interposes itself as the box supervisor's parent, so the supervisor's own launcher-PDEATHSIG
-    // would fire on systemd-run's death, not the launcher's — leaving the box orphaned until the
+    // would fire on systemd-run's death, not the launcher's - leaving the box orphaned until the
     // `--timeout` backstop. Close that: arm PR_SET_PDEATHSIG(SIGKILL) HERE, before the execve. It
     // survives the (non-setuid) exec into `systemd-run`, so a launcher kill SIGKILLs systemd-run,
     // and the re-exec'd kern (PDEATHSIG vs systemd-run) and box PID 1 (PDEATHSIG vs kern) complete
@@ -3468,7 +3468,7 @@ fn detach_stdio(log: Option<&std::path::Path>) {
     }
 }
 
-/// `kern ps [--json]` — list running boxes. Dead entries are pruned on read.
+/// `kern ps [--json]` - list running boxes. Dead entries are pruned on read.
 pub fn ps(json: bool) -> Result<(), Error> {
     let boxes = registry::list();
     if json {
@@ -3493,13 +3493,13 @@ pub fn ps(json: bool) -> Result<(), Error> {
         println!("{out}");
     } else {
         // Build rows first so the PORTS column can size to its widest value (a published mapping
-        // like `127.0.0.1:8080->80` is wider than the "PORTS" header) — keeps COMMAND aligned.
+        // like `127.0.0.1:8080->80` is wider than the "PORTS" header) - keeps COMMAND aligned.
         let now = registry::now_unix();
         let rows: Vec<(&registry::Instance, u64, String, String)> = boxes
             .iter()
             .map(|b| {
                 let up = now.saturating_sub(b.started);
-                // A frozen box (`kern pause`) is reported as "paused" here — otherwise it looks
+                // A frozen box (`kern pause`) is reported as "paused" here - otherwise it looks
                 // identical to a running one in `ps`.
                 let health = if registry::is_paused(b.pid) {
                     "paused".to_string()
@@ -3531,7 +3531,7 @@ pub fn ps(json: bool) -> Result<(), Error> {
         let width = crate::ui::term_width(libc::STDOUT_FILENO);
         let p = crate::ui::Palette::detect();
         // The visible width before COMMAND is fixed (16+1+7+1+7+2+9+1+pw+1 = 45+pw), so the budget
-        // is computed arithmetically — colour codes never enter the count.
+        // is computed arithmetically - colour codes never enter the count.
         let prefix_w = 45 + pw;
         println!(
             "{d}{:<16} {:>7} {:>7}  {:<9} {:<pw$} COMMAND{z}",
@@ -3544,7 +3544,7 @@ pub fn ps(json: bool) -> Result<(), Error> {
             z = p.z
         );
         // One box row. `connector` is a tree glyph ("├─ "/"└─ ") drawn INSIDE the 16-wide NAME cell
-        // for a pod member, or "" for a standalone box — so every PID column still lines up.
+        // for a pod member, or "" for a standalone box - so every PID column still lines up.
         let print_row =
             |b: &registry::Instance, up: u64, health: &str, ports: &str, connector: &str| {
                 let cw = connector.chars().count();
@@ -3575,7 +3575,7 @@ pub fn ps(json: bool) -> Result<(), Error> {
                 );
             };
         // Standalone boxes (no pod) print flat, exactly like before. Pod members are grouped under a
-        // header line — the `kern ps` mirror of Docker Desktop's collapsed compose-project rows.
+        // header line - the `kern ps` mirror of Docker Desktop's collapsed compose-project rows.
         for (b, up, health, ports) in rows.iter().filter(|(b, ..)| b.pod.is_empty()) {
             print_row(b, *up, health, ports, "");
         }
@@ -3589,7 +3589,7 @@ pub fn ps(json: bool) -> Result<(), Error> {
         }
         for (pod, members) in &pods {
             // Pod header: bold accent name + a dim "(N boxes)" tag. `kern stop <pod>` acts on the whole
-            // group — the header is the "root" the user stops or removes.
+            // group - the header is the "root" the user stops or removes.
             let n = members.len();
             let plural = if n == 1 { "box" } else { "boxes" };
             println!(
@@ -3619,7 +3619,7 @@ fn json_str(s: &str) -> String {
             '\n' => o.push_str("\\n"),
             '\r' => o.push_str("\\r"),
             '\t' => o.push_str("\\t"),
-            // Escape every other control char (C0/DEL/C1, incl. ESC `0x1b`) as `\u00XX` — keeps the
+            // Escape every other control char (C0/DEL/C1, incl. ESC `0x1b`) as `\u00XX` - keeps the
             // JSON valid and stops a crafted registry name/description from injecting a real escape
             // sequence into a terminal that cats the output.
             c if c.is_control() => o.push_str(&format!("\\u{:04x}", c as u32)),
@@ -3636,18 +3636,18 @@ fn json_num(v: Option<u64>) -> String {
     v.map_or_else(|| "null".to_string(), |n| n.to_string())
 }
 
-/// Human-readable byte size — the shared [`kern_common::fmt_bytes`] convention (`ps`/`stats` columns).
+/// Human-readable byte size - the shared [`kern_common::fmt_bytes`] convention (`ps`/`stats` columns).
 pub(crate) fn human_bytes(b: u64) -> String {
     kern_common::fmt_bytes(b)
 }
 
-/// `kern stats [--json]` — current memory + cumulative CPU time per running box (from cgroup).
+/// `kern stats [--json]` - current memory + cumulative CPU time per running box (from cgroup).
 pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
     let mut boxes = registry::list();
     // `stats <name>...` filters to the named boxes; a requested name that isn't running is reported
-    // (not silently dropped — that would look like a box with no stats).
+    // (not silently dropped - that would look like a box with no stats).
     if !names.is_empty() {
-        // name-or-PID (NAME wins globally — an all-digit box name is never shadowed by a coincidental pid).
+        // name-or-PID (NAME wins globally - an all-digit box name is never shadowed by a coincidental pid).
         let live: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
         let hit = |b: &registry::Instance, n: &str| -> bool {
             n == b.name || (!live.iter().any(|m| m == n) && n.parse::<i32>().ok() == Some(b.pid))
@@ -3665,7 +3665,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
             if i > 0 {
                 out.push(',');
             }
-            // `null` (not 0) when the box has no dedicated cgroup to read — "unknown", not "zero".
+            // `null` (not 0) when the box has no dedicated cgroup to read - "unknown", not "zero".
             let num = json_num;
             out.push_str(&format!(
                 "{{\"name\":{},\"pid\":{},\"mem_bytes\":{},\"cpu_usec\":{}}}",
@@ -3699,7 +3699,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern inspect <name> [--json]` — full detail for one running box: its identity (pid, pid1,
+/// `kern inspect <name> [--json]` - full detail for one running box: its identity (pid, pid1,
 /// rootfs, command, ports, uptime) plus live resource readings (mem/cpu/tasks) and health. A
 /// superset of one `ps`+`stats` row for a single box. Untrusted fields (rootfs, command) are
 /// scrubbed of terminal-escape sequences before display, exactly like the status panel and tables.
@@ -3713,7 +3713,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     let tasks = registry::tasks(b.pid);
     let up = registry::now_unix().saturating_sub(b.started);
     if json {
-        // `null` (not 0) for a resource the box has no dedicated cgroup to read — "unknown".
+        // `null` (not 0) for a resource the box has no dedicated cgroup to read - "unknown".
         let num = json_num;
         println!(
             "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{}}}",
@@ -3755,7 +3755,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern prune` — garbage-collect leftover `logs/` and `health/` sidecar files from boxes that are
+/// `kern prune` - garbage-collect leftover `logs/` and `health/` sidecar files from boxes that are
 /// no longer running (a detached box's captured log outlives it). Live boxes are never touched.
 /// Reports what it reclaimed (feedback-first: an explicit "nothing to prune" rather than silence).
 pub fn prune() -> Result<(), Error> {
@@ -3775,13 +3775,13 @@ pub fn prune() -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern gc [--images]` — `prune` the dead-box sidecars, and with `--images` also reclaim the pulled
+/// `kern gc [--images]` - `prune` the dead-box sidecars, and with `--images` also reclaim the pulled
 /// OCI image cache. Never touches a running box or a partially-in-use image dir.
 pub fn gc(images: bool) -> Result<(), Error> {
     prune()?;
     // Sweep orphaned build layers: a `kern build` that changes a RUN/COPY leaves its old layer dirs
     // in `L/`, referenced by no image. Delete any `L/<key>` (+ `.ok`) not named in a `<tag>.layers`
-    // manifest — bounds the layer cache without nuking the shared, still-referenced layers.
+    // manifest - bounds the layer cache without nuking the shared, still-referenced layers.
     let (n, freed) = sweep_orphan_layers();
     if n > 0 {
         let p = crate::ui::Palette::detect();
@@ -3847,7 +3847,7 @@ fn sweep_orphan_layers() -> (usize, u64) {
     // Collect every layer key still referenced by some image's `.layers` manifest. This set is used
     // to decide what to DELETE, so it must be COMPLETE: if we can't read a manifest (transient IO /
     // permission error), a layer referenced only by it would look orphaned and be wrongly deleted.
-    // Fail closed — abort the whole sweep (delete nothing) rather than sweep on a partial set.
+    // Fail closed - abort the whole sweep (delete nothing) rather than sweep on a partial set.
     let mut referenced = std::collections::HashSet::new();
     if let Ok(rd) = std::fs::read_dir(&cache) {
         for e in rd.flatten() {
@@ -3889,7 +3889,7 @@ fn sweep_orphan_layers() -> (usize, u64) {
     (count, freed)
 }
 
-/// `kern bench [--rootfs R] [-n N]` — measure end-to-end box start→exit latency by running N throwaway
+/// `kern bench [--rootfs R] [-n N]` - measure end-to-end box start→exit latency by running N throwaway
 /// boxes (each `/bin/true`, foreground) and timing them, then reporting min/median/avg/max +
 /// boxes/sec. This is the real user-facing number (it spawns `kern box` just like you would), so it's
 /// the honest figure to quote. Needs a `--rootfs` with a `/bin/true` (any busybox/distro rootfs).
@@ -3915,11 +3915,11 @@ pub fn bench(rootfs: Option<&str>, count: u32) -> Result<(), Error> {
             .unwrap_or(false);
         ok.then(|| t0.elapsed())
     };
-    // Warm-up (image/overlay caches, first scope) — discarded.
+    // Warm-up (image/overlay caches, first scope) - discarded.
     let pid = std::process::id();
     if one(&format!("bench-{pid}-warm")).is_none() {
         return Err(Error::Sandbox(
-            "bench box failed to run — does the rootfs have /bin/true? (try a busybox/distro rootfs)"
+            "bench box failed to run - does the rootfs have /bin/true? (try a busybox/distro rootfs)"
                 .into(),
         ));
     }
@@ -3961,7 +3961,7 @@ pub fn bench(rootfs: Option<&str>, count: u32) -> Result<(), Error> {
 
 /// Sweep orphaned overlay scratch: `<scratch>/<name>-<pid>/` dirs whose box is no longer live.
 /// Returns `(dirs_removed, bytes_freed)`. Shared by `recover` (its whole job) and `gc` (folded in so
-/// `gc` is the ONE full local cleanup — previously only `recover` reclaimed scratch, and it was easy
+/// `gc` is the ONE full local cleanup - previously only `recover` reclaimed scratch, and it was easy
 /// to miss, so crashed-box overlay dirs quietly piled up).
 fn sweep_orphan_scratch() -> (u32, u64) {
     // `registry::list()` already prunes entries whose process is dead on read; call it to get the
@@ -3980,7 +3980,7 @@ fn sweep_orphan_scratch() -> (u32, u64) {
             if !live_scratch.contains(&merged.to_string_lossy().into_owned()) && path.is_dir() {
                 freed += dir_size(&path);
                 // Use the chmod-then-remove force cleaner: an overlay leaves a mode-000 `work/work`
-                // dir that plain `remove_dir_all` can't traverse (Permission denied) — the bug that made
+                // dir that plain `remove_dir_all` can't traverse (Permission denied) - the bug that made
                 // recover a silent no-op while orphans piled up. `gc`/`prune` already use this helper.
                 remove_build_tree(&path);
                 if !path.exists() {
@@ -3992,7 +3992,7 @@ fn sweep_orphan_scratch() -> (u32, u64) {
     (recovered, freed)
 }
 
-/// `kern recover` — reconcile the runtime state: drop registry entries for boxes whose process is
+/// `kern recover` - reconcile the runtime state: drop registry entries for boxes whose process is
 /// gone (a crash/kill that skipped the supervisor's cleanup) and remove the orphaned overlay scratch
 /// they left behind. Never touches a live box.
 pub fn recover() -> Result<(), Error> {
@@ -4000,7 +4000,7 @@ pub fn recover() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     if recovered == 0 {
         println!(
-            "{}nothing to recover — runtime state is consistent{}",
+            "{}nothing to recover - runtime state is consistent{}",
             p.d, p.z
         );
     } else {
@@ -4014,7 +4014,7 @@ pub fn recover() -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern history [-n N]` — the most recent boxes, reconstructed from their captured log files
+/// `kern history [-n N]` - the most recent boxes, reconstructed from their captured log files
 /// (`<name>-<pid>.log`): name, pid, when it last ran, and whether it's still running. A lightweight
 /// audit trail without a separate history store (prune/gc remove these, so it's "recent", not "all").
 pub fn history(count: usize) -> Result<(), Error> {
@@ -4027,7 +4027,7 @@ pub fn history(count: usize) -> Result<(), Error> {
             let Some(stem) = fname.strip_suffix(".log") else {
                 continue;
             };
-            // `<name>-<pid>` — split on the LAST '-' (a name may contain '-').
+            // `<name>-<pid>` - split on the LAST '-' (a name may contain '-').
             let Some((name, pid_s)) = stem.rsplit_once('-') else {
                 continue;
             };
@@ -4079,14 +4079,14 @@ pub fn history(count: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern images [--json]` — list OCI images pulled into the local cache. Each completed pull leaves
+/// `kern images [--json]` - list OCI images pulled into the local cache. Each completed pull leaves
 /// a `<sanitized>.ok` sentinel whose *content* is the original image ref, next to the `<sanitized>/`
-/// rootfs dir — so we recover the real name, the on-disk size, and when it was pulled.
+/// rootfs dir - so we recover the real name, the on-disk size, and when it was pulled.
 /// One cached OCI image as shown by `kern images` and the `kern top` Images tab.
 pub(crate) struct ImageEntry {
     /// The original ref (`repository:tag`), recovered from the `.ok` sentinel's content.
     pub name: String,
-    /// On-disk size in bytes (0 for an empty build — a valid image that added no files).
+    /// On-disk size in bytes (0 for an empty build - a valid image that added no files).
     pub size: u64,
     /// When it was pulled/built (unix seconds).
     pub pulled: u64,
@@ -4096,7 +4096,7 @@ pub(crate) struct ImageEntry {
     pub dangling: bool,
 }
 
-/// On-disk `(size_bytes, dangling)` of cached image `<stem>`, computed in ONE pass — a flat pulled
+/// On-disk `(size_bytes, dangling)` of cached image `<stem>`, computed in ONE pass - a flat pulled
 /// image (`<stem>/`) or single-diff build (`<stem>.diff/`) is sized by its dir and never dangles; a
 /// multi-layer build sums its referenced `L/<key>` dirs AND dangles if any is missing (a present but
 /// 0-byte layer is a valid EMPTY build, not dangling); a sentinel with no payload at all dangles. Both
@@ -4135,7 +4135,7 @@ fn image_stat(cache: &std::path::Path, stem: &str) -> (u64, bool) {
     }
 }
 
-/// The cached OCI images, sorted by name — the SINGLE source for both `kern images` and the `kern top`
+/// The cached OCI images, sorted by name - the SINGLE source for both `kern images` and the `kern top`
 /// Images tab, so the CLI and TUI can never drift on which images exist, their sizes, or their health.
 pub(crate) fn image_entries() -> Vec<ImageEntry> {
     let cache = cache_dir();
@@ -4192,7 +4192,7 @@ pub fn images(json: bool) -> Result<(), Error> {
         out.push(']');
         println!("{out}");
     } else if rows.is_empty() {
-        println!("no images cached yet — pull one with `kern pull <image>` (or `kern box <name> --image <image>`)");
+        println!("no images cached yet - pull one with `kern pull <image>` (or `kern box <name> --image <image>`)");
     } else {
         let p = crate::ui::Palette::detect();
         println!(
@@ -4205,7 +4205,7 @@ pub fn images(json: bool) -> Result<(), Error> {
         let now = registry::now_unix();
         let mut dangling = 0usize;
         for e in &rows {
-            // `truncate` also strips escapes — the `.ok` sentinel content is untrusted.
+            // `truncate` also strips escapes - the `.ok` sentinel content is untrusted.
             let repo = format!("{}{}{:<30}{}", p.b, p.c, truncate(&e.name, 30), p.z);
             // A dangling image shows an explicit `dangling` (yellow), never a `0 B` that reads as "empty".
             let size = if e.dangling {
@@ -4218,7 +4218,7 @@ pub fn images(json: bool) -> Result<(), Error> {
         }
         if dangling > 0 {
             println!(
-                "{d}{dangling} dangling (missing layers) — reclaim with {z}{c}kern rmi <image>{z}{d} or {z}{c}kern gc{z}",
+                "{d}{dangling} dangling (missing layers) - reclaim with {z}{c}kern rmi <image>{z}{d} or {z}{c}kern gc{z}",
                 d = p.d,
                 z = p.z,
                 c = p.c
@@ -4231,7 +4231,7 @@ pub fn images(json: bool) -> Result<(), Error> {
 /// A stem is a real [`sanitize_ref`] token only when it's non-empty and every byte is `[A-Za-z0-9_-]`.
 /// Delete paths gate on this so a **planted** `.ok` filename can never steer a removal outside the
 /// cache: e.g. a file literally named `...ok` has `Path::file_stem() == ".."`, which unchecked would
-/// make `cache.join(stem)` resolve to the cache's PARENT — `is_safe_stem` rejects it (`.` isn't allowed).
+/// make `cache.join(stem)` resolve to the cache's PARENT - `is_safe_stem` rejects it (`.` isn't allowed).
 fn is_safe_stem(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
@@ -4240,9 +4240,9 @@ fn is_safe_stem(s: &str) -> bool {
 
 /// The on-disk artifacts of cached image `<stem>`: the flat rootfs dir, a single-diff dir, and the
 /// `.layers`/`.base`/`.image`/`.ok`/`.lock` sidecars. ONE place owns this list so every remover (`rmi`,
-/// untag, temp-stage drop) deletes the SAME set and can't drift — a leaked `.base`/`.image` would
+/// untag, temp-stage drop) deletes the SAME set and can't drift - a leaked `.base`/`.image` would
 /// otherwise linger and misclassify a later same-name pull. Best-effort; a missing artifact is fine.
-/// `stem` MUST already be a [`sanitize_ref`] token (see [`is_safe_stem`]) — never raw user input.
+/// `stem` MUST already be a [`sanitize_ref`] token (see [`is_safe_stem`]) - never raw user input.
 fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
     let _ = std::fs::remove_dir_all(cache.join(stem));
     let _ = std::fs::remove_dir_all(cache.join(format!("{stem}.diff")));
@@ -4255,7 +4255,7 @@ fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
 /// sweep any `L/` layers left referenced by no remaining image (shared layers survive). Returns bytes
 /// freed, or `None` if nothing matched. Resolution scans the `.ok` sentinels and prefers an exact REF
 /// (sentinel content) match over a stem match, so an image whose ref happens to equal another's stem
-/// can't be deleted by accident. Entries with an unsafe stem or an unreadable sentinel are skipped — a
+/// can't be deleted by accident. Entries with an unsafe stem or an unreadable sentinel are skipped - a
 /// crafted name never steers the delete, and an empty `want` matches nothing.
 fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     if want.is_empty() {
@@ -4277,7 +4277,7 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
             if st == want {
                 by_stem = Some(st.to_string());
             }
-            // Only a READABLE sentinel counts as a ref match — never default to matching "".
+            // Only a READABLE sentinel counts as a ref match - never default to matching "".
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if content.trim() == want {
                     by_ref = Some(st.to_string());
@@ -4288,7 +4288,7 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     }
     let stem = by_ref.or(by_stem)?;
     // The image's OWN on-disk payload (flat + single-diff), measured before removal. A multi-layer image
-    // owns no dir here — its bytes live in the shared `L/` cache, accounted by the orphan sweep below.
+    // owns no dir here - its bytes live in the shared `L/` cache, accounted by the orphan sweep below.
     let mut freed = 0u64;
     let flat = cache.join(&stem);
     let diff = cache.join(format!("{stem}.diff"));
@@ -4305,13 +4305,13 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     Some(freed + layer_freed)
 }
 
-/// `kern rmi <image>...` — remove one or more cached images by ref (or sanitized stem). Per-image
+/// `kern rmi <image>...` - remove one or more cached images by ref (or sanitized stem). Per-image
 /// feedback: what it freed on success; any unknown ref is collected and the command FAILS (non-zero
-/// exit, one error listing them) so `kern rmi x && …` can't proceed on a no-op — matching `docker rmi`.
+/// exit, one error listing them) so `kern rmi x && …` can't proceed on a no-op - matching `docker rmi`.
 pub fn image_rm(refs: &[String]) -> Result<(), Error> {
     if refs.is_empty() {
         return Err(Error::Usage(
-            "rmi <image>... — name at least one image (see `kern images`)",
+            "rmi <image>... - name at least one image (see `kern images`)",
         ));
     }
     let cache = cache_dir();
@@ -4332,7 +4332,7 @@ pub fn image_rm(refs: &[String]) -> Result<(), Error> {
     }
     if !missing.is_empty() {
         return Err(Error::Oci(format!(
-            "no such image: {} — `kern images` lists cached images",
+            "no such image: {} - `kern images` lists cached images",
             missing.join(", ")
         )));
     }
@@ -4346,7 +4346,7 @@ pub(crate) fn image_prune() -> Result<(), Error> {
     let (n, freed) = sweep_orphan_layers();
     let p = crate::ui::Palette::detect();
     if n == 0 {
-        println!("{}nothing to prune — no orphaned layers{}", p.d, p.z);
+        println!("{}nothing to prune - no orphaned layers{}", p.d, p.z);
     } else {
         println!(
             "{}pruned{} {n} orphaned layer{}, freed {}",
@@ -4359,7 +4359,7 @@ pub(crate) fn image_prune() -> Result<(), Error> {
     Ok(())
 }
 
-/// One build record as a JSON object — the single emitter for both `kern builds --json` (an array of
+/// One build record as a JSON object - the single emitter for both `kern builds --json` (an array of
 /// these) and `kern build inspect --json` (one of these), so the two can't drift on fields or escaping.
 fn build_json(r: &crate::builds::Record) -> String {
     format!(
@@ -4388,7 +4388,7 @@ fn fmt_dur(ms: u64) -> String {
     }
 }
 
-/// `kern builds [<tag>] [--status S] [-n N] [--json]` — the build history: one row per past `kern
+/// `kern builds [<tag>] [--status S] [-n N] [--json]` - the build history: one row per past `kern
 /// build`, newest first (the kern analogue of Docker Desktop's "Builds" panel / `docker buildx
 /// history`). Optional query: `<tag>` keeps builds whose tag contains the substring, `--status`
 /// filters by outcome, `-n` caps to the N newest.
@@ -4417,12 +4417,12 @@ pub fn builds_list(
         out.push(']');
         println!("{out}");
     } else if recs.is_empty() {
-        // Distinguish "history is empty" from "your query matched nothing" — else a filter that finds
+        // Distinguish "history is empty" from "your query matched nothing" - else a filter that finds
         // nothing looks like you've never built.
         if filter.is_some() || status.is_some() || limit.is_some() {
-            println!("no builds match — run `kern builds` to see the full history");
+            println!("no builds match - run `kern builds` to see the full history");
         } else {
-            println!("no builds yet — build one with `kern build -t <name> .`");
+            println!("no builds yet - build one with `kern build -t <name> .`");
         }
     } else {
         let p = crate::ui::Palette::detect();
@@ -4473,7 +4473,7 @@ pub fn builds_list(
     Ok(())
 }
 
-/// `kern build logs <id>` — the captured transcript of a past build.
+/// `kern build logs <id>` - the captured transcript of a past build.
 pub fn build_logs(id: &str) -> Result<(), Error> {
     if crate::builds::get(id).is_none() {
         return Err(Error::Build(format!("no build '{id}'")));
@@ -4485,14 +4485,14 @@ pub fn build_logs(id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern build inspect <id> [--json]` — full detail for one past build.
+/// `kern build inspect <id> [--json]` - full detail for one past build.
 pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
     let r = crate::builds::get(id).ok_or_else(|| Error::Build(format!("no build '{id}'")))?;
     if json {
         println!("{}", build_json(&r));
     } else {
         let p = crate::ui::Palette::detect();
-        // Free-text fields (tag/dockerfile/context/error) are scrubbed of terminal escapes — a record
+        // Free-text fields (tag/dockerfile/context/error) are scrubbed of terminal escapes - a record
         // with a crafted tag can't inject an escape sequence into a terminal that runs `inspect` (same
         // guard the `builds` table and `--json` already apply).
         let s = crate::ui::scrub;
@@ -4512,7 +4512,7 @@ pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern build rm <id>...` — delete build-history records.
+/// `kern build rm <id>...` - delete build-history records.
 pub fn build_rm(ids: &[String]) -> Result<(), Error> {
     for id in ids {
         if crate::builds::remove(id) {
@@ -4524,14 +4524,14 @@ pub fn build_rm(ids: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern build prune [--keep N]` — keep the N newest build records, delete the rest.
+/// `kern build prune [--keep N]` - keep the N newest build records, delete the rest.
 pub fn build_prune(keep: usize) -> Result<(), Error> {
     let n = crate::builds::prune(keep);
     println!("pruned {n} build record(s); kept the {keep} newest");
     Ok(())
 }
 
-/// On-disk size of cached image `<stem>` — the size half of [`image_stat`]. Used by the build-history
+/// On-disk size of cached image `<stem>` - the size half of [`image_stat`]. Used by the build-history
 /// record (which needs only the size, not the health flag).
 fn image_size(cache: &std::path::Path, stem: &str) -> u64 {
     image_stat(cache, stem).0
@@ -4563,7 +4563,7 @@ fn fmt_age(secs: u64) -> String {
     }
 }
 
-/// `kern search <query> [--json]` — search Docker Hub (the same registry `kern pull` uses) for
+/// `kern search <query> [--json]` - search Docker Hub (the same registry `kern pull` uses) for
 /// public images. Prints name, stars, whether it's an official image, and the description.
 pub fn search(query: &str, json: bool) -> Result<(), Error> {
     let results = kern_oci::search(query, 25).map_err(|e| Error::Oci(e.to_string()))?;
@@ -4597,7 +4597,7 @@ pub fn search(query: &str, json: bool) -> Result<(), Error> {
             z = p.z
         );
         for r in &results {
-            // NAME bold-cyan, OFFICIAL a green check, DESCRIPTION dim — all on PLAIN-padded cells so
+            // NAME bold-cyan, OFFICIAL a green check, DESCRIPTION dim - all on PLAIN-padded cells so
             // alignment holds. Both name and description are untrusted (registry data) → escapes stripped.
             let name = format!("{}{}{:<32}{}", p.b, p.c, truncate(&r.name, 32), p.z);
             let official = if r.official {
@@ -4626,7 +4626,7 @@ fn truncate(s: &str, max: usize) -> String {
     t
 }
 
-/// `kern logs <name>` — print the captured stdout/stderr of the most recent box named `name`.
+/// `kern logs <name>` - print the captured stdout/stderr of the most recent box named `name`.
 pub fn logs(name: &str) -> Result<(), Error> {
     // Accept a `kern ps` PID too: a live box's pid resolves to its name; a name (incl. a stopped box,
     // whose log file persists) is used as-is.
@@ -4680,7 +4680,7 @@ fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
     Ok(newest.map(|(_, p)| p))
 }
 
-/// `kern attach <name>` — stream a running (detached) box's output live until it exits or you press
+/// `kern attach <name>` - stream a running (detached) box's output live until it exits or you press
 /// Ctrl-C (which **detaches** without stopping the box; a detached box has no stdin, so this is
 /// output-only). Prints the log so far, then follows appends by polling the file, and stops when the
 /// box leaves the registry.
@@ -4696,7 +4696,7 @@ pub fn attach(name: &str) -> Result<(), Error> {
         )));
     };
     eprintln!(
-        "kern: attached to '{name}' (pid {}) — Ctrl-C detaches (box keeps running)",
+        "kern: attached to '{name}' (pid {}) - Ctrl-C detaches (box keeps running)",
         bx.pid
     );
     let mut f =
@@ -4715,19 +4715,19 @@ pub fn attach(name: &str) -> Result<(), Error> {
                 Err(_) => break,
             }
         }
-        // Stop once the box is gone (drain one final time first, above). Exact (name,pid) pair —
+        // Stop once the box is gone (drain one final time first, above). Exact (name,pid) pair -
         // a duplicate same-name entry must not make a live box read as exited (see `pair_alive`).
         if !registry::pair_alive(name, bx.pid) {
             eprintln!("kern: box '{name}' exited");
             return Ok(());
         }
-        unsafe { libc::usleep(200_000) }; // 200 ms — cheap follow poll
+        unsafe { libc::usleep(200_000) }; // 200 ms - cheap follow poll
     }
 }
 
-/// `kern top` — live, auto-refreshing view of running boxes (name, pid, uptime, mem, cpu%).
+/// `kern top` - live, auto-refreshing view of running boxes (name, pid, uptime, mem, cpu%).
 /// Reads the registry + each box's cgroup every second; exit with Ctrl-C.
-/// `kern top` — an interactive task-manager TUI (tabs, live refresh, keyboard nav) when stdout is
+/// `kern top` - an interactive task-manager TUI (tabs, live refresh, keyboard nav) when stdout is
 /// a terminal; a one-shot table when piped. The implementation lives in [`crate::tui`].
 pub fn top() -> Result<(), Error> {
     use std::io::IsTerminal;
@@ -4749,7 +4749,7 @@ pub(crate) fn fmt_uptime(s: u64) -> String {
     }
 }
 
-/// `kern pull <image> [--dest <dir>]` — download an OCI image into a rootfs directory.
+/// `kern pull <image> [--dest <dir>]` - download an OCI image into a rootfs directory.
 pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(), Error> {
     let dest = match dest {
         Some(d) => PathBuf::from(d),
@@ -4768,7 +4768,7 @@ pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(
     if let Some(p) = &plat {
         if !p.is_host() {
             eprintln!(
-                "note: pulled linux/{} — it won't run natively on this {} host without a qemu-user + binfmt handler",
+                "note: pulled linux/{} - it won't run natively on this {} host without a qemu-user + binfmt handler",
                 p.as_oci_arch(),
                 kern_oci::Platform::host().as_oci_arch()
             );
@@ -4781,7 +4781,7 @@ pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// `kern push <local-ref> [as <remote-ref>]` — publish a locally-cached image to a registry as a
+/// `kern push <local-ref> [as <remote-ref>]` - publish a locally-cached image to a registry as a
 /// single-layer OCI image. The image must be present in the cache (pull/build it first). A push to a
 /// private repo needs `kern login`. The rootfs is materialized (flat cache dir, or the overlay chain
 /// squashed) and packed into one layer.
@@ -4812,10 +4812,10 @@ pub fn push(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
     result
 }
 
-/// `kern save <image> [-o file]` — export a cached image to a `docker load`-compatible tar (offline /
+/// `kern save <image> [-o file]` - export a cached image to a `docker load`-compatible tar (offline /
 /// air-gapped transfer). Materializes the image to one rootfs (like `push`), then writes the archive.
 /// Normalise an image ref to a `repo:tag` that `docker load` accepts: append `:latest` when the ref
-/// carries no tag. A registry port (`localhost:5000/img`) is not a tag — only a `:` in the LAST path
+/// carries no tag. A registry port (`localhost:5000/img`) is not a tag - only a `:` in the LAST path
 /// component (after the final `/`) counts, so `localhost:5000/app` → `localhost:5000/app:latest`.
 fn ensure_repo_tag(image: &str) -> String {
     let last = image.rsplit('/').next().unwrap_or(image);
@@ -4839,7 +4839,7 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("save work dir: {e}")))?;
     // `docker load` REJECTS a bare repo with no tag ("invalid tag 'alpine'"), so the RepoTag must be a
-    // full `repo:tag` — normalise a tagless ref to `…:latest` (matching how `docker save alpine` writes
+    // full `repo:tag` - normalise a tagless ref to `…:latest` (matching how `docker save alpine` writes
     // `alpine:latest`). Keeps kern↔docker save/load interop working for the common `kern save alpine`.
     let repo_tag = ensure_repo_tag(image);
     let result = kern_oci::save(
@@ -4864,7 +4864,7 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     result
 }
 
-/// `kern load [-i file]` — import an image from a `docker save`-format tar (kern's OR docker's), file
+/// `kern load [-i file]` - import an image from a `docker save`-format tar (kern's OR docker's), file
 /// or stdin. Every tar is vetted + extracted through the SAME hardened path as `pull` (an archive is
 /// as untrusted as a registry image).
 pub fn load(input: Option<&str>) -> Result<(), Error> {
@@ -4883,7 +4883,7 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
     };
     for img in &loaded {
         let Some(primary) = img.repo_tags.first() else {
-            eprintln!("kern: loaded an untagged image (skipped — no name to reference it by)");
+            eprintln!("kern: loaded an untagged image (skipped - no name to reference it by)");
             continue;
         };
         let safe = sanitize_ref(primary);
@@ -4907,12 +4907,12 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern tag <src> <dst>` — give a cached image a second name, so `build -t x` then `tag x y:1.0` then
-/// `push y:1.0` works like Docker. Content-addressed: the shared `L/` build layers are NOT duplicated —
+/// `kern tag <src> <dst>` - give a cached image a second name, so `build -t x` then `tag x y:1.0` then
+/// `push y:1.0` works like Docker. Content-addressed: the shared `L/` build layers are NOT duplicated -
 /// a layered image's `.layers` manifest is copied and simply references the same layer keys (which `gc`
 /// keeps alive while ANY `.layers` names them). A flat/single-diff image's rootfs dir IS copied (it's the
 /// image's own bytes). Both names are `sanitize_ref`'d, so a `dst` like `../../etc` can't escape the cache
-/// (it maps to a safe key) — the same collision-free key rule as every other cache path.
+/// (it maps to a safe key) - the same collision-free key rule as every other cache path.
 pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     let cache = cache_dir();
     own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
@@ -4921,11 +4921,11 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     if src_safe == dst_safe {
         return Ok(()); // tagging to the same key is a no-op (not an error, like Docker)
     }
-    // The `.ok` marker is the "this image exists" sentinel — its absence means not cached.
+    // The `.ok` marker is the "this image exists" sentinel - its absence means not cached.
     let src_ok = cache.join(format!("{src_safe}.ok"));
     if !src_ok.exists() {
         return Err(Error::Oci(format!(
-            "no such image '{src}' — `kern images` lists cached images"
+            "no such image '{src}' - `kern images` lists cached images"
         )));
     }
     // Copy the config sidecar (best-effort: an old image may predate it).
@@ -4946,7 +4946,7 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     let flat = cache.join(&src_safe);
     let diff = cache.join(format!("{src_safe}.diff"));
     let layers = cache.join(format!("{src_safe}.layers"));
-    // Clear any PRIOR image at `dst` first (all forms) — otherwise re-tagging over an existing image
+    // Clear any PRIOR image at `dst` first (all forms) - otherwise re-tagging over an existing image
     // would leave stale files from the old one (a hybrid rootfs) or a mismatched sidecar. Like Docker,
     // a tag REPLACES the destination. The `.ok` marker is written LAST (below), so an interrupted
     // re-tag can't leave a half-image that `images`/`push` treats as valid.
@@ -4964,14 +4964,14 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
         cp_file(".layers")?;
         cp_file(".base")?;
     } else if diff.is_dir() {
-        // A single-diff image is `<safe>.diff/` stacked over its `<safe>.base` marker (the base ref) —
+        // A single-diff image is `<safe>.diff/` stacked over its `<safe>.base` marker (the base ref) -
         // `resolve_image` needs BOTH, so copy the diff dir AND the base marker, or the tag would fail to
         // resolve (no `.base` → fall through to a re-pull).
         copy_tree(&diff, &cache.join(format!("{dst_safe}.diff")))?;
         cp_file(".base")?;
     } else {
         return Err(Error::Oci(format!(
-            "image '{src}' is cached but has no rootfs form — try re-pulling"
+            "image '{src}' is cached but has no rootfs form - try re-pulling"
         )));
     }
     // Write the `.ok` marker LAST (so an interrupted tag leaves no half-image that `images`/`push` sees),
@@ -5163,8 +5163,8 @@ impl FreezeGuard {
                 for &sig in &Self::TRAP {
                     unsafe {
                         let mut new: libc::sigaction = std::mem::zeroed();
-                        new.sa_sigaction =
-                            thaw_on_fatal_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                        new.sa_sigaction = thaw_on_fatal_signal as extern "C" fn(libc::c_int)
+                            as libc::sighandler_t;
                         libc::sigemptyset(&mut new.sa_mask);
                         // SA_RESETHAND: the kernel resets the handler to SIG_DFL before invoking it, so the
                         // handler's re-raise dies by default action without any (non-async-signal-safe)
@@ -5310,26 +5310,26 @@ fn copy_rootfs_snapshot(
 /// semantics so a file DELETED in an upper layer (`rm -rf dir && mkdir dir` → an OPAQUE directory, or a
 /// per-file `.wh.` whiteout) can never resurface. This is the ONE correct reader for a ≥2-layer image:
 /// a hand-rolled top-first / bottom-up `cp -a` of the RAW layer dirs ignores the opaque xattr and leaks
-/// the deleted file (a real confidentiality bug — a secret `rm`'d in a build step reappearing in a
+/// the deleted file (a real confidentiality bug - a secret `rm`'d in a build step reappearing in a
 /// `COPY --from` or a pushed image). Letting the KERNEL present the merged view is the only way that
-/// honours opaque + whiteout + redirect_dir + metacopy — the kernel is the authority, not our code.
+/// honours opaque + whiteout + redirect_dir + metacopy - the kernel is the authority, not our code.
 ///
 /// HOW (no box, no `newuidmap`, no pseudo-fs, no external `cp`/`tar`): open an fd on `out_dir` (the copy
-/// DESTINATION) FIRST — on the host, before any namespace work — then fork a child that
-///   1. `unshare(CLONE_NEWUSER | CLONE_NEWNS)` and writes a SINGLE-UID self map (`0 <euid> 1`) — this
+/// DESTINATION) FIRST - on the host, before any namespace work - then fork a child that
+///   1. `unshare(CLONE_NEWUSER | CLONE_NEWNS)` and writes a SINGLE-UID self map (`0 <euid> 1`) - this
 ///      alone grants CAP_SYS_ADMIN *inside the new userns*, enough to mount an overlay, WITHOUT the
 ///      setuid `newuidmap` helper (that's only needed to map a *range* of subuids). No `/etc/subuid`.
 ///   2. mounts the `chain` as a READ-ONLY overlay (`MS_RDONLY|MS_NODEV|MS_NOSUID`) on a private temp
-///      mountpoint. No `/proc`, `/dev`, `/sys` is mounted — so the merged view contains ONLY the image's
+///      mountpoint. No `/proc`, `/dev`, `/sys` is mounted - so the merged view contains ONLY the image's
 ///      files (the disk-filling `/proc/<pid>` copy of a box-based approach is not even representable).
 ///   3. resolves every source path with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` rooted at the
-///      mount — so the untrusted `src_rel` is confined BY CONSTRUCTION: a `..` is kernel-clamped to the
+///      mount - so the untrusted `src_rel` is confined BY CONSTRUCTION: a `..` is kernel-clamped to the
 ///      mount root, and an in-image symlink with an absolute target (`/app -> /etc`) resolves inside the
 ///      IMAGE's `/etc`, never the host's. (Both `..`-escape and in-image-absolute-symlink-escape were
-///      verified to read host files with a naive `cp`; `RESOLVE_IN_ROOT` closes both — `cp`'s
+///      verified to read host files with a naive `cp`; `RESOLVE_IN_ROOT` closes both - `cp`'s
 ///      `--no-dereference` only guards the FINAL component, not parent components, so it is NOT enough.)
 ///   4. copies with an in-process recursive copier (regular files via `copy_file_range` + read/write
-///      fallback, directories recursively, symlinks verbatim) into the pre-opened `out_fd` — no external
+///      fallback, directories recursively, symlinks verbatim) into the pre-opened `out_fd` - no external
 ///      binary, so it works even on a `scratch`/distroless image. `src_rel = None` copies the whole
 ///      rootfs (push squash); `Some(p)` copies that one path by basename (a `COPY --from`).
 ///
@@ -5342,7 +5342,7 @@ fn merged_view_extract(
     out_dir: &std::path::Path,
 ) -> Result<(), Error> {
     // `chain` is ALREADY top-first (the caller split `resolve_image`'s `top:…:base` on ':'), and
-    // overlayfs `lowerdir=` shadows left-to-right (leftmost wins) — so we join it AS-IS (no reverse).
+    // overlayfs `lowerdir=` shadows left-to-right (leftmost wins) - so we join it AS-IS (no reverse).
     // Getting this order wrong silently defeats the opaque (base would shadow top), re-leaking the
     // deleted file. The RO mount needs only lowerdir. The opts CString outlives the fork.
     let lower = chain.join(":"); // top:…:base, order-preserving
@@ -5358,7 +5358,7 @@ fn merged_view_extract(
     }
     // Open the DESTINATION as an fd on the host, BEFORE any namespace work. It stays valid in the child
     // (an fd isn't re-resolved), giving it a handle to the out dir to copy INTO without ever naming a
-    // host path — the only host object reachable from the confined child.
+    // host path - the only host object reachable from the confined child.
     let out_fd = {
         use std::os::unix::io::IntoRawFd;
         std::fs::File::open(out_dir)
@@ -5369,10 +5369,10 @@ fn merged_view_extract(
     let egid = unsafe { libc::getegid() };
 
     // FORK SAFETY: the child allocates (the copier uses `format!`/`CString`), which is only safe after
-    // `fork()` when no OTHER thread could hold the allocator lock — i.e. the process is single-threaded.
+    // `fork()` when no OTHER thread could hold the allocator lock - i.e. the process is single-threaded.
     // `kern build`/`push` run on a synchronous single-threaded `main` (background threads live only in the
     // run/box paths), so this holds today. Enforce it as a HARD runtime check (not a debug_assert, which
-    // vanishes in release — the fork-safety it guards would then be unprotected exactly in production): a
+    // vanishes in release - the fork-safety it guards would then be unprotected exactly in production): a
     // future worker-pool/pre-fork thread gets a clean error here instead of a rare malloc deadlock.
     if !single_threaded() {
         unsafe { libc::close(out_fd) };
@@ -5426,7 +5426,7 @@ fn merged_view_extract(
 
 /// The forked child of [`merged_view_extract`]. Sets up the namespaces + RO overlay mount, opens the
 /// merged view as a dirfd, resolves the source path CONFINED to it via `openat2(RESOLVE_IN_ROOT)`, then
-/// copies it into the pre-opened `out_fd` with an in-process recursive copier — NO chroot, NO `/proc`,
+/// copies it into the pre-opened `out_fd` with an in-process recursive copier - NO chroot, NO `/proc`,
 /// NO external `cp`/`tar` (so it works even on a `scratch`/distroless image with no binaries). Each
 /// failure `_exit`s a distinct code so the parent can pinpoint the stage.
 ///
@@ -5477,7 +5477,7 @@ fn merged_view_child(
         {
             libc::_exit(104);
         }
-        // 3. Open the merged view as a dirfd — the ROOT for all confined source resolution.
+        // 3. Open the merged view as a dirfd - the ROOT for all confined source resolution.
         let root_fd = libc::open(mnt.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
         if root_fd < 0 {
             libc::_exit(105);
@@ -5504,7 +5504,7 @@ fn merged_view_child(
 /// copy the CONTENTS of a directory `src_rel` into `dst_fd` (the whole-rootfs push case, `src_rel="."`).
 /// Returns 0 on success or a small non-zero code identifying the failing operation. Preserves regular
 /// files (via `copy_file_range` with a read/write fallback), directories (recursive), and symlinks
-/// (verbatim, never dereferenced — matching `cp -a`); best-effort mode/owner/mtime; device/fifo are
+/// (verbatim, never dereferenced - matching `cp -a`); best-effort mode/owner/mtime; device/fifo are
 /// skipped gracefully (rootless can't `mknod`, and they don't appear in a COPY --from binary/tree).
 /// Maximum directory nesting the copier will descend. A hostile ≥2-layer image can author an arbitrarily
 /// deep tree (`a/a/a/…`); without a cap the recursion would overflow the child's native stack (SIGSEGV,
@@ -5520,17 +5520,17 @@ unsafe fn copy_confined_tree(
     depth: u32,
 ) -> i32 {
     if depth > MERGED_COPY_MAX_DEPTH {
-        return 120; // too deep — refuse rather than overflow the stack (parent surfaces a clean error)
+        return 120; // too deep - refuse rather than overflow the stack (parent surfaces a clean error)
     }
     // Resolve the source CONFINED to root_fd: `openat2(RESOLVE_IN_ROOT)` clamps `..` to root_fd and
     // reinterprets absolute in-image symlinks relative to it; `RESOLVE_NO_MAGICLINKS` blocks /proc-style
     // magic-link escapes. First open O_PATH|O_NOFOLLOW to classify the entry WITHOUT following a final
-    // symlink; then reopen readable with a SECOND openat2 (files/dirs) — reopening an O_PATH fd readable
+    // symlink; then reopen readable with a SECOND openat2 (files/dirs) - reopening an O_PATH fd readable
     // needs /proc (absent here), so a fresh confined openat2 is the clean way.
     let sfd = openat2_in_root(root_fd, src_rel, libc::O_PATH | libc::O_NOFOLLOW);
     if sfd < 0 {
         // The adapter returns `-errno`. ENOSYS → kernel < 5.6 (no openat2): 107 (parent maps to a precise
-        // hint). ENOENT / RESOLVE refusal → 108 (a confined "no such file" — e.g. an opaque dir correctly
+        // hint). ENOENT / RESOLVE refusal → 108 (a confined "no such file" - e.g. an opaque dir correctly
         // hid the source).
         return if sfd == -libc::ENOSYS { 107 } else { 108 };
     }
@@ -5540,7 +5540,7 @@ unsafe fn copy_confined_tree(
         return 109;
     }
     match st.st_mode & libc::S_IFMT {
-        // Read the symlink target straight off the O_PATH classify fd (AT_EMPTY_PATH) — confined by the
+        // Read the symlink target straight off the O_PATH classify fd (AT_EMPTY_PATH) - confined by the
         // same openat2 that opened it, so no bare `readlinkat(root_fd, path)` re-resolution is needed.
         libc::S_IFLNK => {
             let rc = copy_one_symlink(sfd, dst_fd, dst_name);
@@ -5573,7 +5573,7 @@ fn openat2_in_root(root_fd: libc::c_int, path: &str, flags: libc::c_int) -> libc
 }
 
 /// Copy a symlink SOURCE verbatim (read its target off the already-confined O_PATH `src_fd`, recreate
-/// with `symlinkat`). Never dereferenced — identical to `cp -a`, and reads nothing at the target. Reading
+/// with `symlinkat`). Never dereferenced - identical to `cp -a`, and reads nothing at the target. Reading
 /// via `readlinkat(src_fd, "", AT_EMPTY_PATH)` keeps confinement BY CONSTRUCTION: `src_fd` came from
 /// `openat2(RESOLVE_IN_ROOT)`, so there is no bare path re-resolution that could follow a symlinked parent.
 unsafe fn copy_one_symlink(
@@ -5602,7 +5602,7 @@ unsafe fn copy_one_symlink(
     0
 }
 
-/// Copy a directory: create it in `dst_fd` (or reuse `dst_fd` when `dst_name` is `None` — the whole-
+/// Copy a directory: create it in `dst_fd` (or reuse `dst_fd` when `dst_name` is `None` - the whole-
 /// rootfs push copies contents in place), then recurse. The source is reopened readable via a fresh
 /// confined `openat2` (O_DIRECTORY); each child recurses via its path under the merged root, so every
 /// component stays confined by `RESOLVE_IN_ROOT`.
@@ -5773,12 +5773,12 @@ unsafe fn copy_one_file(
             }
         }
     }
-    // Carry `user.*` xattrs (application metadata, harmless) — best-effort, BEFORE owner/mtime. We do
+    // Carry `user.*` xattrs (application metadata, harmless) - best-effort, BEFORE owner/mtime. We do
     // NOT carry `security.capability`: file-capabilities are a privilege channel exactly like setuid, and
     // the source image is UNTRUSTED (a hostile `COPY --from`/push base could ship `/bin/sh` with
     // `cap_setuid+ep` → escalation in the copied/published image, and file-caps bypass the box's
     // MS_NOSUID unlike setuid). kern's model grants no file-caps at runtime, so dropping them removes an
-    // injection vector without losing anything usable — the same call kern makes for setuid (stripped at
+    // injection vector without losing anything usable - the same call kern makes for setuid (stripped at
     // push). `system.*`/`trusted.*` are skipped too (need privilege, not ours to propagate).
     copy_xattrs(rfd, dfd);
     // Preserve owner + mtime best-effort (mode was set at create time).
@@ -5801,7 +5801,7 @@ unsafe fn copy_one_file(
 
 /// Copy the `user.*` extended attributes from `src_fd` to `dst_fd`, best-effort. Carries ONLY `user.*`
 /// (application metadata, no privilege). Deliberately NOT `security.capability`: file-capabilities are a
-/// privilege channel like setuid, and the source image is untrusted — blindly propagating an attacker's
+/// privilege channel like setuid, and the source image is untrusted - blindly propagating an attacker's
 /// `cap_setuid+ep` would inject an escalation into the copied/pushed image (worse than setuid: caps
 /// bypass MS_NOSUID). `system.*`/`trusted.*` need privilege we don't have. Failures are ignored (xattrs
 /// are best-effort like `cp --preserve=all`; a filesystem without xattr support must not fail the copy).
@@ -5822,7 +5822,7 @@ unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
         .split(|&b| b == 0)
         .filter(|n| !n.is_empty())
     {
-        // Carry ONLY `user.*`. NOT `security.capability` (privilege channel — an untrusted image's caps
+        // Carry ONLY `user.*`. NOT `security.capability` (privilege channel - an untrusted image's caps
         // would be injected into the output; kern uses no runtime file-caps), NOT `system.*`/`trusted.*`
         // (need privilege, not ours to move).
         if !name.starts_with(b"user.") {
@@ -5850,7 +5850,7 @@ unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
     }
 }
 
-/// `write(open(path), val)` — async-signal-safe (no allocation). `true` on full write.
+/// `write(open(path), val)` - async-signal-safe (no allocation). `true` on full write.
 unsafe fn write_proc_self(path: &[u8], val: &[u8]) -> bool {
     let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY);
     if fd < 0 {
@@ -5899,9 +5899,9 @@ fn cstring(s: &str) -> Result<std::ffi::CString, Error> {
     std::ffi::CString::new(s).map_err(|_| Error::Oci("merged-view: NUL in path".into()))
 }
 
-/// `true` if this process has exactly one thread — read from `/proc/self/stat`'s `num_threads` field.
+/// `true` if this process has exactly one thread - read from `/proc/self/stat`'s `num_threads` field.
 /// Guards the fork-safety invariant of [`merged_view_extract`] via a HARD runtime check (it returns an
-/// error if false — NOT a debug_assert, which would vanish in release where the guard matters most).
+/// error if false - NOT a debug_assert, which would vanish in release where the guard matters most).
 /// Best effort: if `/proc` is unreadable we assume single-threaded (don't refuse a legitimate run).
 fn single_threaded() -> bool {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
@@ -5939,12 +5939,12 @@ fn materialize_image(
     // Layered/built image: squash the overlay chain into a fresh temp rootfs so we push one layer.
     //
     // WHITEOUT/OPAQUE INVARIANT (a leak-of-deleted-secrets if broken): a hand-rolled bottom-up `cp -a`
-    // of the RAW layer dirs re-includes a file that a higher layer DELETED — a per-file `.wh.` whiteout
+    // of the RAW layer dirs re-includes a file that a higher layer DELETED - a per-file `.wh.` whiteout
     // OR (the case a naive squash misses) an OPAQUE directory (`rm -rf dir && mkdir dir`, marked by the
     // `overlay.opaque` xattr, NOT a `.wh.` file). A secret `rm`'d in a build step then resurfaces in the
     // pushed image. So we DON'T hand-roll the merge: we copy from the KERNEL-MERGED overlay view (see
     // [`merged_view_extract`]), where the kernel has already applied opaque + whiteout + redirect_dir +
-    // metacopy — the only correct reader. The chain is `top:…:base`; a single-layer image can't have a
+    // metacopy - the only correct reader. The chain is `top:…:base`; a single-layer image can't have a
     // cross-layer opaque, so it's copied directly (below); a ≥2-layer chain goes through the merged view.
     let (lower, config) = resolve_image(image)?;
     let chain: Vec<String> = lower.split(':').map(str::to_string).collect();
@@ -5957,7 +5957,7 @@ fn materialize_image(
             remove_build_tree(&tmp);
         })?;
     } else {
-        // A single layer is already its own merged rootfs — copy it directly (no opaque to honour).
+        // A single layer is already its own merged rootfs - copy it directly (no opaque to honour).
         let ok = std::process::Command::new("cp")
             .arg("-a")
             .arg("--reflink=auto")
@@ -5972,15 +5972,15 @@ fn materialize_image(
             return Err(Error::Oci(format!("squashing image '{image}' failed")));
         }
         // Defence-in-depth on the direct path: strip any surviving OCI whiteout marker file so a
-        // `.wh.<name>` can never be pushed as a literal file. (The merged-view path can't produce one —
-        // the kernel already resolved whiteouts — so it's only needed here.)
+        // `.wh.<name>` can never be pushed as a literal file. (The merged-view path can't produce one -
+        // the kernel already resolved whiteouts - so it's only needed here.)
         strip_whiteout_markers(&tmp);
     }
     Ok((tmp.clone(), config, Some(tmp)))
 }
 
 /// Rewrite each service's RELATIVE bind-mount source to an absolute path under the compose file's
-/// directory (Docker's rule), so kern's `-v` — which wants an absolute path or a named volume —
+/// directory (Docker's rule), so kern's `-v` - which wants an absolute path or a named volume -
 /// accepts the common `./dir:/dst` / `.:/app` compose form. A source that is already absolute (`/…`),
 /// or a bare NAME (a named volume, no `/` and no leading `.`), is left untouched. The resolved path is
 /// CONFINED under the compose dir (canonicalize + starts_with, same traversal guard as a build
@@ -6002,11 +6002,11 @@ fn resolve_relative_binds(
             // Split `src:dst[:opts]`. The source is the first segment; dst/opts follow.
             let (src, rest) = match v.split_once(':') {
                 Some((s, r)) => (s, r),
-                None => continue, // malformed spec — let `kern box` report it precisely
+                None => continue, // malformed spec - let `kern box` report it precisely
             };
             // Classify the source. A leading `/` is absolute (left as-is). A bare NAME with no `/` is a
             // named volume (left as-is; the box validates it). ANYTHING ELSE containing `/` is a
-            // relative PATH and must be confined — not just the `./`/`../` forms: a source like
+            // relative PATH and must be confined - not just the `./`/`../` forms: a source like
             // `foo/../../../etc` is relative but doesn't start with `./`, and the old check let it skip
             // the guard (the box's name-validator caught it as a backstop, but defense-in-depth wants
             // the compose layer to confine every relative path itself). (Hacker-mode audit, MEDIUM.)
@@ -6050,7 +6050,7 @@ fn resolve_relative_binds(
 
 /// Walk a squashed rootfs and honour any OCI whiteout marker that survived the merge: `.wh.<name>`
 /// deletes its sibling `<name>` (and itself), `.wh..wh..opq` clears its directory's contents. In
-/// kern's model the chain has none (see the invariant at the call site), so this is a no-op belt —
+/// kern's model the chain has none (see the invariant at the call site), so this is a no-op belt -
 /// but if a future layer format leaves whiteouts, this keeps a deleted file from being republished.
 /// Best-effort, non-following (never descends a symlink), depth-first.
 fn strip_whiteout_markers(root: &std::path::Path) {
@@ -6083,7 +6083,7 @@ fn strip_whiteout_markers(root: &std::path::Path) {
             let _ = std::fs::remove_file(e.path());
             continue;
         }
-        // Recurse into real subdirectories (not symlinks — no-follow).
+        // Recurse into real subdirectories (not symlinks - no-follow).
         if ft.is_dir() {
             strip_whiteout_markers(&e.path());
         }
@@ -6091,7 +6091,7 @@ fn strip_whiteout_markers(root: &std::path::Path) {
 }
 
 /// Resolve `--image <ref>` to an overlay `(lowerdir, config)`. A pulled (flat) image is a single
-/// cache dir. A locally-built (**layered**) image — marked by a `<ref>.base` sidecar — is its
+/// cache dir. A locally-built (**layered**) image - marked by a `<ref>.base` sidecar - is its
 /// `<ref>.diff` layer stacked over its base, resolved RECURSIVELY (the base may itself be layered)
 /// and re-pulled if the base was pruned, so layered images are prune-safe. The returned `lowerdir`
 /// may be a colon-joined chain (top layer first, exactly overlayfs's ordering).
@@ -6108,7 +6108,7 @@ fn resolve_image_depth(image: &str, depth: u32) -> Result<(String, kern_oci::Ima
     }
     let cache = cache_dir();
     // `scratch` is Docker's reserved EMPTY base (no layers, empty config): materialize a shared empty
-    // directory as the overlay lower so `FROM scratch` builds — the standard base for minimal images
+    // directory as the overlay lower so `FROM scratch` builds - the standard base for minimal images
     // (a single static binary, distroless-style, sentry's `FROM scratch AS odiff-*`).
     if image == "scratch" {
         let empty = cache.join(".scratch-empty");
@@ -6157,14 +6157,14 @@ fn resolve_image_depth(image: &str, depth: u32) -> Result<(String, kern_oci::Ima
         let (base_lower, _) = resolve_image_depth(&base_ref, depth + 1)?;
         let diff = cache.join(format!("{safe}.diff"));
         let config = read_image_config(&cache.join(format!("{safe}.image")));
-        // Top (this image's diff) first, then the base chain — overlayfs shadows left-to-right.
+        // Top (this image's diff) first, then the base chain - overlayfs shadows left-to-right.
         return Ok((format!("{}:{base_lower}", diff.to_string_lossy()), config));
     }
     pull_to_cache(image)
 }
 
 /// Pull `image` into a local cache and return `(rootfs path, its OCI runtime config)`. Reuse is gated
-/// on a sibling completion sentinel (`<ref>.ok`), not "directory is non-empty" — so an interrupted
+/// on a sibling completion sentinel (`<ref>.ok`), not "directory is non-empty" - so an interrupted
 /// pull (or a stray file) never makes a partial/poisoned rootfs look valid; we re-pull cleanly. The
 /// image config is persisted to a `<ref>.image` sidecar (outside the rootfs) so a cache hit reapplies
 /// it without re-pulling.
@@ -6192,11 +6192,11 @@ fn pull_to_cache(image: &str) -> Result<(String, kern_oci::ImageConfig), Error> 
         return Err(Error::Oci("could not acquire pull lock".into()));
     }
     if !sentinel.exists() {
-        eprintln!("→ image '{image}' not cached — pulling once (reused after)");
+        eprintln!("→ image '{image}' not cached - pulling once (reused after)");
         let _ = std::fs::remove_dir_all(&dir); // clear any partial extraction
         std::fs::create_dir_all(&dir).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
         // The `box --image` cache path pulls the host arch; `box --platform` (foreign-arch box) is
-        // Slice B, deferred with the multi-stage work — so no platform override here yet.
+        // Slice B, deferred with the multi-stage work - so no platform override here yet.
         let config = kern_oci::pull(image, &dir, None).map_err(|e| Error::Oci(e.to_string()))?;
         write_image_config(&cfgfile, &config);
         let _ = std::fs::write(&sentinel, image.as_bytes());
@@ -6223,12 +6223,12 @@ fn cache_dir() -> PathBuf {
 
 /// The content-addressed build **layer cache** (`<image cache>/L`): each `kern build` unit (a RUN
 /// batch, a COPY, a WORKDIR) is stored here under its cache key so an unchanged rebuild reuses it
-/// instead of re-executing — Docker-style layer caching, mounted back as an overlay lower.
+/// instead of re-executing - Docker-style layer caching, mounted back as an overlay lower.
 fn layer_cache_dir() -> PathBuf {
     cache_dir().join("L")
 }
 
-/// A 128-bit FNV-1a cache key (32 hex) over `prev-key` then `repr` — the chained key that makes a
+/// A 128-bit FNV-1a cache key (32 hex) over `prev-key` then `repr` - the chained key that makes a
 /// layer's identity depend on everything before it, so a change busts that layer and all after it.
 /// Non-crypto: this is a LOCAL, first-party cache, and a collision only mis-reuses the user's OWN
 /// layer (2^-128); it is never a trust boundary.
@@ -6248,10 +6248,10 @@ fn layer_key(prev: &str, repr: &str) -> String {
 /// contributes a marker so its absence/failure changes the key.
 ///
 /// `ig` (the context's `.dockerignore`, matched relative to `ctx_root`) is applied to a dir source's
-/// DESCENDANTS exactly as `copy_into_rootfs` does, so the key reflects only what actually gets copied
-/// — a change to an ignored `node_modules`/`.git`/secret neither busts the cache nor costs a hash pass
+/// DESCENDANTS exactly as `copy_into_rootfs` does, so the key reflects only what actually gets copied,
+/// a change to an ignored `node_modules`/`.git`/secret neither busts the cache nor costs a hash pass
 /// (previously this walk hashed the WHOLE context on every build). Fail-OPEN: if a path can't be made
-/// context-relative we hash it anyway — worst case a spurious rebuild, never a stale/wrong layer.
+/// context-relative we hash it anyway - worst case a spurious rebuild, never a stale/wrong layer.
 fn content_hash(
     path: &std::path::Path,
     ctx_root: &std::path::Path,
@@ -6306,7 +6306,7 @@ fn content_hash(
                 // (name, is_dir) straight from readdir: `DirEntry::file_type()` reads d_type from the
                 // readdir buffer (no extra stat on Linux ext4/xfs/btrfs/tmpfs), and a symlink reports
                 // is_dir()==false so it's routed through the leaf `excluded` check exactly like
-                // `copy_dir_filtered` — avoids the second `symlink_metadata` per child.
+                // `copy_dir_filtered` - avoids the second `symlink_metadata` per child.
                 let mut names: Vec<(std::ffi::OsString, bool)> = std::fs::read_dir(p)
                     .into_iter()
                     .flatten()
@@ -6351,7 +6351,7 @@ fn content_hash(
                             match f.read(&mut buf) {
                                 Ok(0) => break,
                                 Ok(n) => feed(h, &buf[..n]),
-                                // Retry EINTR like `fs::read` did — a stray signal mid-read must
+                                // Retry EINTR like `fs::read` did - a stray signal mid-read must
                                 // not flap the cache key of an unchanged file.
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                 Err(_) => {
@@ -6366,7 +6366,7 @@ fn content_hash(
             }
             Ok(_) => {
                 // A non-regular node (fifo/socket/device/block): `copy_dir_filtered` SKIPS these, so we
-                // must NOT open it — a writer-less FIFO would block the whole cache-key computation.
+                // must NOT open it - a writer-less FIFO would block the whole cache-key computation.
                 // Feed just a type marker so a regular↔special transition still busts the key.
                 feed(h, b"O");
                 feed(h, rel.as_bytes());
@@ -6389,10 +6389,10 @@ fn layer_cached(lc: &std::path::Path, key: &str) -> bool {
 fn commit_layer(content: &std::path::Path, lc: &std::path::Path, key: &str) -> Result<(), Error> {
     let dest = lc.join(key);
     if !dest.exists() {
-        // Ignore a rename race (another build committed the identical key first) — content is equal.
+        // Ignore a rename race (another build committed the identical key first) - content is equal.
         let _ = std::fs::rename(content, &dest);
     }
-    // Only mark the layer complete once its content dir is actually in place — otherwise a failed
+    // Only mark the layer complete once its content dir is actually in place - otherwise a failed
     // rename (e.g. ENOSPC) would leave a sentinel with no dir → a poisoned "hit" that later fails
     // to mount. A missing sentinel just means the next build re-runs the unit (safe).
     if dest.exists() {
@@ -6402,7 +6402,7 @@ fn commit_layer(content: &std::path::Path, lc: &std::path::Path, key: &str) -> R
 }
 
 /// `true` if `rel` resolves to a directory anywhere in the overlay `chain` (layer dirs + base),
-/// searched top-first — used by COPY to decide "into a dir" vs "as a file" against the MERGED image
+/// searched top-first - used by COPY to decide "into a dir" vs "as a file" against the MERGED image
 /// (a lower layer may hold the dir). Build layers never delete, so the first hit wins.
 fn chain_has_dir(chain: &[String], rel: &str) -> bool {
     if rel.is_empty() {
@@ -6419,7 +6419,7 @@ fn chain_has_dir(chain: &[String], rel: &str) -> bool {
 /// clobber attack on a predictable cache path: another user can't pre-create or enter it.
 /// Size of the caller's subordinate-uid range from `/etc/subuid` (box uids 1..count map here, so the
 /// box can use uids 0..count-1). `0` if there's no allocation (single-uid only). Best-effort, matching
-/// how `newuidmap` resolves the row — a name match wins, else a numeric-uid row. Used only to warn (F1)
+/// how `newuidmap` resolves the row - a name match wins, else a numeric-uid row. Used only to warn (F1)
 /// when an image's declared uid exceeds what `--uid-range` can map; never to clamp.
 /// Size of the caller's `/etc/subuid` range (box uids 0..count usable), or 0 if none. Delegates to the
 /// ONE authoritative parser in kern-isolation (`sub_range`: `count>1`, name-row-wins) so the box path,
@@ -6442,9 +6442,9 @@ fn own_only_dir(dir: &std::path::Path) -> std::io::Result<()> {
 
 /// A filesystem-safe directory name for an image reference.
 fn sanitize_ref(image: &str) -> String {
-    // A filesystem-safe, COLLISION-FREE cache key. Map anything outside `[A-Za-z0-9_-]` to `_` — so
+    // A filesystem-safe, COLLISION-FREE cache key. Map anything outside `[A-Za-z0-9_-]` to `_` - so
     // `/`, `:`, and crucially any `.`/`..` can't build a traversal like `cache/..` (which a later
-    // `remove_dir_all` would then wipe) — then append a short hash of the FULL ref so distinct images
+    // `remove_dir_all` would then wipe) - then append a short hash of the FULL ref so distinct images
     // (`foo/bar` vs `foo_bar`) can never share a cache dir / config sidecar.
     let base: String = image
         .chars()
@@ -6459,7 +6459,7 @@ fn sanitize_ref(image: &str) -> String {
     format!("{base}-{:016x}", fnv1a(image))
 }
 
-/// FNV-1a 64-bit — a fast non-cryptographic hash, used ONLY to make [`sanitize_ref`] cache keys
+/// FNV-1a 64-bit - a fast non-cryptographic hash, used ONLY to make [`sanitize_ref`] cache keys
 /// collision-free (never for anything security-sensitive).
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -6476,7 +6476,7 @@ pub struct BuildArgs<'a> {
     pub tag: Option<&'a str>,
     /// `-f <file>`: the Dockerfile path. `None` → `<context>/Dockerfile`.
     pub file: Option<&'a str>,
-    /// The build context directory (default `.`) — the root COPY/ADD sources resolve against.
+    /// The build context directory (default `.`) - the root COPY/ADD sources resolve against.
     pub context: &'a str,
     /// `--build-arg K=V` (repeatable): values for `ARG` substitution.
     pub build_args: &'a [String],
@@ -6484,7 +6484,7 @@ pub struct BuildArgs<'a> {
     pub quiet: bool,
 }
 
-/// `kern build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]` — build a local image from a
+/// `kern build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]` - build a local image from a
 /// **subset** of Dockerfile (see [`crate::dockerfile`]). `FROM` pulls the base into a mutable build
 /// rootfs; `RUN` executes inside a `kern box` (bind-mounted rootfs + host net); `COPY`/`ADD` copy
 /// from the context (symlink-safe both sides); `ENV`/`WORKDIR`/`USER`/`CMD`/`ENTRYPOINT` accumulate
@@ -6608,7 +6608,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
 /// `COPY --from=<stage>` (the multi-stage feature) is made safe by REUSE, not by a hand-rolled overlay
 /// mount: the source stage is materialized to a single merged rootfs dir (`materialize_image`, which
 /// already resolves the overlay chain + whiteouts correctly), and the copy runs through the SAME
-/// `copy_into_rootfs` guards as a context COPY — it canonicalizes the source under the stage rootfs and
+/// `copy_into_rootfs` guards as a context COPY - it canonicalizes the source under the stage rootfs and
 /// rejects any `..`/symlink escape, so `COPY --from=build /etc/../../host` fails exactly like a hostile
 /// context COPY. The `--from` COPY is rewritten to a plain COPY whose "context" is that merged rootfs.
 ///
@@ -6617,7 +6617,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
 /// ([`announce_built`]). A leading `.` never appears in a user ref, so the two can't collide.
 const STAGE_TAG_PREFIX: &str = ".stage-";
 
-/// Print the "built '<tag>'" success line — UNLESS `tag` is an internal multi-stage stage tag (prefixed
+/// Print the "built '<tag>'" success line - UNLESS `tag` is an internal multi-stage stage tag (prefixed
 /// [`STAGE_TAG_PREFIX`]), which the user shouldn't see. Single-sourced so the create/suppress contract
 /// can't drift.
 fn announce_built(tag: &str) {
@@ -6661,13 +6661,13 @@ fn build_multi_stage(
     };
 
     // WHOLE-BUILD flat cache. Intermediate stages get throwaway pid-based temp tags (below) that are
-    // deleted at the end, so they can't cache individually — but we CAN cache the final result: key the
-    // whole multi-stage build by ALL instructions (every FROM ref, RUN, COPY dst — captured by `Debug`)
+    // deleted at the end, so they can't cache individually - but we CAN cache the final result: key the
+    // whole multi-stage build by ALL instructions (every FROM ref, RUN, COPY dst - captured by `Debug`)
     // + the bytes of every context COPY source (`.dockerignore`-aware). If the final tag already holds
     // exactly this build, skip it entirely. Content-addressed → any change to any stage / file / FROM
     // rebuilds; never serves a stale image. Only hits when the final image is FLAT (`<safe>` dir); a
     // LAYERED final stage already caches per-layer, and the `is_dir` guard means a stale `.flatkey`
-    // there can't false-hit. (Base-image *tag mutation* isn't detected — same as Docker's own build.)
+    // there can't false-hit. (Base-image *tag mutation* isn't detected - same as Docker's own build.)
     let ms_ig = crate::dockerignore::DockerIgnore::load(ctx);
     let ms_ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
     let ms_key = flat_image_key("multistage", instrs, ctx, &ms_ctx_root, ms_ig.as_ref());
@@ -6740,7 +6740,7 @@ fn build_multi_stage(
     cleanup_stage_tags(&stage_tags);
     // Stamp the whole-build key on the final tag so the NEXT identical multi-stage build hits the cache
     // above (overwrites the last stage's per-stage key that its `build_run` wrote). Harmless on a
-    // layered final image — the `is_dir` guard in `flat_cache_hit` never false-hits on it.
+    // layered final image - the `is_dir` guard in `flat_cache_hit` never false-hits on it.
     write_flat_key(tag, &ms_key);
     Ok(())
 }
@@ -6755,7 +6755,7 @@ struct StagePrep {
 }
 
 /// Rewrite a stage's instruction slice, turning every `COPY --from=<stage|image>` into a plain COPY
-/// whose source is the referenced stage's built rootfs — OR, for an external `--from=<image>`, the
+/// whose source is the referenced stage's built rootfs - OR, for an external `--from=<image>`, the
 /// image's pulled rootfs (`resolve_image`, the same path `FROM`/`--image` use). Files are grafted into
 /// `subctx` through the SAME confine guards as a context COPY (`copy_from_stage_chain`), so an external
 /// image's `srcs` can't `..`/symlink-escape its rootfs any more than a stage's can. Each distinct
@@ -6772,7 +6772,7 @@ fn prepare_stage(
     let mut stage_uses_context = false;
     let mut pulled_from_stage = false;
     // Resolve each SOURCE STAGE's overlay chain at most once per stage. We copy files DIRECTLY from the
-    // chain (no full-rootfs squash) — the squash only happens as a fallback for a directory source,
+    // chain (no full-rootfs squash) - the squash only happens as a fallback for a directory source,
     // inside copy_from_stage_chain. Caching the chain dedups N `COPY --from=X`.
     let mut chains: std::collections::HashMap<usize, Vec<String>> =
         std::collections::HashMap::new();
@@ -6790,11 +6790,11 @@ fn prepare_stage(
                 } => {
                     // Resolve the source's overlay chain (top-first list of layer dirs), pulling an
                     // external image on demand. A build STAGE takes precedence over an image of the same
-                    // spelling — already decided by the parser, which only emits `CopyFrom::Image` when
+                    // spelling - already decided by the parser, which only emits `CopyFrom::Image` when
                     // the token names NO earlier stage. Both paths feed the SAME confined copy helper
                     // (`copy_from_stage_chain` → single-layer `starts_with` guard, or ≥2-layer
                     // `merged_view_extract` with `openat2(RESOLVE_IN_ROOT)`), so an external image's
-                    // `srcs` are confined to its rootfs exactly like a stage's — no `..`/symlink escape.
+                    // `srcs` are confined to its rootfs exactly like a stage's - no `..`/symlink escape.
                     let (chain, label): (Vec<String>, String) = match cf {
                         CopyFrom::Stage(fref) => {
                             let src_idx = resolve_from(fref, stage_names, si).ok_or_else(|| {
@@ -6815,7 +6815,7 @@ fn prepare_stage(
                             if let std::collections::hash_map::Entry::Vacant(slot) =
                                 image_chains.entry(img.clone())
                             {
-                                // Pull (if not cached) + resolve the external image's overlay chain —
+                                // Pull (if not cached) + resolve the external image's overlay chain -
                                 // the SAME path `FROM`/`--image` use (`resolve_image` → `pull_to_cache`).
                                 // Runs synchronously on the single-threaded build main, so the confined
                                 // copy that follows keeps the fork-safety invariant.
@@ -6849,7 +6849,7 @@ fn prepare_stage(
                         chmod: chmod.clone(),
                     });
                 }
-                // A context COPY (from: None) — the stage references the real build context.
+                // A context COPY (from: None) - the stage references the real build context.
                 Instr::Copy { .. } => {
                     stage_uses_context = true;
                     stage_instrs.push(ins.clone());
@@ -6872,13 +6872,13 @@ fn prepare_stage(
 /// Copy `src_rel` OUT of a source stage's overlay `chain` (top-first list of layer dirs) into `dest`,
 /// honouring overlay opaque/whiteout semantics so a file DELETED in a build step never resurfaces.
 ///
-/// For a ≥2-layer chain this reads from the KERNEL-MERGED view ([`merged_view_extract`]) — the ONLY
+/// For a ≥2-layer chain this reads from the KERNEL-MERGED view ([`merged_view_extract`]) - the ONLY
 /// correct reader: a top-first walk of the RAW layers leaks a file whose PARENT directory was made
 /// OPAQUE in an upper layer (`rm -rf dir && mkdir dir`), because the walk finds the file in a lower
 /// layer that the opaque was meant to hide. (Verified live: a secret `rm`'d in a build step reappeared
 /// via `COPY --from`.) The merged view also confines an untrusted `src_rel` by CONSTRUCTION
 /// (`openat2(RESOLVE_IN_ROOT)`), so a `..`-escape and an in-image absolute-symlink-escape are both
-/// closed — see the primitive's doc. A single-layer chain has no cross-layer opaque possible, so it's
+/// closed - see the primitive's doc. A single-layer chain has no cross-layer opaque possible, so it's
 /// copied directly (host-side canonicalize + `starts_with` confine).
 fn copy_from_stage_chain(
     chain: &[String],
@@ -6928,7 +6928,7 @@ fn copy_from_stage_rootfs(
         .file_name()
         .ok_or(Error::Build("COPY --from source has no file name".into()))?;
     let target = dest.join(name);
-    // `cp -a --` no-follow, preserving modes — same tool/flags as the rest of the builder.
+    // `cp -a --` no-follow, preserving modes - same tool/flags as the rest of the builder.
     let ok = std::process::Command::new("cp")
         .arg("-a")
         .arg("--reflink=auto") // CoW clone on btrfs/xfs (near-free); plain copy elsewhere
@@ -6974,7 +6974,7 @@ fn merge_context(from: &std::path::Path, into: &std::path::Path) -> Result<(), E
     Ok(())
 }
 
-/// Remove a cached image (all sidecar forms) by ref — used to drop the internal temp stage images a
+/// Remove a cached image (all sidecar forms) by ref - used to drop the internal temp stage images a
 /// multi-stage build creates. Best-effort.
 fn drop_cached_image(image: &str) -> Result<(), Error> {
     // `sanitize_ref` yields an `is_safe_stem` token, so this shares the single artifact-remover with
@@ -7005,16 +7005,16 @@ fn write_flat_key(tag: &str, key: &str) {
 }
 
 /// A content-addressed key for a FLAT-built image: an opaque `domain` tag (the resolved base lower for
-/// a single-stage flat build, a constant like `"multistage"` for the whole-build multi-stage key —
+/// a single-stage flat build, a constant like `"multistage"` for the whole-build multi-stage key -
 /// which domain-separates the two on the same tag) + EVERY instruction (derived `Debug`
-/// captures all fields — build-args are already `${VAR}`-baked into `instrs` at parse time, so a
+/// captures all fields - build-args are already `${VAR}`-baked into `instrs` at parse time, so a
 /// build-arg change shows here; RUN argv, ENV, CMD, WORKDIR, heredoc bodies and ADD URLs are all in) +
 /// the byte hashes of the context files a COPY would keep (honouring `.dockerignore`, which the paths
-/// in `Debug` alone don't capture). The flat executor has no per-layer cache, so an UNCHANGED rebuild —
-/// the common case on WSL / older kernels without unprivileged overlay — can reuse the tag's existing
+/// in `Debug` alone don't capture). The flat executor has no per-layer cache, so an UNCHANGED rebuild -
+/// the common case on WSL / older kernels without unprivileged overlay - can reuse the tag's existing
 /// image instead of redoing the base-copy + RUN + COPY. Content-addressed, so it NEVER reuses a stale
 /// image: any change to the Dockerfile, a build-arg, or a copied file busts the key. (An `ADD <url>` is
-/// keyed by its URL like Docker — a changed remote file isn't caught without `--checksum`, exactly
+/// keyed by its URL like Docker - a changed remote file isn't caught without `--checksum`, exactly
 /// Docker's own ADD-url cache semantics.)
 fn flat_image_key(
     domain: &str,
@@ -7043,14 +7043,14 @@ fn flat_image_key(
     format!("{:016x}", fnv1a(&acc))
 }
 
-/// The build body — separated so [`build`] can always clean up the work tree, success or error.
+/// The build body - separated so [`build`] can always clean up the work tree, success or error.
 ///
 /// Prefers a **layered** build: the base stays a shared read-only overlay lower, and RUN/COPY writes
-/// accumulate in a persistent upper (the diff) — so the base is **never copied** (closing the
+/// accumulate in a persistent upper (the diff) - so the base is **never copied** (closing the
 /// base-copy bottleneck). The image is stored as its diff + a `<tag>.base` marker, and
 /// [`resolve_image`] stacks it back over the (re-resolvable) base at run. Where unprivileged overlay
 /// isn't usable (probed once), it falls back to a **flat** build: copy the base, RUN over a bind
-/// mount, store a full rootfs — exactly as before, at the cost of the base copy.
+/// mount, store a full rootfs - exactly as before, at the cost of the base copy.
 fn build_run(
     quiet: bool,
     tag: &str,
@@ -7072,7 +7072,7 @@ fn build_run(
         return Err(Error::Sandbox("internal: build has no FROM".into()));
     };
     // `build_run` builds ONE stage. A multi-stage Dockerfile is orchestrated by `build_multi_stage`,
-    // which calls us once per stage with a single-stage slice — so we never see a second FROM here.
+    // which calls us once per stage with a single-stage slice - so we never see a second FROM here.
     if !quiet {
         eprintln!("[1/{total}] FROM {base_ref}");
     }
@@ -7085,11 +7085,11 @@ fn build_run(
     // chain), so require overlay in that case.
     //
     // SECURITY (opaque-dir leak, fail-CLOSED across kernels): a layered build represents `rm -rf dir &&
-    // mkdir dir` as an OPAQUE directory in the upper layer — a file the delete hid stays out of the
+    // mkdir dir` as an OPAQUE directory in the upper layer - a file the delete hid stays out of the
     // merged view ONLY IF the kernel actually records the opaque. On some rootless overlay kernels it
     // does NOT (measured: tegra 5.15 silently omits it → a secret `rm`'d in a build step reappears in a
     // `COPY --from`/push; rpi/android hard-fail the delete). Where the opaque isn't honoured, layered is
-    // UNSAFE, so we fall back to the FLAT build — which copies the base and deletes files for real (no
+    // UNSAFE, so we fall back to the FLAT build - which copies the base and deletes files for real (no
     // opaque marker involved), closing the leak by construction on every kernel. `probe_opaque_honored`
     // tests this once, in-process, and only matters on the (older/vendor) kernels that lack it; on a
     // modern kernel it's a sub-ms no-op that returns true.
@@ -7119,7 +7119,7 @@ fn build_run(
     // case on WSL / kernels without unprivileged overlay) redoes the whole base-copy + RUN + COPY. Key
     // the finished image by its content and, if the tag already holds exactly that image, skip the
     // build. Content-addressed (`flat_image_key`), so a changed Dockerfile / build-arg / copied file
-    // busts the key and rebuilds — it never serves a stale image.
+    // busts the key and rebuilds - it never serves a stale image.
     let ig = crate::dockerignore::DockerIgnore::load(ctx);
     let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
     let flat_key = flat_image_key(&base_lower, instrs, ctx, &ctx_root, ig.as_ref());
@@ -7130,7 +7130,7 @@ fn build_run(
         announce_built(tag);
         return Ok(());
     }
-    // A real flat build (cache miss) — now note the base copy (slower than layered).
+    // A real flat build (cache miss) - now note the base copy (slower than layered).
     if !quiet {
         eprintln!("  [flat · unprivileged overlay unavailable, copying the base]");
     }
@@ -7197,7 +7197,7 @@ fn build_run(
                 // copies each match; a literal source passes through. Errors if a glob matches nothing.
                 let srcs = expand_copy_srcs(ctx, srcs)?;
                 // Copying multiple sources requires a directory destination (else each would clobber
-                // the same name) — error rather than silently keep only the last, like Docker.
+                // the same name) - error rather than silently keep only the last, like Docker.
                 if srcs.len() > 1
                     && !(dst.ends_with('/') || write_dir.join(dst.trim_start_matches('/')).is_dir())
                 {
@@ -7280,7 +7280,7 @@ fn build_run(
             Instr::Expose(p) => {
                 announce(
                     step,
-                    format!("EXPOSE {p} (informational — publish with -p at run)"),
+                    format!("EXPOSE {p} (informational - publish with -p at run)"),
                 );
                 i += 1;
             }
@@ -7292,11 +7292,11 @@ fn build_run(
     }
 
     // Finalize: commit the new form FIRST (clearing only THIS mode's prior target so the rename can
-    // land), THEN drop the OTHER mode's stale artifacts and the sentinel — so a failed rename never
+    // land), THEN drop the OTHER mode's stale artifacts and the sentinel - so a failed rename never
     // leaves the tag with neither the old nor the new image.
     let cache = cache_dir();
     let safe = sanitize_ref(tag);
-    // Flat fallback (build_run is only reached when NOT layered — layered returns early above).
+    // Flat fallback (build_run is only reached when NOT layered - layered returns early above).
     let flat = cache.join(&safe);
     let _ = std::fs::remove_dir_all(&flat);
     std::fs::rename(&write_dir, &flat)
@@ -7314,7 +7314,7 @@ fn build_run(
 }
 
 /// The local filename an `ADD <url>` downloads to: the URL's last path segment minus any
-/// query/fragment. SANITIZED — a URL ending in `/..` or `/.`, an empty segment (bare host), or a
+/// query/fragment. SANITIZED - a URL ending in `/..` or `/.`, an empty segment (bare host), or a
 /// segment bearing a path separator / NUL would let `dir.join(name)` escape the scratch dir (and feed
 /// `..` into the copy as a source), so those fall back to a fixed safe name. Pure, so it's unit-tested.
 fn add_url_basename(url: &str) -> &str {
@@ -7328,8 +7328,8 @@ fn add_url_basename(url: &str) -> &str {
 }
 
 /// Fetch `url` into `dir` for a Dockerfile `ADD <url> <dst>`, returning the basename written. HTTPS
-/// only (`--proto '=https'`, incl. redirects) — an `http://` URL is refused rather than silently
-/// downgrading build integrity — via `curl`, matching kern's dependency-free (curl/tar/cp) posture. When `checksum`
+/// only (`--proto '=https'`, incl. redirects) - an `http://` URL is refused rather than silently
+/// downgrading build integrity - via `curl`, matching kern's dependency-free (curl/tar/cp) posture. When `checksum`
 /// (`<algo>:<hex>`) is given it's verified and a mismatch fails the build.
 fn fetch_add_url(
     url: &str,
@@ -7375,7 +7375,7 @@ fn fetch_add_url(
 
 /// Apply a Dockerfile `--chmod=<octal>` to a file the build just CREATED (an ADD-url download or a
 /// COPY-heredoc body), so `ADD --chmod=755 <url> /bin/tool` lands executable (the download-and-run
-/// pattern) — curl/`std::fs::write` create it 0644 otherwise. `None` = no flag, leave the mode as-is.
+/// pattern) - curl/`std::fs::write` create it 0644 otherwise. `None` = no flag, leave the mode as-is.
 /// The octal is parsed leniently (`755`, `0755`, `0o755`); a non-octal mode is a clear error.
 fn apply_chmod(path: &std::path::Path, mode: Option<&str>) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
@@ -7391,8 +7391,8 @@ fn apply_chmod(path: &std::path::Path, mode: Option<&str>) -> Result<(), Error> 
 }
 
 /// Apply a context/`--from` COPY's `--chmod=<octal>` to everything just copied at `target`: the file,
-/// or a directory AND its whole subtree — Docker's `--chmod` is recursive. `None` = no flag, leave the
-/// copied modes as-is. Symlinks are SKIPPED (never chmod THROUGH a symlink — the same no-follow
+/// or a directory AND its whole subtree - Docker's `--chmod` is recursive. `None` = no flag, leave the
+/// copied modes as-is. Symlinks are SKIPPED (never chmod THROUGH a symlink - the same no-follow
 /// invariant the `cp -a`/`copy_dir_filtered` copy upholds, so a `leak -> /host` in the context can't be
 /// used to chmod a host file). Directories are chmod'd AFTER their children so a restrictive mode
 /// (e.g. 0644) on the dir can't block our own descent.
@@ -7473,7 +7473,7 @@ fn verify_download_checksum(path: &std::path::Path, checksum: &str) -> Result<()
     Ok(())
 }
 
-/// Max bytes of the overlay `lowerdir=` chain — the mount-options buffer is ~one page (4 KiB); this
+/// Max bytes of the overlay `lowerdir=` chain - the mount-options buffer is ~one page (4 KiB); this
 /// leaves headroom for `upperdir=`/`workdir=` so a long build/image chain fails with our clear error
 /// instead of a cryptic kernel `EINVAL`.
 const MAX_LOWERDIR_BYTES: usize = 3500;
@@ -7483,8 +7483,8 @@ fn chain_lower(chain: &[String]) -> String {
     chain.iter().rev().cloned().collect::<Vec<_>>().join(":")
 }
 
-/// Layered build with a Docker-style **per-unit layer cache**. Each unit — a batched RUN, a COPY, a
-/// WORKDIR — is a content-addressed overlay layer keyed by the running chain key (which folds in the
+/// Layered build with a Docker-style **per-unit layer cache**. Each unit - a batched RUN, a COPY, a
+/// WORKDIR - is a content-addressed overlay layer keyed by the running chain key (which folds in the
 /// previous key + the instruction + its context: ENV/WORKDIR/USER for RUN, the copied file contents
 /// for COPY). An unchanged unit is a **cache hit** → its cached layer is stacked as a lower and the
 /// unit is NOT re-executed; the first changed unit (and everything after) is a miss and re-runs.
@@ -7517,12 +7517,12 @@ fn build_layered_cached(
     // chained key; `layer_keys` are the produced layers in order (→ the tag's `.layers` manifest).
     let mut chain: Vec<String> = vec![base_lower.to_string()];
     // Seed the chain key from the RESOLVED base lower (content-addressed for a locally-built base:
-    // its colon-chain of layer keys), not just the ref string — so rebuilding the base busts a child.
+    // its colon-chain of layer keys), not just the ref string - so rebuilding the base busts a child.
     let mut key = layer_key("", base_lower);
     let mut layer_keys: Vec<String> = Vec::new();
     let mut cmd_from_dockerfile = false;
     let mut unit = 0usize;
-    // `.dockerignore`/`.kernignore` and the canonical context root are BUILD-INVARIANT — load + resolve
+    // `.dockerignore`/`.kernignore` and the canonical context root are BUILD-INVARIANT - load + resolve
     // them ONCE here instead of re-opening/re-parsing/re-canonicalizing on every COPY instruction.
     let ig = crate::dockerignore::DockerIgnore::load(ctx);
     let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
@@ -7532,7 +7532,7 @@ fn build_layered_cached(
         // clear message BEFORE the chain overflows and the mount fails with a cryptic EINVAL.
         if chain_lower(&chain).len() > MAX_LOWERDIR_BYTES {
             return Err(Error::Sandbox(
-                "build has too many layers to overlay — squash consecutive RUN/COPY steps or reduce \
+                "build has too many layers to overlay - squash consecutive RUN/COPY steps or reduce \
                  the number of instructions"
                     .into(),
             ));
@@ -7675,7 +7675,7 @@ fn build_layered_cached(
             } => {
                 // Key on url + checksum + chmod + dst: with a `--checksum` this layer is fully
                 // content-addressed; without one, the URL string identifies it (a changed remote
-                // won't bust the cache — the documented BuildKit behaviour, so pin with --checksum).
+                // won't bust the cache - the documented BuildKit behaviour, so pin with --checksum).
                 key = layer_key(
                     &key,
                     &format!(
@@ -7790,7 +7790,7 @@ fn build_layered_cached(
                 key = layer_key(&key, &format!("USER\u{0}{u}"));
                 i += 1;
             }
-            // CMD/ENTRYPOINT/EXPOSE change only the image CONFIG, never the filesystem — they persist
+            // CMD/ENTRYPOINT/EXPOSE change only the image CONFIG, never the filesystem - they persist
             // via `config`/`.image` and are reapplied on resolve. So they do NOT advance the layer key
             // (editing a CMD must not bust the cached RUN/COPY layers). ENV/USER above DO advance it,
             // because they change a subsequent RUN's output.
@@ -7801,7 +7801,7 @@ fn build_layered_cached(
             Instr::Expose(p) => {
                 announce(
                     step,
-                    format!("EXPOSE {p} (informational — publish with -p at run)"),
+                    format!("EXPOSE {p} (informational - publish with -p at run)"),
                 );
                 i += 1;
             }
@@ -7828,7 +7828,7 @@ fn build_layered_cached(
     Ok(())
 }
 
-/// The persistent overlay upper dir under a `kern build` work/`--overlay-upper` root — the ONE place
+/// The persistent overlay upper dir under a `kern build` work/`--overlay-upper` root - the ONE place
 /// this layout convention lives, shared by [`build_run`] (writes COPY/WORKDIR here) and [`build_spec`]
 /// (mounts it as the RUN box's overlay upperdir) so the two can't silently desync.
 fn build_upper_dir(overlay_root: &std::path::Path) -> PathBuf {
@@ -7857,14 +7857,14 @@ fn remove_build_tree(path: &std::path::Path) {
 /// Probe whether an unprivileged overlay with a persistent upper actually mounts on this kernel (a
 /// tiny `true`-box over `base_lower`). Decides layered-vs-flat build up front. Best-effort; any
 /// failure → `false` → the flat copy path.
-/// `true` if this kernel HONOURS an overlay opaque directory in a rootless (single-uid userns) mount —
+/// `true` if this kernel HONOURS an overlay opaque directory in a rootless (single-uid userns) mount -
 /// i.e. after `rm -rf dir && mkdir dir` on a dir that lives in a lower layer, the lower's files are
 /// hidden from the merged view. Tested once, in-process (fork + `unshare(CLONE_NEWUSER|NEWNS)` +
 /// single-uid self-map + a throwaway 2-dir overlay), so it needs no `newuidmap` and mirrors exactly what
 /// a build layer does. Returns `true` on a modern kernel (a sub-ms check); `false` on a kernel that
-/// silently omits the opaque (measured: tegra 5.15) — where the caller must NOT build layered, or a
+/// silently omits the opaque (measured: tegra 5.15) - where the caller must NOT build layered, or a
 /// deleted file would leak into a `COPY --from`/push. Best-effort: if the probe itself can't run
-/// (no unpriv userns at all — but then `probe_overlay` already said no), we return `false` (fail-closed).
+/// (no unpriv userns at all - but then `probe_overlay` already said no), we return `false` (fail-closed).
 fn probe_opaque_honored() -> bool {
     let tmp = cache_dir().join(format!(".opaque-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -7903,7 +7903,7 @@ fn probe_opaque_honored() -> bool {
 /// Child of [`probe_opaque_honored`]: mount a RW overlay (lower has `dir/secret`), `rm -rf dir && mkdir
 /// dir` in the merged view, then re-open the merged view read-only and check `dir/secret` is GONE (the
 /// opaque was honoured). `_exit(0)` iff hidden; any other path `_exit`s non-zero. Async-signal-safe until
-/// the `system()` — acceptable here (single-threaded at fork, like `merged_view_child`).
+/// the `system()` - acceptable here (single-threaded at fork, like `merged_view_child`).
 unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: libc::gid_t) -> ! {
     let cs = |p: String| std::ffi::CString::new(p).unwrap();
     if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
@@ -7935,15 +7935,15 @@ unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: lib
     {
         libc::_exit(13);
     }
-    // Reproduce EXACTLY what a build does — and the leak that only shows on RE-MOUNT. A build RUN does
+    // Reproduce EXACTLY what a build does - and the leak that only shows on RE-MOUNT. A build RUN does
     // `rm -rf dir && mkdir dir` in the live overlay (which every kernel honours in the LIVE view), then
     // `commit_layer` saves the UPPER as a standalone layer, and later the merged-view RE-MOUNTS
     // upper-as-lower. The leak is that some kernels (tegra 5.15) honour the opaque live but DON'T
-    // persist it into the upper (no opaque xattr / whiteout written) — so on re-mount the lower's file
+    // persist it into the upper (no opaque xattr / whiteout written) - so on re-mount the lower's file
     // resurfaces. So: do the rm in the live mount, then RE-MOUNT `up:lower` read-only (as the merged
     // view would) and check the secret is STILL hidden. Only if it stays hidden across the re-mount is
     // the opaque truly persisted → layered is safe.
-    // stderr silenced ({{…}} 2>/dev/null): this is an internal PROBE — only its exit status matters
+    // stderr silenced ({{…}} 2>/dev/null): this is an internal PROBE - only its exit status matters
     // (drives the layered-vs-flat decision). On a filesystem where the overlay `rm` can't fully remove
     // the dir (WSL's 9p/overlay: "rm: can't remove …: I/O error"), the probe correctly falls back to a
     // flat build; leaking that rm's diagnostic to the user's build output just looks alarming.
@@ -8026,7 +8026,7 @@ fn run_build_step(
         .map_err(|e| Error::Sandbox(format!("RUN: cannot start kern box: {e}")))?;
     if !status.success() {
         // For a batched RUN this prints the combined `&&` chain; the box inherited stdio, so the
-        // failing sub-step's own stderr already appeared above — enough to see which step failed.
+        // failing sub-step's own stderr already appeared above - enough to see which step failed.
         return Err(Error::Sandbox(format!(
             "RUN failed (exit {}): {}",
             status.code().unwrap_or(-1),
@@ -8036,7 +8036,7 @@ fn run_build_step(
     Ok(())
 }
 
-/// `cp -a src/. dst` — copy the CONTENTS of `src` into the existing `dst`, preserving symlinks,
+/// `cp -a src/. dst` - copy the CONTENTS of `src` into the existing `dst`, preserving symlinks,
 /// modes and timestamps (used to make a mutable copy of the pulled base rootfs).
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Error> {
     std::fs::create_dir_all(dst).map_err(|e| Error::Sandbox(format!("build rootfs: {e}")))?;
@@ -8256,7 +8256,7 @@ fn copy_into_rootfs(
             let _ = std::fs::create_dir_all(&target);
             // Match ignore paths relative to the CANONICAL context root: `src` is already canonicalized,
             // so a symlinked context path (e.g. `/tmp` -> `/private/tmp`, or a symlinked project dir)
-            // would otherwise make `strip_prefix` fail and silently disable filtering — a fail-OPEN
+            // would otherwise make `strip_prefix` fail and silently disable filtering - a fail-OPEN
             // that would leak the very secrets the ignore file exists to keep out. Falls back to raw
             // `ctx` only if canonicalize fails (then the walk fails CLOSED on any un-strippable entry).
             let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
@@ -8271,7 +8271,7 @@ fn copy_into_rootfs(
     } else {
         src.to_string_lossy().into_owned()
     };
-    // SECURITY INVARIANT (do not break): `cp -a` implies `--no-dereference` — it PRESERVES symlinks in
+    // SECURITY INVARIANT (do not break): `cp -a` implies `--no-dereference` - it PRESERVES symlinks in
     // the copied tree rather than following them. This is load-bearing for the build-context confinement
     // (the "duale-di-Z2" note in `resolve_builds`): the COPY source root is confined by canonicalize +
     // starts_with, and because the recursive descent here does NOT follow inner symlinks, a symlink
@@ -8295,10 +8295,10 @@ fn copy_into_rootfs(
 }
 
 /// Recursively copy directory `src` into `target`, SKIPPING paths the context's ignore rules exclude
-/// (matched relative to `ctx`, the context root). NO-FOLLOW — the same confinement invariant as the
+/// (matched relative to `ctx`, the context root). NO-FOLLOW - the same confinement invariant as the
 /// `cp -a` path: a symlink is recreated as a symlink, never traversed, so a `leak -> /host/secret` in
 /// the context lands dangling in the image and its host target is never read. File MODE is preserved
-/// (an executable script stays executable). Non-regular entries (fifo/socket/device — which don't
+/// (an executable script stays executable). Non-regular entries (fifo/socket/device - which don't
 /// belong in a build context) are skipped.
 fn copy_dir_filtered(
     src: &std::path::Path,
@@ -8313,7 +8313,7 @@ fn copy_dir_filtered(
         let md = std::fs::symlink_metadata(&path)?;
         let ft = md.file_type();
         // The path RELATIVE TO THE CONTEXT ROOT drives ignore matching (dockerignore is context-
-        // relative). If it can't be made relative (shouldn't happen — `src` and `ctx` are both
+        // relative). If it can't be made relative (shouldn't happen - `src` and `ctx` are both
         // canonical), fail CLOSED (skip) rather than copy an un-vetted file.
         let Ok(rel) = path.strip_prefix(ctx) else {
             continue;
@@ -8330,14 +8330,14 @@ fn copy_dir_filtered(
         } else if ig.excluded(&rel) {
             continue;
         } else if ft.is_symlink() {
-            // Recreate the symlink verbatim — NEVER follow it (a `leak -> /host/secret` in the context
+            // Recreate the symlink verbatim - NEVER follow it (a `leak -> /host/secret` in the context
             // must land dangling, its target never read at build time).
             let link = std::fs::read_link(&path)?;
             let _ = std::fs::remove_file(&dest);
             std::os::unix::fs::symlink(&link, &dest)?;
         } else if ft.is_file() {
             // Unlink any pre-existing dest first, so a symlink planted at that path (e.g. by the base
-            // image) can't make `fs::copy` write THROUGH it out of the rootfs — stricter than `cp -a`.
+            // image) can't make `fs::copy` write THROUGH it out of the rootfs - stricter than `cp -a`.
             let _ = std::fs::remove_file(&dest);
             std::fs::copy(&path, &dest)?;
             std::fs::set_permissions(
@@ -8359,7 +8359,7 @@ fn set_config_env(env: &mut Vec<String>, k: &str, v: &str) {
     }
 }
 
-/// Apply a CMD or ENTRYPOINT instruction to the image config — the ONE place the Docker rule
+/// Apply a CMD or ENTRYPOINT instruction to the image config - the ONE place the Docker rule
 /// "ENTRYPOINT resets an inherited base CMD unless this Dockerfile set its own CMD" lives, so the
 /// flat and layer-cached build loops can't drift. Config-only: neither touches the filesystem.
 /// `cmd_seen` records whether THIS Dockerfile has set a CMD.
@@ -8426,12 +8426,12 @@ fn mkdir_in_rootfs(rootfs: &std::path::Path, dir: &str) -> Result<(), Error> {
 
 /// Seed `/etc/resolv.conf` in the build rootfs from the host so RUN steps can resolve DNS over the
 /// shared network namespace. Returns `true` if it CREATED the file (the base had none) so the caller
-/// can remove it before finalizing — we don't want the host's DNS servers baked into the image
+/// can remove it before finalizing - we don't want the host's DNS servers baked into the image
 /// (Docker provides resolv.conf only at runtime). Best-effort; a base that ships its own is left be.
 fn seed_resolv_conf(rootfs: &std::path::Path) -> bool {
     let dst = rootfs.join("etc/resolv.conf");
     if dst.exists() {
-        return false; // base image already has one — leave it, don't touch/remove it
+        return false; // base image already has one - leave it, don't touch/remove it
     }
     if let Ok(rc) = std::fs::read("/etc/resolv.conf") {
         let _ = std::fs::create_dir_all(rootfs.join("etc"));
@@ -8443,7 +8443,7 @@ fn seed_resolv_conf(rootfs: &std::path::Path) -> bool {
 }
 
 /// The shell script of a shell-form RUN (`["/bin/sh","-c",<script>]`), or `None` for an exec-form
-/// RUN — only shell-form RUNs are safe to batch into one box.
+/// RUN - only shell-form RUNs are safe to batch into one box.
 fn run_shell_script(argv: &[String]) -> Option<&str> {
     match argv {
         [sh, dashc, s] if sh == "/bin/sh" && dashc == "-c" => Some(s),
@@ -8496,21 +8496,21 @@ fn display_run(argv: &[String]) -> String {
     }
 }
 
-/// Per-box writable overlay scratch (upper/work) — placed on **tmpfs** where possible
+/// Per-box writable overlay scratch (upper/work) - placed on **tmpfs** where possible
 /// (`$XDG_RUNTIME_DIR` → `/run/user/<uid>`, both tmpfs), else `/tmp`. tmpfs makes the create /
 /// overlay-mount / cleanup RAM-fast and keeps the writable layer ephemeral; its pages count
 /// against the box's memory cap. Created mode 0700 by the caller.
 fn scratch_dir() -> PathBuf {
-    // An explicit XDG_RUNTIME_DIR always wins — it is the documented override.
+    // An explicit XDG_RUNTIME_DIR always wins - it is the documented override.
     if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(x).join("kern/scratch");
     }
     let uid = unsafe { libc::getuid() };
-    // The scratch holds each box's overlay upper/work — and the kernel refuses an overlay UPPER
+    // The scratch holds each box's overlay upper/work - and the kernel refuses an overlay UPPER
     // that itself lives on overlayfs. On a normal host `/run/user/<uid>` (tmpfs) or `/tmp` is fine;
     // when kern runs INSIDE a Docker/CI container BOTH sit on the container's overlay rootfs, so
     // probe the candidates and take the first non-overlay one. `/dev/shm` is a real tmpfs even
-    // inside Docker (size-capped — last resort, announced on stderr so an ENOSPC later isn't a
+    // inside Docker (size-capped - last resort, announced on stderr so an ENOSPC later isn't a
     // mystery). If everything is overlayfs, fall through to /tmp and let the mount fail with the
     // actionable nested-overlay error from kern-isolation.
     let run = PathBuf::from(format!("/run/user/{uid}"));
@@ -8526,7 +8526,7 @@ fn scratch_dir() -> PathBuf {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     eprintln!(
-                        "kern: note: /run and /tmp are on overlayfs (container?) — using the \
+                        "kern: note: /run and /tmp are on overlayfs (container?) - using the \
                          size-capped /dev/shm for box scratch; set XDG_RUNTIME_DIR to a tmpfs/disk \
                          path for full capacity"
                     );
@@ -8540,7 +8540,7 @@ fn scratch_dir() -> PathBuf {
 
 const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 
-/// Filesystem magic (`statfs.f_type`) of `p`'s deepest EXISTING ancestor — the path itself usually
+/// Filesystem magic (`statfs.f_type`) of `p`'s deepest EXISTING ancestor - the path itself usually
 /// doesn't exist yet (the scratch is created later). `None` only if nothing up to `/` can be stat'd.
 fn fs_magic_of(p: &std::path::Path) -> Option<i64> {
     let mut cur = p;
@@ -8555,12 +8555,12 @@ fn fs_magic_of(p: &std::path::Path) -> Option<i64> {
     }
 }
 
-/// `kern stop <name>... | --all` — stop running box(es): SIGKILL each target supervisor's process
+/// `kern stop <name>... | --all` - stop running box(es): SIGKILL each target supervisor's process
 /// group (tearing down the box's PID namespace), drop its registry entry, and remove its writable
 /// scratch. Stops every name in `names` (a name may match more than one box if names ever collide),
-/// or — with `all` — every running box. A requested name that isn't running is reported on stderr
+/// or - with `all` - every running box. A requested name that isn't running is reported on stderr
 /// (never silently ignored); the command succeeds as long as at least one box was stopped.
-/// The running boxes matching a list of user refs — each a box NAME or (fallback) its `kern ps`
+/// The running boxes matching a list of user refs - each a box NAME or (fallback) its `kern ps`
 /// supervisor PID. NAME WINS GLOBALLY: `!live_names.contains(n)` gates the pid branch, so an all-digit
 /// box name is never shadowed by a coincidental pid, and `stop 79` can't hit both a box named "79" and
 /// a different pid-79 box. Shared by `stop` and `pause`/`unpause` (the multi-target live commands).
@@ -8582,8 +8582,8 @@ fn live_name_set(running: &[registry::Instance]) -> std::collections::HashSet<St
     running.iter().map(|b| b.name.clone()).collect()
 }
 
-/// Does ref `n` select box `b`? A ref matches by NAME (always), else — only when no live box bears
-/// that exact name (NAME wins globally) — by its PID or by its POD name. Matching a pod name selects
+/// Does ref `n` select box `b`? A ref matches by NAME (always), else - only when no live box bears
+/// that exact name (NAME wins globally) - by its PID or by its POD name. Matching a pod name selects
 /// every member of that pod, so `kern stop <pod>` / `kern pause <pod>` act on the whole group.
 fn ref_matches(
     b: &registry::Instance,
@@ -8591,7 +8591,7 @@ fn ref_matches(
     live_names: &std::collections::HashSet<String>,
 ) -> bool {
     n == b.name
-        // `HashSet<String>::contains(&str)` via Borrow — O(1), no per-call allocation.
+        // `HashSet<String>::contains(&str)` via Borrow - O(1), no per-call allocation.
         || (!live_names.contains(n)
             // The pod branch guards against an EMPTY ref: a standalone box has `pod == ""`, so an
             // empty `n` would otherwise sweep every standalone box. A pid parses only when non-empty.
@@ -8607,7 +8607,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         boxes_matching_refs(running.clone(), names)
     };
     // A persistent (`--restart always`) box is supervised by systemd and may be momentarily down
-    // between restarts — not in the registry, but its unit still exists and would resurrect it at
+    // between restarts - not in the registry, but its unit still exists and would resurrect it at
     // reboot. Collect those so stop reliably removes them too: for explicit names, the requested
     // ones; for `--all`, every `kern-*.service` in the user unit dir not already a live target.
     let managed_only: Vec<String> = if all {
@@ -8649,7 +8649,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     for b in &targets {
         // A persistent box: tell systemd to stop AND disable the unit (so it neither restarts now
         // nor comes back at reboot), then remove it. Killing the process instead would just trip
-        // systemd's `Restart=always`. Otherwise kill the box's PID-namespace init directly — see
+        // systemd's `Restart=always`. Otherwise kill the box's PID-namespace init directly - see
         // `kill_box`; a bare `kill(-pid)` reaches only a detached, `setsid`-ed supervisor's group,
         // never a foreground box whose init isn't in that group.
         // Capture the box's exact direct-path cgroup dir NOW, while pid1 is still alive and a member of
@@ -8675,10 +8675,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         registry::clear_health(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
         if killed {
-            // Eagerly rmdir the box's now-empty cgroup dir (captured above) — the SIGKILL skipped the
+            // Eagerly rmdir the box's now-empty cgroup dir (captured above) - the SIGKILL skipped the
             // supervisor's RAII guard, so it would otherwise linger until `gc`/the next box start. rmdir is
             // empty-only, so a (vanishingly unlikely) reused-pid live box is safe. Covers `compose down`
-            // too — it tears the stack down via this same `stop`.
+            // too - it tears the stack down via this same `stop`.
             if let Some(cg) = &box_cgroup {
                 let _ = std::fs::remove_dir(cg);
             }
@@ -8697,16 +8697,16 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         println!("stopped '{n}' (systemd-managed)");
     }
     // Stopping a pod means removing its "root" too (like Docker Desktop's stop-the-project): once every
-    // member of a pod is stopped, tear the pod down — its holder process, network namespace and shared
+    // member of a pod is stopped, tear the pod down - its holder process, network namespace and shared
     // hosts/resolv files. This fires whether the pod was named directly (`kern stop <pod>`), swept by
-    // `--all`, or emptied by stopping its last member — matching `compose down`'s cleanup.
+    // `--all`, or emptied by stopping its last member - matching `compose down`'s cleanup.
     let stopped_pods: std::collections::BTreeSet<&str> = targets
         .iter()
         .map(|b| b.pod.as_str())
         .filter(|p| !p.is_empty())
         .collect();
     // A pod survives iff some running member's pid ISN'T among the stopped targets. Compute the set of
-    // surviving pods in ONE pass with a pid HashSet — the naive `for pod { running.any(!targets.any) }`
+    // surviving pods in ONE pass with a pid HashSet - the naive `for pod { running.any(!targets.any) }`
     // is O(pods·running·targets) (≈O(N³) on `stop --all` with many boxes); this is O(N).
     let target_pids: std::collections::HashSet<i32> = targets.iter().map(|b| b.pid).collect();
     let survivors: std::collections::HashSet<&str> = running
@@ -8724,7 +8724,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     }
     // Don't silently ignore refs that matched no running box (and no managed unit). A ref matched a
     // target by NAME, by its PID, or by its POD name (same rule as the selection above), so check all
-    // three — else `kern stop <pid|pod>` acts AND then wrongly warns the ref "isn't a box".
+    // three - else `kern stop <pid|pod>` acts AND then wrongly warns the ref "isn't a box".
     if !all {
         let live_names = live_name_set(&running);
         for n in names {
@@ -8737,14 +8737,14 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// The systemd unit file name for a persistent box — the naming convention lives here only.
+/// The systemd unit file name for a persistent box - the naming convention lives here only.
 fn unit_file_name(name: &str) -> String {
     format!("kern-{name}.service")
 }
 
 /// Path of the systemd user unit for a persistent box named `name` (if the user's systemd dir is
 /// resolvable). Existence of this file is what marks a box as systemd-managed. Returns `None` for a
-/// name that isn't a valid box name — `kern stop <name>` takes raw, unvalidated names, and a `../`
+/// name that isn't a valid box name - `kern stop <name>` takes raw, unvalidated names, and a `../`
 /// one must never let `stop_managed_unit`'s `remove_file` escape the systemd user dir.
 fn managed_unit_path(name: &str) -> Option<PathBuf> {
     BoxName::parse(name).ok()?;
@@ -8772,7 +8772,7 @@ fn stop_managed_unit(name: &str) -> bool {
     true
 }
 
-/// `kern pause <name>...` / `kern unpause <name>...` — freeze / thaw a running box via the cgroup v2
+/// `kern pause <name>...` / `kern unpause <name>...` - freeze / thaw a running box via the cgroup v2
 /// **freezer** (`cgroup.freeze`), which suspends every process in the box's cgroup atomically (no
 /// signal races, and a paused box can't be woken by `SIGCONT` from inside). Needs the box to have a
 /// dedicated cgroup (a `systemd --user` scope, the default when present); without one there's nothing
@@ -8780,7 +8780,7 @@ fn stop_managed_unit(name: &str) -> bool {
 pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
     let verb = if freeze { "pause" } else { "unpause" };
     let running = registry::list();
-    // Captured before `running` is consumed — the unmatched-ref report below needs the full live-name
+    // Captured before `running` is consumed - the unmatched-ref report below needs the full live-name
     // set to apply the same NAME-wins rule as selection (a pod/pid ref must not be called "not a box").
     let live_names = live_name_set(&running);
     let targets: Vec<_> = if all {
@@ -8801,7 +8801,7 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
                 }
             }
             None => eprintln!(
-                "kern: cannot {verb} '{}' — the box has no dedicated cgroup (needs a systemd --user \
+                "kern: cannot {verb} '{}' - the box has no dedicated cgroup (needs a systemd --user \
                  scope; pause/unpause is a cgroup-freezer operation)",
                 b.name
             ),
@@ -8810,7 +8810,7 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
     if !all {
         for n in names {
             // Same NAME-or-PID-or-POD rule as `stop`: a `kern pause <pod>` froze every member, so the
-            // pod ref matched — don't then wrongly report it as "no running box".
+            // pod ref matched - don't then wrongly report it as "no running box".
             if !targets.iter().any(|b| ref_matches(b, n, &live_names)) {
                 eprintln!("kern: no running box named '{n}'");
             }
@@ -8828,7 +8828,7 @@ fn cleanup_box_scratch(rootfs: &str) {
     }
     let Some(scratch) = p.parent() else { return };
     // CONFINEMENT (the ranged fallback below runs a privileged newuidmap'd remove_dir_all, so the path
-    // must be provably ours): require `scratch`'s parent to be kern's own scratch root — not a weak
+    // must be provably ours): require `scratch`'s parent to be kern's own scratch root - not a weak
     // `.contains("/scratch/")` (which `/tmp/scratch/../../etc` would pass). Canonicalize both sides so
     // no `..`/symlink in the registry-derived rootfs can steer the remove outside kern's scratch tree.
     let root = scratch_dir();
@@ -8843,7 +8843,7 @@ fn cleanup_box_scratch(rootfs: &str) {
     }
     // Route through cleanup_scratch's ranged fallback: a `--uid-range`/pod box whose image dropped
     // privilege leaves subordinate-uid-owned files (e.g. grafana's /var/lib/grafana owned by subuid
-    // 100471) that a plain remove_dir_all can't unlink from the host — the fallback retries inside a
+    // 100471) that a plain remove_dir_all can't unlink from the host - the fallback retries inside a
     // newuidmap'd user ns where they're removable.
     cleanup_scratch(Some(scratch));
 }
@@ -8855,18 +8855,18 @@ fn cleanup_box_scratch(rootfs: &str) {
 const COMPOSE_CONDITION_TIMEOUT_SECS: u64 = 120;
 
 /// The exit-sidecar key for a box: `<pod>-<token>-<name>`. `<pod>` namespaces by STACK (two stacks
-/// with a `db` don't collide — review 1b); `<token>` namespaces by this `up`'s RUN (two concurrent
+/// with a `db` don't collide - review 1b); `<token>` namespaces by this `up`'s RUN (two concurrent
 /// `up`s of the SAME stack own separate files, so one's clear/write can't clobber the other's real
-/// completion — review round 2, the round-1 "token only inside the file" left the filename shared).
+/// completion - review round 2, the round-1 "token only inside the file" left the filename shared).
 /// `compose_pod_name(file)` is stable per compose file even for a `--no-pod` stack (no live pod), so
 /// the prefix is well-defined in both modes. `compose down` doesn't know the `up`'s token, so it reaps
-/// each box's sidecar by `exit_key_prefix(pod)` ++ `-<name>` (pod-prefix AND name-suffix) — NOT a
+/// each box's sidecar by `exit_key_prefix(pod)` ++ `-<name>` (pod-prefix AND name-suffix) - NOT a
 /// blind pod prefix, which would wipe a concurrent same-stack run's in-flight files.
 fn exit_key(pod: &str, token: &str, name: &str) -> String {
     format!("{pod}-{token}-{name}")
 }
 
-/// The `<pod>-` prefix shared by every exit key of a stack — the LEADING anchor for `compose down`'s
+/// The `<pod>-` prefix shared by every exit key of a stack - the LEADING anchor for `compose down`'s
 /// reap; the box name (`-<name>`) is the trailing anchor, so together they bracket any token.
 fn exit_key_prefix(pod: &str) -> String {
     format!("{pod}-")
@@ -8894,14 +8894,14 @@ fn resolve_builds(
 
     for b in boxes.iter_mut() {
         let Some(bd) = b.build.clone() else { continue };
-        // Guard 1 — CONFINE context under the compose dir. Canonicalize `base/context` and require the
+        // Guard 1 - CONFINE context under the compose dir. Canonicalize `base/context` and require the
         // result stays beneath `base`, so a `context: ../../../etc` in a third-party compose can't
         // escape the project tree. (Same traversal class as image/volume/pod names in the saga.)
-        // NOTE (duale-di-Z2): confining the context ROOT here is not enough on its own — `kern build`
+        // NOTE (duale-di-Z2): confining the context ROOT here is not enough on its own - `kern build`
         // then DESCENDS the context (COPY). That descent is itself confined: `copy_into_rootfs`
         // canonicalizes each COPY source and requires `starts_with(ctx)` (a source symlink pointing out
         // is rejected), and `cp -a` PRESERVES inner symlinks rather than following them (so a symlink
-        // buried in the tree lands in the image verbatim — dangling inside the pivoted rootfs — never
+        // buried in the tree lands in the image verbatim - dangling inside the pivoted rootfs - never
         // read at build time). Verified live: a `leak -> /host/secret` inside the context does not leak
         // the host file into the image. So root-confine here + no-follow descent in build = closed.
         let ctx_abs = std::fs::canonicalize(base.join(&bd.context)).map_err(|e| {
@@ -8916,7 +8916,7 @@ fn resolve_builds(
                 b.name, bd.context
             )));
         }
-        // Guard 1 (dockerfile) — if given, confine it under the CONTEXT (Docker resolves `dockerfile`
+        // Guard 1 (dockerfile) - if given, confine it under the CONTEXT (Docker resolves `dockerfile`
         // relative to the context). Reject an escaping dockerfile path.
         let dfile = match &bd.dockerfile {
             Some(df) => {
@@ -8934,7 +8934,7 @@ fn resolve_builds(
             None => None,
         };
 
-        // Guard 4 — `image:` + `build:` = build AND tag as `image`; `build:` alone → synthesized tag.
+        // Guard 4 - `image:` + `build:` = build AND tag as `image`; `build:` alone → synthesized tag.
         // Either way the box RUNS the freshly built image, never a stale registry one.
         let tag = b
             .image
@@ -8951,13 +8951,13 @@ fn resolve_builds(
             cmd.arg("--build-arg").arg(a); // already ${VAR}-interpolated by the parser (guard 2)
         }
         cmd.arg(&ctx_abs);
-        // Guard 3 — a build failure fails the whole `up` with a linked, service-named message.
+        // Guard 3 - a build failure fails the whole `up` with a linked, service-named message.
         let status = cmd.status().map_err(|e| {
             Error::Compose(format!("service '{}': running `kern build`: {e}", b.name))
         })?;
         if !status.success() {
             return Err(Error::Compose(format!(
-                "service '{}': build failed — run `kern build -t {tag} {}` to see why",
+                "service '{}': build failed - run `kern build -t {tag} {}` to see why",
                 b.name,
                 ctx_abs.display()
             )));
@@ -8970,14 +8970,14 @@ fn resolve_builds(
 /// Reject conditional dependencies that can NEVER be satisfied, at bring-up time rather than after a
 /// two-minute timeout (adversarial-review 2d). `topo_order` (called before this) already rejects
 /// cycles and unknown deps; this adds the one statically-impossible case:
-///   * `depends_healthy` on a box with no `health_cmd` — it can never report healthy.
+///   * `depends_healthy` on a box with no `health_cmd` - it can never report healthy.
 ///
 /// NOTE on `depends_completed` + `restart`: the review suggested rejecting it, but in kern's compose
-/// `restart = true` means ON-FAILURE (a bare `--restart`), NOT always-respawn — the supervisor re-runs
+/// `restart = true` means ON-FAILURE (a bare `--restart`), NOT always-respawn - the supervisor re-runs
 /// the box ONLY on a non-zero exit. So a `depends_completed` target that exits 0 completes normally,
 /// and one that keeps failing crash-loops to the restart cap and then records its final non-zero exit,
 /// which fails the wait cleanly. `restart = true` + `depends_completed` is therefore COHERENT, not
-/// impossible — we must NOT reject it. (Were compose ever to gain an `always`/`unless-stopped` policy,
+/// impossible - we must NOT reject it. (Were compose ever to gain an `always`/`unless-stopped` policy,
 /// THAT would be the never-completes case to reject here.)
 fn validate_conditions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error> {
     let find = |n: &str| boxes.iter().find(|x| x.name == n);
@@ -8999,10 +8999,10 @@ fn validate_conditions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error
 /// `depends_healthy[dep]` waits until `dep`'s health check reports `healthy`; `depends_completed[dep]`
 /// waits until `dep` has run to completion (exit 0), keyed by `pod`+`token` so a same-named service in
 /// another stack, or a previous run's sidecar, can't satisfy it. Driven off the registry sidecars the
-/// box machinery already writes — no IPC of our own. Polled at 100 ms so a fast dep adds only a
+/// box machinery already writes - no IPC of our own. Polled at 100 ms so a fast dep adds only a
 /// sub-100 ms tail, not Docker's whole-second-per-health-interval granularity.
 ///
-/// A dependency that DIES before satisfying its condition aborts immediately (adversarial-review 2a) —
+/// A dependency that DIES before satisfying its condition aborts immediately (adversarial-review 2a) -
 /// we don't burn the full timeout on an already-decided outcome. The registry's liveness (a dep no
 /// longer in `list()` and with no completion recorded) is the death signal.
 fn wait_for_conditions(
@@ -9035,16 +9035,16 @@ fn wait_for_conditions(
                     b.name
                 )));
             }
-            // Dead before healthy — decided; don't wait out the timeout. Prefer the POSITIVE death
+            // Dead before healthy - decided; don't wait out the timeout. Prefer the POSITIVE death
             // signal (a written exit sidecar) over the prune-timing one (absence from `list()`): a box
             // targeted by a `depends_completed` writes its exit on death, so a completion sidecar for
             // this dep is proof it's gone. Fall back to registry liveness for a dep that ISN'T a
-            // completion target (no sidecar), where absence-from-`list()` is the only death signal —
+            // completion target (no sidecar), where absence-from-`list()` is the only death signal -
             // there the timeout backstops the ≤1-poll prune lag (review 2a).
             let died = registry::exit_of(&key_of(dep)).is_some() || !is_box_alive(dep);
             if died {
                 return Err(Error::Compose(format!(
-                    "box '{}': dependency '{dep}' exited before becoming healthy — run `kern logs \
+                    "box '{}': dependency '{dep}' exited before becoming healthy - run `kern logs \
                      {dep}` for the reason (a crash, or e.g. a port already bound by a pod peer)",
                     b.name
                 )));
@@ -9070,7 +9070,7 @@ fn wait_for_conditions(
                     break;
                 }
                 return Err(Error::Compose(format!(
-                    "box '{}': dependency '{dep}' did not complete successfully (exit {code}) — \
+                    "box '{}': dependency '{dep}' did not complete successfully (exit {code}) - \
                      run `kern logs {dep}` for the reason",
                     b.name
                 )));
@@ -9103,14 +9103,14 @@ fn is_box_alive(name: &str) -> bool {
     registry::name_taken(name)
 }
 
-/// `kern compose <file>` — bring up a stack of boxes (detached) in `depends_on` order. Each
+/// `kern compose <file>` - bring up a stack of boxes (detached) in `depends_on` order. Each
 /// service is launched via a fresh `kern box -d` subprocess, so it gets its own scope + registry
 /// entry; track the stack with `kern ps`.
 pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
     let text = std::fs::read_to_string(file)
         .map_err(|e| Error::Compose(format!("reading {file}: {e}")))?;
     let mut boxes = crate::compose::parse(&text).map_err(Error::Compose)?;
-    // The stack's pod is named after the compose file (Docker's project-name idea) — one shared
+    // The stack's pod is named after the compose file (Docker's project-name idea) - one shared
     // network so services reach each other by name.
     let pod = compose_pod_name(file);
 
@@ -9118,9 +9118,9 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
     // the members, so `pod::remove`'s "members keep running" note would contradict this).
     if down {
         let names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
-        let _ = stop(&names, false); // best-effort — some may already be gone
+        let _ = stop(&names, false); // best-effort - some may already be gone
                                      // Reap this stack's exit sidecars. Keys are `<pod>-<token>-<name>`; `down` doesn't know the
-                                     // `up`'s token, so it clears `<pod>-*-<name>` per box it stopped — NOT a blind `<pod>-*` (that
+                                     // `up`'s token, so it clears `<pod>-*-<name>` per box it stopped - NOT a blind `<pod>-*` (that
                                      // would wipe a concurrent same-stack run's OTHER boxes). There's no shared state-file and no
                                      // read-modify-write, so no lost-update: each `remove_file` is atomic and ENOENT-safe, so two
                                      // concurrent `down`s just no-op over each other.
@@ -9149,27 +9149,27 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
     }
 
     let levels = crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
-    // Static rejection of conditions that can NEVER be satisfied — caught here, not left to time out
+    // Static rejection of conditions that can NEVER be satisfied - caught here, not left to time out
     // at runtime (adversarial-review 2d). `topo_order` above already rejects cycles and unknown deps.
     validate_conditions(&boxes)?;
     let self_exe =
         std::env::current_exe().map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
 
-    // Compose `build:` — build each service's image via `kern build` BEFORE the launch loop, so a box
+    // Compose `build:` - build each service's image via `kern build` BEFORE the launch loop, so a box
     // with `build:` gets a real image to run. Four hardenings the adversarial review demanded, because
     // `build:` is the first place the YAML parser drives a privileged operation on host paths:
     //  1. `context`/`dockerfile` are CONFINED under the compose file's directory (traversal guard).
     //  2. `build.args` are already `${VAR}`-interpolated by the parser (never literal `${VAR}`).
     //  3. a build failure fails the WHOLE `up` with a linked message ("service X: build failed …"),
     //     since a box whose image never built can't start (and its depends_completed/healthy peers
-    //     would hang) — fail-fast beats a half-up stack.
+    //     would hang) - fail-fast beats a half-up stack.
     //  4. `image:` + `build:` together = build AND tag as `image` (compose semantics); a `build:` with
     //     no `image:` gets a synthesized tag. We never silently use a stale registry image for a box
     //     the user meant to build locally.
     resolve_builds(&mut boxes, file, &self_exe)?;
     // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
     // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
-    // to absolute (confined under the compose dir — traversal guard, like a build context). A `named:`
+    // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
     // source or an already-absolute `/host:/dst` passes through untouched.
     resolve_relative_binds(&mut boxes, file)?;
 
@@ -9194,7 +9194,7 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
         // Map a uid RANGE into the pod's shared user ns when ANY member needs it: an OCI-image box
         // (official images drop privilege in their entrypoint) OR a box that explicitly set
         // `uid_range = true`. A pod member setns's into the holder's user ns and writes NO map of its
-        // own, so the holder's map is authoritative — `--uid-range` on the member alone is a no-op. This
+        // own, so the holder's map is authoritative - `--uid-range` on the member alone is a no-op. This
         // MUST match `push_box_flags`'s per-box rule exactly (`uid_range || image-and-not-opted-out`),
         // decided HERE, before the holder is created (it writes its map at unshare). A pod of only
         // single-uid rootfs services stays single-uid (faster).
@@ -9204,11 +9204,11 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
         crate::pod::create_with_range(&pod, true, pod_needs_range)?;
     }
     // Feedback-first: a `--net` (host-network) service in a podded stack is NOT on the pod net, so its
-    // peers can't reach it by name — say so rather than let it silently not resolve.
+    // peers can't reach it by name - say so rather than let it silently not resolve.
     if use_pod {
         for b in boxes.iter().filter(|b| b.net) {
             eprintln!(
-                "kern: note: service '{}' uses --net (host network) — it is NOT reachable by name inside pod '{pod}'",
+                "kern: note: service '{}' uses --net (host network) - it is NOT reachable by name inside pod '{pod}'",
                 b.name
             );
         }
@@ -9225,8 +9225,8 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
             .collect::<Vec<_>>()
             .join(" → ")
     );
-    // Bring each dependency LEVEL up CONCURRENTLY — every box in a level is independent (its deps live
-    // in earlier levels) — with a barrier before the next level so `depends_on` still holds. Wall-clock
+    // Bring each dependency LEVEL up CONCURRENTLY - every box in a level is independent (its deps live
+    // in earlier levels) - with a barrier before the next level so `depends_on` still holds. Wall-clock
     // becomes Σ-per-LEVEL instead of Σ-per-box: a wide flat stack starts in one shot, not one-by-one.
     let started = std::sync::atomic::AtomicUsize::new(0);
     // Cap concurrent starts so a very WIDE level (100s of independent services) doesn't fork a
@@ -9276,7 +9276,7 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
                             // If a peer waits on THIS box's completion, hand it the stack+run-scoped exit
                             // KEY via env and CLEAR that exact key BEFORE the spawn. Each box owns a UNIQUE
                             // key (carries this `up`'s token), so concurrent workers never touch each
-                            // other's — the review-round-2 invariant holds under parallelism too.
+                            // other's - the review-round-2 invariant holds under parallelism too.
                             let is_completion_target = boxes
                                 .iter()
                                 .any(|other| other.depends_completed.iter().any(|d| d == &b.name));
@@ -9317,7 +9317,7 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
                 r?;
             }
         }
-        // Register this level's pod aliases AFTER the barrier — serial, so the racy /etc/hosts
+        // Register this level's pod aliases AFTER the barrier - serial, so the racy /etc/hosts
         // read-modify-write in `add_member` never runs concurrently, and the NEXT level resolves them.
         if use_pod {
             for name in level {
@@ -9340,7 +9340,7 @@ pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
 }
 
 /// Derive a STABLE, per-stack pod name from a compose file path. Uses the parent DIRECTORY name
-/// (Docker's project-name rule — compose files are conventionally named `compose.yaml`, so the
+/// (Docker's project-name rule - compose files are conventionally named `compose.yaml`, so the
 /// directory identifies the stack, not the near-constant stem) plus a short hash of the CANONICAL
 /// absolute path, so two same-named dirs in different locations never collapse into one pod. Same
 /// file → same name (so `up` and `down` agree); different stacks → different pods.
@@ -9364,9 +9364,9 @@ fn compose_pod_name(file: &str) -> String {
     format!("{base}-{:08x}", fnv1a(&canon.to_string_lossy()) as u32)
 }
 
-/// `kern config` — list the resource profiles defined in `kern.toml`. Read-only; a missing config
+/// `kern config` - list the resource profiles defined in `kern.toml`. Read-only; a missing config
 /// is not an error.
-/// `kern config [edit|setup|probe|clear]` — dispatch the config-management subcommands (default:
+/// `kern config [edit|setup|probe|clear]` - dispatch the config-management subcommands (default:
 /// list the profiles).
 pub fn config_cmd(sub: &str, force: bool) -> Result<(), Error> {
     match sub {
@@ -9386,13 +9386,13 @@ fn parse_profile_token(token: &str, usage: &'static str) -> Result<(String, Stri
     let (kind, name) = token.split_once(':').ok_or(Error::Usage(usage))?;
     if crate::config::profile_fields(kind).is_empty() {
         return Err(Error::Config(format!(
-            "unknown profile kind '{kind}' — use vcpu, vgpio or vdisk"
+            "unknown profile kind '{kind}' - use vcpu, vgpio or vdisk"
         )));
     }
     Ok((kind.to_string(), name.to_string()))
 }
 
-/// `kern config add <kind:name> [--field value …] [--replace]` — the CLI twin of `kern top`'s profile
+/// `kern config add <kind:name> [--field value …] [--replace]` - the CLI twin of `kern top`'s profile
 /// forms. Builds the profile through the SAME `config` schema (validation + surgical, atomic write),
 /// so a profile made from the CLI is byte-for-byte what the TUI would write, and vice-versa.
 pub fn config_add(args: &[String]) -> Result<(), Error> {
@@ -9400,7 +9400,7 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
     let (kind, name) = parse_profile_token(token, CONFIG_ADD_USAGE)?;
     let allowed = crate::config::profile_fields(&kind);
     // `--update` (alias `--replace`): edit an existing profile IN PLACE, keeping every field you don't
-    // pass — the field-surgical merge does that; the only keys touched are the flags given here.
+    // pass - the field-surgical merge does that; the only keys touched are the flags given here.
     // Without it, a duplicate name is refused.
     let update = args.iter().any(|a| a == "--update" || a == "--replace");
     let mut pairs: Vec<(String, String)> = Vec::new();
@@ -9430,7 +9430,7 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
             None => (raw, None),
         };
         // Profile field names match the CLI flags 1:1 (`--cpus` = the core quota, `--cpuset` = the
-        // pin list), so no remapping is needed — a `config add vcpu:x --cpus 2` sets the same field a
+        // pin list), so no remapping is needed - a `config add vcpu:x --cpus 2` sets the same field a
         // `kern box --cpus 2` user expects. The one alias: accept Docker's long `--cpuset-cpus`
         // spelling for the `cpuset` field, matching `kern box --cpuset-cpus`.
         let field = if kind == "vcpu" && field == "cpuset-cpus" {
@@ -9448,7 +9448,7 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
                     .join(" ")
             )));
         }
-        // `--persistent` is a bare boolean switch (Docker-style, like `-d`) — it never consumes the
+        // `--persistent` is a bare boolean switch (Docker-style, like `-d`) - it never consumes the
         // next token; `--persistent=false` explicitly turns it off.
         if field == "persistent" {
             set_pair("persistent", inline.unwrap_or("true").to_string());
@@ -9495,7 +9495,7 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern config rm <kind:name>` — delete a resource profile (the CLI twin of the TUI's `d`elete).
+/// `kern config rm <kind:name>` - delete a resource profile (the CLI twin of the TUI's `d`elete).
 pub fn config_rm(args: &[String]) -> Result<(), Error> {
     let token = args.first().ok_or(Error::Usage(CONFIG_RM_USAGE))?;
     let (kind, name) = parse_profile_token(token, CONFIG_RM_USAGE)?;
@@ -9511,9 +9511,9 @@ fn config_path() -> Result<PathBuf, Error> {
         .ok_or_else(|| Error::Config("no config path (set $HOME or $XDG_CONFIG_HOME)".into()))
 }
 
-/// `kern config setup [--force]` — write a starter `kern.toml` to the default location (refusing to
+/// `kern config setup [--force]` - write a starter `kern.toml` to the default location (refusing to
 /// clobber an existing one unless `--force`).
-/// The host's resource inventory — `config probe` prints it; `config setup` seeds a kern.toml whose
+/// The host's resource inventory - `config probe` prints it; `config setup` seeds a kern.toml whose
 /// example profiles already fit THIS machine (real core count / cpuset range / i2c buses).
 struct HostInv {
     ncpu: usize,
@@ -9533,7 +9533,7 @@ struct DiskInfo {
 }
 
 /// Whole physical disks from `/sys/block`, sorted by name. Skips virtual/loop/ram/dm/optical devices
-/// and zero-sized entries (empty card readers). Read-only — a hardware inventory, not a pool manager.
+/// and zero-sized entries (empty card readers). Read-only - a hardware inventory, not a pool manager.
 fn read_disks() -> Vec<DiskInfo> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir("/sys/block") else {
@@ -9630,7 +9630,7 @@ fn tailored_kern_toml(h: &HostInv) -> String {
     let half = ((n as f64 / 2.0) * 10.0).round() / 10.0; // ~half the cores, one decimal
     let pin_hi = n.saturating_sub(1).min(3);
     let mut s = format!(
-        "# ~/.config/kern/kern.toml — generated by `kern config setup` for this host \
+        "# ~/.config/kern/kern.toml - generated by `kern config setup` for this host \
          ({n} cores, {ram}).\n# Attach a profile by prefix:  kern run vcpu:heavy -- ./train.sh   \
          ·  edit with `kern config edit`\n\n[kern]\nlog_level = \"info\"\n\n\
          # ── CPU ──  (profile fields match the CLI flags: cpus=--cpus, cpuset=--cpuset-cpus, memory=--memory, nice=--nice)\n\
@@ -9650,7 +9650,7 @@ fn tailored_kern_toml(h: &HostInv) -> String {
             format!(" {}", d.model)
         };
         s.push_str(&format!(
-            "\n# ── Disk — `kern box … vdisk:scratch` gets a size-capped ext4 volume ──\n\
+            "\n# ── Disk - `kern box … vdisk:scratch` gets a size-capped ext4 volume ──\n\
              [[disk]]\nname = \"disk:0\"\npath = \"/\"\ndevice = \"{dev}\"   # {size} {kind}{model}\n\n\
              [[vdisk]]\nname = \"scratch\"\nbackend = \"disk:0\"\nsize = \"2g\"\n",
             dev = d.name,
@@ -9659,7 +9659,7 @@ fn tailored_kern_toml(h: &HostInv) -> String {
     }
     if !h.i2c.is_empty() || !h.gpiochips.is_empty() {
         s.push_str(
-            "\n# ── GPIO / I/O — `kern box … vgpio:io` binds ONLY these devices into the box ──\n\
+            "\n# ── GPIO / I/O - `kern box … vgpio:io` binds ONLY these devices into the box ──\n\
              [[gpio]]\nid = \"gpio:0\"\n\n[[vgpio]]\nname = \"io\"\nbackend = \"gpio:0\"\n",
         );
         if let Some(first) = h.i2c.first() {
@@ -9683,7 +9683,7 @@ fn tailored_kern_toml(h: &HostInv) -> String {
         }
     } else {
         s.push_str(
-            "\n# (no GPIO/I2C detected here — add a [[vgpio]] profile when you attach hardware)\n",
+            "\n# (no GPIO/I2C detected here - add a [[vgpio]] profile when you attach hardware)\n",
         );
     }
     s
@@ -9693,7 +9693,7 @@ fn config_setup(force: bool) -> Result<(), Error> {
     let path = config_path()?;
     if path.exists() && !force {
         return Err(Error::Config(format!(
-            "{} already exists — pass --force to overwrite",
+            "{} already exists - pass --force to overwrite",
             path.display()
         )));
     }
@@ -9704,13 +9704,13 @@ fn config_setup(force: bool) -> Result<(), Error> {
     std::fs::write(&path, &toml)
         .map_err(|e| Error::Config(format!("writing {}: {e}", path.display())))?;
     println!(
-        "wrote a starter config to {} (tailored to this host — `kern config edit` to tweak)",
+        "wrote a starter config to {} (tailored to this host - `kern config edit` to tweak)",
         path.display()
     );
     Ok(())
 }
 
-/// `kern config edit` — open `kern.toml` in `$EDITOR` (seeding a starter file first if none exists).
+/// `kern config edit` - open `kern.toml` in `$EDITOR` (seeding a starter file first if none exists).
 fn config_edit() -> Result<(), Error> {
     let path = config_path()?;
     if !path.exists() {
@@ -9734,7 +9734,7 @@ fn config_edit() -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern config clear [--yes]` — remove the `kern.toml` (destructive → needs `--yes`).
+/// `kern config clear [--yes]` - remove the `kern.toml` (destructive → needs `--yes`).
 fn config_clear(yes: bool) -> Result<(), Error> {
     let path = config_path()?;
     if !path.exists() {
@@ -9743,7 +9743,7 @@ fn config_clear(yes: bool) -> Result<(), Error> {
     }
     if !yes {
         return Err(Error::Config(format!(
-            "would remove {} — pass --yes to confirm",
+            "would remove {} - pass --yes to confirm",
             path.display()
         )));
     }
@@ -9753,7 +9753,7 @@ fn config_clear(yes: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern config probe` — read-only inventory of host resources you can *declare* in a profile: CPUs,
+/// `kern config probe` - read-only inventory of host resources you can *declare* in a profile: CPUs,
 /// RAM, and any GPIO/I2C/SPI/disk devices present. Doesn't touch the config; it just tells you what's
 /// available to reference.
 fn config_probe() -> Result<(), Error> {
@@ -9797,7 +9797,7 @@ fn config_probe() -> Result<(), Error> {
     row("i2c buses", &list(&h.i2c));
     row("spi devices", &list(&h.spi));
     println!(
-        "{d}`kern config setup` writes a kern.toml tailored to these — or `kern examples`{z}",
+        "{d}`kern config setup` writes a kern.toml tailored to these - or `kern examples`{z}",
         d = p.d,
         z = p.z
     );
@@ -9808,7 +9808,7 @@ pub fn config_show() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     let Some(path) = crate::config::default_path().filter(|p| p.exists()) else {
         println!(
-            "{d}no kern.toml — run `kern examples` to see the format{z}",
+            "{d}no kern.toml - run `kern examples` to see the format{z}",
             d = p.d,
             z = p.z
         );
@@ -9866,9 +9866,9 @@ pub fn config_show() -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern validate [path]` — parse a `kern.toml` (the given path, or the default location) and report
+/// `kern validate [path]` - parse a `kern.toml` (the given path, or the default location) and report
 /// success with profile counts, or the offending line. Exits non-zero on a parse error.
-/// Count `[` and `]` in `line` that are OUTSIDE single/double quotes — so a bracket inside a string
+/// Count `[` and `]` in `line` that are OUTSIDE single/double quotes - so a bracket inside a string
 /// value doesn't fool the multi-line-array tracking in `validate`. Escape-agnostic (TOML basic strings
 /// use `\\`, but for bracket-balance the simple quote toggle is sufficient for a best-effort linter).
 fn brackets_outside_quotes(line: &str) -> (usize, usize) {
@@ -9899,7 +9899,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
     // `validate` must be STRICTER than `load`: the config parser deliberately SKIPS lines it can't
     // model (forward-compat with foreign TOML), so a garbage file would otherwise pass as "valid, 0
     // profiles". A validator's whole job is to catch broken syntax, so here we reject any non-blank,
-    // non-comment line that is neither a `[section]` header nor a `key = value` — the same thing a real
+    // non-comment line that is neither a `[section]` header nor a `key = value` - the same thing a real
     // TOML parser (and `kern compose`) would flag. (Deep help/command audit.)
     let mut in_array = false; // inside a multi-line `key = [ … ]` value (its continuation lines are ok)
     for (i, raw) in text.lines().enumerate() {
@@ -9921,7 +9921,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         }
         let is_section = line.starts_with('[') && line.ends_with(']') && !line.contains('=');
         // A `key = value` line must have a NON-EMPTY key before the first `=`. `= orphan` (empty key)
-        // is not valid TOML — the bare `contains('=')` check let it slip through.
+        // is not valid TOML - the bare `contains('=')` check let it slip through.
         let is_kv = line
             .split_once('=')
             .is_some_and(|(k, _)| !k.trim().is_empty());
@@ -9931,7 +9931,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         }
         if !is_section && !is_kv {
             return Err(Error::Config(format!(
-                "{}: line {}: not valid TOML — expected `[section]` or `key = value`, got `{}`",
+                "{}: line {}: not valid TOML - expected `[section]` or `key = value`, got `{}`",
                 target.display(),
                 i + 1,
                 line.chars().take(40).collect::<String>()
@@ -9942,7 +9942,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
     let p = crate::ui::Palette::detect();
     println!(
-        "{g}valid{z} {} {d}—{z} {} vcpu, {} vgpio, {} vdisk profile(s)",
+        "{g}valid{z} {} {d}-{z} {} vcpu, {} vgpio, {} vdisk profile(s)",
         target.display(),
         cfg.vcpu.len(),
         cfg.vgpio.len(),
@@ -9952,7 +9952,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
         z = p.z
     );
     // Warn about a `[[vcpu]]` that carries NO limit at all (none of cpus/cpuset/numa/nice/memory): it
-    // parses fine but has zero effect — attaching it is a silent no-op, exactly the "looks configured,
+    // parses fine but has zero effect - attaching it is a silent no-op, exactly the "looks configured,
     // does nothing" trap. The file is still valid (parses), so this is a warning, not error.
     for e in &cfg.vcpu {
         let has_effect = e.cpus.is_some()
@@ -9962,7 +9962,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
             || e.memory.is_some();
         if !has_effect {
             eprintln!(
-                "{y}warning{z}: vcpu profile '{}' sets no limit (cpus/cpuset/numa/nice/memory) — attaching it does nothing",
+                "{y}warning{z}: vcpu profile '{}' sets no limit (cpus/cpuset/numa/nice/memory) - attaching it does nothing",
                 e.name,
                 y = p.y,
                 z = p.z
@@ -9972,7 +9972,7 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern examples` — print a commented example `kern.toml` to stdout (redirect it into
+/// `kern examples` - print a commented example `kern.toml` to stdout (redirect it into
 /// `~/.config/kern/kern.toml` to get started).
 pub fn examples() -> Result<(), Error> {
     print!("{EXAMPLE_KERN_TOML}");
@@ -9980,7 +9980,7 @@ pub fn examples() -> Result<(), Error> {
 }
 
 /// A ready-to-use example config covering the resource families kern-public supports (CPU/GPIO/disk).
-const EXAMPLE_KERN_TOML: &str = r#"# ~/.config/kern/kern.toml — resource profiles for `kern run`/`kern box`.
+const EXAMPLE_KERN_TOML: &str = r#"# ~/.config/kern/kern.toml - resource profiles for `kern run`/`kern box`.
 # Attach a profile by prefix, e.g.  kern run vcpu:heavy -- ./train.sh
 
 [kern]
@@ -10005,7 +10005,7 @@ name = "lean"
 cpus = 0.5
 memory = "256m"
 
-# ── GPIO / I/O — `kern box vgpio:leds …` binds ONLY these devices into the box ──
+# ── GPIO / I/O - `kern box vgpio:leds …` binds ONLY these devices into the box ──
 [[gpio]]
 id = "gpio:0"
 pins = [17, 27, 22]
@@ -10016,7 +10016,7 @@ backend = "gpio:0"
 pins = [17, 27]
 i2c = ["1"]
 
-# ── Disk — `kern box vdisk:scratch …` mounts a size-capped volume at /vdisk/scratch ──
+# ── Disk - `kern box vdisk:scratch …` mounts a size-capped volume at /vdisk/scratch ──
 [[disk]]
 name = "data"
 path = "/var/lib/kern/volumes"
@@ -10074,13 +10074,13 @@ mod net_resource_tests {
         // by exact NAME
         assert!(ref_matches(&web, "web", &live));
         assert!(!ref_matches(&db, "web", &live));
-        // by POD name — selects every member of the pod
+        // by POD name - selects every member of the pod
         assert!(ref_matches(&web, "myapp", &live));
         assert!(ref_matches(&db, "myapp", &live));
         // by PID (as a string) when no live box bears that exact name
         assert!(ref_matches(&web, "100", &live));
         assert!(!ref_matches(&web, "101", &live));
-        // NAME WINS: a ref equal to a live box name never falls through to the pid/pod branch — so a
+        // NAME WINS: a ref equal to a live box name never falls through to the pid/pod branch - so a
         // box literally named "web" can't sweep a same-named pod, and a numeric name isn't shadowed.
         let numname = inst("100", 999, "grp");
         let live2: std::collections::HashSet<String> =
@@ -10093,7 +10093,7 @@ mod net_resource_tests {
     #[test]
     fn ref_matches_empty_ref_never_sweeps_standalone_boxes() {
         // A standalone box has pod == "". An empty ref (`kern stop ""`) must NOT match it via the pod
-        // branch — otherwise one stray empty argument would stop/pause every standalone box at once.
+        // branch - otherwise one stray empty argument would stop/pause every standalone box at once.
         let empty = std::collections::HashSet::new();
         let solo = inst("solo", 7, "");
         assert!(!ref_matches(&solo, "", &empty));
@@ -10134,7 +10134,7 @@ mod net_resource_tests {
 
     #[test]
     fn matching_refs_selects_two_pods_and_a_loose_name_together() {
-        // `kern stop p1 p2 loner` sweeps every member of both pods plus the standalone — one pass,
+        // `kern stop p1 p2 loner` sweeps every member of both pods plus the standalone - one pass,
         // stable order, no cross-contamination between pods.
         let running = vec![
             inst("a1", 30, "p1"),
@@ -10152,7 +10152,7 @@ mod net_resource_tests {
     #[test]
     fn brackets_outside_quotes_ignores_strings() {
         // Deep validate audit: a `[`/`]` inside a string value must NOT count toward the multi-line
-        // array balance — else `name = "has ] bracket"` would spuriously open/close an array and make
+        // array balance - else `name = "has ] bracket"` would spuriously open/close an array and make
         // the validator silently skip the following lines.
         assert_eq!(brackets_outside_quotes("pins = [1, 2, 3]"), (1, 1)); // real array
         assert_eq!(brackets_outside_quotes(r#"name = "has ] bracket""#), (0, 0)); // ] in string
@@ -10164,7 +10164,7 @@ mod net_resource_tests {
 
     #[test]
     fn run_leading_dashdash_is_not_reclassified_as_a_profile() {
-        // Hacker-mode regression: `kern run -- vcpu:heavy prog` — the `--` end-of-options contract means
+        // Hacker-mode regression: `kern run -- vcpu:heavy prog` - the `--` end-of-options contract means
         // `vcpu:heavy` is the literal command, NOT a profile to peel. peel_run_profiles must skip the
         // leading `--` and return start=1 without applying any profile.
         fn empty() -> AppliedProfiles {
@@ -10202,7 +10202,7 @@ mod net_resource_tests {
             "data:/dev",
             "data:/",      // over the whole rootfs
             "data:/./x",   // dot component
-            "data://proc", // leading-double-slash bypass — resolves to /proc at mount time
+            "data://proc", // leading-double-slash bypass - resolves to /proc at mount time
             "data://sys",
             "data://dev",
             "data:///dev", // triple slash too
@@ -10290,7 +10290,7 @@ mod net_resource_tests {
             RestartPolicy::parse("unless-stopped"),
             Some(RestartPolicy::UnlessStopped)
         );
-        // Unknown tokens don't parse — so a bare `--restart` won't swallow the next arg/command.
+        // Unknown tokens don't parse - so a bare `--restart` won't swallow the next arg/command.
         assert_eq!(RestartPolicy::parse("sh"), None);
         assert_eq!(RestartPolicy::parse("--memory"), None);
         assert_eq!(RestartPolicy::parse(""), None);
@@ -10335,7 +10335,7 @@ mod net_resource_tests {
         assert_ne!(k0, layer_key("base", "RUN b")); // repr changed
         assert_ne!(k0, layer_key("other", "RUN a")); // parent key changed
         assert_eq!(k0.len(), 32); // 128-bit hex
-                                  // chain_lower stacks top (last) first, base (first) last — overlayfs shadow order.
+                                  // chain_lower stacks top (last) first, base (first) last - overlayfs shadow order.
         assert_eq!(
             chain_lower(&["base".into(), "l1".into(), "l2".into()]),
             "l2:l1:base"
@@ -10393,7 +10393,7 @@ mod net_resource_tests {
 
     #[test]
     fn clamp_cpuset_narrows_overwide_pins() {
-        // Host CPU count (same source as the fn) — the test is host-agnostic.
+        // Host CPU count (same source as the fn) - the test is host-agnostic.
         let host = std::fs::read_to_string("/proc/cpuinfo")
             .map(|t| t.lines().filter(|l| l.starts_with("processor")).count())
             .unwrap_or(1)
@@ -10642,7 +10642,7 @@ mod net_resource_tests {
     fn merged_view_honours_opaque_no_secret_resurrection() {
         // REGRESSION for the opaque-dir leak: two stacked layers where an UPPER layer made `/app` opaque
         // (`rm -rf /app && mkdir /app`, marked by `user.overlay.opaque`) and a LOWER layer holds a secret
-        // `/app/token`. Reading the merged view (`merged_view_extract`) must NOT resurrect the secret —
+        // `/app/token`. Reading the merged view (`merged_view_extract`) must NOT resurrect the secret -
         // the kernel applies the opaque, so `/app/token` is gone and only the upper's `marker` remains.
         // A naive raw-layer walk (the old fast-path) leaked the secret here.
         let base = std::env::temp_dir().join(format!("kern-mvbase-{}", std::process::id()));
@@ -10659,7 +10659,7 @@ mod net_resource_tests {
         // Mark the top's `/app` opaque. In a userns-owned overlay kern mounts WITHOUT `userxattr`, so the
         // kernel reads `trusted.overlay.opaque`; but a plain test process can only set `user.overlay.*`.
         // We therefore skip if we can't establish the opaque (CI without the privilege) rather than pass
-        // vacuously — the real guarantee is exercised end-to-end by the build tests.
+        // vacuously - the real guarantee is exercised end-to-end by the build tests.
         let set_trusted = std::process::Command::new("setfattr")
             .args(["-n", "trusted.overlay.opaque", "-v", "y"])
             .arg(top.join("app"))
@@ -10681,7 +10681,7 @@ mod net_resource_tests {
             base.to_string_lossy().into_owned(),
         ];
         let r = merged_view_extract(&chain, Some("/app"), &out);
-        // The copy of `/app` must succeed and contain ONLY `marker` — never the opaque-hidden `token`.
+        // The copy of `/app` must succeed and contain ONLY `marker` - never the opaque-hidden `token`.
         assert!(r.is_ok(), "merged_view_extract failed: {r:?}");
         assert!(
             out.join("app/marker").exists(),
@@ -10733,7 +10733,7 @@ mod net_resource_tests {
         // The double-copy escape class (reviewer 2a): copying a DIR out of a stage that CONTAINS an
         // absolute symlink to a host file must PRESERVE the symlink (cp -a no-follow), never dereference
         // it and copy the host file's bytes at build time. The symlink resolves only later, inside the
-        // box, against the box's own rootfs — so a `→ /etc/passwd` reads the box's passwd, not the host's.
+        // box, against the box's own rootfs - so a `→ /etc/passwd` reads the box's passwd, not the host's.
         let stage = std::env::temp_dir().join(format!("kern-sym-{}", std::process::id()));
         let dest = std::env::temp_dir().join(format!("kern-symdst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&stage);
@@ -10742,7 +10742,7 @@ mod net_resource_tests {
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(stage.join("app/real.txt"), b"real").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", stage.join("app/evil")).unwrap();
-        // Copy the whole `app` dir out — succeeds, and `evil` arrives as a SYMLINK, not the host file.
+        // Copy the whole `app` dir out - succeeds, and `evil` arrives as a SYMLINK, not the host file.
         assert!(copy_from_stage_rootfs(&stage, "/app", &dest).is_ok());
         let copied = dest.join("app/evil");
         let meta = std::fs::symlink_metadata(&copied).expect("evil should exist");
@@ -10799,7 +10799,7 @@ mod net_resource_tests {
                         Err(_) => continue,
                     };
                     if ft.is_symlink() {
-                        continue; // never follow — the whole point
+                        continue; // never follow - the whole point
                     } else if ft.is_dir() {
                         if contains_secret(&ep) {
                             return true;
@@ -10980,7 +10980,7 @@ mod image_rm_tests {
 
     #[test]
     fn rmi_removes_only_the_named_image_and_reports_freed() {
-        // Process-global env (XDG_CACHE_HOME) — serialize with every other env-mutating test.
+        // Process-global env (XDG_CACHE_HOME) - serialize with every other env-mutating test.
         let _g = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -11022,7 +11022,7 @@ mod image_rm_tests {
     #[test]
     fn rmi_rejects_a_planted_dotdot_stem_and_cannot_escape_the_cache() {
         // A file literally named `...ok` has file_stem() == ".."; unchecked, cache.join("..") would let
-        // a `remove_dir_all` wipe the cache's PARENT. `is_safe_stem` must reject it — a delete never
+        // a `remove_dir_all` wipe the cache's PARENT. `is_safe_stem` must reject it - a delete never
         // escapes the images dir, whatever a planted sentinel is named.
         let _g = crate::TEST_ENV_LOCK
             .lock()
@@ -11031,7 +11031,7 @@ mod image_rm_tests {
         let cache = tmp.join("kern/images");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&cache).unwrap();
-        // A canary living in the cache's PARENT (`kern/`) — it must survive no matter what.
+        // A canary living in the cache's PARENT (`kern/`) - it must survive no matter what.
         let canary = tmp.join("kern/CANARY");
         std::fs::write(&canary, b"do-not-delete").unwrap();
         // Plant the hostile sentinel: `...ok` (stem "..") with an arbitrary ref content.
@@ -11056,7 +11056,7 @@ mod image_rm_tests {
 
     #[test]
     fn rmi_removes_the_base_and_image_sidecars_too() {
-        // rmi must delete ALL sidecar forms (via the shared drop_image_artifacts) — a leaked `.base`
+        // rmi must delete ALL sidecar forms (via the shared drop_image_artifacts) - a leaked `.base`
         // would otherwise misclassify a later same-name pull.
         let _g = crate::TEST_ENV_LOCK
             .lock()
@@ -11088,7 +11088,7 @@ mod image_rm_tests {
     #[test]
     fn rmi_never_follows_a_symlinked_payload_dir() {
         // If the payload `<stem>/` is a SYMLINK to a dir outside the cache, deleting the image must NOT
-        // reach through it — remove_dir_all unlinks the symlink, never the target's contents.
+        // reach through it - remove_dir_all unlinks the symlink, never the target's contents.
         use std::os::unix::fs::symlink;
         let _g = crate::TEST_ENV_LOCK
             .lock()
@@ -11126,7 +11126,7 @@ mod image_rm_tests {
     #[test]
     fn rmi_keeps_a_layer_still_referenced_by_another_image() {
         // A shared L/ layer named by TWO images' manifests must survive rmi of the first, and only be
-        // reclaimed once its last referrer is removed — the fail-closed sweep, end to end.
+        // reclaimed once its last referrer is removed - the fail-closed sweep, end to end.
         let _g = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -11243,7 +11243,7 @@ mod image_rm_tests {
             "child should be running"
         );
         // The OLD mechanism alone can't touch it: it's not a group leader, so no group has id `child`
-        // — `kill(-child, SIGTERM)` is a harmless ESRCH, and SIGTERM is ignored regardless.
+        // - `kill(-child, SIGTERM)` is a harmless ESRCH, and SIGTERM is ignored regardless.
         unsafe { libc::kill(-child, libc::SIGTERM) };
         unsafe { libc::usleep(50_000) };
         assert_eq!(

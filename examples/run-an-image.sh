@@ -2,7 +2,7 @@
 # Pull a real OCI image and run a command inside an isolated, writable box.
 #
 # The image is Alpine from Docker Hub. The box is writable by default (an overlay: the image is
-# the read-only lower layer, your writes go to a private upper layer that's discarded on exit —
+# the read-only lower layer, your writes go to a private upper layer that's discarded on exit -
 # the image itself never changes).
 set -eu
 kern="${KERN:-kern}"

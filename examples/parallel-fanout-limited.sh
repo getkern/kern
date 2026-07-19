@@ -3,10 +3,10 @@
 #
 # fan-out.sh / parallel-matrix.sh launch everything at once (great when the count
 # is small and known). But a batch of hundreds shouldn't spawn hundreds of boxes
-# simultaneously — you'd thrash CPU and RAM. Here we cap the fan-out to N using a
+# simultaneously - you'd thrash CPU and RAM. Here we cap the fan-out to N using a
 # plain shell sliding window: track the background PIDs and, once N are running,
 # block on the OLDEST before launching the next. Pure POSIX job control, no daemon
-# and no scheduler — just `&`, `$!`, and `wait <pid>`.
+# and no scheduler - just `&`, `$!`, and `wait <pid>`.
 set -eu
 kern="${KERN:-kern}"
 
@@ -32,7 +32,7 @@ while [ "$i" -le "$items" ]; do
   running=$((running + 1))
 
   # Once the window is full, wait for the OLDEST launched box to finish before we
-  # start another — this is what keeps concurrency at or below $max.
+  # start another - this is what keeps concurrency at or below $max.
   if [ "$running" -ge "$max" ]; then
     # shellcheck disable=SC2086
     set -- $pids
@@ -57,5 +57,5 @@ for i in $(seq 1 "$items"); do
 done
 
 echo
-echo "done — a big batch was throttled to $max concurrent boxes via shell job"
+echo "done - a big batch was throttled to $max concurrent boxes via shell job"
 echo "control; every item finished and all boxes are gone."

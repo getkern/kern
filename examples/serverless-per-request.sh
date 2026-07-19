@@ -2,7 +2,7 @@
 # A fresh, isolated sandbox for every request.
 #
 # A box starts in a few milliseconds, so you can spin up a brand-new one per
-# call instead of reusing a long-lived process — the pattern behind function /
+# call instead of reusing a long-lived process - the pattern behind function /
 # serverless runtimes. Each request runs untrusted input in its own box, with
 # its own namespaces, and leaves nothing behind.
 set -eu
@@ -24,4 +24,4 @@ for payload in '{"n":1}' '{"user":"amy"}' '{"n":3}'; do
   printf 'response  %s\n\n' "$(handle "$i" "$payload")"
 done
 
-echo "Each request ran in its own fresh box — different name, no shared state."
+echo "Each request ran in its own fresh box - different name, no shared state."

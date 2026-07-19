@@ -5,7 +5,7 @@
 #     --platform     pick one arch from a multi-arch index, e.g. linux/amd64 or linux/arm64
 #                    (default: this host's arch)
 #
-# A foreign-arch pull works fine for inspection / export / pushing elsewhere — kern prints a note
+# A foreign-arch pull works fine for inspection / export / pushing elsewhere - kern prints a note
 # that it won't run natively here without a qemu-user + binfmt handler. This is non-invasive:
 # we only download, look at the rootfs ELF header, and delete it. Nothing is installed or run.
 set -eu
@@ -50,4 +50,4 @@ echo "    The arch that doesn't match your host won't run natively without qemu-
 
 echo
 echo "==> cleanup: both rootfs dirs are under the temp dir, removed on exit."
-echo "done — two architectures pulled, inspected by ELF header, nothing installed."
+echo "done - two architectures pulled, inspected by ELF header, nothing installed."

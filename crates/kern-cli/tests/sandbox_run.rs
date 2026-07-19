@@ -1,7 +1,7 @@
 //! Real-syscall sandbox correctness (level 4). Runs an actual command inside a `kern box`
 //! sandbox and asserts isolation + exit-code propagation. **Skip-graceful**: if unprivileged
 //! user namespaces or a static busybox are unavailable (e.g. a locked-down CI runner), the
-//! test returns early instead of failing — so x86 CI stays green either way.
+//! test returns early instead of failing - so x86 CI stays green either way.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ fn kern() -> Command {
 
 /// Run `kern <args>` (which is expected to print something) and return its output, retrying a few
 /// times while **stdout is empty**. Under this suite's heavy parallelism, `Command::output()`'s
-/// pipe occasionally comes back empty even though the box ran (exit 0) — a `systemd-run --scope` +
+/// pipe occasionally comes back empty even though the box ran (exit 0) - a `systemd-run --scope` +
 /// pipe interaction that does not occur in real single/low-concurrency use (verified: 40/40
 /// concurrent boxes capture stdout to files, and 250/250 exit 0). Every caller asserts on
 /// non-empty stdout, so retrying-on-empty is correct and never masks a wrong-output bug. The
@@ -42,7 +42,7 @@ fn static_busybox() -> Option<PathBuf> {
 
 /// Is unprivileged userns *actually* usable here? Guessing from sysctls is not enough: on
 /// Ubuntu 24.04 (the GitHub runner) `unprivileged_userns_clone` reads `1`, yet AppArmor then
-/// blocks the `unshare` for unconfined binaries — so a sysctl-only check thinks userns is fine,
+/// blocks the `unshare` for unconfined binaries - so a sysctl-only check thinks userns is fine,
 /// the box creation fails with EPERM, and the test fails instead of skipping. Probe for real:
 /// fork a throwaway child, attempt `unshare(CLONE_NEWUSER)`, and report whether it succeeded.
 /// Bulletproof against *any* reason userns is unavailable (sysctl, AppArmor, seccomp, an outer
@@ -63,11 +63,11 @@ fn userns_plausible() -> bool {
             pid if pid > 0 => {
                 let mut status = 0;
                 if libc::waitpid(pid, &mut status, 0) < 0 {
-                    return true; // can't tell — stay permissive
+                    return true; // can't tell - stay permissive
                 }
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
             }
-            _ => true, // fork failed — stay permissive (old behaviour)
+            _ => true, // fork failed - stay permissive (old behaviour)
         }
     }
 }
@@ -578,7 +578,7 @@ fn named_volume_persists_across_boxes() {
 }
 
 /// A `vdisk:` profile mounts a size-capped volume at `/vdisk/<name>` (rootless: a `tmpfs size=`),
-/// and the size cap is really enforced — writing past it fails with ENOSPC.
+/// and the size cap is really enforced - writing past it fails with ENOSPC.
 #[test]
 fn box_vdisk_mounts_size_capped_volume() {
     let Some(busybox) = static_busybox() else {
@@ -635,7 +635,7 @@ fn box_vdisk_mounts_size_capped_volume() {
 }
 
 /// A `vgpio:` profile bind-mounts ONLY its listed devices into the box (real I/O passthrough), and
-/// deny-by-default still holds — a device not in the profile stays absent. Skip-graceful: needs a
+/// deny-by-default still holds - a device not in the profile stays absent. Skip-graceful: needs a
 /// real host device (any `/dev/i2c-*` or `/dev/gpiochip*`); skipped where none exist (typical CI).
 #[test]
 fn box_vgpio_passes_listed_devices_only() {
@@ -758,7 +758,7 @@ fn box_applies_vcpu_profile() {
 }
 
 /// The config command surface round-trips: `kern examples` emits a config that `kern validate`
-/// accepts and `kern config` lists — so the embedded example can never drift out of the schema.
+/// accepts and `kern config` lists - so the embedded example can never drift out of the schema.
 #[test]
 fn examples_output_validates_and_lists() {
     let dir = std::env::temp_dir().join(format!("kern-it-ex-{}", std::process::id()));
@@ -780,7 +780,7 @@ fn examples_output_validates_and_lists() {
     assert!(String::from_utf8_lossy(&val.stdout).contains("vcpu"));
 
     // A BAD VALUE for a recognized key fails validation with a non-zero exit and a line number.
-    // (An unknown key would be tolerated/ignored — the parser only errors on malformed values of
+    // (An unknown key would be tolerated/ignored - the parser only errors on malformed values of
     // keys it implements.)
     fs::write(&toml, "[[vcpu]]\nname = \"x\"\ncpus = abc\n").unwrap();
     let bad = kern()
@@ -804,7 +804,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
         "[[vcpu]]\nname = \"pinned\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
     )
     .unwrap();
-    // Retry on empty stdout — `kern run` re-execs into a systemd scope whose piped output can come
+    // Retry on empty stdout - `kern run` re-execs into a systemd scope whose piped output can come
     // back empty under this suite's heavy parallelism (same race as `kern_out`).
     let mut o = String::new();
     for _ in 0..6 {
@@ -837,7 +837,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
     );
 
     // `vgpu:` is NOT a kern-public concept (GPU is out of this edition): it is not a profile token,
-    // so it is treated as a plain command — which doesn't exist — and the run fails, rather than
+    // so it is treated as a plain command - which doesn't exist - and the run fails, rather than
     // being recognized as any kind of "reserved" profile.
     let refused = kern()
         .env("XDG_CONFIG_HOME", &cfgdir)
@@ -848,7 +848,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
     let _ = fs::remove_dir_all(&cfgdir);
 }
 
-/// `--cpuset-cpus` really pins the box, via `sched_setaffinity` — no cgroup `cpuset` delegation
+/// `--cpuset-cpus` really pins the box, via `sched_setaffinity` - no cgroup `cpuset` delegation
 /// needed. Pinning to CPU 0 (present on every host) must yield exactly `0` in the workload's
 /// `Cpus_allowed_list`, which on any multi-CPU host differs from the unpinned `0-N`.
 #[test]
@@ -1026,7 +1026,7 @@ fn box_provides_essential_dev_nodes() {
 }
 
 /// Device access is deny-by-default: the box's `/dev` is a fresh tmpfs with ONLY the safe
-/// allowlist bound in, so a raw disk / physical-memory node is simply absent — and the box can't
+/// allowlist bound in, so a raw disk / physical-memory node is simply absent - and the box can't
 /// fabricate one, because creating a device node in an unprivileged user namespace is refused by
 /// the kernel (EPERM) even though `mknod` is reachable. That is what makes an eBPF device-cgroup
 /// backstop unnecessary here: the boundary is the namespace + the allowlist, not a cooperative
@@ -1044,7 +1044,7 @@ fn box_denies_unauthorized_devices() {
     let root = build_rootfs(&busybox, "devdeny");
     let rootfs = root.to_str().unwrap();
     // (1) A physical-memory / raw-disk node must be ABSENT (never bound into the box's /dev).
-    // (2) Fabricating a block device via mknod must FAIL — the userns forbids device-node creation,
+    // (2) Fabricating a block device via mknod must FAIL - the userns forbids device-node creation,
     //     so a hostile workload can't reach the host disk even with the mknod syscall available.
     let out = kern_out(&[
         "box",
@@ -1198,7 +1198,7 @@ fn box_volume_roundtrips_data_and_ro_is_enforced() {
     let rootfs = root.to_str().unwrap();
     // A per-test-unique base: `std::process::id()` is the SAME for every test in this binary (they
     // share one process), so a bare `kern-it-vol-<pid>` would collide with the named-volume test's
-    // dir — one test's `remove_dir_all` then races the other's mount ("source … No such file").
+    // dir - one test's `remove_dir_all` then races the other's mount ("source … No such file").
     let host = std::env::temp_dir().join(format!("kern-it-volrt-{}", std::process::id()));
     let _ = fs::remove_dir_all(&host);
     fs::create_dir_all(host.join("rw")).unwrap();
@@ -1299,7 +1299,7 @@ fn box_env_and_workdir_apply() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// Regression: a box's `/dev/null` (and friends) must be *writable* — `cmd > /dev/null` is
+/// Regression: a box's `/dev/null` (and friends) must be *writable* - `cmd > /dev/null` is
 /// ubiquitous. A sticky world-writable `/dev` tmpfs + `fs.protected_regular` used to break it.
 #[test]
 fn box_dev_null_is_writable() {
@@ -1481,7 +1481,7 @@ fn many_boxes_share_one_bind_rootfs_concurrently() {
 }
 
 /// SECURITY: a `-v` volume whose in-box target path passes through a symlink must NOT be honored
-/// by following that symlink — the bind is refused, so a hostile image can't redirect a mount
+/// by following that symlink - the bind is refused, so a hostile image can't redirect a mount
 /// (and a host write) through a planted symlink.
 #[test]
 fn volume_target_through_a_symlink_is_refused() {
@@ -1565,7 +1565,7 @@ fn volume_target_with_dotdot_is_rejected() {
     );
 }
 
-/// SECURITY: `--read-only` must leave NO writable surface — including `/dev` (a separate tmpfs).
+/// SECURITY: `--read-only` must leave NO writable surface - including `/dev` (a separate tmpfs).
 /// Creating an entry in `/dev` must fail, while the bound device nodes stay usable.
 #[test]
 fn read_only_dev_is_not_writable() {
@@ -1658,11 +1658,11 @@ fn ranged_uid_map_when_subids_available() {
         let _ = fs::remove_dir_all(&root);
         return;
     }
-    // The range can be unusable at runtime even with newuidmap + an /etc/subuid line present —
+    // The range can be unusable at runtime even with newuidmap + an /etc/subuid line present -
     // e.g. a CI runner where the helper isn't setuid or there's no matching /etc/subgid. kern then
     // degrades to the single-uid map (either because detect_id_range found nothing, or because the
     // helper failed to apply the range); both paths log "using single-uid map". The ranged-map
-    // assertion only applies when the range actually took effect — let kern be the source of truth.
+    // assertion only applies when the range actually took effect - let kern be the source of truth.
     if String::from_utf8_lossy(&out.stderr).contains("using single-uid map") {
         eprintln!("skip: --uid-range fell back to single-uid (range not usable at runtime)");
         let _ = fs::remove_dir_all(&root);
@@ -1672,8 +1672,8 @@ fn ranged_uid_map_when_subids_available() {
     let rows = map.lines().filter(|l| !l.trim().is_empty()).count();
     // The ranged map needs newuidmap/newgidmap to actually SUCCEED at runtime. Some CI runners
     // advertise a newuidmap binary plus an /etc/subuid line (so detect_id_range returns Some and no
-    // fallback notice is printed) yet the helper still fails — e.g. it isn't setuid, or /etc/subgid
-    // has no matching allocation — so the box can't map and produces no uid_map at all. That's not a
+    // fallback notice is printed) yet the helper still fails - e.g. it isn't setuid, or /etc/subgid
+    // has no matching allocation - so the box can't map and produces no uid_map at all. That's not a
     // regression, the range path simply isn't exercisable here → skip. A box that DID map but came
     // back single-uid (1 row) without the fallback notice IS a real bug → still asserted below.
     if rows == 0 {
@@ -1694,7 +1694,7 @@ fn ranged_uid_map_when_subids_available() {
 #[test]
 fn single_uid_map_is_the_default() {
     // Without `--uid-range`, the box gets a single-uid identity map (one row: box uid 0 = caller)
-    // regardless of whether subids exist — the fast, most-isolated default. This is the perf-and-
+    // regardless of whether subids exist - the fast, most-isolated default. This is the perf-and-
     // security default that lets a bare box beat heavier runtimes; the range is strictly opt-in.
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
@@ -1732,7 +1732,7 @@ fn single_uid_map_is_the_default() {
 
 #[test]
 fn bind_rootfs_writes_reach_source_while_overlay_keeps_it_immutable() {
-    // `--bind-rootfs` binds the source directly (faster on slow-overlay kernels) — a write inside
+    // `--bind-rootfs` binds the source directly (faster on slow-overlay kernels) - a write inside
     // the box lands in the source dir. The default overlay keeps the source immutable. This pins
     // both halves of the documented trade-off.
     let Some(busybox) = static_busybox() else {
@@ -1791,7 +1791,7 @@ fn bind_rootfs_writes_reach_source_while_overlay_keeps_it_immutable() {
 fn bind_rootfs_net_does_not_clobber_a_symlinked_host_file() {
     // Security regression: `--bind-rootfs --net` must NOT do a host-side write through a symlink in
     // the (possibly untrusted) rootfs. A `/etc/resolv.conf -> <outside file>` symlink must leave
-    // that outside file untouched — kern injects no resolv.conf in bind mode for exactly this reason.
+    // that outside file untouched - kern injects no resolv.conf in bind mode for exactly this reason.
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1905,7 +1905,7 @@ fn images_strips_terminal_escapes_from_untrusted_ref() {
 }
 
 /// End-to-end: a `compose` file using the extended box schema (resources + env + read-only)
-/// brings the box up — proving every mirror flag `push_box_flags` emits is one `kern box` accepts.
+/// brings the box up - proving every mirror flag `push_box_flags` emits is one `kern box` accepts.
 #[test]
 fn compose_full_schema_brings_box_up() {
     let Some(busybox) = static_busybox() else {

@@ -1,10 +1,10 @@
-//! Local image archive — `kern save` / `kern load`, the offline dual of push/pull. `save` writes a
-//! `docker save`-compatible tar of a cached (single-layer) image; `load` imports such a tar — produced
-//! by kern OR by `docker save` — for offline / air-gapped transfer.
+//! Local image archive - `kern save` / `kern load`, the offline dual of push/pull. `save` writes a
+//! `docker save`-compatible tar of a cached (single-layer) image; `load` imports such a tar - produced
+//! by kern OR by `docker save` - for offline / air-gapped transfer.
 //!
 //! SECURITY: a loaded archive is **untrusted** exactly like a registry pull. `load` therefore routes
 //! every tar it touches (the outer archive AND each layer.tar) through the SAME hardened path pull
-//! uses — [`check_layer_safe`] (in-process header vetting: no setuid, no device nodes, no `..`/symlink
+//! uses - [`check_layer_safe`] (in-process header vetting: no setuid, no device nodes, no `..`/symlink
 //! escape, 2 GiB bomb + entry-count caps) and, for layers, isolated-staging extraction + no-follow
 //! [`merge_layer`]. There is no naive `tar -xf` on attacker bytes anywhere here.
 
@@ -28,7 +28,7 @@ fn hex_of(digest: &str) -> &str {
     digest.strip_prefix("sha256:").unwrap_or(digest)
 }
 
-/// Minimal JSON string quoting (kern-oci is serde-free) — shared with the push manifest builder shape.
+/// Minimal JSON string quoting (kern-oci is serde-free) - shared with the push manifest builder shape.
 fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
@@ -58,7 +58,7 @@ pub fn save(
     out: Option<&Path>,
     work: &Path,
 ) -> Result<(), OciError> {
-    // 1. Pack the rootfs into an UNCOMPRESSED layer.tar (root-owned, setuid-stripped — same
+    // 1. Pack the rootfs into an UNCOMPRESSED layer.tar (root-owned, setuid-stripped - same
     //    normalization as push), and take its sha256 (= the layer's diff_id).
     let layer_tar = work.join("layer.tar");
     tar_rootfs_root_owned(rootfs, &layer_tar)?;
@@ -94,7 +94,7 @@ pub fn save(
     std::fs::write(layout.join("manifest.json"), manifest)
         .map_err(|e| OciError::Extract(format!("save manifest: {e}")))?;
 
-    // 4. Tar the layout to the destination (file or stdout). No compression — `docker save`'s default;
+    // 4. Tar the layout to the destination (file or stdout). No compression - `docker save`'s default;
     //    the caller can pipe through gzip/zstd if they want a smaller file.
     let layout_s = layout.to_string_lossy().into_owned();
     let status = match out {
@@ -131,7 +131,7 @@ fn tar_is_gnu() -> bool {
 }
 
 /// Tar `rootfs`'s contents (`.`) into `out` (uncompressed), setuid/setgid-STRIPPED and ownership
-/// normalized to root — the layer form both `push` and `save` need. GNU tar forces it with
+/// normalized to root - the layer form both `push` and `save` need. GNU tar forces it with
 /// `--owner=0 --group=0`; BusyBox tar (no such flags) gets `--numeric-owner` only, which records the
 /// on-disk owners: root(0) for a root-run build/save (the WSL case → still root-owned layers), or the
 /// real uid for a rootless BusyBox save (functional, just not renumbered). The setuid strip runs on
@@ -178,7 +178,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
         .stdout(Stdio::piped())
         .spawn()
     else {
-        return ZERO.into(); // shouldn't happen — sha256sum is a coreutils staple used across kern-oci
+        return ZERO.into(); // shouldn't happen - sha256sum is a coreutils staple used across kern-oci
     };
     if let Some(mut si) = child.stdin.take() {
         let _ = si.write_all(bytes);
@@ -198,7 +198,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 
 /// Import a `docker save`-format archive from `src` (a file, or stdin when `None`), returning one
 /// [`Loaded`] per image. Every tar (outer + each layer) is vetted by [`check_layer_safe`] before any
-/// extraction, and layers are merged no-follow — an archive is as untrusted as a registry pull.
+/// extraction, and layers are merged no-follow - an archive is as untrusted as a registry pull.
 pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
     std::fs::create_dir_all(work).map_err(|e| OciError::Extract(format!("load work: {e}")))?;
     // Materialize the archive to a file (stdin → a temp file, so we can vet it before extracting).
@@ -222,7 +222,7 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
         }
     };
 
-    // VET then extract the OUTER archive (json + layer tars — regular files, no privileged modes, so
+    // VET then extract the OUTER archive (json + layer tars - regular files, no privileged modes, so
     // no `unpack_as_root` needed here; the LAYERS get the privileged path below).
     check_layer_safe(&archive, Compression::Plain)?;
     let unpacked = work.join("unpacked");
@@ -255,7 +255,7 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
         if layers.is_empty() {
             return Err(OciError::Extract("manifest: image has no layers".into()));
         }
-        // Resolve each in-archive path SAFELY under `unpacked` (reject any `..`/absolute escape — the
+        // Resolve each in-archive path SAFELY under `unpacked` (reject any `..`/absolute escape - the
         // manifest is attacker-controlled just like the tar members).
         let config_path = under(&unpacked, &config_rel)?;
         let config_json = std::fs::read_to_string(&config_path)
@@ -290,7 +290,7 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
 }
 
 /// Extract a vetted layer tar (compression `comp`) into a FRESH `staging` dir, preserving the image's
-/// exact modes and mapping ownership to the (in-ns root) extracting user — the same tar invocation
+/// exact modes and mapping ownership to the (in-ns root) extracting user - the same tar invocation
 /// pull uses for a registry layer. Caller runs this inside [`unpack_as_root`].
 fn extract_into(layer: &Path, comp: Compression, staging: &Path) -> Result<(), OciError> {
     let _ = std::fs::remove_dir_all(staging);

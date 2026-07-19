@@ -1,5 +1,5 @@
 #!/bin/sh
-# Already use the big container and cloud tools? kern speaks the same shapes —
+# Already use the big container and cloud tools? kern speaks the same shapes -
 # on your own hardware, with no daemon, no account, and one small binary.
 #
 # Same CLI muscle memory as Docker:
@@ -9,7 +9,7 @@
 #   docker stop web                  ->  kern stop web
 #   docker compose up                ->  kern compose stack.toml up
 #
-# The building blocks the managed clouds are made of — run them locally or at
+# The building blocks the managed clouds are made of - run them locally or at
 # the edge, no cloud account:
 #   AWS Lambda / GCP Cloud Functions  ->  a fresh box per request  (serverless-per-request.sh)
 #   AWS Fargate / GCP Cloud Run       ->  a detached box with a port  (web-service.sh)
@@ -23,5 +23,5 @@ echo '==> kern box demo --image alpine -- echo "hello from kern"'
 "$kern" box demo --image alpine -- echo "hello from kern"
 
 echo
-echo '==> kern ps   (the box already exited — nothing left running, no daemon)'
+echo '==> kern ps   (the box already exited - nothing left running, no daemon)'
 "$kern" ps

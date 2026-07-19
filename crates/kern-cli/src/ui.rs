@@ -1,5 +1,5 @@
 //! Terminal styling: ANSI colours when stdout is a TTY and `NO_COLOR` is unset (else no-ops), the
-//! `kern` wordmark, and the `kern box` status panel. Dependency-free — raw escape strings, gated
+//! `kern` wordmark, and the `kern box` status panel. Dependency-free - raw escape strings, gated
 //! once. Because the colour fields are `""` when colour is off, call sites interpolate
 //! unconditionally and piped/non-tty output (and the test harness) stays plain.
 
@@ -10,9 +10,9 @@ pub struct Palette {
     pub b: &'static str, // bold
     pub c: &'static str, // cyan
     pub d: &'static str, // dim
-    pub g: &'static str, // green  — isolated / on / healthy
-    pub y: &'static str, // yellow — open but deliberate (a heads-up, not an error)
-    pub r: &'static str, // red    — bad / unhealthy
+    pub g: &'static str, // green  - isolated / on / healthy
+    pub y: &'static str, // yellow - open but deliberate (a heads-up, not an error)
+    pub r: &'static str, // red    - bad / unhealthy
     pub z: &'static str, // reset
 }
 
@@ -22,7 +22,7 @@ impl Palette {
         Self::for_stream(std::io::stdout().is_terminal())
     }
 
-    /// Colour on iff stderr is a terminal and `NO_COLOR` is unset — for the box status panel, which
+    /// Colour on iff stderr is a terminal and `NO_COLOR` is unset - for the box status panel, which
     /// prints to stderr so it never mixes with the box's own stdout.
     pub fn detect_stderr() -> Self {
         Self::for_stream(std::io::stderr().is_terminal())
@@ -138,13 +138,13 @@ pub struct BoxStatus<'a> {
     pub seccomp_syscalls: usize,
 }
 
-/// Human-readable byte size (`512M`, `1.5G`, `256K`, `0 B`) — the shared [`kern_common::fmt_bytes`]
+/// Human-readable byte size (`512M`, `1.5G`, `256K`, `0 B`) - the shared [`kern_common::fmt_bytes`]
 /// convention, so the banner, `ps`/`stats`, `top` and volume sizes all render bytes the same way.
 fn fmt_size(bytes: u64) -> String {
     kern_common::fmt_bytes(bytes)
 }
 
-/// A ONE-LINE box summary — the default for a foreground run, so a beginner who just wants their
+/// A ONE-LINE box summary - the default for a foreground run, so a beginner who just wants their
 /// command's output isn't buried under a six-line posture panel. Shows the name, source, and a green
 /// "isolated" (or a yellow heads-up when a boundary is deliberately open). The full [`box_banner`] is
 /// one `--verbose` away. Pure (returns the string) so it's unit-testable.
@@ -153,9 +153,9 @@ pub fn box_line(s: &BoxStatus, p: &Palette, gl: &Glyphs) -> String {
     let name = scrub(s.name);
     let source = scrub(s.source);
     let posture = if s.share_net {
-        format!("{y}{} host network — not isolated{z}", gl.warn)
+        format!("{y}{} host network - not isolated{z}", gl.warn)
     } else if s.bind_rootfs {
-        format!("{y}{} shared rootfs — writes persist{z}", gl.warn)
+        format!("{y}{} shared rootfs - writes persist{z}", gl.warn)
     } else {
         format!("{g}{} isolated{z}", gl.ok)
     };
@@ -204,7 +204,7 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
         out.push_str(&format!("  {d}{label:<8}{z}{m}{value}\n"));
     };
 
-    // cmd — what the box actually runs (docker `ps` calls this COMMAND). Truncated to the width so
+    // cmd - what the box actually runs (docker `ps` calls this COMMAND). Truncated to the width so
     // a long command never wraps the panel.
     if !s.cmd.is_empty() {
         let budget = width.clamp(20, 100).saturating_sub(12);
@@ -246,7 +246,7 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
             "net",
             gl.warn,
             y,
-            format!("host {d}(shared — no network isolation){z}"),
+            format!("host {d}(shared - no network isolation){z}"),
         );
     } else {
         row(
@@ -270,7 +270,7 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
         ),
     );
 
-    // limits (only when set — else it's noise).
+    // limits (only when set - else it's noise).
     let mut lim = Vec::new();
     if let Some(m) = s.memory {
         lim.push(format!("mem {}", fmt_size(m)));
@@ -290,7 +290,7 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
 
     // volumes (only when present). Published ports are NOT shown here: the port forwarder already
     // prints each `→ publishing …` mapping (for both foreground and detached, with the real bind
-    // result), so repeating them would double-report — the panel stays the single source for the
+    // result), so repeating them would double-report - the panel stays the single source for the
     // rest of the posture.
     if s.volumes > 0 {
         let plural = if s.volumes == 1 { "" } else { "s" };
@@ -316,17 +316,17 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
     }
 
     // Warning block: the deliberately-open choices, each with a one-line fix. Dedup of the status
-    // rows above — the warning *expands* the yellow row, it doesn't repeat it.
+    // rows above - the warning *expands* the yellow row, it doesn't repeat it.
     let mut warns: Vec<(String, String)> = Vec::new();
     if s.share_net {
         warns.push((
-            "--net shares the host network — the box has no network isolation".into(),
+            "--net shares the host network - the box has no network isolation".into(),
             "drop --net for an isolated, loopback-only box".into(),
         ));
     }
     if s.bind_rootfs {
         warns.push((
-            "--bind-rootfs binds the source directly — it's mutable and shared".into(),
+            "--bind-rootfs binds the source directly - it's mutable and shared".into(),
             "drop --bind-rootfs for an immutable, per-box overlay root".into(),
         ));
     }

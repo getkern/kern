@@ -1,4 +1,4 @@
-//! Sandbox execution outcome — the structured result of [`crate::Sandbox::run`].
+//! Sandbox execution outcome - the structured result of [`crate::Sandbox::run`].
 
 /// Where the resource-usage figures in [`Outcome`] came from.
 ///
@@ -10,7 +10,7 @@
 /// children, not strictly per-sandbox).
 ///
 /// The `resource_source` field on [`Outcome`] is therefore the public signal of
-/// the precision the caller is receiving — read it before building billing on
+/// the precision the caller is receiving - read it before building billing on
 /// top of the numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceSource {
@@ -70,7 +70,7 @@ pub struct Outcome {
     /// **Check [`Self::resource_source`] before using this for billing.** When
     /// the source is [`ResourceSource::RusageFallback`] the figure comes from
     /// `getrusage(RUSAGE_CHILDREN)` and is **cumulative across all reaped
-    /// children** of the calling process — it over-reports under sandbox reuse.
+    /// children** of the calling process - it over-reports under sandbox reuse.
     pub peak_memory_bytes: Option<u64>,
 
     /// Total CPU time consumed by the sandboxed process across user and system
@@ -93,7 +93,7 @@ pub struct Outcome {
 #[derive(Debug, Clone, Copy)]
 pub struct OutputView<'a> {
     /// The captured bytes interpreted as UTF-8. `None` if the bytes are not
-    /// valid UTF-8 — callers can still read the raw `Vec<u8>` from
+    /// valid UTF-8 - callers can still read the raw `Vec<u8>` from
     /// `Outcome::stdout` / `stderr`.
     pub text: Option<&'a str>,
 
@@ -122,7 +122,7 @@ impl Outcome {
 
     /// View stdout as `&str` if it is valid UTF-8, else `None`.
     ///
-    /// # WARNING — silent truncation
+    /// # WARNING - silent truncation
     /// This helper does NOT signal truncation. If the process emitted more than
     /// `stdout_limit_bytes`, the returned string is a prefix and
     /// `stdout_truncated` is `true`. For decision paths prefer

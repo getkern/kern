@@ -3,7 +3,7 @@
 #
 # ffmpeg runs inside a throwaway box (installed there, not on your host);
 # `--cpus` caps the job so a long encode can't take over the machine. `-v` maps
-# a folder in and out, so the result lands on your host — which needs no ffmpeg.
+# a folder in and out, so the result lands on your host - which needs no ffmpeg.
 set -eu
 kern="${KERN:-kern}"
 
@@ -20,4 +20,4 @@ echo
 echo "==> the file is on your host:"
 ls -la clip.mp4 2>/dev/null || echo "  (not found)"
 echo
-echo "done — the encode ran in a throwaway box; your host has no ffmpeg installed."
+echo "done - the encode ran in a throwaway box; your host has no ffmpeg installed."

@@ -1,6 +1,6 @@
 //! Registry credentials shared by `kern login`/`logout` (which write them) and the OCI pull path
 //! (which reads them). Stored as a single owner-only (`0600`) file, one `registry <base64(user:pass)>`
-//! line per registry — the same base64 encoding Docker's `config.json` uses (obfuscation, not
+//! line per registry - the same base64 encoding Docker's `config.json` uses (obfuscation, not
 //! encryption: it keeps the password off a casual `cat`/shoulder-surf, and the `0600` mode plus the
 //! owner-only config dir are the real protection).
 
@@ -31,7 +31,7 @@ pub fn store(registry: &str, user: &str, pass: &str) -> std::io::Result<()> {
     }
     let path = creds_path().ok_or_else(|| std::io::Error::other("no config dir (set $HOME)"))?;
     if let Some(parent) = path.parent() {
-        // 0700 — the file mode protects the secret bytes, but the dir being owner-only keeps even the
+        // 0700 - the file mode protects the secret bytes, but the dir being owner-only keeps even the
         // *list* of registries you have credentials for private (parity with `~/.docker`).
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
@@ -121,7 +121,7 @@ fn write_0600(path: &std::path::Path, body: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// ── base64 (standard alphabet, with padding) — tiny, dependency-free ──
+// ── base64 (standard alphabet, with padding) - tiny, dependency-free ──
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 

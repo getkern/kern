@@ -1,6 +1,6 @@
 //! Extreme stress / adversarial exercise of the [`kern_isolation::Sandbox`] SDK.
 //!
-//! Usage: `sandbox_stress <rootfs-dir>` — pushes the SDK harder than the
+//! Usage: `sandbox_stress <rootfs-dir>` - pushes the SDK harder than the
 //! functional `sandbox_e2e` suite: concurrent fan-out with output-isolation
 //! checks, fd/thread-leak detection over many runs, `Sandbox` reuse, exact
 //! truncation boundaries, binary/non-UTF-8 integrity, self-signalled exit codes,
@@ -40,7 +40,7 @@ fn main() {
 
     // 1. CONCURRENT FAN-OUT (the AI-agent flagship): 24 sandboxes across threads,
     //    each echoing a UNIQUE token. Every one must come back with ITS OWN token
-    //    — proof of no cross-talk between concurrent captures (pipes/fds isolated)
+    //    - proof of no cross-talk between concurrent captures (pipes/fds isolated)
     //    and that run() is thread-safe. All must succeed.
     {
         const N: usize = 24;
@@ -86,7 +86,7 @@ fn main() {
     }
 
     // 3. SANDBOX REUSE: one built Sandbox, 30 sequential runs, each with distinct
-    //    output — no state bleed between runs.
+    //    output - no state bleed between runs.
     {
         let s = base().build().unwrap();
         let mut all = true;
@@ -103,7 +103,7 @@ fn main() {
     // 4. EXACT TRUNCATION BOUNDARY: cap C, emit exactly C-1 / C / C+1 bytes. Only
     //    the last must set the truncated flag; the C case must NOT (boundary is
     //    inclusive of C, exclusive of truncation). Guest emits N bytes via a
-    //    builtin loop + a partial line, but we keep it simple: `printf`-free —
+    //    builtin loop + a partial line, but we keep it simple: `printf`-free -
     //    emit exactly C bytes by echoing a string of C-1 chars (echo adds \n).
     {
         // Cap = 32. A 31-char line + newline = 32 bytes exactly.
@@ -163,7 +163,7 @@ fn main() {
     //    resolves in a bare rootfs. (A guest that self-signals is NOT a clean
     //    probe here: the box's PID 1 is kernel-protected from an in-namespace
     //    SIGKILL, and the 128+sig path in run() concerns the *kern child* being
-    //    signalled, not the guest — kern relays a guest signal as a normal code.)
+    //    signalled, not the guest - kern relays a guest signal as a normal code.)
     match base().build().unwrap().run(bb, &["sh", "-c", "exit 42"]) {
         Ok(o) => check("exit_code_fidelity_42", o.exit_code == 42 && !o.success()),
         Err(_) => check("exit_code_fidelity_42", false),
@@ -184,8 +184,8 @@ fn main() {
         Err(_) => check("timeout_not_fired_on_fast_cmd", false),
     }
 
-    // 9. BAD ROOTFS: a non-existent rootfs must fail cleanly — an Err, or an
-    //    Ok(Outcome) with a non-zero exit — but NEVER a panic and never a false
+    // 9. BAD ROOTFS: a non-existent rootfs must fail cleanly - an Err, or an
+    //    Ok(Outcome) with a non-zero exit - but NEVER a panic and never a false
     //    success. (If run() panicked, the process would abort before printing.)
     {
         let r = Sandbox::builder()

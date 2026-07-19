@@ -5,9 +5,9 @@
 # it names a `[[vdisk]]` profile in a kern.toml passed with --config. kern mounts that disk at
 # /vdisk/<name> inside the box:
 #
-#   * rootless (this script): a `size=`-capped tmpfs — RAM-backed, ephemeral, and the size cap IS
+#   * rootless (this script): a `size=`-capped tmpfs - RAM-backed, ephemeral, and the size cap IS
 #     enforced by the kernel (writing past it fails with ENOSPC). No privilege required.
-#   * root / `disk` group (foreground box): upgraded to a real ext4-on-loop image — disk-backed,
+#   * root / `disk` group (foreground box): upgraded to a real ext4-on-loop image - disk-backed,
 #     with optional `persistent`, `iops` and `bandwidth` limits.
 #
 # The vdisk is a SEPARATE mount, so it stays writable even under --read-only (scratch by design).
@@ -33,12 +33,12 @@ echo "==> 1. attach the vdisk profile (token BEFORE the command) and use the scr
     grep " /vdisk/scratch " /proc/mounts | awk "{print \"     type:\", \$3, \" opts:\", \$4}"
     echo "   capacity (df, expect ~10M):"
     df -h /vdisk/scratch | sed -n "2p" | sed "s/^/     /"
-    echo "   write a small file — fits fine:"
+    echo "   write a small file - fits fine:"
     dd if=/dev/zero of=/vdisk/scratch/chunk bs=1M count=4 2>/dev/null && echo "     wrote 4 MiB ✓"
   '
 
 echo
-echo "==> 2. the size cap is ENFORCED — writing past 10 MiB fails with ENOSPC:"
+echo "==> 2. the size cap is ENFORCED - writing past 10 MiB fails with ENOSPC:"
 # This is a real kernel-enforced tmpfs quota (works fully rootless), unlike a named-volume --size
 # which needs root for its ext4-loop backend (see named-volumes.sh).
 set +e
@@ -48,7 +48,7 @@ set -e
 echo "   -> the write stopped at the cap ('No space left on device') ✓"
 
 echo
-echo "done — a vdisk is per-box, size-capped scratch at /vdisk/<name>; enforced rootless via tmpfs,"
+echo "done - a vdisk is per-box, size-capped scratch at /vdisk/<name>; enforced rootless via tmpfs,"
 echo "       disk-backed (persistent + I/O limits) when run privileged."
 # Both boxes ran in the foreground; their ephemeral overlays AND the RAM-backed vdisk are already
 # gone. The trap removes the temp kern.toml.

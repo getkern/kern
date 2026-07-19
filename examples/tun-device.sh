@@ -29,4 +29,4 @@ echo "    A real userspace VPN then does the rest, e.g. inside a --tun box:"
 echo "      apk add wireguard-tools wireguard-go   # (needs egress: add --net or a pod w/ pasta)"
 echo "      wg-quick up wg0                         # opens /dev/net/tun, creates the TUN iface"
 echo
-echo "done — --tun only PROVISIONS the device; the workload owns the tunnel."
+echo "done - --tun only PROVISIONS the device; the workload owns the tunnel."

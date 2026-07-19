@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run your project's tests in a clean, isolated box — on your laptop or on the device itself
+# Run your project's tests in a clean, isolated box - on your laptop or on the device itself
 # (edge CI). Bind the repo read-only, build/test with network, get a pass/fail exit code. No
 # daemon to install on the build agent; works rootless on x86 and ARM alike.
 #
@@ -20,7 +20,7 @@ EOF
 echo "==> running CI in an isolated box (repo bound read-only, scratch is throwaway):"
 if "$kern" box ci --image alpine -v "$repo:/src:ro" -w /tmp -- \
      sh -c 'cp /src/build.sh . && sh build.sh'; then
-  echo "==> CI exit code: 0 (green) — propagated from the box"
+  echo "==> CI exit code: 0 (green) - propagated from the box"
 else
-  echo "==> CI failed (non-zero exit propagated) — your pipeline would stop here"
+  echo "==> CI failed (non-zero exit propagated) - your pipeline would stop here"
 fi

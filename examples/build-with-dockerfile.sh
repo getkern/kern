@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build a local image from a Dockerfile with `kern build`, then run it — no daemon, no root.
+# Build a local image from a Dockerfile with `kern build`, then run it - no daemon, no root.
 #
 #   kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [<context>]
 #     -t / --tag     name (and optional :tag) for the built image      (required)
@@ -9,7 +9,7 @@
 #
 # kern's builder understands the common instructions: FROM RUN COPY ADD ENV WORKDIR
 # USER CMD ENTRYPOINT EXPOSE ARG LABEL. (VOLUME/HEALTHCHECK parse but have no build-time
-# effect — HEALTHCHECK maps to the runtime `--health-cmd` instead.)
+# effect - HEALTHCHECK maps to the runtime `--health-cmd` instead.)
 # The result is a normal cached image: `kern images` lists it and `--image <tag>` runs it.
 set -eu
 kern="${KERN:-kern}"
@@ -35,7 +35,7 @@ echo "==> it's a cached image now:"
 "$kern" images | sed -n '1p;/dockerfile-demo/p'
 
 echo
-echo "==> run it with NO command — the baked-in CMD/ENV/WORKDIR take effect:"
+echo "==> run it with NO command - the baked-in CMD/ENV/WORKDIR take effect:"
 "$kern" box df-run --image dockerfile-demo:1
 
 echo
@@ -46,4 +46,4 @@ echo
 echo "==> cleanup: drop the built image, reclaim its layers:"
 "$kern" rmi dockerfile-demo:1 >/dev/null 2>&1 || true
 "$kern" gc >/dev/null 2>&1 || true
-echo "done — image removed, temp Dockerfile gone, nothing left running."
+echo "done - image removed, temp Dockerfile gone, nothing left running."

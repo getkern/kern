@@ -1,8 +1,8 @@
-//! Embeddable sandbox SDK — a fluent [`Sandbox::builder()`] over `kern box`.
+//! Embeddable sandbox SDK - a fluent [`Sandbox::builder()`] over `kern box`.
 //!
 //! This is the library face of kern for programs that want to run untrusted or
 //! semi-trusted code inside a real kernel isolation boundary (namespaces +
-//! pivot_root + seccomp + cgroup v2) and get a structured [`Outcome`] back —
+//! pivot_root + seccomp + cgroup v2) and get a structured [`Outcome`] back -
 //! the exit code, captured stdout/stderr (with truncation flags), wall time,
 //! and best-effort resource accounting.
 //!
@@ -52,14 +52,14 @@
 //! # let _ = out;
 //! ```
 //!
-//! Tokens are `vcpu:`/`vgpio:`/`vdisk:` (the public set — GPU/`vgpu:` is a
+//! Tokens are `vcpu:`/`vgpio:`/`vdisk:` (the public set - GPU/`vgpu:` is a
 //! private-runtime feature).
 //!
-//! ### Precedence — explicit setter over profile (no conflict, a defined override)
+//! ### Precedence - explicit setter over profile (no conflict, a defined override)
 //! A `vcpu:` profile carries CPU/memory/cpuset (and nice); `vgpio:`/`vdisk:` add
 //! devices/disks and overlap with nothing. When BOTH a `vcpu:` profile and the
 //! matching explicit setter are present, the precedence is fixed and
-//! deterministic: **explicit setter > profile > default** — the runtime
+//! deterministic: **explicit setter > profile > default** - the runtime
 //! pre-seeds the caps from the explicit values and a profile fills only what is
 //! still unset. So this is an intentional override, not an ambiguity:
 //!
@@ -84,17 +84,17 @@
 //! lists every such shadow (and duplicate env keys / volume targets) as a
 //! human-readable advisory after `build()`. Genuine *contradictions* (two roots,
 //! `bind_rootfs` + `readonly_root`, a zero limit, a malformed profile token, …)
-//! are hard errors from `build()` instead — see its docs. So: contradictions
+//! are hard errors from `build()` instead - see its docs. So: contradictions
 //! stop you; benign overrides are reported, never silent.
 //!
 //! ## Honest limits (public runtime)
 //! - The public `kern box` **always** replaces the host filesystem with the
-//!   given `rootfs`/`image` — there is no "share the host fs" mode, so
+//!   given `rootfs`/`image` - there is no "share the host fs" mode, so
 //!   [`SandboxBuilder::no_host_fs`] is the default and the method only affirms
 //!   it. A rootfs or image is therefore **required**; [`SandboxBuilder::build`]
 //!   rejects a config that sets neither.
 //! - The public seccomp filter (hardened denylist) is **always on**;
-//!   [`SandboxBuilder::seccomp`] is advisory — see its docs.
+//!   [`SandboxBuilder::seccomp`] is advisory - see its docs.
 //! - Resource figures come from `getrusage(RUSAGE_CHILDREN)` today
 //!   ([`crate::ResourceSource::RusageFallback`]); read `Outcome::resource_source`
 //!   before treating them as per-sandbox-accurate.
@@ -109,7 +109,7 @@ use crate::outcome::{Outcome, ResourceSource};
 /// Errors returned by the sandbox SDK ([`Sandbox`] / [`SandboxBuilder`]).
 ///
 /// Distinct from the crate's low-level [`crate::Error`] (raw syscall failures):
-/// this type describes failures of the *embedding* API — a bad configuration,
+/// this type describes failures of the *embedding* API - a bad configuration,
 /// a missing `kern` binary, or an I/O failure talking to the child.
 #[derive(Debug)]
 pub enum SandboxError {
@@ -169,21 +169,21 @@ pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
 /// explicit in caller code, but on the public runtime:
 /// - [`Self::DenylistHardened`] is what actually runs (the default).
 /// - [`Self::DenylistHardenedStrict`] and [`Self::Disabled`] are **not honored**
-///   — the always-on hardened denylist applies regardless.
+///   - the always-on hardened denylist applies regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SeccompMode {
-    /// No filter requested. **Not honored on the public runtime** — the
+    /// No filter requested. **Not honored on the public runtime** - the
     /// built-in filter stays on.
     Disabled,
     /// Hardened denylist (the default, and what the public runtime always runs).
     #[default]
     DenylistHardened,
-    /// Denylist with kill-on-violation. **Not honored on the public runtime** —
+    /// Denylist with kill-on-violation. **Not honored on the public runtime** -
     /// treated as [`Self::DenylistHardened`].
     DenylistHardenedStrict,
 }
 
-/// Default output capture cap — 256 KiB per stream.
+/// Default output capture cap - 256 KiB per stream.
 ///
 /// Sized to be safe under fan-out: a platform running 100 concurrent sandboxes
 /// (agent grading, CI, batch) with a 16 MiB default would peak at 3.2 GiB just
@@ -250,14 +250,14 @@ impl Sandbox {
 
     /// Non-fatal advisories about this configuration, computed at
     /// [`SandboxBuilder::build`]. Each is a legal-but-potentially-surprising
-    /// combination the caller may want to surface to a human — most commonly an
+    /// combination the caller may want to surface to a human - most commonly an
     /// explicit resource setter (`.cpus`/`.memory_limit_bytes`/`.cpuset`) that
     /// **shadows** a `vcpu:` profile's value (the explicit one wins), duplicate
     /// env keys or volume targets (last wins), or multiple `vcpu:` profiles
     /// (first-to-set-a-field wins).
     ///
     /// Empty means the config has no known ambiguities. Genuine contradictions
-    /// are hard errors from `build()` instead — this list is only for the cases
+    /// are hard errors from `build()` instead - this list is only for the cases
     /// that are well-defined but easy to misread. A CLI front-end should print
     /// these; an automated caller can log or ignore them.
     ///
@@ -288,8 +288,8 @@ impl Sandbox {
     ///
     /// Resource figures in the returned [`Outcome`] come from
     /// `getrusage(RUSAGE_CHILDREN)`, which is **process-global**: under concurrent
-    /// `run()` calls they conflate all reaped children and are unreliable per-box
-    /// — check `Outcome::resource_source` (it reports
+    /// `run()` calls they conflate all reaped children and are unreliable per-box:
+    /// check `Outcome::resource_source` (it reports
     /// [`crate::ResourceSource::RusageFallback`]).
     ///
     /// # Errors
@@ -311,7 +311,7 @@ impl Sandbox {
         let mut cmd = Command::new(&kern_bin);
         cmd.args(&kern_args);
 
-        // Always pipe stdio so the SDK can present a structured Outcome — the
+        // Always pipe stdio so the SDK can present a structured Outcome - the
         // captured bytes are the primary product for the agent use case.
         cmd.stdin(if self.stdin_bytes.is_some() {
             Stdio::piped()
@@ -354,7 +354,7 @@ impl Sandbox {
 
         // Drain both output streams concurrently to avoid a pipe-buffer deadlock:
         // a child writing >~64 KiB to one stream would block if we read serially.
-        // These MUST start before we push stdin — otherwise a large stdin (the
+        // These MUST start before we push stdin - otherwise a large stdin (the
         // main thread blocked in write_all) plus a guest that writes output
         // before consuming all of stdin deadlocks: nobody drains stdout while we
         // wait to finish feeding stdin, and the guest can't make progress.
@@ -433,7 +433,7 @@ impl Sandbox {
     /// wire format stays an implementation detail.
     fn assemble_kern_args(&self, command: &str, args: &[&str]) -> Vec<String> {
         // Pre-size for the fixed flags (~24), the profile tokens, the per-volume
-        // (-v VALUE) and per-env (--env VALUE) pairs, and the command + its args —
+        // (-v VALUE) and per-env (--env VALUE) pairs, and the command + its args -
         // so a profile- or volume-heavy config doesn't realloc mid-build.
         let mut out: Vec<String> = Vec::with_capacity(
             args.len() + self.profiles.len() + self.volumes.len() * 2 + self.env.len() * 2 + 24,
@@ -512,12 +512,12 @@ impl Sandbox {
                 format!("{}:{}", v.source, v.target)
             });
         }
-        // Guest environment (the box starts from a clean env — pass each var in).
+        // Guest environment (the box starts from a clean env - pass each var in).
         for (k, val) in &self.env {
             out.push("--env".to_string());
             out.push(format!("{k}={val}"));
         }
-        // Resource-profile tokens (`vcpu:`/`vgpio:`/`vdisk:`) — bare positionals the
+        // Resource-profile tokens (`vcpu:`/`vgpio:`/`vdisk:`) - bare positionals the
         // box classifies as profiles (validated at build() so none can be mistaken
         // for the box name). Must sit before the `--` separator.
         for p in &self.profiles {
@@ -587,7 +587,7 @@ impl SandboxBuilder {
         self
     }
 
-    /// Bind the `rootfs` directly instead of layering an overlay — faster on
+    /// Bind the `rootfs` directly instead of layering an overlay - faster on
     /// kernels with slow overlayfs, at the cost of a mutable, shared root.
     /// Only valid with [`Self::rootfs`] (not [`Self::image`]) and not with
     /// [`Self::readonly_root`].
@@ -610,7 +610,7 @@ impl SandboxBuilder {
     /// path (`$KERN_CONFIG`, else `~/.config/kern/kern.toml`).
     ///
     /// Explicit builder setters (e.g. [`Self::cpus`], [`Self::memory_limit_bytes`])
-    /// win over a profile's value — the runtime's "explicit flag wins" merge.
+    /// win over a profile's value - the runtime's "explicit flag wins" merge.
     pub fn config(mut self, path: impl Into<String>) -> Self {
         self.inner.config = Some(path.into());
         self
@@ -638,7 +638,7 @@ impl SandboxBuilder {
         self
     }
 
-    /// Share the host network namespace instead of isolating it. Opt-in — gives
+    /// Share the host network namespace instead of isolating it. Opt-in - gives
     /// the box outbound networking at the cost of network isolation.
     pub fn share_network(mut self) -> Self {
         self.inner.share_net = true;
@@ -665,7 +665,7 @@ impl SandboxBuilder {
         self
     }
 
-    /// Select the seccomp policy. **Advisory on the public runtime** — see
+    /// Select the seccomp policy. **Advisory on the public runtime** - see
     /// [`SeccompMode`]. The hardened denylist is always on regardless.
     pub fn seccomp(mut self, mode: SeccompMode) -> Self {
         self.inner.seccomp = mode;
@@ -799,7 +799,7 @@ impl SandboxBuilder {
         match (s.rootfs.is_some(), s.image.is_some()) {
             (false, false) => {
                 return bad(
-                    "set a rootfs (.rootfs) or an image (.image) — the sandbox has no default root",
+                    "set a rootfs (.rootfs) or an image (.image) - the sandbox has no default root",
                 )
             }
             (true, true) => return bad("set either .rootfs or .image, not both"),
@@ -825,7 +825,7 @@ impl SandboxBuilder {
             }
         }
         // Resource limits: a limit set to a nonsensical value is a caller bug, not
-        // "unlimited" (that's `None`) — reject it rather than let kern do so cryptically.
+        // "unlimited" (that's `None`) - reject it rather than let kern do so cryptically.
         if let Some(c) = s.cpus {
             if !c.is_finite() || c <= 0.0 {
                 return bad("cpus must be a finite positive number of cores (e.g. 0.5, 2.0)");
@@ -853,7 +853,7 @@ impl SandboxBuilder {
         }
         // Volumes: source and target must be non-empty and colon-free. The box's
         // `-v src:target[:ro]` spec is colon-delimited, so a `:` in either field
-        // would shift the fields and silently mis-mount — reject it up front.
+        // would shift the fields and silently mis-mount - reject it up front.
         for v in &s.volumes {
             if v.source.is_empty() || v.target.is_empty() {
                 return bad("volume source and target must both be non-empty");
@@ -868,7 +868,7 @@ impl SandboxBuilder {
         //      box would silently adopt it as the box NAME; and
         //  (b) the name flows into a mount path (`/vdisk/<name>`) and a config
         //      lookup, so a `..`/`/` in it could traverse outside the intended
-        //      target — reject anything but `[A-Za-z0-9._-]` (and no `..`).
+        //      target - reject anything but `[A-Za-z0-9._-]` (and no `..`).
         for tok in &s.profiles {
             let name = ["vcpu:", "vgpio:", "vdisk:"]
                 .iter()
@@ -882,8 +882,8 @@ impl SandboxBuilder {
             }
         }
         // Config is coherent (no contradictions). Compute the non-fatal advisories
-        // — the shadowing / duplicate cases that are well-defined but easy to
-        // misread — so `Sandbox::warnings()` can surface them to a human.
+        // - the shadowing / duplicate cases that are well-defined but easy to
+        // misread - so `Sandbox::warnings()` can surface them to a human.
         let mut inner = self.inner;
         inner.warnings = compute_warnings(&inner);
         Ok(inner)
@@ -915,21 +915,21 @@ fn compute_warnings(s: &Sandbox) -> Vec<String> {
     if vcpu_count > 0 {
         if s.cpus.is_some() {
             w.push(
-                "explicit .cpus() is set together with a vcpu: profile — if that profile also \
+                "explicit .cpus() is set together with a vcpu: profile - if that profile also \
                  sets CPU cores, your explicit .cpus() wins (drop one to remove the ambiguity)"
                     .to_string(),
             );
         }
         if s.memory_limit_bytes.is_some() {
             w.push(
-                "explicit .memory_limit_bytes() is set together with a vcpu: profile — if that \
+                "explicit .memory_limit_bytes() is set together with a vcpu: profile - if that \
                  profile also sets memory, your explicit value wins"
                     .to_string(),
             );
         }
         if s.cpuset.is_some() {
             w.push(
-                "explicit .cpuset() is set together with a vcpu: profile — if that profile also \
+                "explicit .cpuset() is set together with a vcpu: profile - if that profile also \
                  pins CPUs, your explicit value wins"
                     .to_string(),
             );
@@ -937,7 +937,7 @@ fn compute_warnings(s: &Sandbox) -> Vec<String> {
     }
     if vcpu_count > 1 {
         w.push(format!(
-            "{vcpu_count} vcpu: profiles applied — each resource is taken from the FIRST profile \
+            "{vcpu_count} vcpu: profiles applied - each resource is taken from the FIRST profile \
              that sets it; later vcpu: profiles only fill what is still unset"
         ));
     }
@@ -946,12 +946,12 @@ fn compute_warnings(s: &Sandbox) -> Vec<String> {
     // in order). `duplicated` reports each repeated value once.
     for k in duplicated(s.env.iter().map(|(k, _)| k)) {
         w.push(format!(
-            "env key {k:?} is set more than once — the last value wins"
+            "env key {k:?} is set more than once - the last value wins"
         ));
     }
     for t in duplicated(s.volumes.iter().map(|v| &v.target)) {
         w.push(format!(
-            "volume target {t:?} is mounted more than once — the last source wins"
+            "volume target {t:?} is mounted more than once - the last source wins"
         ));
     }
     w
@@ -978,7 +978,7 @@ fn duplicated<T: PartialEq>(items: impl Iterator<Item = T>) -> Vec<T> {
 /// `getrusage(RUSAGE_CHILDREN)`.
 ///
 /// Documented caveat: `ru_maxrss` is cumulative over all reaped children and may
-/// over-report when one `Sandbox` is reused across many `run()` calls — hence
+/// over-report when one `Sandbox` is reused across many `run()` calls - hence
 /// [`ResourceSource::RusageFallback`] is reported so callers know the precision.
 fn sample_resource_usage() -> (Option<u64>, Option<u64>, ResourceSource) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -1070,7 +1070,7 @@ fn resolve_kern_binary() -> SandboxResult<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The command vector `run()` would spawn — pure, so the security-critical
+    /// The command vector `run()` would spawn - pure, so the security-critical
     /// flag translation is testable without spawning anything.
     fn args(s: &Sandbox, cmd: &str, a: &[&str]) -> Vec<String> {
         s.assemble_kern_args(cmd, a)
@@ -1150,7 +1150,7 @@ mod tests {
         // Good tokens.
         assert!(b().profile("vcpu:x").build().is_ok());
         assert!(b().profile("vgpio:y").profile("vdisk:z").build().is_ok());
-        // A bare token (no kind:) would be silently taken as the box NAME — reject.
+        // A bare token (no kind:) would be silently taken as the box NAME - reject.
         assert!(b().profile("small").build().is_err());
         // Empty name after the colon.
         assert!(b().profile("vcpu:").build().is_err());
@@ -1262,7 +1262,7 @@ mod tests {
         assert!(err(Sandbox::builder().rootfs("/r").profile("bogus"))); // bad token
         assert!(err(Sandbox::builder().rootfs("/r").config(""))); // empty config
                                                                   // And a fully-specified coherent config with overrides is NOT an error
-                                                                  // (it's a warning) — override is a supported pattern.
+                                                                  // (it's a warning) - override is a supported pattern.
         assert!(Sandbox::builder()
             .rootfs("/r")
             .config("/k.toml")
@@ -1435,7 +1435,7 @@ mod tests {
     #[test]
     fn seccomp_setter_is_accepted_and_advisory() {
         // The setter must not change the emitted args (public seccomp is always
-        // on and has no CLI knob) — it's advisory, documented on SeccompMode.
+        // on and has no CLI knob) - it's advisory, documented on SeccompMode.
         let base = Sandbox::builder().rootfs("/r").build().unwrap();
         let strict = Sandbox::builder()
             .rootfs("/r")

@@ -39,7 +39,7 @@ pub fn open() -> io::Result<Pty> {
             return Err(e);
         }
         // Close-on-exec the master: the box child inherits it across fork, and without this it would
-        // survive the box's `execvp` — leaving the workload holding its own terminal's master end (a
+        // survive the box's `execvp` - leaving the workload holding its own terminal's master end (a
         // confused-deputy that could steal bytes from the pump). The parent's pump never execs, so
         // CLOEXEC doesn't affect it. (The slave is dup2'd onto the box's stdio, which stays open.)
         libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -76,7 +76,7 @@ pub fn restore(fd: RawFd, prev: &libc::termios) {
 }
 
 /// Put the host's stdin (fd 0) into raw mode and start forwarding window resizes to the PTY
-/// `master` — but ONLY when our stdin is itself a terminal. When kern's input is piped, stdin isn't
+/// `master` - but ONLY when our stdin is itself a terminal. When kern's input is piped, stdin isn't
 /// a tty: the box still gets its PTY, we just leave our own stdin alone. Returns the saved terminal
 /// settings to hand back to [`restore`] (or `None` when there was nothing to raw). Shared by
 /// `box -it` and `exec -it`.

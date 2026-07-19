@@ -3,7 +3,7 @@
 #
 # When a process's parent exits, its children are re-parented to PID 1. If those children then
 # exit, PID 1 must `wait()` on them or they linger as <defunct> "zombie" entries in the process
-# table. A plain shell run as the box's PID 1 does NOT reap re-parented grandchildren — so a
+# table. A plain shell run as the box's PID 1 does NOT reap re-parented grandchildren - so a
 # workload that spawns short-lived orphans (a supervisor, a job runner, anything that forks) piles
 # up zombies. `--init` inserts kern's tiny reaping init as PID 1: it adopts the orphans, reaps them
 # immediately, and forwards signals to your command. (This is the classic "why --init" problem,
@@ -30,13 +30,13 @@ payload='
 
 echo "── 1. WITHOUT --init: the shell is PID 1 and does not reap re-parented orphans"
 "$kern" box reap-off --image "$img" -- sh -c "$payload"
-echo "   (expect a nonzero count — the orphans exited but nobody wait()ed on them)"
+echo "   (expect a nonzero count - the orphans exited but nobody wait()ed on them)"
 
 echo
 echo "── 2. WITH --init: kern's reaping init is PID 1 and adopts + reaps the orphans"
 "$kern" box reap-on --image "$img" --init -- sh -c "$payload"
-echo "   (expect 0 — every orphan was reaped as soon as it exited) ✓"
+echo "   (expect 0 - every orphan was reaped as soon as it exited) ✓"
 
 echo
-echo "done — use --init for any box whose workload forks child processes (supervisors, job"
+echo "done - use --init for any box whose workload forks child processes (supervisors, job"
 echo "runners, test harnesses). Both boxes were rootless and are already gone."

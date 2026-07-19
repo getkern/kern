@@ -1,10 +1,10 @@
 #!/bin/sh
-# Publish a box's port to the host and keep the service healthy — without a daemon. New in 0.4:
+# Publish a box's port to the host and keep the service healthy - without a daemon. New in 0.4:
 #   -p [ip:]host:box   publish a port (binds 127.0.0.1 by default; 0.0.0.0 only if you ask for it)
 #   --restart          restart the box if it exits non-zero (on-failure policy)
 #   --health-cmd       probe the box periodically; `kern ps` shows HEALTH
 #
-# Real-life: run a web service / API on a box, reachable from the host, self-healing — no daemon.
+# Real-life: run a web service / API on a box, reachable from the host, self-healing - no daemon.
 set -eu
 kern="${KERN:-kern}"
 name=web
@@ -18,7 +18,7 @@ echo "==> starting a detached HTTP service: host 8080 -> box 80, with restart + 
 echo
 echo "==> waiting for the health check to go green..."
 sleep 4
-echo "==> kern ps — note the PORTS (127.0.0.1:8080->80) and HEALTH (healthy) columns:"
+echo "==> kern ps - note the PORTS (127.0.0.1:8080->80) and HEALTH (healthy) columns:"
 "$kern" ps
 
 echo
@@ -36,4 +36,4 @@ echo "      kern box $name -d -p 0.0.0.0:8080:80 ...   # binds all interfaces, p
 echo
 echo "==> tear down:"
 "$kern" stop "$name" >/dev/null
-echo "done — port released, no daemon left behind."
+echo "done - port released, no daemon left behind."

@@ -11,9 +11,9 @@
 # The nginx box uses the official image with a small self-contained config we bind over
 # /etc/nginx. It runs workers as root (mapped uid 0) on purpose: `kern pod create` maps a
 # single uid into the pod, so the stock config's drop to the `nginx` user (uid 101) has no uid
-# to land on. `user root;` keeps everything on the one mapped uid — no privilege drop needed.
+# to land on. `user root;` keeps everything on the one mapped uid - no privilege drop needed.
 # (For images that MUST drop to a service uid inside a shared netns, use `kern compose`, which
-# maps a uid range into the pod automatically — see compose-webstack.sh.)
+# maps a uid range into the pod automatically - see compose-webstack.sh.)
 set -eu
 kern="${KERN:-kern}"
 

@@ -1,6 +1,6 @@
 name: Release
 # Build static (musl) binaries for linux-x86_64 and linux-aarch64 on a version tag and attach
-# them — plus SHA256SUMS — to the GitHub Release. `install.sh` downloads from here.
+# them - plus SHA256SUMS - to the GitHub Release. `install.sh` downloads from here.
 on:
   push:
     tags: ["v*"]
@@ -17,7 +17,7 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     # A tag push builds everything; a manual dispatch only backfills the Windows assets (below) onto an
-    # existing release — the Linux binaries + SBOM are already attached from the tag's original run.
+    # existing release - the Linux binaries + SBOM are already attached from the tag's original run.
     if: github.event_name == 'push'
     runs-on: ${{ matrix.runner }}
     strategy:

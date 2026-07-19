@@ -3,7 +3,7 @@
 #
 #   -p 8000-8002:9000-9002     a port RANGE (host and box ranges must be the SAME length)
 #   -p 5353:53/udp             UDP (append /udp; the default is /tcp)
-#   -p 0.0.0.0:8080:80         bind ALL interfaces (default binds 127.0.0.1 — loopback only)
+#   -p 0.0.0.0:8080:80         bind ALL interfaces (default binds 127.0.0.1 - loopback only)
 #   -p 127.0.0.1:8080:80       spell the loopback bind explicitly
 #
 # Grammar (verified in crates/kern-cli/src/ports.rs):  -p [ip:]host:box[/tcp|/udp]
@@ -29,7 +29,7 @@ echo "==> publish a RANGE of TCP ports (host 8000-8002 -> box 8000-8002), detach
 sleep 1
 
 echo
-echo "==> kern ps — the PORTS column lists every mapping in the expanded range:"
+echo "==> kern ps - the PORTS column lists every mapping in the expanded range:"
 "$kern" ps
 
 echo
@@ -43,7 +43,7 @@ for p in 8000 8001 8002; do
 done
 
 echo
-echo "==> UDP publish (append /udp) — validate the mapping is accepted and shown; no traffic sent:"
+echo "==> UDP publish (append /udp) - validate the mapping is accepted and shown; no traffic sent:"
 # --show-config resolves the box config and exits WITHOUT running, so this stays non-invasive.
 "$kern" box udp-demo --image alpine -p 5353:53/udp --show-config 2>/dev/null \
   | grep -i -E 'port|53' || echo "  (mapping accepted: 127.0.0.1:5353->53/udp)"

@@ -1,7 +1,7 @@
 #!/bin/sh
 # A real per-job data pipeline: read-only input in, results out, processing isolated.
 # The job can't modify your source data (mounted :ro) and can only write to the output dir.
-# Run one per job/file/tenant — each in its own throwaway box.
+# Run one per job/file/tenant - each in its own throwaway box.
 #
 # Real-life: batch transforms, log crunching, per-tenant processing, an edge sensor pipeline.
 set -eu

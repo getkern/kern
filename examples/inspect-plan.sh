@@ -1,7 +1,7 @@
 #!/bin/sh
 # Audit the isolation BEFORE running anything.
 #
-# `kern box <name> --plan` prints the exact, ordered mount sequence the sandbox would perform —
+# `kern box <name> --plan` prints the exact, ordered mount sequence the sandbox would perform -
 # no privileges, nothing executed. Useful for review, docs, and CI policy checks.
 set -eu
 kern="${KERN:-kern}"

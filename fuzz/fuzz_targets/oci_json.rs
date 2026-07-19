@@ -1,6 +1,6 @@
 #![no_main]
 //! Fuzz the dependency-free registry-JSON string scanner. A registry can return any bytes, so the
-//! scanner must never panic — in particular it must never slice a `&str` at a non-char boundary.
+//! scanner must never panic - in particular it must never slice a `&str` at a non-char boundary.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

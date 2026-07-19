@@ -1,11 +1,11 @@
 #!/bin/sh
-# Tag an image and push it to a registry — self-contained, via a local `registry:2` in a kern box.
+# Tag an image and push it to a registry - self-contained, via a local `registry:2` in a kern box.
 #
 #   kern tag  <src> <dst>                  give a cached image a second name
 #   kern push <local-ref> [as <remote-ref>]  publish a cached image to a registry
 #
 # We run a throwaway Docker registry (`registry:2`) as a detached kern box, published on
-# 127.0.0.1:5000. kern (like Docker) treats a LOOPBACK registry — localhost / 127.* / ::1 — as
+# 127.0.0.1:5000. kern (like Docker) treats a LOOPBACK registry - localhost / 127.* / ::1 - as
 # insecure-OK and talks plain HTTP to it automatically: there is no --tls/--insecure flag to pass,
 # and none exists. (A non-loopback registry is always HTTPS + TLS-pinned, and a private one needs
 # `kern login` first.) The registry's storage lives in the box's ephemeral overlay, so tearing the
@@ -40,7 +40,7 @@ echo "==> make sure we have a source image cached, then TAG it for the local reg
 "$kern" tag alpine "$remote"
 
 echo
-echo "==> PUSH it (plain HTTP to loopback — no TLS flag needed):"
+echo "==> PUSH it (plain HTTP to loopback - no TLS flag needed):"
 "$kern" push "$remote"
 
 echo
@@ -57,4 +57,4 @@ echo "==> cleanup: stop the registry box (its data was ephemeral) and drop cache
 "$kern" rmi "$remote" >/dev/null 2>&1 || true
 rm -rf "$back"
 "$kern" gc >/dev/null 2>&1 || true
-echo "done — registry gone, no data left, no daemon."
+echo "done - registry gone, no data left, no daemon."

@@ -1,4 +1,4 @@
-"""kern-sandbox — run LLM/agent-generated code in a fast, local, daemonless kernel sandbox.
+"""kern-sandbox: run LLM/agent-generated code in a fast, local, daemonless kernel sandbox.
 
     import kern_sandbox as kern
 
@@ -12,22 +12,22 @@
         r = sbx.run_code("import pandas as pd; print(pd.read_csv('data.csv').shape)")
         png = sbx.read_file("out.png")
 
-Design — the "middle way" (validated with review):
+Design, the "middle way" (validated with review):
   * FILE state persists between steps via a workspace DIRECTORY on the host, bind-mounted into each
     box. PROCESSES are ephemeral: every run_code()/run() spawns a FRESH box on that shared workspace.
-    There is NO resident interpreter — in-memory REPL state (a `x=40` living in globals) does NOT
+    There is NO resident interpreter - in-memory REPL state (a `x=40` living in globals) does NOT
     survive between calls; write to disk if you need continuity. This keeps the cold-start/density
     win (100s of ephemeral boxes, not 100s of resident pythons) instead of chasing a cloud-session
     model kern isn't built for.
   * ONE class (`Sandbox`). `run_code(...)` at module level is literally a throwaway session
-    (`with Sandbox() as s: return s.run_code(...)`), so there is a single, tested security code path —
+    (`with Sandbox() as s: return s.run_code(...)`), so there is a single, tested security code path -
     not two Sandbox-like surfaces that drift apart. (# DECISION, reviewer-ratified.)
   * I/O is HOST-DIRECT: the workspace is a host dir and single-uid maps box-root to the host user, so
-    files the box creates are host-owned — write_file/read_file are plain host filesystem I/O, no
+    files the box creates are host-owned - write_file/read_file are plain host filesystem I/O, no
     `kern cp`, no in-box shim. (`--uid-range` breaks this ownership and is OUT of v1 scope. # DECISION.)
 
 Threat model (honest): kern is a KERNEL-BOUNDARY sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp
-is a DENYLIST — suitable for semi-trusted agent code, NOT a hard boundary against deliberately hostile
+is a DENYLIST - suitable for semi-trusted agent code, NOT a hard boundary against deliberately hostile
 multi-tenant code (for that: a microVM / gVisor). A deny-by-default allowlist mode is on the roadmap.
 """
 
@@ -56,7 +56,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -67,7 +67,7 @@ _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside ev
 _DEPS_DIR = ".deps"  # pip --target dir inside the workspace (added to PYTHONPATH for run_code)
 _ENV_FILE = ".kern-env"  # host-side 0600 env file (kept out of argv so values don't show in `ps`)
 
-# Host paths a `-v` mount must never target — mounting the host's real root/config/secrets into a
+# Host paths a `-v` mount must never target - mounting the host's real root/config/secrets into a
 # sandbox defeats the point; the docker socket is the classic escape. A footgun guard: refused even
 # when asked. Absolute, normalized host-SOURCE paths.
 _REFUSED_MOUNT_SOURCES = {
@@ -86,7 +86,7 @@ _REFUSED_MOUNT_SOURCES = {
 class SandboxError(RuntimeError):
     """A PROGRAMMER/config error, RAISED: bad argument, illegal mount, or `kern` not installed.
 
-    Runtime sandbox events (timeout, blocked escape, OOM-kill) are NOT raised — they are reported as
+    Runtime sandbox events (timeout, blocked escape, OOM-kill) are NOT raised - they are reported as
     data in ``ExecutionResult.fault`` (a :class:`SandboxFault`). Raising them would force every
     ``run_code`` into a try/except for what is a normal, expected outcome of running untrusted code.
     """
@@ -98,7 +98,7 @@ class MountRefused(SandboxError):
 
 @dataclass
 class SandboxFault:
-    """A SANDBOX-level event that stopped the code — reported as DATA, never raised. ``None`` in a
+    """A SANDBOX-level event that stopped the code - reported as DATA, never raised. ``None`` in a
     result means the sandbox did nothing: any non-zero exit is the user's code, not a sandbox fault."""
 
     type: Literal["timeout", "escape_blocked", "killed", "startup_failed"]
@@ -177,7 +177,7 @@ def _find_kern() -> str:
     found = shutil.which("kern")
     if not found:
         raise SandboxError(
-            "the `kern` binary was not found on PATH — install it "
+            "the `kern` binary was not found on PATH - install it "
             "(https://github.com/getkern/kern) or set $KERN_BIN"
         )
     return found
@@ -207,9 +207,9 @@ def _validate_mount(source: str, target: str) -> tuple[str, str]:
 
 
 # Signal-derived exit codes (128 + signum) we classify.
-_EXIT_SIGKILL = 137  # 128 + 9  — SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
-_EXIT_SIGSYS = 159  # 128 + 31 — SIGSYS: a seccomp-denied syscall = a blocked escape attempt
-_EXIT_SIGTERM = 143  # 128 + 15 — SIGTERM: kern's --timeout backstop reaping the box (SIGTERM→SIGKILL)
+_EXIT_SIGKILL = 137  # 128 + 9  - SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
+_EXIT_SIGSYS = 159  # 128 + 31 - SIGSYS: a seccomp-denied syscall = a blocked escape attempt
+_EXIT_SIGTERM = 143  # 128 + 15 - SIGTERM: kern's --timeout backstop reaping the box (SIGTERM→SIGKILL)
 
 
 @dataclass
@@ -231,7 +231,7 @@ class Sandbox:
         timeout_s: MANDATORY per-call wall-clock limit. The BINDING owns this deadline (it kills the
             box), so a ``timeout`` fault is a known fact, never guessed. Default 30.
         network: **RELAXES ISOLATION.** ``True`` shares the host network for every ``run_code`` (kern
-            ``--net``). Default ``False``. There is no per-call network override — network is a
+            ``--net``). Default ``False``. There is no per-call network override - network is a
             session-level, explicit choice.
         mounts: extra host paths to bind, ``{host_src: box_target}`` (or ``{src: (target, "ro")}``).
             Sensitive sources are refused. The workspace is mounted automatically; this is for extras.
@@ -288,7 +288,7 @@ class Sandbox:
             self._own_ws = True
         else:
             # A caller-supplied workspace is host input → validate it like a mount source, and DON'T
-            # delete it on exit (its contents persist across sessions — documented).
+            # delete it on exit (its contents persist across sessions - documented).
             _validate_mount(self.workspace, _WORKSPACE)
             self._ws = os.path.realpath(self.workspace)
             Path(self._ws).mkdir(parents=True, exist_ok=True)
@@ -314,7 +314,7 @@ class Sandbox:
                 "--workdir", _WORKSPACE]
         # deps_readonly: mount <workspace>/.deps read-only OVER the writable workspace for run_code boxes
         # (not the setup box, which must populate it). Closes the cross-run dep-poisoning window within a
-        # session for tighter (still semi-trusted) workloads. Default off — deps writable, documented.
+        # session for tighter (still semi-trusted) workloads. Default off - deps writable, documented.
         if self.deps_readonly and not is_setup:
             deps = os.path.join(self._ws, _DEPS_DIR)
             if os.path.isdir(deps):
@@ -334,7 +334,7 @@ class Sandbox:
             argv += ["--net"]
         argv += self._mount_args
         merged_env = dict(self.env or {})
-        # Deps installed by `setup` live in <workspace>/.deps — put them on PYTHONPATH for run_code.
+        # Deps installed by `setup` live in <workspace>/.deps - put them on PYTHONPATH for run_code.
         merged_env.setdefault("PYTHONPATH", f"{_WORKSPACE}/{_DEPS_DIR}")
         # Pass the workload env via a private --env-file, NOT `--env K=V` on argv: an argv value is
         # visible in `ps` / /proc/<pid>/cmdline to any local user for the box's lifetime, and this
@@ -358,7 +358,7 @@ class Sandbox:
             )
             try:
                 # K=V lines; values are single-line by construction (a NUL is rejected in _spawn, and a
-                # newline in a value would split the record — reject it here so it can't smuggle a var).
+                # newline in a value would split the record - reject it here so it can't smuggle a var).
                 lines = []
                 for k, v in merged_env.items():
                     if "\n" in k or "\n" in v or "\0" in k or "\0" in v:
@@ -383,7 +383,7 @@ class Sandbox:
         started = time.monotonic()
         try:
             # start_new_session so the box + kern share a process group we can signal as a unit.
-            proc = subprocess.Popen(  # noqa: S603 — argv list, no shell
+            proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
                 argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env,
                 start_new_session=True,
             )
@@ -399,7 +399,7 @@ class Sandbox:
         err.start()
         we_timed_out = False
         try:
-            proc.wait(timeout=timeout_s)  # OUR deadline — the authority for a `timeout` fault
+            proc.wait(timeout=timeout_s)  # OUR deadline - the authority for a `timeout` fault
         except subprocess.TimeoutExpired:
             we_timed_out = True
             self._teardown(proc, name, child_env)
@@ -408,7 +408,7 @@ class Sandbox:
         join_deadline = 8.0 if we_timed_out else None
         out.join(join_deadline)
         err.join(join_deadline)
-        # Reap the process so returncode is populated and no zombie lingers (bounded — the backstop has
+        # Reap the process so returncode is populated and no zombie lingers (bounded - the backstop has
         # reaped the box by now in the timeout case).
         try:
             proc.wait(timeout=8.0)
@@ -432,7 +432,7 @@ class Sandbox:
 
     def _teardown(self, proc: "subprocess.Popen", name: str, child_env: dict) -> None:
         """Best-effort tear down a timed-out box. Defense in depth, because a CPU-bound box in its own
-        PID namespace survives a plain SIGKILL of kern's parent process: (1) `kern stop` — the intended
+        PID namespace survives a plain SIGKILL of kern's parent process: (1) `kern stop` - the intended
         teardown (cgroup-kill); (2) SIGKILL the whole process group; (3) SIGKILL the parent. kern's own
         --timeout backstop guarantees the box is gone shortly regardless. We never block here."""
 
@@ -453,40 +453,40 @@ class Sandbox:
 
     def _classify(self, rc: int, stderr: str, we_timed_out: bool) -> SandboxFault | None:
         # ORDER IS A SECURITY PROPERTY. The classes that are DETERMINISTIC by exit code are decided
-        # FIRST, BEFORE we ever look at stderr — because stderr is a channel the workload controls, and
+        # FIRST, BEFORE we ever look at stderr - because stderr is a channel the workload controls, and
         # `startup_failed` is recognised by a pattern on it. If we checked the stderr marker first, a
         # workload could print "error: sandbox:" and exit with SIGSYS and we'd mislabel a blocked escape
-        # as a mere startup failure — hiding a security event behind a benign one. So: our-deadline →
+        # as a mere startup failure - hiding a security event behind a benign one. So: our-deadline →
         # SIGSYS → SIGKILL, all by exit code, THEN the stderr-marker heuristic as the LAST resort.
         # (Same discipline as the tar vetter: never make a security decision by parsing an
         # adversary-influenceable channel.)
         if we_timed_out:
-            # OUR deadline fired and we killed the box — a known fact, never guessed.
+            # OUR deadline fired and we killed the box - a known fact, never guessed.
             return SandboxFault("timeout", f"exceeded the {self.timeout_s}s time limit (killed by the binding)")
         if rc == _EXIT_SIGSYS:
             # A seccomp-denied syscall. Decided by exit code, so no stderr content can mask it.
             return SandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)")
         if rc == _EXIT_SIGKILL:
             # SIGKILL not from our deadline: almost always the cgroup OOM-killer, but the binding can't
-            # read the box's memory.events (kern doesn't expose the cgroup path — verified), so we do
+            # read the box's memory.events (kern doesn't expose the cgroup path - verified), so we do
             # NOT claim "oom" as the type. Honest: type=killed, message carries the likely cause.
-            return SandboxFault("killed", "the box was killed (SIGKILL) — likely out of memory (exit 137)")
+            return SandboxFault("killed", "the box was killed (SIGKILL), likely out of memory (exit 137)")
         if rc in (_EXIT_SIGTERM, -signal.SIGTERM):
             # SIGTERM without our deadline firing = kern's OWN --timeout backstop reaped the box (it
             # SIGTERMs, then SIGKILLs after a grace). The box exceeded its time limit; label it timeout,
             # noting the backstop caught it rather than our own wait.
             return SandboxFault("timeout", "the box exceeded its time limit (reaped by kern's timeout backstop)")
         if rc == -signal.SIGKILL:
-            # Negative == killed by signal N (subprocess convention) — SIGKILL surfaced as -9.
-            return SandboxFault("killed", "the box was killed (SIGKILL) — likely out of memory")
+            # Negative == killed by signal N (subprocess convention) - SIGKILL surfaced as -9.
+            return SandboxFault("killed", "the box was killed (SIGKILL), likely out of memory")
         # LAST resort, heuristic: a non-zero exit that is none of the deterministic classes above, whose
         # stderr carries kern's OWN setup-diagnostic markers (printed by the parent before the box runs).
-        # Heuristic because stderr is workload-influenceable — but it can only ever mislabel an ordinary
+        # Heuristic because stderr is workload-influenceable - but it can only ever mislabel an ordinary
         # non-zero user exit as startup_failed, never mask an escape/timeout/kill (those were decided
         # above by exit code). Documented as best-effort.
         if rc != 0 and _looks_like_startup_failure(stderr):
             return SandboxFault("startup_failed", stderr.strip()[:500])
-        # exit 139 (SIGSEGV) and any other non-zero exit are the USER's code failing — a normal Result.
+        # exit 139 (SIGSEGV) and any other non-zero exit are the USER's code failing - a normal Result.
         return None
 
     # -- workspace file I/O (host-direct; single-uid → box files are host-owned) ---------------------
@@ -495,13 +495,13 @@ class Sandbox:
         """Resolve a workspace-relative path for host-side I/O, refusing any escape out of the workspace.
 
         Containment is checked on the requested path LEXICALLY (normalize `..`/`.`), NOT by resolving
-        symlinks in it — a symlink the box created can point at a box-absolute target like
+        symlinks in it - a symlink the box created can point at a box-absolute target like
         `/workspace/x` that doesn't exist on the host, and `realpath`-ing it would both false-positive
         (a legitimate INTERNAL symlink) and, worse, could be steered to follow a link out of the tree.
         So: lexically contain the requested name here, then open the final component with O_NOFOLLOW
         (in read/write) so a symlinked LAST component can't redirect the host I/O outside the workspace.
         """
-        base = self._ws  # canonical since enter — no per-walk re-resolution
+        base = self._ws  # canonical since enter - no per-walk re-resolution
         # Lexical containment: join + normpath collapses `..`, then require it stays under base.
         full = os.path.normpath(os.path.join(base, rel))
         if full != base and not full.startswith(base + os.sep):
@@ -536,7 +536,7 @@ class Sandbox:
             cur = nxt
 
     def write_file(self, path: str, data: bytes | str) -> None:
-        """Write ``data`` to ``path`` (workspace-relative) — host-direct, so the box sees it next run.
+        """Write ``data`` to ``path`` (workspace-relative) - host-direct, so the box sees it next run.
         The final component is opened O_NOFOLLOW: a symlink the box planted there can't redirect the
         write outside the workspace (it fails instead)."""
         self._require_entered()
@@ -552,7 +552,7 @@ class Sandbox:
             f.write(payload)
 
     def read_file(self, path: str) -> bytes:
-        """Read ``path`` (workspace-relative) from the workspace — host-direct. The final component is
+        """Read ``path`` (workspace-relative) from the workspace - host-direct. The final component is
         opened O_NOFOLLOW: a symlink there can't redirect the read outside the workspace."""
         self._require_entered()
         full = self._ws_path(path)
@@ -595,7 +595,7 @@ class Sandbox:
         made relative to the workspace root so `list_files("sub")` returns `sub/a.txt`, composable with
         `read_file` (that was a regression when `root` doubled as the base). One lstat per file: S_ISREG
         excludes non-regular files AND symlinks in a single syscall (a symlink's lstat mode is never
-        S_ISREG) — no extra isfile()/islink() stats."""
+        S_ISREG) - no extra isfile()/islink() stats."""
         base = os.path.realpath(self._ws)
         out: dict[str, tuple[int, int]] = {}
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -664,7 +664,7 @@ def _unique_name() -> str:
 
 def _looks_like_startup_failure(stderr: str) -> bool:
     """True iff kern (the PARENT, before the box exists) failed to start the box. Anchored on kern's own
-    diagnostic prefixes — printed by kern, not by the workload — so the workload can't forge them by
+    diagnostic prefixes - printed by kern, not by the workload - so the workload can't forge them by
     writing the marker to its own stderr. (Same discipline as the tar vetter: don't trust text the
     adversary controls; kern's setup errors precede any workload output and carry kern's prefixes.)"""
     markers = ("kern:", "error: pull:", "error: sandbox:", "error: box:", "error: oci:", "error: image:")
@@ -677,7 +677,7 @@ def _looks_like_startup_failure(stderr: str) -> bool:
 
 def run_code(code: str, *, language: Literal["python", "bash"] = "python", **kwargs: object) -> ExecutionResult:
     """One-shot convenience: run ``code`` in a throwaway session (workspace created and deleted). This is
-    literally ``with Sandbox(**kwargs) as s: return s.run_code(code)`` — one tested code path, no state
+    literally ``with Sandbox(**kwargs) as s: return s.run_code(code)`` - one tested code path, no state
     persists. For multi-step work (write a file, then read it), use ``Sandbox`` as a context manager."""
     with Sandbox(**kwargs) as s:  # type: ignore[arg-type]
         return s.run_code(code, language=language)

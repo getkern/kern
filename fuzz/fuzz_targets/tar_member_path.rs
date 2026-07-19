@@ -1,8 +1,8 @@
 #![no_main]
 //! Fuzz the tar-member-path escape check with a *property*: whenever kern deems a path safe to
 //! extract, an independent lexical normalization must agree it cannot escape the rootfs. kern being
-//! stricter (rejecting a path that wouldn't escape) is fine; the dangerous direction — kern passing
-//! a path that DOES escape — panics the target, which libFuzzer records as a crash.
+//! stricter (rejecting a path that wouldn't escape) is fine; the dangerous direction - kern passing
+//! a path that DOES escape - panics the target, which libFuzzer records as a crash.
 use libfuzzer_sys::fuzz_target;
 use std::path::{Component, Path};
 

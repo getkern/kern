@@ -1,13 +1,13 @@
-//! Build history — a daemonless record of past `kern build` invocations, the kern analogue of Docker
+//! Build history - a daemonless record of past `kern build` invocations, the kern analogue of Docker
 //! Desktop's "Builds" panel (`docker buildx history`). Each `kern build` writes one flat `key=value`
-//! record under `$XDG_DATA_HOME/kern/builds/<id>/meta` (persistent across reboot — unlike the runtime
+//! record under `$XDG_DATA_HOME/kern/builds/<id>/meta` (persistent across reboot - unlike the runtime
 //! box registry in [`crate::registry`], which lives on tmpfs and is deliberately wiped), plus an
 //! optional `log` transcript of the build's step lines. `kern builds` lists them; `kern build
 //! logs|inspect|rm|prune` manage them.
 //!
 //! No daemon and no lock: records are append-only and each build owns its own `<id>` directory, so
 //! there is no shared-name uniqueness constraint (the box registry needs `flock` only because box
-//! *names* must be unique; a build id can't collide — it embeds the pid). Free-text fields are
+//! *names* must be unique; a build id can't collide - it embeds the pid). Free-text fields are
 //! newline-collapsed on write so a crafted tag/path can't forge extra record lines.
 
 use std::fmt::Write as _;
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Status {
     /// Record pre-written at build start; overwritten on completion. If it survives as `running`, the
-    /// build was killed mid-flight (SIGINT/SIGKILL) before it could finalize — shown as `interrupted`.
+    /// build was killed mid-flight (SIGINT/SIGKILL) before it could finalize - shown as `interrupted`.
     #[default]
     Running,
     Ok,
@@ -72,7 +72,7 @@ impl Status {
 /// One past (or in-flight) build.
 #[derive(Clone, Default, Debug)]
 pub struct Record {
-    /// `<started_unix>-<pid>` — a single safe path component (validated on every read).
+    /// `<started_unix>-<pid>` - a single safe path component (validated on every read).
     pub id: String,
     /// The `-t` tag the image was built under.
     pub tag: String,
@@ -93,7 +93,7 @@ pub struct Record {
     pub error: String,
 }
 
-/// Root directory holding all build records. Mirrors [`crate::volume::volumes_dir`] — persistent user
+/// Root directory holding all build records. Mirrors [`crate::volume::volumes_dir`] - persistent user
 /// data under `$XDG_DATA_HOME/kern/builds` (fallback `~/.local/share/kern/builds`, then a `/tmp`
 /// last resort), NOT the tmpfs runtime dir.
 pub fn builds_dir() -> PathBuf {
@@ -119,7 +119,7 @@ pub fn new_id(started: u64, pid: u32) -> String {
 }
 
 /// Collapse newlines so one free-text field stays on its own record line (same guard as the box
-/// registry's `one_line`) — a tag or path containing `\n` can't forge extra `key=value` lines.
+/// registry's `one_line`) - a tag or path containing `\n` can't forge extra `key=value` lines.
 fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
@@ -128,7 +128,7 @@ fn record_dir(id: &str) -> PathBuf {
     builds_dir().join(id)
 }
 
-/// Create `dir` (and parents) 0700 — build transcripts can contain whatever a `RUN` step printed
+/// Create `dir` (and parents) 0700 - build transcripts can contain whatever a `RUN` step printed
 /// (potentially build-time secrets), so keep the tree owner-only, not umask-default.
 fn mkdir_private(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -138,7 +138,7 @@ fn mkdir_private(dir: &Path) -> io::Result<()> {
         .create(dir)
 }
 
-/// Open a record file for writing, 0600 and refusing to follow a symlink at the final component — the
+/// Open a record file for writing, 0600 and refusing to follow a symlink at the final component - the
 /// single "private, no-symlink" open every record writer uses. `append` = append (create if absent)
 /// vs create+truncate. O_NOFOLLOW means a planted `meta`/`log` symlink can't redirect the write.
 fn open_private(path: &Path, append: bool) -> io::Result<std::fs::File> {
@@ -184,7 +184,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
         rec.size,
         one_line(&rec.error),
     );
-    // Write a temp then rename over `meta` — the swap is atomic, so a crash mid-finalize can't leave a
+    // Write a temp then rename over `meta` - the swap is atomic, so a crash mid-finalize can't leave a
     // truncated/0-byte record: the pre-written `running`/`interrupted` trace survives until the new meta
     // is complete. O_NOFOLLOW on the temp refuses writing THROUGH a planted symlink; `rename` onto `meta`
     // replaces a symlinked `meta` itself (never clobbers through it), so both writes stay confined.
@@ -200,7 +200,7 @@ fn parse(body: &str) -> Option<Record> {
     let mut r = Record::default();
     let mut have_id = false;
     for line in body.lines() {
-        // Skip (don't abort on) a line without '=' — a blank line, a truncated tail from the read cap,
+        // Skip (don't abort on) a line without '=' - a blank line, a truncated tail from the read cap,
         // or stray junk must not discard an otherwise-valid record. Only a present, valid `id=` matters.
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -239,7 +239,7 @@ fn read_capped(path: &Path) -> Option<String> {
 }
 
 /// Read at most `max` bytes of `path`, refusing to follow a symlink at the final component
-/// (`O_NOFOLLOW`) — a planted `meta`/`log` symlink can't turn a record read into an arbitrary
+/// (`O_NOFOLLOW`) - a planted `meta`/`log` symlink can't turn a record read into an arbitrary
 /// file read. `from_utf8_lossy` so a binary file symlinked in still can't produce invalid UTF-8.
 fn read_nofollow(path: &Path, max: u64) -> Option<String> {
     use std::io::Read;
@@ -287,7 +287,7 @@ pub fn list() -> Vec<Record> {
 
 /// The record ids (dir names) newest-first, WITHOUT opening any `meta`. An id is `<started_unix>-<pid>`
 /// and `started` is a fixed-width 10-digit stamp for every real record, so a descending string sort is
-/// newest-first — letting `query`/`prune` avoid the O(N) meta reads `list()` does when they only need
+/// newest-first - letting `query`/`prune` avoid the O(N) meta reads `list()` does when they only need
 /// the newest few. (The full/filtered path still uses `list()`'s exact `started` sort.)
 fn record_ids_newest_first() -> Vec<String> {
     let mut ids: Vec<String> = match std::fs::read_dir(builds_dir()) {
@@ -303,7 +303,7 @@ fn record_ids_newest_first() -> Vec<String> {
 }
 
 /// Records for a `kern builds` query, reading only what's needed. A bare `-n N` (no tag/status filter)
-/// reads just the N newest `meta` files — not the whole history — since ids sort newest-first without a
+/// reads just the N newest `meta` files - not the whole history - since ids sort newest-first without a
 /// read. Any tag/status filter must read all records (those fields live in the meta), so it falls back
 /// to `list()`.
 pub fn query(tag: Option<&str>, status: Option<Status>, limit: Option<usize>) -> Vec<Record> {
@@ -368,17 +368,17 @@ pub fn prune(keep: usize) -> usize {
 // stderr is captured too. On drop, stderr is restored and the logger drains and exits. stdout
 // (fd 1) is untouched, so `kern build ... | …` piping and the final `built '<tag>'` line are unchanged.
 //
-// FORK SAFETY: the pipe is drained by a CHILD PROCESS, not a background thread — deliberately. A
+// FORK SAFETY: the pipe is drained by a CHILD PROCESS, not a background thread - deliberately. A
 // reader THREAD would make `kern build` multi-threaded for the whole build, and a multi-stage build
 // then `fork()`s (and allocates in the child) to read a source stage's merged overlay view for
-// `COPY --from` (see `commands::merged_view_extract`) — which its fork-safety guard (correctly)
+// `COPY --from` (see `commands::merged_view_extract`) - which its fork-safety guard (correctly)
 // REFUSES in a multi-threaded process, breaking every multi-stage build. A separate logger process
 // keeps this process single-threaded, so that fork stays safe without weakening the guard.
 
 /// Cap the captured transcript so a pathological build can't grow an unbounded log.
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
-/// RAII stderr→log tee. `start` returns `None` (build proceeds uncaptured) if the pipe/dup/fork fails —
+/// RAII stderr→log tee. `start` returns `None` (build proceeds uncaptured) if the pipe/dup/fork fails -
 /// a logging problem must never fail a build.
 pub struct Capture {
     saved_err: i32,
@@ -399,7 +399,7 @@ impl Capture {
         }
         let (rd, wr) = (fds[0], fds[1]);
         // `F_DUPFD_CLOEXEC` (not plain `dup`): the logger child inherits this saved stderr across the
-        // fork below (fork ignores CLOEXEC), but a later RUN box `execve`s — CLOEXEC then closes it, so
+        // fork below (fork ignores CLOEXEC), but a later RUN box `execve`s - CLOEXEC then closes it, so
         // the host-stderr fd never leaks into the sandboxed workload.
         let saved_err = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 0) };
         if saved_err < 0 {
@@ -422,7 +422,7 @@ impl Capture {
         }
         if logger_pid == 0 {
             // ---- LOGGER CHILD: read the pipe, tee to the real stderr (inherited `saved_err`) + the log,
-            // until EOF. Holds only the read end — closing our copy of the write end is what lets the
+            // until EOF. Holds only the read end - closing our copy of the write end is what lets the
             // final EOF ever arrive once the parent (and any RUN box) drops fd 2. ----
             unsafe { libc::close(wr) };
             let mut buf = [0u8; 4096];
@@ -467,7 +467,7 @@ impl Drop for Capture {
         unsafe { libc::dup2(self.saved_err, 2) };
         // Reap the logger BEFORE closing `saved_err`, mirroring the old thread-join: the pipe may still
         // hold a buffer of stderr the logger must drain and tee. (It tees through its OWN inherited copy
-        // of the real stderr, so closing ours can't cut it off — but reaping first also avoids a zombie.)
+        // of the real stderr, so closing ours can't cut it off - but reaping first also avoids a zombie.)
         unsafe {
             let mut status = 0i32;
             libc::waitpid(self.logger_pid, &mut status, 0);
@@ -703,7 +703,7 @@ mod tests {
             let dir = builds_dir().join("7-7");
             std::fs::create_dir_all(&dir).unwrap();
             let mut body = String::from("id=7-7\ntag=big\nstarted=1\nstatus=ok\n");
-            body.push_str(&"junk=x\n".repeat(200_000)); // ~1.4 MB — well over the 64 KiB read cap
+            body.push_str(&"junk=x\n".repeat(200_000)); // ~1.4 MB - well over the 64 KiB read cap
             std::fs::write(dir.join("meta"), &body).unwrap();
             // The bounded read sees the leading real fields; no OOM/hang on a planted giant file.
             let r = get("7-7").unwrap();

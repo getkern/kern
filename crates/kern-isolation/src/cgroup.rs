@@ -16,25 +16,25 @@ use std::sync::OnceLock;
 /// host without systemd-user) every box start would leave an orphan dir behind. The guard is held by the
 /// supervisor until AFTER `waitpid`, by which point box PID 1 (and all its PID-namespace descendants) are
 /// dead, so the cgroup is empty and `rmdir` succeeds. The forked child never runs this `Drop` (it always
-/// `exec`s or `_exit`s), so only the supervisor cleans up — exactly once.
+/// `exec`s or `_exit`s), so only the supervisor cleans up - exactly once.
 pub struct CgroupGuard {
     dir: PathBuf,
     /// Where to move the supervisor back to before removing `dir`. On the direct fast path the supervisor
     /// moved ITSELF into the box cgroup (so the forked workload inherits the caps); a non-empty cgroup
-    /// can't be `rmdir`'d, so it must VACATE first — else the direct path leaks one `kern-box-*` dir per
+    /// can't be `rmdir`'d, so it must VACATE first - else the direct path leaks one `kern-box-*` dir per
     /// box. `origin` is kern's cgroup from BEFORE the move (a valid domain that accepts processes).
     origin: Option<PathBuf>,
 }
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        // Vacate the box cgroup first — move the supervisor back to where it came from — so the now-empty
+        // Vacate the box cgroup first - move the supervisor back to where it came from - so the now-empty
         // dir can be removed. (On the scope path an outer `--collect` also cleans up; this is harmless
         // there.) Best-effort: if the move fails the rmdir just no-ops on the non-empty dir, as before.
         if let Some(origin) = &self.origin {
             let _ = fs::write(origin.join("cgroup.procs"), std::process::id().to_string());
         }
-        // Best-effort: a non-empty cgroup or an already-removed dir (ENOENT — an outer `--collect` beat
+        // Best-effort: a non-empty cgroup or an already-removed dir (ENOENT - an outer `--collect` beat
         // us to it) are both fine to ignore.
         let _ = fs::remove_dir(&self.dir);
     }
@@ -43,7 +43,7 @@ impl Drop for CgroupGuard {
 /// The current process's cgroup v2 directory under `/sys/fs/cgroup`, from the `0::<path>` line of
 /// `/proc/self/cgroup`. cgroup v2 uses hierarchy id `0` with an empty controller field, so the line is
 /// literally `0::/some/path`; we match that prefix EXPLICITLY rather than `rsplit("::")` on the whole
-/// blob — on a hybrid (v1+v2) host `/proc/self/cgroup` has several lines and a blind `rsplit` could
+/// blob - on a hybrid (v1+v2) host `/proc/self/cgroup` has several lines and a blind `rsplit` could
 /// latch onto a v1 line's `::`-free tail and mis-resolve. Absent (v1-only host, unusual mount) → `None`,
 /// which every caller treats as "not delegated / best-effort" (fail-safe).
 fn current_v2_cgroup() -> Option<PathBuf> {
@@ -53,7 +53,7 @@ fn current_v2_cgroup() -> Option<PathBuf> {
         .find_map(|l| l.strip_prefix("0::"))?
         .trim_start_matches('/');
     // Defence in depth: `/proc/self/cgroup` is kernel-generated and this runs in the host supervisor
-    // BEFORE any unshare, so `rel` can't be attacker-forged today — but never join a `..` component into
+    // BEFORE any unshare, so `rel` can't be attacker-forged today - but never join a `..` component into
     // a `/sys/fs/cgroup` path (a future caller inside a controlled cgroup-ns could otherwise escape).
     if rel.split('/').any(|c| c == "..") {
         return None;
@@ -61,7 +61,7 @@ fn current_v2_cgroup() -> Option<PathBuf> {
     Some(PathBuf::from("/sys/fs/cgroup").join(rel))
 }
 
-/// Is the direct fast-cap path usable here? True iff kern's delegated `kern.slice` can be ensured — then
+/// Is the direct fast-cap path usable here? True iff kern's delegated `kern.slice` can be ensured - then
 /// the caller can SKIP the per-box `systemd-run --scope` and let `apply_limits` cap directly (~4 ms less).
 /// Ensures the slice as a side effect (idempotent), so the first call pays the one-time ~4 ms bootstrap.
 pub fn direct_caps_available() -> bool {
@@ -70,7 +70,7 @@ pub fn direct_caps_available() -> bool {
 
 /// Is a user systemd manager present (so `reexec` could put a box in a `--scope` / a delegated slice)?
 /// Running as REAL root? Then kern drives the SYSTEM systemd manager (`systemd-run --system`), which
-/// gets the full controller set + a persistent, properly-delegated `kern.slice` — the fast direct-cap
+/// gets the full controller set + a persistent, properly-delegated `kern.slice` - the fast direct-cap
 /// path. A rootless kern (the common case) uses its per-user manager (`--user`). This is the ONE
 /// root/rootless split on the cgroup surface; everything else (box isolation) is identical.
 fn as_root() -> bool {
@@ -78,12 +78,12 @@ fn as_root() -> bool {
     // box uid map): this gates the root-only GLOBAL side-effect (a top-level `kern.slice` + a write to
     // the cgroup-v2 root `subtree_control`), so a setuid-root binary launched by a normal user
     // (getuid≠0) stays on the conservative rootless path instead of touching the host's root cgroup.
-    // Don't "fix" toward geteuid. (Safe either way — the writes are kernel-permission-gated and the
-    // caps are read-back / fail-closed verified — but getuid is the safer trigger for the global write.)
+    // Don't "fix" toward geteuid. (Safe either way - the writes are kernel-permission-gated and the
+    // caps are read-back / fail-closed verified - but getuid is the safer trigger for the global write.)
     (unsafe { libc::getuid() }) == 0
 }
 
-/// `--system` when kern is real root, else `--user` — the systemd manager kern's scope/slice live under.
+/// `--system` when kern is real root, else `--user` - the systemd manager kern's scope/slice live under.
 pub fn systemd_scope_mode() -> &'static str {
     if as_root() {
         "--system"
@@ -94,7 +94,7 @@ pub fn systemd_scope_mode() -> &'static str {
 
 /// Is the systemd manager kern would use actually present? As root → the SYSTEM manager (`/run/systemd/
 /// system`, i.e. pid-1 systemd on a systemd host). Rootless → a `systemd` dir under `$XDG_RUNTIME_DIR`.
-/// The SINGLE definition — both the scope-skip decision and the fail-closed gate call it, no drift.
+/// The SINGLE definition - both the scope-skip decision and the fail-closed gate call it, no drift.
 pub fn user_systemd_present() -> bool {
     if as_root() {
         return std::path::Path::new("/run/systemd/system").exists();
@@ -117,18 +117,18 @@ fn outer_enforcer_present() -> bool {
 }
 
 /// In-process marker recording that `choose_direct_cap_path` DECIDED to skip the per-box scope.
-/// An env var (not a static) because the decision must survive the detached supervisor's forks —
+/// An env var (not a static) because the decision must survive the detached supervisor's forks -
 /// a `--restart` runner re-applies limits in a forked child and must still know the path it's on.
 const DIRECT_MARKER: &str = "KERN_DIRECT_CAPS";
 
-/// Decide — at the ONE decision site, `reexec_in_scope_if_possible` — whether this box takes the
+/// Decide - at the ONE decision site, `reexec_in_scope_if_possible` - whether this box takes the
 /// direct kern.slice cap path (skipping the per-box `systemd-run --scope`). True only when NO outer
 /// enforcer env is set, the user hasn't opted out, a user systemd manager is present, AND the
 /// delegated slice is actually usable (ensured as a side effect). Records the decision in
 /// [`DIRECT_MARKER`] so [`took_direct_cap_path`] reports the REAL choice, not a re-derivation:
 /// re-deriving from env alone made the fail-closed refusal fire on hosts where the scope re-exec
 /// was ATTEMPTED and its `exec()` failed (broken/absent `systemd-run` with a leftover
-/// `$XDG_RUNTIME_DIR/systemd` dir) — a host that used to run boxes best-effort would refuse ALL of
+/// `$XDG_RUNTIME_DIR/systemd` dir) - a host that used to run boxes best-effort would refuse ALL of
 /// them. Callers scrub an INHERITED marker first (see `box_run`), so a nested `kern` can't be
 /// poisoned by its parent's decision.
 pub fn choose_direct_cap_path() -> bool {
@@ -144,47 +144,47 @@ pub fn choose_direct_cap_path() -> bool {
 }
 
 /// Remove an inherited direct-path marker. Called at the top of `box_run`: the marker is meaningful
-/// only for the invocation whose `reexec` set it — a nested `kern box` (or any child re-running
+/// only for the invocation whose `reexec` set it - a nested `kern box` (or any child re-running
 /// kern) inheriting it would arm the fail-closed refusal on a host that never chose the direct path.
 pub fn scrub_direct_marker() {
     std::env::remove_var(DIRECT_MARKER);
 }
 
 /// Did THIS box invocation actually take the direct cap path? Reads the decision recorded by
-/// [`choose_direct_cap_path`] — `apply_limits` picks kern.slice under it (AND-ed with the caller's
+/// [`choose_direct_cap_path`] - `apply_limits` picks kern.slice under it (AND-ed with the caller's
 /// `allow_direct`, so `kern run` stays off it), and `run_in_sandbox`'s fail-closed refusal arms
 /// under it. Because it reports the recorded DECISION (not slice liveness, not an env re-derivation),
-/// the refusal fires when the slice was GC'd mid-flight — and never on the scope-exec-failed
+/// the refusal fires when the slice was GC'd mid-flight - and never on the scope-exec-failed
 /// fall-through, which keeps its historical warn-and-run behavior.
 pub fn took_direct_cap_path() -> bool {
     std::env::var_os(DIRECT_MARKER).is_some()
 }
 
-/// Could a `--memory` cap actually be ENFORCED on this host — i.e. is the `memory` controller
+/// Could a `--memory` cap actually be ENFORCED on this host - i.e. is the `memory` controller
 /// available somewhere in this process's cgroup v2 tree? A `memory.max` write is ACCEPTED even where
 /// the controller isn't delegated/enabled, but then it never bites (no OOM kill). This is false on a
 /// kernel that doesn't expose the memory controller to us: Raspberry Pi OS without
 /// `cgroup_enable=memory`, and **Microsoft's default WSL2 kernel** (which doesn't delegate `memory`).
 /// Env-independent (reads `cgroup.controllers` up the tree); used only to WARN honestly, never to
-/// refuse — the namespace/seccomp isolation is unaffected, only the resource cap is. Same failure on
+/// refuse - the namespace/seccomp isolation is unaffected, only the resource cap is. Same failure on
 /// these kernels for Docker/Podman; it's the environment, not the runtime.
 pub fn memory_cap_enforceable() -> bool {
     current_v2_cgroup().is_some_and(|c| controller_available_in_tree(&c, "memory"))
 }
 
 /// Does an env var CLAIM an outer enforcer while NO real memory cap is actually in force up-tree?
-/// A caller launching `kern box` can FORGE `KERN_SCOPE`/`KERN_MANAGED` to disarm the fail-closed —
+/// A caller launching `kern box` can FORGE `KERN_SCOPE`/`KERN_MANAGED` to disarm the fail-closed -
 /// but a genuine scope ALWAYS sets a `MemoryMax` (see `reexec`'s props) and a genuine managed unit
 /// runs under its own delegated service cgroup, so `memory.max` capped-in-tree is a reliable,
 /// env-INDEPENDENT check that a real enforcer exists. When this is true and the box couldn't cap,
-/// it would run uncapped because of a (possibly forged) env — the caller warns loudly rather than
+/// it would run uncapped because of a (possibly forged) env - the caller warns loudly rather than
 /// let it happen silently. Two deliberate scope-downs (both board/audit findings):
 ///
-/// * **`KERN_BUILD_STEP` never arms it** — `kern build` sets that var as a best-effort scope-skip
+/// * **`KERN_BUILD_STEP` never arms it** - `kern build` sets that var as a best-effort scope-skip
 ///   with NO enforcer anywhere by design, so it claims nothing to verify; arming on it fired the
 ///   "may be bypassing" accusation once per RUN step of every build launched from a session scope.
 /// * **Gated on the memory controller being AVAILABLE up-tree** (per `cgroup.controllers`, root
-///   included — a privileged systemd can cap where the user can't): on a host that never enables it
+///   included - a privileged systemd can cap where the user can't): on a host that never enables it
 ///   (a stock Pi without `cgroup_enable=memory`) no genuine enforcer COULD have set a `memory.max`,
 ///   so our own legit scope re-exec would otherwise trip the warning on EVERY box and pollute each
 ///   detached box's log; the dedicated "--memory not enforced" message already tells that truth.
@@ -197,7 +197,7 @@ pub fn env_claims_enforcer_but_none_real() -> bool {
         })
 }
 
-/// Does ANY level of this cgroup's ancestry have `ctrl` in its `cgroup.controllers` — i.e. could a
+/// Does ANY level of this cgroup's ancestry have `ctrl` in its `cgroup.controllers` - i.e. could a
 /// cap on that controller exist in our tree at all? Checked via `cgroup.controllers` (not `.max`
 /// file existence): the root of a cgroup namespace lists its controllers but carries no limit
 /// files, and a limit set by privileged systemd counts even where the user has no delegation.
@@ -206,7 +206,7 @@ fn controller_available_in_tree(child: &std::path::Path, ctrl: &str) -> bool {
 }
 
 /// Walk from `child` up to the cgroup root (inclusive), returning true at the first level where
-/// `pred` holds. THE shared ancestry walker — `capped_in_tree` and `controller_available_in_tree`
+/// `pred` holds. THE shared ancestry walker - `capped_in_tree` and `controller_available_in_tree`
 /// are one-predicate wrappers, so the subtle termination rules (root clamp, never escaping
 /// `/sys/fs/cgroup`) exist exactly once.
 fn in_tree(child: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> bool {
@@ -226,7 +226,7 @@ fn in_tree(child: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> 
     }
 }
 
-/// Is this slice actually USABLE for capping — i.e. its delegated `cgroup.controllers` really contains
+/// Is this slice actually USABLE for capping - i.e. its delegated `cgroup.controllers` really contains
 /// `memory` AND `pids`? A cgroup always HAS a `cgroup.controllers` file, so checking existence alone is a
 /// false positive on hosts where the memory controller isn't delegated (or isn't even enabled at the root,
 /// e.g. a Raspberry Pi without `cgroup_enable=memory`). Board-test finding: without this, we'd take the
@@ -236,7 +236,7 @@ fn slice_can_cap(slice: &std::path::Path) -> bool {
     has_controller(slice, "memory") && has_controller(slice, "pids")
 }
 
-/// Is `ctrl` listed in this cgroup's `cgroup.controllers`? The single decoder of that file — shared
+/// Is `ctrl` listed in this cgroup's `cgroup.controllers`? The single decoder of that file - shared
 /// by [`slice_can_cap`] and [`controller_available_in_tree`] so "available" can't mean two things.
 fn has_controller(dir: &std::path::Path, ctrl: &str) -> bool {
     fs::read_to_string(dir.join("cgroup.controllers"))
@@ -299,14 +299,14 @@ fn render_cgroup_max(n: u64) -> String {
 }
 
 /// Reap orphaned box cgroup dirs under kern.slice: a `kern-box-<tag>-<pid>` whose supervisor `<pid>` is
-/// DEAD. Self-heals the one leak the RAII guard can't cover — a DETACHED box whose supervisor is
+/// DEAD. Self-heals the one leak the RAII guard can't cover - a DETACHED box whose supervisor is
 /// SIGKILL'd by `kern stop` never runs `Drop`, leaving its (now-empty) dir behind. RACE-SAFE: a LIVE box's
 /// pid is alive (`/proc/<pid>` exists) → skipped, including one mid-creation; only dead-owner dirs are
 /// `rmdir`'d, and `rmdir` itself fails on any still-populated cgroup. Cheap (one readdir + a stat/entry),
 /// run once per box start when kern.slice is confirmed usable.
 /// Reap dead-supervisor `kern-box-<tag>-<pid>` cgroup dirs under `slice`. `limit` caps how many entries
 /// are examined (a `/proc/<pid>` stat each) so the PER-BOX-START call (kern is daemonless → once per box
-/// process) stays O(1) instead of O(entries) — Σ over an N-box burst would otherwise be O(N²). Orphans
+/// process) stays O(1) instead of O(entries) - Σ over an N-box burst would otherwise be O(N²). Orphans
 /// past the cap are cleared by a later start or by `kern gc` (which passes `0` = unbounded). The
 /// `/proc/<pid>` check (not a bare rmdir-if-empty) is deliberate: a box is momentarily EMPTY between its
 /// cgroup `mkdir` and the `cgroup.procs` write, so only a truly dead pid is reaped.
@@ -330,7 +330,7 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
     }
 }
 
-/// The per-box-start orphan-sweep cap — bounds the hot-path cost; the tail is cleaned by later starts / gc.
+/// The per-box-start orphan-sweep cap - bounds the hot-path cost; the tail is cleaned by later starts / gc.
 const SWEEP_LIMIT: usize = 128;
 
 /// `kern gc`: reap orphaned box cgroup dirs under kern.slice and return how many were removed. A
@@ -357,7 +357,7 @@ pub fn gc_orphan_box_cgroups() -> usize {
     before.saturating_sub(count())
 }
 
-/// The box cgroup dir that host-pid `pid` belongs to RIGHT NOW, read from `/proc/<pid>/cgroup` — so
+/// The box cgroup dir that host-pid `pid` belongs to RIGHT NOW, read from `/proc/<pid>/cgroup` - so
 /// `kern stop`/`compose down` can capture a box's exact direct-path `kern-box-<tag>-<pid>` dir (while it's
 /// still alive) and `rmdir` it after the SIGKILL, WITHOUT guessing the dir's internal setup-pid suffix
 /// (which is a forked child's pid, not the registry's supervisor pid) or its `--hostname`-overridable tag.
@@ -370,7 +370,7 @@ pub fn gc_orphan_box_cgroups() -> usize {
 ///
 /// The eager counterpart to [`gc_orphan_box_cgroups`]: the RAII [`CgroupGuard`] `Drop` can't run under
 /// SIGKILL, and the general [`sweep_orphan_boxes`] SKIPS a just-killed box whose pid lingers as a ZOMBIE
-/// (`/proc/<pid>` still present until the parent reaps it), so a post-stop `gc` wouldn't clear it yet —
+/// (`/proc/<pid>` still present until the parent reaps it), so a post-stop `gc` wouldn't clear it yet -
 /// but a dead process is no longer a cgroup member, so the dir is EMPTY and `rmdir`-able immediately, and
 /// `rmdir`'s own empty-only semantics are the safety valve against ever removing a live box's dir.
 pub fn box_cgroup_dir(pid: i32) -> Option<PathBuf> {
@@ -384,7 +384,7 @@ fn parse_box_cgroup_line(raw: &str) -> Option<PathBuf> {
     let rel = raw.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
     let leaf = rel.rsplit('/').next()?;
     if !leaf.starts_with("kern-box-") {
-        return None; // only ever a box leaf — never the shared slice/root
+        return None; // only ever a box leaf - never the shared slice/root
     }
     Some(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }
@@ -395,7 +395,7 @@ fn parse_box_cgroup_line(raw: &str) -> Option<PathBuf> {
 /// --scope -- true` creates a delegated `kern.slice` (the scope exits immediately; the slice PERSISTS,
 /// owned by the user, with memory/cpu/pids delegated and writable). Every subsequent box then writes its
 /// caps DIRECTLY under `kern.slice` (µs) instead of paying a per-box `systemd-run --scope` (~4 ms). NOT a
-/// daemon — it's just a persisted cgroup dir. If systemd-user / delegation isn't available (no
+/// daemon - it's just a persisted cgroup dir. If systemd-user / delegation isn't available (no
 /// `user@<uid>.service`, Android, etc.) → `None`, and the caller falls back to the per-box scope.
 ///
 /// The slice lives as a sibling under our `user@<uid>.service` delegation root (derived from our own
@@ -418,17 +418,17 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
         return Some(slice);
     }
     // As REAL ROOT kern OWNS the cgroup tree, so it creates a persistent, fully-controlled `kern.slice`
-    // DIRECTLY — no `systemd-run` round-trip and no transient scope that systemd GCs the instant it
+    // DIRECTLY - no `systemd-run` round-trip and no transient scope that systemd GCs the instant it
     // exits (exactly why `--user` delegation never stuck as root under `user@0`, forcing the ~40 ms/box
     // scope fallback that D-Bus-serializes at scale). `mkdir` the slice, and only if it didn't inherit
     // the caps, pull the controllers down from the cgroup-v2 root (best-effort; a no-op on a host that
     // already delegates cpu/memory/pids). This gives root the same fast direct-cap path rootless gets.
     //
     // SAFETY of the two root writes (audited): `kern.slice` is an INTENTIONALLY systemd-unmanaged
-    // top-level slice — systemd only GCs cgroups for units it created, so it won't delete or fight it,
+    // top-level slice - systemd only GCs cgroups for units it created, so it won't delete or fight it,
     // and a later `systemd-run --system --slice=kern.slice` cleanly adopts it. The root
     // `subtree_control` write only ADDS controllers (idempotent, never removes; the v2 root is exempt
-    // from the no-internal-process rule) — it makes controllers *available* to children but sets no
+    // from the no-internal-process rule) - it makes controllers *available* to children but sets no
     // limit, so nothing is throttled/starved. Both are best-effort and gated on `as_root()`, so a box
     // payload can never reach them.
     if as_root() {
@@ -444,7 +444,7 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
         }
     }
     // Rootless (or a root host that refused direct control): only systemd can make a *delegated* slice;
-    // best-effort — a failure (no systemd-run, policy) returns None → the caller uses the per-box scope /
+    // best-effort - a failure (no systemd-run, policy) returns None → the caller uses the per-box scope /
     // best-effort path, never uncapped-silently. Resolve `systemd-run` by trusted ABSOLUTE path (not
     // `$PATH`), same policy as the reexec scope spawn, so a `~/.local/bin/systemd-run` can't shadow it.
     let systemd_run =
@@ -467,10 +467,10 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
 }
 
 /// Make the controllers available to `parent`'s children. cgroup-v2 accepts several tokens in one
-/// write, so try them all at once (1 syscall); only if that fails enable them one at a time — so an
+/// write, so try them all at once (1 syscall); only if that fails enable them one at a time - so an
 /// unavailable controller (e.g. no `cpu` on some Android-derived kernels) can't block the others.
 /// (Controllers may already be on, or be denied by the no-internal-process rule when the parent has
-/// members — all best-effort either way.)
+/// members - all best-effort either way.)
 fn enable_subtree_controllers(parent: &std::path::Path) {
     let subtree = parent.join("cgroup.subtree_control");
     if fs::write(&subtree, "+memory +pids +cpu +cpuset +io").is_err() {
@@ -480,9 +480,9 @@ fn enable_subtree_controllers(parent: &std::path::Path) {
     }
 }
 
-/// Default memory ceiling for a sandbox (512 MiB) — conservative but generous; `--memory` overrides.
+/// Default memory ceiling for a sandbox (512 MiB) - conservative but generous; `--memory` overrides.
 const DEFAULT_MEMORY_MAX: u64 = 536_870_912;
-/// Process-count ceiling — caps fork bombs.
+/// Process-count ceiling - caps fork bombs.
 const DEFAULT_PIDS_MAX: &str = "512";
 /// cgroup v2 CPU period (µs) for `cpu.max`; the quota is `cores * PERIOD`.
 const CPU_PERIOD_US: u64 = 100_000;
@@ -490,18 +490,18 @@ const CPU_PERIOD_US: u64 = 100_000;
 /// Confine the current process in a fresh cgroup with memory + pid (+ optional swap / CPU quota /
 /// CPU pinning) caps. Returns the cgroup path on success (the workload, forked later, inherits it),
 /// or `None` if unavailable. `memory_max` (bytes) overrides the default ceiling; `memory_swap_max`
-/// (bytes, `--memory-swap-max`) sets `memory.swap.max` — the v2 swap *allowance*, separate from
+/// (bytes, `--memory-swap-max`) sets `memory.swap.max` - the v2 swap *allowance*, separate from
 /// `memory.max`, default `0` (swap off, so `memory.max` is a hard total); `cpuset` (`--cpuset-cpus`,
 /// e.g. `"0-3"`) pins to specific CPUs via `cpuset.cpus`; `cpus` (cores, K8s semantics) caps CPU
-/// time via `cpu.max`. The swap/CPU/cpuset knobs are all best-effort — silently skipped where the
+/// time via `cpu.max`. The swap/CPU/cpuset knobs are all best-effort - silently skipped where the
 /// controller isn't delegated (e.g. `cpuset` is often not delegated inside a systemd user scope).
 ///
 /// `allow_direct` is the caller's authority to take the direct `kern.slice` path: `true` for `kern box`
 /// (a supervisor holds the RAII guard and vacates the box cgroup before `rmdir`), `false` for `kern run`
-/// (it `exec()`s IN PLACE — no supervisor to move back out — so it must stay on the systemd `--scope`
+/// (it `exec()`s IN PLACE - no supervisor to move back out - so it must stay on the systemd `--scope`
 /// `--collect` path and NEVER relocate into `kern.slice`). This is the one enforcement input that can't be
 /// re-derived from env, so the caller passes it explicitly; `took_direct_cap_path()` supplies the rest.
-#[allow(clippy::too_many_arguments)] // one cgroup knob per parameter — grouping them would only hide it
+#[allow(clippy::too_many_arguments)] // one cgroup knob per parameter - grouping them would only hide it
 pub fn apply_limits(
     allow_direct: bool,
     tag: &str,
@@ -517,7 +517,7 @@ pub fn apply_limits(
     if !PathBuf::from("/sys/fs/cgroup/cgroup.controllers").exists() {
         return None;
     }
-    // Where the supervisor is RIGHT NOW — captured BEFORE we move it into the box cgroup, so the guard can
+    // Where the supervisor is RIGHT NOW - captured BEFORE we move it into the box cgroup, so the guard can
     // move it back and remove the (then-empty) box cgroup on the direct path (no systemd `--collect` there).
     let origin = current_v2_cgroup();
     // The single direct-path decision, computed ONCE and reused at the parent-select and fail-closed sites
@@ -542,7 +542,7 @@ pub fn apply_limits(
         if !direct {
             return None;
         }
-        // Direct path only: kern.slice may have been GC'd since this process memoized it — systemd
+        // Direct path only: kern.slice may have been GC'd since this process memoized it - systemd
         // reaps the empty slice the moment a box exits, and a LONG-LIVED `--restart` supervisor's
         // forked runner still holds the stale `ensure_kern_slice` memo. Re-bootstrap once, uncached,
         // and retry; without this every restart attempt fails the fail-closed refusal and the box
@@ -553,11 +553,11 @@ pub fn apply_limits(
         fs::create_dir(&child).ok()?;
     }
 
-    // Set the memory + PID caps. If BOTH fail the controllers aren't delegated here — do NOT leave a
+    // Set the memory + PID caps. If BOTH fail the controllers aren't delegated here - do NOT leave a
     // useless cgroup behind and do NOT pretend the workload is capped. Clean up and bail, so the
     // caller reports "no cap" honestly rather than a false sense of safety. (CPU never gates this.)
     //
-    // READ-BACK VERIFY (not fire-and-forget): a successful `write()` return is only a proxy — it says
+    // READ-BACK VERIFY (not fire-and-forget): a successful `write()` return is only a proxy - it says
     // the syscall didn't error, not that the limit is in force. On a partially-delegated host a write
     // can be accepted and yet the child's value stay at the `max` (no-limit) sentinel. So we write AND
     // re-read: `wrote_real_limit` is true only if the file no longer reads `max`, i.e. a real cap bit.
@@ -569,7 +569,7 @@ pub fn apply_limits(
         Some(n) => wrote_real_limit(&child.join("pids.max"), &n.to_string()),
         None => wrote_real_limit(&child.join("pids.max"), DEFAULT_PIDS_MAX),
     };
-    // `memory.swap.max` — the v2 swap allowance (separate from memory.max, NOT a combined total).
+    // `memory.swap.max` - the v2 swap allowance (separate from memory.max, NOT a combined total).
     // Default `0` keeps `memory.max` a hard total (overflow is OOM-killed, not swapped); a
     // `--memory-swap-max N` lets the box swap up to N.
     let _ = fs::write(
@@ -580,7 +580,7 @@ pub fn apply_limits(
         let _ = fs::remove_dir(&child);
         return None;
     }
-    // (A "not enforced" warning for memory/CPU comes LATER — after all writes — and is based on the
+    // (A "not enforced" warning for memory/CPU comes LATER - after all writes - and is based on the
     // EFFECTIVE limit up the cgroup tree, not this single inner write, since the outer systemd scope
     // may be the real enforcer. See `capped_in_tree` below.)
 
@@ -590,13 +590,13 @@ pub fn apply_limits(
     if let Some(set) = cpuset {
         // Best-effort: the `cpuset` controller is frequently not delegated in a rootless user scope,
         // but the CLI also pins via `sched_setaffinity` (the real fallback), so a failure here is NOT
-        // "unenforced" — no warning, unlike memory/cpu which have no affinity equivalent.
+        // "unenforced" - no warning, unlike memory/cpu which have no affinity equivalent.
         let _ = fs::write(child.join("cpuset.cpus"), set);
     }
 
     // Optional CPU cap (`--cpus`). cgroup v2 `cpu.max` = "<quota_us> <period_us>"; cores =
     // quota/period. Clamp to the host CPU count. Best-effort: a write failure (no CPU controller,
-    // e.g. some Android kernels) is ignored — isolation still holds, only the CPU cap is skipped.
+    // e.g. some Android kernels) is ignored - isolation still holds, only the CPU cap is skipped.
     if let Some(c) = cpus {
         // `c` is already clamped to the host CPU count by the CLI (the single place that can warn);
         // an over-large quota would be harmless anyway (the kernel never grants more than the
@@ -610,7 +610,7 @@ pub fn apply_limits(
     // Optional per-device I/O limits (`vdisk:` `--iops`/`--bandwidth` → `io.max`) and `io.weight`
     // (`--io-weight`). One `io.max` line per device, `MAJ:MIN riops=… wbps=…`. Best-effort: the `io`
     // controller is usually NOT delegated to a rootless user scope, so a write failure is expected
-    // and simply skips the limit (the vdisk still works, uncapped) — never a hard error. The lines
+    // and simply skips the limit (the vdisk still works, uncapped) - never a hard error. The lines
     // are built by the CLI from a stat'd loop device, so they can't inject arbitrary content.
     let io_requested = !io_max.is_empty() || io_weight.is_some();
     let mut io_applied = false;
@@ -621,51 +621,51 @@ pub fn apply_limits(
         // Clamped by the CLI (1..=10000); re-clamped here as defence in depth.
         io_applied |= fs::write(child.join("io.weight"), w.clamp(1, 10_000).to_string()).is_ok();
     }
-    // The user explicitly asked for an I/O limit — if the `io` controller isn't delegated to this
+    // The user explicitly asked for an I/O limit - if the `io` controller isn't delegated to this
     // box's cgroup, say so rather than silently ignore it (feedback-first). Everything else the box
     // does still works; only the I/O cap is skipped.
     if io_requested && !io_applied {
         eprintln!(
-            "kern: I/O limits (--iops/--bandwidth/--io-weight) not enforced — the cgroup `io` \
+            "kern: I/O limits (--iops/--bandwidth/--io-weight) not enforced - the cgroup `io` \
              controller isn't delegated to this box's cgroup"
         );
     }
 
     // Honest feedback on the two-layer model: memory/CPU are capped EITHER by this inner cgroup OR by
-    // the outer systemd `--scope`. A failed inner write is fine as long as SOME ancestor caps it — so
+    // the outer systemd `--scope`. A failed inner write is fine as long as SOME ancestor caps it - so
     // check the EFFECTIVE limit up the tree, and only warn when NOTHING in the chain enforces a knob
     // the user explicitly asked for (e.g. a rootless host with the memory controller un-delegated, the
     // Pi-5 case). This never false-positives on a host where the scope enforces it.
     if memory_max.is_some() && !capped_in_tree(&child, "memory.max") {
         eprintln!(
-            "kern: --memory not enforced — no cgroup memory cap took effect (the `memory` controller \
+            "kern: --memory not enforced - no cgroup memory cap took effect (the `memory` controller \
              isn't delegated to this rootless scope); the box can exceed the limit"
         );
     }
     if cpus.is_some() && !capped_in_tree(&child, "cpu.max") {
         eprintln!(
-            "kern: --cpus not enforced — no cgroup cpu cap took effect (the `cpu` controller isn't \
+            "kern: --cpus not enforced - no cgroup cpu cap took effect (the `cpu` controller isn't \
              delegated to this rootless scope)"
         );
     }
 
-    // FAIL-CLOSED, per-dimension, ONLY on the genuine direct path (`took_direct_cap_path()` — the SAME
+    // FAIL-CLOSED, per-dimension, ONLY on the genuine direct path (`took_direct_cap_path()` - the SAME
     // predicate the caller refuses under, so they can't diverge; NOT on best-effort / `KERN_NO_SCOPE`
     // hosts, where destroying a partial cap that DID apply would be worse than keeping it).
     //
     // Verify the BOX'S OWN write via `mem_ok`/`pids_ok` (the read-back at `wrote_real_limit`), NOT
     // `capped_in_tree`: the tree walk climbs ABOVE kern.slice into the shared `user-<uid>.slice`, whose
-    // systemd-default `TasksMax` (~83k, session-wide) is finite and would falsely satisfy the pids check —
+    // systemd-default `TasksMax` (~83k, session-wide) is finite and would falsely satisfy the pids check -
     // making the fork-bomb guarantee a no-op. memory + pids ALWAYS carry a cap (explicit or the DEFAULT_*
     // backstop), so both are mandatory; `cpu` is a QoS knob with no default and no OOM/fork-bomb role, so
-    // it stays warn-only (above) — refusing a box for an unenforceable cpu quota is both a regression vs
+    // it stays warn-only (above) - refusing a box for an unenforceable cpu quota is both a regression vs
     // the scope path and wrong (the scope path only warns).
     if direct && (!mem_ok || !pids_ok) {
         let _ = fs::remove_dir(&child);
         return None;
     }
 
-    // Join the cgroup — binds the limits to us (and our future forked workload).
+    // Join the cgroup - binds the limits to us (and our future forked workload).
     if fs::write(child.join("cgroup.procs"), std::process::id().to_string()).is_err() {
         let _ = fs::remove_dir(&child);
         return None;
@@ -674,10 +674,10 @@ pub fn apply_limits(
 }
 
 /// Write a cgroup limit AND verify it took: true only if, after the write, the file no longer reads the
-/// `max` no-limit sentinel — i.e. a real cap is in force. A successful `write()` return is only a proxy
+/// `max` no-limit sentinel - i.e. a real cap is in force. A successful `write()` return is only a proxy
 /// (a partially-delegated host can accept the write yet leave the value at `max`); this read-back is what
 /// lets the caller trust "capped" and fail-closed when it isn't. Kernel rounding (e.g. page-aligning
-/// `memory.max`) is fine — we assert "a real limit is set", not byte-exact equality.
+/// `memory.max`) is fine - we assert "a real limit is set", not byte-exact equality.
 fn wrote_real_limit(file: &std::path::Path, value: &str) -> bool {
     if fs::write(file, value).is_err() {
         return false;
@@ -685,7 +685,7 @@ fn wrote_real_limit(file: &std::path::Path, value: &str) -> bool {
     fs::read_to_string(file).is_ok_and(|v| is_real_limit(&v))
 }
 
-/// Do a cgroup limit file's raw contents represent a REAL cap in force — i.e. NOT the `max` no-limit
+/// Do a cgroup limit file's raw contents represent a REAL cap in force - i.e. NOT the `max` no-limit
 /// sentinel (`max` for `memory.max`/`pids.max`, `max <period>` for `cpu.max`)? The single definition of
 /// the sentinel rule, shared by the write read-back (`wrote_real_limit`) and the up-tree walk
 /// (`capped_in_tree`) so the two can't drift.
@@ -694,7 +694,7 @@ fn is_real_limit(raw: &str) -> bool {
     !v.is_empty() && !v.starts_with("max")
 }
 
-/// Is a `memory.max`/`cpu.max`-style cap actually in force for the box — at THIS cgroup OR any
+/// Is a `memory.max`/`cpu.max`-style cap actually in force for the box - at THIS cgroup OR any
 /// ancestor up to the cgroup root? Accounts for the two-layer model (inner cgroup + outer systemd
 /// scope): the inner write may fail while an ancestor still enforces the cap. The "no cap" sentinel
 /// is `max` (`memory.max`) or `max <period>` (`cpu.max`), so any value not starting with `max` at any
@@ -735,7 +735,7 @@ mod tests {
 
     #[test]
     fn capped_in_tree_reads_the_max_sentinel() {
-        // A temp dir isn't under /sys/fs/cgroup, so the walk checks just this leaf — enough to lock
+        // A temp dir isn't under /sys/fs/cgroup, so the walk checks just this leaf - enough to lock
         // in the sentinel parsing (the bit that decides "enforced or not" and gates the warning).
         let d = std::env::temp_dir().join(format!("kern-cg-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn cgroup_guard_drop_is_harmless_when_dir_is_gone() {
-        // An outer systemd `--collect` may remove the scope (and our dir) first — the guard's Drop must
+        // An outer systemd `--collect` may remove the scope (and our dir) first - the guard's Drop must
         // tolerate ENOENT, not panic.
         let d = std::env::temp_dir().join(format!("kern-guard-gone-{}", std::process::id()));
         let g = CgroupGuard {

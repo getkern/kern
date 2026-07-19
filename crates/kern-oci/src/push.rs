@@ -1,4 +1,4 @@
-//! OCI image push (registry v2) — the dual of [`crate::pull`]. Takes a local rootfs directory + its
+//! OCI image push (registry v2) - the dual of [`crate::pull`]. Takes a local rootfs directory + its
 //! image config and publishes it to a registry as a single-layer OCI image.
 //!
 //! The flow (standard registry-v2 blob upload + manifest PUT):
@@ -11,7 +11,7 @@
 //!  4. `PUT /v2/<repo>/manifests/<tag>` with the manifest JSON.
 //!
 //! Auth is the same challenge dance as pull but with a WRITE scope
-//! (`repository:<repo>:push,pull`) — see [`crate::pull::discover_auth_scoped`]. Credentials travel
+//! (`repository:<repo>:push,pull`) - see [`crate::pull::discover_auth_scoped`]. Credentials travel
 //! off-argv (via curl `-K` STDIN) exactly as on the pull path; a push to a private repo needs `kern
 //! login` first. All requests are HTTPS-pinned (`TLS_PIN`).
 
@@ -23,7 +23,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// The gzip'd-tar media type for an OCI/Docker layer, and the config media type. We publish a v2
-/// schema-2 (Docker) manifest — the format every registry accepts and `docker pull` understands.
+/// schema-2 (Docker) manifest - the format every registry accepts and `docker pull` understands.
 const LAYER_MT: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 const CONFIG_MT: &str = "application/vnd.docker.container.image.v1+json";
 const MANIFEST_MT: &str = "application/vnd.docker.distribution.manifest.v2+json";
@@ -38,7 +38,7 @@ pub fn push(
 ) -> Result<(), OciError> {
     let (registry, repo, reference) = parse_ref(image)?;
     // Loopback registries (localhost / 127.* / ::1) speak plain HTTP and are the common local-dev /
-    // `registry:2` case — Docker treats loopback as insecure-OK by default, and so do we: over the
+    // `registry:2` case - Docker treats loopback as insecure-OK by default, and so do we: over the
     // loopback interface there's no MITM to pin against. Everything else stays HTTPS-pinned.
     let ep = Endpoint::for_registry(&registry);
     // WRITE-scoped auth. A push to a private repo needs `kern login`; anonymous push is refused by the
@@ -56,7 +56,7 @@ pub fn push(
     let config_digest = sha256_file(&config_path)?;
     let config_size = config_json.len() as u64;
 
-    // Upload the two blobs (layer, config) — skip any the registry already has.
+    // Upload the two blobs (layer, config) - skip any the registry already has.
     eprintln!(
         "→ uploading layer ({})…",
         kern_common::fmt_bytes(layer_size)
@@ -83,7 +83,7 @@ struct Endpoint {
 
 impl Endpoint {
     fn for_registry(registry: &str) -> Self {
-        // Shared loopback rule with the pull path (`is_loopback_registry`/`reg_base`) — one source of
+        // Shared loopback rule with the pull path (`is_loopback_registry`/`reg_base`) - one source of
         // truth so push and pull can't disagree on which registries are insecure-OK.
         Endpoint {
             base: reg_base(registry),
@@ -99,7 +99,7 @@ impl Endpoint {
         }
     }
 
-    /// This endpoint's authority as curl would dial it — host **and port** (no scheme/userinfo),
+    /// This endpoint's authority as curl would dial it - host **and port** (no scheme/userinfo),
     /// lowercased. We compare host+port (not host alone) so a compromised registry can't bounce the
     /// upload to a DIFFERENT PORT on the same host (a distinct service, e.g. an internal admin port).
     fn authority(&self) -> String {
@@ -110,7 +110,7 @@ impl Endpoint {
     ///
     /// SECURITY (CVE-2020-15157 class): the registry is untrusted and may answer the upload POST with
     /// an ABSOLUTE `Location: https://evil.com/…`. `curl_authed` unconditionally attaches the bearer
-    /// token (or the long-lived `kern login` basic creds) — so following a cross-host Location would
+    /// token (or the long-lived `kern login` basic creds) - so following a cross-host Location would
     /// exfiltrate the credentials AND the private layer bytes to an attacker-chosen host. We therefore
     /// require an absolute Location to have the SAME host as the registry (a cross-host CDN upload is
     /// not worth leaking creds for); a relative Location is resolved against our own base and is always
@@ -124,7 +124,7 @@ impl Endpoint {
         let loc_auth = authority_no_userinfo(authority_of(location));
         if loc_auth != self.authority() || loc_auth.is_empty() {
             return Err(OciError::Registry(format!(
-                "registry redirected the blob upload to a different host ('{loc_auth}' != '{}') — \
+                "registry redirected the blob upload to a different host ('{loc_auth}' != '{}') - \
                  refusing to send credentials off-registry",
                 self.authority()
             )));
@@ -132,7 +132,7 @@ impl Endpoint {
         // Same host, but a pinned (HTTPS) endpoint must not be downgraded to http:// by the Location.
         if self.pin && location.starts_with("http://") {
             return Err(OciError::Registry(
-                "registry redirected an HTTPS upload to plain http:// — refusing".into(),
+                "registry redirected an HTTPS upload to plain http:// - refusing".into(),
             ));
         }
         Ok(location.to_string())
@@ -174,7 +174,7 @@ pub struct ImageConfigOut {
 
 /// `tar` the rootfs and gzip it into `work/layer.tar.gz`. Returns `(path, "sha256:<compressed>",
 /// "sha256:<uncompressed diff_id>", compressed_size)`. Uses the system `tar`/`gzip` (like the pull
-/// path) — no in-process tar dependency.
+/// path) - no in-process tar dependency.
 fn pack_layer(
     rootfs: &Path,
     work: &Path,
@@ -182,12 +182,12 @@ fn pack_layer(
     let tar_path = work.join("layer.tar");
     // SECURITY (privilege-escalation via ownership normalization): the layer is tarred root-owned
     // (Docker layers are root-owned), but forcing owner 0 on a NON-root-owned `-rwsr-xr-x` binary would
-    // turn it into **setuid-ROOT** in the pushed image — an escalation the original never had. So the
-    // shared packer strips setuid/setgid BEFORE tarring (kern treats in-image setuid as inert anyway —
+    // turn it into **setuid-ROOT** in the pushed image - an escalation the original never had. So the
+    // shared packer strips setuid/setgid BEFORE tarring (kern treats in-image setuid as inert anyway -
     // the box root mount is MS_NOSUID and pull uses `--no-same-owner`; file-capabilities are closed the
     // same way, the build copier never propagates `security.capability`). It also handles the tar-flavour
     // split: GNU `--owner=0 --group=0`, or BusyBox `--numeric-owner` (which is already 0:0 for a
-    // root-run build) — the fix for `save`/`push` erroring on Alpine/WSL's BusyBox tar.
+    // root-run build) - the fix for `save`/`push` erroring on Alpine/WSL's BusyBox tar.
     crate::archive::tar_rootfs_root_owned(rootfs, &tar_path)?;
     let diff_id = sha256_file(&tar_path)?; // uncompressed digest = diff_id
 
@@ -233,7 +233,7 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String, OciError> {
 }
 
 /// Build the OCI/Docker image config JSON. Minimal but valid: `rootfs.diff_ids` (the one layer's
-/// uncompressed digest) plus a `config` with the runtime fields. JSON is emitted by hand (no serde) —
+/// uncompressed digest) plus a `config` with the runtime fields. JSON is emitted by hand (no serde) -
 /// the fields are simple string arrays, matching the dependency-free posture of the rest of kern-oci.
 pub(crate) fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
     let arr = |xs: &[String]| {
@@ -286,9 +286,9 @@ fn build_manifest(
 }
 
 /// Upload one blob unless the registry already has it. Registry-v2 monolithic upload:
-///   HEAD /blobs/<digest> — 200 → skip.
-///   POST /blobs/uploads/ — 202 with a `Location` upload URL.
-///   PUT  <location>?digest=<digest> — the bytes.
+///   HEAD /blobs/<digest> - 200 → skip.
+///   POST /blobs/uploads/ - 202 with a `Location` upload URL.
+///   PUT  <location>?digest=<digest> - the bytes.
 fn upload_blob(
     ep: &Endpoint,
     repo: &str,
@@ -303,7 +303,7 @@ fn upload_blob(
     head.extend_from_slice(&["--connect-timeout", "10", "--max-time", "60"]);
     if let Ok(code) = curl_authed(&head, &head_url, auth) {
         if String::from_utf8_lossy(&code).trim() == "200" {
-            eprintln!("  blob {} already present — skipped", short(digest));
+            eprintln!("  blob {} already present - skipped", short(digest));
             return Ok(());
         }
     }
@@ -326,7 +326,7 @@ fn upload_blob(
     let sep = if location.contains('?') { '&' } else { '?' };
     let put_url = format!("{location}{sep}digest={digest}");
 
-    // PUT the bytes with the digest — the monolithic completion.
+    // PUT the bytes with the digest - the monolithic completion.
     let mut put = vec![
         "-sS",
         "-o",
@@ -385,7 +385,7 @@ fn put_manifest(
     let code = code.trim();
     if code != "201" && code != "202" {
         return Err(OciError::Registry(format!(
-            "manifest push failed (HTTP {code}) — is the repo writable, and are you logged in?"
+            "manifest push failed (HTTP {code}) - is the repo writable, and are you logged in?"
         )));
     }
     Ok(())
@@ -401,7 +401,7 @@ fn location_header(headers: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Minimal JSON string encoder (escapes `"`, `\`, control chars) — the values here are image refs,
+/// Minimal JSON string encoder (escapes `"`, `\`, control chars) - the values here are image refs,
 /// env vars, and paths; no need for a serde dependency.
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -422,7 +422,7 @@ fn json_str(s: &str) -> String {
 }
 
 /// Shell-quote a path for the one `sh -c` we use (gzip redirection). Single-quote and escape any
-/// embedded single quote — a cache path never contains one in practice, but be correct anyway.
+/// embedded single quote - a cache path never contains one in practice, but be correct anyway.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn upload_location_is_port_aware() {
         // A compromised registry must not be able to bounce the upload to a DIFFERENT PORT on the same
-        // host — that's a distinct service (e.g. an internal admin API) and the creds would still leak.
+        // host - that's a distinct service (e.g. an internal admin API) and the creds would still leak.
         let ep = Endpoint {
             base: "https://reg.example.com:5000".into(),
             pin: true,

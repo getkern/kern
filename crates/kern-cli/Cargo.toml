@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "kern — a fast, lightweight sandbox & virtual resource manager."
+description = "kern: a fast, lightweight sandbox & virtual resource manager."
 readme = "../../README.md"
 keywords = ["container", "sandbox", "oci", "runtime", "namespace"]
 categories = ["command-line-utilities", "virtualization"]
@@ -16,9 +16,9 @@ name = "kern"
 path = "src/main.rs"
 
 [dependencies]
-kern-common = { path = "../kern-common", version = "0.6.5" }
-kern-compose = { path = "../kern-compose", version = "0.6.5" }
-kern-oci = { path = "../kern-oci", version = "0.6.5" }
-kern-isolation = { path = "../kern-isolation", version = "0.6.5" }
+kern-common = { path = "../kern-common", version = "0.6.7" }
+kern-compose = { path = "../kern-compose", version = "0.6.7" }
+kern-oci = { path = "../kern-oci", version = "0.6.7" }
+kern-isolation = { path = "../kern-isolation", version = "0.6.7" }
 # Already in the tree via kern-isolation; used here for detach (fork/setsid) + liveness (kill).
 libc = "0.2"

@@ -1,6 +1,6 @@
 //! End-to-end exercise of the embeddable [`kern_isolation::Sandbox`] SDK.
 //!
-//! Usage: `sandbox_e2e <rootfs-dir>` — runs a series of real sandboxed commands
+//! Usage: `sandbox_e2e <rootfs-dir>` - runs a series of real sandboxed commands
 //! through the fluent builder and prints one `CASE <name> <PASS|FAIL>` line per
 //! check. Exits non-zero if any case fails. Requires a runnable rootfs (with
 //! `/bin/busybox`) and a locatable `kern` binary (`KERN_BIN` or on `PATH`).
@@ -96,7 +96,7 @@ fn main() {
 
     // Flood scripts built from POSIX-sh BUILTINS ONLY (echo/while/[/arithmetic) so
     // they run in a bare rootfs where busybox applets like seq/yes/tr don't
-    // resolve — otherwise we'd be testing applet availability, not the SDK.
+    // resolve - otherwise we'd be testing applet availability, not the SDK.
     let line50 = "A".repeat(50);
     let flood_64 = "i=0; while [ $i -lt 2000 ]; do echo AAAAAAAA; i=$((i+1)); done";
     // ~102 KB via 2000 lines of 51 bytes each.
@@ -122,7 +122,7 @@ fn main() {
     //    (builtin, no applet) inside a SUBSHELL: a failed redirection aborts a
     //    non-interactive shell (POSIX), so the subshell contains that abort and
     //    the outer shell still reaches the `|| echo ro`. A "touch not found"
-    //    can't make this pass vacuously — only a real write-block yields "ro".
+    //    can't make this pass vacuously - only a real write-block yields "ro".
     match base().readonly_root().build().unwrap().run(
         bb,
         &[
@@ -156,7 +156,7 @@ fn main() {
     //     floods stdout (~102 KB, well past the 64 KiB pipe buffer) via a builtin
     //     loop. With the old ordering (write stdin on the main thread before
     //     starting the stdout drainer) both pipes fill and neither side can
-    //     progress — a hang. It must complete and capture the whole flood.
+    //     progress - a hang. It must complete and capture the whole flood.
     let big = vec![b'Z'; 1024 * 1024];
     match base()
         .stdin(big)
@@ -174,7 +174,7 @@ fn main() {
         }
     }
 
-    // 12. Guest floods BOTH streams past the caps via builtin loops — must not
+    // 12. Guest floods BOTH streams past the caps via builtin loops - must not
     //     deadlock and both must be flagged truncated.
     match base()
         .stdout_limit_bytes(4096)
@@ -191,7 +191,7 @@ fn main() {
     }
 
     // 13. A timeout actually kills a runaway. `sleep` is invoked DIRECTLY as a
-    //     busybox applet (`/bin/busybox sleep 10`), not via `sh -c "sleep"` —
+    //     busybox applet (`/bin/busybox sleep 10`), not via `sh -c "sleep"` -
     //     which would hit the applet-resolution gotcha in a bare rootfs. A 1 s
     //     timeout must kill the 10 s sleep: non-success and a sub-6 s wall time.
     match base()
@@ -220,7 +220,7 @@ fn main() {
         Err(_) => check("missing_command_nonzero", false),
     }
 
-    // 16. bind_rootfs: bind the rootfs directly instead of layering an overlay —
+    // 16. bind_rootfs: bind the rootfs directly instead of layering an overlay -
     //     the fast path on kernels with slow overlayfs (e.g. the Arduino board).
     //     Must still run and capture.
     match Sandbox::builder()

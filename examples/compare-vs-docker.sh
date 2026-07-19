@@ -1,7 +1,7 @@
 #!/bin/sh
 # Head-to-head: the same isolated `/bin/true`, kern vs `docker run`. Run it yourself.
 # kern starts in single-digit ms with no daemon; `docker run` pays a daemon round-trip.
-# (Warm both first; numbers vary by machine — see BENCHMARKS.md for the full table.)
+# (Warm both first; numbers vary by machine - see BENCHMARKS.md for the full table.)
 set -eu
 kern="${KERN:-kern}"
 N=20
@@ -22,7 +22,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   docker pull -q alpine >/dev/null 2>&1 || true
   bench "docker run --rm alpine" docker run --rm alpine /bin/true
 else
-  echo "docker run --rm alpine     (skipped — docker not available)"
+  echo "docker run --rm alpine     (skipped - docker not available)"
 fi
 
 echo

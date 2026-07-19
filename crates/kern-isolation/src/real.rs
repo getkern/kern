@@ -2,13 +2,13 @@
 //!
 //! [`RealMounts`] performs the mount/pivot/remount ops the [`crate::Rootfs`] typestate issues;
 //! [`run_in_sandbox`] sets up an unprivileged user namespace + PID namespace, builds the root
-//! through that same typestate, mounts a fresh `/proc`, remounts the root read-only (last —
+//! through that same typestate, mounts a fresh `/proc`, remounts the root read-only (last -
 //! enforced by the typestate), and `exec`s the command. The parent waits and returns the exit
 //! code. This is the privileged counterpart of the `Recorder`-driven `--plan`: same sequence,
 //! real kernel.
 //!
 //! Identity mapping: by default the caller's euid maps to root *inside* the namespace and nothing
-//! else (a single-uid map — fastest, and the smallest attack surface). With `--uid-range`
+//! else (a single-uid map - fastest, and the smallest attack surface). With `--uid-range`
 //! (`SandboxSpec::uid_range`), and when `newuidmap`/`newgidmap` + an `/etc/subuid`/`/etc/subgid`
 //! allocation are present, box ids 1..N additionally map to the caller's subordinate-id range (so
 //! `apt`/`dpkg` and daemons that drop to non-root users work). Either way no host privilege is
@@ -20,7 +20,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-/// The one message for "this host won't let an unprivileged user namespace be created" — reused by
+/// The one message for "this host won't let an unprivileged user namespace be created" - reused by
 /// every unshare site (box + pod) so they can't drift. Callers requiring a `&str` (the pod
 /// `eprintln`) use it directly; the sandbox path wraps it in [`Error::Unsupported`].
 const USERNS_UNAVAILABLE: &str =
@@ -37,7 +37,7 @@ pub struct SandboxSpec {
     pub overlay: Option<OverlayDirs>,
     /// Remount the root read-only after pivot. With an overlay root this remounts the merged
     /// overlay RO (works in a user namespace even where a bind remount-RO is denied, e.g. some
-    /// Android-kernel boards). Default boxes leave this false — the upper is the writable surface.
+    /// Android-kernel boards). Default boxes leave this false - the upper is the writable surface.
     pub read_only: bool,
     /// `--landlock-rw <path>` (repeatable): apply a Landlock (LSM) write-allowlist. When non-empty the
     /// box root is read+exec only and writes are permitted ONLY under these paths (plus the box scratch
@@ -48,7 +48,7 @@ pub struct SandboxSpec {
     pub command: Vec<String>,
     /// Hostname to set inside the (isolated) UTS namespace.
     pub hostname: String,
-    /// Host paths bind-mounted into the box (`-v src:dst[:ro]`) — the only way data crosses the
+    /// Host paths bind-mounted into the box (`-v src:dst[:ro]`) - the only way data crosses the
     /// sandbox boundary. Bound before pivot (host source reachable), target resolved symlink-safe.
     pub volumes: Vec<Volume>,
     /// Extra environment for the workload (`--env K=V`), applied on top of the clean base env.
@@ -62,7 +62,7 @@ pub struct SandboxSpec {
     /// so every box in the pod shares one loopback network (they reach each other on `127.0.0.1`,
     /// resolved by name via a shared `/etc/hosts`). The value is the holder process's PID; the box
     /// still gets its own mount/pid/uts/ipc namespaces. Pod members are co-trusted (they share the
-    /// pod's user+net ns) — the pod is the network trust unit, like a Kubernetes pod.
+    /// pod's user+net ns) - the pod is the network trust unit, like a Kubernetes pod.
     pub pod_holder: Option<i32>,
     /// Map a subordinate uid/gid *range* into the box (`--uid-range`) instead of just the caller.
     /// Opt-in because it (a) costs two `newuidmap`/`newgidmap` subprocesses at start and (b) maps
@@ -87,7 +87,7 @@ pub struct SandboxSpec {
     /// it onto stdin/out/err. `None` → the box inherits kern's stdio. The parent pumps the matching
     /// master (see `run_in_sandbox_with`'s `tty_master`).
     pub tty_slave: Option<i32>,
-    /// vGPIO device nodes (host `/dev/*` paths) to expose in the box's `/dev` — from a `vgpio:`
+    /// vGPIO device nodes (host `/dev/*` paths) to expose in the box's `/dev` - from a `vgpio:`
     /// profile. Bound before pivot like the base device allowlist.
     pub vgpio_devs: Vec<String>,
     /// vGPIO sysfs directories (host `/sys/*` paths) to expose in the box's `/sys` (pwm/adc/1-wire/
@@ -110,7 +110,7 @@ pub struct SandboxSpec {
     /// exits with its status. Off by default (PID 1 execs the command directly), so the common path is
     /// byte-for-byte unchanged.
     pub init: bool,
-    /// `--tmpfs PATH[:size]`: extra fresh tmpfs mounts inside the box (`(path, size_option)` — size is
+    /// `--tmpfs PATH[:size]`: extra fresh tmpfs mounts inside the box (`(path, size_option)` - size is
     /// a tmpfs `size=` string like `"64m"`, or empty for the default). Blocked over hardened mounts.
     pub tmpfs: Vec<(String, String)>,
     /// `--user UID[:GID]`: drop to this uid/gid just before exec (after all privileged setup). `None`
@@ -132,18 +132,18 @@ pub struct SandboxSpec {
     pub extra_hosts: Vec<(String, String)>,
     /// `--privileged`: relax the always-on seccomp filter to ALLOW the namespace + classic-mount
     /// syscalls (`unshare`/`setns`/`mount`/`umount2`/`pivot_root`) so a *nested* `kern box` (or
-    /// docker-in-docker-style workload) can start. Honoured ONLY in rootless mode — when the box's
+    /// docker-in-docker-style workload) can start. Honoured ONLY in rootless mode - when the box's
     /// root maps to an UNPRIVILEGED host uid (caller is non-root), a nested userns grants no new
     /// host privilege (the reason rootless podman-in-podman is safe). As real host root (euid 0) the
     /// request is IGNORED (no relaxation): relaxing `mount` there would re-open the core_pattern /
     /// host-privilege class. Every other dangerous syscall (kexec, modules, bpf, io_uring, keyring,
-    /// ptrace, the NEW mount API) stays blocked even here — stronger than Docker's `--privileged`.
+    /// ptrace, the NEW mount API) stays blocked even here - stronger than Docker's `--privileged`.
     pub privileged: bool,
 }
 
 /// A resolved vDisk to mount in the box at `/vdisk/<name>`. When `host_dir` is set, the host prepared
 /// an ext4-on-loop mount (privileged path) that is bind-mounted in; otherwise a `size=`-capped
-/// `tmpfs` is mounted (rootless fallback — RAM-backed, ephemeral).
+/// `tmpfs` is mounted (rootless fallback - RAM-backed, ephemeral).
 pub struct VdiskMount {
     pub name: String,
     pub size: Option<u64>,
@@ -301,7 +301,7 @@ fn mount_overlay(lower: &str, upper: &str, work: &str, merged: &str) -> Result<(
         // only in dmesg). Turn that into an actionable message instead of "Invalid argument".
         if e.raw_os_error() == Some(libc::EINVAL) && fs_is_overlayfs(upper) {
             return Err(Error::Unsupported(
-                "mount(overlay): the box scratch dir is on an overlayfs filesystem — the kernel \
+                "mount(overlay): the box scratch dir is on an overlayfs filesystem - the kernel \
                  rejects nested-overlay upperdirs (typical when kern runs INSIDE a Docker/CI \
                  container). Point XDG_RUNTIME_DIR at a tmpfs/disk path, or in Docker add \
                  `--tmpfs /run`",
@@ -312,7 +312,7 @@ fn mount_overlay(lower: &str, upper: &str, work: &str, merged: &str) -> Result<(
     Ok(())
 }
 
-/// Whether `path` (or its deepest existing ancestor) lives on an overlayfs — the one filesystem the
+/// Whether `path` (or its deepest existing ancestor) lives on an overlayfs - the one filesystem the
 /// kernel refuses as an overlay UPPER layer. Used only to turn a bare `EINVAL` into a clear error.
 fn fs_is_overlayfs(path: &str) -> bool {
     const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
@@ -334,7 +334,7 @@ fn fs_is_overlayfs(path: &str) -> bool {
 /// Mount a fresh procfs for the new PID namespace (so `ps` etc. see only sandbox processes).
 /// Target is the **cwd-relative** `proc` (cwd is the new root right after the self-pivot), NOT
 /// `/proc`: before the old root is detached, "/" still resolves through the stacked old root, so
-/// an absolute target would land in the old root. It must also run BEFORE the detach — mounting a
+/// an absolute target would land in the old root. It must also run BEFORE the detach - mounting a
 /// fresh procfs requires an existing fully-visible proc instance, which the old root still
 /// provides; after `MNT_DETACH` that instance is gone and the mount is refused (EPERM).
 fn mount_proc() -> Result<(), Error> {
@@ -387,7 +387,7 @@ fn ro_bind_ro(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Mask a procfs file by bind-mounting `/dev/null` over it — reads return empty, writes go nowhere.
+/// Mask a procfs file by bind-mounting `/dev/null` over it - reads return empty, writes go nowhere.
 /// Used for kernel-memory / info-leak files (`/proc/kcore`, `/proc/kallsyms`, …).
 fn null_over(path: &str) -> Result<(), Error> {
     let src = cstr("/dev/null")?;
@@ -416,12 +416,12 @@ fn null_over(path: &str) -> Result<(), Error> {
 /// `MS_RDONLY` is load-bearing security, not cosmetic: the box may READ its limits but can never write
 /// `cgroup.procs` (no self-migration out of the cap) or edit a `*.max` file, so exposing the cgroup
 /// buys the runtimes correctness without handing the workload a lever on its own limits. `NOSUID`,
-/// `NODEV`, `NOEXEC` harden the mount. Only `/sys/fs/cgroup` is mounted — the rest of `/sys` is left
+/// `NODEV`, `NOEXEC` harden the mount. Only `/sys/fs/cgroup` is mounted - the rest of `/sys` is left
 /// absent, so the host sysfs stays masked (kern's deny-by-default `/sys` property is unchanged).
 ///
 /// Best-effort throughout: a kernel without cgroup namespaces, a host that refuses the `cgroup2` mount,
 /// or a `--privileged` nested box where `mount_too_revealing` bites, simply leaves the box without a
-/// cgroup view (kern's prior behaviour) — it never fails the box.
+/// cgroup view (kern's prior behaviour) - it never fails the box.
 fn mount_cgroup() {
     // Create the mountpoint on the (still-writable) box root WITHOUT mounting a full sysfs, so `/sys`
     // otherwise stays empty and the host sysfs is never revealed. Neutralize a hostile image symlink at
@@ -451,14 +451,14 @@ fn mount_cgroup() {
     }
 }
 
-/// Neutralize the host-global procfs surface — the runc "readonlyPaths" + "maskedPaths" set. These
+/// Neutralize the host-global procfs surface - the runc "readonlyPaths" + "maskedPaths" set. These
 /// files/dirs are NOT namespaced, so on a kernel where the box's root maps to a privileged host uid
 /// (kern run as root, in WSL, under `sudo`, or in CI), an in-box write reaches the HOST. The escape
 /// that motivated this: `/proc/sys/kernel/core_pattern` → set it to `|/evil` and the kernel runs your
 /// program as ROOT on the host at the next core dump. `/proc/sys` read-only is therefore the HARD
 /// requirement (fail-closed); the rest are best-effort (present on all mainstream kernels).
 fn mask_proc_paths() -> Result<(), Error> {
-    ro_bind_ro("/proc/sys")?; // core_pattern, kernel.modprobe, … — every host-global sysctl. FATAL.
+    ro_bind_ro("/proc/sys")?; // core_pattern, kernel.modprobe, … - every host-global sysctl. FATAL.
     for p in [
         "/proc/sysrq-trigger",
         "/proc/irq",
@@ -486,7 +486,7 @@ fn mask_proc_paths() -> Result<(), Error> {
 /// Detach the old root, which the self-pivot left stacked at "." (== the new root's "/"). Must run
 /// IMMEDIATELY after the pivot, before any absolute-path mount: until the old root is detached,
 /// "/" resolves through it. Resolution of "." starts at the new root and moves up the stack, so
-/// this unmounts the old (host) root. A failed unmount is FATAL — a leftover old root would keep
+/// this unmounts the old (host) root. A failed unmount is FATAL - a leftover old root would keep
 /// the whole host filesystem visible inside the box.
 fn detach_old_root() -> Result<(), Error> {
     let dot = cstr(".")?;
@@ -512,7 +512,7 @@ fn exec(argv: &[CString]) -> Error {
 /// Child path (PID 1 in the new PID namespace): own mount namespace, build the root through the
 /// typestate, mount /proc, drop the old root, remount read-only LAST, then exec. Never returns
 /// Per-phase wall-clock for box setup, gated on the `KERN_TIMING` env var (off → zero cost beyond
-/// one `getenv`). Set `KERN_TIMING=1` to print `kern-timing: <phase>: <µs>` to stderr — a cheap
+/// one `getenv`). Set `KERN_TIMING=1` to print `kern-timing: <phase>: <µs>` to stderr - a cheap
 /// profiler for where startup goes on a given kernel/SoC (overlay vs dev binds vs seccomp).
 struct PhaseTimer {
     on: bool,
@@ -548,12 +548,12 @@ impl PhaseTimer {
     }
 }
 
-/// `Ok` — on success `exec` (or the built-in init) replaces/owns the process; otherwise it returns the
+/// `Ok` - on success `exec` (or the built-in init) replaces/owns the process; otherwise it returns the
 /// error. `ready_fd` (the readiness pipe's write end) is threaded through so that with `--init`, PID 1
 /// can close its own copy after forking the workload (so the launcher still gets EOF = "box up"), and
 /// the forked workload can write the failure byte if its own exec fails.
 /// Whether the box's root (inner uid 0) maps to an UNPRIVILEGED host uid, read from the now-established
-/// `/proc/self/uid_map`. This is the PROPERTY that `--privileged` nesting depends on — a box whose root
+/// `/proc/self/uid_map`. This is the PROPERTY that `--privileged` nesting depends on - a box whose root
 /// maps to host root must never get the relaxed seccomp (a relaxed `mount` there re-opens the host). We
 /// read the map rather than trust the caller's euid because `--pod` joins a holder's user namespace, so
 /// the mapping is the holder's, not a function of our euid. Each map line is `inside outside count`;
@@ -569,7 +569,7 @@ fn box_root_is_unprivileged() -> bool {
 /// Pure parser behind [`box_root_is_unprivileged`] (unit-testable). Given the contents of a
 /// `uid_map` (`inside outside count` per line), return `true` IFF the entry covering inside-uid 0
 /// maps it to a NON-zero (unprivileged) host uid. Fails CLOSED (`false`) if inside-0 is unmapped or
-/// no line is well-formed — so `--privileged` never relaxes seccomp on a map it doesn't understand.
+/// no line is well-formed - so `--privileged` never relaxes seccomp on a map it doesn't understand.
 fn uid_map_root_is_unprivileged(map: &str) -> bool {
     for line in map.lines() {
         let f: Vec<u64> = line
@@ -580,7 +580,7 @@ fn uid_map_root_is_unprivileged(map: &str) -> bool {
             if inside == 0 && count >= 1 {
                 // `outside` is an id in the PARENT user namespace, not guaranteed a host uid. That's
                 // safe here: only real root can construct a userns mapping any id to host uid 0, and
-                // real root is refused `--privileged` up front — so a non-root caller can never reach
+                // real root is refused `--privileged` up front - so a non-root caller can never reach
                 // a chain where inner-0 resolves to host root. We also fail toward OVER-refusal (a
                 // one-level-deep `0 0 1` is refused, never wrongly allowed).
                 return outside != 0;
@@ -602,8 +602,8 @@ fn child_setup_and_exec(
     }
     // Own cgroup namespace: make the box's OWN cgroup the root of the `cgroup2` hierarchy it mounts
     // below (see `mount_cgroup`), so memory-aware runtimes (the JVM, .NET, Node) read the real
-    // `memory.max` and size their heap to the cap instead of the host's RAM — without it they assume
-    // host RAM and get OOM-killed under load despite the cap — while the host tree and sibling boxes
+    // `memory.max` and size their heap to the cap instead of the host's RAM - without it they assume
+    // host RAM and get OOM-killed under load despite the cap - while the host tree and sibling boxes
     // stay invisible. The process is already IN its box cgroup here (the supervisor moved into it via
     // `apply_limits` before the fork), so the namespace root is exactly that cgroup. Best-effort: a
     // kernel without cgroup namespaces just leaves the box without a cgroup view (prior behaviour).
@@ -635,7 +635,7 @@ fn child_setup_and_exec(
     // namespace; volume targets are resolved symlink-safely, confined to the new root.
     // devpts is only needed when the box will host an in-box PTY (an `--ssh` sshd, or an interactive
     // `-it` slave). The overwhelming common case (agent code-exec, CI, `sh -c`) never opens a PTY, so
-    // gate the whole devpts mount+mkdir+symlink out of it — one fewer filesystem-mount syscall per box.
+    // gate the whole devpts mount+mkdir+symlink out of it - one fewer filesystem-mount syscall per box.
     let needs_pts = spec.ssh.is_some() || spec.tty_slave.is_some();
     setup_dev(&spec.root, spec.tun, needs_pts, spec.tty_slave)?;
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
@@ -661,14 +661,14 @@ fn child_setup_and_exec(
     mount_proc()?;
     detach_old_root()?;
     // Lock down the non-namespaced host-global procfs knobs (core_pattern, sysrq, kernel info) now that
-    // `/proc` resolves to the fresh procfs — closes the classic core_pattern escape for a root-mapped box.
+    // `/proc` resolves to the fresh procfs - closes the classic core_pattern escape for a root-mapped box.
     //
     // SKIP for a `--privileged` (nesting) box: the ro-bind/`/dev/null` masks are LOCKED submounts, and
-    // the kernel's `mount_too_revealing` check then refuses a NESTED box's fresh `/proc` mount (EPERM) —
+    // the kernel's `mount_too_revealing` check then refuses a NESTED box's fresh `/proc` mount (EPERM) -
     // it would "reveal" what the outer masks hide. Presenting a fully-visible `/proc` (exactly what
     // Docker `--privileged` does) is what lets docker-in-docker-style nesting work. Safe here because
     // `allow_nesting` is rootless-only: the host-global sysctls under `/proc/sys` are owned by the INIT
-    // user namespace and a rootless box (even as box-root) lacks the CAP_SYS_ADMIN there to write them —
+    // user namespace and a rootless box (even as box-root) lacks the CAP_SYS_ADMIN there to write them -
     // so the mask was defense-in-depth for the ROOT-mapped case, which `--privileged` already refuses.
     // The nested box, unless itself `--privileged`, re-applies its own masks normally.
     if !allow_nesting {
@@ -683,10 +683,10 @@ fn child_setup_and_exec(
         mount_cgroup();
     }
     t.mark("pivot+proc");
-    // Optional read-only remount LAST — the typestate makes any other order a compile error.
+    // Optional read-only remount LAST - the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep
     // their own flags, so a writable `-v` stays writable even under a read-only root. `MS_REMOUNT`
-    // only affects the named mount, so the separate `/dev` tmpfs is remounted read-only too —
+    // only affects the named mount, so the separate `/dev` tmpfs is remounted read-only too -
     // otherwise `--read-only` would leave `/dev` writable. (Device nodes keep working: they're
     // their own bind mounts and writes go through the driver, not the tmpfs.)
     if spec.read_only {
@@ -694,8 +694,8 @@ fn child_setup_and_exec(
         remount_dev_ro()?;
     }
 
-    // Replace the inherited host environment with a clean, minimal one — the host's env (secrets,
-    // tokens, SSH/agent sockets, kern internals like KERN_SCOPE) must NOT leak into the workload —
+    // Replace the inherited host environment with a clean, minimal one - the host's env (secrets,
+    // tokens, SSH/agent sockets, kern internals like KERN_SCOPE) must NOT leak into the workload -
     // then layer the user's `--env` on top.
     set_clean_env(&spec.hostname, &spec.env);
 
@@ -715,13 +715,13 @@ fn child_setup_and_exec(
     }
 
     // `--ssh`: stand up the in-box sshd (mounts /run tmpfs, writes keys/config, forks sshd). Done
-    // here — after loopback (sshd binds 127.0.0.1) and pivot (privileged mounts), before seccomp
+    // here - after loopback (sshd binds 127.0.0.1) and pivot (privileged mounts), before seccomp
     // (the filter would block the mounts, and the forked sshd must predate the filter).
     if let Some(ssh) = &spec.ssh {
         crate::ssh::setup(ssh);
     }
 
-    // `-it`: adopt the PTY slave as the controlling terminal (done before seccomp — these are setup
+    // `-it`: adopt the PTY slave as the controlling terminal (done before seccomp - these are setup
     // syscalls, not the workload's). The slave fd was opened on the host and inherited across the
     // unshare/pivot (it's just an fd).
     if let Some(slave) = spec.tty_slave {
@@ -730,7 +730,7 @@ fn child_setup_and_exec(
 
     // Pin to `--cpuset-cpus` via CPU affinity. This is the rootless-portable path: unlike the
     // cgroup `cpuset` controller (frequently NOT delegated to a user session), `sched_setaffinity`
-    // needs no privilege and no delegation, and the affinity is inherited across the exec — so the
+    // needs no privilege and no delegation, and the affinity is inherited across the exec - so the
     // box command actually runs pinned even where the cgroup write is skipped. Done before seccomp
     // (a setup syscall).
     set_cpu_affinity(spec.cpuset.as_deref());
@@ -739,11 +739,11 @@ fn child_setup_and_exec(
     // profile) composes correctly. All run after privileged setup (mount/pivot/loopback), so they
     // only affect the workload.
     let cap_mask = cap_drop_mask(&spec.caps);
-    // 1. Bounding set — needs effective `CAP_SETPCAP` (still present here); stops a file-cap binary
+    // 1. Bounding set - needs effective `CAP_SETPCAP` (still present here); stops a file-cap binary
     //    re-adding a dropped cap. Dropping a cap from the *bounding* set does NOT block using it from
     //    the effective set, so the `setuid`/`setgid` below still work even under `--cap-drop ALL`.
     drop_cap_bounding(cap_mask);
-    // 2. `--user UID[:GID]`: drop to the workload's uid/gid — needs `CAP_SETUID`/`CAP_SETGID` in the
+    // 2. `--user UID[:GID]`: drop to the workload's uid/gid - needs `CAP_SETUID`/`CAP_SETGID` in the
     //    *effective* set, which are still present (we haven't cleared effective yet). setgid before
     //    setuid (once uid is non-root you can't change gid); setuid to a non-root uid then sheds the
     //    effective caps itself. Only mapped ids succeed; a failure fails closed (refuses to exec).
@@ -770,7 +770,7 @@ fn child_setup_and_exec(
         }
         t.mark("landlock");
     }
-    // Install the seccomp filter LAST — after all setup syscalls (mount/pivot) are done, so it
+    // Install the seccomp filter LAST - after all setup syscalls (mount/pivot) are done, so it
     // only constrains the workload. Then exec (or hand off to the built-in init). `allow_nesting`
     // (a rootless `--privileged` box) leaves the namespace + classic-mount syscalls allowed so a
     // nested `kern box` can start; everything else stays blocked.
@@ -780,13 +780,13 @@ fn child_setup_and_exec(
         // `--init`: this PID-1 process forks the workload and becomes a reaping init. Never returns.
         run_init(spec, argv, ready_fd)
     } else {
-        // Default: PID 1 IS the workload — exec directly, byte-for-byte the original path.
+        // Default: PID 1 IS the workload - exec directly, byte-for-byte the original path.
         Err(exec(argv))
     }
 }
 
 /// Built-in init (`--init`): kern PID 1 forks the workload, then loops reaping EVERY child (the direct
-/// workload plus any orphan reparented to PID 1 — the zombie-reaping guarantee), forwarding SIGTERM and
+/// workload plus any orphan reparented to PID 1 - the zombie-reaping guarantee), forwarding SIGTERM and
 /// SIGINT to the workload, and finally `_exit`s with the workload's own status. Raw libc only, never
 /// unwinds. `ready_fd` is the readiness pipe write end: PID 1 closes its own copy right after the fork
 /// so the launcher still sees EOF when the workload execs; the workload child writes the failure byte
@@ -811,7 +811,7 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
         unsafe { libc::_exit(127) };
     }
     if child == 0 {
-        // WORKLOAD child: inherits the CLOEXEC ready_fd — a successful exec closes it (→ launcher EOF).
+        // WORKLOAD child: inherits the CLOEXEC ready_fd - a successful exec closes it (→ launcher EOF).
         // On exec failure, write the byte HERE (this is not PID 1, so the parent's byte-write below
         // won't fire for us) so the launcher learns it failed, then report and exit.
         // `exec` only ever returns on failure (its type is `-> Error`).
@@ -828,7 +828,7 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
     if let Some(fd) = ready_fd {
         unsafe { libc::close(fd) };
     }
-    // Publish the child pid, THEN install the forwarders — so an early signal can't `kill(0)` the
+    // Publish the child pid, THEN install the forwarders - so an early signal can't `kill(0)` the
     // whole group. `SA_RESTART` is deliberately OFF so `waitpid` returns EINTR and we can re-loop.
     CHILD.store(child, std::sync::atomic::Ordering::SeqCst);
     unsafe {
@@ -848,7 +848,7 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
         let r = unsafe { libc::waitpid(-1, &mut status, 0) };
         if r < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue; // interrupted by a forwarded signal — keep reaping
+                continue; // interrupted by a forwarded signal - keep reaping
             }
             break; // ECHILD (all children gone) or an unexpected error
         }
@@ -858,7 +858,7 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
         }
     }
     // Exit with the workload's decoded status (128+signo if it was killed); if we somehow never saw it,
-    // don't decode uninitialized status — fail with 1.
+    // don't decode uninitialized status - fail with 1.
     unsafe {
         libc::_exit(if child_reaped {
             wait_code(child_status)
@@ -871,7 +871,7 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
 /// Print the actionable "cannot start the box command" diagnostic for a failed `execvp` (command not
 /// found, missing loader, or a dropped-uid permission error), or a generic setup-failure line for any
 /// other error. Shared by the direct-exec path and the `--init` workload child so both give the same
-/// hint. Does not exit — the caller `_exit`s.
+/// hint. Does not exit - the caller `_exit`s.
 fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
     if let Error::Syscall("execvp", io) = e {
         let cmd = spec.command.first().map(String::as_str).unwrap_or("?");
@@ -884,7 +884,7 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
             eprintln!(
                 "kern: cannot start '{cmd}' as uid {uid} in box: {io}\n\
                  hint: a rootless box's rootfs is owned by the box's root uid, so a \
-                 non-root --user often can't exec it — drop --user (runs as the box's \
+                 non-root --user often can't exec it - drop --user (runs as the box's \
                  root) or provide a rootfs owned by uid {uid}"
             );
         } else {
@@ -900,11 +900,11 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
     }
 }
 
-/// `--user`: drop to `uid`/`gid` for the workload. Order matters — `setgroups` (clear supplementary
+/// `--user`: drop to `uid`/`gid` for the workload. Order matters - `setgroups` (clear supplementary
 /// groups) then `setgid` then `setuid`, because once the uid is non-root you can no longer change
 /// gid. Only ids mapped into the box's user namespace succeed (see `--uid-range`).
 ///
-/// **Fails CLOSED**: if a non-root target `setgid`/`setuid` fails (the id isn't mapped — e.g. a host
+/// **Fails CLOSED**: if a non-root target `setgid`/`setuid` fails (the id isn't mapped - e.g. a host
 /// without `newuidmap`/`newgidmap` fell back to the single-uid map), return `Err` so the box
 /// **refuses to exec** rather than silently running the workload as in-box root. Dropping privilege
 /// must never *grant* it. `--user 0` (explicitly root) is a successful no-op.
@@ -915,13 +915,13 @@ fn set_user(uid: u32, gid: u32) -> Result<(), Error> {
         libc::setgroups(0, std::ptr::null());
         if libc::setgid(gid as libc::gid_t) != 0 && gid != 0 {
             return Err(Error::Unsupported(
-                "--user: setgid failed — the gid isn't mapped into the box (add newuidmap/newgidmap \
+                "--user: setgid failed - the gid isn't mapped into the box (add newuidmap/newgidmap \
                  + an /etc/subgid allocation, or use --uid-range)",
             ));
         }
         if libc::setuid(uid as libc::uid_t) != 0 && uid != 0 {
             return Err(Error::Unsupported(
-                "--user: setuid failed — the uid isn't mapped into the box (add newuidmap/newgidmap \
+                "--user: setuid failed - the uid isn't mapped into the box (add newuidmap/newgidmap \
                  + an /etc/subuid allocation, or use --uid-range)",
             ));
         }
@@ -930,8 +930,8 @@ fn set_user(uid: u32, gid: u32) -> Result<(), Error> {
 }
 
 /// Pin the workload to the CPUs named in `--cpuset-cpus` (`"0-3"`, `"0,2,4"`) with
-/// `sched_setaffinity`. Portable and rootless — needs neither a delegated `cpuset` cgroup nor any
-/// capability — and inherited across `exec`. Best-effort: a parse or syscall failure leaves the box
+/// `sched_setaffinity`. Portable and rootless - needs neither a delegated `cpuset` cgroup nor any
+/// capability - and inherited across `exec`. Best-effort: a parse or syscall failure leaves the box
 /// unpinned rather than failing it. Cooperative for this trust model (a hostile workload could widen
 /// its own affinity; `--memory`/`--cpus` are the hard, cgroup-enforced governance). Complements the
 /// cgroup `cpuset.cpus` write, which stays authoritative on hosts where that controller IS delegated.
@@ -957,9 +957,9 @@ pub fn set_cpu_affinity(cpuset: Option<&str>) {
 /// to `N` / `N-M` tokens (`is_cpu_list`), so a malformed token here simply contributes nothing.
 ///
 /// SECURITY: a CPU index past `CPU_SETSIZE` can never be set in a `cpu_set_t`, so we CLAMP each range
-/// to it BEFORE expanding. Without this a hostile `cpuset: 0-999999999` (which `is_cpu_list` accepts —
+/// to it BEFORE expanding. Without this a hostile `cpuset: 0-999999999` (which `is_cpu_list` accepts -
 /// it only checks the `u32` format, not the magnitude) would `extend(0..=999999999)` and allocate a
-/// ~8 GB `Vec` before the per-element bound in the caller ever ran — a memory-exhaustion DoS. (Found
+/// ~8 GB `Vec` before the per-element bound in the caller ever ran - a memory-exhaustion DoS. (Found
 /// in a hacker-mode audit.)
 fn expand_cpu_list(s: &str) -> Vec<usize> {
     const MAX: usize = libc::CPU_SETSIZE as usize;
@@ -990,7 +990,7 @@ fn expand_cpu_list(s: &str) -> Vec<usize> {
 
 /// Bind each `-v` host path into the new root BEFORE pivot (while the host source is reachable at
 /// its real path). The target is resolved **symlink-free, confined to the new root** via an
-/// `openat(O_NOFOLLOW)` component walk — so a hostile image that ships a symlink at the mount
+/// `openat(O_NOFOLLOW)` component walk - so a hostile image that ships a symlink at the mount
 /// point can't redirect the bind onto a host path. Read-only volumes are then remounted RO.
 fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
     if vols.is_empty() {
@@ -1032,11 +1032,11 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             }
         };
         let tgt = cstr(&format!("/proc/self/fd/{tgt_fd}")).unwrap(); // decimal fd → never NUL
-                                                                     // Deliberately NON-recursive (`MS_BIND`, not `MS_BIND | MS_REC`) — same rationale as the bind
+                                                                     // Deliberately NON-recursive (`MS_BIND`, not `MS_BIND | MS_REC`) - same rationale as the bind
                                                                      // root above: if the operator's volume source has host filesystems mounted *underneath* it
                                                                      // (a NAS share, an external disk), a recursive bind would clone those submounts into the box.
                                                                      // The RO remount below is per-mount (`MS_REMOUNT` is not recursive on Linux), so a recursive
-                                                                     // bind would leave every cloned submount WRITABLE under a `:ro` volume — silently breaking the
+                                                                     // bind would leave every cloned submount WRITABLE under a `:ro` volume - silently breaking the
                                                                      // operator's explicit read-only contract. A plain bind exposes the directory tree only.
         let r = unsafe {
             libc::mount(
@@ -1078,11 +1078,11 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
                 result = Err(if e.raw_os_error() == Some(libc::EPERM) {
                     // EPERM on a bind remount-RO has more than one cause: the kernel may not support
                     // it at all (common on Android-kernel boards, where the root `--read-only` path
-                    // sidesteps it by remounting the *overlay*, not a bind), OR a mount policy —
-                    // e.g. SELinux, always on under an Android kernel — refused it. Don't assert one
+                    // sidesteps it by remounting the *overlay*, not a bind), OR a mount policy -
+                    // e.g. SELinux, always on under an Android kernel - refused it. Don't assert one
                     // cause; list the alternatives so the message isn't misleading when it's a policy.
                     Error::Unsupported(
-                        "read-only bind mount (:ro) failed with EPERM — this kernel may not support a \
+                        "read-only bind mount (:ro) failed with EPERM - this kernel may not support a \
                          bind remount-RO (common on Android-kernel boards), or a mount policy (e.g. \
                          SELinux) refused it. Alternatives: use --read-only for the box root \
                          (overlay-based, works on Android), or drop ':ro' to mount read-write. On a \
@@ -1100,7 +1100,7 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
 }
 
 /// Resolve (creating as needed) `target` strictly *within* `root_fd`, refusing to traverse any
-/// symlink (`O_NOFOLLOW` per component) — so the path can never escape the new root. Returns an
+/// symlink (`O_NOFOLLOW` per component) - so the path can never escape the new root. Returns an
 /// `O_PATH` fd to the final component (a directory, or a freshly-created empty file when
 /// `is_dir` is false), suitable as a bind-mount target via `/proc/self/fd`.
 fn open_in_root(root_fd: libc::c_int, target: &str, is_dir: bool) -> Result<libc::c_int, Error> {
@@ -1203,11 +1203,11 @@ const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 /// Populate `<root>/dev` BEFORE pivot, while the host's `/dev` is still reachable at its real
 /// path. A device node bound from the host's devtmpfs is only *writable* from an unprivileged
 /// user namespace when bound by its real path (a post-pivot bind via `/proc/self/fd` leaves
-/// `/dev/null` read-only — the workload can't `> /dev/null`), so the bind must happen here.
+/// `/dev/null` read-only - the workload can't `> /dev/null`), so the bind must happen here.
 ///
 /// Symlink-safe: if the image ships `/dev` as a *symlink* (a hostile image pointing it at a host
 /// path), it is removed first and replaced with a real directory, so the tmpfs mount and the
-/// device binds all resolve to a directory we own *inside* the new root — never through the
+/// device binds all resolve to a directory we own *inside* the new root - never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
 fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> Result<(), Error> {
@@ -1224,12 +1224,12 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
                                                 // A fresh tmpfs so device nodes live on a filesystem we own and the image's /dev is shadowed.
                                                 // `mode=755` is essential: the tmpfs default root mode is 1777 (sticky + world-writable), and
                                                 // with `fs.protected_regular` (≥1, default on most distros) an O_CREAT open of a node we don't
-                                                // own in a sticky world-writable dir is rejected with EACCES — that breaks the universal
+                                                // own in a sticky world-writable dir is rejected with EACCES - that breaks the universal
                                                 // `cmd > /dev/null` redirect. A non-sticky 0755 /dev (owned by the box's root) avoids it.
     let ty = cstr("tmpfs")?;
     let opts = cstr("mode=755")?;
     // `MS_NOSUID`: a workload must never gain privilege via a setuid binary it drops on the box-owned
-    // /dev tmpfs. (No `MS_NODEV` — /dev is exactly where the bind-mounted device nodes below must work;
+    // /dev tmpfs. (No `MS_NODEV` - /dev is exactly where the bind-mounted device nodes below must work;
     // this matches runc/Docker, which mount /dev `nosuid,mode=755` and deliberately NOT `nodev`.)
     if unsafe {
         libc::mount(
@@ -1297,7 +1297,7 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
     }
     // `-it`: bind the controlling-PTY SLAVE onto `/dev/console` (like runc/Docker). kern's `-it` slave
     // is a HOST devpts node; the box's own `/dev/pts` is a private `newinstance` that doesn't contain
-    // it, so fd 0's device isn't found under the box's `/dev` and `ttyname()` fails — bash prints
+    // it, so fd 0's device isn't found under the box's `/dev` and `ttyname()` fails - bash prints
     // "ttyname error: No such device" and the `tty` command errors. The slave's host path is still
     // resolvable here (pre-pivot), so read it off `/proc/self/fd/<slave>` and bind the device onto a
     // fresh `/dev/console` node; `ttyname()` then resolves fd 0 to `/dev/console`. Best-effort: a
@@ -1334,7 +1334,7 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
             }
         }
     }
-    // Standard `/dev` symlinks into procfs — `/dev/fd`, `/dev/std{in,out,err}` — exactly as Docker/runc
+    // Standard `/dev` symlinks into procfs - `/dev/fd`, `/dev/std{in,out,err}` - exactly as Docker/runc
     // provide them. Bash/shell process substitution (`<(...)` → `/dev/fd/63`) and many entrypoints
     // (e.g. postgres `initdb`) need them; without `/dev/fd` they fail "No such file or directory". They
     // resolve through the box's own `/proc` (mounted for its PID namespace), so they're safe and correct.
@@ -1349,11 +1349,11 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
         }
     }
     // devpts: a PRIVATE pty instance at `/dev/pts` + a `/dev/ptmx` multiplexer, so programs INSIDE
-    // the box can allocate a controlling terminal — most importantly the in-box sshd for `--ssh`
+    // the box can allocate a controlling terminal - most importantly the in-box sshd for `--ssh`
     // (interactive `ssh box` otherwise fails "PTY allocation request failed"), plus screen/tmux/script.
     // A user namespace is allowed to mount devpts. `newinstance` = a pty namespace private to this box;
     // `ptmxmode=0666` lets the unprivileged workload open the multiplexer. NOSUID|NOEXEC harden it; no
-    // `gid=` (group 5 isn't mapped in a single-uid box, which would EINVAL the mount). Best-effort — a
+    // `gid=` (group 5 isn't mapped in a single-uid box, which would EINVAL the mount). Best-effort - a
     // host/kernel that refuses it just leaves the box without in-box PTYs (kern's own `-it` uses a HOST
     // pty and is unaffected).
     // Only stand up a devpts instance when the box actually needs an in-box PTY (`--ssh` / `-it`).
@@ -1419,7 +1419,7 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
 }
 
 /// Expose a `vgpio:` profile's host devices in the box. Device nodes are bound into the box's own
-/// `/dev` tmpfs (created by `setup_dev` — box-owned, so binding into it can't be redirected by a
+/// `/dev` tmpfs (created by `setup_dev` - box-owned, so binding into it can't be redirected by a
 /// hostile image symlink). If the profile needs sysfs peripherals (pwm/adc/1-wire/leds), a fresh
 /// box-owned `/sys` tmpfs is created (shadowing any image `/sys`, deny-by-default) and only the
 /// requested directories are bound in. Runs BEFORE pivot while the host sources are reachable.
@@ -1442,7 +1442,7 @@ fn setup_vgpio(root: &str, devs: &[String], sysfs: &[String]) -> Result<(), Erro
     Ok(())
 }
 
-/// If `path` is a symlink, remove it — so a hostile image can't redirect a mkdir/mount we're about to
+/// If `path` is a symlink, remove it - so a hostile image can't redirect a mkdir/mount we're about to
 /// perform on it (used pre-pivot, where paths still resolve through the host root). Best-effort.
 fn unlink_if_symlink(path: &str) {
     if let Ok(p) = cstr(path) {
@@ -1482,8 +1482,8 @@ fn make_box_tmpfs(root: &str, leaf: &str) -> Result<(), Error> {
 }
 
 /// Open a `/dev/...` device node by walking the path ONE component at a time from `/dev`, each hop an
-/// `openat(O_PATH|O_NOFOLLOW)`. A plain `open(path, O_NOFOLLOW)` only guards the FINAL component — an
-/// intermediate symlink is still followed — so a component swapped to a symlink at any depth could
+/// `openat(O_PATH|O_NOFOLLOW)`. A plain `open(path, O_NOFOLLOW)` only guards the FINAL component - an
+/// intermediate symlink is still followed - so a component swapped to a symlink at any depth could
 /// redirect the bind. Walking each hop with `O_NOFOLLOW` closes that TOCTOU *by construction* (not by
 /// trusting a pre-canonicalized string): every hop is atomic against its parent fd, `..` is refused,
 /// and the walk can't leave `/dev`. Returns the pinned leaf fd (the caller fstat-checks it and binds
@@ -1531,7 +1531,7 @@ fn open_dev_pinned(src: &str) -> Option<i32> {
 /// Bind host `src` onto `<root>/<base>/<rel>`, creating the parent chain and leaf target inside the
 /// box-owned `<base>` tmpfs (so target creation can't be redirected by a hostile symlink). `is_dir`
 /// selects a recursive directory bind vs a device-node file bind. Best-effort; a `..`/empty
-/// component in `rel` is refused (defence-in-depth — sources are already sanitised).
+/// component in `rel` is refused (defence-in-depth - sources are already sanitised).
 fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
     let comps: Vec<&str> = rel.split('/').collect();
     if comps.iter().any(|c| *c == ".." || c.is_empty()) {
@@ -1576,7 +1576,7 @@ fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
         }
         // TOCTOU-safe SOURCE: walk `/dev/...` one hop at a time (open_dev_pinned) so the fd PINS the
         // exact inode with NO intermediate symlink followed at any depth, then bind FROM the fd via
-        // /proc/self/fd — a component swapped between the resolver's check and this mount can't redirect
+        // /proc/self/fd - a component swapped between the resolver's check and this mount can't redirect
         // us. Re-check on the pinned fd that it's neither a BLOCK device (a host disk) nor a dangerous
         // raw CHAR node.
         let sfd = match open_dev_pinned(src) {
@@ -1591,9 +1591,9 @@ fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
         // 1, minors mem/kmem/port/kmsg = {1,2,4,11,12}), generic SCSI (major 21), and the stable misc
         // majors `/dev/kvm` (10:232) and `/dev/net/tun` (10:200). If host root swapped a vetted char
         // node for a dangerous one between the parent's resolve and this child's bind, the pinned-fd
-        // re-check still refuses it — so this gate matches its claim, not just block nodes. (Only the
+        // re-check still refuses it - so this gate matches its claim, not just block nodes. (Only the
         // stable major:minor identities can be re-checked here; name/dynamic-major nodes rely on the
-        // resolve-time check + no-symlink-follow pin. Legit vgpio devices — gpiochip, i2c 89, spi — are
+        // resolve-time check + no-symlink-follow pin. Legit vgpio devices - gpiochip, i2c 89, spi - are
         // unaffected.)
         let is_dangerous_char = mode == libc::S_IFCHR && {
             let maj = libc::major(st.st_rdev);
@@ -1621,7 +1621,7 @@ fn bind_into(root: &str, base: &str, rel: &str, src: &str, is_dir: bool) {
 
 /// Mount each `vdisk:` profile at `/vdisk/<name>` in the box. A privileged ext4-on-loop mount, when
 /// the host prepared one (`host_dir`), is bind-mounted in; otherwise a `size=`-capped `tmpfs` is
-/// mounted (rootless — RAM-backed, ephemeral). Runs before pivot. The mount is a *separate* mount,
+/// mounted (rootless - RAM-backed, ephemeral). Runs before pivot. The mount is a *separate* mount,
 /// so a vdisk stays writable even under `--read-only` (a vdisk is scratch space by design).
 /// Best-effort per entry.
 fn setup_vdisk(root: &str, vdisks: &[VdiskMount]) -> Result<(), Error> {
@@ -1629,7 +1629,7 @@ fn setup_vdisk(root: &str, vdisks: &[VdiskMount]) -> Result<(), Error> {
         return Ok(());
     }
     // A fresh box-owned `/vdisk` tmpfs (symlink-neutralized) so every per-disk mkdir/mount target is
-    // created inside a filesystem we own — a hostile image shipping `/vdisk` (or `/vdisk/<name>`) as
+    // created inside a filesystem we own - a hostile image shipping `/vdisk` (or `/vdisk/<name>`) as
     // a symlink can't redirect a vdisk mount to a host path. Mirrors `setup_dev`'s `/dev` handling.
     make_box_tmpfs(root, "vdisk")?;
     for vd in vdisks {
@@ -1645,7 +1645,7 @@ fn setup_vdisk(root: &str, vdisks: &[VdiskMount]) -> Result<(), Error> {
         let hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
         match &vd.host_dir {
             // Privileged ext4-loop mount prepared on the host → bind it in, then remount to LOCK
-            // nosuid/nodev on the bind (a first bind ignores those flags — they need MS_REMOUNT).
+            // nosuid/nodev on the bind (a first bind ignores those flags - they need MS_REMOUNT).
             Some(src) => {
                 if let Ok(s) = cstr(src) {
                     unsafe {
@@ -1691,7 +1691,7 @@ fn setup_vdisk(root: &str, vdisks: &[VdiskMount]) -> Result<(), Error> {
 }
 
 /// Mount each `--tmpfs PATH[:size]` as a fresh tmpfs inside the box (pre-pivot, `<root>/PATH`).
-/// `NOSUID|NODEV` — a scratch tmpfs never hosts a device node or setuid binary. The CLI already
+/// `NOSUID|NODEV` - a scratch tmpfs never hosts a device node or setuid binary. The CLI already
 /// blocked the hardened mounts (`/proc`, `/sys`, `/dev`) and validated the path/size. Best-effort per
 /// entry; the mountpoint's parents are created on the way in.
 fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
@@ -1702,7 +1702,7 @@ fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
             continue;
         }
         let full = format!("{root}{path}");
-        // mkdir -p the target chain inside the new root — pre-pivot, so paths resolve through the
+        // mkdir -p the target chain inside the new root - pre-pivot, so paths resolve through the
         // HOST root. Neutralize a symlink at EACH component first: a hostile image shipping an
         // intermediate dir (or the leaf) as a symlink could otherwise redirect the mkdir/mount out of
         // the rootfs. Same discipline as `setup_dev`/`setup_secrets`.
@@ -1739,7 +1739,7 @@ fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
 /// Append `--add-host NAME:IP` entries to the box's `/etc/hosts` (Docker parity). Best-effort,
 /// pre-pivot, writing into the box's OWN root (an overlay copy-up, not the shared image). The path is
 /// resolved with [`open_in_root`], which refuses a symlink at EVERY component (not just the final one)
-/// and rejects `.`/`..` — so a hostile image shipping `/etc` OR `/etc/hosts` as a symlink can't redirect
+/// and rejects `.`/`..` - so a hostile image shipping `/etc` OR `/etc/hosts` as a symlink can't redirect
 /// the append out of the box root (this runs pre-pivot, where a naive open would resolve through the
 /// HOST root). Content is guarded too: an entry whose name or IP carries whitespace/control is skipped,
 /// so a crafted value can't inject extra `/etc/hosts` lines.
@@ -1770,7 +1770,7 @@ fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
     let path_fd = open_in_root(root_fd, "etc/hosts", false);
     unsafe { libc::close(root_fd) };
     let Ok(path_fd) = path_fd else {
-        return; // a symlinked /etc or /etc/hosts (or a bad component) — refuse rather than escape
+        return; // a symlinked /etc or /etc/hosts (or a bad component) - refuse rather than escape
     };
     // O_PATH can't be written; reopen the SAME inode via /proc/self/fd for the append (no re-resolution
     // of the box path, so the symlink guard above still holds).
@@ -1795,25 +1795,25 @@ fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
 /// on the host before the fork; here we mount a fresh, box-owned, RAM-backed `tmpfs` at
 /// `/run/secrets` (so a secret never lands in the persisted overlay upper) and write each file. Runs
 /// before pivot. A hostile image shipping `/run/secrets` as a symlink is neutralised, and each file
-/// is created `O_NOFOLLOW | O_EXCL` inside the tmpfs we own — the write can't be redirected out.
+/// is created `O_NOFOLLOW | O_EXCL` inside the tmpfs we own - the write can't be redirected out.
 fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> Result<(), Error> {
     if secrets.is_empty() {
         return Ok(());
     }
     // INVARIANT (do not break): the HOST runtime dir `$XDG_RUNTIME_DIR/kern` (registry, health, and
-    // exit sidecars) is NEVER mounted into a box — it isn't in the new root after pivot, so a workload
+    // exit sidecars) is NEVER mounted into a box - it isn't in the new root after pivot, so a workload
     // can't read or forge it. `kern compose`'s `depends_completed` trusts that a box CANNOT write
     // another service's `exit/<…>` sidecar. If a future feature needs in-box supervision state, mount
     // a NARROW box-owned path (like `/run/secrets` below), never bind the host `kern` runtime tree.
     //
     // `/run` may not exist in a minimal rootfs; create the chain. When a wide `/run` tmpfs is already
-    // mounted (the `--ssh` path), `/run/secrets` is just a subdir on it — still RAM-backed and off the
+    // mounted (the `--ssh` path), `/run/secrets` is just a subdir on it - still RAM-backed and off the
     // overlay upper. Otherwise mount a narrow box-owned tmpfs on `/run/secrets` (0700, NOSUID|NODEV)
     // so the rest of the image's `/run` is left intact.
     //
     // This runs pre-pivot, so paths still resolve through the HOST root: a hostile image shipping
     // `/run` (or `/run/secrets`) as a symlink would redirect these mkdir/mount calls. Neutralize a
-    // symlink at BOTH components before touching them — same discipline as `setup_dev`/`make_box_tmpfs`
+    // symlink at BOTH components before touching them - same discipline as `setup_dev`/`make_box_tmpfs`
     // (the `--ssh` path already got a fresh `/run` via `make_box_tmpfs`, so this is a no-op there).
     unlink_if_symlink(&format!("{root}/run"));
     if let Ok(runp) = cstr(&format!("{root}/run")) {
@@ -1851,7 +1851,7 @@ fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> 
             Err(_) => continue,
         };
         // O_EXCL: the tmpfs is freshly ours, so a pre-existing entry would be an anomaly; O_NOFOLLOW:
-        // never traverse a symlink out of the tmpfs. Mode 0400 — read-only to the owner.
+        // never traverse a symlink out of the tmpfs. Mode 0400 - read-only to the owner.
         let fd = unsafe {
             libc::open(
                 cp.as_ptr(),
@@ -1860,7 +1860,7 @@ fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> 
             )
         };
         if fd < 0 {
-            // The tmpfs is freshly box-owned, so this shouldn't happen — but never let a secret go
+            // The tmpfs is freshly box-owned, so this shouldn't happen - but never let a secret go
             // missing *silently* (an app would fall back to a weaker default). Say so.
             eprintln!(
                 "kern: warning: could not materialise secret '{name}' at /run/secrets ({})",
@@ -1887,7 +1887,7 @@ fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> 
     Ok(())
 }
 
-/// Remount the box's `/dev` tmpfs read-only — for `--read-only` boxes, so `/dev` isn't a writable
+/// Remount the box's `/dev` tmpfs read-only - for `--read-only` boxes, so `/dev` isn't a writable
 /// hole in an otherwise read-only root. It's our own tmpfs (created in this user namespace), so
 /// the remount is permitted. Blocks creating/renaming entries in `/dev`; the bound device nodes
 /// stay usable (separate mounts; their writes go through the device driver, not the tmpfs).
@@ -1932,7 +1932,7 @@ struct IdRange {
     gid_count: u32,
 }
 
-/// Resolve a setuid id-map helper by **absolute trusted path only** — deliberately NOT via `$PATH`.
+/// Resolve a setuid id-map helper by **absolute trusted path only** - deliberately NOT via `$PATH`.
 /// `newuidmap`/`newgidmap` are security-sensitive (they write our uid map with privilege); resolving
 /// them through `$PATH` would let a writable entry like `~/.local/bin` shadow the real system binary
 /// and feed us a bogus mapping. Only the standard system bin dirs are trusted.
@@ -1957,7 +1957,7 @@ pub fn username(uid: u32) -> Option<String> {
 
 /// `(start, count)` from a `name:start:count` (or `id:start:count`) row in `/etc/subuid` or
 /// `/etc/subgid`, with `count > 1`. A row matching the login **name** wins (returned immediately);
-/// a numeric-uid row is only used as a fallback — mirroring how shadow's `newuidmap` resolves the
+/// a numeric-uid row is only used as a fallback - mirroring how shadow's `newuidmap` resolves the
 /// allocation, so a stray numeric row never shadows the user's named one.
 pub fn sub_range(file: &str, name: Option<&str>, id: u32) -> Option<(u32, u32)> {
     let content = std::fs::read_to_string(file).ok()?;
@@ -2002,7 +2002,7 @@ fn detect_id_range(euid: u32, egid: u32) -> Option<IdRange> {
     })
 }
 
-/// `newuidmap`/`newgidmap PID 0 own 1 1 sub count` — map box id 0 → caller, box ids 1.. → the
+/// `newuidmap`/`newgidmap PID 0 own 1 1 sub count` - map box id 0 → caller, box ids 1.. → the
 /// subordinate range. `bin` is a trusted absolute path. Returns whether the helper exited 0.
 fn run_idmap(bin: &std::path::Path, pid: i32, own: u32, sub: u32, count: u32) -> bool {
     std::process::Command::new(bin)
@@ -2042,7 +2042,7 @@ fn apply_userns_range(
         return Err(Error::last("fork(idmap helper)"));
     }
     if helper == 0 {
-        // Helper — still in the host user namespace, so the setuid map helpers have privilege.
+        // Helper - still in the host user namespace, so the setuid map helpers have privilege.
         unsafe {
             libc::close(p2h[1]);
             libc::close(h2p[0]);
@@ -2091,14 +2091,14 @@ fn apply_userns_range(
     }
     if n != 1 || got[0] != b'1' {
         // newuidmap/newgidmap are present (detect_id_range found them + a sub-id allocation) but
-        // couldn't actually apply the range here — typically the helper isn't setuid-root, or there
+        // couldn't actually apply the range here - typically the helper isn't setuid-root, or there
         // is no matching /etc/subgid row. We're already in a fresh, still-unmapped user namespace, so
         // fall back to the safe single-uid self-map (identical to the no-range default) instead of
-        // aborting the box — mirroring how an *absent* helper already degrades gracefully. (If a
+        // aborting the box - mirroring how an *absent* helper already degrades gracefully. (If a
         // partial map already populated uid_map, the self-map write fails and that unrecoverable
         // half-mapped state is surfaced as the error.)
         eprintln!(
-            "kern: --uid-range mapping via newuidmap/newgidmap failed (helper present but not usable here) — using single-uid map"
+            "kern: --uid-range mapping via newuidmap/newgidmap failed (helper present but not usable here) - using single-uid map"
         );
         return write_single_uid_map(euid, egid);
     }
@@ -2114,13 +2114,13 @@ fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
         // Denying setgroups is the kernel's prerequisite for an unprivileged `gid_map`. Ubuntu's
         // `apparmor_restrict_unprivileged_userns` policy can let a userns be created (full caps, empty
         // maps) yet still refuse *this* write with EACCES (the AppArmor mediation) or EPERM (a plain
-        // kernel denial) — the environment permits the namespace but not a rootless id map, so a box
+        // kernel denial) - the environment permits the namespace but not a rootless id map, so a box
         // genuinely can't run here. Report it as unsupported (and name user namespaces) so foreground
         // and detached fail identically and the skip-graceful tests skip either way, rather than
         // leaking a bare "setgroups: Permission denied".
         if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
             return Err(Error::Unsupported(
-                "unprivileged user namespaces are restricted here — an AppArmor \
+                "unprivileged user namespaces are restricted here - an AppArmor \
                  apparmor_restrict_unprivileged_userns policy allows the namespace but blocks \
                  denying setgroups for the rootless uid map",
             ));
@@ -2164,22 +2164,22 @@ impl Drop for ReadyGuard {
 }
 
 /// Like [`run_in_sandbox`], but invokes `on_started` in the parent with the box's PID-1 pid (in
-/// the host pid namespace) right after the fork — so a supervisor can record it for `kern exec`
+/// the host pid namespace) right after the fork - so a supervisor can record it for `kern exec`
 /// to join the box's namespaces later.
 ///
 /// `ready_fd`, if set, is the write end of a readiness pipe: it is closed automatically when the
 /// box's command `execvp`s (`FD_CLOEXEC`), so a waiting reader gets EOF = "the box is up", and one
-/// byte is written to it first if setup/exec fails — letting a detached launcher report a truthful
+/// byte is written to it first if setup/exec fails - letting a detached launcher report a truthful
 /// "started" / "failed to start" with zero polling. The parent closes its own copy after the fork.
 ///
 /// The fd is wrapped in a [`ReadyGuard`] so that *any* early error (a failed `unshare`,
-/// `uid_map`, or uid-range mapping — all of which return before the box is even forked) signals
+/// `uid_map`, or uid-range mapping - all of which return before the box is even forked) signals
 /// failure on drop. Without this, an error before the fork would close the pipe cleanly and the
 /// launcher would misread the EOF as a successful start.
 ///
 /// `die_with_parent` is set ONLY for a FOREGROUND box (a plain `kern box`, not `-d`/`-it`/managed):
 /// this supervisor arms `PR_SET_PDEATHSIG(SIGKILL)` relative to its launcher and the box's PID 1
-/// arms it relative to this supervisor, so a hard kill of the launcher (SIGKILL/OOM — where no
+/// arms it relative to this supervisor, so a hard kill of the launcher (SIGKILL/OOM - where no
 /// cleanup can run) cascades launcher → supervisor → pidns-init instead of orphaning the box until
 /// the `--timeout` backstop fires. It MUST stay false for a detached box, whose launcher exits right
 /// after forking the supervisor (arming would kill the box instantly).
@@ -2199,15 +2199,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         return Err(Error::Unsupported("no command given to run in the sandbox"));
     }
     // FOREGROUND box: die with the launcher. Arm `PR_SET_PDEATHSIG(SIGKILL)` so that if the process
-    // that launched this `kern` (our parent) is hard-killed — SIGKILL/OOM, where no exit path or
-    // Drop can run `kern stop` — this supervisor is torn down too, rather than being reparented and
+    // that launched this `kern` (our parent) is hard-killed - SIGKILL/OOM, where no exit path or
+    // Drop can run `kern stop` - this supervisor is torn down too, rather than being reparented and
     // keeping the box alive until the `--timeout` backstop. PDEATHSIG is per parent *thread*; the
     // fork below already requires this process to be single-threaded, so it fires on the launcher's
     // real death. Skipped for `-d`/`-it`/managed (see `die_with_parent`).
     if die_with_parent {
         // Capture the launcher BEFORE arming, then re-check: PDEATHSIG only fires on a *future*
         // parent death, so if the launcher already exited (its child `kern` reparented) between our
-        // spawn and this prctl, the signal would never come — detect the reparent and refuse to
+        // spawn and this prctl, the signal would never come - detect the reparent and refuse to
         // start, leaving no orphaned box.
         let launcher = unsafe { libc::getppid() };
         unsafe {
@@ -2238,7 +2238,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // Best-effort cgroup v2 cap (memory + PIDs) BEFORE namespacing, so the forked workload
     // inherits it. Degrades gracefully where the hierarchy isn't delegated. The returned guard owns
     // the cgroup dir and removes it on drop; we bind it to `_cg` so it lives until this function
-    // returns — which is AFTER the `waitpid` below, when the box (and its PID-namespace descendants)
+    // returns - which is AFTER the `waitpid` below, when the box (and its PID-namespace descendants)
     // are dead and the cgroup is empty, so the `rmdir` in `Drop` succeeds. Without this the scope-less
     // fast path (no systemd `--collect`) would leak one cgroup dir per box.
     let cg = crate::cgroup::apply_limits(
@@ -2254,9 +2254,9 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     );
 
     // FAIL-CLOSED on the direct fast path. When we DELIBERATELY skipped the per-box systemd scope
-    // (`took_direct_cap_path()` — the SAME canonical predicate `reexec` used, so they can't diverge), the
+    // (`took_direct_cap_path()` - the SAME canonical predicate `reexec` used, so they can't diverge), the
     // box's OWN cgroup is the sole enforcer. `apply_limits` returns `None` iff a MANDATORY cap didn't bite
-    // (memory + pids ALWAYS carry a default cap, verified per-dimension inside apply_limits) — so a `None`
+    // (memory + pids ALWAYS carry a default cap, verified per-dimension inside apply_limits) - so a `None`
     // here means we'd run with a missing OOM/fork-bomb backstop. REFUSE. No `caps_requested` gate: the
     // default memory/pids caps are mandatory, so a default box (no flags) must also be refused if they
     // didn't take. Hosts with no user systemd never took the direct path → best-effort, no refusal; the
@@ -2278,7 +2278,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         if crate::cgroup::env_claims_enforcer_but_none_real() {
             eprintln!(
                 "kern: warning: an outer-enforcer env var (KERN_SCOPE/KERN_MANAGED/KERN_BUILD_STEP) is set \
-                 but NO cgroup cap is in force — the box runs UNCAPPED. If kern did not set that variable, a \
+                 but NO cgroup cap is in force - the box runs UNCAPPED. If kern did not set that variable, a \
                  caller may be bypassing the resource limits."
             );
         }
@@ -2289,9 +2289,9 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     let egid = unsafe { libc::getegid() };
 
     // `--pod`: JOIN the pod holder's existing user + net namespace (created by `kern pod create`)
-    // instead of unsharing our own — so every box in the pod shares one loopback network. We start
+    // instead of unsharing our own - so every box in the pod shares one loopback network. We start
     // in the host user ns, where we are privileged over our descendant holder, so we can `setns`
-    // into it; then we unshare only pid/uts/ipc (mount is unshared in the child). No uid map — the
+    // into it; then we unshare only pid/uts/ipc (mount is unshared in the child). No uid map - the
     // holder already mapped the pod user ns. This branch is fully separate from the normal one, so a
     // non-pod box is byte-for-byte unaffected.
     if let Some(holder) = spec.pod_holder {
@@ -2328,8 +2328,8 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
             ));
         }
     } else {
-        // Full namespace set: user + PID + UTS (hostname) + IPC, and — unless `--net` shares the host
-        // network — an isolated (loopback-only) network namespace. The mount namespace is unshared in
+        // Full namespace set: user + PID + UTS (hostname) + IPC, and - unless `--net` shares the host
+        // network - an isolated (loopback-only) network namespace. The mount namespace is unshared in
         // the child (so its pivot doesn't touch the parent). With CLONE_NEWPID the *next* fork
         // becomes PID 1.
         let mut ns_flags =
@@ -2338,7 +2338,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
             ns_flags |= libc::CLONE_NEWNET;
         }
         // Map the user namespace. The DEFAULT is the dependency-free single-uid identity map (box uid
-        // 0 = caller) — no subprocess, one extra id in the namespace: the fastest and most isolated
+        // 0 = caller) - no subprocess, one extra id in the namespace: the fastest and most isolated
         // option. `--uid-range` opts into a FULL subordinate range (box uid 0 → caller, uids 1..N →
         // the caller's `/etc/subuid` range) so software that drops to or `chown`s *other* uids works
         // (`apt`/`dpkg`, daemons that drop to `www-data`, …); it needs the setuid `newuidmap`/
@@ -2346,10 +2346,10 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         let range = if spec.uid_range {
             let r = detect_id_range(euid, egid);
             if r.is_none() {
-                // Requested but unavailable — don't silently behave as if mapped: tell the user, then
+                // Requested but unavailable - don't silently behave as if mapped: tell the user, then
                 // fall through to the safe single-uid map (apt-style workloads just lack extra uids).
                 eprintln!(
-                    "kern: --uid-range requested but unavailable (need newuidmap/newgidmap + an /etc/subuid+/etc/subgid allocation) — using single-uid map"
+                    "kern: --uid-range requested but unavailable (need newuidmap/newgidmap + an /etc/subuid+/etc/subgid allocation) - using single-uid map"
                 );
             }
             r
@@ -2371,10 +2371,10 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         }
     }
 
-    // `--privileged` relaxes the seccomp filter so a NESTED box can create its own namespaces — but
+    // `--privileged` relaxes the seccomp filter so a NESTED box can create its own namespaces - but
     // ONLY when the box's root actually maps to an UNPRIVILEGED host uid. Decide from the EFFECTIVE
     // userns uid_map now that it is established (the single-uid / `--uid-range` map written above, OR
-    // the holder's map we joined via `--pod` setns) — NOT from the caller's euid. In pod mode the
+    // the holder's map we joined via `--pod` setns) - NOT from the caller's euid. In pod mode the
     // mapping is the holder's, so an euid-only proxy could relax a box whose root maps to host root;
     // reading the actual map closes that. Fails CLOSED on anything it can't confirm. (The CLI also
     // refuses `--privileged` as real root up front; this is the authoritative, property-based gate.)
@@ -2386,14 +2386,14 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     }
     if pid == 0 {
         // CHILD (box PID 1): set up and exec. Take the readiness fd from the guard (this process
-        // now owns the signalling) and mark it close-on-exec — a successful `execvp` then closes
+        // now owns the signalling) and mark it close-on-exec - a successful `execvp` then closes
         // it, so the waiting launcher reads EOF = "the box is up". On any error below we write one
-        // byte first, so it learns it failed. (The guard is disarmed; the child never unwinds —
-        // it always exec()s or `_exit`s — so its Drop never runs here.)
+        // byte first, so it learns it failed. (The guard is disarmed; the child never unwinds -
+        // it always exec()s or `_exit`s - so its Drop never runs here.)
         //
         // FOREGROUND box: complete the death cascade. Arm `PR_SET_PDEATHSIG(SIGKILL)` relative to
-        // the supervisor (our parent) FIRST, so if the supervisor is hard-killed — e.g. because ITS
-        // launcher died and its own PDEATHSIG fired above — this pidns init dies too, and killing
+        // the supervisor (our parent) FIRST, so if the supervisor is hard-killed - e.g. because ITS
+        // launcher died and its own PDEATHSIG fired above - this pidns init dies too, and killing
         // PID 1 tears down the box's whole namespace. It survives the workload's (non-setuid)
         // execve; on the `--init` path PID 1 never execs and stays armed. Only for a foreground box:
         // a detached box's supervisor is its persistent owner, and teardown there stays with the
@@ -2401,11 +2401,11 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         //
         // Two honest bounds on this hop. (a) It is COOPERATIVE for a hostile PID 1: the box's own init
         // could `prctl(PR_SET_PDEATHSIG, 0)` to clear it (prctl isn't seccomp-blocked) or a setuid
-        // entrypoint clears it on execve — that only drops the anti-orphan guarantee back to the
+        // entrypoint clears it on execve - that only drops the anti-orphan guarantee back to the
         // `--timeout` backstop (an availability property, not an isolation boundary). (b) Unlike the
         // supervisor leg we do NOT re-check `getppid()` after arming: this child is already PID 1 of
         // its new pid namespace (CLONE_NEWPID was unshared above), so `getppid()` reads 0 regardless of
-        // the host-side supervisor's fate — a supervisor death in the fork→prctl microsecond window
+        // the host-side supervisor's fate - a supervisor death in the fork→prctl microsecond window
         // simply falls through to the `--timeout` backstop, exactly as before this fix.
         if die_with_parent {
             unsafe {
@@ -2437,7 +2437,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     }
 
     // PARENT (supervisor): the box was forked and now owns readiness signalling, so disarm our
-    // guard and just drop our copy of the fd — the launcher then sees EOF exactly when the box
+    // guard and just drop our copy of the fd - the launcher then sees EOF exactly when the box
     // exec()s (or the failure byte if the box's own setup fails), not before.
     if let Some(fd) = ready.disarm() {
         unsafe { libc::close(fd) };
@@ -2448,7 +2448,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         f.activate(pid);
     }
     // `-it`: hand the terminal to the box. Drop our copy of the slave so the master sees EOF when
-    // the box exits, then pump host stdio <-> master until then. Single-threaded by design — the
+    // the box exits, then pump host stdio <-> master until then. Single-threaded by design - the
     // fork above must run in a single-threaded process (the child does non-async-signal-safe setup),
     // so we never spawn a pump thread.
     if let Some(master) = tty_master {
@@ -2474,7 +2474,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
 /// exit code. Single-threaded poll loop: host stdin → master, master → host stdout. A master EOF
 /// (the box closed its slave) ends it; then we reap the box. The host terminal's raw mode + window
 /// size are the CLI's responsibility (set before this call, restored after).
-/// `-it`: adopt the PTY `slave` as the controlling terminal — a new session (so we may claim a
+/// `-it`: adopt the PTY `slave` as the controlling terminal - a new session (so we may claim a
 /// controlling tty), make the slave it, then dup it onto stdio. Shared by the `box` child and the
 /// `exec` child so both get an identical interactive terminal.
 fn adopt_controlling_tty(slave: i32) {
@@ -2508,7 +2508,7 @@ fn pty_pump_and_wait(master: i32, pid: i32) -> i32 {
         ];
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue; // SIGWINCH/SIGCHLD etc. — re-poll
+                continue; // SIGWINCH/SIGCHLD etc. - re-poll
             }
             break;
         }
@@ -2556,7 +2556,7 @@ fn write_all(fd: i32, mut data: &[u8]) {
 /// Defense-in-depth (least privilege): strip capabilities the box never legitimately needs from
 /// the workload's effective/permitted/inheritable sets AND its bounding set, so neither the
 /// workload nor a setuid/file-cap binary inside it can ever wield them. These are namespaced (they
-/// grant no power over host-owned resources — verified) and several are already seccomp-blocked;
+/// grant no power over host-owned resources - verified) and several are already seccomp-blocked;
 /// dropping them shrinks the attack surface against kernel bugs reachable only with the cap.
 /// KEPT (so apt/apk, chown, and privilege-drop to non-root keep working): CHOWN, DAC_*, FOWNER,
 /// FSETID, KILL, SETUID, SETGID, SETPCAP, NET_BIND_SERVICE, NET_RAW, NET_ADMIN (also used for `lo`),
@@ -2581,7 +2581,7 @@ const DEFAULT_DROP: &[u32] = &[
 ];
 
 /// `--cap-add`/`--cap-drop` policy layered on top of the always-dropped [`DEFAULT_DROP`] set. Cap
-/// numbers (not names) — the CLI resolves names and rejects unknown ones before the fork. Default
+/// numbers (not names) - the CLI resolves names and rejects unknown ones before the fork. Default
 /// (`Default::default()`) drops exactly the dangerous set. All cap numbers are < 64 (the current
 /// `CAP_LAST_CAP` is 40), so a single `u64` bitmask covers the whole set.
 #[derive(Default, Clone)]
@@ -2590,13 +2590,13 @@ pub struct CapSpec {
     pub drop_all: bool,
     /// Extra caps to drop beyond the default dangerous set.
     pub drops: Vec<u32>,
-    /// Caps to KEEP — removed from the computed drop set (so `--cap-add` wins over a drop).
+    /// Caps to KEEP - removed from the computed drop set (so `--cap-add` wins over a drop).
     pub adds: Vec<u32>,
 }
 
 /// The bitmask (bit N = cap N) of the dangerous caps kern ALWAYS drops from a box's bounding set
 /// ([`DEFAULT_DROP`]). `kern top` reads a box's `CapBnd` and, if it intersects this mask, knows the box
-/// re-added a normally-dropped cap via `--cap-add` — i.e. it is LESS confined than the default. A
+/// re-added a normally-dropped cap via `--cap-add` - i.e. it is LESS confined than the default. A
 /// rootless box's `CapEff` is full-but-namespaced (not a signal), so the bounding set is what matters.
 pub fn default_dropped_cap_mask() -> u64 {
     DEFAULT_DROP.iter().fold(0u64, |m, &c| m | (1u64 << c))
@@ -2704,7 +2704,7 @@ fn drop_dangerous_caps(spec: &CapSpec) {
 }
 
 /// After `fork()`, close every inherited fd `>= 3` except `keep` (pass `-1` to keep none). A
-/// long-lived helper child (a `-p` forwarder, a health-checker) must shed the parent's fds — most
+/// long-lived helper child (a `-p` forwarder, a health-checker) must shed the parent's fds - most
 /// importantly a detached box's readiness-pipe write end, whose lingering copy would stop the
 /// launcher from ever seeing EOF and hang `kern box -d`.
 ///
@@ -2750,7 +2750,7 @@ fn bring_loopback_up() {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         ifr.ifr_name[0] = b'l' as libc::c_char;
         ifr.ifr_name[1] = b'o' as libc::c_char;
-        // `ioctl`'s request arg is `c_ulong` on x86_64 but `c_int` on aarch64 — `as _` casts the
+        // `ioctl`'s request arg is `c_ulong` on x86_64 but `c_int` on aarch64 - `as _` casts the
         // SIOC* constant to whatever this target expects, so this compiles on every arch.
         if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0 {
             ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
@@ -2769,13 +2769,13 @@ pub fn run_pod_holder() -> ! {
     // A pod holder maps a RANGED uid map (`KERN_POD_UID_RANGE=1`, set by `pod create --uid-range`)
     // when the pod will host OCI images that drop privilege in their entrypoint (postgres/redis/nginx/
     // …). Members `setns` into this shared user ns and inherit the range, so their drop to a service
-    // uid works — the 0.6 official-image fix, extended to the pod path. Default (no env) = the single-
+    // uid works - the 0.6 official-image fix, extended to the pod path. Default (no env) = the single-
     // uid self-map: faster (no newuidmap), more isolated (one uid), for a pod of root-only services.
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
     let want_range = std::env::var_os("KERN_POD_UID_RANGE").is_some();
     let ns = libc::CLONE_NEWUSER | libc::CLONE_NEWNET;
     // The range needs newuidmap + an /etc/subuid allocation; if either is missing, fall back to the
-    // single-uid map (honest degrade — official images in this pod will then fail with the F1 warning,
+    // single-uid map (honest degrade - official images in this pod will then fail with the F1 warning,
     // not silently). detect_id_range is resolved BEFORE the unshare (it must run in the init userns).
     let range = if want_range {
         detect_id_range(euid, egid)
@@ -2787,7 +2787,7 @@ pub fn run_pod_holder() -> ! {
             // apply_userns_range does its own unshare(ns) + fork-helper newuidmap/newgidmap + sync.
             if let Err(e) = apply_userns_range(ns, euid, egid, &r) {
                 eprintln!(
-                    "kern: pod: ranged user-ns map failed ({e}) — falling back to single-uid"
+                    "kern: pod: ranged user-ns map failed ({e}) - falling back to single-uid"
                 );
                 // apply_userns_range unshares before it can fail on the map write; we may already be in
                 // a fresh userns. Try the single-uid self-map here as the honest fallback.
@@ -2808,7 +2808,7 @@ pub fn run_pod_holder() -> ! {
                 unsafe { libc::_exit(1) };
             }
             if want_range {
-                eprintln!("kern: pod: --uid-range requested but unavailable (need newuidmap/newgidmap + /etc/subuid) — single-uid map");
+                eprintln!("kern: pod: --uid-range requested but unavailable (need newuidmap/newgidmap + /etc/subuid) - single-uid map");
             }
             if write_single_uid_map(euid, egid).is_err() {
                 eprintln!("kern: pod: could not map the pod user namespace");
@@ -2822,7 +2822,7 @@ pub fn run_pod_holder() -> ! {
     println!("pod-ready");
     // Release the caller's inherited stdio: we're now a detached daemon that `pause()`s for the pod's
     // whole lifetime. If we kept the inherited stderr (fd 2) open, ANY caller reading our parent's
-    // combined output — `kern compose up 2>&1 | …`, `$(kern pod create …)`, a CI log pipe — would never
+    // combined output - `kern compose up 2>&1 | …`, `$(kern pod create …)`, a CI log pipe - would never
     // see EOF and would appear to hang for as long as the pod lives. Point fd 1 and fd 2 at /dev/null so
     // those pipes close now, while keeping the descriptors valid for the rest of our life.
     unsafe {
@@ -2844,7 +2844,7 @@ pub fn run_pod_holder() -> ! {
 
 /// Blocking `waitpid(pid)` that retries on `EINTR`, writing the status through `status` and returning
 /// the raw `waitpid` return (`>= 0` = reaped, `< 0` = a real, non-EINTR error). A signal
-/// (SIGCHLD/SIGWINCH/…) can interrupt a blocking `waitpid` with the child STILL ALIVE — returning early
+/// (SIGCHLD/SIGWINCH/…) can interrupt a blocking `waitpid` with the child STILL ALIVE - returning early
 /// there would leave the box unreaped (a zombie, and for the supervisor path a cgroup guard dropped on a
 /// non-empty cgroup → EBUSY leak). Looping until the child is actually reaped, or a non-EINTR error,
 /// makes every foreground reap robust. One helper so all reap sites share the same discipline.
@@ -2892,7 +2892,7 @@ pub fn exec_in_box(
     let argv: Vec<CString> = command.iter().map(|s| cstr(s)).collect::<Result<_, _>>()?;
 
     // Open every namespace fd BEFORE any setns: once we enter the mount namespace, `/proc` points
-    // at the box's, so `/proc/<pid1>/ns/*` would no longer resolve. Order of *entry* matters —
+    // at the box's, so `/proc/<pid1>/ns/*` would no longer resolve. Order of *entry* matters -
     // user first (so we hold CAP_SYS_ADMIN in the box's userns for the rest); pid before the fork.
     let ns_order: [(&str, libc::c_int); 6] = [
         ("user", libc::CLONE_NEWUSER),
@@ -2909,11 +2909,11 @@ pub fn exec_in_box(
         if fd >= 0 {
             fds.push((fd, flag));
         }
-        // A missing ns file means it isn't separate (e.g. `--net` shares the host net ns) —
+        // A missing ns file means it isn't separate (e.g. `--net` shares the host net ns) -
         // there's nothing to join, so skipping is correct.
     }
     // Refuse if the box's core namespaces aren't there to join: if PID 1 has exited (a race), its
-    // `/proc/<pid1>/ns/*` vanish, and without this we'd fork+exec in the HOST namespaces — running
+    // `/proc/<pid1>/ns/*` vanish, and without this we'd fork+exec in the HOST namespaces - running
     // the command UNSANDBOXED. user + mnt + pid must all be present.
     for req in [libc::CLONE_NEWUSER, libc::CLONE_NEWNS, libc::CLONE_NEWPID] {
         if !fds.iter().any(|(_, f)| *f == req) {
@@ -2951,7 +2951,7 @@ pub fn exec_in_box(
     if pid == 0 {
         // For a `--health-timeout` probe: become a **session leader** (`setsid`) so this grandchild is
         // a new process-group/session leader inside the box's pid namespace whose host-visible id is
-        // `pid` — the probe and everything it forks then live in that group, so the parent can
+        // `pid` - the probe and everything it forks then live in that group, so the parent can
         // `kill(-pid)` the whole subtree on timeout. Also arm `PR_SET_PDEATHSIG(SIGKILL)` so if the
         // waiting stub dies for any reason the probe is torn down too. Skip under a tty (the terminal
         // pump owns the session).
@@ -2968,11 +2968,11 @@ pub fn exec_in_box(
             }
         }
         set_clean_env("", env);
-        // `-it`: adopt the PTY slave as the controlling terminal (before seccomp — a setup syscall).
+        // `-it`: adopt the PTY slave as the controlling terminal (before seccomp - a setup syscall).
         if let Some(slave) = tty_slave {
             adopt_controlling_tty(slave);
         }
-        // Honor `--workdir` — fatal if it can't be entered (consistent with `kern box -w`, so a
+        // Honor `--workdir` - fatal if it can't be entered (consistent with `kern box -w`, so a
         // typo'd dir is an error, not a silent run in `/`).
         if let Some(wd) = workdir {
             let entered = cstr(wd).is_ok_and(|c| unsafe { libc::chdir(c.as_ptr()) } == 0);
@@ -2983,15 +2983,15 @@ pub fn exec_in_box(
         }
         // Parity with a box's own workload: drop the always-dropped dangerous caps here too, so an
         // `exec`'d command isn't more privileged than the box's PID 1 (which ran `drop_dangerous_caps`
-        // + seccomp before its own exec). The box's *custom* `--cap-drop`/`--user` aren't reapplied —
-        // they aren't recorded per box — but the dangerous baseline + seccomp match.
+        // + seccomp before its own exec). The box's *custom* `--cap-drop`/`--user` aren't reapplied -
+        // they aren't recorded per box - but the dangerous baseline + seccomp match.
         drop_dangerous_caps(&CapSpec::default());
-        // Fail CLOSED if seccomp can't install — never run the exec'd command unfiltered (the box's
+        // Fail CLOSED if seccomp can't install - never run the exec'd command unfiltered (the box's
         // PID 1 fails closed on this same call; `exec` must match, not fall through unprotected).
         // `exec` keeps the STRICT filter regardless of the box's `--privileged` (which isn't
-        // recorded per box) — an exec'd command being *more* constrained than PID 1 is always safe.
+        // recorded per box) - an exec'd command being *more* constrained than PID 1 is always safe.
         if crate::seccomp::install(false).is_err() {
-            eprintln!("kern: exec: seccomp filter could not be installed — refusing to run");
+            eprintln!("kern: exec: seccomp filter could not be installed - refusing to run");
             unsafe { libc::_exit(126) };
         }
         eprintln!("kern: exec failed: {}", exec(&argv));
@@ -3008,7 +3008,7 @@ pub fn exec_in_box(
     let mut status = 0i32;
     match timeout_secs {
         // `--health-timeout`: poll, and on expiry SIGKILL the whole probe group (the in-box grandchild
-        // and anything it spawned), then reap — so a hung probe can't leak a live process into the box
+        // and anything it spawned), then reap - so a hung probe can't leak a live process into the box
         // every interval. Returns 124 (the `timeout(1)` convention) on expiry.
         Some(secs) if secs > 0 => {
             let mut waited_ms = 0u64;
@@ -3022,7 +3022,7 @@ pub fn exec_in_box(
                 }
                 if waited_ms >= secs * 1000 {
                     // Kill the probe's whole session/group (the grandchild made itself the leader), so
-                    // a probe that forked helpers is fully torn down — not just its top process; then
+                    // a probe that forked helpers is fully torn down - not just its top process; then
                     // reap the grandchild. `kill(-pid)` is the load-bearing one; the direct `kill(pid)`
                     // covers the (skipped-setsid) edge.
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -3073,7 +3073,7 @@ mod ready_guard_tests {
 
     #[test]
     fn disarmed_guard_is_silent() {
-        // Success path: the box child / parent disarm the guard, so dropping it writes nothing —
+        // Success path: the box child / parent disarm the guard, so dropping it writes nothing -
         // the read end then sees EOF only once the real fd owner closes it.
         let (rd, wr) = pipe();
         let mut g = ReadyGuard(Some(wr));
@@ -3090,7 +3090,7 @@ mod ready_guard_tests {
 mod pdeathsig_cascade_tests {
     // Reproduces the OS mechanism the orphan-on-launcher-death fix relies on: a "box PID 1" (G)
     // that arms `PR_SET_PDEATHSIG(SIGKILL)` relative to its "supervisor" (A) is SIGKILLed the moment
-    // A dies — the same relationship `run_in_sandbox_with` wires between the box's pidns-init and its
+    // A dies - the same relationship `run_in_sandbox_with` wires between the box's pidns-init and its
     // supervisor when `die_with_parent` is set. Deterministic (kernel-guaranteed pdeathsig delivery),
     // no namespaces/root needed, so it runs anywhere. The whole scenario runs inside a dedicated
     // observer child so the subreaper mode + `waitpid(-1)` can't disturb the cargo test harness.
@@ -3102,7 +3102,7 @@ mod pdeathsig_cascade_tests {
             if outer == 0 {
                 // ── Observer (isolated process) ──
                 // Anti-hang: if the cascade DOESN'T fire, G would `pause()` forever and our
-                // `waitpid` would block — SIGALRM turns that into a visible non-zero exit instead.
+                // `waitpid` would block - SIGALRM turns that into a visible non-zero exit instead.
                 libc::alarm(10);
                 // Become a subreaper so a grandchild orphaned by A's death reparents to US, letting
                 // us reap it and observe HOW it died (rather than losing it to init).
@@ -3123,7 +3123,7 @@ mod pdeathsig_cascade_tests {
                         libc::_exit(12);
                     }
                     if g == 0 {
-                        // ── G: the "box PID 1" — arm the death cascade, then block forever ──
+                        // ── G: the "box PID 1" - arm the death cascade, then block forever ──
                         libc::close(sr);
                         libc::prctl(
                             libc::PR_SET_PDEATHSIG,
@@ -3132,7 +3132,7 @@ mod pdeathsig_cascade_tests {
                             0,
                             0,
                         );
-                        // Tell A we've armed it BEFORE A exits — closes the pdeathsig race (a parent
+                        // Tell A we've armed it BEFORE A exits - closes the pdeathsig race (a parent
                         // that dies before the child arms would never trigger the signal).
                         let one = [1u8; 1];
                         let _ = libc::write(sw, one.as_ptr().cast(), 1);
@@ -3172,7 +3172,7 @@ mod pdeathsig_cascade_tests {
             assert_eq!(r, outer, "waitpid(observer) failed");
             assert!(
                 libc::WIFEXITED(st),
-                "observer was signaled (e.g. SIGALRM timeout) — cascade never fired (status {st})"
+                "observer was signaled (e.g. SIGALRM timeout) - cascade never fired (status {st})"
             );
             assert_eq!(
                 libc::WEXITSTATUS(st),
@@ -3185,12 +3185,12 @@ mod pdeathsig_cascade_tests {
 
 /// The `--uid-range` + official-image gap (0.6): images whose entrypoint drops privilege
 /// (postgres/redis/mysql/nginx `setpriv`/`gosu` to a service uid) failed to start. ROOT CAUSE (found
-/// by ~45 tests, after ruling out idmapped mounts — impossible rootless, EPERM: mount_setattr(IDMAP)
-/// needs CAP_SYS_ADMIN in the init userns where the image fs lives — and fuse-overlayfs — slow,
+/// by ~45 tests, after ruling out idmapped mounts - impossible rootless, EPERM: mount_setattr(IDMAP)
+/// needs CAP_SYS_ADMIN in the init userns where the image fs lives - and fuse-overlayfs - slow,
 /// user-space): the box's `/` was mode 0700 (from the own-only overlay upper), so ANY dropped non-root
 /// uid hit EACCES on the FIRST path component `/`, before ownership ever mattered. FIX (two surgical
-/// changes): (1) the box root is 0755 when privilege may be dropped (`--user` non-root OR `--uid-range`)
-/// — a normal rootfs mode, safe because the HOST scratch dir stays 0700 and isolation is the namespace,
+/// changes): (1) the box root is 0755 when privilege may be dropped (`--user` non-root OR `--uid-range`),
+/// a normal rootfs mode, safe because the HOST scratch dir stays 0700 and isolation is the namespace,
 /// not the root's mode; (2) `/dev/fd` + `/dev/std{in,out,err}` symlinks into procfs (bash process
 /// substitution / postgres initdb need them). Verified live: redis, nginx, postgres all reach
 /// "ready to accept connections" under `--uid-range`.
@@ -3201,7 +3201,7 @@ mod uid_range_root_traversable {
     // The fix is a mode on the overlay upper (→ the box root). Assert the exact rule the box path uses:
     // root becomes world-traversable (0755) iff a non-root --user is set, OR --uid-range is on, OR the
     // box is a POD MEMBER (it joins a shared user ns that may map a range, and its image may drop
-    // privilege — the box's own uid_range flag is false there, so pod membership must count too).
+    // privilege - the box's own uid_range flag is false there, so pod membership must count too).
     fn root_should_be_traversable(user_non_root: bool, uid_range: bool, pod_member: bool) -> bool {
         user_non_root || uid_range || pod_member
     }
@@ -3239,7 +3239,7 @@ mod uid_range_root_traversable {
         assert_eq!(
             std::fs::Permissions::from_mode(0o700).mode() & 0o001,
             0,
-            "0700 blocks other — the bug"
+            "0700 blocks other - the bug"
         );
     }
 }
@@ -3249,7 +3249,7 @@ mod cpuset_expand_tests {
     use super::expand_cpu_list;
 
     /// REGRESSION (HIGH, hacker-mode audit): a huge cpuset range must NOT allocate a giant Vec. Indices
-    /// past CPU_SETSIZE are unsettable, so the range is clamped before expansion — `0-999999999` yields
+    /// past CPU_SETSIZE are unsettable, so the range is clamped before expansion - `0-999999999` yields
     /// at most CPU_SETSIZE entries, not a billion (which would be ~8 GB → memory-exhaustion DoS).
     #[test]
     fn huge_cpuset_range_is_clamped_not_exploded() {
@@ -3306,7 +3306,7 @@ mod add_host_tests {
     fn extra_hosts_refuses_a_symlinked_etc_and_cannot_escape_the_box_root() {
         // A hostile image shipping `/etc` as a symlink must NOT let the append escape the box root
         // (open_in_root refuses a symlink at every component). Runs pre-pivot, so a naive open would
-        // resolve through the host root — this is the exact escape the audit flagged.
+        // resolve through the host root - this is the exact escape the audit flagged.
         use std::os::unix::fs::symlink;
         let base = std::env::temp_dir().join(format!("kern-etcsym-{}", std::process::id()));
         let root = base.join("boxroot");
@@ -3372,7 +3372,7 @@ mod cap_mask_tests {
 mod nesting_gate_tests {
     use super::uid_map_root_is_unprivileged;
 
-    /// `--privileged` nesting is gated on the EFFECTIVE box-root mapping, not the caller's euid — so a
+    /// `--privileged` nesting is gated on the EFFECTIVE box-root mapping, not the caller's euid - so a
     /// `--pod` box that joins a holder's userns is judged by the holder's real map. This is the parser
     /// behind that gate; it MUST refuse (fail closed) whenever box-root could reach host root.
     #[test]

@@ -2,21 +2,21 @@
 //!
 //! Resolves an image reference, fetches a manifest (selecting this host's arch from a manifest
 //! list / image index), downloads each layer blob, extracts it into a rootfs directory, and
-//! applies OCI whiteouts — with the symlink-escape guard from [`crate::whiteout_dir_symlink_free`].
+//! applies OCI whiteouts - with the symlink-escape guard from [`crate::whiteout_dir_symlink_free`].
 //!
 //! Tooling: `curl` (TLS, auth, redirects) and GNU `tar` (gzip + traversal-safe extraction, no
 //! `-P`). Authentication follows the standard registry-v2 `WWW-Authenticate` challenge, so any
-//! compliant registry works (Docker Hub, GHCR, GitLab, quay, Harbor, self-hosted) — anonymously, or
+//! compliant registry works (Docker Hub, GHCR, GitLab, quay, Harbor, self-hosted) - anonymously, or
 //! with `kern login` credentials (sent off-argv). All requests are https-pinned.
 //!
 //! Hardening (adversarial images): every blob is verified to hash to its `sha256:` digest
 //! ([`verify_digest`]) before use. Each layer is then vetted ([`check_layer_safe`]) by reading the
-//! RAW tar headers IN-PROCESS (`gzip -dc` only decompresses) — name/prefix/linkname/typeflag at fixed
-//! offsets, resolving GNU long-name/link and PAX overrides — so the escape decision (no absolute/`..`
+//! RAW tar headers IN-PROCESS (`gzip -dc` only decompresses) - name/prefix/linkname/typeflag at fixed
+//! offsets, resolving GNU long-name/link and PAX overrides - so the escape decision (no absolute/`..`
 //! path, no device node, no escaping hardlink target, a 2 GiB bomb cap, an entry-count cap) never
 //! depends on parsing `tar -tv`'s locale-dependent, delimiter-desyncable text. The layer is then
 //! extracted into an ISOLATED staging dir and merged into the rootfs with **no-follow** semantics
-//! ([`merge_layer`]) — a symlink planted by an earlier layer can never be traversed by a later
+//! ([`merge_layer`]) - a symlink planted by an earlier layer can never be traversed by a later
 //! layer's writes, so the cross-layer escape class is closed structurally, not by trusting tar.
 
 use crate::json::{
@@ -31,7 +31,7 @@ const DEFAULT_REGISTRY: &str = "registry-1.docker.io";
 
 /// Warn if the pull destination sits on a Windows-mounted filesystem. WSL2 exposes the Windows drives
 /// (`/mnt/c`, `\\wsl$`) as a **9p** (`drvfs`) mount that can't represent Linux ownership, permissions,
-/// or special files — so extracting an image there is slow and, for images that carry those (e.g.
+/// or special files - so extracting an image there is slow and, for images that carry those (e.g.
 /// `debian`), fails outright with an opaque "layer extraction failed". Turn that into an actionable
 /// hint BEFORE the failure: pull into a real Linux filesystem instead (the WSL home / a Linux-side
 /// cache). Simple images (alpine/busybox) still extract on 9p, so this warns rather than refuses.
@@ -45,7 +45,7 @@ fn warn_if_windows_mount(dest: &Path) {
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && st.f_type as i64 == V9FS_MAGIC {
         eprintln!(
-            "kern: warning: pulling into a Windows-mounted path (WSL2 9p/drvfs) — slow, and it fails \
+            "kern: warning: pulling into a Windows-mounted path (WSL2 9p/drvfs) - slow, and it fails \
              for images carrying Linux ownership/permissions (e.g. debian). Pull into a Linux \
              filesystem instead: run from your WSL home directory, not a /mnt/<drive> path."
         );
@@ -78,25 +78,25 @@ impl std::fmt::Display for OciError {
 
 impl std::error::Error for OciError {}
 
-/// An image's runtime configuration, read from its OCI config blob — the defaults `kern box --image`
+/// An image's runtime configuration, read from its OCI config blob - the defaults `kern box --image`
 /// applies (explicit CLI flags win) so an official image runs like `docker run`, not a bare shell.
 #[derive(Debug, Default, Clone)]
 pub struct ImageConfig {
-    /// `config.Entrypoint` — prepended to the command.
+    /// `config.Entrypoint` - prepended to the command.
     pub entrypoint: Vec<String>,
-    /// `config.Cmd` — the default command (used when the user gives none).
+    /// `config.Cmd` - the default command (used when the user gives none).
     pub cmd: Vec<String>,
-    /// `config.Env` — `KEY=VALUE` strings, applied UNDER the user's `--env` (user wins).
+    /// `config.Env` - `KEY=VALUE` strings, applied UNDER the user's `--env` (user wins).
     pub env: Vec<String>,
-    /// `config.WorkingDir` — default working directory.
+    /// `config.WorkingDir` - default working directory.
     pub workdir: Option<String>,
-    /// `config.User` — default `uid[:gid]` / name.
+    /// `config.User` - default `uid[:gid]` / name.
     pub user: Option<String>,
 }
 
 /// Pull `image` into `dest` (created if needed), producing a usable rootfs, and return its OCI
 /// runtime config (entrypoint/cmd/env/workdir/user). Progress is reported to **stderr** (so stdout
-/// stays clean) — the user always sees what's happening, never a silent hang.
+/// stays clean) - the user always sees what's happening, never a silent hang.
 pub fn pull(
     image: &str,
     dest: &Path,
@@ -110,7 +110,7 @@ pub fn pull(
 
     let manifest = fetch_manifest(&registry, &repo, &reference, &auth)?;
     let manifest = if is_manifest_list(&manifest) {
-        // Select the requested arch EXACTLY — no wrong-arch fallback. Under an explicit `--platform`
+        // Select the requested arch EXACTLY - no wrong-arch fallback. Under an explicit `--platform`
         // that would silently pull the wrong image; even by default it's safer to error with the list
         // of available arches than to hand back a mismatched rootfs.
         let digest = select_arch_digest(&manifest, want).ok_or_else(|| {
@@ -119,7 +119,7 @@ pub fn pull(
                 format!("no linux/{} manifest in the index", want.arch)
             } else {
                 format!(
-                    "no linux/{} manifest — available: {}",
+                    "no linux/{} manifest - available: {}",
                     want.arch,
                     avail.join(", ")
                 )
@@ -143,18 +143,18 @@ pub fn pull(
     warn_if_windows_mount(dest);
     // ONE-CONNECTION PRE-DOWNLOAD (cold-pull speedup): fetch the config blob + every layer blob in a
     // SINGLE `curl` process (keep-alive reused across `--next`), so the whole blob set costs ONE TLS
-    // handshake instead of one per blob — the measured cold-pull bottleneck was that each separate
+    // handshake instead of one per blob - the measured cold-pull bottleneck was that each separate
     // `curl` process re-handshakes to the same registry host. Best-effort and TRANSPORT-ONLY: it writes
     // each blob to the SAME tmp path `fetch_config`/`download_layer` use, so they find it already there
     // and skip their own download; every blob is still sha256-verified and every layer still vetted +
     // merged no-follow, byte-identical to before. A no-op for Basic-credential registries (leaves that
     // audited off-argv `-K` path untouched) and on any failure (tmps cleaned → the per-blob path re-runs).
     download_blobs_oneconn(&registry, &repo, &manifest, &layers, &auth, dest);
-    // The image's runtime config (entrypoint/env/…) — now usually already fetched above; `fetch_config`
+    // The image's runtime config (entrypoint/env/…) - now usually already fetched above; `fetch_config`
     // reuses the pre-downloaded tmp when present. Best-effort: a missing/odd config yields defaults.
     let config = fetch_config(&registry, &repo, &manifest, &auth, dest);
     // PREFETCH: download layer K+1 concurrently while layer K is verified + extracted + merged. The
-    // per-layer download command is UNCHANGED (same TLS pin, auth, timeouts) — only the SCHEDULING
+    // per-layer download command is UNCHANGED (same TLS pin, auth, timeouts) - only the SCHEDULING
     // overlaps the next layer's network with the current layer's CPU (decompress/extract). Extract +
     // merge stay strictly ordered (overlay whiteout semantics demand it), so the result is byte-identical
     // to the sequential path; security is untouched. Wall-clock ≈ slowest download + Σ extracts, not Σ both.
@@ -175,12 +175,12 @@ pub fn pull(
     // downloads run INLINE (no worker thread at all), strictly before each extract. Off by default;
     // also used to A/B the speedup.
     //
-    // NON-root ALSO disables prefetch — and this is a CORRECTNESS guarantee, not a perf choice: a
+    // NON-root ALSO disables prefetch - and this is a CORRECTNESS guarantee, not a perf choice: a
     // non-root unpack `fork()`s a userns child (see `unpack_as_root`), and forking while a prefetch
     // DOWNLOAD THREAD is live risks the classic fork-in-threaded-process deadlock (the child inherits a
     // possibly-locked allocator). With no prefetch thread, the process is single-threaded at every fork,
     // so the child can never deadlock. Root never forks here (it unpacks in-process), so it keeps the
-    // overlap. The cost is only non-root multi-layer pulls losing download/extract overlap — a fair
+    // overlap. The cost is only non-root multi-layer pulls losing download/extract overlap - a fair
     // price for a can't-deadlock guarantee on the exact hosts that fork (edge boards run as a user).
     let is_root = unsafe { libc::geteuid() == 0 };
     let prefetch = std::env::var_os("KERN_NO_PREFETCH").is_none() && is_root;
@@ -194,20 +194,20 @@ pub fn pull(
                 .map_err(|_| OciError::Extract("layer download thread panicked".into()))??,
             None => download_layer(i, &registry, &repo, &layers[i], &auth, dest)?,
         };
-        // Prefetch: start layer i+1's download BEFORE extracting i — the SINGLE spawn site — so its
+        // Prefetch: start layer i+1's download BEFORE extracting i - the SINGLE spawn site - so its
         // network overlaps i's CPU.
         if prefetch && i + 1 < total {
             next = Some(spawn_dl(i + 1));
         }
         // On error, don't just bail: an already-spawned prefetch thread would detach and keep writing its
-        // blob into `dest` after the pull failed. Wait for it — SAYING SO first: the join can take as
-        // long as that download (the error is worth more than the wait; a detached writer is worse) —
+        // blob into `dest` after the pull failed. Wait for it - SAYING SO first: the join can take as
+        // long as that download (the error is worth more than the wait; a detached writer is worse) -
         // and unlink its blob whatever the outcome (`download_layer` cleans up its own curl failures;
         // the deterministic tmp name covers a panicked thread).
         if let Err(e) = process_layer(&tmp, &layers[i], dest, i + 1, total) {
             if let Some(h) = next.take() {
                 eprintln!(
-                    "✗ layer {}/{total} failed — stopping the in-flight prefetch…",
+                    "✗ layer {}/{total} failed - stopping the in-flight prefetch…",
                     i + 1
                 );
                 let _ = h.join();
@@ -222,7 +222,7 @@ pub fn pull(
 
 /// Fetch and parse the image's OCI config blob (the descriptor is in `manifest.config`). Best-effort:
 /// any failure (missing descriptor, network, digest mismatch) returns the default config rather than
-/// failing the pull — the box just falls back to a shell / the user's flags. The blob is
+/// failing the pull - the box just falls back to a shell / the user's flags. The blob is
 /// sha256-verified against its digest before use, like every other blob.
 fn fetch_config(
     registry: &str,
@@ -261,7 +261,7 @@ fn fetch_config(
 }
 
 /// Run `curl <base> [Authorization: Bearer …] -- <url>`, routing Basic credentials off-argv (`-K`
-/// STDIN config) exactly like every other request — the ONE place the "Basic creds never in argv"
+/// STDIN config) exactly like every other request - the ONE place the "Basic creds never in argv"
 /// decision is made for GET-style fetches (manifest + config blob). Returns curl's stdout (empty
 /// when `base` already redirects the body to a file with `-o`).
 pub(crate) fn curl_authed(base: &[&str], url: &str, auth: &Auth) -> Result<Vec<u8>, OciError> {
@@ -279,7 +279,7 @@ pub(crate) fn curl_authed(base: &[&str], url: &str, auth: &Auth) -> Result<Vec<u
     }
 }
 
-/// Quietly download a small blob (the config JSON) to `tmp` — no progress bar (unlike a layer), size-
+/// Quietly download a small blob (the config JSON) to `tmp` - no progress bar (unlike a layer), size-
 /// and time-capped, https-pinned, with the same off-argv auth as every other request.
 fn download_blob_quiet(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
     let mut args = vec!["-sS", "-L"];
@@ -340,16 +340,16 @@ pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciErro
 ///
 /// Used to tell a `COPY --from=<image>` apart from an unresolved build-stage name (or plain garbage):
 /// the parser first checks for an earlier stage, and only falls back to "is this a real image ref?".
-/// This mirrors the distribution-spec grammar closely enough to ACCEPT the everyday forms — `busybox`,
-/// `nginx:alpine`, `ghcr.io/org/img:1.2`, `registry:5000/img@sha256:<hex>` — while REJECTING an
+/// This mirrors the distribution-spec grammar closely enough to ACCEPT the everyday forms - `busybox`,
+/// `nginx:alpine`, `ghcr.io/org/img:1.2`, `registry:5000/img@sha256:<hex>` - while REJECTING an
 /// uppercase repo, a `..`/absolute path, whitespace, a stray `--flag`, or an empty string. It is pure
-/// (no I/O), so it stays usable from the pure Dockerfile parser. Deliberately syntactic only — a
+/// (no I/O), so it stays usable from the pure Dockerfile parser. Deliberately syntactic only - a
 /// well-formed ref that doesn't exist still fails later, at pull time, with the registry's own error.
 ///
-/// SSRF note: like `FROM`, an accepted ref names ANY registry host — including a numeric IP or
-/// `localhost:<port>` — so a `FROM`/`COPY --from=<image>` in a Dockerfile triggers a build-time fetch
+/// SSRF note: like `FROM`, an accepted ref names ANY registry host - including a numeric IP or
+/// `localhost:<port>` - so a `FROM`/`COPY --from=<image>` in a Dockerfile triggers a build-time fetch
 /// to whatever host the ref names. This is not a new capability (`FROM` already does it) and the
-/// **Dockerfile author is the trust boundary** — they already choose the base images. The fetch itself
+/// **Dockerfile author is the trust boundary** - they already choose the base images. The fetch itself
 /// is HTTPS + TLS-pinned and runs the full pull hardening (sha256 blob verify, layer vetting), so a
 /// plain-HTTP metadata endpoint (e.g. cloud IMDS `169.254.169.254`) fails the TLS handshake, not
 /// silently exfiltrating. Kept syntactic on purpose: an allow/deny-list of registries is a
@@ -376,7 +376,7 @@ pub fn valid_reference(image: &str) -> bool {
         None => image,
     };
     // Split off an optional leading registry host: the first `/`-segment is a registry only if it looks
-    // like a host (has a `.`/`:`, or is `localhost`) — matching `parse_ref`'s rule, so the two agree.
+    // like a host (has a `.`/`:`, or is `localhost`) - matching `parse_ref`'s rule, so the two agree.
     let (registry, rest) = match name_tag.split_once('/') {
         Some((host, r)) if host.contains('.') || host.contains(':') || host == "localhost" => {
             (Some(host), r)
@@ -448,7 +448,7 @@ fn valid_repo_path(path: &str) -> bool {
     path.split('/').all(valid_path_component)
 }
 
-/// One repository-path component: `[a-z0-9]+((\.|_|-)+[a-z0-9]+)*` — starts and ends alphanumeric
+/// One repository-path component: `[a-z0-9]+((\.|_|-)+[a-z0-9]+)*` - starts and ends alphanumeric
 /// (lowercase), only `.`/`_`/`-` in between, and never a `..`.
 fn valid_path_component(c: &str) -> bool {
     let b = c.as_bytes();
@@ -477,7 +477,7 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
         || low.contains("authentication");
     if auth_ish {
         OciError::Registry(format!(
-            "cannot access '{repo}' on {registry} — it may be private (run `kern login {registry}`) \
+            "cannot access '{repo}' on {registry} - it may be private (run `kern login {registry}`) \
              or the tag may not exist"
         ))
     } else {
@@ -511,7 +511,7 @@ impl Platform {
 
     /// Parse a `--platform` string: `os/arch` or a bare `arch` (⇒ `linux/arch`). Arch aliases are
     /// normalised (`x86_64`/`x86-64`→`amd64`, `aarch64`/`arm64v8`→`arm64`). A 3-part `os/arch/variant`
-    /// (e.g. `linux/arm/v7`) is rejected legibly — kern doesn't select variants. An unknown arch is
+    /// (e.g. `linux/arm/v7`) is rejected legibly - kern doesn't select variants. An unknown arch is
     /// allowed through (the registry error then lists the available arches); a non-`linux` OS is rejected.
     pub fn parse(s: &str) -> Result<Self, OciError> {
         let s = s.trim().to_ascii_lowercase();
@@ -541,7 +541,7 @@ impl Platform {
         })
     }
 
-    /// Is this the host platform? (A host-equal `--platform` is a no-op — the normal native pull.)
+    /// Is this the host platform? (A host-equal `--platform` is a no-op - the normal native pull.)
     pub fn is_host(&self) -> bool {
         *self == Platform::host()
     }
@@ -551,11 +551,11 @@ impl Platform {
     }
 }
 
-/// Download a blob to `tmp`. curl runs with `--no-progress-meter` — its built-in bar is a mess for a
+/// Download a blob to `tmp`. curl runs with `--no-progress-meter` - its built-in bar is a mess for a
 /// redirected CDN blob (it re-emits the `#=#=#O` connection meter on every hop), so kern prints its
 /// own clean per-layer line instead (see `extract_layer`). `-S` still surfaces errors; `-L` follows
 /// redirects (registries hand blobs off to a CDN) but `--proto-redir =https` (in `TLS_PIN`) keeps
-/// every hop on TLS — a hostile registry can't redirect a blob to `http://`/`file://`. Bearer creds
+/// every hop on TLS - a hostile registry can't redirect a blob to `http://`/`file://`. Bearer creds
 /// go in a header; Basic creds go via `-K` STDIN (off-argv).
 fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
     let mut cmd = Command::new("curl");
@@ -581,8 +581,8 @@ fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
         cmd.args(["-H", &h]);
     }
     // This re-hand-rolls the `-K -` STDIN plumbing that `net::curl_with_config` owns because it needs
-    // a different I/O shape: stream to `-o tmp` and INHERIT stderr (only `-S` errors reach it now —
-    // the progress meter is off) rather than capturing stdout — so it can't reuse that helper.
+    // a different I/O shape: stream to `-o tmp` and INHERIT stderr (only `-S` errors reach it now -
+    // the progress meter is off) rather than capturing stdout - so it can't reuse that helper.
     let basic_cfg = auth.basic_config();
     if basic_cfg.is_some() {
         cmd.args(["-K", "-"]).stdin(Stdio::piped());
@@ -607,13 +607,13 @@ fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
     Ok(())
 }
 
-/// Pre-download the config blob + every layer blob in ONE `curl` process — `--next` between requests
+/// Pre-download the config blob + every layer blob in ONE `curl` process - `--next` between requests
 /// makes curl reuse the SAME keep-alive connection, so the whole set pays ONE TLS handshake instead of
 /// one per blob (the measured cold-pull bottleneck: each separate `curl` process re-handshakes to the
 /// registry host). Best-effort and TRANSPORT-ONLY: each blob is written to the exact tmp path
 /// `fetch_config` / `download_layer` use, so they find it and skip their own fetch; every blob is still
-/// sha256-verified and every layer vetted + merged no-follow by the caller — byte-identical to the
-/// per-blob path. Scoped to Bearer / anonymous auth (the public path — ~all of Docker Hub & GHCR): a
+/// sha256-verified and every layer vetted + merged no-follow by the caller - byte-identical to the
+/// per-blob path. Scoped to Bearer / anonymous auth (the public path - ~all of Docker Hub & GHCR): a
 /// Basic-credential registry returns early, leaving the audited off-argv `-K` credential plumbing
 /// untouched. On ANY curl failure every partial tmp is removed, so the caller's per-blob path re-runs.
 fn download_blobs_oneconn(
@@ -629,13 +629,13 @@ fn download_blobs_oneconn(
     if std::env::var_os("KERN_NO_BLOB_BATCH").is_some() {
         return;
     }
-    // Basic creds go off-argv via `-K` stdin; do NOT reshape that into a `--next` chain — fall back.
+    // Basic creds go off-argv via `-K` stdin; do NOT reshape that into a `--next` chain - fall back.
     let bearer = match auth {
         Auth::Basic { .. } => return,
         Auth::Bearer(t) => Some(format!("Authorization: Bearer {t}")),
         Auth::None => None,
     };
-    // (url, tmp_path) for the config blob (if present) then each layer, in order — the exact tmp paths
+    // (url, tmp_path) for the config blob (if present) then each layer, in order - the exact tmp paths
     // `fetch_config` and `download_layer` expect.
     let mut blobs: Vec<(String, std::path::PathBuf)> = Vec::new();
     if let Some(d) = object_after(manifest, "config").and_then(|d| first_str(d, "digest")) {
@@ -651,11 +651,11 @@ fn download_blobs_oneconn(
         ));
     }
     if blobs.len() < 2 {
-        return; // 0–1 blobs: no second request to share a connection with — nothing to save.
+        return; // 0–1 blobs: no second request to share a connection with - nothing to save.
     }
     // Build one `curl` command, a `--next`-separated segment per blob. curl RESETS per-request options
     // at `--next`, so the TLS pin + size cap + `-o` + Bearer header MUST be repeated on every segment
-    // (dropping the pin on a later segment would silently weaken it — hence per-segment, identical to
+    // (dropping the pin on a later segment would silently weaken it - hence per-segment, identical to
     // `curl_download`'s single-blob options).
     let tmp_strs: Vec<String> = blobs
         .iter()
@@ -686,12 +686,12 @@ fn download_blobs_oneconn(
         }
         // The URL goes POSITIONAL (no `--`): a leading `--` ends option parsing for the segment and
         // then swallows the following `--next` (breaking every later segment's `-o`, sending its body
-        // to stdout). Safe without it — the URL always comes from `reg_base` (`https://…`, never `-`)
+        // to stdout). Safe without it - the URL always comes from `reg_base` (`https://…`, never `-`)
         // and `--proto =https` above rejects any non-https anyway.
         args.push(url.as_str());
     }
     if crate::net::curl(&args).is_err() {
-        // Partial/failed batch: remove every tmp so the caller's per-blob path re-downloads cleanly —
+        // Partial/failed batch: remove every tmp so the caller's per-blob path re-downloads cleanly -
         // a leftover partial would otherwise be picked up and (correctly) fail digest verification.
         for (_, t) in &blobs {
             let _ = std::fs::remove_file(t);
@@ -716,12 +716,12 @@ fn curl_cfg_escape(s: &str) -> String {
 /// `Clone` so a layer prefetch thread can carry its own copy (Bearer token / Basic creds are Strings).
 #[derive(Clone)]
 pub(crate) enum Auth {
-    /// Open (or already-satisfied) — no `Authorization` header.
+    /// Open (or already-satisfied) - no `Authorization` header.
     None,
     /// A short-lived Bearer token from the registry's token endpoint (Docker Hub, GHCR, GitLab,
     /// Harbor, quay, …). Sent as a header (tokens are not the long-lived secret).
     Bearer(String),
-    /// HTTP Basic — the `kern login` credentials, sent to curl **off-argv** via a `-K` STDIN config.
+    /// HTTP Basic - the `kern login` credentials, sent to curl **off-argv** via a `-K` STDIN config.
     Basic { user: String, pass: String },
 }
 
@@ -754,7 +754,7 @@ fn curl_user_config(user: &str, pass: &str) -> String {
 }
 
 /// Discover how to authenticate to `registry` for pulling `repo`, via the standard registry-v2
-/// `WWW-Authenticate` challenge — so ANY compliant registry works (Docker Hub, GHCR, GitLab, Harbor,
+/// `WWW-Authenticate` challenge - so ANY compliant registry works (Docker Hub, GHCR, GitLab, Harbor,
 /// quay, self-hosted `distribution`), not just Docker Hub. Pings `/v2/`: a `200` means no auth is
 /// needed; a `401` carries the challenge. For a `Bearer` challenge we fetch a pull-scoped token from
 /// the advertised realm (anonymously, or upgraded with `kern login` credentials for private repos);
@@ -764,7 +764,7 @@ fn discover_auth(registry: &str, repo: &str) -> Result<Auth, OciError> {
     discover_auth_scoped(registry, repo, "pull")
 }
 
-/// Like [`discover_auth`] but for an explicit `action` scope — `"pull"` for reads, `"push,pull"` for
+/// Like [`discover_auth`] but for an explicit `action` scope - `"pull"` for reads, `"push,pull"` for
 /// an upload (`kern push`). Push needs a write-scoped token; everything else in the challenge dance
 /// (realm/service parsing, credential-host trust, off-argv creds) is identical, so it's shared here.
 pub(crate) fn discover_auth_scoped(
@@ -774,7 +774,7 @@ pub(crate) fn discover_auth_scoped(
 ) -> Result<Auth, OciError> {
     let headers = match crate::net::head_headers(&format!("{}/v2/", reg_base(registry))) {
         Ok(h) => h,
-        // A registry that won't answer the ping (older/odd) — fall back to anonymous and let the
+        // A registry that won't answer the ping (older/odd) - fall back to anonymous and let the
         // manifest fetch surface a clear error if auth turns out to be required.
         Err(_) => return Ok(Auth::None),
     };
@@ -795,7 +795,7 @@ pub(crate) fn discover_auth_scoped(
                 "--max-redirs",
                 "5",
                 "--max-filesize",
-                "8000000", // a token response is tiny — cap it so a hostile realm can't OOM us
+                "8000000", // a token response is tiny - cap it so a hostile realm can't OOM us
                 "--connect-timeout",
                 "10",
                 "--max-time",
@@ -805,7 +805,7 @@ pub(crate) fn discover_auth_scoped(
             ]);
             // CREDENTIAL SAFETY (CVE-2020-15157 class): only send the stored credentials to the token
             // endpoint if its host belongs to the SAME registry (same host, or a subdomain of the
-            // registry's parent domain — e.g. Docker Hub's registry-1.docker.io ↔ auth.docker.io). A
+            // registry's parent domain - e.g. Docker Hub's registry-1.docker.io ↔ auth.docker.io). A
             // hostile/compromised registry could otherwise advertise `realm="https://evil/token"` and
             // harvest the creds the user stored for it. If the realm is foreign we withhold the creds
             // and fetch an ANONYMOUS token instead (fine for public repos; a private one then fails
@@ -815,7 +815,7 @@ pub(crate) fn discover_auth_scoped(
                 .filter(|_| realm_host_trusted(&realm, registry));
             if creds.is_some() && send_creds.is_none() {
                 eprintln!(
-                    "kern: withholding credentials — {registry} pointed its auth to a different host \
+                    "kern: withholding credentials - {registry} pointed its auth to a different host \
                      ({realm}); fetching an anonymous token instead"
                 );
             }
@@ -835,7 +835,7 @@ pub(crate) fn discover_auth_scoped(
         Some(Challenge::Basic) => {
             let (user, pass) = creds.ok_or_else(|| {
                 OciError::Registry(format!(
-                    "{registry} requires authentication — run `kern login {registry}`"
+                    "{registry} requires authentication - run `kern login {registry}`"
                 ))
             })?;
             Ok(Auth::Basic { user, pass })
@@ -848,9 +848,9 @@ pub(crate) fn discover_auth_scoped(
 /// Whether it's safe to send the registry's stored credentials to a Bearer `realm` (token endpoint).
 /// True only when the realm host is the registry host, or a subdomain of the registry's parent domain
 /// (so Docker Hub's `registry-1.docker.io` trusts `auth.docker.io`, but no registry can point auth at
-/// an unrelated host to harvest creds — the CVE-2020-15157 credential-leak class). The realm must be
+/// an unrelated host to harvest creds - the CVE-2020-15157 credential-leak class). The realm must be
 /// `https://`. Both hosts are parsed the SAME way curl resolves them (userinfo + port stripped, see
-/// [`host_from_authority`]) — a parser differential here would itself be an allowlist bypass.
+/// [`host_from_authority`]) - a parser differential here would itself be an allowlist bypass.
 fn realm_host_trusted(realm: &str, registry: &str) -> bool {
     let reg_host = host_from_authority(registry.split('/').next().unwrap_or(registry));
     let Some(after) = realm.strip_prefix("https://") else {
@@ -865,7 +865,7 @@ fn realm_host_trusted(realm: &str, registry: &str) -> bool {
         return true;
     }
     // Otherwise, trust ONLY a known, hardcoded registry↔auth mapping. The old rule trusted ANY sibling
-    // under the registry's parent domain (`realm_host.ends_with(".{parent}")`) — but on shared PaaS /
+    // under the registry's parent domain (`realm_host.ends_with(".{parent}")`) - but on shared PaaS /
     // hosting / a delegated-subdomain org, an attacker who controls a sibling subdomain (say
     // `attacker.acme.com`) could make a hostile `registry.acme.com` point its auth realm there and
     // harvest the user's long-lived, WRITE-scoped `kern login` password. Credentials must never go to a
@@ -875,7 +875,7 @@ fn realm_host_trusted(realm: &str, registry: &str) -> bool {
 
 /// The hardcoded registry-host ↔ auth-realm-host pairs kern trusts for sending stored credentials to a
 /// DIFFERENT host than the one the user logged into. Only well-known public registries whose auth lives
-/// on a sibling host belong here — never a generic parent-domain rule (which a hostile sibling abuses).
+/// on a sibling host belong here - never a generic parent-domain rule (which a hostile sibling abuses).
 fn known_auth_pair(reg_host: &str, realm_host: &str) -> bool {
     const PAIRS: &[(&str, &str)] = &[
         // Docker Hub: the registry is registry-1.docker.io, its token realm is auth.docker.io.
@@ -889,7 +889,7 @@ fn known_auth_pair(reg_host: &str, realm_host: &str) -> bool {
 }
 
 /// The host of a URL authority as curl would dial it: drop any `userinfo@` (curl uses the part after
-/// the LAST `@` as the host — a `realm="https://trusted:0@evil.com/…"` connects to `evil.com`, NOT
+/// the LAST `@` as the host - a `realm="https://trusted:0@evil.com/…"` connects to `evil.com`, NOT
 /// `trusted`) and any `:port`, lowercased (DNS is case-insensitive). Parsing the host the same way
 /// curl resolves it is what keeps [`realm_host_trusted`] sound.
 fn host_from_authority(authority: &str) -> String {
@@ -979,7 +979,7 @@ fn short_digest(digest: &str) -> &str {
 }
 
 /// Download ONE layer blob to a tmp file, returning its path. The download command is IDENTICAL to the
-/// old inline one (same TLS pin, auth, redirects, timeouts) — split out only so the pull loop can
+/// old inline one (same TLS pin, auth, redirects, timeouts) - split out only so the pull loop can
 /// PREFETCH the next layer concurrently. No security logic lives here (verify/vet/extract/merge do).
 fn download_layer(
     idx: usize,
@@ -999,7 +999,7 @@ fn download_layer(
     // caught there exactly as a bad per-blob download would be.
     if !tmp.exists() {
         if let Err(e) = curl_download(&url, &tmp_s, auth) {
-            // curl `-o` may have written a partial blob before failing — never leave it inside `dest`
+            // curl `-o` may have written a partial blob before failing - never leave it inside `dest`
             // (which can be the user's rootfs dir): a junk `.kern-layer-*` would end up visible at `/`
             // in every box booted from that rootfs.
             let _ = std::fs::remove_file(&tmp);
@@ -1009,8 +1009,8 @@ fn download_layer(
     Ok(tmp)
 }
 
-/// The tmp blob path for layer `idx` — per-INDEX (not per-digest): adjacent layers may legally
-/// share a digest, and prefetch runs two downloads at once — a digest-only name would make them
+/// The tmp blob path for layer `idx` - per-INDEX (not per-digest): adjacent layers may legally
+/// share a digest, and prefetch runs two downloads at once - a digest-only name would make them
 /// collide on one file. One definition, so the download and the error-path cleanup can't drift.
 fn layer_tmp_path(dest: &Path, idx: usize, digest: &str) -> std::path::PathBuf {
     dest.join(format!(
@@ -1032,10 +1032,10 @@ fn process_layer(
     let short = short_digest(digest);
     let tmp_s = tmp.to_string_lossy().into_owned();
 
-    // INTEGRITY: the blob's content must hash to its digest — defends against a compromised or
+    // INTEGRITY: the blob's content must hash to its digest - defends against a compromised or
     // MITM'd registry (TLS only protects the transport), and against a corrupt download. Report the
     // downloaded size on the same line so a big multi-hundred-MB image shows real progress per layer
-    // (curl's own meter is off — it's noise over a redirected CDN blob).
+    // (curl's own meter is off - it's noise over a redirected CDN blob).
     let size = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "  layer {idx}/{total}  {short}  {}  verifying + extracting…",
@@ -1050,7 +1050,7 @@ fn process_layer(
     // both the vet and the extract so they can never disagree.
     let comp = detect_compression(tmp);
 
-    // HARDENING: vet the layer BEFORE writing anything to disk — reject path traversal, absolute
+    // HARDENING: vet the layer BEFORE writing anything to disk - reject path traversal, absolute
     // members, device nodes, and oversized (decompression-bomb) layers.
     if let Err(e) = check_layer_safe(tmp, comp) {
         let _ = std::fs::remove_file(tmp);
@@ -1059,11 +1059,11 @@ fn process_layer(
 
     // ISOLATED STAGING: extract this layer into a FRESH empty sibling dir, never directly into
     // `dest`. Then merge it into `dest` ourselves with no-follow semantics (see `merge_layer`),
-    // so a symlink planted by a previous layer cannot be traversed by this layer's writes — the
+    // so a symlink planted by a previous layer cannot be traversed by this layer's writes - the
     // cross-layer symlink-escape class is closed structurally, not by trusting tar.
     //
     // The extract + merge + cleanup below touch the image's REAL modes (a 0555 dir, a setuid file), so
-    // run them with the capability to override permissions — directly as root, or inside a forked
+    // run them with the capability to override permissions - directly as root, or inside a forked
     // single-uid userns for a non-root user (see `unpack_as_root`). verify + vet above stayed in the
     // parent (they need no privilege and produce detailed errors). Plain `tar` here (no `unshare -r`
     // wrapper): we're already in-ns root when non-root, so it has the caps.
@@ -1073,12 +1073,12 @@ fn process_layer(
         std::fs::create_dir_all(&staging).map_err(|e| OciError::Extract(e.to_string()))?;
         let staging_s = staging.to_string_lossy().into_owned();
         // `--same-permissions`: preserve the image's EXACT modes, including the sticky bit and world-write
-        // on `/tmp` (1777) that many images rely on — without it, tar as a non-root user applies the umask
+        // on `/tmp` (1777) that many images rely on - without it, tar as a non-root user applies the umask
         // (022) and drops world-write + sticky, so a workload that drops to a non-root uid can't write
         // `/tmp` (e.g. mariadb InnoDB temp files fail EACCES). Docker/podman extract with `-p` for the same
         // reason. `--no-same-owner` still maps ownership to the extracting user (we don't want the image's
         // raw uids on the host); the tar vetter already rejected setuid/device nodes, so preserving modes is
-        // safe (a setuid bit on a rootfs file is inert anyway — the box root mount is MS_NOSUID).
+        // safe (a setuid bit on a rootfs file is inert anyway - the box root mount is MS_NOSUID).
         // Extract with the codec detected above. gzip → tar's own `-z`; plain → no decompressor (`-xf`);
         // zstd → pipe `zstd -dc` into `tar -xf -` rather than relying on `tar --zstd`, which BusyBox/musl
         // edge builds often lack even when a standalone `zstd` is present. `--no-same-owner`
@@ -1116,7 +1116,7 @@ fn process_layer(
                 // DEFENCE IN DEPTH: unlike the `tar -xzf`/`-xf` paths (which read the on-disk blob and are
                 // bounded by tar itself), the zstd path STREAMS a decompressor into tar and does NOT re-run
                 // the size-capped vetter. `check_layer_safe` already rejected an over-2GiB bomb before we get
-                // here — but a gate shouldn't depend on ANOTHER gate being perfect. `head -c MAX_LAYER_BYTES`
+                // here - but a gate shouldn't depend on ANOTHER gate being perfect. `head -c MAX_LAYER_BYTES`
                 // hard-caps the decompressed bytes reaching tar, so even if the vet ever let a gonfio blob
                 // through, the extract writes at most the cap (the truncated tar then fails cleanly). One
                 // extra tiny process; irrelevant vs the decompression cost.
@@ -1149,7 +1149,7 @@ fn process_layer(
                     .status()
                     .map_err(|e| OciError::Tool("tar", e.to_string()));
                 let zcode = z.wait().map(|s| s.success()).unwrap_or(false);
-                // `head` closing the pipe early (cap hit) makes zstd take SIGPIPE — that's the intended
+                // `head` closing the pipe early (cap hit) makes zstd take SIGPIPE - that's the intended
                 // truncation, and tar then fails on the short archive, so we don't treat head's own status
                 // as authoritative; tar + a clean zstd exit are what matter.
                 let _ = h.wait();
@@ -1176,7 +1176,7 @@ fn process_layer(
 /// algorithm is skipped (not failed); a mismatch is a hard error.
 fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
     let Some(expected) = digest.strip_prefix("sha256:") else {
-        // Refuse any digest we can't verify — a non-sha256 algorithm must not be a free pass for
+        // Refuse any digest we can't verify - a non-sha256 algorithm must not be a free pass for
         // a compromised registry to serve unverified bytes.
         return Err(OciError::Registry(format!(
             "unsupported digest algorithm (only sha256 is verified): {digest}"
@@ -1193,7 +1193,7 @@ fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
     let got = got.split_whitespace().next().unwrap_or("");
     if !got.eq_ignore_ascii_case(expected) {
         return Err(OciError::Registry(format!(
-            "blob digest mismatch (expected {expected}, got {got}) — refusing"
+            "blob digest mismatch (expected {expected}, got {got}) - refusing"
         )));
     }
     Ok(())
@@ -1207,7 +1207,7 @@ pub(crate) fn unsafe_member_path(p: &str) -> bool {
 /// Canonicalize a (relative, already `..`-free) member path the way a tar extractor lays it on disk:
 /// drop `.` and empty components (leading `./`, `//`, `/./`, trailing `/`). The symlink-escape tracking
 /// keys on this, so a member spelled `./A/x` / `A//x` / `A/./x` can't slip past a symlink recorded as
-/// `A` — the vetter's string view has to equal the filesystem's, or the textual prefix check is fooled.
+/// `A` - the vetter's string view has to equal the filesystem's, or the textual prefix check is fooled.
 pub(crate) fn normalize_member_path(p: &str) -> String {
     p.split('/')
         .filter(|c| !c.is_empty() && *c != ".")
@@ -1216,7 +1216,7 @@ pub(crate) fn normalize_member_path(p: &str) -> String {
 }
 
 /// Is `p` AT, or UNDER, a recorded escaping symlink? True iff `p` itself or one of its ancestor
-/// directories is a path in `set`. Walks `p`'s prefixes from the root down — O(path depth) HashSet
+/// directories is a path in `set`. Walks `p`'s prefixes from the root down - O(path depth) HashSet
 /// lookups, so vetting stays linear in the number of members even at the 2M-entry cap. Used for BOTH
 /// the per-member escape check and the chain resolution (a symlink whose target lands here escapes).
 pub(crate) fn under_escaping(p: &str, set: &std::collections::HashSet<String>) -> bool {
@@ -1238,9 +1238,9 @@ pub(crate) fn under_escaping(p: &str, set: &std::collections::HashSet<String>) -
     false
 }
 
-/// Max uncompressed bytes per layer — a decompression-bomb ceiling (2 GiB).
+/// Max uncompressed bytes per layer - a decompression-bomb ceiling (2 GiB).
 pub(crate) const MAX_LAYER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Max entries per layer — a dir/empty-file *inode* bomb has ~0 byte total but still exhausts the fs.
+/// Max entries per layer - a dir/empty-file *inode* bomb has ~0 byte total but still exhausts the fs.
 const MAX_LAYER_ENTRIES: u64 = 2_000_000;
 /// Max COMPRESSED bytes for a single layer download (curl `--max-filesize`), as a string for the argv.
 /// Bounds a disk-fill DoS from a hostile registry; generous enough for any realistic layer (8 GB).
@@ -1249,11 +1249,11 @@ const MAX_LAYER_DOWNLOAD_BYTES: &str = "8000000000";
 /// The TLS-pinning flags EVERY registry fetch must carry: HTTPS-only on the initial request AND on
 /// every redirect hop (registries hand blobs to a CDN), with a bounded redirect count. Single-sourced
 /// so a copy can't silently drop `--proto-redir =https` and let a hostile registry downgrade a hop to
-/// `http://` or `file://`. (`--max-redirs` stays per-call — the count legitimately differs.)
+/// `http://` or `file://`. (`--max-redirs` stays per-call - the count legitimately differs.)
 pub(crate) const TLS_PIN: &[&str] = &["--proto", "=https", "--proto-redir", "=https"];
 
 /// Is `registry` a loopback host (`localhost` / `127.x.y.z` / `[::1]`)? Loopback registries speak plain
-/// HTTP (the local-dev / `registry:2` case) and are insecure-OK by default, like Docker — there's no
+/// HTTP (the local-dev / `registry:2` case) and are insecure-OK by default, like Docker - there's no
 /// MITM to pin against over the loopback interface. Single source of truth, shared by pull AND push so
 /// the two can't drift on which registries are treated as insecure.
 ///
@@ -1262,15 +1262,15 @@ pub(crate) const TLS_PIN: &[&str] = &["--proto", "=https", "--proto-redir", "=ht
 /// a REAL push/pull = MITM / credential leak. So a `127.` host is loopback only if it's a valid dotted
 /// IPv4 in 127/8 (four numeric octets), and `localhost`/`::1` are exact-string matches.
 pub(crate) fn is_loopback_registry(registry: &str) -> bool {
-    // `localhost` is a NAME, not an IP — exact match, never a prefix (`localhost.evil.com` is NOT
+    // `localhost` is a NAME, not an IP - exact match, never a prefix (`localhost.evil.com` is NOT
     // loopback). NOTE (documented residual, per review): this trusts that `localhost` resolves to
-    // loopback — the default, but not guaranteed if `/etc/hosts` is tampered. The decision is on the
+    // loopback - the default, but not guaranteed if `/etc/hosts` is tampered. The decision is on the
     // STRING, never on DNS resolution: we never treat "an arbitrary host that resolves to 127.0.0.1"
     // as a reason for http (which would let `attacker.com`→127.0.0.1 bypass pinning).
     if registry == "localhost" || registry.starts_with("localhost:") {
         return true;
     }
-    // A bare IPv6 loopback (`::1`, no port) — matched before the `:`-split, since it's all colons.
+    // A bare IPv6 loopback (`::1`, no port) - matched before the `:`-split, since it's all colons.
     if registry == "::1" {
         return true;
     }
@@ -1278,7 +1278,7 @@ pub(crate) fn is_loopback_registry(registry: &str) -> bool {
     // the DEFINITION of loopback (all of 127.0.0.0/8 and ::1). This closes the whole "form I forgot"
     // class BY CONSTRUCTION instead of enumerating: `127.0.0.1.evil.com` (not an IP → parse fails),
     // `127.999.0.1` / `127.0x1.0.1` (invalid octet → parse fails), `::ffff:127.0.0.1` (an IPv4-mapped
-    // address whose `is_loopback()` is false) — ALL fall to NOT-loopback → https + TLS pin. A real
+    // address whose `is_loopback()` is false) - ALL fall to NOT-loopback → https + TLS pin. A real
     // domain also fails to parse → pinned. Fail-closed in the safe direction for every non-IP host.
     let host = if let Some(rest) = registry.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest) // `[::1]` / `[::1]:port`
@@ -1290,7 +1290,7 @@ pub(crate) fn is_loopback_registry(registry: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `<scheme>://<registry>` — `http` for a loopback registry, `https` otherwise.
+/// `<scheme>://<registry>` - `http` for a loopback registry, `https` otherwise.
 pub(crate) fn reg_base(registry: &str) -> String {
     let scheme = if is_loopback_registry(registry) {
         "http"
@@ -1300,7 +1300,7 @@ pub(crate) fn reg_base(registry: &str) -> String {
     format!("{scheme}://{registry}")
 }
 
-/// The HTTPS-pin curl args for `registry` — `TLS_PIN` for a real registry, empty for loopback HTTP.
+/// The HTTPS-pin curl args for `registry` - `TLS_PIN` for a real registry, empty for loopback HTTP.
 pub(crate) fn reg_pin(registry: &str) -> &'static [&'static str] {
     if is_loopback_registry(registry) {
         &[]
@@ -1338,15 +1338,15 @@ fn userns_ok() -> bool {
 /// Run the mode-sensitive part of a layer unpack (extract + merge + cleanup) with the capability to
 /// override file/dir permissions. ROOT (any OS, incl. WSL's default root) already has it → runs `f`
 /// DIRECTLY, byte-identical to before (no fork, no userns). A NON-root user forks a child that maps
-/// its uid to in-ns root (a single-uid user namespace — the same primitive as `unshare -r`), then
+/// its uid to in-ns root (a single-uid user namespace - the same primitive as `unshare -r`), then
 /// runs `f` there: with CAP_DAC_OVERRIDE/DAC_READ_SEARCH the extractor and merger never EACCES on an
-/// image's restrictive dir/file modes (fedora's 0555 `etc/pki/...` dirs, a setuid `/usr/bin/sudo`) —
+/// image's restrictive dir/file modes (fedora's 0555 `etc/pki/...` dirs, a setuid `/usr/bin/sudo`) -
 /// the exact failures a plain non-root unpack hit on edge boards. Falls back to a direct best-effort
 /// run where userns is unavailable (no worse than before there).
 ///
-/// FORK SAFETY (not by timing — by construction): forking a MULTI-threaded process is a deadlock
+/// FORK SAFETY (not by timing - by construction): forking a MULTI-threaded process is a deadlock
 /// hazard (the child inherits a possibly-locked allocator). We fork ONLY on the non-root path, and the
-/// caller (`pull`) DISABLES the layer-prefetch thread whenever non-root — so the process is provably
+/// caller (`pull`) DISABLES the layer-prefetch thread whenever non-root - so the process is provably
 /// SINGLE-THREADED at every `fork()` here and the child can't inherit a held lock. Root keeps prefetch
 /// but never forks. The child reports failure via a non-zero exit (its specific error already went to
 /// the inherited stderr); the single-uid mapping means its in-ns root can only override perms on the
@@ -1404,7 +1404,7 @@ pub(crate) fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Resul
 /// How a layer blob is compressed. Detected from the blob's leading magic bytes (never from the
 /// manifest's declared media type, which can lie or be omitted), so the codec is decided by the
 /// actual, already-sha256-verified bytes. `Plain` is an uncompressed tar (`…tar`, no `+gzip`/`+zstd`)
-/// — accepting it also fixes a latent gap where uncompressed OCI layers failed the gzip-only path.
+/// - accepting it also fixes a latent gap where uncompressed OCI layers failed the gzip-only path.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Compression {
     Gzip,
@@ -1415,7 +1415,7 @@ pub(crate) enum Compression {
 /// Sniff a (verified, on-disk) layer blob's compression from its first bytes: gzip = `1f 8b`, zstd =
 /// `28 b5 2f fd`, anything else = an uncompressed tar. Reads at most 4 bytes; a short/empty read is
 /// treated as `Plain` (tar then errors cleanly). Called only AFTER `verify_digest`, so the content is
-/// authentic — sniffing adds no attack surface.
+/// authentic - sniffing adds no attack surface.
 pub(crate) fn detect_compression(path: &Path) -> Compression {
     use std::io::Read;
     let mut buf = [0u8; 4];
@@ -1455,7 +1455,7 @@ fn zstd_missing() -> OciError {
 /// Vet a downloaded layer tarball before extraction by reading its RAW tar headers in-process
 /// (`gzip -dc` does ONLY the decompression). We deliberately do NOT parse `tar -tv`'s human-readable
 /// text: it is locale-dependent and can be desynced by a member name that contains the ` -> ` /
-/// ` link to ` delimiter, hiding an escaping link target — a real BusyBox-tar escape. Header fields
+/// ` link to ` delimiter, hiding an escaping link target - a real BusyBox-tar escape. Header fields
 /// (name / prefix / linkname / typeflag) live at FIXED offsets, so this decision is sound on GNU and
 /// BusyBox alike. Rejects: absolute / `..` paths, an escaping hardlink target (always) or symlink
 /// target (on non-GNU tar), device/special nodes, a total uncompressed size over the 2 GiB bomb cap,
@@ -1469,7 +1469,7 @@ pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(),
         return vet_tar_stream(&mut f);
     }
     // gzip / zstd: the decompressor does ONLY the decompression; `vet_tar_stream` (the fuzzed core)
-    // reads the DECOMPRESSED stream and is codec-agnostic — so the entire hardening surface (bomb
+    // reads the DECOMPRESSED stream and is codec-agnostic - so the entire hardening surface (bomb
     // caps, symlink/whiteout/device guards) is identical regardless of codec.
     let (bin, args) = match comp {
         Compression::Gzip => ("gzip", ["-dc", &path]),
@@ -1496,7 +1496,7 @@ pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(),
     let mut stdout = child.stdout.take().expect("stdout piped");
     let res = vet_tar_stream(&mut stdout);
     // We stop reading at the end-of-archive marker (or on rejection), so the decompressor may take a
-    // SIGPIPE — its exit status isn't meaningful here. Truncation/corruption is caught inside
+    // SIGPIPE - its exit status isn't meaningful here. Truncation/corruption is caught inside
     // `vet_tar_stream` (a short read before the end-of-archive marker is an error), so a cut-off unsafe
     // member can't slip.
     let _ = child.kill();
@@ -1505,7 +1505,7 @@ pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(),
 }
 
 const TAR_BLOCK: usize = 512;
-/// Cap on a GNU long-name / long-link / PAX record set — a real one is a few KB; refuse the absurd.
+/// Cap on a GNU long-name / long-link / PAX record set - a real one is a few KB; refuse the absurd.
 const TAR_MAX_LONG: u64 = 1 << 20;
 
 /// Read up to `buf.len()` bytes (retrying on EINTR). Returns the count: `0` = clean EOF, `< len` = a
@@ -1531,7 +1531,7 @@ fn tar_field(b: &[u8]) -> String {
 
 /// A tar numeric field: octal (space/NUL-terminated), or GNU base-256 (high bit of the first byte).
 /// Base-256 magnitude is accumulated in `u128` and rejected (returns `None`) if it doesn't fit in a
-/// `u64` — `checked_shl(8)` on a `u64` only fails when the shift is ≥ 64, so it would SILENTLY WRAP a
+/// `u64` - `checked_shl(8)` on a `u64` only fails when the shift is ≥ 64, so it would SILENTLY WRAP a
 /// large value, desyncing our byte-skip from what tar extracts. (A field this large exceeds our layer
 /// caps anyway; refusing it is fail-closed.)
 fn tar_num(field: &[u8]) -> Option<u64> {
@@ -1583,7 +1583,7 @@ fn take_data(r: &mut impl std::io::Read, len: u64, keep: usize) -> Result<Vec<u8
 }
 
 /// What `parse_pax` extracted from a PAX record set: the overriding `path`/`linkpath`, and whether any
-/// `GNU.sparse.*` key was present (the PAX-encoded new-GNU sparse-file variant — a divergence surface we
+/// `GNU.sparse.*` key was present (the PAX-encoded new-GNU sparse-file variant - a divergence surface we
 /// refuse, same as a raw `'S'` typeflag).
 struct PaxInfo {
     path: Option<String>,
@@ -1591,8 +1591,8 @@ struct PaxInfo {
     sparse: bool,
 }
 
-/// Parse the PAX records we care about (`<len> key=value\n`…). Operates on the RAW bytes — never on a
-/// lossy `&str` — so a `len` that an attacker tuned to fall inside a multi-byte UTF-8 sequence can't
+/// Parse the PAX records we care about (`<len> key=value\n`…). Operates on the RAW bytes - never on a
+/// lossy `&str` - so a `len` that an attacker tuned to fall inside a multi-byte UTF-8 sequence can't
 /// panic on a char-boundary slice; malformed input just stops the scan. Only the final value is decoded
 /// (lossily) to a `String`.
 fn parse_pax(data: &[u8]) -> PaxInfo {
@@ -1640,7 +1640,7 @@ fn parse_pax(data: &[u8]) -> PaxInfo {
 
 /// Vet the raw (decompressed) tar stream `r` block by block. Resolves the effective path/linkname
 /// through ustar `prefix`, GNU `L`/`K` long name/link, and PAX `x`/`g` `path=`/`linkpath=`, so what we
-/// check is what tar will actually create — never a truncated or text-desynced approximation.
+/// check is what tar will actually create - never a truncated or text-desynced approximation.
 pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError> {
     let bad = |m: &str| OciError::Extract(m.to_string());
     let mut header = [0u8; TAR_BLOCK];
@@ -1650,8 +1650,8 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
     let mut next_link: Option<String> = None; // …K / PAX linkpath
                                               // Paths of symlinks seen SO FAR in this layer whose target ESCAPES the rootfs (absolute / `..`).
                                               // A symlink-following extractor (BusyBox tar) writing THROUGH one would land outside the staging
-                                              // dir — so a LATER member that descends through one is the real escape (tracked, not the mere
-                                              // existence of an absolute symlink, which every busybox-based image — alpine's `/bin/*` — has).
+                                              // dir - so a LATER member that descends through one is the real escape (tracked, not the mere
+                                              // existence of an absolute symlink, which every busybox-based image - alpine's `/bin/*` - has).
     let mut escaping_symlinks: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
@@ -1667,20 +1667,20 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
         if header.iter().all(|&b| b == 0) {
             // A zero block STARTS the end-of-archive marker (POSIX wants two). Do NOT return here: a
             // single stray zero block followed by more members would let us stop vetting while the host
-            // tar reads on and extracts them. Require the tail to be all-zero — any non-zero byte after
+            // tar reads on and extracts them. Require the tail to be all-zero - any non-zero byte after
             // the marker is a hidden trailing member → reject. But do NOT drain to EOF unboundedly: a
             // hostile image can append gigabytes of zero blocks (a zero-bomb DoS). A legitimate tail is
             // a couple of zero blocks plus at most one blocking-factor of record padding (GNU default 20
-            // blocks); cap generously and, once past the cap, stop reading — the extractor's own output
+            // blocks); cap generously and, once past the cap, stop reading - the extractor's own output
             // is already bounded by MAX_LAYER_BYTES, and a multi-MiB all-zero tail carries no member.
-            const MAX_TAIL_BLOCKS: usize = 4096; // 2 MiB of trailing zero padding — absurdly generous
+            const MAX_TAIL_BLOCKS: usize = 4096; // 2 MiB of trailing zero padding - absurdly generous
             let mut pad = [0u8; TAR_BLOCK];
             let mut tail_blocks = 0usize;
             loop {
                 let m =
                     read_block(r, &mut pad).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
                 if m == 0 {
-                    return Ok(()); // clean EOF after the zero marker — fully vetted
+                    return Ok(()); // clean EOF after the zero marker - fully vetted
                 }
                 if pad[..m].iter().any(|&b| b != 0) {
                     return Err(bad(
@@ -1702,17 +1702,17 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
         let size = tar_num(&header[124..136]).ok_or_else(|| bad("bad tar size field"))?;
 
         // GNU long-name/link and PAX headers carry the real path/linkname in their DATA, for the NEXT
-        // entry — read (capped) and stash; they aren't entries themselves.
+        // entry - read (capped) and stash; they aren't entries themselves.
         //
         // FAIL-CLOSED ON AMBIGUITY: if two sources try to set the SAME field for one member (a GNU `L`
         // *and* a PAX `path=`, or `K` *and* a PAX `linkpath=`), we do NOT guess which one the host tar
-        // will honour — GNU tar prefers PAX regardless of physical order, others differ, so any choice
+        // will honour - GNU tar prefers PAX regardless of physical order, others differ, so any choice
         // we make can diverge from extraction. Legit images never mix two sources for one member, so we
         // simply reject. `set_once` enforces this: a second setter on an already-set slot is an error.
         fn set_once(slot: &mut Option<String>, val: String, what: &str) -> Result<(), OciError> {
             if slot.is_some() {
                 return Err(OciError::Extract(format!(
-                    "layer sets {what} for one member from two sources (ambiguous — refusing)"
+                    "layer sets {what} for one member from two sources (ambiguous - refusing)"
                 )));
             }
             *slot = Some(val);
@@ -1738,7 +1738,7 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
                 let info = parse_pax(&take_data(r, size, size as usize)?);
                 if info.sparse {
                     return Err(bad(
-                        "layer has a PAX-encoded sparse member (unsupported — refusing)",
+                        "layer has a PAX-encoded sparse member (unsupported - refusing)",
                     ));
                 }
                 if let Some(p) = info.path {
@@ -1751,7 +1751,7 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
             }
             b'g' => {
                 // A PAX GLOBAL header is sticky across all following members, and most tars ignore
-                // `path`/`linkpath` inside it entirely — so trusting it here would vet a name that
+                // `path`/`linkpath` inside it entirely - so trusting it here would vet a name that
                 // extraction never uses. A legit OCI layer never carries a global `path`/`linkpath`;
                 // refuse the archive rather than guess. (Global records without those keys are benign
                 // and simply skipped.)
@@ -1761,18 +1761,18 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
                 let info = parse_pax(&take_data(r, size, size as usize)?);
                 if info.sparse {
                     return Err(bad(
-                        "layer has a PAX-encoded sparse member (unsupported — refusing)",
+                        "layer has a PAX-encoded sparse member (unsupported - refusing)",
                     ));
                 }
                 if info.path.is_some() || info.linkpath.is_some() {
                     return Err(bad(
-                        "layer carries a PAX global path/linkpath override (ambiguous — refusing)",
+                        "layer carries a PAX global path/linkpath override (ambiguous - refusing)",
                     ));
                 }
                 continue;
             }
             // GNU SPARSE ('S') and MULTIVOLUME ('M') members are a hard divergence surface: the `size`
-            // header field is the STORED (sparse) length, not the real extracted layout — the data does
+            // header field is the STORED (sparse) length, not the real extracted layout - the data does
             // NOT occupy `size` contiguous bytes, so skipping `size` bytes here desyncs our cursor from
             // what tar reads (→ a fake "next header" parsed from mid-data), and a sparse member also lets
             // `size` under-count the real file (a bomb the byte-cap can't see). An OCI layer never needs
@@ -1780,31 +1780,31 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
             // is caught in `parse_pax` → the 'x' branch's set_once/`is_err`.)
             b'S' | b'M' => {
                 return Err(bad(
-                    "layer has a sparse or multivolume member (unsupported — refusing)",
+                    "layer has a sparse or multivolume member (unsupported - refusing)",
                 ));
             }
-            // A FIFO ('6') is INERT toward the host (unlike a device node it reaches no hardware — it's
+            // A FIFO ('6') is INERT toward the host (unlike a device node it reaches no hardware - it's
             // just a filesystem object in the staging rootfs), so accepting it would be safe. We refuse
             // it anyway, as a DELIBERATE, DOCUMENTED policy: an ephemeral sandbox rootfs has no
             // legitimate use for a named pipe baked into an image layer, and refusing keeps the member
-            // set to the types kern actually models. This is an explicit choice with a clear message —
-            // not the accidental "unsupported type" fallthrough — so a maintainer can flip it to accept
+            // set to the types kern actually models. This is an explicit choice with a clear message -
+            // not the accidental "unsupported type" fallthrough - so a maintainer can flip it to accept
             // by moving `b'6'` into the allow-list on the line below.
             b'6' => {
                 return Err(bad(
-                    "layer has a FIFO member — refused by policy (not needed in a sandbox rootfs)",
+                    "layer has a FIFO member - refused by policy (not needed in a sandbox rootfs)",
                 ));
             }
             // Known member typeflags that fall through to be vetted as a real entry below: regular
             // (`0`, NUL, and pre-POSIX `7` contiguous ≈ regular), directory (`5`), hardlink (`1`),
             // symlink (`2`), and device (`3`/`4`, rejected just below). Anything else is a typeflag we
-            // don't model — fail CLOSED (don't silently treat an unknown vendor type as a regular file
+            // don't model - fail CLOSED (don't silently treat an unknown vendor type as a regular file
             // and skip `size` bytes on a possibly-different-meaning field). Every other divergence class
             // in this vetter already fails closed; this keeps the last fallthrough consistent.
             b'0' | 0 | b'7' | b'5' | b'1' | b'2' | b'3' | b'4' => {}
             other => {
                 return Err(bad(&format!(
-                    "layer has an unsupported tar member type (0x{other:02x}) — refusing"
+                    "layer has an unsupported tar member type (0x{other:02x}) - refusing"
                 )));
             }
         }
@@ -1835,13 +1835,13 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
             return Err(OciError::Extract(format!("unsafe path in layer: {path}")));
         }
         // CANONICALIZE the way the extractor lays it on disk (drop `.`/empty components: leading `./`,
-        // `//`, `/./`, trailing `/`) — else a member spelled `./A/x` or `A//x` would slip past a symlink
+        // `//`, `/./`, trailing `/`) - else a member spelled `./A/x` or `A//x` would slip past a symlink
         // recorded as `A` (the vetter's string view must match the filesystem's). `..` already rejected.
         let path = normalize_member_path(&path);
 
         // SYMLINK-ESCAPE: reject any member AT or UNDER a symlink recorded earlier in THIS layer whose
         // (resolved) target escapes the rootfs. On a symlink-FOLLOWING extractor (BusyBox tar) such a
-        // member writes OUTSIDE the isolated staging dir — whether it DESCENDS the symlink (`a/x` through
+        // member writes OUTSIDE the isolated staging dir - whether it DESCENDS the symlink (`a/x` through
         // `a -> /etc`), writes a file straight ONTO it (`a` over `a -> /etc/x`, which tar opens through
         // the link), or the symlink was reached through a CHAIN (`b -> a -> /etc`). `under_escaping` is
         // O(path depth) HashSet lookups → linear even at 2M entries (a per-member scan of all prior
@@ -1863,10 +1863,10 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
             )));
         }
 
-        // A symlink('2'), hardlink('1') or directory('5') header carries NO data — its `size` MUST be
+        // A symlink('2'), hardlink('1') or directory('5') header carries NO data - its `size` MUST be
         // 0. A hostile layer that puts a NON-ZERO size on one of these desyncs the vetter from the
         // extractor: WE skip `size` bytes (trusting the lie), but a non-GNU `tar` (BusyBox on the
-        // musl/edge boards kern targets) does NOT skip data for these types — it reads the skipped block
+        // musl/edge boards kern targets) does NOT skip data for these types - it reads the skipped block
         // as the NEXT header. So the attacker hides an escaping member (esc -> /etc/shadow) in the
         // "data" of a lying symlink: the vetter never sees it, BusyBox extracts it -> full escape-guard
         // bypass. Reject a non-zero size on these types BEFORE consuming, so the vetter and every
@@ -1876,10 +1876,10 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
                 "layer has a symlink/hardlink/directory header with non-zero size (tar desync attack)",
             ));
         }
-        // Record this symlink if its target ESCAPES the rootfs — DIRECTLY (absolute / `..`) or via a
+        // Record this symlink if its target ESCAPES the rootfs - DIRECTLY (absolute / `..`) or via a
         // CHAIN (a relative target that resolves onto an already-escaping symlink, e.g. `b -> a` where
         // `a -> /etc`). ADD-ONLY, never cleared: once a path holds an escaping symlink a later same-path
-        // member must NOT un-guard it — a symlink-following extractor may leave the original link in place
+        // member must NOT un-guard it - a symlink-following extractor may leave the original link in place
         // (a dir/file written over it EEXISTs or is opened THROUGH it), and any member at/under it is
         // already refused by `under_escaping` above. The relative-target resolution is done against the
         // symlink's PARENT dir (that's what the link is relative to), normalized like any member path.
@@ -1895,7 +1895,7 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
             }
         }
         // Cap BEFORE consuming the data: a single member with a huge size would otherwise stream its
-        // entire (decompressed) body from gzip before the running total tripped the cap — a per-member
+        // entire (decompressed) body from gzip before the running total tripped the cap - a per-member
         // DoS. Checking the declared size up front bounds the work to one block.
         total = total.saturating_add(size);
         if size > MAX_LAYER_BYTES || total > MAX_LAYER_BYTES {
@@ -1909,7 +1909,7 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
 
 /// Merge an isolated layer staging tree into `dest` with **no-follow** semantics. Before writing
 /// any entry, the destination parent must be symlink-free (else a previous layer planted a
-/// symlink to escape through — refuse). `.wh.<name>` deletes `<name>`; `.wh..wh..opq` drops the
+/// symlink to escape through - refuse). `.wh.<name>` deletes `<name>`; `.wh..wh..opq` drops the
 /// directory's lower-layer contents. Targets are removed without following symlinks, so the
 /// merge can never write through one.
 pub(crate) fn merge_layer(staging: &Path, dest: &Path) -> Result<(), OciError> {
@@ -1950,7 +1950,7 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
         if let Some(victim_name) = fname.strip_prefix(".wh.") {
             // A whiteout deletes a sibling in THIS directory, so the victim must be a plain file
             // name. Reject `.`/`..`/empty/`<sep>`: a crafted `.wh...` strips to `..`, and
-            // `with_file_name("..")` then points at the rootfs's PARENT — `remove_no_follow` would
+            // `with_file_name("..")` then points at the rootfs's PARENT - `remove_no_follow` would
             // `remove_dir_all` files OUTSIDE the image (other pulled images / the store). `..` is a
             // real dir, so the no-follow symlink guard does not stop it. (Opaque marker handled above.)
             let plain_victim = !victim_name.is_empty()
@@ -1977,12 +1977,12 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
                     std::fs::create_dir(&target).map_err(|e| OciError::Extract(e.to_string()))?;
                 }
             }
-            // Copy the source dir's EXACT mode onto the merged dir — `create_dir` uses 0777&umask
+            // Copy the source dir's EXACT mode onto the merged dir - `create_dir` uses 0777&umask
             // (0755), which drops the sticky bit + world-write that images set on `/tmp` (1777). Without
             // this, a workload that drops to a non-root uid can't write `/tmp` (mariadb/mysql InnoDB temp
             // files fail EACCES). The staging was extracted with `--same-permissions`, so `src` carries
-            // the image's real mode. (setuid/setgid bits on a rootfs dir are inert — the box root mount
-            // is MS_NOSUID — so copying the full mode is safe.)
+            // the image's real mode. (setuid/setgid bits on a rootfs dir are inert - the box root mount
+            // is MS_NOSUID - so copying the full mode is safe.)
             if let Ok(m) = std::fs::metadata(&src) {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(
@@ -2027,7 +2027,7 @@ fn clear_dir(d: &Path) {
             // NEVER delete kern's own transient files: the layer cache dir (`dest`) also holds the
             // in-flight prefetch blob (`.kern-layer-<i>-*`) and, in `dest`'s parent, staging dirs.
             // A layer with a ROOT-LEVEL opaque whiteout (`.wh..wh..opq` at the tar root) makes the
-            // merge `clear_dir(dest)` — without this skip, a (possibly hostile) image would wipe the
+            // merge `clear_dir(dest)` - without this skip, a (possibly hostile) image would wipe the
             // blob curl is still writing for the NEXT layer, ENOENT-ing the pull. Image members can
             // never legitimately be named `.kern-*` (nothing in an OCI layer is), so this is safe.
             if e.file_name().to_string_lossy().starts_with(".kern-") {
@@ -2043,7 +2043,7 @@ fn is_manifest_list(m: &str) -> bool {
 }
 
 /// Pick the layer-bearing manifest digest for `want.arch` (+ os linux) from a manifest list / index.
-/// EXACT match only — returns `None` if the requested arch isn't in the index (the caller then errors
+/// EXACT match only - returns `None` if the requested arch isn't in the index (the caller then errors
 /// with the available arches), never a wrong-arch fallback.
 fn select_arch_digest(m: &str, want: &Platform) -> Option<String> {
     let manifests = array_after(m, "manifests")?;
@@ -2104,7 +2104,7 @@ mod tests {
         assert!(is_loopback_registry("127.5.6.7"));
         assert!(is_loopback_registry("::1"));
         assert!(is_loopback_registry("[::1]:5000"));
-        // SECURITY: an attacker domain that merely LOOKS loopback must NOT be treated as insecure —
+        // SECURITY: an attacker domain that merely LOOKS loopback must NOT be treated as insecure -
         // else a real push/pull to it runs over http with no TLS pin (MITM / credential leak).
         assert!(!is_loopback_registry("127.0.0.1.evil.com")); // 5 parts, not an IPv4
         assert!(!is_loopback_registry("127x.evil.com"));
@@ -2238,7 +2238,7 @@ mod tests {
             "registry-1.docker.io"
         ));
         assert!(!realm_host_trusted("https://evil.com/token", "ghcr.io"));
-        // CRITICAL bypass class — userinfo (`user@host`) with/without a port: curl connects to the
+        // CRITICAL bypass class - userinfo (`user@host`) with/without a port: curl connects to the
         // host AFTER the last `@`, so the check must too. Every one of these dials `evil.com`.
         assert!(!realm_host_trusted(
             "https://ghcr.io@evil.com/token",
@@ -2256,13 +2256,13 @@ mod tests {
             "https://registry.gitlab.com@evil.com/token",
             "registry.gitlab.com"
         ));
-        // `#` ends the authority (curl treats it as a fragment) — must not smuggle a foreign host.
+        // `#` ends the authority (curl treats it as a fragment) - must not smuggle a foreign host.
         assert!(!realm_host_trusted(
             "https://ghcr.io:0@evil.com#x",
             "ghcr.io"
         ));
         // HACKER-MODE FIX: a same-parent SIBLING is NO LONGER trusted. The old parent-domain rule
-        // trusted any `*.acme.com` for a `registry.acme.com` login — a hostile registry on shared
+        // trusted any `*.acme.com` for a `registry.acme.com` login - a hostile registry on shared
         // hosting could point its realm at an attacker-controlled sibling and harvest the write creds.
         assert!(!realm_host_trusted(
             "https://attacker.acme.com/token",
@@ -2357,7 +2357,7 @@ mod tests {
 
     #[test]
     fn no_matching_arch_returns_none_no_fallback() {
-        // A requested arch absent from the index yields None (NOT a wrong-arch fallback) — the pull
+        // A requested arch absent from the index yields None (NOT a wrong-arch fallback) - the pull
         // then errors with the available list. Locks the reviewer-mandated dropped fallback.
         let ppc = Platform {
             os: "linux".into(),
@@ -2508,7 +2508,7 @@ mod tests {
     }
 
     /// SECURITY: merging a layer must never write THROUGH a symlink an earlier layer planted in
-    /// the rootfs — the target outside the rootfs must stay untouched.
+    /// the rootfs - the target outside the rootfs must stay untouched.
     #[test]
     fn merge_never_writes_through_a_planted_symlink() {
         let base = std::env::temp_dir().join(format!("kern-oci-merge-{}", std::process::id()));
@@ -2524,7 +2524,7 @@ mod tests {
         std::fs::create_dir_all(staging.join("link")).unwrap();
         std::fs::write(staging.join("link/evil"), b"pwned").unwrap();
 
-        let _ = merge_layer(&staging, &dest); // may replace or refuse — either way must be safe
+        let _ = merge_layer(&staging, &dest); // may replace or refuse - either way must be safe
 
         assert!(
             !victim.join("evil").exists(),
@@ -2548,7 +2548,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let dest = base.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
-        // A sibling of `dest` — i.e. living under `dest/..` (== base) — that an escape would wipe.
+        // A sibling of `dest` - i.e. living under `dest/..` (== base) - that an escape would wipe.
         let outside = base.join("outside_sibling.txt");
         std::fs::write(&outside, b"keep me").unwrap();
         // A layer (staging) carrying a single member `.wh...`: `.wh.` + `..` → victim name "..".
@@ -2633,10 +2633,10 @@ mod tests {
     /// panic on a char-boundary slice. `parse_pax` operates on bytes, so this just parses harmlessly.
     #[test]
     fn parse_pax_does_not_panic_on_midchar_len() {
-        // "8 path=é" — bytes: 38 20 70 61 74 68 3d c3 a9 ; len=8 lands between the two bytes of 'é'.
+        // "8 path=é" - bytes: 38 20 70 61 74 68 3d c3 a9 ; len=8 lands between the two bytes of 'é'.
         let payload = b"8 path=\xc3\xa9";
         let info = parse_pax(payload); // must not panic
-                                       // The declared length truncates the value mid-char; lossy decode yields a replacement — fine,
+                                       // The declared length truncates the value mid-char; lossy decode yields a replacement - fine,
                                        // the point is it does not crash `kern pull`.
         let _ = info.path;
     }
@@ -2670,7 +2670,7 @@ mod tests {
     }
 
     /// REGRESSION (GNU sparse, PAX-encoded): a `GNU.sparse.*` PAX record marks a sparse member even with
-    /// a regular typeflag — must be refused via `parse_pax`'s sparse flag.
+    /// a regular typeflag - must be refused via `parse_pax`'s sparse flag.
     #[test]
     fn rejects_pax_encoded_sparse() {
         let mut stream = Vec::new();
@@ -2717,7 +2717,7 @@ mod tests {
         );
     }
 
-    /// POLICY (documented): a FIFO ('6') is inert toward the host but refused by deliberate policy —
+    /// POLICY (documented): a FIFO ('6') is inert toward the host but refused by deliberate policy -
     /// with a SPECIFIC message, not the generic "unsupported type" fallthrough. This test pins the
     /// decision: flipping the policy to accept must be a conscious change that updates this test.
     #[test]
@@ -2749,13 +2749,13 @@ mod tests {
         }
     }
 
-    /// A normal short zero-padded tail (a couple of blocks) still passes — no false positive.
+    /// A normal short zero-padded tail (a couple of blocks) still passes - no false positive.
     #[test]
     fn accepts_normal_zero_padding() {
         let mut stream = Vec::new();
         stream.extend_from_slice(&hdr(b"safe/file", b'0', 0, b""));
-        stream.extend(end_marker()); // two zero blocks — the canonical end marker
-        stream.extend_from_slice(&vec![0u8; BLK * 18]); // GNU pads to a 20-block record — legit
+        stream.extend(end_marker()); // two zero blocks - the canonical end marker
+        stream.extend_from_slice(&vec![0u8; BLK * 18]); // GNU pads to a 20-block record - legit
         let mut r: &[u8] = &stream;
         assert!(
             vet_tar_stream(&mut r).is_ok(),
@@ -2770,7 +2770,7 @@ mod tests {
         let mut f = [0u8; 12];
         f[0] = 0x80; // base-256 flag, magnitude follows
         for b in f.iter_mut().skip(1) {
-            *b = 0xff; // huge — far beyond u64
+            *b = 0xff; // huge - far beyond u64
         }
         assert_eq!(
             tar_num(&f),
@@ -2801,10 +2801,10 @@ mod tests {
         );
     }
 
-    /// REGRESSION (PAX global path): a sticky global `path`/`linkpath` override is refused ON ITS OWN —
+    /// REGRESSION (PAX global path): a sticky global `path`/`linkpath` override is refused ON ITS OWN -
     /// the following member's header name is SAFE, so the ONLY thing that can trip the vetter is the
     /// global override itself (host tar would ignore it and extract the safe header name; a different
-    /// tar might honour it — we don't guess, we refuse the archive).
+    /// tar might honour it - we don't guess, we refuse the archive).
     #[test]
     fn rejects_pax_global_path_override() {
         let mut stream = Vec::new();
@@ -2823,7 +2823,7 @@ mod tests {
     }
 
     /// REGRESSION (early zero-block): a member HIDDEN after a single stray zero block must still be
-    /// vetted — we must not stop at the first zero block.
+    /// vetted - we must not stop at the first zero block.
     #[test]
     fn rejects_member_hidden_after_a_zero_block() {
         let mut stream = Vec::new();
@@ -2854,7 +2854,7 @@ mod tests {
     /// REGRESSION (busybox images): alpine's `/bin/*` and `/usr/bin/*` are ABSOLUTE symlinks to
     /// `/bin/busybox`. The old guard blanket-rejected every escaping symlink target under non-GNU tar,
     /// so `kern box --image alpine` failed on EVERY BusyBox host (the shipped WSL distro, edge Pi/Alpine).
-    /// A lone absolute symlink with nothing written through it must now PASS — on GNU tar AND BusyBox.
+    /// A lone absolute symlink with nothing written through it must now PASS - on GNU tar AND BusyBox.
     #[test]
     fn accepts_absolute_symlinks_with_no_write_through() {
         let mut stream = Vec::new();
@@ -2876,7 +2876,7 @@ mod tests {
     /// FILE-OVER-SYMLINK variant: a regular file written straight ONTO the escaping symlink path.
     #[test]
     fn rejects_write_through_an_escaping_symlink() {
-        // (target, follow-member) — follow descends OR lands on the symlink.
+        // (target, follow-member) - follow descends OR lands on the symlink.
         let cases: &[(&str, &str)] = &[
             ("/etc", "evil/passwd"),       // absolute escape, descend
             ("../../../../etc", "evil/x"), // `..` escape, descend
@@ -2900,7 +2900,7 @@ mod tests {
         }
     }
 
-    /// SECURITY (audit findings — the subtle bypasses of a naive textual guard). Each of these would
+    /// SECURITY (audit findings - the subtle bypasses of a naive textual guard). Each of these would
     /// escape on a symlink-following extractor while a first-cut guard passed it. All must be refused.
     #[test]
     fn rejects_symlink_escape_bypasses() {
@@ -2946,16 +2946,16 @@ mod tests {
     }
 
     /// A symlink with a SAFE (in-rootfs) target is NOT escaping, so writing through it stays inside
-    /// staging — allowed. A deeper member that does NOT descend an escaping symlink is fine too. And a
+    /// staging - allowed. A deeper member that does NOT descend an escaping symlink is fine too. And a
     /// CHAIN of safe symlinks (c -> d -> real) stays allowed.
     #[test]
     fn safe_symlink_traversal_and_sibling_writes_pass() {
         let mut stream = Vec::new();
         stream.extend_from_slice(&hdr(b"data", b'2', 0, b"real")); // relative, in-rootfs target
-        stream.extend_from_slice(&hdr(b"data/file", b'0', 0, b"")); // writes through a SAFE symlink — ok
+        stream.extend_from_slice(&hdr(b"data/file", b'0', 0, b"")); // writes through a SAFE symlink - ok
         stream.extend_from_slice(&hdr(b"d", b'2', 0, b"real2")); // safe
         stream.extend_from_slice(&hdr(b"c", b'2', 0, b"d")); // safe chain c -> d -> real2
-        stream.extend_from_slice(&hdr(b"c/x", b'0', 0, b"")); // through a safe chain — ok
+        stream.extend_from_slice(&hdr(b"c/x", b'0', 0, b"")); // through a safe chain - ok
         stream.extend_from_slice(&hdr(b"lib", b'2', 0, b"/usr/lib")); // escaping symlink…
         stream.extend_from_slice(&hdr(b"libexec/tool", b'0', 0, b"")); // …but this does NOT descend it
         stream.extend(end_marker());

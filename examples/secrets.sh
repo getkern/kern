@@ -3,7 +3,7 @@
 #
 #   --secret NAME=-        read the value from kern's stdin (never hits argv / the process table)
 #   --secret SRC[:NAME]    read a host file (NAME defaults to the file's basename)
-#   --secret NAME=value    inline literal — convenient, but visible in `ps` and recorded in the
+#   --secret NAME=value    inline literal - convenient, but visible in `ps` and recorded in the
 #                          systemd journal, so prefer the stdin or file forms for real secrets
 #
 # Each secret is read on the HOST, before the box's namespaces exist, then written to a RAM-backed
@@ -13,7 +13,7 @@
 set -eu
 kern="${KERN:-kern}"
 
-# A host secret file (chmod 600 — a world-writable secret source is refused, group/world-readable
+# A host secret file (chmod 600 - a world-writable secret source is refused, group/world-readable
 # is warned about). Cleaned up on exit.
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -40,18 +40,18 @@ printf '%s' 'tok_live_abc123' | "$kern" box vault --image alpine \
   '
 
 echo
-echo "==> 2. the secret is EPHEMERAL — a second box (no --secret) sees nothing:"
+echo "==> 2. the secret is EPHEMERAL - a second box (no --secret) sees nothing:"
 # Nothing was written to the image, so a fresh box from the same image has an empty (or absent)
 # /run/secrets. Proof the secret lived only in RAM for the first box's lifetime.
 "$kern" box plain --image alpine -- /bin/sh -c '
   if [ -d /run/secrets ] && [ -n "$(ls -A /run/secrets 2>/dev/null)" ]; then
     echo "   unexpected: /run/secrets still has content"
   else
-    echo "   /run/secrets is empty / absent — the secret never touched the image ✓"
+    echo "   /run/secrets is empty / absent - the secret never touched the image ✓"
   fi
 '
 
 echo
-echo "done — secrets ride in on a 0400 tmpfs, stay out of argv/env/overlay, and vanish on exit."
+echo "done - secrets ride in on a 0400 tmpfs, stay out of argv/env/overlay, and vanish on exit."
 # Both boxes ran in the foreground and their ephemeral overlays are already gone; only the temp
 # secret file remains, and the trap above removes it.

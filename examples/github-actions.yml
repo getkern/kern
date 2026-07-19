@@ -1,7 +1,7 @@
 # Minimal GitHub Actions workflow: run your build/test inside a kern box on CI.
 #
 # kern is daemonless and rootless, so there is nothing to set up on the runner beyond the single
-# install line — no Docker socket, no privileged service container. The build runs in an isolated
+# install line - no Docker socket, no privileged service container. The build runs in an isolated
 # sandbox (repo bound read-only, memory-capped), and the box's exit code fails the job on error.
 #
 # Copy this to .github/workflows/ci.yml. `examples/ci-integration.sh` runs the SAME steps locally

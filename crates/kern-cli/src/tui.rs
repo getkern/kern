@@ -1,25 +1,25 @@
-//! `kern top` — a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
+//! `kern top` - a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
 //! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Seven tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
-//! per-box table — MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) — with lifecycle
-//! actions: stop/pause/unpause/kill/logs), **Runs** (aggregate `kern run` throughput — rate/sec, avg
+//! per-box table - MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) - with lifecycle
+//! actions: stop/pause/unpause/kill/logs), **Runs** (aggregate `kern run` throughput - rate/sec, avg
 //! setup latency, peak, total + sparkline; a `⚡` on the tab marks live activity), **Builds** (`kern
 //! build` history), **Profiles** (the reusable
-//! specs you attach by prefix — vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
+//! specs you attach by prefix - vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
 //! disks, and its `[[disk]]` is materialised from that choice, never hand-created) and **Storage** (the
-//! concrete data layer — physical disks read-only + named volumes you create). Host stats come straight
+//! concrete data layer - physical disks read-only + named volumes you create). Host stats come straight
 //! from `/proc`. Pure `libc` termios + ANSI, no curses/ratatui dependency.
 //!
 //! A `?` from any tab opens a full-keymap help overlay (the footer always advertises it), so the whole
 //! interface is discoverable without docs.
 //!
-//! Interaction is a small [`Mode`] state machine — `Nav` plus three modals (`Overlay` read-only pane,
+//! Interaction is a small [`Mode`] state machine - `Nav` plus three modals (`Overlay` read-only pane,
 //! `Form` input, `Confirm` for destructive actions). Profile edits are written **surgically** (see
 //! [`crate::toml_surgery`]) so a single edit never rewrites the whole file and drop the user's other
 //! sections.
 //!
 //! Robustness: the terminal is put in raw mode + the alternate screen on entry and **restored on
 //! drop** (so a panic or early return still leaves a sane terminal). `ISIG` is disabled, so Ctrl-C
-//! arrives as a byte we handle as "quit" — clean teardown, no stranded alt-screen.
+//! arrives as a byte we handle as "quit" - clean teardown, no stranded alt-screen.
 
 use crate::commands::{fmt_uptime, human_bytes};
 use crate::registry;
@@ -98,8 +98,8 @@ fn nav_fields(form: &Form) -> Vec<usize> {
 }
 
 /// Canonicalize a pick option/value token for MATCHING (edit-seed dedup). Only i2c has an ambiguous
-/// short form: a bus may be saved bare (`"1"`) or as `"i2c-1"` but the host scan lists `"/dev/i2c-1"`
-/// — fold all three to the `/dev/` form so they compare equal. Everything else is returned unchanged.
+/// short form: a bus may be saved bare (`"1"`) or as `"i2c-1"` but the host scan lists `"/dev/i2c-1"`:
+/// fold all three to the `/dev/` form so they compare equal. Everything else is returned unchanged.
 /// Uses the resolver's `canon_i2c_bus` (SINGLE source of truth) so the form and the runtime can't
 /// drift on what counts as the same bus.
 fn canon_pick_token(label: &str, s: &str) -> String {
@@ -117,10 +117,10 @@ struct Field {
     /// Shown dim inside an empty field as a placeholder (text fields), or as the toggle's caption.
     hint: &'static str,
     value: String,
-    /// A boolean switch (`[x]`/`[ ]`, Space flips) rather than free-text — for keys like `persistent`
+    /// A boolean switch (`[x]`/`[ ]`, Space flips) rather than free-text - for keys like `persistent`
     /// that are a bool, so a beginner never types "true"/"false". On = non-empty value; off = empty.
     toggle: bool,
-    /// Checkbox options: the host devices DETECTED for this field. Non-empty ⇒ a "pick" field — the
+    /// Checkbox options: the host devices DETECTED for this field. Non-empty ⇒ a "pick" field - the
     /// user toggles which are selected (←/→ to move, Space to check) instead of typing a `/dev/…`
     /// path, so a wrong path is impossible. `value` (what `apply_form` saves) stays in sync = the
     /// checked options, comma-joined. `cur` is the highlighted option.
@@ -129,7 +129,7 @@ struct Field {
     cur: usize,
     /// A rare/expert knob: hidden under the "Advanced" fold so a beginner sees only the common fields.
     advanced: bool,
-    /// The "▸ Advanced" fold row itself (not an input) — Space/←→ expand or collapse the advanced group.
+    /// The "▸ Advanced" fold row itself (not an input) - Space/←→ expand or collapse the advanced group.
     divider: bool,
     /// A device kind the host DOESN'T have: while its value is empty it's a read-only "none on this
     /// host" note (nothing to type, skipped by navigation), so a beginner is never asked to invent a
@@ -175,7 +175,7 @@ impl Field {
         }
     }
 
-    /// True while this is a dead "none on this host" note — no value, nothing to edit, skip in nav.
+    /// True while this is a dead "none on this host" note - no value, nothing to edit, skip in nav.
     fn is_dead_info(&self) -> bool {
         self.info && self.value.is_empty()
     }
@@ -188,7 +188,7 @@ impl Field {
         }
     }
 
-    /// A checkbox picker over detected devices — foolproof: you can only choose what exists.
+    /// A checkbox picker over detected devices - foolproof: you can only choose what exists.
     fn pick(label: &'static str, hint: &'static str, options: Vec<String>) -> Self {
         let n = options.len();
         Field {
@@ -293,15 +293,15 @@ struct Row {
     cpu_pct: f64,
     tasks: Option<u64>,
     paused: bool,
-    /// Health-check state (`healthy`/`unhealthy`/`starting`, empty if the box has no `--health-cmd`) —
+    /// Health-check state (`healthy`/`unhealthy`/`starting`, empty if the box has no `--health-cmd`) -
     /// the same signal `kern ps` shows, so a compose stack's readiness is visible in the TUI too.
     health: String,
-    /// Published-ports summary (e.g. `8080->80`), empty if none — parity with `kern ps`.
+    /// Published-ports summary (e.g. `8080->80`), empty if none - parity with `kern ps`.
     ports: String,
-    /// The pod (compose stack) this box belongs to, empty for a standalone box — drives the `kern ps`
+    /// The pod (compose stack) this box belongs to, empty for a standalone box - drives the `kern ps`
     /// tree grouping in the Boxes tab.
     pod: String,
-    /// How this box DEVIATES from the secure default — `net:host` and/or `root-mapped`, empty when
+    /// How this box DEVIATES from the secure default - `net:host` and/or `root-mapped`, empty when
     /// fully isolated (the common case). Flags only the LESS-confined boxes, never a vanity badge.
     iso: String,
 }
@@ -323,8 +323,8 @@ impl Drop for TermGuard {
 }
 
 /// Saved `(termios, fd)` for the signal handler to restore. `TermGuard::drop` covers a normal
-/// return and a panic (unwind runs Drop), but a fatal signal — `SIGTERM` (`kill`), `SIGHUP` (an SSH
-/// disconnect), `SIGINT`/`SIGQUIT` via `kill` — terminates WITHOUT unwinding, leaving the terminal
+/// return and a panic (unwind runs Drop), but a fatal signal - `SIGTERM` (`kill`), `SIGHUP` (an SSH
+/// disconnect), `SIGINT`/`SIGQUIT` via `kill` - terminates WITHOUT unwinding, leaving the terminal
 /// in raw mode + the alternate screen. The handler below restores it. Set once before the handlers
 /// are installed; kern is single-threaded, so the handler's read is sound.
 static mut RESTORE: Option<(libc::termios, libc::c_int)> = None;
@@ -369,7 +369,7 @@ fn term_size() -> (usize, usize) {
 
 /// An inotify fd watching the box registry dir for box create/remove/rename, or `-1` if unavailable.
 /// `kern top` polls this alongside stdin, so a box lifecycle change (from ANY kern process) refreshes
-/// the view INSTANTLY instead of on the next 1 s tick — the "no lag" property. Best-effort.
+/// the view INSTANTLY instead of on the next 1 s tick - the "no lag" property. Best-effort.
 fn setup_registry_watch() -> i32 {
     use std::os::unix::ffi::OsStrExt;
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -398,7 +398,7 @@ pub fn run() -> Result<(), crate::error::Error> {
     let fd = 0; // stdin
     let mut orig: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
-        return snapshot(); // not a real tty after all — one-shot fallback
+        return snapshot(); // not a real tty after all - one-shot fallback
     }
     let mut raw = orig;
     raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
@@ -428,7 +428,7 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut runs_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the Runs tab
 
     // Live wake: an inotify watch on the box registry dir so a box created/removed by ANY kern
-    // process shows up INSTANTLY, with zero poll lag. Best-effort — if inotify or the dir is
+    // process shows up INSTANTLY, with zero poll lag. Best-effort - if inotify or the dir is
     // unavailable, the 1 s timer below still keeps the view fresh (just not sub-second on changes).
     let ino_fd = setup_registry_watch();
 
@@ -490,7 +490,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             continue;
         }
         // A registry change woke us: drain the inotify queue and refresh NOW. If no key is also
-        // pending, re-render and wait again — no 1 s lag on box appear/disappear.
+        // pending, re-render and wait again - no 1 s lag on box appear/disappear.
         if ino_fd >= 0 && pfds[1].revents & libc::POLLIN != 0 {
             let mut ibuf = [0u8; 4096];
             while unsafe { libc::read(ino_fd, ibuf.as_mut_ptr().cast(), ibuf.len()) } > 0 {}
@@ -568,7 +568,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             }
         }
         // A mutating action re-reads the lists at once (the stopped box vanishes, the new volume
-        // appears) but leaves the CPU% baselines alone — re-sampling over the sub-second gap since
+        // appears) but leaves the CPU% baselines alone - re-sampling over the sub-second gap since
         // the last tick would show a spurious spike. The next tick restores a full ~1 s window.
         if dirty {
             let (rows, _) = collect_rows(&prev);
@@ -631,7 +631,7 @@ fn handle_nav(
         *t = nt;
         *s = 0;
     };
-    // Arrow-key escape sequences: ↑↓ select, ←→ switch tab. Pure navigation — never dirties data.
+    // Arrow-key escape sequences: ↑↓ select, ←→ switch tab. Pure navigation - never dirties data.
     if key.len() >= 3 && key[0] == 0x1b && key[1] == b'[' {
         match key[2] {
             b'A' => up(sel),
@@ -642,7 +642,7 @@ fn handle_nav(
         }
         return false;
     }
-    // `?` opens the full-key help overlay from ANY tab — the discoverable safety net every good TUI
+    // `?` opens the full-key help overlay from ANY tab - the discoverable safety net every good TUI
     // has (htop/k9s/lazydocker). The footer always advertises `?` so a first-time user knows it exists.
     if key[0] == b'?' {
         *mode = Mode::Overlay(help_text());
@@ -660,7 +660,7 @@ fn handle_nav(
         b'7' => switch(tab, sel, TAB_STORAGE),
         b'j' => down(sel),
         // Only the Boxes tab acts immediately (stop/pause/kill). Profiles/Storage keys just open a
-        // modal, so the mutation (if any) happens later via Confirm/Form — nothing to refresh yet.
+        // modal, so the mutation (if any) happens later via Confirm/Form - nothing to refresh yet.
         _ if *tab == TAB_BOXES => return nav_boxes(key[0], *sel, rows, mode),
         _ if *tab == TAB_IMAGES => nav_images(key[0], *sel, images, mode),
         _ if *tab == TAB_BUILDS => nav_builds(key[0], *sel, builds, mode),
@@ -762,7 +762,7 @@ fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mo
 
 /// Images-tab action keys: delete the selected image (`d`), prune orphaned build layers (`p`), or open
 /// a read-only detail overlay (`Enter`). Images are pulled/built elsewhere (no in-`top` "create"), so
-/// the interactive surface is Delete + Prune + Read — the meaningful CRUD for a cache of artifacts.
+/// the interactive surface is Delete + Prune + Read - the meaningful CRUD for a cache of artifacts.
 fn nav_images(k: u8, sel: usize, images: &[crate::commands::ImageEntry], mode: &mut Mode) {
     match k {
         b'd' => {
@@ -810,7 +810,7 @@ fn nav_builds(k: u8, sel: usize, builds: &[crate::builds::Record], mode: &mut Mo
             if let Some(b) = builds.get(sel) {
                 let body = crate::builds::read_log(&b.id)
                     .unwrap_or_else(|| "(no transcript captured for this build)".into());
-                *mode = Mode::Overlay(format!("build {} — {}\n{}", b.id, b.tag, body));
+                *mode = Mode::Overlay(format!("build {} - {}\n{}", b.id, b.tag, body));
             }
         }
         _ => {}
@@ -818,12 +818,12 @@ fn nav_builds(k: u8, sel: usize, builds: &[crate::builds::Record], mode: &mut Mo
 }
 
 /// A read-only detail block for one cached image (Images tab `Enter`). The ref is scrubbed of terminal
-/// escapes — a `.ok` sentinel's content is untrusted.
+/// escapes - a `.ok` sentinel's content is untrusted.
 fn image_detail(img: &crate::commands::ImageEntry) -> String {
     let now = registry::now_unix();
     // A dangling image (layers gone) shows that plainly instead of a misleading `0 B` size.
     let size = if img.dangling {
-        "dangling (missing layers — would fail to run)".to_string()
+        "dangling (missing layers - would fail to run)".to_string()
     } else {
         human_bytes(img.size)
     };
@@ -859,7 +859,7 @@ fn perform_pending(action: Pending) {
     }
 }
 
-/// Run `f` with fd 1 and fd 2 redirected to `/dev/null`, then restored — so a reused CLI helper's
+/// Run `f` with fd 1 and fd 2 redirected to `/dev/null`, then restored - so a reused CLI helper's
 /// `println!`/`eprintln!` can't corrupt the alt-screen. Used for the lifecycle key actions.
 fn quiet_io(f: impl FnOnce()) {
     let _ = std::io::stdout().flush();
@@ -926,7 +926,7 @@ fn profile_rows(cfg: &crate::config::KernConfig) -> Vec<ProfRow> {
             summary: parts.join("  "),
         });
     }
-    // vdisk — a per-box scratch/disk profile (attached with `vdisk:name`).
+    // vdisk - a per-box scratch/disk profile (attached with `vdisk:name`).
     for e in &cfg.vdisk {
         let mut parts = Vec::new();
         parts.push(e.size.clone().unwrap_or_else(|| "uncapped".into()));
@@ -943,7 +943,7 @@ fn profile_rows(cfg: &crate::config::KernConfig) -> Vec<ProfRow> {
             summary: parts.join("  "),
         });
     }
-    // Group by category (compute → device → storage) and sort by name within each — so the list is
+    // Group by category (compute → device → storage) and sort by name within each - so the list is
     // predictable and grouped, not raw config-insertion order.
     out.sort_by(|a, b| {
         let rank = |s: &str| match s {
@@ -979,10 +979,10 @@ fn trim_f(v: f64) -> String {
     crate::ui::fmt_cpus(v)
 }
 
-/// The `backend` field for every profile kind — a SELECTION of the configured backends, never free text
+/// The `backend` field for every profile kind - a SELECTION of the configured backends, never free text
 /// (that's how `disk:0sfsf…` / `gpio:0sfsf…` were possible). vgpio→`[[gpio]]` ids, vcpu→`[[cpu]]` ids,
 /// vdisk→`disk:<[[disk]] name>`. A single-select radio (a profile uses ONE backend); if none are
-/// configured, a "run kern config setup" note instead of a blank box. Optional — leave it unticked and
+/// configured, a "run kern config setup" note instead of a blank box. Optional - leave it unticked and
 /// the profile uses the default. One helper so all three kinds behave identically.
 fn backend_field(kind: &str) -> Field {
     let cfg = crate::config::load(None).unwrap_or_default();
@@ -1003,11 +1003,11 @@ fn backend_field(kind: &str) -> Field {
     }
 }
 
-/// The editable fields for a compute/IO profile section (`vcpu`/`vgpio`) — used for new and edit.
-/// (Storage kinds — vdisk, volume — have their own forms.)
+/// The editable fields for a compute/IO profile section (`vcpu`/`vgpio`) - used for new and edit.
+/// (Storage kinds - vdisk, volume - have their own forms.)
 fn section_fields(section: &str) -> Vec<Field> {
     // The common fields first (a beginner rarely scrolls past them), then the advanced ones. The form
-    // scrolls, so every field of every kind is reachable — nothing is CLI-only.
+    // scrolls, so every field of every kind is reachable - nothing is CLI-only.
     match section {
         "vcpu" => vec![
             Field::text("name", "e.g. heavy"),
@@ -1021,14 +1021,14 @@ fn section_fields(section: &str) -> Vec<Field> {
         ],
         "vgpio" => {
             // For-dummies: the beginner sees only NAME + the everyday devices, each as a checkbox
-            // list of what THIS host actually exposes — so there's nothing to type and nothing to
+            // list of what THIS host actually exposes - so there's nothing to type and nothing to
             // guess: tick the device you want the box to reach, or leave it empty. Everything rare
             // (LEDs, CAN, PWM, backend, …) lives under the "Advanced" fold so the form stays short.
             //
-            // `pick(label, plain-language what-is-this)` when the host HAS that device — you tick it,
+            // `pick(label, plain-language what-is-this)` when the host HAS that device - you tick it,
             // you never type a path. When the host DOESN'T have it, there's nothing valid to type, so
             // it becomes a read-only "none detected on this host" note instead of an empty box that
-            // invites garbage. Same mechanism on every host — only the detected contents differ.
+            // invites garbage. Same mechanism on every host - only the detected contents differ.
             let mk = |label: &'static str, plain: &'static str| {
                 let opts = present_devices(label);
                 if opts.is_empty() {
@@ -1041,8 +1041,8 @@ fn section_fields(section: &str) -> Vec<Field> {
             let mut common = vec![Field::text("name", "a short name, e.g. sensors")];
             let mut absent = Vec::new(); // a common device the host lacks → a note under Advanced
             for (label, plain) in [
-                ("i2c", "I²C bus — sensors, small displays"),
-                ("spi", "SPI bus — displays, ADCs"),
+                ("i2c", "I²C bus - sensors, small displays"),
+                ("spi", "SPI bus - displays, ADCs"),
                 ("uart", "serial port"),
                 ("camera", "camera"),
                 ("audio", "sound card"),
@@ -1056,7 +1056,7 @@ fn section_fields(section: &str) -> Vec<Field> {
                 }
             }
             // GPIO pins are line NUMBERS from YOUR wiring, so they're the one thing you legitimately
-            // type — but only when the host actually has a GPIO controller. Check the modern chardev
+            // type - but only when the host actually has a GPIO controller. Check the modern chardev
             // (/dev/gpiochip*) AND the legacy sysfs interface (/sys/class/gpio), so a board that only
             // exposes sysfs-GPIO isn't wrongly told it has none. No GPIO at all ⇒ a "none here" note,
             // not an empty box inviting a guess.
@@ -1068,10 +1068,10 @@ fn section_fields(section: &str) -> Vec<Field> {
             } else {
                 advanced.push(Field::info("pins", "no GPIO controller on this host"));
             }
-            // The rare / expert knobs — hidden until the user opens "Advanced". Anything the host can
+            // The rare / expert knobs - hidden until the user opens "Advanced". Anything the host can
             // enumerate is a pick (net interfaces, LEDs, …); a device it lacks is a note; pwm follows
             // the same GPIO gate as pins; only the truly free-form escape (`extra`) stays typed.
-            // NOTE: `net` is deliberately absent — a vgpio profile does NOT attach a network interface
+            // NOTE: `net` is deliberately absent - a vgpio profile does NOT attach a network interface
             // (the resolver ignores it), so offering it would be a lie. Network access is the box's
             // own `--net`. If net-passthrough is ever wired in the resolver, add it back here.
             for (label, plain) in [
@@ -1085,15 +1085,15 @@ fn section_fields(section: &str) -> Vec<Field> {
             }
             // A USB peripheral is passed by its FUNCTION, not as a raw bus node: a USB-serial adapter is
             // under 'serial' (ttyUSB), a webcam under 'camera' (video), a USB mic under 'sound card'.
-            // Raw /dev/bus/usb passthrough is refused by the resolver (it reaches the WHOLE bus — BadUSB),
-            // so a real usb pick would only ever be denied — an explanatory note instead of a lie.
+            // Raw /dev/bus/usb passthrough is refused by the resolver (it reaches the WHOLE bus - BadUSB),
+            // so a real usb pick would only ever be denied - an explanatory note instead of a lie.
             advanced.push(Field::info(
                 "usb",
-                "by function (serial/camera/audio) — or a specific /dev/bus/usb/B/D in 'extra'",
+                "by function (serial/camera/audio) - or a specific /dev/bus/usb/B/D in 'extra'",
             ));
             // Number fields (pwm/adc/onewire are channel/line indices you'd type) only accept typing
             // when the host actually HAS that controller; otherwise there's nothing to type, so it's a
-            // "none here" note — never an empty box asking you to guess. A gated helper keeps it uniform.
+            // "none here" note - never an empty box asking you to guess. A gated helper keeps it uniform.
             let dir_has = |dir: &str, prefix: &str| {
                 std::fs::read_dir(dir)
                     .map(|rd| {
@@ -1151,11 +1151,11 @@ fn section_fields(section: &str) -> Vec<Field> {
 
 /// A concrete, plain-language "what is this field and when would I use it" line for the focused field,
 /// shown at the bottom of the form. This is the hand-holding: the user isn't expected to know what an
-/// I²C bus or a PWM line is — the help says it, with an everyday example. `None` = no help (e.g. the
+/// I²C bus or a PWM line is - the help says it, with an everyday example. `None` = no help (e.g. the
 /// Advanced fold row). Kept short (≤ ~74 chars) so it never wraps an 80-column terminal.
 fn field_help(section: &str, label: &str) -> Option<&'static str> {
     let h = match (section, label) {
-        ("vgpio", "name") => "A label for this hardware set — attach with  vgpio:NAME",
+        ("vgpio", "name") => "A label for this hardware set - attach with  vgpio:NAME",
         ("vgpio", "i2c") => "I²C bus for sensors & small displays. Tick the bus your part is on.",
         ("vgpio", "spi") => "SPI bus for displays, ADCs, radios. Tick the port your part uses.",
         ("vgpio", "uart") => "Serial port for GPS, modems, consoles. Tick the tty it's on.",
@@ -1164,8 +1164,8 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
         ("vgpio", "bluetooth") => "The Bluetooth adapter. Tick to let the box use Bluetooth/BLE.",
         ("vgpio", "pins") => "Raw GPIO pin numbers (e.g. 17 27) for LEDs, buttons, relays.",
         ("vgpio", "leds") => "On-board LEDs you want the box to control.",
-        ("vgpio", "can") => "CAN bus — vehicle & industrial networking.",
-        ("vgpio", "input") => "Input devices — keys, touchscreen, joystick.",
+        ("vgpio", "can") => "CAN bus - vehicle & industrial networking.",
+        ("vgpio", "input") => "Input devices - keys, touchscreen, joystick.",
         ("vgpio", "midi") => "MIDI ports for music gear.",
         ("vgpio", "display") => {
             "GPU render node (renderD) for compute/video; card modeset is refused."
@@ -1177,15 +1177,15 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
             "The configured [[gpio]] backend (optional; run kern config setup to add one)."
         }
         ("vgpio", "extra") => "Any other /dev path to pass, only if you know it exists.",
-        ("vcpu", "name") => "A label for this CPU/memory slice — attach with  vcpu:NAME",
+        ("vcpu", "name") => "A label for this CPU/memory slice - attach with  vcpu:NAME",
         ("vcpu", "cpus") => {
-            "How many cores the box may use, e.g. 4 — or 0.5 for half a core (= --cpus)."
+            "How many cores the box may use, e.g. 4 - or 0.5 for half a core (= --cpus)."
         }
         ("vcpu", "cpuset") => {
             "Pin to specific cores, e.g. 0-3 (= --cpuset-cpus). Leave blank to let it float."
         }
         ("vcpu", "memory") => "Memory ceiling, e.g. 512m or 2g. The box is OOM-capped at this.",
-        ("vdisk", "name") => "A label for this scratch disk — attach with  vdisk:NAME",
+        ("vdisk", "name") => "A label for this scratch disk - attach with  vdisk:NAME",
         ("vdisk", "size") => "Max size of the scratch disk, e.g. 2g. Writes past it fail.",
         ("vdisk", "persistent") => {
             "Keep the disk's data after the box is removed (default: wiped)."
@@ -1195,7 +1195,7 @@ fn field_help(section: &str, label: &str) -> Option<&'static str> {
     Some(h)
 }
 
-/// The ONE validation authority for a typed keystroke — the derived "char filter": a character is
+/// The ONE validation authority for a typed keystroke - the derived "char filter": a character is
 /// accepted iff the resulting value isn't `field_state::Invalid`. `field_state` is itself derived from
 /// the save parser (`profile_line` / `validate_profile_name`), so there is a SINGLE source of truth for
 /// what any field may hold, shared by live-typing AND save; a per-field char-class list (which could
@@ -1206,7 +1206,7 @@ fn field_value_ok(label: &str, v: &str) -> bool {
     crate::config::field_state(label, v) != crate::config::FieldState::Invalid
 }
 
-/// Fields governed by `config::field_state` — the SINGLE rule shared with save — and given the live
+/// Fields governed by `config::field_state` - the SINGLE rule shared with save - and given the live
 /// three-state indicator. Numbers/ranges/sizes, the name/extends identifiers, AND the `extra` /dev-path
 /// escape (all route through the same `field_state` dispatcher, so no field validates by a second,
 /// drift-prone path). Only `backend` (a pick) isn't here.
@@ -1232,8 +1232,8 @@ fn validated_field(label: &str) -> bool {
 }
 
 /// A blank form to create a new profile. `backend` is no longer pre-filled: it's now a picker of the
-/// configured GPIO ids (or a "run kern config setup" note), and it's optional — the resolver binds the
-/// gpiochips from `pins` regardless — so a beginner leaves it alone.
+/// configured GPIO ids (or a "run kern config setup" note), and it's optional - the resolver binds the
+/// gpiochips from `pins` regardless - so a beginner leaves it alone.
 fn new_profile_form(section: &'static str) -> Form {
     let fields = section_fields(section);
     Form {
@@ -1250,14 +1250,14 @@ fn new_profile_form(section: &'static str) -> Form {
 }
 
 /// A form pre-filled with EVERY set field of the existing profile (via `config::profile_pairs`), so an
-/// edit shows and re-saves all of them — nothing is dropped or hidden.
+/// edit shows and re-saves all of them - nothing is dropped or hidden.
 fn edit_profile_form(section: &'static str, name: &str, cfg: &crate::config::KernConfig) -> Form {
     let mut fields = section_fields(section);
     set_field(&mut fields, "name", name.to_string());
     for (k, v) in crate::config::profile_pairs(cfg, section, name) {
         set_field(&mut fields, &k, v);
     }
-    // If the profile already sets an advanced field, open the fold so the edit SHOWS it — nothing the
+    // If the profile already sets an advanced field, open the fold so the edit SHOWS it - nothing the
     // user configured stays hidden.
     let show_advanced = fields.iter().any(|f| f.advanced && !f.value.is_empty());
     Form {
@@ -1371,7 +1371,7 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
         }
         return FormOutcome::Stay(form);
     }
-    // The Advanced fold row: Space toggles it; Enter still saves, Esc cancels, Tab moves on — but a
+    // The Advanced fold row: Space toggles it; Enter still saves, Esc cancels, Tab moves on - but a
     // typed character never lands on it.
     if form.fields[form.active].divider {
         match key[0] {
@@ -1390,7 +1390,7 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
             _ => return FormOutcome::Stay(form),
         }
     }
-    // A "none on this host" note never takes input — its value stays empty so it stays a note and a
+    // A "none on this host" note never takes input - its value stays empty so it stays a note and a
     // wrong path can't be typed. (Enter/Tab/Esc still work; nav already skips it anyway.)
     if form.fields[form.active].is_dead_info()
         && !matches!(key[0], 0x1b | b'\t' | b'\r' | b'\n' | 0x13)
@@ -1449,7 +1449,7 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
         _ => {
             // Append typed printable ASCII, but ONLY if the resulting value isn't Invalid per the
             // single `field_state` authority (shared with save). A letter can't land in a number field
-            // and `pins` can't reach `44545454545` — both because the value would be Invalid — with no
+            // and `pins` can't reach `44545454545` - both because the value would be Invalid - with no
             // separate char-class list to drift. The `0x20..0x7f` gate blocks control / multibyte bytes.
             let label = form.fields[form.active].label;
             let v = &mut form.fields[form.active].value;
@@ -1457,7 +1457,7 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
                 if !(0x20..0x7f).contains(&b) {
                     continue;
                 }
-                // Append then roll back on reject — no per-byte clone of the whole value, so pasting
+                // Append then roll back on reject - no per-byte clone of the whole value, so pasting
                 // n chars stays O(n·len) instead of O(n²) clones.
                 v.push(b as char);
                 if !field_value_ok(label, v) {
@@ -1501,7 +1501,7 @@ fn apply_form(form: &Form) -> Result<(), String> {
                 return Err("name is required".into());
             }
             let size_raw = get("size");
-            // Blank size clears the quota; otherwise it must parse (and be > 0 — a 0-byte quota is
+            // Blank size clears the quota; otherwise it must parse (and be > 0 - a 0-byte quota is
             // meaningless and is the mistake that produced the confusing `0 B` quota).
             let size = if size_raw.is_empty() {
                 None
@@ -1528,7 +1528,7 @@ fn apply_form(form: &Form) -> Result<(), String> {
     }
 }
 
-/// Turn a profile form's fields into (name, body lines) via the shared `config` schema — the
+/// Turn a profile form's fields into (name, body lines) via the shared `config` schema - the
 /// SAME validation + emission `kern config add` and the loader use, so the two paths can't diverge.
 fn form_to_body(fields: &[Field]) -> Result<(String, Vec<String>), String> {
     let name = fields
@@ -1553,7 +1553,7 @@ fn delete_profile(section: &str, name: &str) -> Result<(), String> {
 /// The detail text shown in the Volumes inspect overlay.
 fn volume_detail(v: &crate::volume::VolInfo) -> String {
     let quota = v.quota.map_or_else(
-        || "∞ (unlimited — grows until the disk is full)".to_string(),
+        || "∞ (unlimited - grows until the disk is full)".to_string(),
         human_bytes,
     );
     format!(
@@ -1565,7 +1565,7 @@ fn volume_detail(v: &crate::volume::VolInfo) -> String {
     )
 }
 
-/// Snapshot the Boxes table once (used when stdout is not a TTY — e.g. piped).
+/// Snapshot the Boxes table once (used when stdout is not a TTY - e.g. piped).
 pub fn snapshot() -> Result<(), crate::error::Error> {
     let p = Palette::detect();
     // Two `/proc/stat` samples ~120 ms apart give a real host CPU% even for a one-shot snapshot.
@@ -1603,7 +1603,7 @@ struct Snapshot {
     images: Vec<crate::commands::ImageEntry>,
 }
 
-/// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) — used
+/// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) - used
 /// on the 1 s tick, where the ~1 s delta gives a meaningful CPU percentage.
 fn refresh_full(
     prev: &mut HashMap<i32, (u64, Instant)>,
@@ -1627,7 +1627,7 @@ fn refresh_full(
     host.runs_total = rt;
     host.runs_avg_us = lat_sum_us.checked_div(rt).unwrap_or(0);
     // Reader-side sparkline: keep the last N runs/sec samples so the Runs tab shows recent shape, and
-    // track the session peak. The very first sample (no prior baseline) is 0 — harmless. One push per
+    // track the session peak. The very first sample (no prior baseline) is 0 - harmless. One push per
     // refresh, so at most one drop keeps the ring bounded.
     const SPARK_N: usize = 48;
     runs_hist.push(host.runs_per_sec);
@@ -1655,8 +1655,8 @@ fn refresh_full(
 
 /// A compact marker of how a running box DEVIATES from the secure default: `net:host` (it shares the
 /// host network namespace instead of an isolated one) and/or `root-mapped` (its uid 0 maps to host uid
-/// 0 — kern ran as root). Empty when the box is fully isolated, so the Boxes tab flags only the boxes
-/// that are LESS confined than default (the always-on layers — seccomp, masked `/proc`, dropped caps —
+/// 0 - kern ran as root). Empty when the box is fully isolated, so the Boxes tab flags only the boxes
+/// that are LESS confined than default (the always-on layers - seccomp, masked `/proc`, dropped caps -
 /// are identical for every box, so a "secure" badge would be vanity). Read-only `/proc` introspection.
 fn box_isolation(pid: i32) -> String {
     let mut flags = Vec::new();
@@ -1684,7 +1684,7 @@ fn box_isolation(pid: i32) -> String {
         }
     }
     // Extra caps: a box whose BOUNDING set (`CapBnd`) contains a cap kern always drops by default
-    // (DEFAULT_DROP — module load, raw I/O, BPF, …) was handed it back via `--cap-add`, so it is less
+    // (DEFAULT_DROP - module load, raw I/O, BPF, …) was handed it back via `--cap-add`, so it is less
     // confined than default. The bounding set is the honest signal: a rootless box's `CapEff` is full
     // but namespaced (grants no host power) and would false-positive; `CapBnd` reflects what kern kept.
     if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
@@ -1717,7 +1717,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         };
         seen.insert(b.pid, (cpu_now, now_t));
         let health = registry::health_of(&b.name, b.pid);
-        // Introspect the box's INTERIOR init (`pid1`), not the host-side supervisor `pid` — the
+        // Introspect the box's INTERIOR init (`pid1`), not the host-side supervisor `pid` - the
         // supervisor lives in the host netns with the kernel's trivial uid_map, which would falsely flag
         // every box. `pid1 == 0` (unrecorded / old entry) → the /proc reads fail → no flag, no false
         // positive.
@@ -1737,7 +1737,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         });
     }
     // Group for the pod-tree view: standalone boxes first, then each pod's members contiguous (pods in
-    // name order). A STABLE sort, so registry order is preserved within a group — and the selection
+    // name order). A STABLE sort, so registry order is preserved within a group - and the selection
     // index stays valid (it just indexes this display order; actions still hit rows[sel]).
     rows.sort_by(|a, b| {
         (!a.pod.is_empty())
@@ -1757,13 +1757,13 @@ struct HostStats {
     cores: usize,
     load1: f64,
     /// Cumulative `kern run` invocations (from the daemonless runstats mmap counter) + the derived
-    /// rate/sec — kern's fire-and-forget capped-process throughput, which Docker can't show at scale.
+    /// rate/sec - kern's fire-and-forget capped-process throughput, which Docker can't show at scale.
     runs_total: u64,
     runs_per_sec: f64,
     /// Average per-run setup latency in microseconds (entry→exec, the honest "~1 ms"); 0 with no runs.
     runs_avg_us: u64,
     /// The highest runs/sec seen since `top` started (session peak throughput) and a reader-side ring of
-    /// recent runs/sec samples for the Runs-tab sparkline — both derived from the monotonic total.
+    /// recent runs/sec samples for the Runs-tab sparkline - both derived from the monotonic total.
     runs_peak: f64,
     runs_spark: Vec<f64>,
 }
@@ -1779,7 +1779,7 @@ impl HostStats {
     }
 }
 
-/// `(busy, total)` jiffies from `/proc/stat`'s aggregate `cpu ` line — CPU% is the delta of two.
+/// `(busy, total)` jiffies from `/proc/stat`'s aggregate `cpu ` line - CPU% is the delta of two.
 fn host_cpu_sample() -> Option<(u64, u64)> {
     let s = std::fs::read_to_string("/proc/stat").ok()?;
     let mut it = s.lines().next()?.split_whitespace();
@@ -1810,8 +1810,8 @@ fn host_mem() -> Option<(u64, u64)> {
 }
 
 /// True for an on-board LED worth offering; false for the NOISE that dominates `/sys/class/leds` on a
-/// desktop — a netdev LED (`<iface>` or `<iface>-<port>` before `::`, e.g. `enp5s0-0::lan`, a NIC PHY
-/// light) or an input LED (`inputN::…`, a keyboard capslock light) — neither of which is a meaningful
+/// desktop - a netdev LED (`<iface>` or `<iface>-<port>` before `::`, e.g. `enp5s0-0::lan`, a NIC PHY
+/// light) or an input LED (`inputN::…`, a keyboard capslock light) - neither of which is a meaningful
 /// device to pass into a sandbox. Real board LEDs (`led0`, `ACT`, `PWR`, `mmc0::…`) pass.
 fn is_board_led(name: &str, nets: &[String]) -> bool {
     let head = name.split("::").next().unwrap_or(name);
@@ -1824,10 +1824,10 @@ fn is_board_led(name: &str, nets: &[String]) -> bool {
     !is_input_led && !is_netdev_led
 }
 
-/// The host devices currently present for a vGPIO field `kind` — the options the new/edit form offers
+/// The host devices currently present for a vGPIO field `kind` - the options the new/edit form offers
 /// as checkboxes, so a user PICKS from what actually exists instead of typing a `/dev/…` path (which
 /// is easy to get wrong). Uniform for every host: the same probe runs everywhere, only the *contents*
-/// differ — a Pi shows its i2c/gpio, a mini-PC its bluetooth/usb. Returns sorted; a busy desktop can
+/// differ - a Pi shows its i2c/gpio, a mini-PC its bluetooth/usb. Returns sorted; a busy desktop can
 /// return many (e.g. 20 i2c DDC buses), so the form caps the visible count and keeps a manual field.
 /// The shared, host-uniform probe: `section_fields` consumes it so every profile form picks devices
 /// through one identical mechanism.
@@ -1859,7 +1859,7 @@ fn present_devices(kind: &str) -> Vec<String> {
             format!("/dev/snd/{n}")
         }),
         // On-board LED NAMES, but DROP the noise: `/sys/class/leds` on a desktop is dominated by
-        // netdev LEDs (`enp5s0-0::lan` — a NIC PHY link light) and input LEDs (`input3::capslock` — a
+        // netdev LEDs (`enp5s0-0::lan` - a NIC PHY link light) and input LEDs (`input3::capslock` - a
         // keyboard light), which are meaningless to pass into a sandbox. A LED whose segment before
         // `::` is a present network interface, or is `inputN`, is filtered; real board LEDs (`led0`,
         // `ACT`, `PWR`, `mmc0::…`) remain.
@@ -1873,14 +1873,14 @@ fn present_devices(kind: &str) -> Vec<String> {
         "bluetooth" => scan("/sys/class/bluetooth", &["hci"], |n| n.to_string()),
         "net" => scan("/sys/class/net", &[""], |n| n.to_string()), // interface NAMES (eth0, wlan0…)
         "midi" => scan("/dev/snd", &["midi"], |n| format!("/dev/snd/{n}")), // ALSA MIDI nodes
-        // GPU: offer the RENDER node (renderD*, allowed for compute/video) — the privileged card*
+        // GPU: offer the RENDER node (renderD*, allowed for compute/video) - the privileged card*
         // modeset node is refused by the resolver, so it isn't offered.
         "display" => scan("/dev/dri", &["renderD"], |n| format!("/dev/dri/{n}")),
         _ => Vec::new(),
     }
 }
 
-/// `(used, total)` bytes on the filesystem that backs the kern data root — `statvfs("/")`, matching
+/// `(used, total)` bytes on the filesystem that backs the kern data root - `statvfs("/")`, matching
 /// `df` (used = blocks − free). This is the disk where images / volumes / vdisks physically live.
 fn host_disk() -> Option<(u64, u64)> {
     let path = std::ffi::CString::new("/").ok()?;
@@ -1894,7 +1894,7 @@ fn host_disk() -> Option<(u64, u64)> {
     Some((used, total))
 }
 
-/// The host's logical CPU count (per-CPU lines in `/proc/stat`), resolved once — the core count is
+/// The host's logical CPU count (per-CPU lines in `/proc/stat`), resolved once - the core count is
 /// fixed for the process's life, so `top` needn't re-read `/proc/stat` for it every frame.
 fn host_cores() -> usize {
     static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1977,7 +1977,7 @@ fn render(
     let body_rows = term_rows.saturating_sub(9).max(1);
     let mut s = String::new();
 
-    // Title bar — a live host header, always visible on every tab (CPU · RAM · Disk · Boxes),
+    // Title bar - a live host header, always visible on every tab (CPU · RAM · Disk · Boxes),
     // refreshed each frame. The green figures are the "now"; the dim ones the total/context.
     s.push_str(&format!(
         "{b}{c} kern top{z}   {d}CPU{z} {g}{:>3.0}%{z} {d}/ {} cores{z}   {d}RAM{z} {g}{}{z}{d} / {}{z}   {d}Disk{z} {g}{}{z}{d} / {}{z}   {d}Boxes{z} {g}{}{z}\n\n",
@@ -1990,9 +1990,9 @@ fn render(
         rows.len(),
     ));
 
-    // Tab bar — active tab inverted, each data tab showing a LIVE count of its rows so you can see how
+    // Tab bar - active tab inverted, each data tab showing a LIVE count of its rows so you can see how
     // many boxes/profiles/volumes exist without entering the tab. Overview is an aggregate → no count.
-    // Each tab carries a live count — but 7 counted tabs (~87 cols) overflow a narrow/80-col
+    // Each tab carries a live count - but 7 counted tabs (~87 cols) overflow a narrow/80-col
     // terminal: the bar wraps and shoves the later tabs (Images/Builds/…) off screen. If the full
     // bar won't fit `width`, drop the counts and render just the names so every tab stays visible.
     let label = |i: usize, compact: bool| -> String {
@@ -2005,7 +2005,7 @@ fn render(
             TAB_BUILDS => format!("{} ({})", TABS[i], builds.len()),
             TAB_PROFILES => format!("{} ({})", TABS[i], profs.len()),
             TAB_STORAGE => format!("{} ({})", TABS[i], vols.len()),
-            // Runs are fire-and-forget (~1 ms) — there's no "current items" set like the other tabs,
+            // Runs are fire-and-forget (~1 ms) - there's no "current items" set like the other tabs,
             // so a cumulative count would mislead (it'd only grow). Show the LIVE rate while streaming
             // (that's the only meaningful "now"); nothing when idle. The cumulative total lives on the
             // tab body ("Total"), not here.
@@ -2076,14 +2076,14 @@ fn render(
 /// The `?` help overlay: the complete keymap + what each tab is for, in plain language. Rendered in the
 /// read-only [`Mode::Overlay`] pane (any key closes it). First line is the bold title (see `text_pane`).
 fn help_text() -> String {
-    "kern top — keyboard help  (press any key to close)\n\
+    "kern top - keyboard help  (press any key to close)\n\
      \n\
      MOVE\n\
        Tab / → / l      next tab            ← / h      previous tab\n\
        1 2 3 4 5 6 7    jump to a tab       ↑ ↓ / j k  select a row\n\
        q  or  Ctrl-C    quit\n\
      \n\
-     TABS — what each one shows\n\
+     TABS - what each one shows\n\
        1 Overview   host CPU / RAM / load and the box totals\n\
        2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
      \x20                (yellow net:host / root-mapped / caps:+ flags a box LESS isolated than default)\n\
@@ -2093,7 +2093,7 @@ fn help_text() -> String {
        6 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
        7 Storage    physical disks (read-only) and your named volumes\n\
      \n\
-     BOXES tab — act on the selected box\n\
+     BOXES tab - act on the selected box\n\
        s  stop        p  pause        u  unpause        k  kill\n\
        Enter          view its logs (a box's own output)\n\
      \n\
@@ -2125,7 +2125,7 @@ fn nav_footer(
     images: &[crate::commands::ImageEntry],
 ) -> String {
     let (d, z) = (p.d, p.z);
-    // Every footer ends with a permanent `[?] help` — a first-time user doesn't know `?` exists until
+    // Every footer ends with a permanent `[?] help` - a first-time user doesn't know `?` exists until
     // it's shown, and `?` is where they find everything else. The hint to `?` is what discovers `?`.
     let help = format!("   [{z}?{d}] help{z}");
     match tab {
@@ -2183,8 +2183,8 @@ fn text_pane(p: &Palette, text: &str, body_rows: usize, width: usize) -> String 
 }
 
 /// The input-form pane: a title, a one-line hint, then one line per field. The **active** field lights
-/// up (accent caret / label / brackets) and shows the text cursor `▏` **at the insertion point** — right
-/// after what you've typed, or at the very start (before the dim placeholder) when the field is empty —
+/// up (accent caret / label / brackets) and shows the text cursor `▏` **at the insertion point** - right
+/// after what you've typed, or at the very start (before the dim placeholder) when the field is empty -
 /// so it's obvious where your typing lands. When a kind has more fields than fit, the list **scrolls**
 /// to keep the active field visible (`↑ N more` / `↓ N more`), so every field is reachable. Any
 /// validation error shows in red.
@@ -2198,7 +2198,7 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
     if let Submit::SaveProfile { section, .. } = &form.submit {
         let intro = match *section {
             "vgpio" => {
-                Some("Give the box real hardware. Not doing hardware work? Leave it empty — that's fine.")
+                Some("Give the box real hardware. Not doing hardware work? Leave it empty - that's fine.")
             }
             _ => None,
         };
@@ -2234,9 +2234,9 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
             format!("{b}{:<9}{z}", f.label)
         };
         // A "none on this host" note: dim label + dim message, no box. Nothing to type here, and the
-        // cursor never lands on it — it's there only so you can SEE the machine has no such device.
+        // cursor never lands on it - it's there only so you can SEE the machine has no such device.
         if f.is_dead_info() {
-            s.push_str(&format!("    {d}{:<9}{z} {d}— {} —{z}\n", f.label, f.hint));
+            s.push_str(&format!("    {d}{:<9}{z} {d}- {} -{z}\n", f.label, f.hint));
             continue;
         }
         // The Advanced fold row: a single toggle line that hides the rare knobs. Collapsed, it lists a
@@ -2244,7 +2244,7 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
         if f.divider {
             let n_adv = form.fields.iter().filter(|x| x.advanced).count();
             let cap = if form.show_advanced {
-                "▾ Advanced — hide rare devices".to_string()
+                "▾ Advanced - hide rare devices".to_string()
             } else {
                 let names: Vec<&str> = form
                     .fields
@@ -2254,9 +2254,9 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
                     .take(4)
                     .collect();
                 let more = if n_adv > names.len() { ", …" } else { "" };
-                format!("▸ Advanced — {n_adv} more: {}{more}", names.join(", "))
+                format!("▸ Advanced - {n_adv} more: {}{more}", names.join(", "))
             };
-            // No generic caret here — the ▸/▾ in the cap IS the pointer; accent colour shows focus.
+            // No generic caret here - the ▸/▾ in the cap IS the pointer; accent colour shows focus.
             let styled = if active {
                 format!(
                     "{c}{cap}   Space to {}{z}",
@@ -2268,7 +2268,7 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
             s.push_str(&format!("\n    {styled}\n"));
             continue;
         }
-        // A pick field renders detected devices as checkboxes — ←/→ highlight one, Space checks it.
+        // A pick field renders detected devices as checkboxes - ←/→ highlight one, Space checks it.
         // No typing: the choices come from the host, so it's impossible to enter a wrong path.
         if f.is_pick() {
             let cap = if active {
@@ -2333,7 +2333,7 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
             s.push('\n');
             continue;
         }
-        // A toggle renders as a checkbox `[x]`/`[ ]` with its hint as caption — no text box / cursor.
+        // A toggle renders as a checkbox `[x]`/`[ ]` with its hint as caption - no text box / cursor.
         if f.toggle {
             let on = !f.value.is_empty();
             let mark = if on {
@@ -2382,7 +2382,7 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
             format!("{g}{val:<boxw$}{z}")
         };
         // Three-state indicator on the ACTIVE numeric field: ✓ once the value is save-valid, a dim ‥
-        // while it's still an incomplete-but-ok prefix (keep typing) — so "valid yet?" is never a guess.
+        // while it's still an incomplete-but-ok prefix (keep typing) - so "valid yet?" is never a guess.
         let status = if active && !f.value.is_empty() && validated_field(f.label) {
             match crate::config::field_state(f.label, &f.value) {
                 crate::config::FieldState::Valid => format!("  {g}✓{z}"),
@@ -2397,7 +2397,7 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
     if vend < nvis {
         s.push_str(&format!("  {d}  ↓ {} more{z}\n", nvis - vend));
     }
-    // Contextual help: what the FOCUSED field is and when you'd use it, with an everyday example — so
+    // Contextual help: what the FOCUSED field is and when you'd use it, with an everyday example - so
     // the user is guided to the right choice instead of guessing.
     if let Submit::SaveProfile { section, .. } = &form.submit {
         if let Some(h) = field_help(section, form.fields[form.active].label) {
@@ -2423,7 +2423,7 @@ fn pick_pane(p: &Palette) -> String {
     let row = |key: &str, name: &str, what: &str| {
         format!("    {b}[{c}{key}{b}]{z}  {b}{name:<8}{z}{d}{what}{z}\n")
     };
-    let mut s = format!("\n  {b}new profile{z}  {d}— pick a kind:{z}\n\n");
+    let mut s = format!("\n  {b}new profile{z}  {d}- pick a kind:{z}\n\n");
     s.push_str(&row("c", "vcpu", "CPU / memory limits for a box"));
     s.push_str(&row("g", "vgpio", "GPIO / I²C / SPI access for a box"));
     s.push_str(&row(
@@ -2435,7 +2435,7 @@ fn pick_pane(p: &Palette) -> String {
 }
 
 /// The lead marker + name colour for a table row: the selected row gets a `›` caret and bold, so it
-/// reads at a glance which row the lifecycle keys act on. (Reverse-video is avoided — an embedded
+/// reads at a glance which row the lifecycle keys act on. (Reverse-video is avoided - an embedded
 /// colour reset mid-row would cut it.) Shared by the Boxes / Profiles / Storage tables.
 fn sel_marker(p: &Palette, selected: bool) -> (String, String) {
     if selected {
@@ -2447,7 +2447,7 @@ fn sel_marker(p: &Palette, selected: bool) -> (String, String) {
 
 /// The physical-disk one-liner for the Overview / Storage panes: the first two disks, then a
 /// `(+N more)` tail when there are others. `None` when no disk was detected. The caller wraps it in
-/// its own dim styling. Cached — disks are fixed hardware, so `top` scans `/sys/block` once, not
+/// its own dim styling. Cached - disks are fixed hardware, so `top` scans `/sys/block` once, not
 /// every frame.
 fn disks_summary() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -2477,12 +2477,12 @@ fn disks_summary() -> Option<String> {
 fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -> String {
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let mut s = format!(
-        "\n  {d}reusable specs — attach to a box: {z}{c}kern box vcpu:heavy vgpio:leds vdisk:scratch …{z}\n"
+        "\n  {d}reusable specs - attach to a box: {z}{c}kern box vcpu:heavy vgpio:leds vdisk:scratch …{z}\n"
     );
-    // One titled sub-table per category, in a fixed order — an empty category still shows its header
+    // One titled sub-table per category, in a fixed order - an empty category still shows its header
     // + "none yet" so it's obvious the kind exists. `sel` is a flat index into `profs` (already sorted
     // by category then name), so the caret lands on the right row across sections; navigation is
-    // unchanged. Headers are visual only — they don't consume a selection index.
+    // unchanged. Headers are visual only - they don't consume a selection index.
     const CATS: [(&str, &str, &str); 3] = [
         ("vcpu", "vCPU", "CPU / memory slices"),
         ("vgpio", "vGPIO", "GPIO · I²C · device passthrough"),
@@ -2490,7 +2490,7 @@ fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -
     ];
     let mut budget = max_rows;
     for (section, title, desc) in CATS {
-        s.push_str(&format!("\n  {b}{title}{z}  {d}— {desc}{z}\n"));
+        s.push_str(&format!("\n  {b}{title}{z}  {d}- {desc}{z}\n"));
         let rows: Vec<(usize, &ProfRow)> = profs
             .iter()
             .enumerate()
@@ -2498,7 +2498,7 @@ fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -
             .collect();
         if rows.is_empty() {
             s.push_str(&format!(
-                "    {d}none yet — press {z}{g}n{z}{d} to add one{z}\n"
+                "    {d}none yet - press {z}{g}n{z}{d} to add one{z}\n"
             ));
             continue;
         }
@@ -2519,7 +2519,7 @@ fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -
     s
 }
 
-/// The Storage tab — the concrete data layer: the read-only physical disks, then the named volumes
+/// The Storage tab - the concrete data layer: the read-only physical disks, then the named volumes
 /// (persistent storage you mount with `-v`). Per-box vdisks are *specs*, so they live in Profiles.
 fn storage_table(
     p: &Palette,
@@ -2530,7 +2530,7 @@ fn storage_table(
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let mut s = String::new();
 
-    // Physical disks — read-only hardware; where volumes and vdisks physically live.
+    // Physical disks - read-only hardware; where volumes and vdisks physically live.
     if let Some(summary) = disks_summary() {
         s.push_str(&format!(
             "\n  {b}DISKS{z} {d}(physical, read-only){z}\n    {d}{summary}{z}\n"
@@ -2538,7 +2538,7 @@ fn storage_table(
     }
 
     s.push_str(&format!(
-        "\n  {d}named volumes — persistent, shared: {z}{c}kern box -v NAME:/data …{z}  {d}(per-box vdisks are in Profiles){z}\n\n"
+        "\n  {d}named volumes, persistent and shared: {z}{c}kern box -v NAME:/data …{z}  {d}(per-box vdisks are in Profiles){z}\n\n"
     ));
     s.push_str(&format!(
         "  {b}{:<24}  {:>10}  {:>10}{z}\n",
@@ -2546,7 +2546,7 @@ fn storage_table(
     ));
     if vols.is_empty() {
         s.push_str(&format!(
-            "  {d}no volumes yet — press {z}{g}n{z}{d} to create one{z}\n"
+            "  {d}no volumes yet, press {z}{g}n{z}{d} to create one{z}\n"
         ));
         return s;
     }
@@ -2555,7 +2555,7 @@ fn storage_table(
         let (lead, col) = sel_marker(p, i == sel);
         // No quota = UNLIMITED (the volume can grow until the disk is full). A bare `-` read as
         // "unset/error"; `∞` says "no cap" at a glance (the `?` help and the create form spell it out).
-        // `kern_common::pad_visible` right-pads by COLUMN width (`∞` is 1 col / 3 bytes) — the colour is
+        // `kern_common::pad_visible` right-pads by COLUMN width (`∞` is 1 col / 3 bytes) - the colour is
         // applied AFTER padding so the zero-width codes don't count. Same helper as `kern volume ls`.
         let quota_plain = v.quota.map_or_else(|| "∞".to_string(), human_bytes);
         let padded = kern_common::pad_visible(&quota_plain, 10);
@@ -2577,7 +2577,7 @@ fn storage_table(
     s
 }
 
-/// Compact large counts (`1.2k`, `3.4M`) for the runs metric — thousands of runs shouldn't sprawl.
+/// Compact large counts (`1.2k`, `3.4M`) for the runs metric - thousands of runs shouldn't sprawl.
 fn human_count(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
@@ -2594,7 +2594,7 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     let mut s = String::from("\n");
     let row = |k: &str, v: String| format!("  {b}{:<16}{z}{v}\n", k);
 
-    // Host — the machine kern is running on (like the private's top).
+    // Host - the machine kern is running on (like the private's top).
     let mem_pct = host.mem_pct();
     s.push_str(&format!("  {b}HOST{z}\n"));
     s.push_str(&row(
@@ -2613,21 +2613,21 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
             mem_pct
         ),
     ));
-    // Physical disks — read-only hardware, the pool a `vdisk:` profile's image lives on.
+    // Physical disks - read-only hardware, the pool a `vdisk:` profile's image lives on.
     if let Some(summary) = disks_summary() {
         s.push_str(&row("Disks", format!("{d}{summary}{z}")));
     }
-    // `kern run` throughput lives on its own **Runs** tab (fire-and-forget capped processes) — Overview
+    // `kern run` throughput lives on its own **Runs** tab (fire-and-forget capped processes) - Overview
     // stays the host + box picture. A one-line pointer only while runs actively stream (same > 0.5/s
     // threshold as the Runs-tab `⚡`, so the two never disagree), never a stale idle cumulative.
     if host.runs_per_sec > 0.5 {
         s.push_str(&row(
             "Runs",
-            format!("{d}⚡ live — see the {z}{b}Runs{z}{d} tab{z}"),
+            format!("{d}⚡ live - see the {z}{b}Runs{z}{d} tab{z}"),
         ));
     }
 
-    // Boxes — the aggregate of what kern is running.
+    // Boxes - the aggregate of what kern is running.
     let total_mem: u64 = rows.iter().filter_map(|r| r.mem).sum();
     // `pct()` normalises a stray `-0.0` (float rounding on an idle host) to a clean `0.0`.
     let total_cpu: f64 = pct(rows.iter().map(|r| r.cpu_pct).sum());
@@ -2645,13 +2645,13 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     s.push_str(&row("Resource cap", format!("{d}{cap}{z}")));
     if rows.is_empty() {
         s.push_str(&format!(
-            "\n  {d}no running boxes — start one with `kern box <name> -d …`{z}\n"
+            "\n  {d}no running boxes - start one with `kern box <name> -d …`{z}\n"
         ));
     }
     s
 }
 
-/// A tiny unicode-block sparkline of `samples`, scaled to their own max — a compact recent-shape glyph
+/// A tiny unicode-block sparkline of `samples`, scaled to their own max - a compact recent-shape glyph
 /// for the Runs tab. An all-zero (idle) window renders as a flat baseline, never a panic.
 fn spark(samples: &[f64]) -> String {
     const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -2669,17 +2669,17 @@ fn spark(samples: &[f64]) -> String {
 }
 
 /// The Runs tab. `kern run` is fire-and-forget (~1 ms, no sandbox, exec-in-place, not registered), so it
-/// has NO per-row list — it's shown as **aggregate throughput**. Every figure here is really measured
-/// from the daemonless mmap counter: the live rate, the honest average setup latency (entry→exec — this
+/// has NO per-row list - it's shown as **aggregate throughput**. Every figure here is really measured
+/// from the daemonless mmap counter: the live rate, the honest average setup latency (entry→exec - this
 /// IS the "~1 ms"), the session-peak rate, the cumulative total, and a recent-shape sparkline.
-/// Deliberately NOT shown: "active / peak concurrent" — unmeasurable without a per-run reaper that would
+/// Deliberately NOT shown: "active / peak concurrent" - unmeasurable without a per-run reaper that would
 /// defeat the whole point of a ~1 ms run, so we don't invent it.
 fn runs_table(p: &Palette, host: &HostStats) -> String {
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let row = |k: &str, v: String| format!("  {b}{:<14}{z}{v}\n", k);
     let mut s = String::new();
     s.push_str(&format!(
-        "\n  {b}Runs{z}{d} = fast, CPU/memory-capped commands — {z}{c}kern run -- <cmd>{z}{d} — with {z}{b}no sandbox{z}{d}, gone in ~1 ms.{z}\n"
+        "\n  {b}Runs{z}{d} = fast, CPU/memory-capped commands - {z}{c}kern run -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}, gone in ~1 ms.{z}\n"
     ));
     s.push_str(&format!(
         "  {d}A run is {z}{b}NOT a container{z}{d}: for an isolated box, use the {z}{c}Boxes{z}{d} tab. Runs are too fast/many to{z}\n"
@@ -2690,20 +2690,20 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
 
     if host.runs_total == 0 {
         s.push_str(&format!(
-            "  {d}no runs yet — fire capped processes with {z}{c}kern run -- <cmd>{z}\n"
+            "  {d}no runs yet - fire capped processes with {z}{c}kern run -- <cmd>{z}\n"
         ));
         s.push_str(&format!(
             "  {d}e.g.  {z}{c}for i in $(seq 1000); do kern run -- true; done{z}\n\n"
         ));
         s.push_str(&format!(
-            "  {d}a run is a CPU/mem-capped process with no sandbox — Docker has no analogue this fast.{z}\n"
+            "  {d}a run is a CPU/mem-capped process with no sandbox - Docker has no analogue this fast.{z}\n"
         ));
         return s;
     }
 
     let rate = host.runs_per_sec.round().max(0.0) as u64;
     let per_min = (host.runs_per_sec * 60.0).round().max(0.0) as u64;
-    // Live rate is green while streaming, dim when idle (0/s) — the number is the honest "now".
+    // Live rate is green while streaming, dim when idle (0/s) - the number is the honest "now".
     let rate_col = if host.runs_per_sec > 0.5 { g } else { d };
     s.push_str(&row(
         "Speed",
@@ -2736,7 +2736,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
     ));
 
     // Recent-shape sparkline of runs/sec (the reader-side ring). When the whole window is idle, an
-    // all-`▁` baseline rendered green looks like a growing bar next to "0 /s" (confusing) — so show a
+    // all-`▁` baseline rendered green looks like a growing bar next to "0 /s" (confusing) - so show a
     // green sparkline only when there's real recent activity, else a dim "idle" so a flat line never
     // reads as throughput.
     if host.runs_spark.len() >= 2 {
@@ -2748,14 +2748,14 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
             ));
         } else {
             s.push_str(&format!(
-                "\n  {b}{:<14}{z}{d}idle — no runs in the last window{z}\n",
+                "\n  {b}{:<14}{z}{d}idle - no runs in the last window{z}\n",
                 "Recent"
             ));
         }
     }
 
     s.push_str(&format!(
-        "\n  {d}runs = capped processes (CPU/mem cgroup, no sandbox), fire-and-forget — shown as{z}\n"
+        "\n  {d}runs = capped processes (CPU/mem cgroup, no sandbox), fire-and-forget - shown as{z}\n"
     ));
     s.push_str(&format!(
         "  {d}aggregate throughput, not a per-row list. This is what Docker can't do at scale.{z}\n"
@@ -2763,7 +2763,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
     s
 }
 
-/// The Images tab: cached OCI images (`repository` + `tag` split, size, pulled age) — a read-only
+/// The Images tab: cached OCI images (`repository` + `tag` split, size, pulled age) - a read-only
 /// in-`top` mirror of `kern images`, sourced from the exact same [`crate::commands::image_entries`] so
 /// the two never drift. `repository:tag` is split on the last `:` (unless that tail holds a `/`, i.e. a
 /// `host:port/…` reference with no explicit tag → shown as `latest`).
@@ -2775,14 +2775,14 @@ fn images_table(
 ) -> String {
     let (b, c, d, y, z) = (p.b, p.c, p.d, p.y, p.z);
     let cut = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
-    let mut s = format!("\n  {d}cached images — {z}{c}kern pull <image>{z}{d} · name order{z}\n\n");
+    let mut s = format!("\n  {d}cached images - {z}{c}kern pull <image>{z}{d} · name order{z}\n\n");
     s.push_str(&format!(
         "  {b}{:<24} {:<14} {:>9}  PULLED{z}\n",
         "REPOSITORY", "TAG", "SIZE"
     ));
     if images.is_empty() {
         s.push_str(&format!(
-            "  {d}no images yet — pull one with {z}{c}kern pull alpine{z}\n"
+            "  {d}no images yet - pull one with {z}{c}kern pull alpine{z}\n"
         ));
         return s;
     }
@@ -2795,7 +2795,7 @@ fn images_table(
             _ => (img.name.as_str(), "latest"),
         };
         // A dangling image (layers gone) shows `dangling` in yellow, never a misleading `0 B`. The ref is
-        // untrusted `.ok` content — scrub escapes before the raw alt-screen (as image_detail / the CLI do).
+        // untrusted `.ok` content - scrub escapes before the raw alt-screen (as image_detail / the CLI do).
         let size = if img.dangling {
             format!("{y}{:>9}{z}", "dangling")
         } else {
@@ -2816,7 +2816,7 @@ fn images_table(
 
 /// The Boxes tab: a per-box table, capped to `max_rows` so it never overflows the screen. `sel` is the
 /// highlighted row (the target of the lifecycle keys), marked with a `›` and reverse-video.
-/// The Builds tab: `kern build` history (newest first) — id, tag, coloured status (+ warning count),
+/// The Builds tab: `kern build` history (newest first) - id, tag, coloured status (+ warning count),
 /// duration, size, age. A read-only in-`top` mirror of `kern builds`.
 fn builds_table(
     p: &Palette,
@@ -2828,7 +2828,7 @@ fn builds_table(
     let cut = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
     let mut s = String::new();
     s.push_str(&format!(
-        "\n  {d}build history — {z}{c}kern build -t NAME .{z}{d} · newest first{z}\n\n"
+        "\n  {d}build history - {z}{c}kern build -t NAME .{z}{d} · newest first{z}\n\n"
     ));
     s.push_str(&format!(
         "  {b}{:<18} {:<16} {:<11} {:>8} {:>9}  CREATED{z}\n",
@@ -2836,7 +2836,7 @@ fn builds_table(
     ));
     if builds.is_empty() {
         s.push_str(&format!(
-            "  {d}no builds yet — run {z}{g}kern build -t app .{z}\n"
+            "  {d}no builds yet - run {z}{g}kern build -t app .{z}\n"
         ));
         return s;
     }
@@ -2885,7 +2885,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
     let shown = rows.len().min(max_rows);
     let mut prev_pod = "";
     for (i, r) in rows[..shown].iter().enumerate() {
-        // Pod header when entering a new pod group — the `kern ps` tree view: standalone boxes are
+        // Pod header when entering a new pod group - the `kern ps` tree view: standalone boxes are
         // flat, a pod's members sit under a `<pod> (pod · N boxes)` header, indented with ├─/└─.
         if !r.pod.is_empty() && r.pod != prev_pod {
             let n = rows.iter().filter(|x| x.pod == r.pod).count();
@@ -2929,7 +2929,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
         } else {
             format!("{:<14}", trunc(&r.ports, 14))
         };
-        // Trailing flag only when the box is LESS isolated than default (net:host / root-mapped) — in
+        // Trailing flag only when the box is LESS isolated than default (net:host / root-mapped) - in
         // yellow so it reads as "heads-up", never a green all-clear badge.
         let iso = if r.iso.is_empty() {
             String::new()
@@ -2954,7 +2954,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
 }
 
 /// Normalise a CPU% for display: clamp to ≥ 0 and collapse a signed zero (`-0.0`) to a clean `0.0`.
-/// (`f64::max(-0.0, 0.0)` may keep the sign, which then prints as "-0" — an idle-host eyesore.)
+/// (`f64::max(-0.0, 0.0)` may keep the sign, which then prints as "-0" - an idle-host eyesore.)
 fn pct(v: f64) -> f64 {
     let v = v.max(0.0);
     if v == 0.0 {
@@ -3007,7 +3007,7 @@ mod tests {
 
     #[test]
     fn boxes_flag_only_reduced_isolation_never_a_secure_badge() {
-        // A default (fully isolated) box carries NO isolation marker — no vanity "secure" badge.
+        // A default (fully isolated) box carries NO isolation marker - no vanity "secure" badge.
         let out = boxes_table(&plain(), &[row("safe", false)], 10, usize::MAX);
         let safe = out.lines().find(|l| l.contains("safe")).unwrap();
         assert!(
@@ -3055,7 +3055,7 @@ mod tests {
     #[test]
     fn tab_bar_shows_live_counts() {
         // The tab bar shows a live count per data tab (Boxes/Profiles/Storage) so you see how many
-        // items exist without entering — Overview (an aggregate) has no count.
+        // items exist without entering - Overview (an aggregate) has no count.
         let host = HostStats {
             mem_used: 0,
             mem_total: 1,
@@ -3128,7 +3128,7 @@ mod tests {
 
     #[test]
     fn storage_shows_infinity_for_unlimited_quota() {
-        // A volume with no quota is UNLIMITED — show `∞`, not an ambiguous `-`. A capped one shows the
+        // A volume with no quota is UNLIMITED - show `∞`, not an ambiguous `-`. A capped one shows the
         // human size. (The bug: `-` read as "unset/error" instead of "no cap".)
         let vols = [
             crate::volume::VolInfo {
@@ -3337,7 +3337,7 @@ mod tests {
     #[test]
     fn edit_form_round_trips_every_field_losslessly() {
         // A profile hand-written with the full field set, loaded into the edit form and re-serialised,
-        // must reproduce every field — no CLI-only / hand-edit-only field is dropped by an edit cycle.
+        // must reproduce every field - no CLI-only / hand-edit-only field is dropped by an edit cycle.
         let raw = "\
 [[vgpio]]
 name = \"full\"
@@ -3470,7 +3470,7 @@ leds = [\"led0\"]
             f.value, "/dev/i2c-1",
             "value canonicalizes to the /dev path"
         );
-        // A bus NOT detected here is still kept (canonicalized) as a checked extra — lossless.
+        // A bus NOT detected here is still kept (canonicalized) as a checked extra - lossless.
         let mut g = Field::pick("i2c", "h", vec!["/dev/i2c-0".into()]);
         g.value = "i2c-0, 9".into();
         g.seed_pick_selection();
@@ -3481,7 +3481,7 @@ leds = [\"led0\"]
     #[test]
     fn vgpio_form_does_not_offer_net_a_field_the_resolver_ignores() {
         // `net` in a vgpio profile is inert (the resolver never attaches an interface), so the form
-        // must not advertise it — offering a knob that does nothing is exactly the "misleading" trap.
+        // must not advertise it - offering a knob that does nothing is exactly the "misleading" trap.
         let form = new_profile_form("vgpio");
         assert!(
             !form.fields.iter().any(|f| f.label == "net"),
@@ -3531,7 +3531,7 @@ leds = [\"led0\"]
     #[test]
     fn leds_picker_drops_netdev_and_input_noise_keeps_board_leds() {
         let nets = vec!["enp5s0".to_string(), "lo".to_string(), "wlp4s0".to_string()];
-        // Noise: NIC PHY LEDs and keyboard LEDs — never a meaningful sandbox device.
+        // Noise: NIC PHY LEDs and keyboard LEDs - never a meaningful sandbox device.
         for noise in [
             "enp5s0-0::lan",
             "enp5s0::act",
@@ -3540,7 +3540,7 @@ leds = [\"led0\"]
         ] {
             assert!(!is_board_led(noise, &nets), "{noise} should be dropped");
         }
-        // Real board LEDs — kept. 'logo' starts with 'lo' but isn't the 'lo' iface → kept.
+        // Real board LEDs - kept. 'logo' starts with 'lo' but isn't the 'lo' iface → kept.
         for led in ["led0", "ACT", "PWR", "mmc0::activity", "default-on", "logo"] {
             assert!(is_board_led(led, &nets), "{led} should be kept");
         }
@@ -3550,7 +3550,7 @@ leds = [\"led0\"]
     fn every_profile_field_is_guarded_for_all_kinds() {
         // EXTREME, for all vprofiles: no field in ANY profile form is unguarded free text. Each field
         // is validated by the field_state authority (numbers / name / sizes), a picker/radio selection,
-        // a boolean toggle, or a "none here / explanatory" note — with ONE documented exception, the
+        // a boolean toggle, or a "none here / explanatory" note - with ONE documented exception, the
         // free-form `extra` /dev-path escape (guarded downstream by the resolver). If a new field is
         // added as free text, this fails.
         for kind in ["vcpu", "vgpio", "vdisk"] {
@@ -3564,7 +3564,7 @@ leds = [\"led0\"]
                     || validated_field(f.label); // field_state governs it (numbers/name/size/extra path)
                 assert!(
                     guarded,
-                    "{kind} field {:?} is UNGUARDED free text — make it validated / a pick / a note",
+                    "{kind} field {:?} is UNGUARDED free text - make it validated / a pick / a note",
                     f.label
                 );
             }
@@ -3573,7 +3573,7 @@ leds = [\"led0\"]
 
     #[test]
     fn backend_is_a_selection_never_a_free_text_box() {
-        // `backend` names a configured id (gpio/cpu/disk) — so for EVERY kind it must be a picker of
+        // `backend` names a configured id (gpio/cpu/disk) - so for EVERY kind it must be a picker of
         // those ids (or a "none configured" note), never a free-text box where `disk:0sfsf…` could be
         // typed. Regression: vcpu/vdisk backend used to be free text.
         for kind in ["vgpio", "vcpu", "vdisk"] {
@@ -3589,7 +3589,7 @@ leds = [\"led0\"]
     #[test]
     fn focused_field_gets_a_plain_language_help_line() {
         // Whatever field is focused, the form shows a concrete "what is this / when to use it" line at
-        // the bottom — the user is guided, never left guessing what to enter.
+        // the bottom - the user is guided, never left guessing what to enter.
         let mut form = new_profile_form("vgpio");
         // Focus the name field: help explains it's a label + how to attach it.
         assert_eq!(form.fields[0].label, "name");
@@ -3625,7 +3625,7 @@ leds = [\"led0\"]
         for &b in input {
             match handle_form_key(form, &[b]) {
                 FormOutcome::Stay(f) | FormOutcome::Submit(f) => form = f,
-                FormOutcome::Cancel => return String::new(), // Esc aborts — nothing typed
+                FormOutcome::Cancel => return String::new(), // Esc aborts - nothing typed
             }
         }
         form.fields.into_iter().next().unwrap().value
@@ -3636,7 +3636,7 @@ leds = [\"led0\"]
         // Hammer every typed numeric/size field with adversarial byte strings and assert two things:
         //  (1) the accumulated value is NEVER config::field_state == Invalid (the filter never lets a
         //      dead value stick), and
-        //  (2) whenever it IS Valid, config::profile_line accepts it — no value can dead-end at save.
+        //  (2) whenever it IS Valid, config::profile_line accepts it - no value can dead-end at save.
         use crate::config::{field_state, profile_line, FieldState};
         let fields: &[(&str, &str)] = &[
             ("vgpio", "pins"),
@@ -3801,7 +3801,7 @@ leds = [\"led0\"]
 
     #[test]
     fn radio_field_holds_a_single_value() {
-        // A radio (single-select) pick — like `backend` — can never reach the invalid multi-value
+        // A radio (single-select) pick - like `backend` - can never reach the invalid multi-value
         // state: ticking a second option clears the first.
         let mut form = Form {
             title: "t".into(),
@@ -3839,7 +3839,7 @@ leds = [\"led0\"]
 
     #[test]
     fn number_fields_reject_letters_as_you_type() {
-        // pwm/pins/adc are line NUMBERS — typing letters must do nothing, so `1dfdf` can't happen.
+        // pwm/pins/adc are line NUMBERS - typing letters must do nothing, so `1dfdf` can't happen.
         let mut form = Form {
             title: "t".into(),
             fields: vec![Field::text("pwm", "PWM lines"), Field::text("name", "n")],
@@ -3894,7 +3894,7 @@ leds = [\"led0\"]
             error: None,
             show_advanced: false,
         };
-        // pins: `44545454545` stops the moment the number would exceed the range — never the garbage.
+        // pins: `44545454545` stops the moment the number would exceed the range - never the garbage.
         let f = feed(mk("vgpio", "pins"), b"44545454545");
         assert!(
             f.fields[0].value.parse::<u32>().unwrap() < crate::config::MAX_GPIO_PIN,
@@ -3925,7 +3925,7 @@ leds = [\"led0\"]
     #[test]
     fn absent_device_is_a_read_only_note_you_cannot_type_into() {
         // A device the host lacks is a "none on this host" note: the cursor skips it and typing does
-        // nothing — so a beginner can NEVER put garbage into, say, `spi` on a machine without SPI.
+        // nothing - so a beginner can NEVER put garbage into, say, `spi` on a machine without SPI.
         let mut form = Form {
             title: "t".into(),
             fields: vec![

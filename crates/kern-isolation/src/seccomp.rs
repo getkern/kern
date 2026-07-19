@@ -1,6 +1,6 @@
 //! Always-on seccomp denylist.
 //!
-//! Blocks the syscalls a sandboxed workload must never make — kexec, kernel-module
+//! Blocks the syscalls a sandboxed workload must never make - kexec, kernel-module
 //! (un)loading, ptrace, reboot, swap on/off, and further mount/namespace manipulation. It is an
 //! allow-by-default *denylist* (kern's "always-on" baseline); a stricter allowlist mode can land
 //! later. The filter is installed last, after kern's own setup syscalls, so it only constrains
@@ -20,7 +20,7 @@ const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
 // `__X32_SYSCALL_BIT` (`<asm/unistd.h>`). On x86_64 the x32 ABI reuses the x86_64 `AUDIT_ARCH`
-// token but sets this bit on the syscall number — so a plain number-equality denylist can be
+// token but sets this bit on the syscall number - so a plain number-equality denylist can be
 // bypassed by calling the x32 variant of a blocked syscall. Kill anything with the bit set.
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
@@ -29,7 +29,7 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 // Deny gracefully with an errno instead of killing. The syscall STILL never runs (isolation is
-// identical to a kill), but the caller gets `ENOSYS` and can take its fallback path — so software
+// identical to a kill), but the caller gets `ENOSYS` and can take its fallback path - so software
 // that merely PROBES an optional capability (io_uring, perf, userfaultfd, keyring) keeps working
 // instead of being SIGSYS-killed mid-startup. Reserved for deny-but-degrade syscalls (see
 // `errno_syscalls`); true escape vectors still kill. `SECCOMP_RET_DATA` masks the errno into the low
@@ -52,10 +52,10 @@ const AUDIT_ARCH: u32 = 0xC000_00B7;
 /// (`unshare`/`setns`) and set up its rootfs (`mount`/`umount2`/`pivot_root`, the CLASSIC mount
 /// API kern itself uses). These are the ONLY entries `denylist(true)` drops for a `--privileged`
 /// box. Everything else in the always-on set (kexec, modules, bpf, io_uring, keyring, ptrace, the
-/// NEW mount API, …) stays blocked even under `--privileged` — so a kern privileged box is
+/// NEW mount API, …) stays blocked even under `--privileged` - so a kern privileged box is
 /// materially stronger than a Docker `--privileged` container (which drops the seccomp filter
 /// wholesale). `--privileged` is honoured ONLY in rootless mode (see `real.rs`): when the box's
-/// root maps to an unprivileged host uid, a nested userns grants no new host privilege — exactly
+/// root maps to an unprivileged host uid, a nested userns grants no new host privilege - exactly
 /// why rootless podman-in-podman is safe.
 fn nesting_syscalls() -> [libc::c_long; 5] {
     [
@@ -68,7 +68,7 @@ fn nesting_syscalls() -> [libc::c_long; 5] {
 }
 
 /// Dangerous syscalls. `libc::SYS_*` resolves to the correct number for the compile target.
-/// `clone`/`clone3` are intentionally NOT blocked — they're how ordinary programs fork.
+/// `clone`/`clone3` are intentionally NOT blocked - they're how ordinary programs fork.
 /// Returned as a `Vec` because a few `SYS_*` constants aren't exposed by `libc` on every arch
 /// (e.g. `kexec_file_load` on aarch64-musl), so they're added conditionally rather than as a
 /// fixed-size array.
@@ -89,10 +89,10 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
         libc::SYS_reboot,
         libc::SYS_swapon,
         libc::SYS_swapoff,
-        // Mounting — classic API. Dropped only for a rootless `--privileged` (nesting) box; see
+        // Mounting - classic API. Dropped only for a rootless `--privileged` (nesting) box; see
         // `nesting_syscalls`. `mount`/`umount2`/`pivot_root` are re-added below unless nesting.
         // … and the new mount API (would otherwise bypass the `mount` denial). Kept blocked ALWAYS
-        // — kern's own setup uses the classic API, so even a nested box never needs the new one.
+        // - kern's own setup uses the classic API, so even a nested box never needs the new one.
         libc::SYS_open_tree,
         libc::SYS_move_mount,
         libc::SYS_fsopen,
@@ -101,9 +101,9 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
         // `fspick(2)` opens an fs-context on an existing mount to reconfigure it. It's inert on its own
         // (the reconfigure only commits via `fsconfig(FSCONFIG_CMD_RECONFIGURE)`, already denied above),
         // but block the whole reconfiguration family so the guarantee doesn't rest on that one coupling
-        // — a future edit to the fsconfig handling can't silently re-open an RO-clear path.
+        // - a future edit to the fsconfig handling can't silently re-open an RO-clear path.
         libc::SYS_fspick,
-        // `mount_setattr(2)` changes attributes of an existing mount — with CAP_SYS_ADMIN in the box's
+        // `mount_setattr(2)` changes attributes of an existing mount - with CAP_SYS_ADMIN in the box's
         // own userns it could clear `MS_RDONLY` and strip a `--read-only` box (or a `:ro` volume). Same
         // family as the mount API above; deny it outright so the read-only contract can't be undone.
         libc::SYS_mount_setattr,
@@ -111,15 +111,15 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
         // local-privilege-escalation bugs.
         libc::SYS_bpf,
         // io_uring, userfaultfd, perf_event_open, the keyring family (add_key/request_key/keyctl) and
-        // syslog(2) are ALSO denied — but via `errno_syscalls()` (→ ENOSYS) rather than a kill. They're
+        // syslog(2) are ALSO denied - but via `errno_syscalls()` (→ ENOSYS) rather than a kill. They're
         // deny-but-degrade: legitimate software probes them for an optional fast-path (async I/O,
         // profiling, GC) and falls back when they're unavailable, so a SIGSYS-kill was a needless
-        // compat break (it killed Redis 8's modules mid-startup) while the isolation — the syscall
-        // never runs — is identical. See `errno_syscalls`.
+        // compat break (it killed Redis 8's modules mid-startup) while the isolation - the syscall
+        // never runs - is identical. See `errno_syscalls`.
     ];
     // Namespace creation + classic mount API. Blocked by default (nested userns → CAP_SYS_ADMIN
     // escape, and mount would undo the RO/masked-/proc contract). A rootless `--privileged` box
-    // keeps them ALLOWED so a nested `kern box` can start — safe because the box's root is an
+    // keeps them ALLOWED so a nested `kern box` can start - safe because the box's root is an
     // unprivileged host uid (the caller is non-root; enforced in `real.rs`).
     if !allow_nesting {
         v.extend_from_slice(&nesting_syscalls());
@@ -135,21 +135,21 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
 }
 
 /// Denied, but with `ENOSYS` instead of a kill (see [`SECCOMP_RET_ERRNO`]). A hostile payload can't
-/// escape through any of these anyway — they're capabilities that legitimate software merely PROBES
+/// escape through any of these anyway - they're capabilities that legitimate software merely PROBES
 /// for an optional fast-path and gracefully falls back on when unavailable. Killing on them (the old
 /// behaviour) needlessly broke such software: Redis 8's modules probe io_uring on startup and were
 /// SIGSYS-killed. Returning `ENOSYS` keeps the isolation IDENTICAL (the syscall still never runs)
-/// while letting the fallback path (epoll/threads/no-op) take over. Not affected by `allow_nesting` —
+/// while letting the fallback path (epoll/threads/no-op) take over. Not affected by `allow_nesting` -
 /// none of these are nesting syscalls. True escape vectors (kexec, modules, the mount API, bpf,
 /// ptrace, the nesting set) stay in [`denylist`] and still KILL.
 fn errno_syscalls() -> [libc::c_long; 9] {
     [
-        // io_uring: bug-rich async-I/O (LPE-CVE history). Still fully denied — callers fall back to
+        // io_uring: bug-rich async-I/O (LPE-CVE history). Still fully denied - callers fall back to
         // epoll/thread-pool I/O, which is exactly what every one of them already ships as the default.
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
-        // Optional GC / profiling fast-paths — software runs fine without them.
+        // Optional GC / profiling fast-paths - software runs fine without them.
         libc::SYS_userfaultfd,
         libc::SYS_perf_event_open,
         // Kernel keyring: already namespaced by the box user-ns (defense-in-depth, not a live escape);
@@ -157,13 +157,13 @@ fn errno_syscalls() -> [libc::c_long; 9] {
         libc::SYS_add_key,
         libc::SYS_request_key,
         libc::SYS_keyctl,
-        // syslog(2)/klogctl reads the kernel ring buffer (dmesg) — an info leak; a prober just gets
-        // nothing. (The libc `syslog()` LOGGING function uses /dev/log, not this syscall — unaffected.)
+        // syslog(2)/klogctl reads the kernel ring buffer (dmesg) - an info leak; a prober just gets
+        // nothing. (The libc `syslog()` LOGGING function uses /dev/log, not this syscall - unaffected.)
         libc::SYS_syslog,
     ]
 }
 
-/// How many syscalls the denylist blocks (for the box status banner — kept truthful by reading the
+/// How many syscalls the denylist blocks (for the box status banner - kept truthful by reading the
 /// live list rather than a hard-coded number). `allow_nesting` reflects a rootless `--privileged`
 /// box, which blocks [`nesting_syscalls`] fewer.
 pub fn denied_syscall_count(allow_nesting: bool) -> usize {
@@ -207,7 +207,7 @@ pub fn install(allow_nesting: bool) -> Result<(), Error> {
         prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     }
     // 3. Each KILL-set number: ==nr → kill the process. These are real escape vectors / pure-attack
-    // syscalls (kexec, modules, the mount API, bpf, ptrace, nesting) — no legitimate workload calls
+    // syscalls (kexec, modules, the mount API, bpf, ptrace, nesting) - no legitimate workload calls
     // them, so an attempt is treated as hostile and the process dies.
     for nr in denylist(allow_nesting) {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (kill); else skip
@@ -247,7 +247,7 @@ pub fn install(allow_nesting: bool) -> Result<(), Error> {
 mod tests {
     use super::{denylist, errno_syscalls, nesting_syscalls};
 
-    /// Every high-value syscall a sandboxed workload must never run stays DENIED — whether by a kill
+    /// Every high-value syscall a sandboxed workload must never run stays DENIED - whether by a kill
     /// (escape vectors) or by ENOSYS (deny-but-degrade). A regression that drops an entry from BOTH
     /// sets silently reopens a kernel surface, so the test checks the union.
     #[test]
@@ -287,7 +287,7 @@ mod tests {
         }
     }
 
-    /// The KILL set and the ENOSYS set must stay DISJOINT, and — critically — the ENOSYS demotion must
+    /// The KILL set and the ENOSYS set must stay DISJOINT, and - critically - the ENOSYS demotion must
     /// only ever apply to deny-but-degrade syscalls. A real escape vector (kexec, bpf, ptrace, the
     /// mount API) demoted to a mere ENOSYS would let a hostile payload keep probing instead of dying,
     /// so this asserts every escape vector stays a hard kill.
@@ -324,7 +324,7 @@ mod tests {
     }
 
     /// A rootless `--privileged` (nesting) box drops EXACTLY the namespace + classic-mount syscalls
-    /// and nothing else — so a nested `kern box` can start while every other escape/DoS syscall
+    /// and nothing else - so a nested `kern box` can start while every other escape/DoS syscall
     /// (kexec, modules, bpf, io_uring, keyring, ptrace, the NEW mount API) stays blocked. This is
     /// the property that makes a kern privileged box stronger than a Docker `--privileged` one.
     #[test]
@@ -337,7 +337,7 @@ mod tests {
             assert!(strict.contains(&nr), "strict must block {nr}");
             assert!(!nest.contains(&nr), "nesting must allow {nr}");
         }
-        // Everything a nested box never needs stays blocked even under `--privileged` — unlike
+        // Everything a nested box never needs stays blocked even under `--privileged` - unlike
         // Docker's `--privileged`, which drops the seccomp filter entirely.
         for nr in [
             libc::SYS_kexec_load,
@@ -350,7 +350,7 @@ mod tests {
         ] {
             assert!(nest.contains(&nr), "nesting must STILL block (kill) {nr}");
         }
-        // io_uring + the keyring stay denied under `--privileged` too — via ENOSYS. The errno set is
+        // io_uring + the keyring stay denied under `--privileged` too - via ENOSYS. The errno set is
         // independent of nesting, so a privileged box is no weaker on these than a strict one.
         for nr in [libc::SYS_io_uring_setup, libc::SYS_keyctl] {
             assert!(

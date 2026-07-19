@@ -1,9 +1,9 @@
-//! Surgical, line-based edits to a `kern.toml` — used by the `kern top` **Profiles** tab so editing a
+//! Surgical, line-based edits to a `kern.toml` - used by the `kern top` **Profiles** tab so editing a
 //! single profile can't destroy the rest of the file. kern's parser is deliberately *tolerant* (it
 //! ignores sections/keys it doesn't model, so a config shared with the private runtime still loads);
 //! that means a naive "parse → re-serialize" would silently drop every unknown section on save. These
 //! helpers instead splice *only the one array-of-tables block* being edited and leave every other
-//! byte — comments, blank lines, unknown `[gpu]`/`[intelligence]` sections — exactly as it was.
+//! byte - comments, blank lines, unknown `[gpu]`/`[intelligence]` sections - exactly as it was.
 //!
 //! A "block" is a `[[<header>]]` line and every line after it up to (but not including) the next line
 //! that starts a new `[table]`/`[[array]]`, or end of file. A block is matched by its `name = "…"`.
@@ -12,7 +12,7 @@
 fn name_value(trimmed: &str) -> Option<&str> {
     let rest = trimmed.strip_prefix("name")?.trim_start();
     let rest = rest.strip_prefix('=')?.trim();
-    // The value may be followed by an inline comment (`name = "heavy"   # …`) — the starter config from
+    // The value may be followed by an inline comment (`name = "heavy"   # …`) - the starter config from
     // `kern config setup` writes exactly that. Take the QUOTED span (up to the closing quote), not
     // `strip_suffix('"')` on the whole line, which failed when a comment trailed the value → the block
     // wasn't found → `config add` on an existing name created a DUPLICATE instead of erroring.
@@ -123,14 +123,14 @@ fn line_key(trimmed: &str) -> Option<&str> {
 /// Like [`upsert_block`], but **field-surgical**: when the block already exists it keeps every line
 /// whose key is NOT in `managed` (and any comment lines), replacing only the managed fields with
 /// `body_lines`. So a profile edit from the form / `kern config` preserves keys those surfaces don't
-/// model — a hand-added `numa`, `nice`, `iops`, or a peripheral like `i2c` — instead of dropping them
+/// model - a hand-added `numa`, `nice`, `iops`, or a peripheral like `i2c` - instead of dropping them
 /// (the same promise `upsert_block` makes for the rest of the *file*, now for the rest of the *block*).
 ///
 /// `source_name` is the block being edited (for a rename it's the OLD name); `body_lines` carries the
-/// new `name = "…"`. A managed field absent from `body_lines` is treated as cleared (removed) — so the
+/// new `name = "…"`. A managed field absent from `body_lines` is treated as cleared (removed) - so the
 /// form can still empty a field. If no block named `source_name` exists, this is a plain insert.
 // `managed` is `&[&'static str]` while `k` borrows a line (shorter lifetime), so `.contains(&k)` won't
-// typecheck — the `iter().any()` is required, not a style choice.
+// typecheck - the `iter().any()` is required, not a style choice.
 #[allow(clippy::manual_contains)]
 pub fn upsert_block_merge(
     raw: &str,

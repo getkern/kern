@@ -1,4 +1,4 @@
-# Reusable resource PROFILES for kern — a kern.toml you attach to a box by name.
+# Reusable resource PROFILES for kern - a kern.toml you attach to a box by name.
 #
 # The model is resource-centric: you DECLARE physical resources ([[cpu]], [[gpio]], [[disk]]) and
 # DEFINE named virtual profiles that carve them up ([[vcpu]], [[vgpio]], [[vdisk]]). A box then
@@ -14,9 +14,9 @@ config_version = 1
 
 # ── virtual CPU slices ([[vcpu]]) ─────────────────────────────────────────────────────────────
 # Field names match the CLI flags 1:1:
-#   cpus   = core QUOTA (cgroup cpu.max)      — the CLI flag is --cpus
-#   cpuset = CPU PINNING list (cgroup cpuset) — the CLI flag is --cpuset-cpus
-#   nice   = scheduling priority (-20 high .. 19 low) — the CLI flag is --nice
+#   cpus   = core QUOTA (cgroup cpu.max)      - the CLI flag is --cpus
+#   cpuset = CPU PINNING list (cgroup cpuset) - the CLI flag is --cpuset-cpus
+#   nice   = scheduling priority (-20 high .. 19 low) - the CLI flag is --nice
 [[vcpu]]
 name = "slim"
 cpus = 0.5           # half a core of quota
@@ -45,7 +45,7 @@ size = "32m"
 # ── virtual GPIO / peripherals ([[vgpio]]) ────────────────────────────────────────────────────
 # Device exposure is host-dependent (real gpiochips / /dev nodes / sysfs). This profile is inert
 # on a host without the hardware; see device-isolation.sh for the device-binding angle. GPIO
-# isolation is chip-granular, not per-line — see SECURITY.md.
+# isolation is chip-granular, not per-line - see SECURITY.md.
 [[vgpio]]
 name = "leds"
 backend = "gpio:0"

@@ -9,7 +9,7 @@
 # WHY --uid-range: the official redis image's entrypoint drops privilege to the `redis` service
 # user (uid 999) via gosu. A single-uid box can't map that uid, so the drop fails. --uid-range
 # maps a subordinate uid range so the entrypoint works. It needs the `uidmap` helpers
-# (newuidmap/newgidmap) installed — standard on desktop Linux; on a host without them kern warns
+# (newuidmap/newgidmap) installed - standard on desktop Linux; on a host without them kern warns
 # and falls back to single-uid (where this recipe's redis would not start).
 #
 # WHY the data survives: redis persists to /data/dump.rdb, and /data is a kern-managed NAMED

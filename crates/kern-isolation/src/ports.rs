@@ -5,7 +5,7 @@
 //! `127.0.0.1:<box_port>`, pumping bytes. No box-side proxy, no shared socket, no extra deps.
 //!
 //! - **TCP**: one worker per accepted connection (a byte pump with half-close).
-//! - **UDP**: one worker per *client* — a wildcard host socket sees each client's first datagram, then
+//! - **UDP**: one worker per *client* - a wildcard host socket sees each client's first datagram, then
 //!   a `SO_REUSEPORT` socket *connected* to that client takes over its later datagrams (the kernel
 //!   routes a connected match ahead of the wildcard), relaying whole datagrams to a box-side UDP
 //!   socket. Per-client workers are capped so a spoofed-source flood can't fork-bomb.
@@ -18,7 +18,7 @@
 use std::mem;
 use std::ptr;
 
-/// One published port mapping. Replaces a bare `(u32, u16, u16, bool)` — the two adjacent `u16`s
+/// One published port mapping. Replaces a bare `(u32, u16, u16, bool)` - the two adjacent `u16`s
 /// (host / box port) made the tuple swap-prone at every call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortMap {
@@ -58,11 +58,11 @@ impl PortForwarder {
 }
 
 /// Pre-flight: verify every `-p` host port can actually be bound (`AF_INET`, matching the mapping's
-/// TCP/UDP type) BEFORE the box is declared started. Uses `SO_REUSEADDR` only — NOT `SO_REUSEPORT` —
+/// TCP/UDP type) BEFORE the box is declared started. Uses `SO_REUSEADDR` only - NOT `SO_REUSEPORT` -
 /// on purpose: the UDP forwarder adds `SO_REUSEPORT` (for its per-client sockets), but a REUSEPORT
 /// probe here would bind happily ALONGSIDE another REUSEPORT holder and falsely pass the conflict
-/// check. Without this preflight a taken host port only fails inside the forked forwarder — whose
-/// stderr a detached box swallows — so the box prints "✔ started" while nothing listens. Returns the
+/// check. Without this preflight a taken host port only fails inside the forked forwarder - whose
+/// stderr a detached box swallows - so the box prints "✔ started" while nothing listens. Returns the
 /// first conflicting `(host_port, os-error)`. Best-effort: a socket-creation failure is skipped (the
 /// forwarder still reports its own bind error as the backstop).
 pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, String)> {
@@ -76,7 +76,7 @@ pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, String)> {
         if s < 0 {
             continue;
         }
-        set_sock_flag(s, libc::SO_REUSEADDR); // NOT REUSEPORT — see the doc: a REUSEPORT probe here
+        set_sock_flag(s, libc::SO_REUSEADDR); // NOT REUSEPORT - see the doc: a REUSEPORT probe here
                                               // would falsely pass alongside another REUSEPORT holder.
         let addr = addr_in(p.bind_ip, p.host);
         let r = unsafe { libc::bind(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) };
@@ -113,7 +113,7 @@ pub fn fork_forwarders(ports: &[PortMap]) -> Vec<PortForwarder> {
         if pid == 0 {
             // CHILD = forwarder (still in the host ns). Wait for PID 1, then forward forever.
             unsafe { libc::close(wr) };
-            // Shed inherited fds (keep our pipe `rd`) — drops the detached box's readiness pipe so
+            // Shed inherited fds (keep our pipe `rd`) - drops the detached box's readiness pipe so
             // it can't hang `kern box -d`, and the box's scratch/registry fds.
             crate::shed_inherited_fds(rd);
             let mut buf = [0u8; 4];
@@ -133,7 +133,7 @@ pub fn fork_forwarders(ports: &[PortMap]) -> Vec<PortForwarder> {
             if udp { "/udp" } else { "" }
         );
         if ip == 0 {
-            eprintln!("  warning: bound 0.0.0.0 — box port {bp} is reachable from the network");
+            eprintln!("  warning: bound 0.0.0.0 - box port {bp} is reachable from the network");
         }
         out.push(PortForwarder { pid, activate: wr });
     }
@@ -195,7 +195,7 @@ fn tcp_forwarder(box_pid1: i32, bind_ip: u32, host_port: u16, box_port: u16) -> 
 }
 
 /// Join the box's user+net namespaces (we start in the host ns, where we have the privilege to enter
-/// the box's child user ns — exactly as `kern exec` does). Single-threaded caller only (setns(USER)).
+/// the box's child user ns - exactly as `kern exec` does). Single-threaded caller only (setns(USER)).
 /// Returns `false` on any failure. After this, sockets created here live in the BOX's net ns.
 fn enter_box_ns(box_pid1: i32) -> bool {
     let open_ns = |kind: &str| -> i32 {
@@ -252,7 +252,7 @@ fn connect_box_loopback(box_port: u16, ty: libc::c_int) -> i32 {
     }
 }
 
-/// Enable one boolean `SOL_SOCKET` option on `s` (best-effort — a failure is ignored, matching the
+/// Enable one boolean `SOL_SOCKET` option on `s` (best-effort - a failure is ignored, matching the
 /// existing forwarder behaviour where these are hardening, not correctness).
 fn set_sock_flag(s: i32, opt: libc::c_int) {
     let one: libc::c_int = 1;
@@ -296,7 +296,7 @@ fn udp_forwarder(box_pid1: i32, bind_ip: u32, host_port: u16, box_port: u16) -> 
     }
     // Recently-forked clients (ip:port → when). Its ONLY job is to dedupe the ~ms race window between
     // us reading a client's first datagram and its child binding the connected socket that steals the
-    // client's later datagrams. It is TIME-BOUNDED (pruned to `DEDUP_TTL`), NOT a lifetime blacklist —
+    // client's later datagrams. It is TIME-BOUNDED (pruned to `DEDUP_TTL`), NOT a lifetime blacklist -
     // so a long-lived resolver never hits a cumulative ceiling, and a client whose relay died can
     // reconnect once its stale entry ages out. The size cap is a secondary flood guard on RECENT peers.
     const DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -410,7 +410,7 @@ fn pump_dgram(a: i32, b: i32) {
         ];
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, IDLE_MS) };
         if r == 0 {
-            return; // idle timeout — no traffic either way, tear the relay down
+            return; // idle timeout - no traffic either way, tear the relay down
         }
         if r < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -430,7 +430,7 @@ fn pump_dgram(a: i32, b: i32) {
                     }
                     return;
                 }
-                // n == 0 is a legitimate zero-length datagram — forward it too.
+                // n == 0 is a legitimate zero-length datagram - forward it too.
                 let _ = unsafe { libc::send(to, buf.as_ptr().cast(), n as usize, 0) };
             }
         }

@@ -17,6 +17,50 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.7], 2026-07-19
+
+Agent and fleet sprint: run LLM/agent-generated code and dense per-request workloads with a real
+egress boundary, a write-allowlist, warm-start snapshots, and honest fleet budgets.
+
+### Added
+- **`--egress-allow d1,d2,…` restricts a box's outbound traffic to a domain allowlist.** The box runs
+  in an isolated network namespace and reaches the internet only through a kern-run filtering proxy
+  that permits exactly the listed domains (ports 80/443). An agent can `pip install` from the index
+  you allow but cannot exfiltrate to an arbitrary host. SSRF-guarded: a domain that resolves to any
+  non-public address (loopback, RFC1918, link-local, CGNAT, reserved) is refused, and the request head
+  is checked for smuggling. One inherent gap stays documented, not hidden: a domain sharing a CDN IP +
+  SNI with an allowed one can be reached. Threat model and gaps in [docs/EGRESS.md](docs/EGRESS.md).
+- **`--landlock-rw <path>` confines a box's writes with the Landlock LSM.** The box root is read+exec
+  and writes are allowed only under the paths you name, a kernel-enforced second boundary the workload
+  can't lift, fail-safe on symlinks.
+- **`kern commit <box> <image>` snapshots a running box into a reusable image (warm start).** Bake an
+  expensive one-time setup (`apt`/`pip`, a warmed cache) once, then start from it in milliseconds. A
+  filesystem snapshot, not live memory: volumes and secrets are skipped, never baked in. It is
+  `docker commit`, daemonless.
+- **Fleet budgets.** `KERN_MAX_CONCURRENT` is a cooperative admission cap (best-effort, may overshoot
+  under a parallel burst); `KERN_FLEET_MEMORY_MAX` / `KERN_FLEET_PIDS_MAX` place a REAL summed cap on
+  `kern.slice` when boxes share it (root/direct-cap path), and warn + no-op on rootless per-box scopes
+  where a summed cap can't be enforced. Scope stated honestly in [docs/CONFIG.md](docs/CONFIG.md).
+- **`kern pod --uid-range`** maps a pod's members through a subuid range.
+- **Node / TypeScript `kern-sandbox` binding**, 1:1 with the Python one, for embedding a fresh isolated
+  box per call from JS/TS agents.
+
+### Changed
+- **A box now reads its own resource caps from inside.** Its cgroup namespace gets a read-only view of
+  its own cgroup, so a JVM, .NET or Node runtime sees its real `--memory` limit (`memory.max`) by
+  default instead of the host's, and **`/dev/shm` is a real tmpfs** so Postgres, Python `multiprocessing`
+  and Chromium run out of the box.
+
+### Security
+- Egress path hardened end to end: resolved-IP vetting (whole name refused if any record is non-public),
+  IPv4-mapped-IPv6 canonicalization, CGNAT / `240/4` / reserved ranges refused, bare-LF request-smuggling
+  rejection, userinfo stripped from the authority, and slowloris / idle-relay bounds on the proxy.
+- `kern commit` snapshots under an RAII cgroup freeze (TOCTOU-safe), with an async-signal-safe thaw so
+  an interrupted commit never leaves a box frozen.
+
+### Housekeeping
+- Prose and CLI output swept free of em-dashes for brand consistency; crate `description` fields tidied.
+
 ## [0.6.5], 2026-07-18
 
 ### Added
