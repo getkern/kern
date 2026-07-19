@@ -223,6 +223,15 @@ pub enum Command {
         sock: String,
         allow: String,
     },
+    /// Hidden: the re-exec'd egress box-netns pump (spawned by `--egress-allow`, not user-facing).
+    /// `read_fd` is an inherited pipe from box_run over which the box init pid arrives (the pump is
+    /// spawned in the HOST pid namespace, before box_run unshares CLONE_NEWPID, so it cannot be told the
+    /// pid at spawn time; delivering it over a pipe keeps the pump out of the box pidns).
+    EgressPump {
+        read_fd: i32,
+        box_port: u16,
+        sock: String,
+    },
     /// `kern search <query> [--json]`: search Docker Hub for images.
     Search {
         query: String,
@@ -417,6 +426,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("__egress-proxy") => Command::EgressProxy {
             sock: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
             allow: rest.get(2).map(|s| s.to_string()).unwrap_or_default(),
+        },
+        Some("__egress-pump") => Command::EgressPump {
+            read_fd: rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1),
+            box_port: rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
+            sock: rest.get(3).map(|s| s.to_string()).unwrap_or_default(),
         },
         // `build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image.
         Some("build") => parse_build(&rest)?,
@@ -1865,6 +1879,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodRemove { names } => crate::pod::remove(&names),
         Command::PodHolder => crate::pod::run_holder(),
         Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
+        Command::EgressPump {
+            read_fd,
+            box_port,
+            sock,
+        } => crate::egress::pump_reexec(read_fd, box_port, &sock),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
         Command::Rmi { images } => commands::image_rm(&images),
