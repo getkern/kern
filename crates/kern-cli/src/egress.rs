@@ -49,6 +49,27 @@ pub fn host_allowed(host: &str, allow: &[String]) -> bool {
     })
 }
 
+/// Is `entry` a syntactically valid allowlist domain? Strict LDH (letters/digits/hyphen, dot-separated
+/// labels), so a comma / space / control char (which would corrupt the CSV argv the proxy re-parses)
+/// is refused. Leading/trailing dots are tolerated (normalized away like `host_allowed` does); each label
+/// is 1..=63 chars and may not start or end with a hyphen; the whole name is <= 253 chars. An all-numeric
+/// entry (an IP-literal) passes syntactically but is harmless: `host_allowed` never matches a domain host
+/// against it and a CONNECT to an IP-literal is refused anyway.
+fn valid_allow_entry(entry: &str) -> bool {
+    let e = entry.trim().trim_matches('.');
+    if e.is_empty() || e.len() > 253 {
+        return false;
+    }
+    e.split('.').all(|label| {
+        let b = label.as_bytes();
+        !b.is_empty()
+            && b.len() <= 63
+            && b[0] != b'-'
+            && b[b.len() - 1] != b'-'
+            && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+    })
+}
+
 /// Parse the host of a `CONNECT host:port …` request line (the HTTPS proxy verb). Returns the bare host
 /// (no port). `None` if the line is not a well-formed CONNECT. IPv6 literals arrive bracketed
 /// (`[::1]:443`); the brackets are stripped so a bare `[::1]` never accidentally matches a domain entry.
@@ -273,6 +294,16 @@ fn helper_pre_exec() -> std::io::Result<()> {
 /// this (multi-threaded) process, so glibc's resolver starts fresh. Returns the proxy child and the
 /// UNIX socket path it binds. Pair with [`attach_pump`] once the box's init pid is known.
 pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::PathBuf), String> {
+    // Validate every allowlist entry BEFORE flattening to the CSV argv (`allow.join(",")`): a domain
+    // containing a comma / space / control char would otherwise split silently in the re-exec, producing
+    // phantom or truncated entries. Reject the whole invocation (fail-closed) rather than filter a
+    // malformed allowlist into a surprising one.
+    for d in allow {
+        let t = d.trim();
+        if !t.is_empty() && !valid_allow_entry(t) {
+            return Err(format!("egress: invalid domain in --egress-allow: {d:?}"));
+        }
+    }
     let uid = unsafe { libc::getuid() };
     let sock_path = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -458,6 +489,20 @@ fn handle_client(mut client: UnixStream, allow: &[String]) {
             Err(_) => return,
         }
     }
+    // Reject a BARE LF (a '\n' not preceded by '\r'). We terminate the head on strict CRLF, but `.lines()`
+    // below AND the upstream we forward the raw head to may treat a lone '\n' as a line end. That
+    // read-vs-parse-vs-upstream disagreement is HTTP request smuggling: a request whose FIRST line ends in
+    // a bare LF can carry a second `Host:` (or a second request) that we parse as one header block and vet
+    // as the allowed host, while the upstream splits on the LF and honours the smuggled `Host: evil.com`.
+    // Only strict CRLF framing is accepted; real clients (pip/curl/wget) always send it.
+    if head
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\n' && (i == 0 || head[i - 1] != b'\r'))
+    {
+        let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+        return;
+    }
     let text = String::from_utf8_lossy(&head);
     let mut lines = text.lines();
     let request_line = lines.next().unwrap_or("");
@@ -495,14 +540,19 @@ fn handle_client(mut client: UnixStream, allow: &[String]) {
             let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
             return;
         };
-        if !host_allowed(&host, allow) {
+        // Vet the port the SAME way as CONNECT (symmetry): parse it from the absolute-URI authority
+        // (default 80), enforce `port_allowed`, and dial exactly that. Previously the port was hardcoded
+        // to 80, so `http://allowed.com:22/` silently dialed 80; now the vetted port equals the dialed
+        // port and a non-80/443 target is refused, not silently redirected.
+        let port = http_target_port(request_line);
+        if !host_allowed(&host, allow) || !port_allowed(port) {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
-        let mut upstream = match connect_vetted(&host, 80) {
+        let mut upstream = match connect_vetted(&host, port) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("kern: egress proxy: HTTP upstream {host}:80 refused/failed: {e}");
+                eprintln!("kern: egress proxy: HTTP upstream {host}:{port} refused/failed: {e}");
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
                 return;
             }
@@ -523,6 +573,28 @@ fn connect_port(request_line: &str) -> Option<u16> {
         target.rsplit_once(':')?.1
     };
     after.trim().parse().ok()
+}
+
+/// The port a plain-HTTP proxied request targets: the `:port` of the absolute-URI authority
+/// (`GET http://host:port/…`), userinfo/IPv6 aware, defaulting to 80 (origin-form, or no explicit port).
+fn http_target_port(request_line: &str) -> u16 {
+    request_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|t| {
+            t.strip_prefix("http://")
+                .or_else(|| t.strip_prefix("https://"))
+        })
+        .map(|rest| rest.split('/').next().unwrap_or(rest))
+        .and_then(|authority| {
+            let a = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority); // strip userinfo
+            if let Some(rest) = a.strip_prefix('[') {
+                rest.rsplit_once("]:").and_then(|(_, p)| p.trim().parse().ok()) // [v6]:port
+            } else {
+                a.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok()) // host:port
+            }
+        })
+        .unwrap_or(80)
 }
 
 /// The box-netns pump: join the box's user+net ns, listen on `127.0.0.1:box_port` inside the box, and
@@ -821,6 +893,36 @@ mod tests {
             parse_http_host("GET http://allowed.com/ HTTP/1.1", "Host: evil.com\r\n"),
             Some("allowed.com".into())
         );
+    }
+
+    #[test]
+    fn valid_allow_entry_is_strict_ldh() {
+        for ok in ["pypi.org", "files.pythonhosted.org", "a-b.example.com", "EXAMPLE.com", "pypi.org."] {
+            assert!(valid_allow_entry(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "a.com,b.com",  // comma would corrupt the CSV argv
+            "a com",        // space
+            "a.com b.com",
+            "-lead.com",    // label starts with hyphen
+            "trail-.com",   // label ends with hyphen
+            "a..com",       // empty label
+            "",
+            "e\nvil.com",   // internal control char
+            "e\tvil.com",
+            "e vil.com",    // internal space
+        ] {
+            assert!(!valid_allow_entry(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn http_target_port_parses_authority_port() {
+        assert_eq!(http_target_port("GET http://pypi.org/ HTTP/1.1"), 80); // no port → 80
+        assert_eq!(http_target_port("GET http://pypi.org:443/x HTTP/1.1"), 443);
+        assert_eq!(http_target_port("GET http://pypi.org:8080/x HTTP/1.1"), 8080); // → port_allowed refuses
+        assert_eq!(http_target_port("GET http://user@pypi.org:80/x HTTP/1.1"), 80); // userinfo-aware
+        assert_eq!(http_target_port("GET /origin-form HTTP/1.1"), 80); // no absolute-URI → 80
     }
 
     #[test]
