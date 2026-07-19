@@ -3,10 +3,10 @@
 kern reads TOML from `~/.config/kern/kern.toml` and from compose files. Two kinds of definition live
 there, sharing **one schema philosophy** (every key mirrors a CLI flag):
 
-- **Resource profiles** — reusable `[[vcpu]]` / `[[vgpio]]` / `[[vdisk]]` tables, attached to any
+- **Resource profiles**: reusable `[[vcpu]]` / `[[vgpio]]` / `[[vdisk]]` tables, attached to any
   `kern box` or `kern run` by **prefix**: `kern run vcpu:heavy vgpio:sensors vdisk:data -- ./job`.
   Managed with `kern config`, and edited live (guided, validated) in `kern top`.
-- **Compose stacks** — `[box.NAME]` tables in a compose file, brought up by `kern compose` in
+- **Compose stacks**: `[box.NAME]` tables in a compose file, brought up by `kern compose` in
   `depends_on` order.
 
 The parser is hand-rolled (no `serde`/`toml`) and **tolerant**: an unrecognized section or key, or a
@@ -19,10 +19,10 @@ edition still loads. A *malformed value* of a key it DOES implement is always an
 
 Profiles are **resource-centric**: you declare a named slice once, then attach it to as many boxes as
 you like by its prefix. This mirrors the private runtime's model (declare-then-carve, attach-by-prefix);
-the CPU field names are spelled to match the CLI flags here — see the divergence note at the end. The
-GPU family stays private — see [Roadmap](../README.md#roadmap).
+the CPU field names are spelled to match the CLI flags here, see the divergence note at the end. The
+GPU family stays private, see [Roadmap](../README.md#roadmap).
 
-### `[[vcpu]]` — a CPU + memory slice · attach with `vcpu:<name>`
+### `[[vcpu]]`, a CPU + memory slice · attach with `vcpu:<name>`
 
 ```toml
 [[vcpu]]
@@ -36,10 +36,10 @@ backend  = "cpu:0"     # optional: reference a [[cpu]] declaration to carve from
 extends  = "base"      # optional: inherit another [[vcpu]] by name
 ```
 
-> Profile fields match the CLI flags **1:1** — `cpus` = `--cpus` (quota), `cpuset` = `--cpuset-cpus`
+> Profile fields match the CLI flags **1:1**: `cpus` = `--cpus` (quota), `cpuset` = `--cpuset-cpus`
 > (pinning), `memory` = `--memory`, `nice` = `--nice`. Know the flag, know the field.
 
-### `[[vgpio]]` — device passthrough · attach with `vgpio:<name>`
+### `[[vgpio]]`, device passthrough · attach with `vgpio:<name>`
 
 Deny-by-default: **only** the peripherals you list cross into the box; every other `/dev` node is
 refused. Each device is fd-pinned at bind time to close a check→mount race.
@@ -59,7 +59,7 @@ onewire = [4]
 # deny-list (raw memory, disks, VFIO/DMA, kvm, HID injection, the console, …) rejects it first.
 ```
 
-### `[[vdisk]]` — a size-capped disk · attach with `vdisk:<name>`
+### `[[vdisk]]`, a size-capped disk · attach with `vdisk:<name>`
 
 ```toml
 [[vdisk]]
@@ -74,7 +74,7 @@ persistent = true          # survive box removal (default: false → scratch, di
 A `vdisk:` appears in the box at `/vdisk/<name>`: a RAM tmpfs when rootless, or an ext4-on-loop image
 with a real quota when privileged.
 
-### Physical declarations — what a profile's `backend` points at
+### Physical declarations, what a profile's `backend` points at
 
 Optional. Declare the host resources your profiles carve from; a profile with no `backend` is
 standalone. Field shapes:
@@ -95,10 +95,10 @@ name = "pool"; path = "/var/lib/kern/disks"; default = true; size = "100g"; iops
 
 ---
 
-## Compose — `[box.NAME]` tables
+## Compose, `[box.NAME]` tables
 
 `kern compose <file>` brings up a stack of `[box.NAME]` tables in `depends_on` order (it also reads a
-`docker-compose.yml`). Every key maps to a `kern box` flag one-to-one — `compose` shells out to
+`docker-compose.yml`). Every key maps to a `kern box` flag one-to-one, `compose` shells out to
 `kern box`, so a value can never mean something different from its flag.
 
 ```toml
@@ -110,7 +110,7 @@ rootfs     = "/var/lib/rootfs"    # --rootfs   (mutually: image OR rootfs)
 # command & ordering
 command    = ["/bin/sh", "-c", "exec app"]   # -- <command...>
 depends_on = ["db"]               # start after these boxes
-# conditional dependencies — `up` WAITS for the condition before starting this box:
+# conditional dependencies, `up` WAITS for the condition before starting this box:
 depends_healthy   = ["db"]        # wait until each named box's health_cmd reports healthy
 depends_completed = ["migrate"]   # wait until each named box exits 0 (init-container / migration job)
 # Docker long-syntax is accepted verbatim too, so a docker-compose.yml block pastes in as-is:
@@ -131,12 +131,12 @@ tmpfs      = ["/tmp:64m"]         # --tmpfs  (repeatable; PATH[:size])
 # resources
 memory     = "512m"               # --memory / -m
 cpus       = "1.5"                # --cpus                (quota)
-cpuset     = "0-3"                # --cpuset-cpus         (pinning, via sched_setaffinity — rootless)
+cpuset     = "0-3"                # --cpuset-cpus         (pinning, via sched_setaffinity, rootless)
 swap_max   = "1g"                 # --memory-swap-max
 pids_limit = "512"                # --pids-limit
 io_weight  = "200"                # --io-weight (cgroup v2 io.weight, 1–10000)
 nice       = "5"                  # --nice (-20..19)
-# (Resource profiles attach on the CLI — `kern run vcpu:heavy vgpio:sensors -- cmd` — not via a box
+# (Resource profiles attach on the CLI, `kern run vcpu:heavy vgpio:sensors -- cmd`, not via a box
 #  key yet. Docker's `profiles: [...]` service-gating key IS honored: a service with a non-empty
 #  profile list stays inactive unless enabled via COMPOSE_PROFILES, exactly like Docker.)
 
@@ -194,7 +194,7 @@ family).
 
 ## The one rule: TOML mirrors the CLI
 
-Every key maps to a flag one-to-one — nothing to learn twice. If you know the flag, you know the key.
+Every key maps to a flag one-to-one, nothing to learn twice. If you know the flag, you know the key.
 
 - **Scalar** → a **quoted string** carrying the exact CLI argument: `memory = "512m"`, `cpus = "1.5"`,
   `cpuset = "0-3"`. (Numeric profile fields like `cpus = 4.0` / `iops = 1000` / `nice = -5` are
@@ -205,23 +205,23 @@ Every key maps to a flag one-to-one — nothing to learn twice. If you know the 
 ## Types & tolerance
 
 - Strings are double-quoted. An unquoted scalar (`memory = 512m`) for a key kern **implements** is a
-  parse error — quote it. A *malformed value* of a recognized key is always caught, with its line.
+  parse error, quote it. A *malformed value* of a recognized key is always caught, with its line.
 - Bools are bare `true` / `false`. Integers/floats are bare (`health_interval = 30`, `cpus = 4.0`).
 - Arrays are `["a", "b"]` / `[17, 27]`; a comma inside a quoted element does not split it.
 - `#` starts a comment outside a string.
-- **Unknown keys and sections are ignored, not rejected** — a `kern.toml` written for another kern
+- **Unknown keys and sections are ignored, not rejected**: a `kern.toml` written for another kern
   edition still loads, so config is portable across editions. The trade-off is deliberate: a typo in a
   key name is silently skipped, so lean on `kern config` / `kern top` (which validate live) when authoring.
 
 ## Deliberate divergences from the private runtime
 
 - **Profiles are resource-centric and identical in shape** to the private (`[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]`
-  attached by prefix) — a profile file is portable between the two. Compose is the box-centric surface
+  attached by prefix), a profile file is portable between the two. Compose is the box-centric surface
   (`[box.NAME]`), a public addition.
-- **CPU field names match the CLI everywhere** — `cpus` = quota, `cpuset` = pinning in both the flat
+- **CPU field names match the CLI everywhere**: `cpus` = quota, `cpuset` = pinning in both the flat
   compose keys AND the `[[vcpu]]` profile. This aligns the public schema with the flags 1:1, diverging
   from the private runtime's older `vcpus` = quota / `cpus` = pinning spelling. Chosen on purpose.
-- **No `seccomp = "off"` / `no_seccomp` / `no_cgroup` key** — the seccomp filter and the cgroup caps
+- **No `seccomp = "off"` / `no_seccomp` / `no_cgroup` key**: the seccomp filter and the cgroup caps
   are always on and cannot be disabled from config (hardening over blind parity, by design).
 - **Not public:** the `[[vgpu]]` / `[[gpu]]` family (VRAM/compute/GPU slices), and the `intelligence`
   / `pool` sections, are on the [roadmap](../README.md#roadmap), not in the schema yet. A config that

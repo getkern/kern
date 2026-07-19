@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: A reproducible problem (NOT a security vulnerability — see SECURITY.md)
+about: A reproducible problem (NOT a security vulnerability, see SECURITY.md)
 labels: bug
 ---
 
@@ -10,4 +10,4 @@ labels: bug
 
 **Environment**: kern version (`kern --version`), arch (x86_64 / aarch64), kernel, distro.
 
-> Security vulnerability? Do NOT file here — see SECURITY.md for private disclosure.
+> Security vulnerability? Do NOT file here, see SECURITY.md for private disclosure.
