@@ -32,6 +32,9 @@ loopback-only netns). `--egress-allow` is strictly *more* open than the default,
    - a **filtering proxy** in the host network namespace, listening on that UNIX socket, that parses each
      request and dials out **only** to an allowlisted host.
    `HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` / `https_proxy` are set in the box to point at the pump.
+   This is **fail-closed**: if either helper fails to start (or dies), the box's isolated netns still has
+   no route, so the box gets *no* outbound rather than an unfiltered one. A helper failure can only make
+   egress more restrictive, never open it.
 3. **The proxy allowlists by the host the client names**: the `CONNECT host:port` target for HTTPS, or
    the request's `Host` / absolute-URI for plain HTTP. A host that is not the allowlist (or a subdomain of
    an entry) is refused with `403`, and no connection is dialed. An **IP-literal** target (`CONNECT
@@ -72,7 +75,7 @@ The proxy is not a suggestion; it is the only door.
 | Box has no egress except the proxy | **Hard** (isolated netns; kernel-enforced) |
 | Non-allowlisted domain refused | **Hard** for a normal client (proxy refuses `CONNECT`, no dial) |
 | IP-literal target refused | **Hard** (never matches a domain entry) |
-| Connecting an allowlisted NAME that resolves to a private/loopback/metadata IP | **Hard** (resolved-IP guard: the proxy connects only to a public unicast address, refusing loopback/link-local/`169.254.169.254`/RFC-1918/ULA/multicast) |
+| Connecting an allowlisted NAME that resolves to a private/loopback/metadata IP | **Hard** (resolved-IP guard: the proxy refuses the WHOLE name if ANY resolved record is non-public: loopback / link-local / `169.254.169.254` / RFC-1918 / ULA / multicast, incl. IPv4-mapped IPv6 like `::ffff:127.0.0.1`. It does not "pick the public one" from a mixed record set, so a clever-DNS operator can't order/flip records to reach a host-local service.) |
 | Restricting the PORT on an allowlisted host | **Hard** (only 80 and 443 are tunnelled; `:22`, `:6379`, … are refused) |
 | SNI ≠ CONNECT host on a shared CDN (domain fronting) | **Not addressed** (no ClientHello parsing today) |
 | Covert channel inside an allowed session | **Not addressed** (this is an allowlist, not DLP) |

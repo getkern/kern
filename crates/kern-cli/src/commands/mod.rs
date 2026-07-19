@@ -5036,20 +5036,54 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The write-end fd of the freeze file, published for the signal handler while a commit holds a box
+/// frozen. `-1` when no commit is freezing. A signal that would kill the commit process (and so skip the
+/// `FreezeGuard::drop` thaw) is caught, the box is thawed via this fd with an async-signal-safe raw
+/// `write`, and the signal is re-raised with its default disposition.
+static FREEZE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Async-signal-safe: thaw the frozen box (raw `write` of "0") then re-raise `sig` with SIG_DFL so the
+/// process still dies as the signal intends. Only `write`/`signal`/`raise` are used, all async-signal-safe.
+extern "C" fn thaw_on_fatal_signal(sig: i32) {
+    let fd = FREEZE_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe { libc::write(fd, b"0".as_ptr() as *const libc::c_void, 1) };
+    }
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
 /// RAII cgroup-freezer guard: freezes a box's cgroup on construction and thaws it on drop. Used by
 /// `commit` to stop the workload for the duration of the rootfs snapshot (a frozen cgroup runs no task,
 /// so no file can be swapped mid-copy). `thaw_path` is `Some` ONLY when this guard is the one that
 /// transitioned the cgroup 0 -> 1; if the box has no dedicated cgroup, the write fails, or the box was
 /// ALREADY frozen (the user ran `kern pause`), it is `None` and drop leaves the freeze state untouched,
 /// so committing a paused box never silently un-pauses it.
+///
+/// Drop alone is NOT a sufficient safety net: SIGINT (Ctrl-C), SIGTERM, `process::exit`, and
+/// `panic = "abort"` all skip destructors, which would leave the box frozen forever. So while WE hold the
+/// freeze, SIGINT/SIGTERM/SIGHUP are trapped by [`thaw_on_fatal_signal`] (which thaws and re-raises), and
+/// `kern stop`/`kern unpause` thaw a box they find frozen, giving a recovery path even for SIGKILL/OOM
+/// that no handler can catch. The freeze is never a state you can only leave if a destructor ran.
 struct FreezeGuard {
     thaw_path: Option<std::path::PathBuf>,
+    freeze_fd: i32,
+    old_handlers: Vec<(i32, libc::sigaction)>,
 }
 
 impl FreezeGuard {
+    const TRAP: [i32; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
     fn freeze(box_pid: i32) -> FreezeGuard {
+        let none = || FreezeGuard {
+            thaw_path: None,
+            freeze_fd: -1,
+            old_handlers: Vec::new(),
+        };
         let Some(cg) = registry::box_cgroup(box_pid) else {
-            return FreezeGuard { thaw_path: None };
+            return none();
         };
         let freeze = cg.join("cgroup.freeze");
         // Preserve a pre-existing freeze: if the box is already paused, snapshot under it and do NOT thaw
@@ -5058,10 +5092,10 @@ impl FreezeGuard {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         if already_frozen {
-            return FreezeGuard { thaw_path: None };
+            return none();
         }
         if std::fs::write(&freeze, "1").is_err() {
-            return FreezeGuard { thaw_path: None };
+            return none();
         }
         // The freeze is asynchronous; wait (bounded) until the cgroup reports `frozen 1` so the snapshot
         // starts only once every task is actually stopped. If it never settles, proceed anyway rather
@@ -5073,16 +5107,51 @@ impl FreezeGuard {
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
+        // Arm the signal-safe thaw: publish an fd to the freeze file and trap the interactive/kill signals
+        // that would otherwise skip Drop and strand the box frozen.
+        let mut freeze_fd = -1;
+        let mut old_handlers = Vec::new();
+        let cpath = std::ffi::CString::new(freeze.as_os_str().as_encoded_bytes()).ok();
+        if let Some(cp) = cpath {
+            freeze_fd = unsafe { libc::open(cp.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+            if freeze_fd >= 0 {
+                FREEZE_FD.store(freeze_fd, std::sync::atomic::Ordering::SeqCst);
+                for &sig in &Self::TRAP {
+                    unsafe {
+                        let mut new: libc::sigaction = std::mem::zeroed();
+                        new.sa_sigaction =
+                            thaw_on_fatal_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                        libc::sigemptyset(&mut new.sa_mask);
+                        let mut old: libc::sigaction = std::mem::zeroed();
+                        if libc::sigaction(sig, &new, &mut old) == 0 {
+                            old_handlers.push((sig, old));
+                        }
+                    }
+                }
+            }
+        }
         FreezeGuard {
             thaw_path: Some(freeze),
+            freeze_fd,
+            old_handlers,
         }
     }
 }
 
 impl Drop for FreezeGuard {
     fn drop(&mut self) {
+        // Restore the original signal handlers and stop publishing the fd BEFORE the normal thaw.
+        for (sig, old) in &self.old_handlers {
+            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+        }
+        if self.freeze_fd >= 0 {
+            FREEZE_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+        }
         if let Some(p) = &self.thaw_path {
             let _ = std::fs::write(p, "0");
+        }
+        if self.freeze_fd >= 0 {
+            unsafe { libc::close(self.freeze_fd) };
         }
     }
 }
@@ -8542,6 +8611,13 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         let box_cgroup = (b.pid1 > 0)
             .then(|| kern_isolation::box_cgroup_dir(b.pid1))
             .flatten();
+        // Recovery path for a box left FROZEN by a `commit` that died past its signal trap (SIGKILL / OOM
+        // / panic=abort): thaw it before killing. SIGKILL is honoured on a frozen cgroup-v2 task anyway,
+        // but thawing first guarantees prompt delivery and means a stuck-frozen box is never unrecoverable
+        // without the user knowing about `cgroup.freeze`. Best-effort; a non-frozen box is unaffected.
+        if let Some(cg) = &box_cgroup {
+            let _ = std::fs::write(cg.join("cgroup.freeze"), "0");
+        }
         let killed = if stop_managed_unit(&b.name) {
             true // systemd owns the lifecycle and has torn the unit down
         } else {
