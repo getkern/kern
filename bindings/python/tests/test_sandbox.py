@@ -295,3 +295,32 @@ def test_workspace_is_deleted_on_exit_when_owned():
         s.write_file("a.txt", "x")
         assert os.path.exists(os.path.join(s._ws, "a.txt"))
     assert not os.path.exists(holder["ws"])  # temp workspace cleaned up
+
+
+@integration
+def test_planted_env_symlink_cannot_clobber_host_file(tmp_path):
+    # A box has rw access to the workspace and could replace our private `.kern-env` with a symlink to
+    # a host file; without O_NOFOLLOW the next call would follow it and O_TRUNC-clobber that file.
+    victim = tmp_path / "precious.txt"
+    victim.write_text("PRECIOUS")
+    with Sandbox(timeout_s=20, env={"X": "1"}) as s:
+        s.run_code(
+            "import os\n"
+            "p = '/workspace/.kern-env'\n"
+            "os.path.lexists(p) and os.remove(p)\n"
+            f"os.symlink({str(victim)!r}, p)"
+        )
+        s.run_code("print('ok')")  # writes .kern-env again; must not follow the symlink
+    assert victim.read_text() == "PRECIOUS"  # untouched
+
+
+@integration
+def test_write_file_refuses_intermediate_symlink(tmp_path):
+    # A box plants an intermediate directory symlink; write_file must not traverse it (mkdir -p would).
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with Sandbox(timeout_s=20) as s:
+        s.run_code(f"import os; os.symlink({str(outside)!r}, '/workspace/evil')")
+        with pytest.raises(SandboxError):
+            s.write_file("evil/pwned.txt", "x")
+    assert not (outside / "pwned.txt").exists()

@@ -11,7 +11,7 @@ or agent-generated code in a real, kernel-enforced box that starts in **~1.9 ms*
 caps a bare process's CPU (`vcpu:`), memory or disk (`vdisk:`), or grants it exactly one device
 (`vgpio:`), with or without a full box. **Runs everywhere Linux does: bare Linux, Windows (via
 WSL2), and ARM boards** (Raspberry Pi, NVIDIA Jetson, Arduino UNO Q), where a 186 MB Docker daemon
-is a poor fit (on the Pi 5 tested here, no engine was installed at all). Embed it from Python or
+is a poor fit (on the Pi 5 tested here, no engine was installed at all). Embed it from Python, Node or
 Rust, or drive it from the CLI.
 
 **~1.9 ms** cold start (vs **~308 ms** `docker run`) · **~1.6 MB** static binary · **0 RAM at rest** · **rootless**
@@ -25,7 +25,7 @@ Rust, or drive it from the CLI.
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.6 MB static binary, no daemon.">
 </p>
 
-[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
+[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -399,10 +399,27 @@ with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
     print(out.stdout)          # network-off, capped, isolated; a fault is a typed SandboxFault
 ```
 
-Safe by default: every relaxing argument (`network=True`, extra `mounts`) says so, and the binding owns
-the timeout, so a `timeout` fault is a fact, not a guess. Both use the installed `kern` (`PATH` or
-`KERN_BIN`); see [bindings/python](bindings/python) and the `kern-isolation` crate (git/path, not yet
-crates.io).
+**Node / TypeScript**, the `kern-sandbox` package (`npm install kern-sandbox`), the same model for
+the other half of the agent ecosystem (LangChain JS, the Vercel AI SDK), with types in the box:
+
+```js
+import { runCode, withSandbox } from "kern-sandbox";
+
+// one-shot: throwaway box, network OFF, hard caps, a timeout the binding enforces
+const r = await runCode("print(sum(range(100)))");
+console.log(r.stdout, r.success);
+
+// a session: files persist across calls; run agent-generated JS or Python
+await withSandbox({ memoryMb: 512, timeoutS: 30 }, async (s) => {
+  await s.writeFile("data.csv", csvBytes);
+  const out = await s.runCode("import pandas as pd; print(pd.read_csv('data.csv').shape)");
+});
+```
+
+Safe by default: every relaxing argument (`network`, extra `mounts`) says so, and the binding owns
+the timeout, so a `timeout` fault is a fact, not a guess. All three use the installed `kern` (`PATH` or
+`KERN_BIN`); see [bindings/python](bindings/python), [bindings/node](bindings/node), and the
+`kern-isolation` crate (git/path, not yet crates.io).
 
 ## Platforms
 

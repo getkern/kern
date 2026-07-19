@@ -343,7 +343,19 @@ class Sandbox:
         # not readable by other users; kern reads it before the box's env is set up. (Hacker-mode audit.)
         if merged_env:
             env_path = os.path.join(self._ws, _ENV_FILE)
-            fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # SECURITY: the box has rw access to the workspace and could plant `.kern-env` as a symlink
+            # to a host file (e.g. ~/.ssh/authorized_keys); a follow-through open would O_TRUNC-clobber
+            # it. Unlink any existing entry (removing a planted symlink), then create fresh with
+            # O_EXCL|O_NOFOLLOW so we never write through a symlink. Fails closed on a concurrent re-plant.
+            try:
+                os.unlink(env_path)
+            except FileNotFoundError:
+                pass
+            fd = os.open(
+                env_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
             try:
                 # K=V lines; values are single-line by construction (a NUL is rejected in _spawn, and a
                 # newline in a value would split the record — reject it here so it can't smuggle a var).
@@ -496,13 +508,40 @@ class Sandbox:
             raise SandboxError(f"path escapes the workspace: {rel!r}")
         return full
 
+    def _ensure_parent_dirs(self, full: str) -> None:
+        """Create the parent dirs of ``full`` under the workspace WITHOUT following a symlink in any
+        intermediate component. ``mkdir(parents=True)`` follows symlinks, so a box that plants
+        ``a -> /etc`` could steer a ``write_file("a/b.txt")`` outside the workspace even though the final
+        component is opened ``O_NOFOLLOW``. Descend one level at a time from the (canonical) workspace
+        base: reject a symlink component, create a missing dir non-recursively."""
+        base = self._ws
+        rel_dir = os.path.relpath(os.path.dirname(full), base)
+        if rel_dir in ("", "."):
+            return  # parent is the workspace root itself
+        cur = base
+        for part in rel_dir.split(os.sep):
+            if not part or part == ".":
+                continue
+            nxt = os.path.join(cur, part)
+            try:
+                st = os.lstat(nxt)
+            except FileNotFoundError:
+                os.mkdir(nxt)  # non-recursive: each level is a fresh real dir we just created
+                cur = nxt
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                raise SandboxError(f"path escapes the workspace via a symlinked directory: {part!r}")
+            if not stat.S_ISDIR(st.st_mode):
+                raise SandboxError(f"workspace path component is not a directory: {part!r}")
+            cur = nxt
+
     def write_file(self, path: str, data: bytes | str) -> None:
         """Write ``data`` to ``path`` (workspace-relative) — host-direct, so the box sees it next run.
         The final component is opened O_NOFOLLOW: a symlink the box planted there can't redirect the
         write outside the workspace (it fails instead)."""
         self._require_entered()
         full = self._ws_path(path)
-        Path(full).parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_parent_dirs(full)  # symlink-safe descent, NOT mkdir(parents) which follows symlinks
         payload = data.encode() if isinstance(data, str) else data
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         try:
