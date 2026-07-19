@@ -37,6 +37,8 @@ pub enum Command {
         volumes: Vec<String>,
         /// `--env K=V` / `-e K=V` (repeatable): extra environment for the workload.
         env: Vec<String>,
+        /// `--egress-allow d1,d2` (repeatable / comma-separated): outbound restricted to these domains.
+        egress_allow: Vec<String>,
         /// `--workdir <dir>` / `-w <dir>`: working directory inside the box.
         workdir: Option<String>,
         /// `--net`: share the host network namespace (outbound networking; no net isolation).
@@ -214,6 +216,11 @@ pub enum Command {
     },
     /// Hidden: the pod namespace holder process (spawned by `pod create`, not user-facing).
     PodHolder,
+    /// Hidden: the re-exec'd egress filtering proxy (spawned by `--egress-allow`, not user-facing).
+    EgressProxy {
+        sock: String,
+        allow: String,
+    },
     /// `kern search <query> [--json]`: search Docker Hub for images.
     Search {
         query: String,
@@ -405,6 +412,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("pod") => parse_pod(&rest)?,
         // Hidden: the pod namespace holder (spawned by `pod create`).
         Some("__pod-holder") => Command::PodHolder,
+        Some("__egress-proxy") => Command::EgressProxy {
+            sock: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
+            allow: rest.get(2).map(|s| s.to_string()).unwrap_or_default(),
+        },
         // `build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image.
         Some("build") => parse_build(&rest)?,
         // `pull <image> [--dest <dir>]`: download an OCI image.
@@ -813,6 +824,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut cpuset: Option<String> = None;
     let mut volumes: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
+    let mut egress_allow: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
     let mut profiles: Vec<String> = Vec::new();
@@ -1101,6 +1113,18 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         env.push((*v).to_string());
                     }
                 }
+                "--egress-allow" => {
+                    i += 1;
+                    if let Some(v) = rest.get(i) {
+                        // comma-separated and repeatable; empties filtered.
+                        egress_allow.extend(
+                            v.split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from),
+                        );
+                    }
+                }
                 "-w" | "--workdir" => {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
@@ -1247,6 +1271,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             read_only,
             volumes,
             env,
+            egress_allow,
             workdir,
             share_net,
             pod,
@@ -1684,6 +1709,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             read_only,
             volumes,
             env,
+            egress_allow,
             workdir,
             share_net,
             pod,
@@ -1735,6 +1761,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             read_only,
             volumes: &volumes,
             env: &env,
+            egress_allow: &egress_allow,
             workdir: workdir.as_deref(),
             share_net,
             pod: pod.as_deref(),
@@ -1821,6 +1848,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodList => crate::pod::list(),
         Command::PodRemove { names } => crate::pod::remove(&names),
         Command::PodHolder => crate::pod::run_holder(),
+        Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
         Command::Rmi { images } => commands::image_rm(&images),

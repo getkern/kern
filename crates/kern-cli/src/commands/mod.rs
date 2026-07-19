@@ -246,6 +246,9 @@ pub struct BoxRunArgs<'a> {
     pub read_only: bool,
     pub volumes: &'a [String],
     pub env: &'a [String],
+    /// `--egress-allow d1,d2`: outbound network restricted to these domains (+ subdomains) via a
+    /// kern-run filtering proxy; empty = the default (no outbound unless `--net`/`--pod`).
+    pub egress_allow: &'a [String],
     pub workdir: Option<&'a str>,
     pub share_net: bool,
     /// `--pod <name>`: join this pod's shared network (created by `kern pod create`).
@@ -592,6 +595,31 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--env-file` first (K=V lines from a file), then `--env` on top (explicit wins).
     let mut env = parse_env_files(args.env_file)?;
     env.extend(parse_envs(args.env)?);
+    // `--egress-allow <domains>`: an outbound domain allowlist. The box keeps its default ISOLATED netns
+    // (no route out, a real kernel boundary), and its ONLY egress is a kern-run filtering proxy started
+    // once the box's netns exists (in the `on_started` callback below). Point the box's proxy env at it.
+    // See egress.rs and docs/EGRESS.md for the enforcement model and its honest limits.
+    const EGRESS_PROXY_PORT: u16 = 3128;
+    if !args.egress_allow.is_empty() {
+        if args.detached {
+            return Err(Error::Sandbox(
+                "--egress-allow is foreground-only for now (the filter's lifetime is tied to the box); \
+                 drop -d"
+                    .to_string(),
+            ));
+        }
+        if args.share_net || args.pod.is_some() {
+            return Err(Error::Sandbox(
+                "--egress-allow filters the box's OWN isolated network, so it can't combine with --net \
+                 (host network) or --pod (shared pod network)"
+                    .to_string(),
+            ));
+        }
+        let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
+        for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            env.push((k.to_string(), proxy.clone()));
+        }
+    }
     // Fold resource profiles (`vcpu:name` …) into the caps — explicit flags win — before capping.
     let mut ap = AppliedProfiles {
         memory: args.memory,
@@ -1066,6 +1094,21 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let timeout_wd = (args.timeout > 0 && !managed)
         .then(|| spawn_foreground_timeout(args.timeout))
         .flatten();
+    // Egress filter: spawn the filtering proxy NOW, while we're still in the HOST net namespace (it needs
+    // a route to a DNS server; the box's own netns is isolated). The box-netns pump is attached in the
+    // `on_started` callback once the box's init pid exists. The completed guard is held for the box's
+    // lifetime; dropping it (after the box exits) SIGKILLs both helpers. Fail-CLOSED: on any failure the
+    // box simply has no outbound.
+    let mut egress_pending: Option<(std::process::Child, std::path::PathBuf)> = None;
+    if !args.egress_allow.is_empty() {
+        match crate::egress::spawn_proxy(args.egress_allow) {
+            Ok(p) => egress_pending = Some(p),
+            Err(e) => eprintln!(
+                "kern: warning: egress proxy failed to start ({e}); the box will have NO outbound"
+            ),
+        }
+    }
+    let mut egress_guard: Option<crate::egress::EgressFilter> = None;
     let result = run_in_sandbox_with(
         &spec,
         None,
@@ -1077,6 +1120,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     let _ = registry::register(inst);
                 }
             }
+            if let Some((proxy, sock)) = egress_pending.take() {
+                match crate::egress::attach_pump(proxy, sock, pid1, EGRESS_PROXY_PORT) {
+                    Ok(g) => egress_guard = Some(g),
+                    Err(e) => eprintln!(
+                        "kern: warning: egress pump failed to start ({e}); the box has NO outbound"
+                    ),
+                }
+            }
         },
         None,
         ports,
@@ -1086,6 +1137,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         !managed,
     );
     cancel_foreground_timeout(timeout_wd);
+    // The box has exited: SIGKILL the egress helpers NOW (this foreground path leaves via
+    // `process::exit`, which skips Drop, so an implicit drop would leak the proxy + pump).
+    drop(egress_guard);
     // Tear down any ext4-loop vdisks (unmount + detach loop + remove ephemeral image) and network
     // volumes (fusermount/gio -u) now the box is gone; then the scratch (which holds the images) is
     // removed.
