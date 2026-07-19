@@ -1738,7 +1738,16 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         // the fix for the "official images don't start" gap. It's safe: the HOST scratch dir is still
         // 0700 (no other host user can enter), and root=0755 is the norm for every real filesystem —
         // it's the in-box view only, and the box's isolation is the namespace, not the root's mode.
-        let root_traversable = matches!(b.run_as, Some((u, _)) if u != 0) || b.uid_range;
+        //
+        // A POD MEMBER (`pod_holder` set) gets the same treatment: it joins a shared user namespace that
+        // may map a subordinate uid range (`pod create --uid-range`), and its image may drop privilege to
+        // a service uid — but the box's own `uid_range` flag is false there (the range lives on the pod
+        // holder, not this box), so it must be included explicitly or postgres/redis/… in a pod hit the
+        // exact EACCES-on-`/` gap this whole block fixes. Harmless for a single-uid pod (no other uid to
+        // traverse). Found via a live python+postgres pod stack: the entrypoint's `gosu postgres` drop
+        // could not traverse the 0700 `/`, so every PATH lookup failed "not found".
+        let root_traversable =
+            matches!(b.run_as, Some((u, _)) if u != 0) || b.uid_range || b.pod_holder.is_some();
         if root_traversable {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o755))
