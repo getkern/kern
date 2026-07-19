@@ -1,7 +1,7 @@
 //! Shared types and utilities for kern.
 //!
 //! Newtypes live here so units (bytes vs MiB, names vs paths) can't be mixed up by accident.
-//! This is a 0.1 scaffold — see the roadmap in README.md / ARCHITECTURE.md.
+//! This is a 0.1 scaffold - see the roadmap in README.md / ARCHITECTURE.md.
 
 /// The kern version, sourced from the workspace `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -24,7 +24,7 @@ pub mod toml_lite;
 pub struct BoxName(String);
 
 impl BoxName {
-    /// Maximum length, in bytes. Conservative — box names are short identifiers.
+    /// Maximum length, in bytes. Conservative - box names are short identifiers.
     pub const MAX_LEN: usize = 64;
 
     /// Parse a box name under the conservative rules above.
@@ -57,7 +57,7 @@ impl BoxName {
 
 /// Parse a binary size like `512m`, `1g`, `512mb`, `2t`, or a bare byte count (`268435456`) into
 /// bytes. Units are binary (`k`=1024). An optional trailing `b` is accepted (`mb`==`m`), as is
-/// surrounding whitespace. Returns `None` on a malformed, zero, or overflowing value — callers layer
+/// surrounding whitespace. Returns `None` on a malformed, zero, or overflowing value - callers layer
 /// their own upper cap / `Result` / error message. One source of truth for `--memory`, `--size`,
 /// vdisk sizes and profile size fields, so they can never disagree on what `512m` means.
 pub fn parse_binary_size(s: &str) -> Option<u64> {
@@ -79,7 +79,7 @@ pub fn parse_binary_size(s: &str) -> Option<u64> {
         .filter(|b| *b > 0)
 }
 
-/// The shared rule for a kern resource name — volume, secret, pod, profile/vdisk. Each becomes a
+/// The shared rule for a kern resource name - volume, secret, pod, profile/vdisk. Each becomes a
 /// filesystem path component and/or a `kind:name` attach token, so: non-empty, ≤64 bytes, charset
 /// `[A-Za-z0-9_.-]`, no `..` substring (path escape), no leading `-` (argument injection) or `.`
 /// (dotfiles / `.`/`..`). One definition so the four callers can't drift into subtly different rules

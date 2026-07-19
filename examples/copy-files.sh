@@ -1,5 +1,5 @@
 #!/bin/sh
-# Move single files across the sandbox boundary with `kern cp` — the `docker cp` analogue.
+# Move single files across the sandbox boundary with `kern cp` - the `docker cp` analogue.
 #
 #   kern cp <hostsrc> <box>:<dst>    copy a host file INTO a running box
 #   kern cp <box>:<src> <hostdst>    copy a file OUT of a running box
@@ -35,7 +35,7 @@ cat "$work/result.txt"
 
 echo
 echo "==> the copy stays confined. Plant a symlink in the box aimed at an absolute path,"
-echo "    then copy it out — it resolves inside the BOX root, so we get the box's own file,"
+echo "    then copy it out - it resolves inside the BOX root, so we get the box's own file,"
 echo "    never the host's /etc/passwd:"
 "$kern" exec files -- /bin/sh -c 'ln -sf /etc/hostname /tmp/escape'
 "$kern" cp files:/tmp/escape "$work/escape.txt"

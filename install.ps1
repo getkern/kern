@@ -24,7 +24,7 @@ $DistroDir  = Join-Path $InstallDir 'distro'
 $ExePath    = Join-Path $InstallDir 'kern.exe'
 $ExeUrl     = "$RelBase/kern-windows-x86_64.exe"
 $RootfsUrl  = "$RelBase/kern-wsl-rootfs.tar.gz"
-# The standalone static-musl Linux binary (same asset the Linux installer uses) — runs as-is inside the
+# The standalone static-musl Linux binary (same asset the Linux installer uses) - runs as-is inside the
 # Alpine WSL distro, so an UPGRADE can swap just this file and keep the distro's image cache + boxes.
 $BinUrl     = "$RelBase/kern-x86_64-unknown-linux-musl.tar.gz"
 $ScriptUrl  = 'https://raw.githubusercontent.com/getkern/kern/main/install.ps1'
@@ -157,7 +157,7 @@ function Get-TargetVersion {
     } catch { return $null }
 }
 
-# Upgrade the kern binary INSIDE the existing distro WITHOUT re-importing it — so the image cache and
+# Upgrade the kern binary INSIDE the existing distro WITHOUT re-importing it - so the image cache and
 # boxes (which live in the distro's own filesystem) survive an update. The pre-baked distro is Alpine
 # x86_64, so the standalone static-musl binary runs in it verbatim. Returns $true only when the swap is
 # done AND verified; on ANY failure it returns $false and the caller falls back to a full re-import.
@@ -165,7 +165,7 @@ function Update-DistroBinary($want) {
     $tgz    = Join-Path $env:TEMP 'kern-bin.tar.gz'
     $binDir = Join-Path $env:TEMP 'kern-bin'
     try {
-        # NON-FATAL download + sha256 verify (mirrors Fetch, but returns $false instead of Die-ing — a
+        # NON-FATAL download + sha256 verify (mirrors Fetch, but returns $false instead of Die-ing - a
         # failed in-place update must FALL BACK to a full re-import, never kill the installer).
         $local = Resolve-Local 'KERN_BIN_LOCAL' 'kern-x86_64-unknown-linux-musl.tar.gz'
         if ($local) {
@@ -190,7 +190,7 @@ function Update-DistroBinary($want) {
         $dest = (wsl.exe -d $DistroName -u root -- sh -lc 'command -v kern' 2>$null | Out-String).Trim()
         if (-not $dest) { $dest = '/usr/local/bin/kern' }
         # The distro's view of the downloaded Windows file, then an atomic in-place swap (keeps the cache).
-        # NB: pass the path with FORWARD slashes — `wsl -- wslpath` eats backslashes in a Windows path
+        # NB: pass the path with FORWARD slashes - `wsl -- wslpath` eats backslashes in a Windows path
         # ("C:\a\b" -> "C:ab"), so a backslashed path returns empty and would wrongly force a re-import.
         $src = (wsl.exe -d $DistroName -- wslpath -u "$($winBin -replace '\\','/')" 2>$null | Out-String).Trim()
         if (-not $src) { return $false }
@@ -225,7 +225,7 @@ function Import-Distro {
         }
         Info "kern distro is $have -> upgrading to $want..."
         # Preferred: swap ONLY the binary in place, so the image cache and boxes (which live inside the
-        # distro's filesystem) survive the update. Full re-import — which WIPES them — is the fallback.
+        # distro's filesystem) survive the update. Full re-import - which WIPES them - is the fallback.
         if (Update-DistroBinary $want) {
             Info "kern updated to $want in place -- image cache and boxes preserved."
             return

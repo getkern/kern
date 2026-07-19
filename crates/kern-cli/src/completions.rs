@@ -1,4 +1,4 @@
-//! `kern completions <bash|zsh|fish>` — print a shell-completion script to stdout.
+//! `kern completions <bash|zsh|fish>` - print a shell-completion script to stdout.
 //!
 //! kern uses a hand-rolled parser (no clap), so the scripts are hand-written: they complete the verb
 //! set and, for the box-management verbs, the names of currently-running boxes via `kern ps`. Install
@@ -72,7 +72,7 @@ fn bash() -> String {
     let verbs = VERBS.join(" ");
     let name_verbs = NAME_VERBS.join("|");
     format!(
-        r#"# kern bash completion — install: kern completions bash | sudo tee /etc/bash_completion.d/kern
+        r#"# kern bash completion - install: kern completions bash | sudo tee /etc/bash_completion.d/kern
 _kern() {{
     local cur prev verbs
     cur="${{COMP_WORDS[COMP_CWORD]}}"
@@ -101,7 +101,7 @@ fn zsh() -> String {
     let name_verbs = NAME_VERBS.join(" ");
     format!(
         r#"#compdef kern
-# kern zsh completion — install: kern completions zsh > "${{fpath[1]}}/_kern"
+# kern zsh completion - install: kern completions zsh > "${{fpath[1]}}/_kern"
 _kern() {{
     local -a verbs name_verbs
     verbs=({verbs})
@@ -124,7 +124,7 @@ _kern "$@"
 }
 
 fn fish() -> String {
-    let mut out = String::from("# kern fish completion — install: kern completions fish > ~/.config/fish/completions/kern.fish\n");
+    let mut out = String::from("# kern fish completion - install: kern completions fish > ~/.config/fish/completions/kern.fish\n");
     // Verb completions (only at the first position).
     for v in VERBS {
         out.push_str(&format!(

@@ -1,14 +1,14 @@
-//! In-box `sshd` for `kern box --ssh` — a throwaway SSH server so you can `ssh` (and `scp`/`sftp`)
+//! In-box `sshd` for `kern box --ssh` - a throwaway SSH server so you can `ssh` (and `scp`/`sftp`)
 //! into a running box. Runs entirely inside the box's namespaces and is torn down with it.
 //!
 //! This has to happen **in the isolation layer, before seccomp**: making `sshd` work rootless needs
-//! privileged setup the workload itself can't do (the seccomp filter blocks `mount`) —
+//! privileged setup the workload itself can't do (the seccomp filter blocks `mount`) -
 //!   * a fresh `tmpfs` on `/run` so `/run/sshd` is owned by the namespace root and passes sshd's
 //!     privsep ownership check (a host-owned `/run/sshd` shows up as `nobody` and sshd refuses it);
 //!   * a bind-mounted `/etc/passwd`/`/etc/shadow` giving sshd's privilege-separation user UID 0, so
 //!     its `setresuid` privsep drop is a no-op in a single-uid user namespace;
 //!   * an LD_PRELOAD shim that stubs `setgroups`/`initgroups` (they return `EPERM` under
-//!     `/proc/self/setgroups=deny`, which sshd treats as fatal — clearing the single mapped group is
+//!     `/proc/self/setgroups=deny`, which sshd treats as fatal - clearing the single mapped group is
 //!     a no-op anyway).
 //!
 //! Keys never touch the image: the host key + `authorized_keys` + config live on the `/run` tmpfs.
@@ -16,8 +16,8 @@
 //! to it with the ordinary `-p HOST:22` rootless forwarder. sshd is `fork`ed as a child just before
 //! the box execs its PID 1, so it dies with the box's PID namespace.
 //!
-//! Honest scope: the box must ship `sshd` + `ssh-keygen` (openssh-server). The forked sshd — and the
-//! shells it spawns per session — run **without** the box's seccomp filter (they're forked before it
+//! Honest scope: the box must ship `sshd` + `ssh-keygen` (openssh-server). The forked sshd - and the
+//! shells it spawns per session - run **without** the box's seccomp filter (they're forked before it
 //! is installed); the namespace/pivot/cgroup isolation still holds. Grant `--ssh` to workloads you'd
 //! trust with an interactive shell in the box.
 
@@ -58,23 +58,23 @@ pub fn setup(ssh: &SshSetup) {
         set_mode(d, mode);
     }
 
-    // 2. Host key (ed25519 — fast + tiny). ssh-keygen writes it 0600.
+    // 2. Host key (ed25519 - fast + tiny). ssh-keygen writes it 0600.
     let keygen = std::process::Command::new("ssh-keygen")
         .args(["-t", "ed25519", "-f", HOST_KEY, "-N", "", "-q"])
         .status();
     if !matches!(keygen, Ok(s) if s.success()) {
-        warn("ssh-keygen failed (is openssh installed in the image?) — SSH not started");
+        warn("ssh-keygen failed (is openssh installed in the image?) - SSH not started");
         return;
     }
 
     // 3. authorized_keys (0600).
     if write_mode(AUTH_KEYS, ssh.authorized_key.trim().as_bytes(), 0o600).is_err() {
-        warn("cannot write authorized_keys — SSH not started");
+        warn("cannot write authorized_keys - SSH not started");
         return;
     }
 
     // 4. passwd/shadow with the privsep user `sshd` (and `root`) at UID 0, bind-mounted over the
-    //    image's — never modifying the image. UID 0 makes sshd's privsep `setresuid` a no-op in a
+    //    image's - never modifying the image. UID 0 makes sshd's privsep `setresuid` a no-op in a
     //    single-uid namespace; `root` gets a writable home so the login shell can chdir.
     let _ = std::fs::create_dir_all("/tmp/kern-home");
     set_mode("/tmp/kern-home", 0o700);
@@ -93,7 +93,7 @@ pub fn setup(ssh: &SshSetup) {
     //    (use `--uid-range`, which maps groups so setgroups succeeds, or install cc). Best-effort.
     let preload = build_shim();
 
-    // 6. sshd_config — pubkey-only, no PAM/password, fast single cipher suite, no DNS.
+    // 6. sshd_config - pubkey-only, no PAM/password, fast single cipher suite, no DNS.
     let sftp = [
         "/usr/lib/openssh/sftp-server",
         "/usr/lib/ssh/sftp-server",
@@ -118,7 +118,7 @@ pub fn setup(ssh: &SshSetup) {
         cfg.push_str(&format!("Subsystem sftp {sftp}\n"));
     }
     if write_mode(CONFIG, cfg.as_bytes(), 0o600).is_err() {
-        warn("cannot write sshd_config — SSH not started");
+        warn("cannot write sshd_config - SSH not started");
         return;
     }
 
@@ -148,12 +148,12 @@ pub fn setup(ssh: &SshSetup) {
         .into_iter()
         .find(|p| Path::new(p).exists());
     let Some(sshd) = sshd else {
-        warn("sshd not found — install openssh-server in the image (SSH not started)");
+        warn("sshd not found - install openssh-server in the image (SSH not started)");
         return;
     };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        warn("fork for sshd failed — SSH not started");
+        warn("fork for sshd failed - SSH not started");
         return;
     }
     if pid == 0 {
@@ -173,8 +173,8 @@ pub fn setup(ssh: &SshSetup) {
     }
 }
 
-/// Compile the tiny setgroups/initgroups shim inside the box (matches the image's own libc — glibc or
-/// musl — since it uses the box's compiler). Returns the `.so` path for `LD_PRELOAD`, or `None` when
+/// Compile the tiny setgroups/initgroups shim inside the box (matches the image's own libc - glibc or
+/// musl - since it uses the box's compiler). Returns the `.so` path for `LD_PRELOAD`, or `None` when
 /// no C compiler is available. The source is fixed and trusted; no untrusted input is compiled.
 fn build_shim() -> Option<String> {
     let cc = ["cc", "gcc", "clang", "tcc", "musl-gcc"]

@@ -2,10 +2,10 @@
 //! `compose` file parser. Both parse the same quoted-string / bool / `[...]` array / `#` comment
 //! syntax, so keeping ONE definition here stops the two from drifting into subtly different rules.
 //!
-//! Lives in `kern-common` (not the CLI) so the `kern-compose` parser crate — which is CLI-free so it
-//! can be fuzzed in isolation — and the CLI's `config` loader share the exact same scanners.
+//! Lives in `kern-common` (not the CLI) so the `kern-compose` parser crate - which is CLI-free so it
+//! can be fuzzed in isolation - and the CLI's `config` loader share the exact same scanners.
 
-/// Everything before an unquoted `#` (a comment). A `#` inside a `"..."` string is kept — values are
+/// Everything before an unquoted `#` (a comment). A `#` inside a `"..."` string is kept - values are
 /// quoted, so a `#` in a value is safe. Escape-aware, exactly like `split_top_commas`: a `\"` inside a
 /// string does NOT close it (otherwise `command = ["say \" #hi"]` would have its `#` mis-stripped and
 /// the truncated value would fail to parse). The two scanners MUST agree on string boundaries.
@@ -48,7 +48,7 @@ pub fn parse_bool(v: &str) -> Result<bool, String> {
     }
 }
 
-/// Split on top-level commas — a comma inside a `"..."` string (escape-aware) does not split. Items
+/// Split on top-level commas - a comma inside a `"..."` string (escape-aware) does not split. Items
 /// are returned verbatim (untrimmed); a trailing whitespace-only item is dropped.
 pub fn split_top_commas(s: &str) -> Vec<String> {
     let mut out = Vec::new();

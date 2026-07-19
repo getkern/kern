@@ -574,7 +574,7 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 
 ## Project status
 
-**0.6.5, a daemonless container + resource runtime that does less than Docker, on purpose.**
+**0.6.7, a daemonless container + resource runtime that does less than Docker, on purpose.**
 Everything in [Features](#features) works today and is tested (**454 tests**, clippy-clean,
 `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast, honest core. The

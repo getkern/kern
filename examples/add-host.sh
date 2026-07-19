@@ -41,4 +41,4 @@ echo "==> with --net the box shares the host network, so host-gateway resolves t
   sh -c 'grep host.internal /etc/hosts'
 
 echo
-echo "done — custom names and the host-gateway keyword are just /etc/hosts entries in the box."
+echo "done - custom names and the host-gateway keyword are just /etc/hosts entries in the box."

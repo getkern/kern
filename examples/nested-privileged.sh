@@ -1,12 +1,12 @@
 #!/bin/sh
 # Nesting: run a `kern box` INSIDE a `kern box`, with `--privileged`.
 #
-# By default a box's seccomp filter kills the syscalls a nested sandbox needs — unshare, setns,
-# mount, umount2, pivot_root — so a box can't create its own namespaces (SIGSYS). That's the safe
+# By default a box's seccomp filter kills the syscalls a nested sandbox needs - unshare, setns,
+# mount, umount2, pivot_root - so a box can't create its own namespaces (SIGSYS). That's the safe
 # default. `--privileged` relaxes EXACTLY those 5 syscalls and NOTHING else: kexec, kernel modules,
 # bpf, io_uring, the keyring, ptrace and the new mount API all STAY blocked. So a kern privileged
 # box is materially STRONGER than a Docker `--privileged` container (which drops the seccomp filter
-# wholesale). It is honoured in ROOTLESS mode only — the box's root maps to your unprivileged host
+# wholesale). It is honoured in ROOTLESS mode only - the box's root maps to your unprivileged host
 # uid, so a nested user namespace grants no new privilege on the host (the reason rootless
 # podman-in-podman is safe).
 #
@@ -57,4 +57,4 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 echo
-echo "done — nesting is opt-in, rootless-only, and relaxes 5 syscalls, not the whole filter."
+echo "done - nesting is opt-in, rootless-only, and relaxes 5 syscalls, not the whole filter."

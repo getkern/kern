@@ -1,7 +1,7 @@
 //! Sandbox setup.
 //!
 //! [`SandboxCtx`] holds the resolved configuration; [`SandboxCtx::build_root`] runs the ordered
-//! mount steps against any [`MountOps`] — the real libc impl (`kern box --rootfs`) and the
+//! mount steps against any [`MountOps`] - the real libc impl (`kern box --rootfs`) and the
 //! `Recorder` (`kern box --plan`) share the exact same typestate-driven sequence.
 
 use kern_common::BoxName;
@@ -9,7 +9,7 @@ use kern_isolation::{Error as IsoError, MountMode, MountOps, Recorder, Rootfs};
 
 /// Resolved configuration for one sandbox.
 pub(crate) struct SandboxCtx {
-    /// Validated box name (no path separators / traversal — see [`BoxName`]).
+    /// Validated box name (no path separators / traversal - see [`BoxName`]).
     pub name: BoxName,
     /// New-root path the box's filesystem is assembled at.
     pub root: String,
@@ -19,7 +19,7 @@ pub(crate) struct SandboxCtx {
 
 impl SandboxCtx {
     /// A context for box `name`, with the default overlay root layout. The root path is
-    /// derived, not yet created — `--plan` only records the sequence.
+    /// derived, not yet created - `--plan` only records the sequence.
     pub fn new(name: BoxName) -> Self {
         let root = format!("/var/lib/kern/{}/rootfs", name.as_str());
         SandboxCtx {
@@ -39,7 +39,7 @@ impl SandboxCtx {
         Ok(())
     }
 
-    /// The isolation plan as an ordered, human-readable list — privilege-free, used by
+    /// The isolation plan as an ordered, human-readable list - privilege-free, used by
     /// `kern box <name> --plan` to show exactly what the sandbox setup would do.
     pub fn plan(&self) -> Vec<String> {
         let mut rec = Recorder::default();

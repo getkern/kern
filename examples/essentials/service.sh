@@ -12,4 +12,4 @@ echo "==> kern box web --image python:alpine -d -p $port:8000 -- python3 -m http
 i=0; while [ "$i" -lt 25 ]; do body="$(fetch "http://localhost:$port")" && break; i=$((i+1)); sleep 1; done
 echo "==> curl http://localhost:$port  ->  ${body:-(did not come up)}"
 echo "==> kern ps:"; "$kern" ps
-echo "==> stopping (trap on exit) — no daemon."
+echo "==> stopping (trap on exit) - no daemon."

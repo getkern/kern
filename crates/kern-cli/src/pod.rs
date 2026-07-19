@@ -1,4 +1,4 @@
-//! `kern pod` — a **pod** is a set of boxes that share ONE loopback network, so services reach each
+//! `kern pod` - a **pod** is a set of boxes that share ONE loopback network, so services reach each
 //! other by name on `127.0.0.1` (like a Kubernetes pod). A hidden **holder** process (`kern
 //! __pod-holder`, [`kern_isolation::run_pod_holder`]) owns the pod's user+net namespace; each
 //! `kern box --pod <name>` box `setns`es into it. A shared `/etc/hosts` (bind-mounted into every pod
@@ -8,7 +8,7 @@
 //! **Outbound** is OPTIONAL: if `pasta` (passt) is installed, `create` attaches it to the pod net ns
 //! for rootless NAT'd internet access + DNS (unless `--no-outbound`); without pasta the pod is
 //! loopback-only (inter-service only; publish to the host with `-p` on a box). kern itself needs no
-//! extra dependency to run — pasta only unlocks pod egress.
+//! extra dependency to run - pasta only unlocks pod egress.
 
 use crate::error::Error;
 use std::io::{BufRead, Write};
@@ -34,13 +34,13 @@ pub fn hosts_path(name: &str) -> PathBuf {
     pod_dir(name).join("hosts")
 }
 
-/// Path of a pod's `/etc/resolv.conf` — present only when the pod has OUTBOUND (a `pasta` NAT was
+/// Path of a pod's `/etc/resolv.conf` - present only when the pod has OUTBOUND (a `pasta` NAT was
 /// set up); bind-mounted into member boxes so DNS works. `None`/absent → loopback-only pod.
 pub fn resolv_path(name: &str) -> PathBuf {
     pod_dir(name).join("resolv.conf")
 }
 
-/// The inode of `/proc/<pid>/ns/<kind>` — a namespace's stable identity. Used to detect PID reuse:
+/// The inode of `/proc/<pid>/ns/<kind>` - a namespace's stable identity. Used to detect PID reuse:
 /// a recorded holder PID is only trusted if its net ns inode still matches the one from create time.
 fn ns_inode(pid: i32, kind: &str) -> Option<u64> {
     std::fs::metadata(format!("/proc/{pid}/ns/{kind}"))
@@ -50,7 +50,7 @@ fn ns_inode(pid: i32, kind: &str) -> Option<u64> {
 
 /// The holder PID for pod `name` if the pod exists, its holder is still alive, AND its net ns is the
 /// SAME one recorded at create (guards against the PID being reused by an unrelated process after the
-/// holder died — otherwise a box could `setns` into a stranger's namespace). Else `None`.
+/// holder died - otherwise a box could `setns` into a stranger's namespace). Else `None`.
 pub fn holder_pid(name: &str) -> Option<i32> {
     let dir = pod_dir(name);
     let pid: i32 = std::fs::read_to_string(dir.join("holder"))
@@ -61,7 +61,7 @@ pub fn holder_pid(name: &str) -> Option<i32> {
     if unsafe { libc::kill(pid, 0) } != 0 {
         return None; // holder gone
     }
-    // Verify the net ns identity matches what we recorded — reject a reused PID.
+    // Verify the net ns identity matches what we recorded - reject a reused PID.
     let want: u64 = std::fs::read_to_string(dir.join("netns"))
         .ok()?
         .trim()
@@ -75,7 +75,7 @@ pub fn holder_pid(name: &str) -> Option<i32> {
 }
 
 /// Is a concurrent `pod create` still mid-startup for this dir? True iff the `starting` marker names
-/// a live PID **whose kernel start-time still matches** — so a stale marker whose pid was reused by an
+/// a live PID **whose kernel start-time still matches** - so a stale marker whose pid was reused by an
 /// unrelated process reads as dead, not as a live starter. Used only to make two racing
 /// `pod create <same>` safe: the mkdir loser must not reclaim the dir while the winner's holder is
 /// still coming up (its `holder` pid isn't written yet).
@@ -84,7 +84,7 @@ fn starter_alive(dir: &std::path::Path) -> bool {
         return false;
     };
     let marker = marker.trim();
-    // `pid:starttime` (new) or a bare `pid` (older marker) — parse whichever is present.
+    // `pid:starttime` (new) or a bare `pid` (older marker) - parse whichever is present.
     let (pid_s, want_start) = marker.split_once(':').unwrap_or((marker, ""));
     let Ok(pid) = pid_s.parse::<i32>() else {
         return false;
@@ -98,10 +98,10 @@ fn starter_alive(dir: &std::path::Path) -> bool {
     }
 }
 
-/// `kern pod create <name> [--no-outbound] [--uid-range]` — spawn the pod's namespace holder + seed its
+/// `kern pod create <name> [--no-outbound] [--uid-range]` - spawn the pod's namespace holder + seed its
 /// hosts, and (unless `--no-outbound`, and if pasta is installed) attach pasta for internet egress.
 /// Publish a service with `-p` on its member box. `uid_range` maps a subordinate uid RANGE into the
-/// pod's shared user namespace (via the holder) instead of the single-uid self-map — needed when the
+/// pod's shared user namespace (via the holder) instead of the single-uid self-map - needed when the
 /// pod hosts OCI images that drop privilege in their entrypoint (postgres/redis/…). `kern compose`
 /// passes `true` when the stack has image boxes; a pod of root-only services stays single-uid (faster,
 /// more isolated).
@@ -120,7 +120,7 @@ pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Re
             // In BOTH cases refuse: never stomp an in-progress claim, or we'd orphan the winner's
             // holder. Only a genuinely dead leftover (no holder AND no live starter) is reclaimed.
             //
-            // The winner writes its `starting` marker microseconds after winning the mkdir — but on a
+            // The winner writes its `starting` marker microseconds after winning the mkdir - but on a
             // slow host that gap widens to milliseconds, so a naive single check here can race in and
             // see neither holder nor starter *before* the winner marks itself. Poll briefly (bounded)
             // before concluding the dir is dead: a live winner appears within a few ms; a genuinely
@@ -181,7 +181,7 @@ pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Re
         .map_err(|e| Error::Sandbox(format!("pod holder: {e}")))?;
     let pid = child.id() as i32;
     // Wait for the holder's `pod-ready` line, but BOUNDED: a holder that wedges during namespace setup
-    // (a host/kernel quirk) must NOT hang `pod create` — and with it the whole `compose up` — forever.
+    // (a host/kernel quirk) must NOT hang `pod create` - and with it the whole `compose up` - forever.
     // A reader thread does the blocking `read_line`; if no answer arrives within the timeout we treat
     // the holder as failed, kill it, and error, instead of an unbounded wait on a child's readiness.
     let ready = child.stdout.take().is_some_and(|mut out| {
@@ -189,7 +189,7 @@ pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Re
         std::thread::spawn(move || {
             let mut line = String::new();
             std::io::BufReader::new(&mut out).read_line(&mut line).ok();
-            let _ = tx.send(line.trim() == "pod-ready"); // receiver may be gone on timeout — ignore
+            let _ = tx.send(line.trim() == "pod-ready"); // receiver may be gone on timeout - ignore
         });
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .unwrap_or(false)
@@ -211,7 +211,7 @@ pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Re
     let _ = std::fs::remove_file(dir.join("starting")); // claim complete: holder pid is now recorded
                                                         // The holder is detached (own process group, reparented to init on our exit) and runs until
                                                         // `kern pod rm`. `forget` just drops our `Child` handle without any wait/kill (std never reaps or
-                                                        // signals on drop) — the stdout pipe was already `.take()`n, so nothing leaks.
+                                                        // signals on drop) - the stdout pipe was already `.take()`n, so nothing leaks.
     std::mem::forget(child);
     // OUTBOUND (default, opt-out with `--no-outbound`): if `pasta` (passt) is installed, attach it to
     // the pod net ns for NAT'd internet egress + DNS. Best-effort: absent/failed → loopback-only.
@@ -223,9 +223,9 @@ pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Re
     if outbound {
         println!("  network: services reach each other by name + outbound to the internet (pasta)");
     } else if !want_outbound {
-        println!("  network: loopback-only (--no-outbound) — services reach each other; no egress");
+        println!("  network: loopback-only (--no-outbound) - services reach each other; no egress");
     } else {
-        println!("  network: loopback-only — services reach each other; NO outbound (install `passt`/`pasta` for egress)");
+        println!("  network: loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)");
     }
     Ok(())
 }
@@ -259,7 +259,7 @@ fn setup_outbound(name: &str, holder: i32) -> bool {
     if !ok {
         return false;
     }
-    // Seed the pod resolv.conf with the host's real (non-loopback) nameservers — reachable through
+    // Seed the pod resolv.conf with the host's real (non-loopback) nameservers - reachable through
     // the NAT, so split-horizon/LAN DNS keeps working. Only if the host has NONE that are usable from
     // the ns (e.g. systemd-resolved's 127.0.0.53 stub) do we fall back to a public resolver.
     let mut resolv = String::new();
@@ -277,7 +277,7 @@ fn setup_outbound(name: &str, holder: i32) -> bool {
     if resolv.is_empty() {
         resolv.push_str("nameserver 1.1.1.1\n"); // host has only a local stub → public fallback
     }
-    // DNS is only "up" if we actually wrote the resolv.conf the box will bind — else don't claim it.
+    // DNS is only "up" if we actually wrote the resolv.conf the box will bind - else don't claim it.
     std::fs::write(resolv_path(name), resolv).is_ok()
 }
 
@@ -311,7 +311,7 @@ pub fn add_member(name: &str, member: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern pod ls` — list pods (name, member count, alive/dead holder).
+/// `kern pod ls` - list pods (name, member count, alive/dead holder).
 pub fn list() -> Result<(), Error> {
     let root = pods_root();
     let mut rows: Vec<(String, usize, bool)> = Vec::new();
@@ -336,7 +336,7 @@ pub fn list() -> Result<(), Error> {
     }
     rows.sort();
     if rows.is_empty() {
-        println!("no pods — create one with `kern pod create <name>`");
+        println!("no pods - create one with `kern pod create <name>`");
         return Ok(());
     }
     let p = crate::ui::Palette::detect();
@@ -355,7 +355,7 @@ pub fn list() -> Result<(), Error> {
 }
 
 /// Does this `/proc/<pid>/comm` belong to the `pasta`/`passt` family? passt re-execs into an
-/// ISA-optimized variant, so `comm` is `pasta.avx2` (or `passt.avx512`, …) — never the bare `pasta`.
+/// ISA-optimized variant, so `comm` is `pasta.avx2` (or `passt.avx512`, …) - never the bare `pasta`.
 /// Matching by family prefix is what keeps the teardown's PID-reuse check from silently leaking the
 /// NAT daemon (the bug where `comm == "pasta"` never matched → pasta survived every `pod rm`).
 fn is_pasta_comm(comm: &str) -> bool {
@@ -363,7 +363,7 @@ fn is_pasta_comm(comm: &str) -> bool {
 }
 
 /// Tear a pod down: kill its pasta NAT daemon (verified by PID + `comm` family prefix), then its holder, then wipe
-/// its state dir. Returns `(existed, member_count)`. Silent — callers do the messaging so `pod rm`
+/// its state dir. Returns `(existed, member_count)`. Silent - callers do the messaging so `pod rm`
 /// and `compose down` can each say the right thing. Member boxes keep their own (already-joined)
 /// namespaces until they exit; only the holder is freed.
 pub fn teardown(name: &str) -> (bool, usize) {
@@ -378,7 +378,7 @@ pub fn teardown(name: &str) -> (bool, usize) {
     if !dir.is_dir() {
         return (false, 0);
     }
-    // Kill pasta FIRST, while the holder still owns the net ns — so its recorded PID is unambiguously
+    // Kill pasta FIRST, while the holder still owns the net ns - so its recorded PID is unambiguously
     // pasta (killing the holder frees the ns → pasta auto-exits → PID-reuse window). Verify via comm
     // (pasta runs in the HOST net ns, so the holder's ns-inode guard can't cover it).
     let holder = holder_pid(name);
@@ -410,7 +410,7 @@ pub fn teardown(name: &str) -> (bool, usize) {
     (true, members)
 }
 
-/// `kern pod rm <name>` — tear the pod down; still-running member boxes keep going until they exit.
+/// `kern pod rm <name>` - tear the pod down; still-running member boxes keep going until they exit.
 pub fn remove(names: &[String]) -> Result<(), Error> {
     if names.is_empty() {
         return Err(Error::Usage("pod rm <name>..."));
@@ -429,7 +429,7 @@ pub fn remove(names: &[String]) -> Result<(), Error> {
         }
     }
     // A `pod rm <name>` that removed NOTHING (every name was missing) must exit non-zero, so a script
-    // can tell the removal failed — parity with `config rm` / `volume rm` on an unknown name.
+    // can tell the removal failed - parity with `config rm` / `volume rm` on an unknown name.
     if missing.len() == names.len() {
         return Err(Error::NotRunning(format!(
             "no pod named '{}'",
@@ -439,7 +439,7 @@ pub fn remove(names: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// `kern __pod-holder` (hidden): become the pod's namespace holder — never returns.
+/// `kern __pod-holder` (hidden): become the pod's namespace holder - never returns.
 pub fn run_holder() -> ! {
     kern_isolation::run_pod_holder()
 }

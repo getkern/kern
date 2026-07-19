@@ -2,12 +2,12 @@
 # A scrape/fetch that reaches the web but stays otherwise locked down.
 #
 # Networking is OFF by default in a kern box. `--net` is the ONE relaxation we
-# make here — it shares the host network namespace so the fetch can resolve DNS
+# make here - it shares the host network namespace so the fetch can resolve DNS
 # and connect out. EVERYTHING ELSE stays isolated: separate PID/mount/user
 # namespaces, a capped box (memory/CPU/time), and the output goes to a volume
 # you mount in. The scraper cannot touch your host filesystem beyond `-v`.
 #
-# HONEST trade-off: `--net` means NO network isolation — the box shares the
+# HONEST trade-off: `--net` means NO network isolation - the box shares the
 # host's loopback and can reach 127.0.0.1 services. Use it for trusted fetch
 # code, not for running untrusted scrapers against your own machine. See
 # SECURITY.md and with-network.sh.
@@ -37,10 +37,10 @@ then
   ls -l "$work/out/page.html" | sed 's/^/  /'
 else
   echo
-  echo "  (no network available — that's fine; the box behaved, it just had"
+  echo "  (no network available - that's fine; the box behaved, it just had"
   echo "   nothing to reach. Re-run with connectivity to see the scrape.)"
 fi
 
 echo
-echo "done — only --net was relaxed; the box was still PID/mount/user-isolated,"
+echo "done - only --net was relaxed; the box was still PID/mount/user-isolated,"
 echo "capped, and could only write to the volume you mounted. Box is gone."

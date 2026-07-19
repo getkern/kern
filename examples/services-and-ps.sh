@@ -2,7 +2,7 @@
 # Long-running boxes without a daemon: start detached, list, stop.
 #
 # `-d` forks a tiny supervisor that registers the box under $XDG_RUNTIME_DIR/kern/instances/.
-# `kern ps` reads that directory and prunes dead entries as it goes — no background service.
+# `kern ps` reads that directory and prunes dead entries as it goes - no background service.
 set -eu
 kern="${KERN:-kern}"
 

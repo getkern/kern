@@ -1,11 +1,11 @@
 #!/bin/sh
-# Freeze a box's processes and reconnect to a detached box's output — no daemon involved.
+# Freeze a box's processes and reconnect to a detached box's output - no daemon involved.
 #
 #   kern pause <name>     freeze EVERY process in the box atomically (cgroup v2 freezer)
 #   kern unpause <name>   thaw it again  (aliases: freeze/unfreeze, resume)
 #   kern attach <name>    stream a detached box's captured output live (Ctrl-C detaches, box lives)
 #
-# `pause` uses the kernel cgroup freezer (`cgroup.freeze`), so the freeze is real and atomic — the
+# `pause` uses the kernel cgroup freezer (`cgroup.freeze`), so the freeze is real and atomic - the
 # box makes zero progress while frozen. `attach` follows the box's log file, so it only works on a
 # DETACHED (`-d`) box, which is the one that logs to a file.
 set -eu
@@ -22,7 +22,7 @@ echo "==> it has been running ~3s, so a few ticks are in the log:"
 before="$("$kern" logs ticker | wc -l)"
 
 echo
-echo "==> freeze it with kern pause — every process in the box stops dead:"
+echo "==> freeze it with kern pause - every process in the box stops dead:"
 "$kern" pause ticker
 sleep 3   # 3 real seconds pass, but the frozen box produces no new ticks
 
@@ -30,7 +30,7 @@ after_pause="$("$kern" logs ticker | wc -l)"
 echo "    log lines before pause: $before   after 3s frozen: $after_pause  (unchanged = truly frozen)"
 
 echo
-echo "==> thaw it with kern unpause — it resumes exactly where it left off:"
+echo "==> thaw it with kern unpause - it resumes exactly where it left off:"
 "$kern" unpause ticker
 sleep 2
 echo "    ticks resume:"

@@ -4,7 +4,7 @@
 //! (falling back to `/run/user/<uid>/kern/instances/`, then `/tmp/kern-<uid>/instances/`). The
 //! "pid" is the supervisor process that lives for the box's lifetime. [`list`] reads the dir and
 //! **prunes dead entries** as a side effect, so `kern ps` always reflects reality without a
-//! daemon. The on-disk format is deliberately a flat `key=value` file — trivial to write from a
+//! daemon. The on-disk format is deliberately a flat `key=value` file - trivial to write from a
 //! post-`fork` supervisor and to parse, no JSON dependency.
 
 use std::fs;
@@ -30,17 +30,17 @@ pub struct Instance {
     pub starttime: u64,
     /// Published ports summary for `kern ps` (e.g. `8080->80, 127.0.0.1:443->443`); empty if none.
     pub ports: String,
-    /// Comma-separated **named volumes** this box mounts (from `-v name:/dst`) — so `kern volume rm`
+    /// Comma-separated **named volumes** this box mounts (from `-v name:/dst`) - so `kern volume rm`
     /// can refuse to delete a volume still in use. Empty when none; absent in older entries.
     pub volumes: String,
-    /// The **pod** (`--pod <name>`, e.g. a compose stack) this box belongs to — the grouping key for
+    /// The **pod** (`--pod <name>`, e.g. a compose stack) this box belongs to - the grouping key for
     /// `kern ps`'s tree view and `kern stop <pod>`. Empty for a standalone box; absent in older entries.
     pub pod: String,
 }
 
 impl Instance {
     /// The named volumes this box mounts. Sole decoder of the comma-separated `volumes` wire-format
-    /// (empties filtered) — `volume rm`/`prune` ask through here rather than splitting the raw field,
+    /// (empties filtered) - `volume rm`/`prune` ask through here rather than splitting the raw field,
     /// so the encoding lives in one place (paired with `commands::mounted_named_volumes`, the encoder).
     pub fn volume_names(&self) -> impl Iterator<Item = &str> {
         self.volumes.split(',').filter(|v| !v.is_empty())
@@ -63,7 +63,7 @@ pub fn ssh_dir() -> io::Result<PathBuf> {
     runtime_subdir("ssh")
 }
 
-/// The health directory — a sidecar `<name>-<pid>` per box with `--health-cmd`, holding its latest
+/// The health directory - a sidecar `<name>-<pid>` per box with `--health-cmd`, holding its latest
 /// status. Kept SEPARATE from `instances/` so `list()` never mistakes a status file for a box entry.
 fn health_dir() -> io::Result<PathBuf> {
     runtime_subdir("health")
@@ -92,7 +92,7 @@ pub fn clear_health(name: &str, pid: i32) {
     }
 }
 
-/// The exit directory — a sidecar per box that has RUN TO COMPLETION, holding its `<code>` as decimal
+/// The exit directory - a sidecar per box that has RUN TO COMPLETION, holding its `<code>` as decimal
 /// text. Written by the detached supervisor when a box's main process exits for good (no `--restart`
 /// left). Consumed by `kern compose`'s `depends_completed` (Docker's `service_completed_successfully`):
 /// the box has left `list()`, and this tells us whether it finished cleanly (0) or failed.
@@ -100,15 +100,15 @@ pub fn clear_health(name: &str, pid: i32) {
 /// The sidecar filename is an opaque compose-supplied KEY that encodes BOTH the stack AND the `up`
 /// epoch: `<pod>-<token>-<name>` (adversarial review, rounds 1-2):
 ///  * **`<pod>`** namespaces by stack, so two different stacks that each contain a `db` never collide
-///    on one `exit/db` — one stack could otherwise read the OTHER's `db` exit.
+///    on one `exit/db` - one stack could otherwise read the OTHER's `db` exit.
 ///  * **`<token>`** (a fresh per-`up` epoch) namespaces by RUN. This is the round-2 fix: with the
 ///    token only INSIDE the file, two concurrent `up`s of the same stack shared the filename, so one
-///    `up`'s `clear`-before-spawn would DELETE the other's real completion — a healthy stack failing
+///    `up`'s `clear`-before-spawn would DELETE the other's real completion - a healthy stack failing
 ///    because a peer `up` wiped its state, not fail-closed. With the token in the KEY, each run owns
 ///    its own files; a concurrent run's clear/write can't touch them. Isolation is structural.
 ///
 /// Because a separate `down` invocation doesn't know the `up`'s token, it reaps each box's sidecar by
-/// pod-prefix AND box-name-suffix (`<pod>-*-<name>`, see `clear_exit_matching`) — NOT a blind `<pod>-`
+/// pod-prefix AND box-name-suffix (`<pod>-*-<name>`, see `clear_exit_matching`) - NOT a blind `<pod>-`
 /// prefix, which would delete a concurrent same-stack run's in-flight files. Kept SEPARATE from
 /// `instances/` so `list()` never mistakes it for a live box. The runtime dir is NOT in a box's mount
 /// namespace (verified), so a workload can't forge another service's exit.
@@ -126,7 +126,7 @@ pub fn set_exit(key: &str, code: i32) {
 
 /// A completed box's recorded exit code for `key`, or `None` if it hasn't completed here or the
 /// sidecar is malformed. The key already carries the run's token, so any file that exists for it
-/// belongs to THIS run — no separate token check needed. `Some(0)` = finished successfully.
+/// belongs to THIS run - no separate token check needed. `Some(0)` = finished successfully.
 pub fn exit_of(key: &str) -> Option<i32> {
     exit_dir()
         .ok()
@@ -134,7 +134,7 @@ pub fn exit_of(key: &str) -> Option<i32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-/// Remove a box's exit sidecar for the exact `key` — compose calls this BEFORE (re)launching the box.
+/// Remove a box's exit sidecar for the exact `key` - compose calls this BEFORE (re)launching the box.
 /// Best-effort.
 pub fn clear_exit(key: &str) {
     if let Ok(d) = exit_dir() {
@@ -143,11 +143,11 @@ pub fn clear_exit(key: &str) {
 }
 
 /// Remove every exit sidecar whose filename starts with `prefix` (compose passes `<pod>-`). Used by
-/// `compose down`, which — being a separate invocation — doesn't know the `up`'s token and so can't
-/// name the exact per-run key. Reaping is scoped to BOTH ends — `<prefix>…<suffix>` — so `compose
+/// `compose down`, which - being a separate invocation - doesn't know the `up`'s token and so can't
+/// name the exact per-run key. Reaping is scoped to BOTH ends - `<prefix>…<suffix>` - so `compose
 /// down` clears `<pod>-<*any-token*>-<name>` only for the box `<name>` it is actually stopping. A
 /// blind `<pod>-` prefix would ALSO delete `<pod>-<otherToken>-<name>` of a DIFFERENT run of the same
-/// stack that is still in flight — re-opening, from the GC side, the exact cross-run deletion the
+/// stack that is still in flight - re-opening, from the GC side, the exact cross-run deletion the
 /// token-in-key fix closed for clear/write (adversarial review, final round). Anchoring the suffix to
 /// the box name keeps GC safe: the only run that can own `<pod>-*-<name>` is the one whose `<name>`
 /// box exists, and duplicate live box names are refused, so down can't wipe a concurrent run's box.
@@ -213,7 +213,7 @@ fn own_cgroup() -> Option<&'static PathBuf> {
 
 /// The box's **dedicated** cgroup, or `None` if it doesn't have one. A box gets its own cgroup
 /// only when it ran inside a `systemd-run --user --scope`; without one (no systemd-user) its
-/// processes live in the shared session cgroup — the same one `kern` itself runs in — and
+/// processes live in the shared session cgroup - the same one `kern` itself runs in - and
 /// `memory.current` there reflects the whole session, not the box. We detect that by comparing
 /// the box's cgroup to our own: if they match, the reading isn't box-specific, so we report none
 /// rather than a misleading session-wide number.
@@ -225,7 +225,7 @@ pub fn box_cgroup(pid: i32) -> Option<PathBuf> {
     Some(cg)
 }
 
-/// All per-box cgroup stats from a **single** `box_cgroup` resolve — mem / cpu / tasks / frozen. The
+/// All per-box cgroup stats from a **single** `box_cgroup` resolve - mem / cpu / tasks / frozen. The
 /// `top` refresh reads these together per box, so this avoids re-resolving the cgroup (and re-reading
 /// `/proc/<pid>/cgroup`) four separate times per box, per frame.
 #[derive(Default)]
@@ -258,7 +258,7 @@ pub fn box_stats(pid: i32) -> BoxStats {
 }
 
 /// Is this box frozen by `kern pause`? Reads its cgroup v2 `cgroup.freeze` ("1" = frozen). `false`
-/// when the box has no dedicated cgroup or the file is unreadable — so `ps`/`top` can show "paused"
+/// when the box has no dedicated cgroup or the file is unreadable - so `ps`/`top` can show "paused"
 /// instead of a frozen box looking identical to a running one.
 pub fn is_paused(pid: i32) -> bool {
     box_cgroup(pid)
@@ -268,7 +268,7 @@ pub fn is_paused(pid: i32) -> bool {
 }
 
 /// A box's current memory usage (bytes), from its (dedicated) cgroup `memory.current`. `None` if
-/// the box has no dedicated cgroup (see [`box_cgroup`]) — shown as `-` rather than a wrong number.
+/// the box has no dedicated cgroup (see [`box_cgroup`]) - shown as `-` rather than a wrong number.
 pub fn mem_bytes(pid: i32) -> Option<u64> {
     let cg = box_cgroup(pid)?;
     fs::read_to_string(cg.join("memory.current"))
@@ -341,7 +341,7 @@ const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 
 /// The `<name>` of a well-formed `<name>-<pid>` entry filename (name non-empty, pid all digits), else
 /// `None`. The SOLE decoder of the on-disk key grammar (paired with `register`'s `format!("{name}-{pid}")`
-/// encoder) — so `well_formed_entry` and `find`'s filename pre-filter can't drift on what a valid entry
+/// encoder) - so `well_formed_entry` and `find`'s filename pre-filter can't drift on what a valid entry
 /// is (they had already diverged: one required a non-empty name, the other didn't).
 fn entry_name(fname: &std::ffi::OsStr) -> Option<&str> {
     let (n, pid) = fname.to_str()?.rsplit_once('-')?;
@@ -350,7 +350,7 @@ fn entry_name(fname: &std::ffi::OsStr) -> Option<&str> {
 
 /// Is this a well-formed registry filename (`<name>-<pid>`, pid all digits)? Skips anything else a
 /// same-user process dropped in the dir, so junk files aren't parsed. NOTE: we deliberately do NOT
-/// cap the *number* of entries — a cap could push a real box's entry out of view and let its
+/// cap the *number* of entries - a cap could push a real box's entry out of view and let its
 /// in-use volume be deleted (fail-open). Reading many small files stays O(n) but bounded per file.
 fn well_formed_entry(name: &std::ffi::OsStr) -> bool {
     entry_name(name).is_some()
@@ -392,7 +392,7 @@ pub fn list() -> Vec<Instance> {
 }
 
 /// Load the registry entry at `path` if it is a LIVE box, pruning a dead/unparseable one as a side
-/// effect (never a live one). The single entry-loading rule — [`list`] and [`find`] both go through
+/// effect (never a live one). The single entry-loading rule - [`list`] and [`find`] both go through
 /// here, so the capped read, the parse, the liveness gate and the prune can't drift between them.
 fn load_live(path: &Path) -> Option<Instance> {
     match read_entry_capped(path).and_then(|b| parse(&b)) {
@@ -405,24 +405,24 @@ fn load_live(path: &Path) -> Option<Instance> {
 }
 
 /// The LIVE box named `name`, or `None`. The targeted-lookup primitive: unlike [`list`], it opens and
-/// `/proc`-stats ONLY the entry whose FILENAME (`<name>-<pid>`) matches `name` — every OTHER running box
+/// `/proc`-stats ONLY the entry whose FILENAME (`<name>-<pid>`) matches `name` - every OTHER running box
 /// costs nothing but its dirent. This is what keeps by-name commands (start name-check, `exec`, `stop`,
 /// `attach`, health polls…) O(1) in file I/O regardless of how many boxes run: routing them through
 /// `list()` made each call O(running boxes) (open + parse + `kill` + read `/proc/<pid>/stat` for EVERY
-/// box) — measured super-linear (3 ms idle → 19 ms at 100 live boxes), and O(N²) for a per-box health
+/// box) - measured super-linear (3 ms idle → 19 ms at 100 live boxes), and O(N²) for a per-box health
 /// checker polling forever. Prunes a dead same-name entry as a side effect (name reusable after a crash),
 /// never a live one.
 pub fn find(name: &str) -> Option<Instance> {
     let d = dir().ok()?;
     for e in fs::read_dir(&d).ok()?.flatten() {
         // Match on the `<name>-<pid>` FILENAME (one grammar decoder, shared with `well_formed_entry`)
-        // WITHOUT opening the file, so a non-matching box — the common case at scale — costs only its
+        // WITHOUT opening the file, so a non-matching box - the common case at scale - costs only its
         // dirent, never an open/`/proc` stat.
         let fname = e.file_name();
         if entry_name(&fname) != Some(name) {
             continue;
         }
-        // A filename match — confirm it's actually a LIVE box named `name` (body `name=` is authoritative,
+        // A filename match - confirm it's actually a LIVE box named `name` (body `name=` is authoritative,
         // matching `list()`). Dead/unparseable → pruned by `load_live` so the name is reusable; a live box
         // whose body-name differs from its filename (shouldn't happen) is left alone, keep looking.
         match load_live(&e.path()) {
@@ -437,7 +437,7 @@ pub fn find(name: &str) -> Option<Instance> {
 /// that track one specific instance (the detached `--timeout` watchdog, `attach`'s exit poll): a
 /// by-name [`find`] would test the pid against whichever same-name entry readdir yields first, so a
 /// duplicate entry (possible only from a fail-open unclaimed start or a pre-claim kern) could shadow
-/// the tracked box — the watchdog would never fire / attach would report a live box as exited.
+/// the tracked box - the watchdog would never fire / attach would report a live box as exited.
 /// Opens exactly one file; never prunes.
 pub fn pair_alive(name: &str, pid: i32) -> bool {
     let Ok(d) = dir() else { return false };
@@ -446,20 +446,20 @@ pub fn pair_alive(name: &str, pid: i32) -> bool {
         .is_some_and(|i| i.name == name && i.pid == pid && is_alive(i.pid, i.starttime))
 }
 
-/// Is a LIVE box already named `name`? Thin wrapper over [`find`] — the box-start hot-path name-check.
+/// Is a LIVE box already named `name`? Thin wrapper over [`find`] - the box-start hot-path name-check.
 pub fn name_taken(name: &str) -> bool {
     find(name).is_some()
 }
 
-/// Resolve a box by a user-supplied reference: its NAME, or — as a fallback — its supervisor PID as
+/// Resolve a box by a user-supplied reference: its NAME, or - as a fallback - its supervisor PID as
 /// shown in `kern ps` (Docker-style ref-or-name for the live commands: `stop`/`exec`/`logs`/…).
 /// NAME WINS: a box literally named "79" resolves before a box whose pid is 79, so an all-digit box
 /// name is never shadowed by a coincidental pid. The pid branch runs ONLY when the ref is a plain
 /// positive integer AND is not a live box name, and scans the (small) registry once. Caveat: a pid is
-/// a LIVE handle only — reused by the OS, changed by `--restart` — so the NAME stays the stable identity.
+/// a LIVE handle only - reused by the OS, changed by `--restart` - so the NAME stays the stable identity.
 pub fn find_ref(x: &str) -> Option<Instance> {
     if let Some(inst) = find(x) {
-        return Some(inst); // a live box named `x` — name wins
+        return Some(inst); // a live box named `x` - name wins
     }
     let pid: i32 = x.parse().ok().filter(|&p| p > 0)?; // else it can't be a pid
     let d = dir().ok()?;
@@ -475,17 +475,17 @@ pub fn find_ref(x: &str) -> Option<Instance> {
     None
 }
 
-/// The claims directory — one `<name>` file per IN-FLIGHT box start (see [`claim_name`]).
+/// The claims directory - one `<name>` file per IN-FLIGHT box start (see [`claim_name`]).
 fn claims_dir() -> io::Result<PathBuf> {
     runtime_subdir("claims")
 }
 
 /// Take the claims-dir advisory lock (`flock`; the kernel releases it with the process, so it can't
-/// leak). ALL claim mutation — take, stale takeover, prune — happens under it, so two starters that
+/// leak). ALL claim mutation - take, stale takeover, prune - happens under it, so two starters that
 /// both see the same stale claim can't both "take it over" (one would silently delete the other's
 /// fresh claim). Held for a handful of syscalls; contention cost is microseconds against a ~3 ms
 /// box start. Retries `EINTR`: a signal landing while blocked on a contended lock must not surface
-/// as "no usable runtime dir" — the caller would fail-open UNCLAIMED, quietly disabling the very
+/// as "no usable runtime dir" - the caller would fail-open UNCLAIMED, quietly disabling the very
 /// race protection this lock exists for.
 fn lock_claims(d: &Path) -> io::Result<fs::File> {
     use std::os::fd::AsRawFd;
@@ -507,7 +507,7 @@ fn parse_claim(body: &str) -> Option<(i32, u64)> {
 }
 
 /// A held start-claim on a box name. Dropping it (in the process that took it) releases the name.
-/// A claim leaked by a crash is stale the moment its pid dies — the next same-name start takes it
+/// A claim leaked by a crash is stale the moment its pid dies - the next same-name start takes it
 /// over, and [`prune`] sweeps the rest.
 pub struct NameClaim {
     path: PathBuf,
@@ -524,21 +524,21 @@ impl Drop for NameClaim {
     }
 }
 
-/// Atomically claim `name` for an in-flight box start — the other half of the start name-check.
+/// Atomically claim `name` for an in-flight box start - the other half of the start name-check.
 /// [`name_taken`] sees a box only once it's REGISTERED, so two concurrent same-name starts could
 /// both pass it and both come up (check-then-register TOCTOU). The claim closes that window:
 ///
-/// * `Ok(Some(_))` — this process owns the name; hold the claim until the box is registered (the
+/// * `Ok(Some(_))` - this process owns the name; hold the claim until the box is registered (the
 ///   registry entry is authoritative from then on), then drop it.
-/// * `Ok(None)` — the name is taken: a LIVE process holds the claim (already starting), or a live
+/// * `Ok(None)` - the name is taken: a LIVE process holds the claim (already starting), or a live
 ///   box is already REGISTERED under it. The registry re-check happens HERE, under the lock, so
-///   name reservation is atomic-by-construction for every caller — a second start path that only
+///   name reservation is atomic-by-construction for every caller - a second start path that only
 ///   calls `claim_name` cannot silently reintroduce the race.
-/// * `Err(_)` — no usable runtime dir. The registry itself is equally unavailable then, so callers
+/// * `Err(_)` - no usable runtime dir. The registry itself is equally unavailable then, so callers
 ///   proceed unclaimed (fail-open, exactly like `name_taken`).
 ///
 /// A claim is a `<pid> <starttime>` file judged by the registry's own [`is_alive`] rule, and the
-/// whole check-and-take runs under the dir-wide flock — a stale claim (starter crashed before
+/// whole check-and-take runs under the dir-wide flock - a stale claim (starter crashed before
 /// registering) is taken over exactly once, never raced.
 pub fn claim_name(name: &str) -> io::Result<Option<NameClaim>> {
     let d = claims_dir()?;
@@ -551,7 +551,7 @@ pub fn claim_name(name: &str) -> io::Result<Option<NameClaim>> {
         // Dead claimant or malformed body → stale; fall through and take it over (we hold the lock).
     }
     // A box that REGISTERED before we locked is invisible to the claim file (its starter already
-    // released the claim after registering) — the registry entry is authoritative from that point.
+    // released the claim after registering) - the registry entry is authoritative from that point.
     if name_taken(name) {
         return Ok(None);
     }
@@ -560,7 +560,7 @@ pub fn claim_name(name: &str) -> io::Result<Option<NameClaim>> {
     Ok(Some(NameClaim { path, owner: pid }))
 }
 
-/// Is this claim body a LIVE claimant's? The single staleness rule — [`claim_name`]'s takeover and
+/// Is this claim body a LIVE claimant's? The single staleness rule - [`claim_name`]'s takeover and
 /// [`prune`]'s sweep both ask here, so they can never disagree on what counts as live (a divergence
 /// would let prune delete a claim a racing starter still honors).
 fn live_claim(body: &str) -> bool {
@@ -576,14 +576,14 @@ pub fn volumes_in_use() -> std::collections::HashSet<String> {
 }
 
 /// Is this our live box supervisor? It must exist (`kill(pid,0)==0`; `EPERM` = another user's
-/// pid → gone) AND — when both start-times are known — its kernel start-time must match what we
+/// pid → gone) AND - when both start-times are known - its kernel start-time must match what we
 /// recorded, so a reused pid (a different process that happens to have the same number) is seen as
 /// gone. The start-time check is an ANTI-REUSE refinement layered on the existence proof, NOT a
 /// second liveness test: if we recorded no start-time (`starttime == 0`) OR the live read comes back
-/// empty (`proc_starttime` returns 0 — a transient `/proc` read failure: `open` hitting `EMFILE`
+/// empty (`proc_starttime` returns 0 - a transient `/proc` read failure: `open` hitting `EMFILE`
 /// under heavy parallel fd pressure, a stat hiccup during namespace churn), we fall back to the
 /// `kill(0)` proof rather than declaring a demonstrably-existing process dead. Pruning a live box's
-/// entry on a momentary read failure is fail-DANGEROUS — it would drop a running box from `ps`/
+/// entry on a momentary read failure is fail-DANGEROUS - it would drop a running box from `ps`/
 /// `stop` and let `volume prune` delete a volume it still mounts. Pid-reuse is still caught whenever
 /// the live read succeeds (the overwhelmingly common case).
 fn is_alive(pid: i32, starttime: u64) -> bool {
@@ -594,14 +594,14 @@ fn is_alive(pid: i32, starttime: u64) -> bool {
     starttime == 0 || live == 0 || live == starttime
 }
 
-/// The fields of `/proc/<pid>/stat` *after* the `comm` field — i.e. the slice past the last `)`.
+/// The fields of `/proc/<pid>/stat` *after* the `comm` field - i.e. the slice past the last `)`.
 /// `comm` can contain spaces and parens, so this is the only safe split point; post-`)` tokens
 /// start at field 3 (state), so field N is `nth(N - 3)`.
 fn stat_after_comm(stat: &str) -> Option<&str> {
     stat.rfind(')').map(|rp| &stat[rp + 1..])
 }
 
-/// The sole child of `ppid` (a box supervisor forks exactly one child — PID 1 of the box), found
+/// The sole child of `ppid` (a box supervisor forks exactly one child - PID 1 of the box), found
 /// by scanning `/proc/*/stat` for a process whose parent is `ppid`. Fallback for `kern exec` when
 /// the supervisor hadn't yet recorded PID 1. `None` if no such process exists.
 pub fn child_of(ppid: i32) -> Option<i32> {
@@ -642,7 +642,7 @@ fn one_line(s: &str) -> String {
 
 /// Garbage-collect leftovers from boxes that are no longer running. [`list`] already prunes dead
 /// *instance* files on read, but a detached box's `logs/<name>-<pid>.log` and `health/<name>-<pid>`
-/// sidecars outlive it — those accumulate. This removes any log/health file whose `<name>-<pid>`
+/// sidecars outlive it - those accumulate. This removes any log/health file whose `<name>-<pid>`
 /// key doesn't match a currently-live box, and returns `(files_removed, bytes_freed)` so the caller
 /// can report it honestly. Live boxes are never touched.
 pub fn prune() -> (usize, u64) {
@@ -667,7 +667,7 @@ pub fn prune() -> (usize, u64) {
                     let fname = e.file_name();
                     let Some(f) = fname.to_str() else { continue };
                     if f.starts_with('.') {
-                        continue; // `.lock` — never a claim (BoxName forbids a leading '.')
+                        continue; // `.lock` - never a claim (BoxName forbids a leading '.')
                     }
                     let live = fs::read_to_string(e.path()).is_ok_and(|b| live_claim(&b));
                     if !live {
@@ -714,7 +714,7 @@ fn sweep_orphans(
             continue;
         }
         // Re-check right before deleting: if the box's instance file exists NOW, a box registered
-        // after our `list()` snapshot (a start racing this prune) — leave its sidecar alone. This is
+        // after our `list()` snapshot (a start racing this prune) - leave its sidecar alone. This is
         // exact and, unlike a time window, never delays reclaiming a genuinely-stopped box's log
         // (`kern stop` removes the instance file first, so its log is swept immediately).
         if instances.is_some_and(|i| i.join(key).exists()) {
@@ -771,11 +771,11 @@ mod tests {
     // (`std::process::id()`), so a pid-keyed `find_ref` in one test can observe a box another test
     // registered under the same pid. Serialize them through this lock so each runs without a
     // concurrent same-pid registration racing it. (No dir wipe: a stale entry from a prior run is
-    // inert — its pid belongs to a now-dead process, so `is_alive` skips it — and a developer's real
+    // inert - its pid belongs to a now-dead process, so `is_alive` skips it - and a developer's real
     // running boxes have different pids and are never touched.)
     static REG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Registry tests resolve the claims/instances dir through `runtime_subdir`, which READS
-    /// `$XDG_RUNTIME_DIR`. Other modules' tests (e.g. `runstats`) repoint that var — process-global —
+    /// `$XDG_RUNTIME_DIR`. Other modules' tests (e.g. `runstats`) repoint that var - process-global -
     /// under [`crate::TEST_ENV_LOCK`]. Holding only `REG_LOCK` left the two uncoordinated: a concurrent
     /// env flip mid-test split the 16-thread contention test across two runtime dirs, so each half took
     /// its own `.lock` and BOTH "won" (flaky `claim_name_one_winner_under_contention`). Hold BOTH locks,
@@ -794,7 +794,7 @@ mod tests {
     #[test]
     fn well_formed_entry_accepts_our_files_rejects_junk() {
         use std::ffi::OsStr;
-        // `<name>-<pid>` — names may contain `-` `.` `_`, pid is the trailing digits.
+        // `<name>-<pid>` - names may contain `-` `.` `_`, pid is the trailing digits.
         assert!(well_formed_entry(OsStr::new("web-42")));
         assert!(well_formed_entry(OsStr::new("my-box-12345")));
         assert!(well_formed_entry(OsStr::new("app.v2-7")));
@@ -815,7 +815,7 @@ mod tests {
         let s = "-migrate"; // -<name>
         assert!(exit_key_bracketed("myapp-tokenA-migrate", p, s));
         assert!(exit_key_bracketed("myapp-99-123456789-migrate", p, s)); // real token shape
-                                                                         // A DIFFERENT box of the same stack must NOT match — this is the fix.
+                                                                         // A DIFFERENT box of the same stack must NOT match - this is the fix.
         assert!(!exit_key_bracketed("myapp-tokenA-other", p, s));
         // A different stack must not match.
         assert!(!exit_key_bracketed("otherapp-tokenA-migrate", p, s));
@@ -866,18 +866,18 @@ mod tests {
         };
         let uniq = format!("fr-{pid}");
         let p1 = mk(&uniq, pid);
-        // by NAME: resolves to exactly our box (unique name — deterministic).
+        // by NAME: resolves to exactly our box (unique name - deterministic).
         assert_eq!(find_ref(&uniq).map(|i| i.name), Some(uniq.clone()));
         // by PID: a numeric ref resolves via the pid branch to a LIVE box with this pid. Under the
         // test harness every test shares THIS process's pid, so a concurrent test's box may be the one
-        // returned — assert the resolved box carries the queried pid, not that it's our exact name.
+        // returned - assert the resolved box carries the queried pid, not that it's our exact name.
         // (The name-resolution and name-wins properties below use unique names and stay exact.)
         assert_eq!(find_ref(&pid.to_string()).map(|i| i.pid), Some(pid));
         // an unknown name and a non-existent pid both miss.
         assert!(find_ref("no-such-box-xyz").is_none());
-        assert!(find_ref("2147483647").is_none()); // i32::MAX — no such pid
+        assert!(find_ref("2147483647").is_none()); // i32::MAX - no such pid
                                                    // NAME WINS: a box literally named after a NUMBER resolves by that NAME (via `find`), never
-                                                   // via the pid branch — so a numeric name can't be shadowed by a coincidental pid.
+                                                   // via the pid branch - so a numeric name can't be shadowed by a coincidental pid.
         let numname = format!("{}", pid.wrapping_add(1)); // a name that looks like a (different) pid
         let p2 = mk(&numname, pid);
         assert_eq!(find_ref(&numname).map(|i| i.name), Some(numname.clone()));
@@ -889,7 +889,7 @@ mod tests {
     fn claim_name_refuses_a_live_registered_box() {
         let _g = reg_guard();
         // The registry re-check lives INSIDE claim_name (under its lock): a box that registered and
-        // released its claim must still make a fresh claim fail — for EVERY caller, by construction.
+        // released its claim must still make a fresh claim fail - for EVERY caller, by construction.
         let name = format!("clm-reg-{}", std::process::id());
         let pid = std::process::id() as i32;
         let path = register(&Instance {
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn claim_name_one_winner_under_contention() {
         let _g = reg_guard();
-        // The E5 race: N concurrent starts of the SAME name — exactly one may win. Threads each
+        // The E5 race: N concurrent starts of the SAME name - exactly one may win. Threads each
         // open their own lock fd (flock is per-open-file-description, so they do exclude each other).
         let name = format!("clm-race-{}", std::process::id());
         let wins: Vec<Option<NameClaim>> = std::thread::scope(|s| {
@@ -952,7 +952,7 @@ mod tests {
         assert_eq!(i.name, "web");
         assert_eq!(i.volumes, "data,cache");
         assert_eq!(i.pod, "myapp");
-        // An OLDER entry with no `volumes=`/`pod=` line still parses (fields default to empty) — the
+        // An OLDER entry with no `volumes=`/`pod=` line still parses (fields default to empty) - the
         // wire format is append-only, so a box registered by a previous kern version is never dropped.
         let old = "name=web\npid=42\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nports=\n";
         let oi = parse(old).unwrap();

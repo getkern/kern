@@ -1,5 +1,5 @@
 #!/bin/sh
-# kern installer — downloads the latest prebuilt static binary for this platform.
+# kern installer - downloads the latest prebuilt static binary for this platform.
 #
 #   curl -fsSL https://getkern.dev/install.sh | sh
 #
@@ -7,7 +7,7 @@
 #   KERN_INSTALL_DIR   where to install (default: ~/.local/bin, or /usr/local/bin as root)
 #   KERN_VERSION       a specific tag, e.g. v0.3.0 (default: latest)
 # No dependencies beyond a POSIX shell, curl (or wget), tar, and sha256sum (optional, for
-# integrity verification). Linux only — kern is a Linux sandbox.
+# integrity verification). Linux only - kern is a Linux sandbox.
 set -eu
 
 REPO="getkern/kern"
@@ -54,7 +54,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 info "downloading ${asset} (${ver})"
-dl "${base}/${asset}" "${tmp}/${asset}" || err "download failed — is ${ver} published for ${arch}?"
+dl "${base}/${asset}" "${tmp}/${asset}" || err "download failed - is ${ver} published for ${arch}?"
 
 # --- integrity (best-effort: verify if the checksum asset and sha256sum are both available) ---
 if command -v sha256sum >/dev/null 2>&1 && dl "${base}/${asset}.sha256" "${tmp}/${asset}.sha256" 2>/dev/null; then
@@ -74,5 +74,5 @@ install -m755 "${tmp}/kern" "${bindir}/kern"
 info "installed $("${bindir}/kern" --version)"
 case ":${PATH}:" in
   *":${bindir}:"*) ;;
-  *) printf "${DIM}    ${bindir} is not on your PATH — add:  export PATH=\"${bindir}:\$PATH\"${ZZ}\n" ;;
+  *) printf "${DIM}    ${bindir} is not on your PATH - add:  export PATH=\"${bindir}:\$PATH\"${ZZ}\n" ;;
 esac

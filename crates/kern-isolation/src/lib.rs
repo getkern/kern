@@ -1,13 +1,13 @@
 //! Isolation primitives (namespaces, mounts) for kern.
 //!
-//! The mount sequence is expressed against the [`MountOps`] trait — one ordered, fallible op
+//! The mount sequence is expressed against the [`MountOps`] trait - one ordered, fallible op
 //! log. A [`Recorder`] captures the calls without privileges (characterization / `--plan`); the
 //! real [`RealMounts`] performs the syscalls. Both flow through the SAME [`Rootfs`] typestate,
 //! so the security-critical ordering (pivot before read-only) is enforced at compile time for
-//! the real path too — not just the recorded one.
+//! the real path too - not just the recorded one.
 //!
 //! The headline guarantee: [`Rootfs::into_readonly`] exists only on `Rootfs<OldRootReady>`, so
-//! remounting the root read-only before pivoting into it is **unrepresentable** — it does not
+//! remounting the root read-only before pivoting into it is **unrepresentable** - it does not
 //! compile.
 
 use std::marker::PhantomData;
@@ -23,7 +23,7 @@ mod ssh;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 pub use cgroup::apply_limits as apply_cgroup_limits;
-/// Resolve a box's exact direct-path cgroup dir from `/proc/<pid1>/cgroup` — the immediate, targeted
+/// Resolve a box's exact direct-path cgroup dir from `/proc/<pid1>/cgroup` - the immediate, targeted
 /// counterpart to [`gc_orphan_box_cgroups`]: `kern stop`/`compose down` capture the dir while the box is
 /// alive and `rmdir` it after the SIGKILL, so the empty dir is gone at once instead of waiting for `gc`
 /// or the next box start. See [`cgroup::box_cgroup_dir`].
@@ -32,8 +32,8 @@ pub use cgroup::box_cgroup_dir;
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
 pub use cgroup::gc_orphan_box_cgroups;
 /// Whether a `--memory` cap can actually be ENFORCED here (the `memory` controller is available in
-/// the cgroup tree). False on kernels that don't delegate it — a stock Raspberry Pi OS and the
-/// default WSL2 kernel — where a `memory.max` write is accepted but never bites. Used only to warn.
+/// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
+/// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.
 pub use cgroup::memory_cap_enforceable;
 /// Apply a fleet-wide `memory.max`/`pids.max` budget to kern's shared `kern.slice`, bounding the SUM of
 /// all running boxes at the kernel. The real-enforcement backstop to the cooperative box counter. See
@@ -48,7 +48,7 @@ pub use cgroup::user_systemd_present;
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
 /// records itself in an in-process marker) and the scrub of an INHERITED marker (a nested kern must
 /// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,
-/// `env_claims_enforcer_but_none_real`) stay crate-internal — only `real.rs` reads them.
+/// `env_claims_enforcer_but_none_real`) stay crate-internal - only `real.rs` reads them.
 pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::{preflight as preflight_ports, PortMap};
@@ -62,7 +62,7 @@ pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompM
 pub use seccomp::denied_syscall_count;
 pub use ssh::SshSetup;
 
-/// `MS_BIND` from `<sys/mount.h>` — bind-mount an existing tree at a new location.
+/// `MS_BIND` from `<sys/mount.h>` - bind-mount an existing tree at a new location.
 pub(crate) const MS_BIND: u64 = 0x1000;
 
 /// An isolation error: a failed syscall (with context) or an unsupported environment.
@@ -100,7 +100,7 @@ pub trait MountOps {
     fn remount_ro(&mut self, target: &str) -> Result<(), Error>;
 }
 
-/// A `MountOps` that records every call instead of performing it — the characterization seam,
+/// A `MountOps` that records every call instead of performing it - the characterization seam,
 /// also used by `kern box --plan`.
 #[derive(Default)]
 pub struct Recorder {
@@ -126,7 +126,7 @@ impl MountOps for Recorder {
 /// How a sandbox's root filesystem is provided. A closed set → an exhaustive `enum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountMode {
-    /// Copy-on-write overlay over a read-only lower — the default for OCI images.
+    /// Copy-on-write overlay over a read-only lower - the default for OCI images.
     Overlay,
     /// Bind-mount an existing host directory as the root.
     Bind,
@@ -152,20 +152,20 @@ impl MountMode {
 pub struct Mounted;
 /// `.old_root` has been created and we have pivoted into the new root.
 pub struct OldRootReady;
-/// The new root has been remounted read-only — terminal state.
+/// The new root has been remounted read-only - terminal state.
 pub struct ReadOnly;
 
 /// A sandbox root filesystem tracked through its setup states.
 ///
-/// The setup order — mount → pivot → remount read-only — is encoded in the type: each step consumes
+/// The setup order - mount → pivot → remount read-only - is encoded in the type: each step consumes
 /// the previous state and returns the next, and [`into_readonly`](Rootfs::into_readonly) is
-/// implemented only for `Rootfs<OldRootReady>`. Remounting the root read-only *before* the pivot — a
-/// classic sandbox-escape shape — is therefore a compile error, not a test you hope you wrote:
+/// implemented only for `Rootfs<OldRootReady>`. Remounting the root read-only *before* the pivot - a
+/// classic sandbox-escape shape - is therefore a compile error, not a test you hope you wrote:
 ///
 /// ```compile_fail
 /// use kern_isolation::{MountMode, Recorder, Rootfs};
 /// let mut ops = Recorder::default();
-/// // `into_readonly` doesn't exist on `Rootfs<Mounted>` (before the pivot) — this fails to compile.
+/// // `into_readonly` doesn't exist on `Rootfs<Mounted>` (before the pivot) - this fails to compile.
 /// let _ = Rootfs::mount(&mut ops, MountMode::Bind, "/r")
 ///     .unwrap()
 ///     .into_readonly(&mut ops);
@@ -196,7 +196,7 @@ impl<S> Rootfs<S> {
 }
 
 impl Rootfs<Mounted> {
-    /// Step 1 — mount the new root for `root` using `mode`.
+    /// Step 1 - mount the new root for `root` using `mode`.
     pub fn mount<M: MountOps>(ops: &mut M, mode: MountMode, root: &str) -> Result<Self, Error> {
         let (src, fstype, flags) = mode.spec();
         ops.mount(src, root, fstype, flags)?;
@@ -215,7 +215,7 @@ impl Rootfs<Mounted> {
         }
     }
 
-    /// Step 2 — create `.old_root` inside the new root and `pivot_root` into it. Consumes the
+    /// Step 2 - create `.old_root` inside the new root and `pivot_root` into it. Consumes the
     /// `Mounted` state, so this must precede any read-only remount.
     pub fn create_old_root<M: MountOps>(self, ops: &mut M) -> Result<Rootfs<OldRootReady>, Error> {
         let old = format!("{}/.old_root", self.root);
@@ -228,7 +228,7 @@ impl Rootfs<Mounted> {
 }
 
 impl Rootfs<OldRootReady> {
-    /// Step 3 — remount the root read-only. Reachable ONLY from `OldRootReady`, so "read-only
+    /// Step 3 - remount the root read-only. Reachable ONLY from `OldRootReady`, so "read-only
     /// before pivot" cannot be written.
     pub fn into_readonly<M: MountOps>(self, ops: &mut M) -> Result<Rootfs<ReadOnly>, Error> {
         ops.remount_ro("/")?;

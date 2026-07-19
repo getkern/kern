@@ -159,7 +159,10 @@ fn connect_vetted(host: &str, port: u16) -> std::io::Result<std::net::TcpStream>
     if let Some(bad) = addrs.iter().find(|a| !ip_is_public(a.ip())) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("refusing {host}: resolves to non-public address {}", bad.ip()),
+            format!(
+                "refusing {host}: resolves to non-public address {}",
+                bad.ip()
+            ),
         ));
     }
     // Every resolved address is public; connect to the first that accepts.
@@ -182,7 +185,7 @@ pub fn ip_is_public(ip: std::net::IpAddr) -> bool {
     fn v4_public(a: std::net::Ipv4Addr) -> bool {
         let o = a.octets();
         // `is_private()` misses ranges that are still NOT routable-public and are reachable inside cloud /
-        // carrier networks, so add them explicitly: CGNAT 100.64.0.0/10 (RFC 6598 — the one that bites in
+        // carrier networks, so add them explicitly: CGNAT 100.64.0.0/10 (RFC 6598 - the one that bites in
         // practice), IETF protocol assignments 192.0.0.0/24, and benchmarking 198.18.0.0/15.
         let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
         let is_ietf_proto = o[0] == 192 && o[1] == 0 && o[2] == 0;
@@ -283,7 +286,13 @@ fn helper_pre_exec() -> std::io::Result<()> {
     // setsid doesn't change the parent) still ties the helper's life to box_run.
     unsafe {
         libc::setsid();
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
     }
     Ok(())
 }
@@ -312,10 +321,15 @@ pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::
     let _ = std::fs::remove_file(&sock_path);
     let exe = std::env::current_exe().map_err(|e| format!("egress: self exe: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("__egress-proxy").arg(&sock_path).arg(allow.join(","))
-        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
+    cmd.arg("__egress-proxy")
+        .arg(&sock_path)
+        .arg(allow.join(","))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
     unsafe { cmd.pre_exec(helper_pre_exec) };
-    let proxy = cmd.spawn().map_err(|e| format!("egress: spawn proxy: {e}"))?;
+    let proxy = cmd
+        .spawn()
+        .map_err(|e| format!("egress: spawn proxy: {e}"))?;
     // Wait briefly for the proxy to bind, so the box's first request doesn't race it. Poll at 1 ms (not
     // 10 ms) granularity: the proxy usually binds in 1-3 ms, and a coarse 10 ms sleep added ~10 ms of dead
     // time to EVERY egress box start (a real bottleneck when a fleet spins many). Same ~2 s total ceiling.
@@ -367,7 +381,13 @@ pub fn spawn(allow: &[String], box_port: u16) -> Result<EgressPending, String> {
         cmd.pre_exec(move || {
             kern_isolation::shed_inherited_fds(rfd);
             libc::setsid();
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
             Ok(())
         });
     }
@@ -589,9 +609,13 @@ fn http_target_port(request_line: &str) -> u16 {
         })
         .map(|rest| rest.split('/').next().unwrap_or(rest))
         .and_then(|authority| {
-            let a = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority); // strip userinfo
+            let a = authority
+                .rsplit_once('@')
+                .map(|(_, h)| h)
+                .unwrap_or(authority); // strip userinfo
             if let Some(rest) = a.strip_prefix('[') {
-                rest.rsplit_once("]:").and_then(|(_, p)| p.trim().parse().ok()) // [v6]:port
+                rest.rsplit_once("]:")
+                    .and_then(|(_, p)| p.trim().parse().ok()) // [v6]:port
             } else {
                 a.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok()) // host:port
             }
@@ -820,29 +844,38 @@ mod tests {
             "255.255.255.255",
             "224.0.0.1", // multicast
             "::1",
-            "fe80::1",              // link-local
-            "fc00::1",              // ULA
-            "fd12::34",             // ULA
-            "::ffff:127.0.0.1",     // IPv4-mapped loopback (must not smuggle past V6 checks)
+            "fe80::1",                // link-local
+            "fc00::1",                // ULA
+            "fd12::34",               // ULA
+            "::ffff:127.0.0.1",       // IPv4-mapped loopback (must not smuggle past V6 checks)
             "::ffff:169.254.169.254", // IPv4-mapped cloud metadata
-            "::ffff:10.0.0.1",      // IPv4-mapped RFC-1918
-            "100.64.0.1",           // CGNAT (RFC 6598)
-            "100.127.255.255",      // CGNAT upper edge
-            "192.0.0.1",            // IETF protocol assignments
-            "198.18.0.1",           // benchmarking
-            "198.19.255.255",       // benchmarking upper edge
-            "240.0.0.1",            // class E reserved (240.0.0.0/4)
-            "255.255.255.254",      // class E upper (broadcast itself caught by is_broadcast)
+            "::ffff:10.0.0.1",        // IPv4-mapped RFC-1918
+            "100.64.0.1",             // CGNAT (RFC 6598)
+            "100.127.255.255",        // CGNAT upper edge
+            "192.0.0.1",              // IETF protocol assignments
+            "198.18.0.1",             // benchmarking
+            "198.19.255.255",         // benchmarking upper edge
+            "240.0.0.1",              // class E reserved (240.0.0.0/4)
+            "255.255.255.254",        // class E upper (broadcast itself caught by is_broadcast)
         ];
         for s in bad {
-            assert!(!ip_is_public(s.parse::<IpAddr>().unwrap()), "{s} must be refused");
+            assert!(
+                !ip_is_public(s.parse::<IpAddr>().unwrap()),
+                "{s} must be refused"
+            );
         }
         for s in [
-            "1.1.1.1", "8.8.8.8", "93.184.215.14", "2606:4700:4700::1111",
-            "100.63.255.255", // just below CGNAT — public
-            "100.128.0.1",    // just above CGNAT — public
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.215.14",
+            "2606:4700:4700::1111",
+            "100.63.255.255", // just below CGNAT - public
+            "100.128.0.1",    // just above CGNAT - public
         ] {
-            assert!(ip_is_public(s.parse::<IpAddr>().unwrap()), "{s} must be allowed");
+            assert!(
+                ip_is_public(s.parse::<IpAddr>().unwrap()),
+                "{s} must be allowed"
+            );
         }
     }
 
@@ -899,20 +932,26 @@ mod tests {
 
     #[test]
     fn valid_allow_entry_is_strict_ldh() {
-        for ok in ["pypi.org", "files.pythonhosted.org", "a-b.example.com", "EXAMPLE.com", "pypi.org."] {
+        for ok in [
+            "pypi.org",
+            "files.pythonhosted.org",
+            "a-b.example.com",
+            "EXAMPLE.com",
+            "pypi.org.",
+        ] {
             assert!(valid_allow_entry(ok), "{ok} should be valid");
         }
         for bad in [
-            "a.com,b.com",  // comma would corrupt the CSV argv
-            "a com",        // space
+            "a.com,b.com", // comma would corrupt the CSV argv
+            "a com",       // space
             "a.com b.com",
-            "-lead.com",    // label starts with hyphen
-            "trail-.com",   // label ends with hyphen
-            "a..com",       // empty label
+            "-lead.com",  // label starts with hyphen
+            "trail-.com", // label ends with hyphen
+            "a..com",     // empty label
             "",
-            "e\nvil.com",   // internal control char
+            "e\nvil.com", // internal control char
             "e\tvil.com",
-            "e vil.com",    // internal space
+            "e vil.com", // internal space
         ] {
             assert!(!valid_allow_entry(bad), "{bad:?} should be refused");
         }
@@ -922,8 +961,14 @@ mod tests {
     fn http_target_port_parses_authority_port() {
         assert_eq!(http_target_port("GET http://pypi.org/ HTTP/1.1"), 80); // no port → 80
         assert_eq!(http_target_port("GET http://pypi.org:443/x HTTP/1.1"), 443);
-        assert_eq!(http_target_port("GET http://pypi.org:8080/x HTTP/1.1"), 8080); // → port_allowed refuses
-        assert_eq!(http_target_port("GET http://user@pypi.org:80/x HTTP/1.1"), 80); // userinfo-aware
+        assert_eq!(
+            http_target_port("GET http://pypi.org:8080/x HTTP/1.1"),
+            8080
+        ); // → port_allowed refuses
+        assert_eq!(
+            http_target_port("GET http://user@pypi.org:80/x HTTP/1.1"),
+            80
+        ); // userinfo-aware
         assert_eq!(http_target_port("GET /origin-form HTTP/1.1"), 80); // no absolute-URI → 80
     }
 
@@ -943,7 +988,13 @@ mod tests {
             Some("evil.com".into())
         );
         // Same via CONNECT authority + with a port; last '@' wins even if userinfo contains one.
-        assert_eq!(host_of_authority("a@b@evil.com:443"), Some("evil.com".into()));
-        assert_eq!(host_of_authority("user@[2606:4700::1]:443"), Some("2606:4700::1".into()));
+        assert_eq!(
+            host_of_authority("a@b@evil.com:443"),
+            Some("evil.com".into())
+        );
+        assert_eq!(
+            host_of_authority("user@[2606:4700::1]:443"),
+            Some("2606:4700::1".into())
+        );
     }
 }

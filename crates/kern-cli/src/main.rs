@@ -1,8 +1,8 @@
-//! kern — a fast, lightweight sandbox & virtual resource manager.
+//! kern - a fast, lightweight sandbox & virtual resource manager.
 //!
 //! This binary is intentionally THIN: it parses argv into a [`cli::Command`] and dispatches.
 //! Real subcommand logic lives in `commands/`, and the sandbox in `sandbox/`. There is NO
-//! `include!()` mega-module — every file is a real `mod` with `pub(crate)` boundaries.
+//! `include!()` mega-module - every file is a real `mod` with `pub(crate)` boundaries.
 //!
 //! See README.md / ARCHITECTURE.md for the roadmap. Commands and flags may still change before 1.0.
 

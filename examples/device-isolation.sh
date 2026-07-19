@@ -1,9 +1,9 @@
 #!/bin/sh
-# Give a container exactly one hardware device — and nothing else.
+# Give a container exactly one hardware device - and nothing else.
 #
 # kern binds only the device you name into the box; every other host device
 # stays absent (deny-by-default). Handy on edge boards: a sensor on i2c, a
-# serial MCU, or a SPI peripheral — exposed to one workload, kept away from the
+# serial MCU, or a SPI peripheral - exposed to one workload, kept away from the
 # rest of the system. Device access is node-granular (a whole /dev node), which
 # is a real kernel boundary; see SECURITY.md for the GPIO-line caveat.
 set -eu
@@ -46,7 +46,7 @@ echo
   echo;
   echo "  host disks in the box?";
   if ls /dev/nvme* /dev/sd* /dev/mmcblk* 2>/dev/null | grep -q .; then
-    echo "    LEAK: host disks visible"; else echo "    none — host storage is not exposed"; fi
+    echo "    LEAK: host disks visible"; else echo "    none - host storage is not exposed"; fi
 '
 
 echo

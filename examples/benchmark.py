@@ -3,7 +3,7 @@
 
 Same workload as the docs: isolate one `/bin/true` and measure *startup overhead*, against
 whatever runtimes are installed (kern, bubblewrap, crun, runc, podman, docker). Latency is
-reported as **total time / N** over N sequential runs — at sub-millisecond scale a per-call
+reported as **total time / N** over N sequential runs - at sub-millisecond scale a per-call
 timer (its own fork+exec) would dominate, so we never time a single run on its own.
 
     python3 examples/benchmark.py                 # auto-detect everything, 200 runs + 200 parallel
@@ -11,11 +11,11 @@ timer (its own fork+exec) would dominate, so we never time a single run on its o
     python3 examples/benchmark.py --conc 50       # lighter concurrency (e.g. on an edge board)
     KERN=./target/release/kern python3 examples/benchmark.py
 
-It prints the same three tables as BENCHMARKS.md — cold-start (median/min/max), throughput
-(runs/s, same data), and concurrency (N parallel, wall-clock) — for whatever runtimes are
+It prints the same three tables as BENCHMARKS.md - cold-start (median/min/max), throughput
+(runs/s, same data), and concurrency (N parallel, wall-clock) - for whatever runtimes are
 installed, so anyone can reproduce the published numbers on their own machine. Stdlib only,
 no dependencies. Honest caveat: the top tier sits within a couple ms of each
-other and of run-to-run noise — nobody "wins" single-shot latency outright. The real gap is to
+other and of run-to-run noise - nobody "wins" single-shot latency outright. The real gap is to
 the engines (podman/docker), which fork conmon / round-trip a daemon every run.
 """
 
@@ -46,7 +46,7 @@ def get_rootfs(kern, workdir):
     dest = os.path.join(workdir, "alpine-rootfs")
     print("==> pulling alpine rootfs (once)...", file=sys.stderr)
     if not sh([kern, "pull", "alpine", "--dest", dest]):
-        sys.exit("could not pull alpine with kern — pass a ready rootfs via --rootfs")
+        sys.exit("could not pull alpine with kern - pass a ready rootfs via --rootfs")
     return dest
 
 
@@ -69,7 +69,7 @@ def make_oci_bundle(spec_tool, rootfs, workdir):
 
 def bench(label, cmd_for, n, repeat, uid, env=None):
     """Warm once, then time `repeat` batches of `n` runs each. Returns the per-batch ms/run
-    samples (sorted) so the caller can report min / median / max — runtimes vary run-to-run
+    samples (sorted) so the caller can report min / median / max - runtimes vary run-to-run
     (runc especially), and a single batch would hide that. `uid` yields a globally-unique id per
     run so OCI container names never collide across batches."""
     sh(cmd_for(next(uid)), env=env)  # warm (caches, cgroup tree, image store)
@@ -93,7 +93,7 @@ def main():
 
     kern = os.environ.get("KERN", "kern")
     if not (have(kern) or os.path.exists(kern)):
-        sys.exit(f"kern not found ({kern}) — set KERN=/path/to/kern")
+        sys.exit(f"kern not found ({kern}) - set KERN=/path/to/kern")
 
     work = tempfile.mkdtemp(prefix="kern-bench-")
     rootfs = args.rootfs or get_rootfs(kern, work)
@@ -101,7 +101,7 @@ def main():
 
     # (label, command-builder, env) for each available runtime; `skipped` records the rest with a
     # reason. On an edge board (Jetson / Pi / Android-kernel SBC) the engines often can't be
-    # installed at all — kern, a single static binary, still runs. That gap *is* the point.
+    # installed at all - kern, a single static binary, still runs. That gap *is* the point.
     rows = [("kern box --rootfs", lambda i: [kern, "box", f"kb{i}", "--rootfs", rootfs,
                                              "--", "/bin/busybox", "true"], bare_env)]
     skipped = []
@@ -112,7 +112,7 @@ def main():
             "--unshare-net", "--bind", rootfs, "/", "--proc", "/proc", "--dev", "/dev",
             "/bin/busybox", "true"], None))
     else:
-        skipped.append("bubblewrap — not installed")
+        skipped.append("bubblewrap - not installed")
 
     spec_tool = "runc" if have("runc") else ("crun" if have("crun") else None)
     bundle = make_oci_bundle(spec_tool, rootfs, work) if spec_tool else None
@@ -120,14 +120,14 @@ def main():
         if have(rt) and bundle:
             rows.append((rt, lambda i, rt=rt: [rt, "run", "--bundle", bundle, f"{rt}{i}"], None))
         else:
-            skipped.append(f"{rt} — " + ("not installed" if not have(rt)
+            skipped.append(f"{rt} - " + ("not installed" if not have(rt)
                                          else "no OCI runtime to build a bundle"))
 
     if have("podman"):
         rows.append(("podman run --rm", lambda i: [
             "podman", "run", "--rm", "--network", "none", "alpine", "/bin/true"], None))
     else:
-        skipped.append("podman — not installed")
+        skipped.append("podman - not installed")
 
     if have("docker"):
         if sh(["docker", "info"]):
@@ -135,14 +135,14 @@ def main():
             rows.append(("docker run --rm", lambda i: [
                 "docker", "run", "--rm", "alpine", "/bin/true"], None))
         else:
-            skipped.append("docker — installed but the daemon isn't running/reachable")
+            skipped.append("docker - installed but the daemon isn't running/reachable")
     else:
-        skipped.append("docker — not installed")
+        skipped.append("docker - not installed")
 
     n, repeat = args.runs, args.repeat
     uid = itertools.count()  # globally-unique id per run (no OCI name collisions across batches)
-    print(f"\nOne isolated /bin/true — {repeat} batches × {n} runs, time/run = total / {n}.")
-    print("(kern here is the bare box, no cgroup cap — like bubblewrap; add a hard cap with the")
+    print(f"\nOne isolated /bin/true - {repeat} batches × {n} runs, time/run = total / {n}.")
+    print("(kern here is the bare box, no cgroup cap - like bubblewrap; add a hard cap with the")
     print(" default `kern box` and it is ~5.5 ms, tied with crun.)\n")
 
     results = []
@@ -161,25 +161,25 @@ def main():
     for label, lo, med, hi in results:
         ratio = med / kern_med
         if med == kern_med:
-            rel = "—"
+            rel = "-"
         elif ratio >= 1:  # slower than kern
             rel = f"{ratio:.1f}× slower" if ratio < 10 else f"{ratio:.0f}× slower"
-        else:  # faster than kern — report it honestly, don't dress it up
+        else:  # faster than kern - report it honestly, don't dress it up
             rel = f"{1 / ratio:.1f}× faster"
         print(f"  {label.ljust(width)}   {med:5.1f}ms  ({lo:4.1f}–{hi:5.1f})   "
               f"{1000 / med:6.0f} runs/s   {rel}")
     if skipped:
-        print(f"\n  Not runnable on this machine (kern is — that's the point):")
+        print(f"\n  Not runnable on this machine (kern is - that's the point):")
         for s in skipped:
             print(f"    ✗ {s}")
 
-    # Concurrency — fan out `conc` isolated starts in parallel (all at once), wall-clock + success
+    # Concurrency - fan out `conc` isolated starts in parallel (all at once), wall-clock + success
     # count. This is the daemonless, lock-free win: kern forks each box independently, while the
     # engines serialize through a daemon. Engines spawn `conc` client processes at once, so this is
-    # deliberately heavy — `--conc 0` skips it.
+    # deliberately heavy - `--conc 0` skips it.
     if args.conc:
         c = args.conc
-        print(f"\nConcurrency — {c} isolated /bin/true in parallel (wall-clock, succeeded/total):")
+        print(f"\nConcurrency - {c} isolated /bin/true in parallel (wall-clock, succeeded/total):")
         for label, cmd_for, env in rows:
             sh(cmd_for(next(uid)), env=env)  # warm
             start = time.perf_counter_ns()
@@ -189,7 +189,7 @@ def main():
             wall = (time.perf_counter_ns() - start) / 1e9
             print(f"  {label.ljust(width)}   {wall:6.2f} s   {ok}/{c}")
 
-    print("\nTop tier sits within a couple ms (= noise) — nobody 'wins' single-shot latency")
+    print("\nTop tier sits within a couple ms (= noise) - nobody 'wins' single-shot latency")
     print("outright. The real gap is to the engines. Full method + table: BENCHMARKS.md\n")
 
     # Best-effort: reap any OCI container state a crashed run might have left behind.

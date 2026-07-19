@@ -1,5 +1,5 @@
 #!/bin/sh
-# An ephemeral, writable shell in an image — like `docker run --rm -it`, but no daemon.
+# An ephemeral, writable shell in an image - like `docker run --rm -it`, but no daemon.
 #
 # Install packages, scribble files, break things: it all lands in a private overlay that's
 # thrown away when the shell exits. The cached image stays pristine for the next run.

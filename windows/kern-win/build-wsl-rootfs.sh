@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-wsl-rootfs.sh — build kern's pre-baked WSL distro rootfs FROM ANY LINUX HOST (no root, no Alpine).
+# build-wsl-rootfs.sh - build kern's pre-baked WSL distro rootfs FROM ANY LINUX HOST (no root, no Alpine).
 # Produces dist/kern-wsl-rootfs.tar.gz: a minimal Alpine + curl + ca-certificates + the kern musl binary,
 # ready for `wsl --import kern <dir> kern-wsl-rootfs.tar.gz`. This is the plug-and-play one-shot payload.
 set -eu
@@ -34,7 +34,7 @@ APK="$WORK/sbin/apk.static"
 
 echo "== bootstrapping rootfs (alpine-base + curl + ca-certificates) =="
 # apk exits non-zero for cosmetic "updating directory permissions" warnings (harmless in-userns); the
-# triggers (busybox symlinks, ca bundle) still run. Don't let set -e abort on those — verify below instead.
+# triggers (busybox symlinks, ca bundle) still run. Don't let set -e abort on those - verify below instead.
 "$APK" --arch "$ARCH" \
   -X "$CDN/main" -X "$CDN/community" \
   -U --allow-untrusted --root "$ROOT" --initdb \
@@ -51,7 +51,7 @@ echo "== uid/gid subrange for multi-uid box isolation =="
 printf 'root:100000:65536\n' > "$ROOT/etc/subuid"
 printf 'root:100000:65536\n' > "$ROOT/etc/subgid"
 # apk couldn't set the setuid bit inside our build userns (the "chown: Invalid argument" above), so set
-# it explicitly — newuidmap/newgidmap must be setuid-root to map a uid range. (kern also runs them as
+# it explicitly - newuidmap/newgidmap must be setuid-root to map a uid range. (kern also runs them as
 # root in WSL, but keep them correct for any path.)
 chmod 4755 "$ROOT/usr/bin/newuidmap" "$ROOT/usr/bin/newgidmap" 2>/dev/null || true
 

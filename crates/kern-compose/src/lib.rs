@@ -1,5 +1,5 @@
-//! The `kern compose` file parser — `docker-compose.yml` (YAML-lite, in the private `yaml` module) and the native
-//! kern TOML subset — both lowered to a `Vec<`[`ComposeBox`]`>`. This crate is **pure parsing**: it
+//! The `kern compose` file parser - `docker-compose.yml` (YAML-lite, in the private `yaml` module) and the native
+//! kern TOML subset - both lowered to a `Vec<`[`ComposeBox`]`>`. This crate is **pure parsing**: it
 //! is CLI-free (no `std::process`, no filesystem) so it can be fuzzed in isolation
 //! (`fuzz/compose_yaml`) and reused by an SDK. The orchestration that shells out to `kern box`
 //! (build/up/down, dependency waits, GC) lives in the CLI's `commands/` module, not here.
@@ -12,8 +12,8 @@
 //! **Mirror-CLI rule (frozen).** A scalar key is a quoted string carrying the exact CLI argument
 //! (`memory = "512m"`, `cpus = "1.5"`, `cpuset = "0-3"`); a repeatable flag is an array of those
 //! same strings (`volumes = ["src:dst:ro"]`); a switch is a TOML bool (`read_only = true`). Because
-//! `compose` shells out to `kern box`, each value is validated by the very same parser the CLI uses
-//! — the TOML surface can never drift from the flag surface. The same `[box.NAME]` table is the
+//! `compose` shells out to `kern box`, each value is validated by the very same parser the CLI uses,
+//! the TOML surface can never drift from the flag surface. The same `[box.NAME]` table is the
 //! unit a future `--profile` will reuse, which is why the key names are frozen now.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 mod yaml;
 
 /// A resolved compose `build:` directive. `context` is a path RELATIVE to the compose file's dir (the
-/// caller confines it beneath that dir before use — traversal guard). `dockerfile` is relative to the
+/// caller confines it beneath that dir before use - traversal guard). `dockerfile` is relative to the
 /// context. `args` are the `--build-arg K=V` pairs (already `${VAR}`-interpolated).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BuildDirective {
@@ -31,7 +31,7 @@ pub struct BuildDirective {
 }
 
 /// One service in a compose file. Most fields mirror a `kern box` flag (`None`/empty/`false` =
-/// "flag absent"); `name`/`command`/`depends_on` are structural — `depends_on` is compose-only, and
+/// "flag absent"); `name`/`command`/`depends_on` are structural - `depends_on` is compose-only, and
 /// `push_box_flags` deliberately skips all three. Frozen key ↔ flag map (non-obvious names):
 /// `swap_max`→`--memory-swap-max`, `cpuset`→`--cpuset-cpus`, `net`→`--net`, `ssh`→`--ssh`,
 /// `user`→`--user`, `volumes`→`-v`, `env`→`-e`, `ports`→`-p`, `secrets`→`--secret`; the rest share
@@ -46,11 +46,11 @@ pub struct ComposeBox {
     pub depends_on: Vec<String>,
     /// Dependencies this box waits to become HEALTHY before it starts (Docker's
     /// `condition: service_healthy`). Each named box must declare `health_cmd`. A superset relation
-    /// with `depends_on` is NOT required — a `depends_healthy` entry implies the ordering edge too
+    /// with `depends_on` is NOT required - a `depends_healthy` entry implies the ordering edge too
     /// (see `all_deps`), so you don't have to repeat the name in `depends_on`.
     pub depends_healthy: Vec<String>,
     /// Dependencies this box waits to RUN TO SUCCESSFUL COMPLETION (exit 0) before it starts
-    /// (Docker's `condition: service_completed_successfully`) — the init-container / migration-job
+    /// (Docker's `condition: service_completed_successfully`) - the init-container / migration-job
     /// pattern. Implies the ordering edge, like `depends_healthy`.
     pub depends_completed: Vec<String>,
     /// A compose `build:` directive resolved to `(context_dir, dockerfile_opt, build_args)`. When set,
@@ -99,7 +99,7 @@ pub struct ComposeBox {
     /// the profile-less services. Empty = always active. `parse` drops inactive services from the
     /// returned set (with a warning) so a profiled service can never be started by accident.
     pub profiles: Vec<String>,
-    /// Network aliases from a service's `networks.<net>.aliases` — extra names the service is reachable
+    /// Network aliases from a service's `networks.<net>.aliases` - extra names the service is reachable
     /// by inside the stack pod (Docker gives each service DNS for its aliases). `kern compose` adds
     /// each to the pod's shared `/etc/hosts` (→ `127.0.0.1`), so a peer that connects to an alias
     /// resolves it exactly like the service name. Empty for the common (no-alias) case.
@@ -108,7 +108,7 @@ pub struct ComposeBox {
 
 impl ComposeBox {
     // Every field's "flag absent" value is its type's Default (None/empty/false), so `new` only sets
-    // the name — a newly-added mirror-CLI field can never be silently left out of construction.
+    // the name - a newly-added mirror-CLI field can never be silently left out of construction.
     fn new(name: String) -> Self {
         ComposeBox {
             name,
@@ -211,7 +211,7 @@ impl ComposeBox {
         // (postgres/redis/nginx/mariadb/grafana) drop privilege in their entrypoint to a service uid,
         // which needs the subordinate uid range to work (see the 0.6 official-image fix). A `rootfs` box
         // is the user's own tree and keeps the default single-uid map (faster, more isolated). Explicit
-        // `uid_range = false` in the compose file is respected — only the ABSENT default flips per image.
+        // `uid_range = false` in the compose file is respected - only the ABSENT default flips per image.
         if self.uid_range || (self.image.is_some() && !self.uid_range_explicit_false) {
             cmd.arg("--uid-range");
         }
@@ -257,11 +257,11 @@ impl ComposeBox {
 /// Both produce the SAME `ComposeBox`es, so the
 /// whole downstream pipeline (topo/conditions/exit-sidecar/pod/launch) is format-agnostic. This is the
 /// compat entry: point `kern compose` at either and it just works (YAML degrades-with-warning on the
-/// long tail — see `yaml::parse`). Auto-detect is deliberate: the two grammars are unambiguous at the
+/// long tail - see `yaml::parse`). Auto-detect is deliberate: the two grammars are unambiguous at the
 /// first non-comment line (`[` opens a TOML table; a bare `key:` opens a YAML mapping).
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     // Strip a leading UTF-8 BOM (Windows editors add one) so the first key/table header is recognized
-    // — Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
+    // - Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
     // "has no services".
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if is_yaml(text) {
@@ -318,7 +318,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
         let b = &mut boxes[idx];
         let s = |v: &str| parse_string(v).map_err(|e| line_err(i, &e));
         match key.trim() {
-            // Scalars — quoted strings carrying the exact CLI argument.
+            // Scalars - quoted strings carrying the exact CLI argument.
             "image" => b.image = Some(s(val)?),
             "rootfs" => b.rootfs = Some(s(val)?),
             "workdir" => b.workdir = Some(s(val)?),
@@ -342,7 +342,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "health_start_period" => b.health_start_period = Some(s(val)?),
             "health_timeout" => b.health_timeout = Some(s(val)?),
             "health_action" => b.health_action = Some(s(val)?),
-            // Switches — TOML booleans.
+            // Switches - TOML booleans.
             "read_only" => b.read_only = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "net" => b.net = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "uid_range" => {
@@ -352,9 +352,9 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "bind_rootfs" => b.bind_rootfs = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "restart" => b.restart = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "tun" => b.tun = parse_bool(val).map_err(|e| line_err(i, &e))?,
-            // Repeatable flags — arrays of the same CLI strings.
+            // Repeatable flags - arrays of the same CLI strings.
             "command" => b.command = parse_string_array(val).map_err(|e| line_err(i, &e))?,
-            // `depends_on` accepts BOTH the array form (`["db"]` — start-order only, like Docker's
+            // `depends_on` accepts BOTH the array form (`["db"]` - start-order only, like Docker's
             // short syntax) and the Docker long-syntax inline table (`{ db = { condition =
             // "service_healthy" } }`), so a real `docker-compose.yml` snippet can be pasted as-is and
             // the health/completion waits just work. The table form routes each dep into the right
@@ -381,7 +381,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
         return Err("no [box.NAME] tables found".into());
     }
     for b in &boxes {
-        // An empty string (`image = ""`) counts as absent — otherwise it only fails downstream in
+        // An empty string (`image = ""`) counts as absent - otherwise it only fails downstream in
         // the child with an opaque error instead of a line-level "needs image or rootfs".
         let nonempty = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
         if !nonempty(&b.image) && !nonempty(&b.rootfs) {
@@ -394,7 +394,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
     Ok(boxes)
 }
 
-/// Dependency order (a box starts after every box it depends on — `depends_on` plus the conditional
+/// Dependency order (a box starts after every box it depends on - `depends_on` plus the conditional
 /// `depends_healthy`/`depends_completed`, via [`ComposeBox::all_deps`]). Errors on an unknown
 /// dependency or a cycle.
 pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
@@ -430,7 +430,7 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
         }
     }
     if order.len() != boxes.len() {
-        // Name the services still in the cycle (indegree never reached 0) — like Docker's
+        // Name the services still in the cycle (indegree never reached 0) - like Docker's
         // "dependency cycle detected: a -> b -> a", this points the user at the offending set instead
         // of just "there's a cycle somewhere". File order, so it's deterministic.
         let mut stuck: Vec<&str> = boxes
@@ -449,7 +449,7 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
 
 /// Like [`topo_order`], but grouped into dependency LEVELS: every box in level `k` depends only on
 /// boxes in levels `< k`, so all boxes WITHIN one level are independent and can be started
-/// concurrently — a barrier between levels preserves `depends_on`. Same deterministic file-order
+/// concurrently - a barrier between levels preserves `depends_on`. Same deterministic file-order
 /// tie-break, same unknown-dep / cycle errors as [`topo_order`].
 pub fn topo_levels(boxes: &[ComposeBox]) -> Result<Vec<Vec<String>>, String> {
     let names: HashSet<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
@@ -466,7 +466,7 @@ pub fn topo_levels(boxes: &[ComposeBox]) -> Result<Vec<Vec<String>>, String> {
     }
     // Level 0 = every indegree-0 box, in file order. Then repeatedly: emit the current level, decrement
     // successors, and the boxes that hit indegree 0 form the next level (a box lands one level after
-    // its LAST-satisfied dependency — standard levelised Kahn).
+    // its LAST-satisfied dependency - standard levelised Kahn).
     // A precomputed name→file-index map keeps the per-level `sort_by_key` at O(k log k): looking the
     // index up here is O(1), vs an O(N) `position` scan that would make the sort O(N·k log k).
     let index: HashMap<&str, usize> = boxes
@@ -527,13 +527,13 @@ pub fn topo_levels(boxes: &[ComposeBox]) -> Result<Vec<Vec<String>>, String> {
 fn parse_depends(b: &mut ComposeBox, val: &str) -> Result<(), String> {
     let v = val.trim();
     if !v.starts_with('{') {
-        // Array form — plain start-order dependencies.
+        // Array form - plain start-order dependencies.
         b.depends_on = parse_string_array(v)?;
         return Ok(());
     }
     // Inline-table form. Parse `name = { condition = "..." }` entries at the top level. We scan
     // rather than pull in a TOML crate (the whole compose parser is dependency-free by design).
-    // Robustness (this is user-supplied — a docker-compose.yml from a third-party repo): reject
+    // Robustness (this is user-supplied - a docker-compose.yml from a third-party repo): reject
     // malformed brace/quote nesting with a clean error, NEVER panic. `balanced_braces` verifies the
     // WHOLE value is a single well-formed `{ … }` (quotes respected, no over-close) before we strip.
     balanced_braces(v)?;
@@ -586,7 +586,7 @@ fn parse_depends(b: &mut ComposeBox, val: &str) -> Result<(), String> {
 /// Verify `s` is a single well-formed `{ … }` inline table: it opens and closes with braces, brace
 /// depth never goes negative (no over-close like `x } }`) and returns to zero (no unterminated `{`),
 /// and braces inside double quotes are literal (not structural). Quotes must be balanced too. Returns
-/// a clean parse error on any violation — the guard that keeps a malformed `docker-compose.yml`
+/// a clean parse error on any violation - the guard that keeps a malformed `docker-compose.yml`
 /// snippet from reaching the slicing/splitting code below as garbage. Iterative (no recursion → no
 /// stack overflow on pathological `{{{{…}}}}`); scans `char`s (never raw byte offsets).
 fn balanced_braces(s: &str) -> Result<(), String> {
@@ -614,12 +614,12 @@ fn balanced_braces(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Split on commas that are NOT inside a nested `{ ... }` and NOT inside double quotes — for the
+/// Split on commas that are NOT inside a nested `{ ... }` and NOT inside double quotes - for the
 /// inline-table `depends_on` form, where the whole list is comma-separated but each entry
 /// (`name = { condition = "..." }`) has its own braces (and a value may quote a comma). Depth- and
 /// quote-tracked. Assumes `balanced_braces(s's wrapper)` already passed, so depth stays ≥ 0. Splits on
 /// the ASCII byte `,`, so `s[start..i]` is always on a char boundary (`char_indices` yields boundaries
-/// and `i+1` past a 1-byte `,` is one too) — no UTF-8 slicing panic.
+/// and `i+1` past a 1-byte `,` is one too) - no UTF-8 slicing panic.
 fn split_top_level_commas(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
@@ -651,8 +651,8 @@ fn strip_comment(line: &str) -> &str {
     toml_lite::strip_comment(line)
 }
 
-/// Fold physical lines into LOGICAL lines so a multi-line array value —
-/// `command = [\n  "a",\n  "b",\n]` (standard TOML) — is parsed as one unit instead of the parser
+/// Fold physical lines into LOGICAL lines so a multi-line array value -
+/// `command = [\n  "a",\n  "b",\n]` (standard TOML) - is parsed as one unit instead of the parser
 /// choking on the bare `[`. Comments are stripped per physical line first; a logical line stays open
 /// while its bracket depth (counted OUTSIDE quoted strings, so a `[`/`]` inside a string doesn't
 /// count) is positive. Returns `(start_line_index, joined)` so errors still point at the opening line.
@@ -729,7 +729,7 @@ fn parse_bool(v: &str) -> Result<bool, String> {
     toml_lite::parse_bool(v)
 }
 
-/// A positive integer (the only int key, `health_interval`, is seconds — 0/negative is nonsense).
+/// A positive integer (the only int key, `health_interval`, is seconds - 0/negative is nonsense).
 /// Validating here gives a precise line-numbered error instead of an opaque child "failed to start".
 fn parse_positive_int(v: &str) -> Result<i64, String> {
     match v.trim().parse::<i64>() {
@@ -958,7 +958,7 @@ mod tests {
         ];
         for input in bad {
             let doc = format!("[box.a]\nimage=\"x\"\n[box.b]\nimage=\"x\"\ndepends_on = {input}");
-            // Must return Ok or Err — the point is it does not panic. (`std::panic` would abort the
+            // Must return Ok or Err - the point is it does not panic. (`std::panic` would abort the
             // test.) A few of these are actually well-formed-but-benign (e.g. `{ a = }` → start-order),
             // which is fine; the invariant under test is "no panic on any of them".
             let _ = parse(&doc);
@@ -967,7 +967,7 @@ mod tests {
 
     #[test]
     fn exhaustive_short_strings_never_panic() {
-        // Enumerate ALL length-6 strings over the structural ASCII alphabet — total coverage of the
+        // Enumerate ALL length-6 strings over the structural ASCII alphabet - total coverage of the
         // short-input space where a brace/quote/comma scanner bug lives. Complements the randomized
         // test below (which reaches long inputs, multibyte, and deep nesting the enumeration can't).
         let alphabet = *b"{}\",=a";
@@ -989,12 +989,12 @@ mod tests {
     #[test]
     fn randomized_fuzz_never_panics_incl_multibyte_and_deep_nesting() {
         // Property: `balanced_braces` / `split_top_level_commas` / `parse_depends` NEVER panic on any
-        // input — Err or benign Ok only. This is the `cargo fuzz`-equivalent the review asked for,
+        // input - Err or benign Ok only. This is the `cargo fuzz`-equivalent the review asked for,
         // run inline (the parser is a private fn in a bin crate, not reachable from the fuzz
         // workspace). Two classes the length-6 enumeration can't reach are covered HERE:
-        //   * MULTIBYTE UTF-8 in values (`é`, `→`, emoji) — the byte-offset-slicing panic class. The
+        //   * MULTIBYTE UTF-8 in values (`é`, `→`, emoji) - the byte-offset-slicing panic class. The
         //     scanner uses `char_indices`, so a multibyte char never splits a boundary; this proves it.
-        //   * DEEP NESTING (`{{{…}}}` hundreds deep) — the recursion/stack-overflow class. The scanner
+        //   * DEEP NESTING (`{{{…}}}` hundreds deep) - the recursion/stack-overflow class. The scanner
         //     is iterative, so depth is just a counter; this proves it doesn't blow the stack.
         // Deterministic LCG (no rng dep, reproducible): if this ever finds a panic, the seed+len make
         // it replayable.
@@ -1029,10 +1029,10 @@ mod tests {
             let _ = split_top_level_commas(&s);
             let _ = parse(&format!("[box.a]\nimage=\"x\"\ndepends_on = {s}"));
         }
-        // Explicit pathological deep nesting — a single input the LCG is unlikely to build exactly.
+        // Explicit pathological deep nesting - a single input the LCG is unlikely to build exactly.
         let deep_open = "{".repeat(2000);
         let deep = format!("{deep_open}{}", "}".repeat(2000));
-        assert!(balanced_braces(&deep).is_ok()); // balanced, just deep — must not overflow
+        assert!(balanced_braces(&deep).is_ok()); // balanced, just deep - must not overflow
         let _ = parse(&format!("[box.a]\nimage=\"x\"\ndepends_on = {deep}"));
         // Unbalanced deep (2000 opens, no closes) → clean Err, no overflow.
         assert!(balanced_braces(&deep_open).is_err());

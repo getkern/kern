@@ -1,15 +1,15 @@
 //! A `.dockerignore` (and kern-native `.kernignore`) matcher for `kern build`, deciding which paths of
 //! the build context are EXCLUDED before a `COPY`/`ADD` reads them. Excluding `.git/`, `node_modules/`,
-//! `.env`, secrets, and build artifacts keeps images small and — more importantly — stops a stray
+//! `.env`, secrets, and build artifacts keeps images small and - more importantly - stops a stray
 //! `COPY . /app` from baking host secrets or the whole VCS history into the image.
 //!
 //! Docker semantics (deliberately matched, including the traps that surprise `.gitignore` users):
-//! - Leading/trailing `/` are STRIPPED — `/build`, `build`, `build/` are the same; there is NO
+//! - Leading/trailing `/` are STRIPPED - `/build`, `build`, `build/` are the same; there is NO
 //!   anchoring like `.gitignore`.
 //! - Rules are evaluated IN ORDER and the LAST match wins, so a `!re-include` must come AFTER the
 //!   exclude that hid it.
 //! - `*` matches a run of non-`/` (one path segment), `?` one non-`/` char, `**` any number of
-//!   segments (incl. zero) — so `*.log` is NOT recursive but `**/*.log` is.
+//!   segments (incl. zero) - so `*.log` is NOT recursive but `**/*.log` is.
 //! - A pattern that matches a directory excludes everything under it.
 //! - `#` comments and blank lines are ignored.
 //!
@@ -27,7 +27,7 @@ struct Rule {
 /// A compiled set of ignore rules for one build context.
 pub struct DockerIgnore {
     rules: Vec<Rule>,
-    /// True if any rule is a `!` re-include — then an excluded directory can't be pruned wholesale
+    /// True if any rule is a `!` re-include - then an excluded directory can't be pruned wholesale
     /// (a descendant might be re-included), so the walk must descend into it.
     has_negation: bool,
 }
@@ -35,7 +35,7 @@ pub struct DockerIgnore {
 impl DockerIgnore {
     /// Load the ignore rules for build context `ctx`: `.dockerignore` first, then `.kernignore`
     /// appended (so kern rules win under last-match). `None` when neither file exists (the caller then
-    /// keeps its fast unfiltered copy — no behavior change for the common no-ignore-file case).
+    /// keeps its fast unfiltered copy - no behavior change for the common no-ignore-file case).
     pub fn load(ctx: &Path) -> Option<DockerIgnore> {
         let mut text = String::new();
         let mut found = false;
@@ -62,7 +62,7 @@ impl DockerIgnore {
                 Some(rest) => (true, rest.trim()),
                 None => (false, line),
             };
-            // Leading/trailing `/` carry no meaning in dockerignore (no anchoring) — strip them, then
+            // Leading/trailing `/` carry no meaning in dockerignore (no anchoring) - strip them, then
             // split into segments. An all-slashes/empty body is skipped.
             let body = body.trim_matches('/');
             if body.is_empty() {
@@ -114,7 +114,7 @@ impl DockerIgnore {
 }
 
 /// Whether ignore `pat` (segments) matches context path `path` (segments). A pattern matches when it
-/// matches SOME prefix of the path — so a pattern naming a directory (`node_modules`) also excludes
+/// matches SOME prefix of the path - so a pattern naming a directory (`node_modules`) also excludes
 /// everything beneath it (`node_modules/lib/x`).
 fn pattern_matches(pat: &[String], path: &[&str]) -> bool {
     (1..=path.len()).any(|k| segs_match(pat, &path[..k]))
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn leading_and_trailing_slashes_are_stripped_no_anchoring() {
-        // `/build`, `build`, `build/` are identical — no `.gitignore`-style anchoring.
+        // `/build`, `build`, `build/` are identical - no `.gitignore`-style anchoring.
         for p in ["/build", "build", "build/"] {
             let i = ig(p);
             assert!(i.excluded("build"), "{p}");
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn negation_re_includes_and_last_match_wins() {
-        // Exclude all logs, but keep important.log — the `!` MUST come after.
+        // Exclude all logs, but keep important.log - the `!` MUST come after.
         let i = ig("*.log\n!important.log\n");
         assert!(i.excluded("debug.log"));
         assert!(!i.excluded("important.log"));

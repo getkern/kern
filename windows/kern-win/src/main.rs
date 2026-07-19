@@ -1,13 +1,13 @@
-//! `kern.exe` — the Windows edge of kern. A THIN bridge: kern's sandbox needs a real Linux kernel
-//! (namespaces + cgroups v2 + overlayfs + seccomp), and Windows already ships one — **WSL2**. This shim
+//! `kern.exe` - the Windows edge of kern. A THIN bridge: kern's sandbox needs a real Linux kernel
+//! (namespaces + cgroups v2 + overlayfs + seccomp), and Windows already ships one - **WSL2**. This shim
 //! translates Windows paths and forwards the command to `kern` INSIDE WSL2.
 //!
 //! HOT PATH = ONE `wsl.exe` spawn, and the forward uses `--exec` (NO shell): with plain `wsl -- cmd`
-//! the args are re-joined and re-parsed by the distro's default shell — argument boundaries survive
+//! the args are re-joined and re-parsed by the distro's default shell - argument boundaries survive
 //! only by accident, `$VAR`/globs get expanded, and a `;` in an arg becomes a second command. `--exec`
 //! passes argv through untouched. kern's absolute path inside the distro is resolved ONCE (via a login
 //! shell, so `~/.local/bin` installs are found) and cached next to the distro name; afterwards each
-//! command is a single `wsl.exe --exec /abs/kern …` — no probe, no shell, no profile sourcing.
+//! command is a single `wsl.exe --exec /abs/kern …` - no probe, no shell, no profile sourcing.
 //!
 //! "Hybrid" = ONE kern: identical CLI on native Linux and on Windows; the Windows side is only this
 //! forwarder. No daemon, no Docker Desktop.
@@ -18,7 +18,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{exit, Command, Stdio};
 
-/// Cache dir (`%LOCALAPPDATA%\kern`) — holds the resolved-distro cache and one-shot hint markers.
+/// Cache dir (`%LOCALAPPDATA%\kern`) - holds the resolved-distro cache and one-shot hint markers.
 fn cache_dir() -> Option<PathBuf> {
     let base = env::var("LOCALAPPDATA").ok().filter(|s| !s.is_empty())?;
     Some(PathBuf::from(base).join("kern"))
@@ -28,7 +28,7 @@ fn cache_dir() -> Option<PathBuf> {
 /// first run only, so the hot path spends ZERO probe spawns and ZERO shell startups. NOTE the name is
 /// `wsl-distro`, NOT `distro`: the installer imports the WSL image into a DIRECTORY
 /// `%LOCALAPPDATA%\kern\distro\` (the ext4.vhdx), so a cache file literally named `distro` collided
-/// with that dir — the write failed every time and every command re-ran the first-run probe.
+/// with that dir - the write failed every time and every command re-ran the first-run probe.
 fn cache_file() -> Option<PathBuf> {
     Some(cache_dir()?.join("wsl-distro"))
 }
@@ -56,7 +56,7 @@ fn clear_cache() {
     }
 }
 
-/// Why we couldn't resolve a usable distro — each maps to an actionable message.
+/// Why we couldn't resolve a usable distro - each maps to an actionable message.
 enum ResolveErr {
     NoDistro,
     KernMissing(String),
@@ -65,11 +65,11 @@ enum ResolveErr {
 /// The resolved forward target: which distro, and how to reach `kern` inside it.
 struct Target {
     distro: String,
-    /// kern's absolute path (cached). `None` only for a `KERN_WSL_DISTRO` env override — then the
+    /// kern's absolute path (cached). `None` only for a `KERN_WSL_DISTRO` env override - then the
     /// forward goes through a login-shell trampoline that resolves PATH the same way the user's
     /// interactive shell would (still ONE wsl.exe spawn).
     kern_path: Option<String>,
-    /// True when `distro` came from the cache file — only then is a stale-cache retry meaningful.
+    /// True when `distro` came from the cache file - only then is a stale-cache retry meaningful.
     from_cache: bool,
 }
 
@@ -78,7 +78,7 @@ struct Target {
 fn resolve_target() -> Result<Target, ResolveErr> {
     if let Ok(d) = env::var("KERN_WSL_DISTRO") {
         if !d.trim().is_empty() {
-            // Explicit override — trust it, no probe, no cache. PATH is resolved by the trampoline.
+            // Explicit override - trust it, no probe, no cache. PATH is resolved by the trampoline.
             return Ok(Target {
                 distro: d.trim().to_string(),
                 kern_path: None,
@@ -93,8 +93,8 @@ fn resolve_target() -> Result<Target, ResolveErr> {
             from_cache: true,
         });
     }
-    // First run only. WSL can take several seconds to boot its utility VM — say so, never hang mute.
-    eprintln!("kern: first run — locating your WSL distro (WSL itself can take a few seconds to start)…");
+    // First run only. WSL can take several seconds to boot its utility VM - say so, never hang mute.
+    eprintln!("kern: first run - locating your WSL distro (WSL itself can take a few seconds to start)…");
     let names = list_distros();
     if names.is_empty() {
         return Err(ResolveErr::NoDistro);
@@ -112,13 +112,13 @@ fn resolve_target() -> Result<Target, ResolveErr> {
             });
         }
     }
-    // Distros exist but none has kern — report the most likely candidate (the first tried).
+    // Distros exist but none has kern - report the most likely candidate (the first tried).
     Err(ResolveErr::KernMissing(ordered[0].clone()))
 }
 
 /// Capture the stdout of a `wsl.exe` sub-command, or `None` on spawn failure / non-zero exit. Sets
 /// `WSL_UTF8=1` (2021+ WSL → plain UTF-8; older ignores it and emits UTF-16LE) and decodes both via
-/// `decode_wsl`. THE one place probe spawns live — a non-success status is never parsed as output
+/// `decode_wsl`. THE one place probe spawns live - a non-success status is never parsed as output
 /// (else WSL's own error text would be mistaken for a distro name / kern path).
 fn wsl_query(args: &[&str]) -> Option<String> {
     let out = Command::new("wsl.exe").args(args).env("WSL_UTF8", "1").output().ok()?;
@@ -127,7 +127,7 @@ fn wsl_query(args: &[&str]) -> Option<String> {
 
 /// Candidate distros in probe order: kern's own pre-baked `kern` distro FIRST (case-insensitive),
 /// then every other listed distro in order. Pure so the "try all, kern-first" rule is unit-tested
-/// without spawning `wsl.exe` — the default distro may be `docker-desktop` while kern lives one line
+/// without spawning `wsl.exe` - the default distro may be `docker-desktop` while kern lives one line
 /// down in `Ubuntu`, so probing only the first name would wrongly report kern missing.
 fn order_candidates(names: &[String]) -> Vec<&String> {
     names
@@ -150,7 +150,7 @@ fn list_distros() -> Vec<String> {
 
 /// One-time, cache-populating resolution of kern's ABSOLUTE path inside `distro`. A LOGIN shell
 /// (`sh -lc`) on purpose: install.sh drops kern in `~/.local/bin`, which only profile-sourcing
-/// shells have on PATH — probing with a bare `sh -c` (non-login) would tell users to install kern,
+/// shells have on PATH - probing with a bare `sh -c` (non-login) would tell users to install kern,
 /// watch them do it, and then still refuse: a dead loop. Runs only when the cache is being written.
 fn kern_path_in(distro: &str) -> Option<String> {
     let p = wsl_query(&["-d", distro, "--exec", "sh", "-lc", "command -v kern"])?;
@@ -160,7 +160,7 @@ fn kern_path_in(distro: &str) -> Option<String> {
 
 /// WSL command output decoding. With `WSL_UTF8=1` it's plain UTF-8; pre-2021 WSL ignores the var and
 /// emits UTF-16LE. Detect by embedded NULs (any real UTF-16LE line has them; UTF-8 never does) and
-/// decode PROPERLY via `decode_utf16` — a byte-skipping hack would truncate any non-Latin-1 distro
+/// decode PROPERLY via `decode_utf16` - a byte-skipping hack would truncate any non-Latin-1 distro
 /// name (e.g. a CJK name) to garbage.
 fn decode_wsl(bytes: &[u8]) -> String {
     if !bytes.contains(&0) {
@@ -216,7 +216,7 @@ fn win_to_wsl(p: &str) -> String {
 }
 
 /// Print the 9p perf hint ONCE per install, and only to a human: a marker file next to the cache
-/// silences repeats, and a non-terminal stderr (scripted/piped use) never sees it — 200 boxes in a
+/// silences repeats, and a non-terminal stderr (scripted/piped use) never sees it - 200 boxes in a
 /// CI loop must not emit 200 identical warnings into captured output.
 fn hint_9p_once() {
     if !std::io::stderr().is_terminal() {
@@ -229,15 +229,15 @@ fn hint_9p_once() {
         return;
     }
     let _ = fs::write(&marker, "shown\n");
-    eprintln!("kern: note — a mounted Windows path uses the WSL2 9p bridge (slower); keep hot data inside WSL for speed. (shown once)");
+    eprintln!("kern: note - a mounted Windows path uses the WSL2 9p bridge (slower); keep hot data inside WSL for speed. (shown once)");
 }
 
 /// Build the exact `wsl.exe` argv (everything after the program name). `--exec` means argv passes
-/// through to the Linux side UNTOUCHED — no default-shell re-parse, so a user arg like
+/// through to the Linux side UNTOUCHED - no default-shell re-parse, so a user arg like
 /// `--env X=1;rm -rf /` or `printenv '$HOME'` reaches kern literally, never a second shell command.
 /// With a cached absolute kern path we exec it directly; with an env-override distro (no cached path)
 /// we exec a login-shell TRAMPOLINE whose script is a FIXED literal (`exec kern "$@"`) and whose args
-/// arrive as POSITIONAL PARAMETERS — still no re-parse of user args. Pure, so the argv is unit-tested.
+/// arrive as POSITIONAL PARAMETERS - still no re-parse of user args. Pure, so the argv is unit-tested.
 fn forward_argv(target: &Target, translated: &[String]) -> Vec<String> {
     let mut argv = vec!["-d".into(), target.distro.clone(), "--exec".into()];
     match &target.kern_path {
@@ -258,21 +258,21 @@ fn forward(target: &Target, translated: &[String]) -> std::io::Result<std::proce
         .status()
 }
 
-/// The one-shot Windows install command — quoted in both "distro missing" messages, so the URL
+/// The one-shot Windows install command - quoted in both "distro missing" messages, so the URL
 /// lives in exactly one place.
 const INSTALL_HINT: &str =
     "   powershell -ExecutionPolicy Bypass -Command \"irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex\"";
 
 fn main() {
     // `args_os` + lossy, NOT `env::args()`: the latter PANICS on an argument with invalid Unicode
-    // (legal in NTFS names via unpaired UTF-16 surrogates) — a backtrace instead of an error.
+    // (legal in NTFS names via unpaired UTF-16 surrogates) - a backtrace instead of an error.
     let args: Vec<String> = env::args_os()
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
 
     // Up to 2 attempts: a stale cache (distro unregistered since it was written) is cleared and
-    // re-resolved ONCE, transparently — not a permanent bare WSL error until a human deletes a file.
+    // re-resolved ONCE, transparently - not a permanent bare WSL error until a human deletes a file.
     for attempt in 0..2 {
         let target = match resolve_target() {
             Ok(t) => t,
@@ -280,13 +280,13 @@ fn main() {
                 eprintln!(
                     "kern: no usable WSL2 distro found. kern runs its Linux sandbox inside WSL2. Install it once:\n\n\
                      {INSTALL_HINT}\n\n\
-                     (one-time setup — far lighter than Docker Desktop)."
+                     (one-time setup - far lighter than Docker Desktop)."
                 );
                 exit(1);
             }
             Err(ResolveErr::KernMissing(d)) => {
                 eprintln!(
-                    "kern: found WSL distro '{d}', but kern isn't installed inside it. Easiest fix — re-run the\n\
+                    "kern: found WSL distro '{d}', but kern isn't installed inside it. Easiest fix - re-run the\n\
                      kern installer (it imports a ready-made distro with kern already inside):\n\n\
                      {INSTALL_HINT}\n\n\
                      or, if '{d}' has curl:  wsl -d {d} -- sh -lc 'curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh'"
@@ -303,19 +303,19 @@ fn main() {
         }
 
         match forward(&target, &translated) {
-            // wsl.exe itself failed (code -1 = 0xFFFFFFFF — kern's own exits are 0-255): if the
+            // wsl.exe itself failed (code -1 = 0xFFFFFFFF - kern's own exits are 0-255): if the
             // distro came from OUR cache it may have been unregistered → clear + one fresh retry.
             Ok(s) if s.code() == Some(-1) && target.from_cache && attempt == 0 => {
                 clear_cache();
                 eprintln!(
-                    "kern: WSL distro '{}' didn't start (removed or renamed?) — re-detecting…",
+                    "kern: WSL distro '{}' didn't start (removed or renamed?) - re-detecting…",
                     target.distro
                 );
                 continue;
             }
             Ok(s) => exit(s.code().unwrap_or(1)),
             Err(e) => {
-                clear_cache(); // wsl.exe not even spawnable — force a fresh probe next time
+                clear_cache(); // wsl.exe not even spawnable - force a fresh probe next time
                 eprintln!("kern: could not invoke WSL2: {e}. Is WSL installed? Try: wsl -l -v");
                 exit(1);
             }
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn translate_arg_leaves_unc_and_drive_relative_untouched() {
         // We only translate real drive paths; UNC and drive-relative are forwarded verbatim
-        // (kern inside WSL / the user is responsible — we never silently corrupt them).
+        // (kern inside WSL / the user is responsible - we never silently corrupt them).
         assert_eq!(translate_arg(r"\\wsl$\Ubuntu\home"), r"\\wsl$\Ubuntu\home");
         assert_eq!(translate_arg("C:relative"), "C:relative");
     }
@@ -425,7 +425,7 @@ mod tests {
             kern_path: Some("/root/.local/bin/kern".into()),
             from_cache: true,
         };
-        // A shell-hostile arg must survive as ONE element — `--exec` means no shell parses it.
+        // A shell-hostile arg must survive as ONE element - `--exec` means no shell parses it.
         let args = vec!["box".into(), "--env".into(), "X=1;rm -rf /".into()];
         assert_eq!(
             forward_argv(&t, &args),

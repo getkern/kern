@@ -10,5 +10,5 @@ publish = false
 
 [dependencies]
 # The single boundary to the kernel. libc is the minimal, ubiquitous choice (raw syscalls,
-# no abstraction) — closest to the project's zero-bloat ethos now that real syscalls are needed.
+# no abstraction) - closest to the project's zero-bloat ethos now that real syscalls are needed.
 libc = "0.2"

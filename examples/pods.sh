@@ -1,5 +1,5 @@
 #!/bin/sh
-# A POD is a set of boxes that share ONE network namespace — like a Kubernetes pod. Members reach
+# A POD is a set of boxes that share ONE network namespace - like a Kubernetes pod. Members reach
 # each other over `localhost` AND by NAME, on 127.0.0.1. There is no daemon: `kern pod create`
 # spawns a tiny holder process that owns the shared user+net namespace, and each
 # `kern box --pod <name>` setns()es into it.
@@ -37,7 +37,7 @@ echo "==> join 'server': a detached box in the pod, serving HTTP on :8080:"
 sleep 1
 
 echo
-echo "==> kern pod ls — the pod now has members:"
+echo "==> kern pod ls - the pod now has members:"
 "$kern" pod ls
 
 echo

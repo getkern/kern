@@ -1,4 +1,4 @@
-# kern.exe — the Windows→WSL2 bridge. kern is one Linux binary; on Windows the edge is a thin shim
+# kern.exe - the Windows→WSL2 bridge. kern is one Linux binary; on Windows the edge is a thin shim
 # that forwards to kern running inside a WSL2 distro. Zero dependencies (std only), like kern itself.
 #
 # This crate is OUTSIDE the main workspace (see the root Cargo.toml `exclude`) so the normal Linux
@@ -7,7 +7,7 @@
 # (needs the mingw-w64 toolchain + `rustup target add x86_64-pc-windows-gnu`).
 [package]
 name = "kern-win"
-version = "0.6.5"
+version = "0.6.7"
 edition = "2021"
 description = "Windows->WSL2 forwarder for kern (the Windows edge is a thin shim over one Linux kern)"
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ license = "Apache-2.0"
 name = "kern"          # ships as kern.exe on Windows
 path = "src/main.rs"
 
-[dependencies]           # zero — std only, like kern itself
+[dependencies]           # zero - std only, like kern itself
 
 [profile.release]
 opt-level = "z"

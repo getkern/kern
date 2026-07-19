@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Embed kern in Python: run LLM/agent-generated code in a fresh kernel sandbox per call.
 
-This is the `kern_sandbox` package (install from source: `pip install ./bindings/python`) — a thin, safe
+This is the `kern_sandbox` package (install from source: `pip install ./bindings/python`) - a thin, safe
 wrapper around the `kern` binary. Each `run_code()`/`run()` spawns a FRESH, ephemeral box (user
 namespace + seccomp + cgroups); FILE state persists between steps via a workspace directory on disk,
-but PROCESSES do not (no resident interpreter — write to disk if you need continuity).
+but PROCESSES do not (no resident interpreter - write to disk if you need continuity).
 
 Safe by default: no network, no host mounts, seccomp on, resource caps enforced. Sandbox events
-(timeout / blocked-escape / OOM-kill) come back as DATA in `result.fault`, never as an exception —
+(timeout / blocked-escape / OOM-kill) come back as DATA in `result.fault`, never as an exception -
 so running untrusted code doesn't force a try/except for normal outcomes.
 
     KERN_BIN=./target/release/kern python3 examples/embed-python.py
 
 Honest threat model: this is a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp is
-a denylist — good for agent/CI code, NOT a hard boundary against deliberately hostile multi-tenant
+a denylist - good for agent/CI code, NOT a hard boundary against deliberately hostile multi-tenant
 code (for that use a microVM / gVisor). See bindings/python/README.md.
 """
 import kern_sandbox as kern
@@ -26,7 +26,7 @@ print("   stdout:", r.stdout.strip().replace("\n", " | "))
 
 # 2) A session: FILE state persists across steps (a workspace on disk), each step is a fresh box.
 #    `setup=` is the ONE moment the network is on (a separate box that installs deps, then dies).
-print("\n2) a session — write a file in one step, read it in the next:")
+print("\n2) a session - write a file in one step, read it in the next:")
 with kern.Sandbox(memory_mb=256, cpus=0.5, timeout_s=15) as sbx:
     sbx.write_file("data.csv", "a,b\n1,2\n3,4\n")
     r = sbx.run_code(
@@ -35,7 +35,7 @@ with kern.Sandbox(memory_mb=256, cpus=0.5, timeout_s=15) as sbx:
     print(f"   computed from the CSV the previous step wrote: {r.stdout.strip()}  (success={r.success})")
 
 # 3) Untrusted code that misbehaves is reported as a FAULT (data), not an exception.
-print("\n3) untrusted code that runs away — reported as a fault, not a crash:")
+print("\n3) untrusted code that runs away - reported as a fault, not a crash:")
 with kern.Sandbox(timeout_s=2) as sbx:
     r = sbx.run_code("while True: pass")   # infinite loop
     if r.fault:
@@ -43,7 +43,7 @@ with kern.Sandbox(timeout_s=2) as sbx:
     print(f"   success={r.success}   (the binding killed the box at its deadline)")
 
 # 4) The isolation is real: with no `network=True`, the box cannot open a socket to the outside.
-print("\n4) network is off by default — an outbound connection fails:")
+print("\n4) network is off by default - an outbound connection fails:")
 with kern.Sandbox(timeout_s=10) as sbx:
     r = sbx.run_code(
         "import socket\n"
@@ -54,4 +54,4 @@ with kern.Sandbox(timeout_s=10) as sbx:
     )
     print("   ", r.stdout.strip())
 
-print("\ndone — a fresh, isolated box per call; file-state on disk; faults as data.")
+print("\ndone - a fresh, isolated box per call; file-state on disk; faults as data.")

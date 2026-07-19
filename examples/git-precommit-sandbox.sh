@@ -4,10 +4,10 @@
 # Why: a pre-commit run executes project code (test suites, lint plugins, git hooks pulled in with a
 # dependency). On your bare machine that code has your whole home directory. Run it in a box instead:
 # the repo is bound READ-ONLY, there is no network and no host access, and the box's exit code gates
-# the commit — non-zero means git aborts. A malicious test or hook can fail the commit but can't
+# the commit - non-zero means git aborts. A malicious test or hook can fail the commit but can't
 # touch your machine.
 #
-# kern has no built-in git integration (it's a sandbox runtime, not a hook manager) — the "hook" is
+# kern has no built-in git integration (it's a sandbox runtime, not a hook manager) - the "hook" is
 # just a two-line shell snippet that calls `kern box`. It's printed below, then demoed for real.
 set -eu
 kern="${KERN:-kern}"
@@ -41,11 +41,11 @@ run_hook() {
     sh -c 'sh check.sh'
 }
 
-echo "==> commit #1: clean tree — checks pass, commit would be ALLOWED:"
+echo "==> commit #1: clean tree - checks pass, commit would be ALLOWED:"
 if run_hook; then echo "   hook exit 0 -> git proceeds with the commit"; fi
 
 echo
-echo "==> commit #2: someone left a blocker in the code — checks fail, commit is BLOCKED:"
+echo "==> commit #2: someone left a blocker in the code - checks fail, commit is BLOCKED:"
 echo "// TODO-BLOCKER do not ship" > "$repo/oops.c"
 if run_hook; then
   echo "   (unexpected) hook passed"

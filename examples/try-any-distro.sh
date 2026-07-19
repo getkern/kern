@@ -1,5 +1,5 @@
 #!/bin/sh
-# Try a command on several Linux distros — instantly, throwaway, no VM, no install.
+# Try a command on several Linux distros - instantly, throwaway, no VM, no install.
 # Each box pulls the image once (cached after), runs in a writable overlay, and vanishes.
 # Without kern this means either a daemon (Docker) or hand-built chroots/VMs.
 set -eu

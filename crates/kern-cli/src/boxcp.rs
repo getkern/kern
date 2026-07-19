@@ -1,10 +1,10 @@
-//! `kern cp` — copy a file between the host and a running box, with **symlink-confined** resolution
+//! `kern cp` - copy a file between the host and a running box, with **symlink-confined** resolution
 //! of the in-box path.
 //!
 //! The box side of the path is resolved with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`
 //! against the box's root directory (`/proc/<pid1>/root`). `RESOLVE_IN_ROOT` reinterprets every
 //! absolute symlink and `..` as if that directory were `/`, so a hostile image cannot plant a symlink
-//! (or a `..` chain) that makes the copy read or write a **host** file outside the box — the class of
+//! (or a `..` chain) that makes the copy read or write a **host** file outside the box - the class of
 //! bug behind CVE-2019-14271 (`docker cp` following a container symlink out to the host). We never
 //! exec anything inside the box, and `RESOLVE_NO_MAGICLINKS` refuses to traverse `/proc`-style magic
 //! links during resolution.
@@ -16,7 +16,7 @@ use crate::error::Error;
 use crate::openat2::openat2_in_root;
 use std::os::unix::io::RawFd;
 
-/// Open `/proc/<pid1>/root` as an `O_PATH` dirfd — the box's root for confined resolution.
+/// Open `/proc/<pid1>/root` as an `O_PATH` dirfd - the box's root for confined resolution.
 fn box_root_fd(pid1: i32) -> std::io::Result<RawFd> {
     let p = std::ffi::CString::new(format!("/proc/{pid1}/root")).unwrap();
     let fd = unsafe {
@@ -47,11 +47,11 @@ fn as_box_ref(spec: &str) -> Option<(i32, String)> {
     Some((pid1, path.to_string()))
 }
 
-/// `kern cp <src> <dst>` — exactly one of `src`/`dst` must be `<box>:<path>`.
+/// `kern cp <src> <dst>` - exactly one of `src`/`dst` must be `<box>:<path>`.
 pub fn cp(src: &str, dst: &str) -> Result<(), Error> {
     match (as_box_ref(src), as_box_ref(dst)) {
         (Some(_), Some(_)) => Err(Error::Sandbox(
-            "box-to-box copy isn't supported — copy via the host in two steps".into(),
+            "box-to-box copy isn't supported - copy via the host in two steps".into(),
         )),
         (Some((pid1, box_src)), None) => copy_out(pid1, &box_src, dst),
         (None, Some((pid1, box_dst))) => copy_in(src, pid1, &box_dst),
@@ -66,7 +66,7 @@ pub fn cp(src: &str, dst: &str) -> Result<(), Error> {
 /// takes the source basename).
 fn copy_out(pid1: i32, box_src: &str, host_dst: &str) -> Result<(), Error> {
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
-    // `O_NONBLOCK`: a hostile image could plant a FIFO at `box_src` — a plain `O_RDONLY` open of a FIFO
+    // `O_NONBLOCK`: a hostile image could plant a FIFO at `box_src` - a plain `O_RDONLY` open of a FIFO
     // BLOCKS until a writer appears, hanging the operator's `cp`. Opening non-blocking returns
     // immediately; we then `fstat` and reject anything but a regular file (below), for which the flag
     // is a no-op.
@@ -96,7 +96,7 @@ fn copy_out(pid1: i32, box_src: &str, host_dst: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Max bytes `kern cp` moves in one call (streamed) — a self-DoS guard, not a security boundary.
+/// Max bytes `kern cp` moves in one call (streamed) - a self-DoS guard, not a security boundary.
 const MAX_CP_BYTES: u64 = 4 << 30; // 4 GiB
 
 /// Copy `src` → `dst` with a fixed buffer, refusing past [`MAX_CP_BYTES`]. Returns bytes copied.

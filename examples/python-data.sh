@@ -58,5 +58,5 @@ sed 's/^/   /' "$work/out/report.md"
 
 echo
 echo "==> your host stayed clean:"
-command -v python3 >/dev/null 2>&1 && echo "   (host has python3)" || echo "   host has NO python3 — it all lived in the boxes"
-echo "done — deps, data and output removed on exit (trap)."
+command -v python3 >/dev/null 2>&1 && echo "   (host has python3)" || echo "   host has NO python3 - it all lived in the boxes"
+echo "done - deps, data and output removed on exit (trap)."

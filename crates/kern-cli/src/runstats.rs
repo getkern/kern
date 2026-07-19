@@ -1,17 +1,17 @@
-//! `kern run` throughput counter — a single mmap'd atomic, daemonless and lock-free.
+//! `kern run` throughput counter - a single mmap'd atomic, daemonless and lock-free.
 //!
 //! `kern run` is a fire-and-forget capped process (~1 ms, no sandbox, not registered). To let `kern
 //! top` show LIVE run throughput without tracking each ephemeral run, every `kern run` does ONE
-//! `fetch_add` on a shared-memory counter just before it `exec()`s the workload — cost a few
+//! `fetch_add` on a shared-memory counter just before it `exec()`s the workload - cost a few
 //! nanoseconds plus a one-time page map. `kern top` samples the MONOTONIC total each refresh and
 //! derives runs/sec + a sparkline entirely reader-side.
 //!
 //! Two honest, zero-cost fields are tracked (a page has room for more): a monotonic **total** count
 //! and the cumulative **setup latency** (process entry → `exec`, in microseconds) so `top` can show a
-//! real average — the per-run exec-setup cost, measured not guessed. (Honest caveat: for a *scoped*
+//! real average - the per-run exec-setup cost, measured not guessed. (Honest caveat: for a *scoped*
 //! run the workload is exec'd in a re-exec'd child, so this is the child's entry→exec leg, not the full
-//! outer→inner setup — an under-, never over-count.) What is NOT tracked:
-//! "active/peak CONCURRENT" — `kern run` exec()s IN PLACE (no supervisor left to decrement on exit), so
+//! outer→inner setup - an under-, never over-count.) What is NOT tracked:
+//! "active/peak CONCURRENT" - `kern run` exec()s IN PLACE (no supervisor left to decrement on exit), so
 //! a live-count would need a per-run reaper against the whole point of a ~1 ms run. `top` derives
 //! runs/sec, a session peak throughput, and a sparkline entirely reader-side from the monotonic total.
 
@@ -23,17 +23,17 @@ const MAP_LEN: usize = 4096;
 
 /// Captured once at process entry (see [`mark_start`]); [`record`] measures entry→exec against it to
 /// accumulate the honest per-run setup latency. If `mark_start` was never called the latency add is 0
-/// (the count still increments) — a metric must never change behaviour, only observe it.
+/// (the count still increments) - a metric must never change behaviour, only observe it.
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Stamp the process-start instant, as early as possible in `main`. Cheap (one `Instant::now`), safe to
-/// call on every `kern` invocation — only `kern run` reads it back via [`record`].
+/// call on every `kern` invocation - only `kern run` reads it back via [`record`].
 pub fn mark_start() {
     let _ = START.set(std::time::Instant::now());
 }
 
 /// `$XDG_RUNTIME_DIR/kern/runstats` (falling back to `/run/user/<uid>` then `/tmp/kern-<uid>`), the
-/// same runtime-dir resolution as the box registry — so writer (`kern run`) and reader (`kern top`)
+/// same runtime-dir resolution as the box registry - so writer (`kern run`) and reader (`kern top`)
 /// agree on the file without a shared constant.
 fn path() -> std::path::PathBuf {
     if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -73,8 +73,8 @@ pub fn record() {
     );
 }
 
-/// `(total, setup_latency_µs_sum)` — the cumulative `kern run` count and the summed entry→exec latency
-/// (both 0 if the counter file is absent/unreadable). Read-only and lock-free — safe to sample from
+/// `(total, setup_latency_µs_sum)` - the cumulative `kern run` count and the summed entry→exec latency
+/// (both 0 if the counter file is absent/unreadable). Read-only and lock-free - safe to sample from
 /// `kern top` on every refresh; the average latency is `sum / total`.
 pub fn snapshot() -> (u64, u64) {
     let mut out = (0u64, 0u64);
@@ -88,7 +88,7 @@ pub fn snapshot() -> (u64, u64) {
 
 /// Open `path` with `open_flags`, ensure it's page-sized, `mmap` it `MAP_SHARED` with `prot`, run `f`
 /// on the mapping, then unmap. All failures are swallowed (the caller gets its default). The fd is
-/// closed right after mmap — the mapping keeps the page alive without it.
+/// closed right after mmap - the mapping keeps the page alive without it.
 fn with_map(path: &std::path::Path, open_flags: i32, prot: i32, f: impl FnOnce(*mut libc::c_void)) {
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return;
@@ -103,8 +103,8 @@ fn with_map(path: &std::path::Path, open_flags: i32, prot: i32, f: impl FnOnce(*
             let _ = libc::ftruncate(fd, MAP_LEN as libc::off_t);
         }
         // Guard against a SIGBUS: mapping MAP_LEN over a file SHORTER than a page leaves the page we
-        // touch (offsets 0/8) with no backing, and any access faults. A 0-byte counter — planted, or a
-        // failed/racing ftruncate — must not crash `kern top`. Refuse to map under a full page: the
+        // touch (offsets 0/8) with no backing, and any access faults. A 0-byte counter - planted, or a
+        // failed/racing ftruncate - must not crash `kern top`. Refuse to map under a full page: the
         // reader then reports 0, the writer skips this one increment rather than abort.
         let mut st: libc::stat = std::mem::zeroed();
         if libc::fstat(fd, &mut st) != 0 || (st.st_size as u64) < MAP_LEN as u64 {
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn record_increments_the_shared_total() {
-        // Isolate the counter file to a temp runtime dir (process-global env — serialize with others).
+        // Isolate the counter file to a temp runtime dir (process-global env - serialize with others).
         let _g = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn a_short_counter_file_reads_as_empty_and_never_sigbuses() {
         // A 0-byte counter (planted, externally truncated, or a failed/racing ftruncate) mmaps a page
-        // with no backing — touching it would SIGBUS and crash `kern top`. `with_map`'s fstat guard must
+        // with no backing - touching it would SIGBUS and crash `kern top`. `with_map`'s fstat guard must
         // make the reader report 0 instead, and the writer must self-heal the file (ftruncate to a page)
         // then count. This test would ABORT the whole runner if the guard regressed.
         let _g = crate::TEST_ENV_LOCK

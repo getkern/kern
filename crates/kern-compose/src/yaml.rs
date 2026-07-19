@@ -2,17 +2,17 @@
 //!
 //! **Why hand-rolled.** The whole compose surface is dependency-free by design (like the TOML parser
 //! and the OCI tar vetter). We parse the SUBSET of compose that real stacks use and **degrade the long
-//! tail with a warning** rather than promise full compatibility — the honest "drop-in-with-degrade"
+//! tail with a warning** rather than promise full compatibility - the honest "drop-in-with-degrade"
 //! posture. A field we can't map is warned about and skipped (or reconstructed), never silently
 //! mis-converted: a mis-converted field is worse than a skipped one because it *runs and lies*.
 //!
-//! **Security posture (this is semi-trusted input — a compose from a third-party repo).**
+//! **Security posture (this is semi-trusted input - a compose from a third-party repo).**
 //!  * Never a panic on any input: only `char_indices`/byte-safe slicing, iterative (no recursion → no
 //!    stack overflow on deep nesting), and a nesting cap. Property-fuzzed (see `fuzz/`).
-//!  * **Anchors/aliases (`&`/`*`) are NOT expanded** — a `&a [*a]` billion-laughs is not even
+//!  * **Anchors/aliases (`&`/`*`) are NOT expanded** - a `&a [*a]` billion-laughs is not even
 //!    representable because we refuse the document on sight of a structural anchor/alias, never follow
 //!    the reference. (Hand-rolled means WE control this, not a library that might expand first.)
-//!  * Every value is treated as a raw string — no numeric coercion, so YAML 1.1's sexagesimal trap
+//!  * Every value is treated as a raw string - no numeric coercion, so YAML 1.1's sexagesimal trap
 //!    (`22:22` → 1342) can't fire on a port.
 //!  * `build:` `context`/`dockerfile` are paths the caller CONFINES under the compose dir (traversal).
 //!
@@ -22,7 +22,7 @@
 
 use super::{BuildDirective, ComposeBox};
 
-/// Max indentation depth we track — a compose service tree is 3-4 deep; anything past this is refused
+/// Max indentation depth we track - a compose service tree is 3-4 deep; anything past this is refused
 /// rather than parsed, bounding work and stack (we're iterative, but this caps pathological input).
 const MAX_DEPTH: usize = 32;
 /// Total nodes an anchor/alias/merge expansion may materialize. Every aliased clone spends from this
@@ -35,18 +35,18 @@ const MAX_ANCHOR_NODES: usize = 10_000;
 /// return is the mappable boxes (or a hard error for a malformed / unsupported-structural document).
 ///
 /// `pub(crate)`: reached only through the crate's one public door, [`super::parse`] (which sniffs
-/// YAML vs TOML first). The `yaml` module itself is private, so this was never externally reachable —
+/// YAML vs TOML first). The `yaml` module itself is private, so this was never externally reachable -
 /// the narrower marker just says so.
 pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     // Fold multi-line block scalars (`|`/`>`) and multi-line flow collections onto single logical lines
     // first, so the rest of the pipeline stays line-at-a-time (block-scalar bodies become opaque values).
     let folded = fold_multiline(text)?;
 
-    // Refuse structural YAML we deliberately don't support, BEFORE any parsing — so a billion-laughs
+    // Refuse structural YAML we deliberately don't support, BEFORE any parsing - so a billion-laughs
     // or a tab-indented file fails fast with a clear reason, never reaches the line scanner.
     prescreen(&folded)?;
 
-    // Interpolate `${VAR}` / `${VAR:-default}` at the DOCUMENT level, like Docker — so it works
+    // Interpolate `${VAR}` / `${VAR:-default}` at the DOCUMENT level, like Docker - so it works
     // everywhere (ports, command, volumes, environment, build.args), not just in a couple of fields. A
     // per-field pass would miss `ports: ["${PORT}:80"]`; Docker substitutes over the whole file before
     // parsing, and so do we. Unset with no default → empty + warn (Docker semantics), never a literal
@@ -56,17 +56,17 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
 
     let lines = lex(text)?;
     let mut root = build_tree(&lines)?;
-    // Expand YAML anchors (`&x`), aliases (`*x`) and merge keys (`<<: *x`) — the common `x-*` template
-    // DRY pattern real compose files use — under a hard node budget (billion-laughs-safe). After this,
+    // Expand YAML anchors (`&x`), aliases (`*x`) and merge keys (`<<: *x`) - the common `x-*` template
+    // DRY pattern real compose files use - under a hard node budget (billion-laughs-safe). After this,
     // the tree holds only concrete values.
     resolve_anchors(&mut root)?;
-    // Resolve `extends:` (a service inheriting another service's fields) — a real Compose feature the
+    // Resolve `extends:` (a service inheriting another service's fields) - a real Compose feature the
     // `x-`/anchor pattern doesn't cover, since it references another SERVICE by name. Same-file only.
     resolve_extends(&mut root)?;
 
     // Top level must have `services:`. `volumes:`/`networks:`/`version:`/`name:` are recognized;
     // everything else at the top is warned and ignored.
-    // Top-level `secrets:` definitions (`name -> file`) — collected first so a service's
+    // Top-level `secrets:` definitions (`name -> file`) - collected first so a service's
     // `secrets: [name]` reference can be resolved to its file. Only the `file:`-backed form maps to
     // kern (`--secret <file>:<name>` → `/run/secrets/<name>`); `external:`/`environment:` secrets warn.
     let secret_files = collect_secret_files(&root);
@@ -78,7 +78,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
             "services" => {
                 have_services = true;
                 for (name, svc) in &node.children {
-                    // A duplicate service key is a real authoring mistake (two blocks, same name) —
+                    // A duplicate service key is a real authoring mistake (two blocks, same name) -
                     // reject it rather than launch two boxes with the same name (which then collide at
                     // start with an opaque "already running", or silently shadow). Docker's YAML parser
                     // rejects duplicate mapping keys too.
@@ -88,12 +88,12 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
                     let b = service_to_box(name, svc, &secret_files)?;
                     // Docker profiles: a service with a non-empty profile list is INACTIVE unless one
                     // of its profiles is enabled via COMPOSE_PROFILES. A plain `up` starts only the
-                    // profile-less services — so we SKIP an inactive one (never start it by accident),
+                    // profile-less services - so we SKIP an inactive one (never start it by accident),
                     // warning how to enable it. (kern has no `--profile` flag yet; COMPOSE_PROFILES is
                     // the env kern honors, matching Docker's env of the same name.)
                     if !b.profiles.is_empty() && !any_profile_active(&b.profiles) {
                         warn(&format!(
-                            "service '{name}': skipped — profile(s) [{}] not active (set COMPOSE_PROFILES to enable)",
+                            "service '{name}': skipped - profile(s) [{}] not active (set COMPOSE_PROFILES to enable)",
                             b.profiles.join(", ")
                         ));
                         continue;
@@ -105,7 +105,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
                 // `volumes:`/`secrets:` top-level are consumed elsewhere (volumes auto-created on `-v`
                 // use; secrets pre-collected above). `networks:` is the one we actively warn about.
                 if key == "networks" {
-                    warn("'networks:' ignored — kern connects pod members by name (shared netns)");
+                    warn("'networks:' ignored - kern connects pod members by name (shared netns)");
                 }
             }
             other => warn(&format!("top-level '{other}:' ignored (unsupported)")),
@@ -120,7 +120,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     // A `depends_on` toward a service that was dropped as profile-inactive must not fail the topo sort
     // with "unknown box". Docker treats a dependency on an inactive-profile service as an error only
     // when the dependent is itself active; here we DROP the dangling edge with a warning (the depended
-    // service simply isn't part of this run). Only prune names that vanished — a truly unknown name
+    // service simply isn't part of this run). Only prune names that vanished - a truly unknown name
     // still errors later in `topo_order`.
     let present: std::collections::HashSet<String> = boxes.iter().map(|b| b.name.clone()).collect();
     for b in boxes.iter_mut() {
@@ -134,13 +134,13 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
         }
         if dropped {
             warn(&format!(
-                "service '{}': a dependency was dropped (target not active in this run — e.g. a profiled service)",
+                "service '{}': a dependency was dropped (target not active in this run - e.g. a profiled service)",
                 b.name
             ));
         }
     }
     // A service must resolve to something runnable: an `image` (or a `build:` that produces one). Catch
-    // it HERE with a precise message, not later as an opaque "need --rootfs or --image" from the box —
+    // it HERE with a precise message, not later as an opaque "need --rootfs or --image" from the box -
     // parity with the TOML parser's image/rootfs check.
     for b in &boxes {
         let has_image = b.image.as_deref().is_some_and(|s| !s.is_empty());
@@ -159,7 +159,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
 /// Resolve `depends_healthy` edges that point at a box with NO `health_cmd` (typically because that
 /// box's healthcheck wasn't convertible and we omitted it). Instead of letting `validate_conditions`
 /// hard-abort the whole `up` with a message disconnected from the root cause, we DEGRADE the edge to a
-/// plain `depends_on` (start-order) and warn ONCE with the causal chain — the honest drop-in-with-
+/// plain `depends_on` (start-order) and warn ONCE with the causal chain - the honest drop-in-with-
 /// degrade posture, and what the omit-healthcheck warning already promised. (Adversarial review: the
 /// parser must not promise a degrade it doesn't deliver.)
 fn degrade_orphan_health_gates(boxes: &mut [ComposeBox]) {
@@ -213,11 +213,11 @@ fn any_profile_active(profiles: &[String]) -> bool {
 const BLOCK_NL: char = '\u{1}';
 
 /// Fold the multi-line YAML the line scanner can't span, before prescreen/lex:
-///  * BLOCK SCALARS — `key: |`/`>` and the list form `- |`/`- >` (with `-`/`+`/indent indicators): the
+///  * BLOCK SCALARS - `key: |`/`>` and the list form `- |`/`- >` (with `-`/`+`/indent indicators): the
 ///    indented body becomes ONE value; `|` (literal) keeps line breaks as [`BLOCK_NL`], `>` (folded)
 ///    joins with spaces; trailing blank lines are clipped. Comments inside the body are LITERAL (a `#`
 ///    in a shell script is kept), so the body lines are taken raw.
-///  * MULTI-LINE FLOW — `key: [ … ]` / `{ … }` (or `- [ … ]`) spanning lines: joined onto one line.
+///  * MULTI-LINE FLOW - `key: [ … ]` / `{ … }` (or `- [ … ]`) spanning lines: joined onto one line.
 ///
 /// Each consumed line is emitted BLANK so downstream error line numbers stay exact.
 fn fold_multiline(text: &str) -> Result<String, String> {
@@ -232,7 +232,7 @@ fn fold_multiline(text: &str) -> Result<String, String> {
         let code = split_at_comment(raw).0;
         let indent = code.len() - code.trim_start_matches(' ').len();
 
-        // Block scalar: gather the indented body (raw — comments literal) until a dedent.
+        // Block scalar: gather the indented body (raw - comments literal) until a dedent.
         if let Some((prefix, folded)) = block_intro(code) {
             let mut body: Vec<String> = Vec::new();
             let mut base: Option<usize> = None;
@@ -253,7 +253,7 @@ fn fold_multiline(text: &str) -> Result<String, String> {
                 j += 1;
             }
             while body.last().is_some_and(String::is_empty) {
-                body.pop(); // clip trailing blanks (default/`-` chomp — enough for compose)
+                body.pop(); // clip trailing blanks (default/`-` chomp - enough for compose)
             }
             let sep = if folded {
                 " ".to_string()
@@ -285,7 +285,7 @@ fn fold_multiline(text: &str) -> Result<String, String> {
             continue;
         }
 
-        // A bare `key:` whose value is a FLOW collection on the FOLLOWING line(s) — `command:` then an
+        // A bare `key:` whose value is a FLOW collection on the FOLLOWING line(s) - `command:` then an
         // indented `["postgres"]`. Fold it up (only a pure flow value with no top-level `:`, so a real
         // nested mapping/sequence is untouched).
         if let Some(prefix) = key_only(code) {
@@ -385,7 +385,7 @@ fn flow_intro(code: &str) -> Option<(String, String)> {
 }
 
 /// Reject structural YAML we don't support, up front, with a precise reason. This is the billion-laughs
-/// / tab-indent / multi-doc guard — cheaper and safer than parsing-then-detecting.
+/// / tab-indent / multi-doc guard - cheaper and safer than parsing-then-detecting.
 fn prescreen(text: &str) -> Result<(), String> {
     let mut seen_content = false; // has a real (non-comment, non-marker) line appeared yet?
     for (i, raw) in text.lines().enumerate() {
@@ -397,7 +397,7 @@ fn prescreen(text: &str) -> Result<(), String> {
         if t.is_empty() {
             continue;
         }
-        // Tab indentation is invalid YAML and a classic parser trap — refuse rather than guess.
+        // Tab indentation is invalid YAML and a classic parser trap - refuse rather than guess.
         if line.starts_with('\t')
             || (line.len() > line.trim_start_matches(' ').len() && line.contains('\t'))
         {
@@ -405,7 +405,7 @@ fn prescreen(text: &str) -> Result<(), String> {
                 "line {ln}: tab indentation not supported (use spaces)"
             ));
         }
-        // A `---`/`...` marker: a LEADING one (only comments/blanks before it — as a licensed header
+        // A `---`/`...` marker: a LEADING one (only comments/blanks before it - as a licensed header
         // like Apache Airflow's produces) is a document-start and fine; one AFTER real content begins a
         // SECOND document, which we don't read.
         if t == "---" || t == "..." {
@@ -417,16 +417,16 @@ fn prescreen(text: &str) -> Result<(), String> {
             ));
         }
         seen_content = true;
-        // A folded block scalar (`fold_multiline` marked it with U+0001) is an OPAQUE value — its bytes
+        // A folded block scalar (`fold_multiline` marked it with U+0001) is an OPAQUE value - its bytes
         // are shell-script text, not YAML structure. Skip every value-scanning check for it.
         if line.contains(BLOCK_NL) {
             continue;
         }
         // Block-level anchors (`key: &c`), aliases (`key: *c`) and merge keys (`<<: *c` / `<<: [*a,*b]`)
-        // ARE supported — `resolve_anchors` expands them after the tree is built, under a hard node
+        // ARE supported - `resolve_anchors` expands them after the tree is built, under a hard node
         // budget (`MAX_ANCHOR_NODES`) that defuses the billion-laughs bomb the old refusal guarded
         // against. Only anchors/aliases nested INSIDE a flow collection (`[*x]`, `{k: *x}`) remain
-        // unsupported — `line_has_inline_anchor` below still refuses those.
+        // unsupported - `line_has_inline_anchor` below still refuses those.
         if let Some(v) = value_after_colon(line) {
             let vt = v.trim();
             if vt == "|"
@@ -441,10 +441,10 @@ fn prescreen(text: &str) -> Result<(), String> {
                 ));
             }
         }
-        // An anchor/alias as a TOKEN inside an inline collection — `[*x]`, `[a, *x]`, `{k: *x}`. An alias
+        // An anchor/alias as a TOKEN inside an inline collection - `[*x]`, `[a, *x]`, `{k: *x}`. An alias
         // nested inside `[…]`/`{…}` would otherwise reach the box as the literal `*x`. EXCEPTION: a merge
         // key with an alias-LIST value (`<<: [*a, *b]`, and the `<< :` spacing) is the standard way to
-        // merge several templates — `resolve_anchors` expands it, so it's allowed. Everything else with
+        // merge several templates - `resolve_anchors` expands it, so it's allowed. Everything else with
         // an aliased flow token is refused.
         let is_merge_line = colon_index(line).map(|ci| line[..ci].trim()) == Some("<<");
         if !is_merge_line && line_has_inline_anchor(line) {
@@ -452,13 +452,13 @@ fn prescreen(text: &str) -> Result<(), String> {
                 "line {ln}: YAML anchors/aliases not supported (rewrite the value inline)"
             ));
         }
-        // Explicit type tags (`!!str`, `!!float`, …) — refuse ONLY when the tag is at value position
+        // Explicit type tags (`!!str`, `!!float`, …) - refuse ONLY when the tag is at value position
         // (right after `key:`), not when `!!` appears inside a value's text (a `WARNING!!!` in a shell
         // command, an image tag, …), which is a plain scalar and perfectly fine.
         if value_after_colon(line).is_some_and(|v| v.trim_start().starts_with("!!")) {
             return Err(format!("line {ln}: YAML type tags (`!!`) not supported"));
         }
-        // Unbalanced inline collection at value position — a `[` / `{` that doesn't close on the same
+        // Unbalanced inline collection at value position - a `[` / `{` that doesn't close on the same
         // line. Without this a `command: [unterminated` would be SILENTLY accepted as the single
         // element `[unterminated` (a lie: a malformed list treated as valid). Refuse it explicitly.
         if let Some(v) = value_after_colon(line) {
@@ -471,7 +471,7 @@ fn prescreen(text: &str) -> Result<(), String> {
             // A value that OPENS with a quote must close it on the line (`image: "alpine`). Without
             // this the stray-quoted value is taken literally and fails later with a confusing
             // downstream error (a garbage image name → "no layers in manifest"). Only enforce closure
-            // when the value STARTS quoted — an unquoted scalar may legitimately contain a bare
+            // when the value STARTS quoted - an unquoted scalar may legitimately contain a bare
             // apostrophe (`command: don't`), which is not an opened string.
             if (vt.starts_with('"') || vt.starts_with('\'')) && has_unterminated_quote(vt) {
                 return Err(format!("line {ln}: unterminated quoted string"));
@@ -542,7 +542,7 @@ fn brackets_balanced(s: &str) -> bool {
 }
 
 /// Byte index of the FIRST top-level key-terminating `:` in `line` (not inside quotes, followed by
-/// end-of-line or whitespace), or `None`. The single source of truth for "where does the key end" —
+/// end-of-line or whitespace), or `None`. The single source of truth for "where does the key end" -
 /// both `value_after_colon` and `split_key` derive from it, so key/value slicing can't drift. `:` is
 /// ASCII, so the returned index is always a char boundary.
 fn colon_index(line: &str) -> Option<usize> {
@@ -570,17 +570,17 @@ fn value_after_colon(line: &str) -> Option<&str> {
 }
 
 /// True if `line` contains a YAML anchor (`&x`) or alias (`*x`) as a structural TOKEN (`[*x]`,
-/// `[a, *x]`, `{k: *x}`, `{&a k: v}`) — as opposed to a `&`/`*` that is ordinary scalar text
+/// `[a, *x]`, `{k: *x}`, `{&a k: v}`) - as opposed to a `&`/`*` that is ordinary scalar text
 /// (`my*repo`, `2*2`, `a&b`, or anything inside quotes).
 ///
-/// Closed BY CONSTRUCTION, not by enumerating openers. A `&`/`*` outside quotes starts a token — and
-/// is therefore an anchor/alias — iff it is NOT preceded (ignoring spaces) by *scalar content*. The
+/// Closed BY CONSTRUCTION, not by enumerating openers. A `&`/`*` outside quotes starts a token - and
+/// is therefore an anchor/alias - iff it is NOT preceded (ignoring spaces) by *scalar content*. The
 /// complement is the whole trick: if the previous significant byte is scalar content (alphanumeric or
 /// the plain-scalar punctuation `_ - . / %% @ + ~`), the `&`/`*` is part of a value; otherwise it opens
-/// one — after a separator/opener (`[ { , :`), a `-` list marker, at line start, whatever. Defining
+/// one - after a separator/opener (`[ { , :`), a `-` list marker, at line start, whatever. Defining
 /// "starts a token" (rather than listing the openers that can precede one) means any present-or-future
 /// flow separator is covered, and the fuzz can PROVE completeness (no unflagged token-opening `&`/`*`)
-/// instead of trusting a hand-kept opener list — the same move as `IpAddr::is_loopback()` for the push
+/// instead of trusting a hand-kept opener list - the same move as `IpAddr::is_loopback()` for the push
 /// loopback check: a canonical definition, not a maintained enumeration.
 fn line_has_inline_anchor(line: &str) -> bool {
     fn is_scalar_content(b: u8) -> bool {
@@ -614,7 +614,7 @@ fn line_has_inline_anchor(line: &str) -> bool {
             }
             b'&' | b'*' => {
                 // A token-opening `&`/`*` INSIDE a flow collection (`[*x]`, `{k: *x}`) is an anchor/alias
-                // we still don't expand — refuse it. A block-level one (`<<: *c`, `key: *c`, `k: &c`) is
+                // we still don't expand - refuse it. A block-level one (`<<: *c`, `key: *c`, `k: &c`) is
                 // now supported (see `resolve_anchors`), so at depth 0 it is NOT flagged here.
                 if !prev_content && depth > 0 {
                     return true;
@@ -649,7 +649,7 @@ fn lex(text: &str) -> Result<Vec<Line>, String> {
         if raw.trim() == "---" || raw.trim() == "..." {
             continue; // document markers (prescreen already bounded to the first doc)
         }
-        // A folded block scalar carries literal `#`s (shell comments) inside its U+0001-joined body —
+        // A folded block scalar carries literal `#`s (shell comments) inside its U+0001-joined body -
         // do NOT run the comment scanner over it, or the body would be truncated at the first `#`.
         let stripped = if raw.contains(BLOCK_NL) {
             raw.to_string()
@@ -676,7 +676,7 @@ fn strip_comment_precise(line: &str) -> String {
 }
 
 /// A parsed node: a scalar value and/or child mappings and/or list items. YAML is a tree; we model the
-/// slice we need — a mapping (`children`) whose values may be scalars, nested mappings, or sequences.
+/// slice we need - a mapping (`children`) whose values may be scalars, nested mappings, or sequences.
 #[derive(Default, Clone)]
 struct Node {
     /// Inline scalar on the same line as the key (`image: alpine` → `"alpine"`), if any.
@@ -697,14 +697,14 @@ impl Node {
     }
 }
 
-/// Build the mapping tree from lexed lines using an explicit indentation stack (iterative — no
+/// Build the mapping tree from lexed lines using an explicit indentation stack (iterative - no
 /// recursion, so a deeply-nested document can't overflow the stack; `MAX_DEPTH` caps it anyway).
 fn build_tree(lines: &[Line]) -> Result<Node, String> {
     let mut root = Node::default();
     // `path` = child-index chain from root to the CURRENTLY-OPEN mapping; `cols[k]` = the indentation
     // column of the key that opened `path[k]`. Invariant: a child at column C belongs to the deepest
     // open mapping whose opening column is < C. Before placing a line we pop every open level whose
-    // column is >= C (they've ended). Iterative — deep nesting can't overflow the stack.
+    // column is >= C (they've ended). Iterative - deep nesting can't overflow the stack.
     let mut path: Vec<usize> = Vec::new();
     let mut cols: Vec<usize> = Vec::new();
     // A block-mapping list item being folded into an inline `{…}` string (long-form ports etc.):
@@ -748,7 +748,7 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
 
         // List item: append to the mapping that opened the current level. A YAML sequence item is a
         // dash FOLLOWED BY WHITESPACE (`- x`) or a bare `-` (empty). A dash NOT followed by space is
-        // part of a key — e.g. `--net:` is a (bad) key, NOT the list item `-net:`. Matching a bare
+        // part of a key - e.g. `--net:` is a (bad) key, NOT the list item `-net:`. Matching a bare
         // `strip_prefix('-')` mis-parsed `--net:` as a list item; require the space/EOL boundary.
         let is_list_item = ln.content == "-"
             || ln
@@ -776,7 +776,7 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
         }
 
         // A bare `&anchor` on its OWN line anchors the currently-open mapping. This is the form Apache
-        // Airflow (and others) use: `x-common:` then an indented `&common` then the mapping's keys —
+        // Airflow (and others) use: `x-common:` then an indented `&common` then the mapping's keys -
         // the anchor decorates the node, not a `key: value`. `resolve_anchors` consumes it.
         if ln.content.starts_with('&') && colon_index(&ln.content).is_none() {
             let after = ln.content[1..].trim();
@@ -788,7 +788,7 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
         // `key:` or `key: value`.
         let (key, val) = split_key(&ln.content, ln.lineno)?;
         let mut node = Node::default();
-        // Peel a leading anchor `&name` off the value. What remains is the real value — often empty
+        // Peel a leading anchor `&name` off the value. What remains is the real value - often empty
         // (`x-common: &common` then a nested mapping on the following lines), so it must reset `inline`
         // to `None` and let the key open a mapping as usual. `resolve_anchors` consumes `node.anchor`.
         let val = match val {
@@ -805,7 +805,7 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
         let inline = val.filter(|v| !v.is_empty());
         if let Some(v) = inline {
             let vt = v.trim();
-            // ALWAYS keep the raw value as `scalar` — a converter that wants the verbatim value
+            // ALWAYS keep the raw value as `scalar` - a converter that wants the verbatim value
             // (`environment`, where `CFG: {"k":"v"}` is a JSON string that must NOT be structured) reads
             // it as-is. ADDITIONALLY, for an inline TABLE (`{…}`), also parse it into `children`, so a
             // converter that wants structure (`healthcheck`/`depends_on`/`build`) reads children. Keeping
@@ -843,15 +843,15 @@ fn descend_mut<'a>(root: &'a mut Node, path: &[usize]) -> &'a mut Node {
     cur
 }
 
-/// Expand YAML anchors/aliases/merge keys in the built tree, in place — so no converter ever sees a raw
+/// Expand YAML anchors/aliases/merge keys in the built tree, in place - so no converter ever sees a raw
 /// `*alias`. Pass 1 records every `&name` node (children-first, so a nested anchor is known before an
 /// outer one merges it), stripping the marker. Pass 2 substitutes each `*name` value and folds each
-/// `<<: *name` mapping, cloning the recorded node and resolving IT too — all spending one shared
+/// `<<: *name` mapping, cloning the recorded node and resolving IT too - all spending one shared
 /// `MAX_ANCHOR_NODES` budget, so a self-referential bomb is refused rather than followed.
 fn resolve_anchors(root: &mut Node) -> Result<(), String> {
     let mut anchors: std::collections::HashMap<String, Node> = std::collections::HashMap::new();
     collect_anchors(root, &mut anchors);
-    // Always apply — even with no anchors defined, a stray `*alias` must surface as a clear "unknown
+    // Always apply - even with no anchors defined, a stray `*alias` must surface as a clear "unknown
     // anchor" error, never reach a box as the literal string `*alias`.
     let mut budget = MAX_ANCHOR_NODES;
     apply_anchors(root, &anchors, &mut budget)
@@ -868,7 +868,7 @@ fn collect_anchors(node: &mut Node, anchors: &mut std::collections::HashMap<Stri
     }
 }
 
-/// Nodes in a subtree (mappings + sequence items) — what an expansion spends from the budget.
+/// Nodes in a subtree (mappings + sequence items) - what an expansion spends from the budget.
 fn count_nodes(node: &Node) -> usize {
     1 + node.items.len()
         + node
@@ -880,7 +880,7 @@ fn count_nodes(node: &Node) -> usize {
 
 fn spend(budget: &mut usize, n: usize) -> Result<(), String> {
     *budget = budget.checked_sub(n).ok_or_else(|| {
-        "YAML anchor expansion too large (possible billion-laughs bomb) — refused".to_string()
+        "YAML anchor expansion too large (possible billion-laughs bomb) - refused".to_string()
     })?;
     Ok(())
 }
@@ -950,7 +950,7 @@ fn apply_anchors(
         }
     }
     // Sequence-item aliases (`- *name`): inline a SCALAR anchor's value. An unknown alias, an alias to
-    // a MAPPING (no scalar to inline), or an ANCHOR in list position (`- &x …`) are all hard errors —
+    // a MAPPING (no scalar to inline), or an ANCHOR in list position (`- &x …`) are all hard errors -
     // never left as the literal `*name`/`&x` string (the silent mis-conversion the module forbids).
     for item in &mut node.items {
         let t = item.trim();
@@ -960,7 +960,7 @@ fn apply_anchors(
                 .get(&name)
                 .ok_or_else(|| format!("unknown YAML anchor `*{name}`"))?;
             let sc = src.scalar.clone().ok_or_else(|| {
-                format!("YAML alias `*{name}` refers to a mapping — not usable as a list item")
+                format!("YAML alias `*{name}` refers to a mapping - not usable as a list item")
             })?;
             *item = sc;
         } else if t.starts_with('&') {
@@ -970,10 +970,10 @@ fn apply_anchors(
     Ok(())
 }
 
-/// Resolve Compose `extends:` — a service inheriting another service's fields. Same-file only
+/// Resolve Compose `extends:` - a service inheriting another service's fields. Same-file only
 /// (`extends: base` or `extends: {service: base}`); a `{file: …}` cross-file extends is a clear error
-/// (inline the service instead). Merge is SHALLOW and the extending service WINS on a key conflict —
-/// the same rule kern uses for `<<` merge — resolved transitively (A extends B extends C) with a
+/// (inline the service instead). Merge is SHALLOW and the extending service WINS on a key conflict -
+/// the same rule kern uses for `<<` merge - resolved transitively (A extends B extends C) with a
 /// cycle guard.
 fn resolve_extends(root: &mut Node) -> Result<(), String> {
     let Some(si) = root.children.iter().position(|(k, _)| k == "services") else {
@@ -1001,7 +1001,7 @@ fn extends_target(n: &Node) -> Result<String, String> {
     }
     if n.children.iter().any(|(k, _)| k == "file") {
         return Err(
-            "cross-file `extends: {file: …}` isn't supported yet — inline the base service into this \
+            "cross-file `extends: {file: …}` isn't supported yet - inline the base service into this \
              compose file"
                 .to_string(),
         );
@@ -1051,7 +1051,7 @@ fn resolve_service_extends(
     };
     let parent = services.children[tidx].1.children.clone();
     // Drop the `extends` key now that it's being resolved, then fold in the parent's keys the child
-    // doesn't already set (child wins — Compose's override semantics).
+    // doesn't already set (child wins - Compose's override semantics).
     services.children[idx].1.children.remove(ep);
     for (pk, pv) in parent {
         if pk == "extends" {
@@ -1071,12 +1071,12 @@ fn resolve_service_extends(
 
 /// Split a `key: value` line into `(key, Some(value))` or a bare `key:` into `(key, Some(""))`.
 /// Quote-aware on the key side so a quoted key with a `:` is handled; the value keeps its raw form
-/// (unquoted here — `scalar_str` unquotes at use).
+/// (unquoted here - `scalar_str` unquotes at use).
 fn split_key(content: &str, lineno: usize) -> Result<(&str, Option<&str>), String> {
     let Some(colon) = colon_index(content) else {
         return Err(format!("line {lineno}: expected `key: value`"));
     };
-    // Slice at the colon index directly — no length arithmetic, so no risk of an unsigned underflow
+    // Slice at the colon index directly - no length arithmetic, so no risk of an unsigned underflow
     // if the helpers ever change. `colon` and `colon + 1` are ASCII-`:` boundaries.
     let key = strip_quotes(content[..colon].trim());
     if key.is_empty() {
@@ -1087,7 +1087,7 @@ fn split_key(content: &str, lineno: usize) -> Result<(&str, Option<&str>), Strin
 
 /// Strip one layer of matching single/double quotes from a scalar, if present. YAML single-quotes
 /// don't process escapes; double-quotes do, but for compose values (paths, images, commands) we treat
-/// the inner text verbatim — no numeric coercion, no escape expansion — which is exactly what we want
+/// the inner text verbatim - no numeric coercion, no escape expansion - which is exactly what we want
 /// (verbatim → the sexagesimal trap can't fire, and argv values reach `kern box` unmodified).
 fn strip_quotes(s: &str) -> &str {
     let b = s.as_bytes();
@@ -1140,7 +1140,7 @@ fn parse_inline_table(s: &str) -> Node {
     node
 }
 
-/// The index of the first `:` in an inline-table entry that separates key from value — quote-aware so
+/// The index of the first `:` in an inline-table entry that separates key from value - quote-aware so
 /// a `:` inside a quoted key/value doesn't split early. Unlike `colon_index` (which requires the `:`
 /// be followed by space/EOL, YAML block rule), an inline-table `{k:v}` may have no space, so we take
 /// the first top-level unquoted `:`.
@@ -1185,7 +1185,7 @@ fn parse_inline_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Split on top-level commas (depth 0, outside quotes) — shared shape with the TOML depends parser.
+/// Split on top-level commas (depth 0, outside quotes) - shared shape with the TOML depends parser.
 fn split_top_commas(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
@@ -1248,14 +1248,14 @@ fn list_value(node: &Node) -> Vec<String> {
 }
 
 /// A service's `secrets:` reference names. Short form is a list of names (`[db_pw, api_key]`); long
-/// form is a list of maps each with a `source:` (`[{source: db_pw, target: …}]`) — we take `source`
+/// form is a list of maps each with a `source:` (`[{source: db_pw, target: …}]`) - we take `source`
 /// (the target is always `/run/secrets/<source>` in kern). Returns the referenced secret names.
 fn secret_refs(node: &Node) -> Vec<String> {
     let mut out = Vec::new();
     for it in list_value(node) {
         let it = it.trim();
         if it.starts_with('{') {
-            // long-form inline `{source: name, target: …}` — pull `source`.
+            // long-form inline `{source: name, target: …}` - pull `source`.
             let n = parse_inline_table(it);
             if let Some(src) = n.child("source").and_then(|s| s.scalar.as_deref()) {
                 out.push(scalar_str(src));
@@ -1295,7 +1295,7 @@ fn service_to_box(
     kern_common::BoxName::parse(name)
         .map_err(|e| format!("service '{name}': invalid name: {e}"))?;
     let mut b = ComposeBox::new(name.to_string());
-    // `entrypoint` + `command` are composed as `entrypoint ++ command` (Docker semantics) — but ONLY
+    // `entrypoint` + `command` are composed as `entrypoint ++ command` (Docker semantics) - but ONLY
     // after the whole service is parsed, since the two keys can appear in EITHER order in the file.
     // Merging inline (as before) was order-dependent: if `entrypoint` came first, `command` hadn't been
     // read yet, then `command` overwrote the merge → the entrypoint was dropped and the box tried to
@@ -1305,13 +1305,13 @@ fn service_to_box(
     // `sh -c "/init here"`) vs EXEC form (a list). It changes how `command` composes: Docker appends
     // `command` only to an EXEC-form entrypoint; a shell-form entrypoint is the whole command and
     // `command` is dropped (appending it would make the args shell positional params, not entrypoint
-    // args — the box would run `/init here` and silently discard `command`). See the merge below.
+    // args - the box would run `/init here` and silently discard `command`). See the merge below.
     let mut entrypoint_is_shell_form = false;
 
     for (key, node) in &svc.children {
         match key.as_str() {
             "image" => b.image = node.scalar.as_deref().map(scalar_str),
-            // `rootfs`/`bind_rootfs` are kern-native keys (not Docker compose) — accepted so a kern
+            // `rootfs`/`bind_rootfs` are kern-native keys (not Docker compose) - accepted so a kern
             // stack authored in YAML can use a host rootfs dir instead of an OCI image.
             "rootfs" => b.rootfs = node.scalar.as_deref().map(scalar_str),
             "bind_rootfs" => b.bind_rootfs = scalar_is_true(node),
@@ -1332,10 +1332,10 @@ fn service_to_box(
             "user" => b.user = node.scalar.as_deref().map(scalar_str),
             "working_dir" | "workdir" => b.workdir = node.scalar.as_deref().map(scalar_str),
             "build" => b.build = Some(build_value(node)),
-            // Resource / capability / hardening keys — these map 1:1 to `kern box` flags the runtime
+            // Resource / capability / hardening keys - these map 1:1 to `kern box` flags the runtime
             // already enforces, so CONVERT them (not warn-and-ignore): a compose that sets `mem_limit`
             // or `read_only` must get those limits, else the stack "runs but without the constraints
-            // the user asked for" — worse than a visible gap.
+            // the user asked for" - worse than a visible gap.
             "mem_limit" | "memory" => b.memory = node.scalar.as_deref().map(scalar_str),
             "memswap_limit" | "mem_swap_limit" => {
                 b.swap_max = node.scalar.as_deref().map(scalar_str)
@@ -1348,32 +1348,32 @@ fn service_to_box(
             "cap_drop" => b.cap_drop = list_value(node),
             "tmpfs" => b.tmpfs = tmpfs_value(node, name),
             "read_only" => b.read_only = scalar_is_true(node),
-            // `privileged: true` has no kern equivalent (rootless by design) — warn, don't silently
+            // `privileged: true` has no kern equivalent (rootless by design) - warn, don't silently
             // pretend. The box runs UNprivileged; a workload needing real privilege will notice.
             "privileged" => {
                 if scalar_is_true(node) {
                     warn(&format!(
-                        "service '{name}': 'privileged: true' has no kern equivalent (rootless) — running unprivileged"
+                        "service '{name}': 'privileged: true' has no kern equivalent (rootless) - running unprivileged"
                     ));
                 }
             }
             "secrets" => {
                 // A service `secrets: [name, …]` (or long-form `{source: name, target: …}`) references
                 // top-level secret definitions. Map each `file:`-backed one to `--secret <file>:<name>`
-                // (kern delivers it at `/run/secrets/<name>`, mode 0400) — matching compose's mount
+                // (kern delivers it at `/run/secrets/<name>`, mode 0400) - matching compose's mount
                 // point exactly. `<file>` is relative → `compose()` makes it absolute (dir-confined).
                 for entry in secret_refs(node) {
                     match secret_files.get(&entry) {
                         Some(file) => b.secrets.push(format!("{file}:{entry}")),
                         None => warn(&format!(
-                            "service '{name}': secret '{entry}' has no top-level `file:` definition — skipped (external/env secrets aren't supported)"
+                            "service '{name}': secret '{entry}' has no top-level `file:` definition - skipped (external/env secrets aren't supported)"
                         )),
                     }
                 }
             }
             "profiles" => b.profiles = list_value(node),
             // Docker Compose v3 puts the hard caps under `deploy.resources.limits` (memory/cpus/pids).
-            // CONVERT them — kern enforces them exactly like its own `--memory`/`--cpus`/`--pids-limit`
+            // CONVERT them - kern enforces them exactly like its own `--memory`/`--cpus`/`--pids-limit`
             // flags, and Docker rootless famously IGNORES them without cgroup-v2+systemd, so this is a
             // place kern is *stronger*, not weaker. A silently-dropped cap is worse than a visible gap.
             "deploy" => apply_deploy(&mut b, node, name),
@@ -1399,14 +1399,14 @@ fn service_to_box(
     //  * EXEC-form entrypoint (a list) → final argv is `entrypoint ++ command`.
     //  * SHELL-form entrypoint (`entrypoint: /init here` → `sh -c "/init here"`) → the shell string IS
     //    the whole command; Docker IGNORES `command`. Appending it would put the args after
-    //    `sh -c <string>`, where they become the shell's positional params ($0,$1…) — NOT arguments to
-    //    the entrypoint — so the box would run `/init here` and silently discard `command` (a "runs and
+    //    `sh -c <string>`, where they become the shell's positional params ($0,$1…) - NOT arguments to
+    //    the entrypoint - so the box would run `/init here` and silently discard `command` (a "runs and
     //    lies" mis-conversion the audit caught). We drop `command` with a warning instead.
     if !entrypoint.is_empty() {
         if entrypoint_is_shell_form {
             if !b.command.is_empty() {
                 warn(&format!(
-                    "service '{name}': a shell-form `entrypoint` ignores `command` (Docker semantics) — `command` dropped; use an exec-form (list) entrypoint to pass args"
+                    "service '{name}': a shell-form `entrypoint` ignores `command` (Docker semantics) - `command` dropped; use an exec-form (list) entrypoint to pass args"
                 ));
             }
             b.command = entrypoint;
@@ -1419,10 +1419,10 @@ fn service_to_box(
     Ok(b)
 }
 
-/// Map Docker Compose v3 `deploy.resources.limits.{memory,cpus,pids}` onto kern's hard caps — the
+/// Map Docker Compose v3 `deploy.resources.limits.{memory,cpus,pids}` onto kern's hard caps - the
 /// runtime enforces them via `--memory`/`--cpus`/`--pids-limit`. `deploy.resources.reservations` are
 /// soft best-effort hints with no kern equivalent, so they're left alone (a compose that only reserves
-/// still runs, just uncapped — which is what a reservation means). Anything else under `deploy:`
+/// still runs, just uncapped - which is what a reservation means). Anything else under `deploy:`
 /// (`replicas`, `restart_policy`, `placement`, …) is swarm/orchestration kern doesn't do; silently
 /// skipped here rather than warned per-key, since a single-node `deploy:` block is common and mostly
 /// inert for `kern compose`.
@@ -1444,11 +1444,11 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
         mapped = true;
     }
     // Honesty: a `limits:` block that maps NOTHING (a mistyped key like `mem:`/`cpu:`) would leave the
-    // service silently UNCAPPED — a "runs but lies" the trust model forbids. Say so out loud rather than
-    // pretend the cap took. (An empty/whitespace `limits:` — no children — is a no-op, not a typo.)
+    // service silently UNCAPPED - a "runs but lies" the trust model forbids. Say so out loud rather than
+    // pretend the cap took. (An empty/whitespace `limits:` - no children - is a no-op, not a typo.)
     if !mapped && !limits.children.is_empty() {
         warn(&format!(
-            "service '{name}': deploy.resources.limits set none of memory/cpus/pids — the service runs UNCAPPED (check the key names)"
+            "service '{name}': deploy.resources.limits set none of memory/cpus/pids - the service runs UNCAPPED (check the key names)"
         ));
     }
 }
@@ -1458,7 +1458,7 @@ fn command_value(node: &Node) -> Vec<String> {
     command_argv(node).0
 }
 
-/// The entrypoint argv PLUS whether it was shell-form (a bare string) — the merge with `command`
+/// The entrypoint argv PLUS whether it was shell-form (a bare string) - the merge with `command`
 /// branches on it (see `service_to_box`). Shares one parser with `command`, so the two can't drift.
 fn entrypoint_value(node: &Node) -> (Vec<String>, bool) {
     command_argv(node)
@@ -1487,14 +1487,14 @@ fn command_argv(node: &Node) -> (Vec<String>, bool) {
     (Vec::new(), false)
 }
 
-/// A `K=v` collection written in either compose shape — a list of `- K=v` and/or a map of `K: v` —
+/// A `K=v` collection written in either compose shape - a list of `- K=v` and/or a map of `K: v` -
 /// flattened to `["K=v", …]`. Shared by `environment` and `build.args`, which have the identical YAML
 /// shape, so the two can't drift. `${VAR}` is already substituted document-wide (see
 /// `interpolate_document`), so values are used verbatim here.
 ///
 /// A list item with NO `=` (`- API_KEY`) is Docker's **host pass-through**: the value is taken from the
 /// host environment. If the host has it, we emit `API_KEY=<host value>`; if not, we OMIT it (Docker
-/// does too). Passing the bare `API_KEY` straight through was a bug — the box's `--env K=V` parser
+/// does too). Passing the bare `API_KEY` straight through was a bug - the box's `--env K=V` parser
 /// rejected it and the whole service failed to start.
 fn kv_pairs(node: &Node) -> Vec<String> {
     let mut out = Vec::new();
@@ -1532,7 +1532,7 @@ fn kv_pairs(node: &Node) -> Vec<String> {
 ///
 /// COMMENT-AWARE: a `${VAR}` inside a trailing `#` comment is NOT substituted and raises no unset-var
 /// warning (the comment text is dropped by the lexer anyway; interpolating it only produced spurious
-/// stderr noise — audit finding). We split each line at its first unquoted `#`, interpolate the code
+/// stderr noise - audit finding). We split each line at its first unquoted `#`, interpolate the code
 /// part, and re-attach the comment verbatim.
 fn interpolate_document(text: &str) -> String {
     if !text.contains('$') {
@@ -1550,7 +1550,7 @@ fn interpolate_document(text: &str) -> String {
         first = false;
         let (code, comment) = split_at_comment(line);
         out.push_str(&interpolate_fragment(code));
-        out.push_str(comment); // verbatim — no interpolation, no warning
+        out.push_str(comment); // verbatim - no interpolation, no warning
     }
     if ends_with_nl {
         out.push('\n');
@@ -1586,7 +1586,7 @@ fn interpolate_fragment(text: &str) -> String {
     interpolate_depth(text, 0)
 }
 
-/// Max nesting depth for `${A:-${B:-…}}` — a hard cap so an adversarial input can't drive unbounded
+/// Max nesting depth for `${A:-${B:-…}}` - a hard cap so an adversarial input can't drive unbounded
 /// recursion. Real nesting is 1-2 deep; anything past this leaves the inner `${…}` un-substituted.
 const MAX_INTERP_DEPTH: usize = 16;
 
@@ -1616,7 +1616,7 @@ fn interpolate_depth(text: &str, depth: usize) -> String {
         return text.to_string();
     }
     if depth >= MAX_INTERP_DEPTH {
-        // Too deep — stop resolving and return the text as-is (bounded work, no leaked fragment).
+        // Too deep - stop resolving and return the text as-is (bounded work, no leaked fragment).
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
@@ -1637,7 +1637,7 @@ fn interpolate_depth(text: &str, depth: usize) -> String {
             continue;
         };
         let Some(end) = matching_brace_end(inner) else {
-            // Unterminated `${` — leave it literal (the prescreen doesn't reject it here); a downstream
+            // Unterminated `${` - leave it literal (the prescreen doesn't reject it here); a downstream
             // parse error will surface if it matters. Don't loop forever.
             out.push_str("${");
             rest = inner;
@@ -1726,12 +1726,12 @@ fn interpolate_expr(expr: &str) -> String {
             } else {
                 arg.to_string()
             };
-            warn(&format!("${{{var}}}: {msg} — substituted empty"));
+            warn(&format!("${{{var}}}: {msg} - substituted empty"));
             String::new()
         }),
         _ => val.unwrap_or_else(|| {
             warn(&format!(
-                "${{{var}}} is not set (no default) — substituted empty (set it in your shell, like Docker)"
+                "${{{var}}} is not set (no default) - substituted empty (set it in your shell, like Docker)"
             ));
             String::new()
         }),
@@ -1740,7 +1740,7 @@ fn interpolate_expr(expr: &str) -> String {
 
 /// `ports`: each entry → a `--publish` string, RAW (no numeric coercion → the sexagesimal trap can't
 /// fire). Long-form (`{target,published,...}`) is reconstructed from fields, not passed verbatim.
-/// `/udp` (and any non-TCP proto) is refused-with-warning — kern publishes TCP only, and silently
+/// `/udp` (and any non-TCP proto) is refused-with-warning - kern publishes TCP only, and silently
 /// dropping the proto would mislead. A plain `host:box` (no host-IP) publishes on kern's loopback
 /// default, which differs from Docker's all-interfaces default → warn so a Docker user isn't surprised
 /// their service "doesn't answer from outside".
@@ -1754,7 +1754,7 @@ fn ports_value(node: &Node, svc: &str) -> Vec<String> {
         if let Some(pr) = &proto {
             if pr != "tcp" {
                 warn(&format!(
-                    "service '{svc}': port '{spec}' uses /{pr} — kern publishes TCP only, entry SKIPPED"
+                    "service '{svc}': port '{spec}' uses /{pr} - kern publishes TCP only, entry SKIPPED"
                 ));
                 return;
             }
@@ -1784,11 +1784,11 @@ fn ports_value(node: &Node, svc: &str) -> Vec<String> {
             .collect()
     } else {
         // A `ports:` whose entries are BLOCK mappings (a `- ` opening a nested mapping over several
-        // lines, rather than an inline `{…}`) lands here with no scalar/items — a shape we don't
+        // lines, rather than an inline `{…}`) lands here with no scalar/items - a shape we don't
         // reconstruct. NEVER silently drop it: warn so the user knows a port wasn't published.
         if !node.children.is_empty() {
             warn(&format!(
-                "service '{svc}': block-mapping long-form `ports` not supported — use inline `{{target: N, published: M}}` or a \"M:N\" string; entry SKIPPED"
+                "service '{svc}': block-mapping long-form `ports` not supported - use inline `{{target: N, published: M}}` or a \"M:N\" string; entry SKIPPED"
             ));
         }
         Vec::new()
@@ -1803,7 +1803,7 @@ fn ports_value(node: &Node, svc: &str) -> Vec<String> {
 
 /// Turn one `ports` list item into a `[ip:]host:box[/proto]` string. A plain scalar passes through; an
 /// inline-table long-form (`{target: 80, published: 8080, protocol: udp}`) is REBUILT from its fields
-/// (never passed verbatim — it's an object, not a string).
+/// (never passed verbatim - it's an object, not a string).
 fn reconstruct_port_item(item: &str, svc: &str) -> String {
     let t = item.trim();
     if !t.starts_with('{') {
@@ -1826,7 +1826,7 @@ fn reconstruct_port_item(item: &str, svc: &str) -> String {
     }
     if target.is_empty() {
         warn(&format!(
-            "service '{svc}': a long-form port has no `target` — skipped"
+            "service '{svc}': a long-form port has no `target` - skipped"
         ));
         return String::new();
     }
@@ -1872,7 +1872,7 @@ fn tmpfs_value(node: &Node, svc: &str) -> Vec<String> {
             }
             if !dropped.is_empty() {
                 warn(&format!(
-                    "service '{svc}': tmpfs '{path}' options {} not supported by kern --tmpfs (size only) — dropped",
+                    "service '{svc}': tmpfs '{path}' options {} not supported by kern --tmpfs (size only) - dropped",
                     dropped.join(",")
                 ));
             }
@@ -1887,7 +1887,7 @@ fn tmpfs_value(node: &Node, svc: &str) -> Vec<String> {
 /// `volumes`: a short-form `src:dst[:ro]` entry passes through (kern's `-v` grammar matches compose's
 /// short form); a LONG-form entry (`{type:, source:, target:, read_only:}`, which `build_tree` folds to
 /// an inline `{…}` scalar) is reconstructed into `source:target[:ro]`. Passing the raw `{…}` to `-v`
-/// was a bug — the box rejected it and the whole service failed to start.
+/// was a bug - the box rejected it and the whole service failed to start.
 fn volumes_value(node: &Node) -> Vec<String> {
     list_value(node)
         .into_iter()
@@ -1917,13 +1917,13 @@ fn reconstruct_volume_item(item: &str) -> Option<String> {
                 "target" => target = v,
                 "type" => vtype = v,
                 "read_only" => read_only = v == "true",
-                _ => {} // bind/volume sub-options (bind:, volume:, consistency:) — ignored
+                _ => {} // bind/volume sub-options (bind:, volume:, consistency:) - ignored
             }
         }
     }
     if target.is_empty() || source.is_empty() {
         warn(&format!(
-            "service volume long-form {{{inner}}} has no usable source+target ({}) — skipped",
+            "service volume long-form {{{inner}}} has no usable source+target ({}) - skipped",
             if vtype == "tmpfs" {
                 "tmpfs: use kern --tmpfs"
             } else {
@@ -1967,7 +1967,7 @@ fn apply_depends(b: &mut ComposeBox, node: &Node) {
         b.depends_on = list_value(node);
         return;
     }
-    // Long-form (block OR inline `{db: {condition: …}}` — both now parsed into `children` by
+    // Long-form (block OR inline `{db: {condition: …}}` - both now parsed into `children` by
     // `parse_inline_table`): each child is a service with an optional `condition:` mapping.
     for (dep, spec) in &node.children {
         let cond = spec
@@ -1995,7 +1995,7 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
     }
     let Some(test) = node.child("test") else {
         warn(&format!(
-            "service '{svc}': healthcheck has no `test` — omitted"
+            "service '{svc}': healthcheck has no `test` - omitted"
         ));
         return;
     };
@@ -2007,7 +2007,7 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
             // `depends_healthy` edge toward this box is degraded to start-order later in
             // `degrade_orphan_health_gates`, which emits the linked, direction-correct warning.
             warn(&format!(
-                "service '{svc}': healthcheck `test` not convertible — omitted"
+                "service '{svc}': healthcheck `test` not convertible - omitted"
             ));
             return;
         }
@@ -2019,7 +2019,7 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
         // `retries` is a plain count (`--health-retries <n>`), no duration suffix.
         b.health_retries = Some(scalar_str(v));
     }
-    // `timeout`/`start_period` map to `--health-{timeout,start-period} <seconds>` — an INTEGER count of
+    // `timeout`/`start_period` map to `--health-{timeout,start-period} <seconds>` - an INTEGER count of
     // seconds. Docker writes them as durations (`30s`, `1m30s`, `0s`), so we must convert, not pass the
     // raw string: `--health-timeout 30s` fails the CLI's `u64` parse. Route them through the same
     // `parse_duration_secs` as `interval`; an unparseable/overflowing value is dropped (box default)
@@ -2030,7 +2030,7 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
     }
     if let Some(v) = node.child("start_period").and_then(|n| n.scalar.as_deref()) {
         // `start_period` reaches `--health-start-period <seconds>`, where 0 is MEANINGFUL ("no startup
-        // grace") — so allow_zero=true, handling every zero spelling (`0s`, `0m`, `0h0m0s`) uniformly.
+        // grace") - so allow_zero=true, handling every zero spelling (`0s`, `0m`, `0h0m0s`) uniformly.
         b.health_start_period =
             parse_duration_secs_opt(&scalar_str(v), true).map(|s| s.to_string());
     }
@@ -2079,7 +2079,7 @@ fn healthcheck_test(node: &Node) -> Option<String> {
 }
 
 /// A compose duration (`30s`, `1m30s`, or a bare number of seconds) → whole seconds. Best-effort; a
-/// form we don't understand — OR one that overflows — yields `None` (the box uses its default
+/// form we don't understand - OR one that overflows - yields `None` (the box uses its default
 /// interval).
 ///
 /// The value is UNTRUSTED (a third-party `interval:`), so every step uses CHECKED arithmetic: a huge
@@ -2146,7 +2146,7 @@ fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
         }
         other => {
             warn(&format!(
-                "service '{svc}': unknown restart '{other}' — treated as on-failure"
+                "service '{svc}': unknown restart '{other}' - treated as on-failure"
             ));
             b.restart = true;
         }
@@ -2154,7 +2154,7 @@ fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
 }
 
 /// `build`: resolve to a [`BuildDirective`]. `context`/`dockerfile` are kept RELATIVE (the caller in
-/// `compose()` confines them under the compose file's dir — traversal guard). `args` values are
+/// `compose()` confines them under the compose file's dir - traversal guard). `args` values are
 /// already `${VAR}`-substituted document-wide.
 fn build_value(node: &Node) -> BuildDirective {
     // Short form: `build: ./dir`
@@ -2283,7 +2283,7 @@ mod tests {
     #[test]
     fn inline_table_depends_on_routes_conditions() {
         // The copy-pasted one-liner form `depends_on: {x: {condition: ...}}` lands in `scalar`, not
-        // `children` — it MUST still route to the right bucket. The bug: it was dropped, so a
+        // `children` - it MUST still route to the right bucket. The bug: it was dropped, so a
         // `service_completed_successfully` gate silently became no-dependency and the dependent
         // started regardless of the init's exit.
         let y = "services:\n  db:\n    image: r\n    healthcheck:\n      test: [\"CMD\",\"redis-cli\",\"ping\"]\n  m:\n    image: a\n  app:\n    image: a\n    depends_on: {db: {condition: service_healthy}, m: {condition: service_completed_successfully}}\n";
@@ -2300,7 +2300,7 @@ mod tests {
     #[test]
     fn entrypoint_and_command_compose_order_independent() {
         // `entrypoint ++ command`, whichever order the keys appear (the merge must happen AFTER the
-        // whole service is parsed, not inline — else `command` overwrites the merge).
+        // whole service is parsed, not inline - else `command` overwrites the merge).
         let ep_first = "services:\n  a:\n    image: alpine\n    entrypoint: [\"echo\", \"P\"]\n    command: [\"x\", \"y\"]\n";
         let cmd_first = "services:\n  a:\n    image: alpine\n    command: [\"x\", \"y\"]\n    entrypoint: [\"echo\", \"P\"]\n";
         for y in [ep_first, cmd_first] {
@@ -2311,7 +2311,7 @@ mod tests {
     #[test]
     fn shell_form_entrypoint_ignores_command_like_docker() {
         // Audit regression: a SHELL-form entrypoint (`sh -c "<string>"`) must NOT have `command`
-        // appended — the args would become the shell's positional params and `command` would be
+        // appended - the args would become the shell's positional params and `command` would be
         // silently discarded. Docker ignores `command` for a shell-form entrypoint; so do we (+warn).
         let y = "services:\n  a:\n    image: x\n    entrypoint: /init here\n    command: run now\n";
         assert_eq!(boxes(y)[0].command, ["sh", "-c", "/init here"]);
@@ -2386,7 +2386,7 @@ mod tests {
             interpolate_document("cmd: ${UNSET_XYZ_KERN:-run}  # ${ALSO_UNSET}"),
             "cmd: run  # ${ALSO_UNSET}"
         );
-        // A `#` inside quotes is NOT a comment — interpolation applies across it.
+        // A `#` inside quotes is NOT a comment - interpolation applies across it.
         assert_eq!(
             interpolate_document("v: \"${UNSET_XYZ_KERN:-a#b}\""),
             "v: \"a#b\""
@@ -2405,7 +2405,7 @@ mod tests {
 
     #[test]
     fn duplicate_service_key_is_rejected() {
-        // Two service blocks with the same name is an authoring mistake — reject, don't launch two
+        // Two service blocks with the same name is an authoring mistake - reject, don't launch two
         // boxes with a colliding name (opaque "already running" later) or silently shadow.
         let y = "services:\n  a:\n    image: alpine\n  a:\n    image: nginx\n";
         let err = match parse(y) {
@@ -2438,7 +2438,7 @@ mod tests {
         assert_eq!(b.health_timeout.as_deref(), Some("30")); // 30s → "30", not "30s"
         assert_eq!(b.health_start_period.as_deref(), Some("90")); // 1m30s → 90
         assert_eq!(b.health_retries.as_deref(), Some("4")); // a plain count, unchanged
-                                                            // `start_period` 0 (no grace) is legitimate and must reach the box as `0`, not be dropped —
+                                                            // `start_period` 0 (no grace) is legitimate and must reach the box as `0`, not be dropped -
                                                             // for EVERY zero spelling, not just `0s` (the old literal whitelist dropped `0m`/`0h`).
         for zero in ["0s", "0m", "0h", "0", "0h0m0s"] {
             let y0 = format!("services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      start_period: {zero}\n");
@@ -2556,7 +2556,7 @@ mod tests {
     #[test]
     fn profiled_service_is_inactive_unless_enabled() {
         // Extreme vs-Docker regression: a `profiles:`-tagged service was warn-and-ignored but STILL
-        // STARTED — a service that should be OFF ran. Now it is dropped from the run unless one of its
+        // STARTED - a service that should be OFF ran. Now it is dropped from the run unless one of its
         // profiles is active via COMPOSE_PROFILES (Docker semantics: a plain `up` = profile-less only).
         let y = "services:\n  always:\n    image: x\n  dbg:\n    image: x\n    profiles: [debug]\n";
         // Ensure no ambient profile leaks in.
@@ -2570,7 +2570,7 @@ mod tests {
             names2.contains(&"dbg".to_string()),
             "profile active → dbg present"
         );
-        // A depends_on toward a dropped profiled service must NOT fail the topo — the edge is pruned.
+        // A depends_on toward a dropped profiled service must NOT fail the topo - the edge is pruned.
         std::env::remove_var("COMPOSE_PROFILES");
         let y2 = "services:\n  app:\n    image: x\n    depends_on: [dbg]\n  dbg:\n    image: x\n    profiles: [debug]\n";
         let parsed = parse(y2).expect("dangling profiled dependency must be pruned, not error");
@@ -2582,8 +2582,8 @@ mod tests {
     #[test]
     fn partial_stack_failure_honors_depends_chain() {
         // Review P3 (the untested angle): a failed service must not start its dependents, but the
-        // parser-level guarantee is that the dependency edge exists. (Runtime behaviour — independent
-        // services start, dependents don't — is verified live; here we assert the edge is recorded so
+        // parser-level guarantee is that the dependency edge exists. (Runtime behaviour - independent
+        // services start, dependents don't - is verified live; here we assert the edge is recorded so
         // `validate`/`wait` can enforce it.)
         let y = "services:\n  bad:\n    image: a\n    command: [\"false\"]\n  dep:\n    image: a\n    depends_on: {bad: {condition: service_completed_successfully}}\n";
         let dep = boxes(y).into_iter().find(|b| b.name == "dep").unwrap();
@@ -2612,7 +2612,7 @@ mod tests {
     fn healthcheck_test_reads_present_representation_not_expected() {
         // Review P1 "third state": `healthcheck.test` is SOMETIMES a string (CMD-SHELL) and SOMETIMES a
         // list (exec). With the dual scalar+children representation, the converter must read whichever
-        // is PRESENT for the value's form, not blindly the same one — else the block/inline × list/bare
+        // is PRESENT for the value's form, not blindly the same one - else the block/inline × list/bare
         // matrix drops or mis-parses a cell. All four cells must resolve to the same command.
         let cases = [
             // (yaml, expected)
@@ -2674,7 +2674,7 @@ mod tests {
         // Block-level anchors are SUPPORTED now (see yaml_anchors_and_merge_keys_expand_with_override):
         // an anchored service with no alias just parses.
         assert!(parse("services:\n  a: &anchor\n    image: alpine\n").is_ok());
-        // A block-level alias to an UNDEFINED anchor is still an error — a clear "unknown anchor", never
+        // A block-level alias to an UNDEFINED anchor is still an error - a clear "unknown anchor", never
         // the literal `*alias` reaching the box.
         assert!(parse("services:\n  a:\n    image: *alias\n").is_err());
         assert!(parse("services:\n\timage: alpine\n").is_err()); // tab
@@ -2684,7 +2684,7 @@ mod tests {
         );
         assert!(parse("services:\n  a:\n    command: |\n      echo hi\n").is_err());
         // block scalar
-        // Audit regression: an anchor/alias in LIST-ITEM position must be refused too — it used to
+        // Audit regression: an anchor/alias in LIST-ITEM position must be refused too - it used to
         // slip past both the `t`-prefix check (line starts with `- `) and `value_after_colon` (a list
         // item has no `:`), reaching the box as the literal `*boom`. `after_seq_markers` closes it.
         assert!(
@@ -2698,7 +2698,7 @@ mod tests {
         assert!(
             parse("services:\n  a:\n    image: alpine\n    command:\n      - --version\n").is_ok()
         );
-        // An anchor/alias as a structural token must be refused in EVERY inline position — the two
+        // An anchor/alias as a structural token must be refused in EVERY inline position - the two
         // positional checks only see line-start / after-`:`. `line_has_inline_anchor` closes this by
         // construction (a token-opening `&`/`*` outside quotes), not by an opener list, so a value
         // (`[*x]`), a nested value (`{test: [*x]}`), AND a KEY (`{&a k: v}`) are all caught.
@@ -2707,7 +2707,7 @@ mod tests {
             parse("services:\n  a:\n    image: alpine\n    healthcheck: {test: *boom}\n").is_err()
         );
         assert!(parse("services:\n  a:\n    image: alpine\n    environment: {K: &a v}\n").is_err());
-        // Anchor as a MAP KEY, and alias NESTED inside a `{…}`-wrapped `[…]` — the cases an opener
+        // Anchor as a MAP KEY, and alias NESTED inside a `{…}`-wrapped `[…]` - the cases an opener
         // list ("preceded by `[{,:`") had to reason about; the token-start definition covers them.
         assert!(parse("services:\n  a:\n    image: x\n    environment: {&a k: v}\n").is_err());
         assert!(parse("services:\n  a:\n    image: x\n    healthcheck: {test: [*a]}\n").is_err());
@@ -2725,7 +2725,7 @@ mod tests {
     fn inline_anchor_detection_matches_an_independent_oracle() {
         // Completeness PROOF (not enumeration): generate lines with `&`/`*` in every position among a
         // small alphabet, and check `line_has_inline_anchor` against an INDEPENDENT oracle written a
-        // different way — a right-to-left scan that, for each unquoted `&`/`*`, walks back over spaces
+        // different way - a right-to-left scan that, for each unquoted `&`/`*`, walks back over spaces
         // and asks "is the previous significant char scalar content?". If the two ever disagree, either
         // the guard misses a token-opening anchor (a hole) or over-flags a scalar (a false positive).
         fn oracle(line: &str) -> bool {
@@ -2746,7 +2746,7 @@ mod tests {
                 i += 1;
             }
             // Flow-collection depth entering each byte (outside quotes). A token-opening `&`/`*` is only
-            // refused when it sits INSIDE a `[…]`/`{…}` — block-level anchors/aliases are supported.
+            // refused when it sits INSIDE a `[…]`/`{…}` - block-level anchors/aliases are supported.
             let mut depth_at = vec![0i32; b.len()];
             let mut d = 0i32;
             for (idx, &c) in b.iter().enumerate() {
@@ -2768,7 +2768,7 @@ mod tests {
                 if (c == b'&' || c == b'*') && !inq[idx] {
                     // Walk left over spaces to the previous significant, non-quoted byte. A `&`/`*` is
                     // itself "already inside a value" if IT was preceded by content, so we treat a
-                    // preceding `&`/`*` as content too (skip past it and keep looking) — a `b&*` run is
+                    // preceding `&`/`*` as content too (skip past it and keep looking) - a `b&*` run is
                     // one plain scalar, not two anchors. This mirrors the guard's forward `prev_content`
                     // latch; writing the walk L→R-independently (here R→L) is what makes it a check.
                     let mut j = idx;
@@ -2784,7 +2784,7 @@ mod tests {
                             break false; // a quote is a scalar boundary, not content
                         }
                         if b[j] == b'&' || b[j] == b'*' {
-                            continue; // part of the same scalar run — keep walking back
+                            continue; // part of the same scalar run - keep walking back
                         }
                         if !inq[j] && (b[j] == b']' || b[j] == b'}') {
                             break true; // a CLOSED flow collection is content-like (the guard latches
@@ -2923,7 +2923,7 @@ services:
 
     #[test]
     fn multi_line_quoted_scalar_folds_to_a_space() {
-        // Appwrite's form: a single-quoted list item whose closing quote is on the NEXT line — YAML
+        // Appwrite's form: a single-quoted list item whose closing quote is on the NEXT line - YAML
         // folds the line break to a space.
         let y = "services:\n  a:\n    image: alpine\n    command:\n      - -c\n      - 'curl http://x/health\n          >/dev/null'\n";
         let c = &boxes(y)[0].command;
@@ -2962,7 +2962,7 @@ services:
 
     #[test]
     fn leading_document_marker_after_comments_is_ok_but_a_second_doc_is_not() {
-        // Airflow's file opens with a licensed comment header, then a `---` document-start — fine.
+        // Airflow's file opens with a licensed comment header, then a `---` document-start - fine.
         let y = "# a licensed header\n#\n---\nservices:\n  a:\n    image: alpine\n";
         assert_eq!(boxes(y)[0].name, "a");
         // A `---` AFTER real content still begins a second document, which we don't read.
@@ -3030,7 +3030,7 @@ services:
 
     #[test]
     fn deploy_resources_limits_map_to_hard_caps() {
-        // Docker Compose v3 puts hard caps under `deploy.resources.limits` — kern must CONVERT them to
+        // Docker Compose v3 puts hard caps under `deploy.resources.limits` - kern must CONVERT them to
         // its own enforced caps (Docker rootless ignores them). `reservations` are soft → left alone.
         let y = "services:\n  app:\n    image: alpine\n    deploy:\n      resources:\n        limits:\n          memory: 128M\n          cpus: \"0.5\"\n          pids: 100\n        reservations:\n          memory: 64M\n";
         let app = parse(y)
@@ -3062,7 +3062,7 @@ services:
 
     #[test]
     fn deploy_limits_typo_maps_no_cap_and_does_not_lie() {
-        // A mistyped limits key (`mem:` not `memory:`) must NOT silently apply a cap — it maps nothing
+        // A mistyped limits key (`mem:` not `memory:`) must NOT silently apply a cap - it maps nothing
         // (and apply_deploy warns the service runs uncapped). Better a visible gap than a runs-but-lies.
         let y = "services:\n  app:\n    image: alpine\n    deploy:\n      resources:\n        limits:\n          mem: 64m\n";
         let app = parse(y)
@@ -3091,7 +3091,7 @@ services:
 
     #[test]
     fn randomized_fuzz_never_panics_incl_multibyte_and_deep() {
-        // Property: parse() NEVER panics on ANY input — Err or Ok only. Covers the two classes plain
+        // Property: parse() NEVER panics on ANY input - Err or Ok only. Covers the two classes plain
         // examples miss: MULTIBYTE at a slice boundary (byte-safe slicing / char_indices) and DEEP
         // NESTING (iterative + MAX_DEPTH → no stack overflow). Deterministic LCG, reproducible.
         let alphabet: [&str; 18] = [
@@ -3111,7 +3111,7 @@ services:
             "é",
             "→",
             "🦀",
-            // A long digit-run + a duration suffix — the class the audit found `parse_duration_secs`
+            // A long digit-run + a duration suffix - the class the audit found `parse_duration_secs`
             // could overflow-panic on (e.g. reaching `interval: 9999999999999999h`).
             "9999999999999999",
             "h",
@@ -3131,7 +3131,7 @@ services:
             }
             let _ = parse(&s); // must not panic for any input
         }
-        // Explicit deep nesting (2000 levels of `  key:`) — must be refused (MAX_DEPTH) or parsed, no
+        // Explicit deep nesting (2000 levels of `  key:`) - must be refused (MAX_DEPTH) or parsed, no
         // stack overflow.
         let mut deep = String::from("services:\n");
         for i in 0..2000 {
@@ -3139,14 +3139,14 @@ services:
             deep.push_str("k:\n");
         }
         let _ = parse(&deep);
-        // Billion-laughs shape — must be refused by the anchor prescreen, not expanded.
+        // Billion-laughs shape - must be refused by the anchor prescreen, not expanded.
         assert!(parse("services:\n  a: &x [*x, *x]\n").is_err());
     }
 
     #[test]
     fn duration_overflow_falls_back_to_none_not_panic() {
         // Audit regression: an unbounded untrusted `interval:` must never overflow-panic (debug) nor
-        // wrap to a nonsense value (release) — a form that overflows falls back to None (box default).
+        // wrap to a nonsense value (release) - a form that overflows falls back to None (box default).
         assert_eq!(parse_duration_secs("30s"), Some(30));
         assert_eq!(parse_duration_secs("1m30s"), Some(90));
         assert_eq!(parse_duration_secs("2h"), Some(7200));
@@ -3154,7 +3154,7 @@ services:
         assert_eq!(parse_duration_secs("200000000000000000m"), None); // n*60 overflows → None
         assert_eq!(parse_duration_secs("9223372036854775807s5s"), None); // total add overflows → None
         assert_eq!(parse_duration_secs("99999999999999999999"), None); // >i64 bare number → None
-                                                                       // And through the real public entry point, as a healthcheck.interval — parse must not panic.
+                                                                       // And through the real public entry point, as a healthcheck.interval - parse must not panic.
         let y = "services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      interval: 6000000000000000h\n";
         let _ = parse(y); // Ok or Err, never a panic
     }
@@ -3207,7 +3207,7 @@ services:
     #[test]
     fn network_aliases_are_collected_map_form_only() {
         // The map form `networks: {net: {aliases: [db]}}` yields the aliases; the list form has none.
-        // (kern ignores the network itself — shared-netns pod — but honours the alias names so a peer
+        // (kern ignores the network itself - shared-netns pod - but honours the alias names so a peer
         // can reach the service by alias too.)
         let y = "services:\n  postgres:\n    image: x\n    networks:\n      usbim:\n        aliases:\n          - db\n          - primary\n  rest:\n    image: y\n    networks:\n      - usbim\n";
         let b = parse(y).unwrap();

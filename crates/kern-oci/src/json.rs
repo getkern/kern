@@ -1,4 +1,4 @@
-//! A tiny, dependency-free JSON reader — just enough to walk the registry's manifests and Docker
+//! A tiny, dependency-free JSON reader - just enough to walk the registry's manifests and Docker
 //! Hub's search response. Not a general parser: it finds keys/arrays/objects by string scanning,
 //! which is sound for the well-formed, machine-generated JSON these APIs return. Shared by
 //! [`crate::pull`] and [`crate::search`] so there is one string-scanner, not two.
@@ -31,7 +31,7 @@ pub(crate) fn matching_bracket(s: &str, open_idx: usize, open: u8, close: u8) ->
     None
 }
 
-/// The `open..=close` bracketed span (inclusive) following `"key"` — one implementation of
+/// The `open..=close` bracketed span (inclusive) following `"key"` - one implementation of
 /// "find key → find opener → match its close" so the array and object walkers can't drift.
 fn bracketed_after<'a>(json: &'a str, key: &str, open: u8, close: u8) -> Option<&'a str> {
     let k = json.find(&format!("\"{key}\""))?;
@@ -45,7 +45,7 @@ pub(crate) fn array_after<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     bracketed_after(json, key, b'[', b']')
 }
 
-/// The `{...}` object (inclusive) following `"key"` — e.g. an OCI image config's `"config": {…}`.
+/// The `{...}` object (inclusive) following `"key"` - e.g. an OCI image config's `"config": {…}`.
 pub(crate) fn object_after<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     bracketed_after(json, key, b'{', b'}')
 }
@@ -92,7 +92,7 @@ pub(crate) fn split_objects(arr: &str) -> Vec<&str> {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'{' {
-            // A `{` either opens a complete object (jump past its close) or is unbalanced — and if it
+            // A `{` either opens a complete object (jump past its close) or is unbalanced - and if it
             // doesn't close, no later brace can either, so stop. Advancing by one instead would
             // rescan to end-of-input for every unmatched `{`: O(n^2), a parse-time DoS on a crafted
             // array of open braces. (Found by the `oci_json` fuzz target.)
@@ -109,7 +109,7 @@ pub(crate) fn split_objects(arr: &str) -> Vec<&str> {
 }
 
 /// The next JSON string value after the first `:` in `s`, properly **unescaped** and
-/// **escape-aware** (a `\"` inside the value doesn't end it). Only valid for STRING-valued keys —
+/// **escape-aware** (a `\"` inside the value doesn't end it). Only valid for STRING-valued keys -
 /// for a numeric value use [`u64_field`]. Surrogate-pair `\uXXXX` (non-BMP) is skipped, not the
 /// common case for registry/Hub fields.
 pub(crate) fn value_after_colon(s: &str) -> Option<String> {

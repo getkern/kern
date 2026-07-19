@@ -35,7 +35,7 @@ echo "     (memory in bytes, cpus = quota, cpuset = pinning, nice = scheduling p
   | grep -E '^(name|memory|cpus|cpuset|nice):' | sed 's/^/   /'
 
 echo
-echo "── 3. 'burst' extends 'slim' and overrides it — same dry run shows the merged result:"
+echo "── 3. 'burst' extends 'slim' and overrides it - same dry run shows the merged result:"
 "$kern" box rp-burst --image "$img" --config "$cfg" vcpu:burst --show-config \
   | grep -E '^(memory|cpus|cpuset):' | sed 's/^/   /'
 echo "   (cpus 0.5->2, memory 256M->512M; cpuset 0 inherited from slim)"
@@ -47,11 +47,11 @@ echo "── 4. the vdisk:scratch profile is a real mount at /vdisk/scratch insi
   echo "hello from a profile-mounted disk" > /vdisk/scratch/note.txt
   echo "     wrote + read back: $(cat /vdisk/scratch/note.txt)"
 '
-echo "   (the 32m cap is a tmpfs here — rootless; kern upgrades it to ext4-on-loop when privileged)"
+echo "   (the 32m cap is a tmpfs here - rootless; kern upgrades it to ext4-on-loop when privileged)"
 
 echo
 echo "NOTE on enforcement: --show-config prints the resolved INTENT. Hard CPU/memory caps need a"
-echo "cgroup v2 delegation (e.g. a systemd user slice) to be kernel-enforced — see governed-run.sh"
+echo "cgroup v2 delegation (e.g. a systemd user slice) to be kernel-enforced - see governed-run.sh"
 echo "and SECURITY.md. The vgpio:leds profile is device-dependent; see device-isolation.sh."
 echo
-echo "done — profiles defined once, reused by name; the boxes and their tmpfs are gone."
+echo "done - profiles defined once, reused by name; the boxes and their tmpfs are gone."

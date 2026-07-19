@@ -11,12 +11,12 @@ pub use pull::{pull, valid_reference, ImageConfig, OciError, Platform};
 pub use push::{push, ImageConfigOut};
 pub use search::{search, SearchResult};
 
-/// Fuzzing surface — **not** part of the public API (hidden from docs, no stability guarantee). It
+/// Fuzzing surface - **not** part of the public API (hidden from docs, no stability guarantee). It
 /// exposes the pure functions that parse untrusted registry input so the `fuzz/` harness can drive
 /// them. See `fuzz/README.md`.
 #[doc(hidden)]
 pub mod __fuzz {
-    /// Drive the registry-JSON string scanner over arbitrary input — it must never panic (e.g. on a
+    /// Drive the registry-JSON string scanner over arbitrary input - it must never panic (e.g. on a
     /// non-UTF-8-boundary slice) no matter how malformed the bytes are.
     pub fn json_walk(s: &str) {
         use crate::json::*;
@@ -37,12 +37,12 @@ pub mod __fuzz {
         crate::pull::unsafe_member_path(p)
     }
 
-    /// Drive the in-process tar-header vetter over arbitrary bytes — it parses untrusted, decompressed
+    /// Drive the in-process tar-header vetter over arbitrary bytes - it parses untrusted, decompressed
     /// layer bytes at fixed offsets and must never panic (no OOB slice, no unbounded read) however
     /// malformed the input.
     pub fn tar_vet(data: &[u8]) {
         // The vetter is tar-flavour-INDEPENDENT (its verdict must not hinge on which `tar` the host
-        // has — a security boundary can't trust an external tool's version), so one pass covers it.
+        // has - a security boundary can't trust an external tool's version), so one pass covers it.
         let _ = crate::pull::vet_tar_stream(&mut std::io::Cursor::new(data));
     }
 }
@@ -70,7 +70,7 @@ pub fn whiteout_dir_symlink_free(rootfs_dir: &str, dir: &str) -> bool {
         match std::fs::symlink_metadata(&cur) {
             Ok(m) if m.file_type().is_symlink() => return false,
             Ok(_) => {}
-            Err(_) => return true, // doesn't exist yet — nothing to traverse/delete
+            Err(_) => return true, // doesn't exist yet - nothing to traverse/delete
         }
     }
     true
@@ -90,7 +90,7 @@ mod tests {
     }
 
     /// SECURITY regression: a whiteout under a symlinked parent must NOT be followed.
-    /// Fixture is synthetic, minimal, self-contained — no private paths, no real exploit
+    /// Fixture is synthetic, minimal, self-contained - no private paths, no real exploit
     /// payload (the audit gate from the launch standard).
     #[test]
     fn refuses_to_traverse_a_symlinked_parent() {

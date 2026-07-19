@@ -1,4 +1,4 @@
-//! Search Docker Hub for images — the backend of `kern search`. Uses the stable v1 search
+//! Search Docker Hub for images - the backend of `kern search`. Uses the stable v1 search
 //! endpoint that `docker search` itself uses (no auth, public repositories), so the set of
 //! discoverable images is exactly Docker's.
 
@@ -7,7 +7,7 @@ use crate::{net, OciError};
 
 /// One Docker Hub search hit.
 pub struct SearchResult {
-    /// Repository name (`nginx`, `bitnami/postgresql`, …) — what you pass to `kern pull`.
+    /// Repository name (`nginx`, `bitnami/postgresql`, …) - what you pass to `kern pull`.
     pub name: String,
     pub description: String,
     pub stars: u64,

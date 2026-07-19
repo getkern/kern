@@ -11,7 +11,7 @@ use crate::error::Error;
 pub struct GlobalOpts;
 
 /// The parsed subcommand.
-// `BoxRun` carries every `kern box` flag, so it dwarfs the unit variants — but a `Command` is built
+// `BoxRun` carries every `kern box` flag, so it dwarfs the unit variants - but a `Command` is built
 // exactly once per process on the cold parse path, so boxing it would only add indirection for no
 // runtime benefit.
 #[allow(clippy::large_enum_variant)]
@@ -59,7 +59,7 @@ pub enum Command {
         /// read-only base instead of `--rootfs`/`--image`. Paired with `--overlay-upper`.
         overlay_lower: Option<String>,
         /// INTERNAL (used by `kern build`): a PERSISTENT overlay upper dir (the build layer) instead
-        /// of the ephemeral scratch upper — so a build's writes accumulate across RUN steps.
+        /// of the ephemeral scratch upper - so a build's writes accumulate across RUN steps.
         overlay_upper: Option<String>,
         /// `--memory`/`-m`: hard memory ceiling in bytes (default cap if `None`).
         memory: Option<u64>,
@@ -89,7 +89,7 @@ pub enum Command {
         tun: bool,
         /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
         init: bool,
-        /// `--pids-limit N`: cap the box's process/thread count (`pids.max`) — fork-bomb containment.
+        /// `--pids-limit N`: cap the box's process/thread count (`pids.max`) - fork-bomb containment.
         pids_limit: Option<u64>,
         /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
         tmpfs: Vec<String>,
@@ -119,7 +119,7 @@ pub enum Command {
         timeout: u64,
         /// `--nice <n>`: scheduling niceness (-20..19) for the box workload.
         nice: Option<i64>,
-        /// `--io-weight <n>`: cgroup v2 `io.weight` (1..10000) — relative I/O priority.
+        /// `--io-weight <n>`: cgroup v2 `io.weight` (1..10000) - relative I/O priority.
         io_weight: Option<u64>,
         /// `--config <path>`: a specific `kern.toml` for this invocation (else the default / `KERN_CONFIG`).
         config: Option<String>,
@@ -134,7 +134,7 @@ pub enum Command {
         profiles: Vec<String>,
     },
     /// `kern run [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--] <cmd...>`:
-    /// run a command under cgroup CPU/memory caps WITHOUT a full sandbox — the resource-governor
+    /// run a command under cgroup CPU/memory caps WITHOUT a full sandbox - the resource-governor
     /// verb (composes with `box`'s isolation). Takes the same resource flags as `kern box`.
     Run {
         command: Vec<String>,
@@ -255,7 +255,7 @@ pub enum Command {
     Load {
         input: Option<String>,
     },
-    /// `kern builds [<tag>] [--status S] [-n N] [--json]`: list past builds (build history — the
+    /// `kern builds [<tag>] [--status S] [-n N] [--json]`: list past builds (build history - the
     /// `docker buildx history` analogue), optionally filtered by tag substring / outcome / count.
     Builds {
         json: bool,
@@ -304,7 +304,7 @@ pub enum Command {
     Gc {
         images: bool,
     },
-    /// `kern doctor`: preflight — will boxes run here, and which optional features are available?
+    /// `kern doctor`: preflight - will boxes run here, and which optional features are available?
     Doctor,
     /// `kern info`: compact runtime + host snapshot.
     Info,
@@ -347,7 +347,7 @@ pub enum Command {
         sub: String,
         force: bool,
     },
-    /// `kern config add <kind:name> [--flags]`: create/replace a resource profile non-interactively —
+    /// `kern config add <kind:name> [--flags]`: create/replace a resource profile non-interactively -
     /// the CLI twin of `kern top`'s profile forms (same validation + surgical write).
     ConfigAdd {
         args: Vec<String>,
@@ -436,7 +436,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("build") => parse_build(&rest)?,
         // `pull <image> [--dest <dir>]`: download an OCI image.
         Some("pull") => parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?,
-        // `push <local-ref> [as <remote-ref>]` — publish a cached image. `as` lets you retag on push
+        // `push <local-ref> [as <remote-ref>]` - publish a cached image. `as` lets you retag on push
         // (e.g. `kern push myapp as ghcr.io/me/myapp:1.0`).
         Some("push") => {
             let args: Vec<&&str> = rest
@@ -449,7 +449,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .map(|s| s.to_string())
                 .ok_or(Error::Usage("push <local-ref> [as <remote-ref>]"))?;
             // Optional `as <remote>` (or just a second positional). A DANGLING `as` with no ref after
-            // it is a usage error, NOT a silent fall-through to the local ref — otherwise
+            // it is a usage error, NOT a silent fall-through to the local ref - otherwise
             // `kern push myimg as` would push to Docker Hub as `library/myimg` unintentionally.
             let remote = match args.get(1) {
                 Some(s) if **s == "as" => Some(args.get(2).map(|s| s.to_string()).ok_or(
@@ -670,7 +670,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `doctor`: environment preflight. `info`: runtime snapshot.
         Some("doctor") => Command::Doctor,
         Some("info") => Command::Info,
-        // `probe`: a top-level alias for `config probe` — the short form a newcomer reaches for first.
+        // `probe`: a top-level alias for `config probe` - the short form a newcomer reaches for first.
         Some("probe") => Command::Config {
             sub: "probe".into(),
             force: false,
@@ -859,7 +859,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--read-only" | "--ro" => read_only = true,
                 // `--net` is Docker-shaped and value-OPTIONAL: bare `--net` shares the host network
                 // (back-compat), and `--net host`/`--net none` are honored too. Before, `--net none`
-                // set share=true and silently dropped the `none` token — a Docker user's muscle-memory
+                // set share=true and silently dropped the `none` token - a Docker user's muscle-memory
                 // isolation request produced a LESS-isolated box with no error.
                 "--net" => match rest.get(i + 1).copied() {
                     Some("host") => {
@@ -873,7 +873,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     // A non-flag token that isn't host|none is a Docker network mode kern has no
                     // concept of (`bridge`, a named network, …): reject it with the same message
                     // `--network` gives, instead of sharing the host net and swallowing it as the box
-                    // name — the box name goes FIRST (`kern box NAME --net`).
+                    // name - the box name goes FIRST (`kern box NAME --net`).
                     Some(v) if !v.starts_with('-') => {
                         return Err(Error::Usage(
                             "--net <host|none> (host = share host net; none = isolated)",
@@ -912,7 +912,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => return Err(Error::Usage("--hostname <name>")),
                     }
                 }
-                // `--pids-limit N`: cap the box's task count (`pids.max`) — fork-bomb containment.
+                // `--pids-limit N`: cap the box's task count (`pids.max`) - fork-bomb containment.
                 "--pids-limit" => {
                     i += 1;
                     match rest
@@ -964,7 +964,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--uid-range" => uid_range = true,
                 "--bind-rootfs" => bind_rootfs = true,
                 "--privileged" => privileged = true,
-                // Internal build-layer flags (see the Command::BoxRun docs) — take a value.
+                // Internal build-layer flags (see the Command::BoxRun docs) - take a value.
                 "--overlay-lower" => {
                     i += 1;
                     overlay_lower = Some(
@@ -983,7 +983,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 // `--restart [policy]`: no | on-failure | always | unless-stopped. `always`/
                 // `unless-stopped` persist via a systemd user unit (survive reboot); `on-failure`
-                // uses kern's in-process supervisor. A bare `--restart` = on-failure (back-compat) —
+                // uses kern's in-process supervisor. A bare `--restart` = on-failure (back-compat) -
                 // an unrecognized next token is left for the parser, not swallowed.
                 "--restart" => {
                     match rest
@@ -1169,7 +1169,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 "--add-host" => {
                     i += 1;
-                    // `NAME:IP` — the name has no colon, so split on the first `:` (IP is v4 or the
+                    // `NAME:IP` - the name has no colon, so split on the first `:` (IP is v4 or the
                     // `host-gateway` keyword). Both halves must be non-empty.
                     match rest.get(i).and_then(|v| v.split_once(':')) {
                         Some((n, ip)) if !n.is_empty() && !ip.is_empty() => {
@@ -1245,7 +1245,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 // Reject Docker's `--memory-swap` explicitly (don't alias it): on pure cgroup v2 the
                 // swap limit is a SEPARATE knob (`memory.swap.max`), not Docker's combined mem+swap
-                // total — aliasing would silently mean something different. Point to the honest flag.
+                // total - aliasing would silently mean something different. Point to the honest flag.
                 "--memory-swap" => return Err(Error::Usage(REJECT_MEMORY_SWAP)),
                 // Reject an unknown flag rather than silently ignoring it: a typo'd `--read-only`
                 // must NOT quietly run a writable box. (Flags after `--` are part of the command.)
@@ -1255,7 +1255,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // A `vcpu:`/`vgpio:`/`vdisk:`/`vgpu:` token is a resource profile, not the box name.
                 s if crate::config::classify(s).is_some() => profiles.push(s.to_string()),
                 s if name.is_none() => name = Some(s),
-                // A SECOND bare token (name already set, not a flag, not a profile) is junk — almost
+                // A SECOND bare token (name already set, not a flag, not a profile) is junk - almost
                 // always a command the user forgot to put after `--`. Reject it rather than silently
                 // dropping it (same anti-footgun rule as the unknown-flag arm above).
                 _ => {
@@ -1438,7 +1438,7 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
 }
 
 /// Like [`parse_size`] but accepts an explicit `0`. Used for `--memory-swap-max`, where `0` is a
-/// meaningful, valid value (zero swap allowance = swap off — the default) rather than a nonsense cap.
+/// meaningful, valid value (zero swap allowance = swap off - the default) rather than a nonsense cap.
 fn parse_size_z(s: &str) -> Option<u64> {
     if s.trim() == "0" {
         Some(0)
@@ -1448,7 +1448,7 @@ fn parse_size_z(s: &str) -> Option<u64> {
 }
 
 /// Parse a memory size like `512m`, `1g`, `512mb`, `2t`, or a bare `268435456` (= bytes) into bytes.
-/// Units are binary (k = 1024). Returns `None` on a malformed value — the caller turns that into a
+/// Units are binary (k = 1024). Returns `None` on a malformed value - the caller turns that into a
 /// usage error. Delegates to the shared [`kern_common::parse_binary_size`] so `--memory`, `--size`
 /// and profile size fields can never disagree on what `512m` means.
 fn parse_size(s: &str) -> Option<u64> {
@@ -1458,7 +1458,7 @@ fn parse_size(s: &str) -> Option<u64> {
 /// A valid `--cpuset-cpus` list (`0-3`, `0,2,4`, `1-2,5`): the SAME rule the profile `cpus` field
 /// uses, so the flag and the profiles can't disagree. See [`crate::config::is_cpu_list`]. Validating
 /// at the parse boundary means a typo can't silently produce an *unpinned* box, and only digits/`,`/`-`
-/// survive the numeric parse — no arbitrary string reaches the kernel's `cpuset.cpus`.
+/// survive the numeric parse - no arbitrary string reaches the kernel's `cpuset.cpus`.
 fn is_cpu_list(s: &str) -> bool {
     crate::config::is_cpu_list(s)
 }
@@ -1625,7 +1625,7 @@ fn discover_compose_file() -> Option<String> {
 
 /// `kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [-q] [<context>]`.
 fn parse_build(rest: &[&str]) -> Result<Command, Error> {
-    // `build <sub> …` — build-history management subcommands. A bare `build … -t <name>` (an actual
+    // `build <sub> …` - build-history management subcommands. A bare `build … -t <name>` (an actual
     // build) never starts with one of these verbs, so the dispatch is unambiguous. `--json` may sit
     // anywhere after the verb.
     let json = rest.contains(&"--json");
@@ -1986,7 +1986,7 @@ mod tests {
             .1;
         assert_eq!(plan, Command::BoxPlan { name: "web".into() });
         // `box <name>` with no rootfs/image still routes to BoxRun (box_run reports the missing
-        // source) — NOT a misleading "not implemented".
+        // source) - NOT a misleading "not implemented".
         assert!(matches!(
             parse(&["box".into(), "web".into()]).unwrap().1,
             Command::BoxRun { name, rootfs: None, image: None, .. } if name == "web"
@@ -2123,7 +2123,7 @@ mod tests {
                 ..
             }
         ));
-        // off by default — nesting stays blocked unless explicitly requested
+        // off by default - nesting stays blocked unless explicitly requested
         let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
         assert!(matches!(
             cmd,
@@ -2224,7 +2224,7 @@ mod tests {
         assert_eq!(memory_swap_max, Some(512 * 1024 * 1024));
 
         // A cpuset list must be structurally valid: injection chars, non-numeric tokens, empty
-        // tokens, dangling/reversed ranges are all refused at the parse boundary — so a typo can't
+        // tokens, dangling/reversed ranges are all refused at the parse boundary - so a typo can't
         // silently yield an unpinned box (and nothing arbitrary reaches the kernel's cpuset file).
         for bad in ["0;rm", "bad", "0-", "-", "1,,2", "3-1", "", "0-3-5", " 0"] {
             assert!(

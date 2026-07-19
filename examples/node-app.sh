@@ -8,7 +8,7 @@
 #                         dependency and publishes its port to localhost (-p). No outbound access.
 #
 # The split is the point: fetch deps once with the network on, then run the app sealed off. Your host
-# never gets node, npm, or node_modules in its PATH — it all stays in the throwaway boxes and the
+# never gets node, npm, or node_modules in its PATH - it all stays in the throwaway boxes and the
 # bind-mounted app dir.
 set -eu
 kern="${KERN:-kern}"
@@ -35,7 +35,7 @@ const http = require('http');
 const ms = require('ms'); // the dependency fetched in the install phase
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('hello from a kern node box — uptime ' + ms(Math.round(process.uptime() * 1000), { long: true }) + '\n');
+  res.end('hello from a kern node box - uptime ' + ms(Math.round(process.uptime() * 1000), { long: true }) + '\n');
 }).listen(8000, () => console.log('listening on 8000'));
 EOF
 
@@ -69,5 +69,5 @@ echo "==> kern ps (the detached server, with its published port):"
 
 echo
 echo "==> your host stayed clean:"
-command -v node >/dev/null 2>&1 && echo "   (host has node)" || echo "   host has NO node — it all lived in the boxes"
-echo "done — server stopped and app dir removed on exit (trap), no daemon left behind."
+command -v node >/dev/null 2>&1 && echo "   (host has node)" || echo "   host has NO node - it all lived in the boxes"
+echo "done - server stopped and app dir removed on exit (trap), no daemon left behind."

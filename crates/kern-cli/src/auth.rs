@@ -1,15 +1,15 @@
-//! `kern login` / `kern logout` — store or remove registry credentials used by the OCI pull path
+//! `kern login` / `kern logout` - store or remove registry credentials used by the OCI pull path
 //! for private images. Credentials live in the owner-only (`0600`) file managed by
 //! [`kern_common::registry_auth`]; the password is read from the terminal with echo off (or from
 //! stdin when piped, so it stays out of shell history and `argv`).
 
 use crate::error::Error;
 
-/// Docker Hub's token service host — the default registry when none is given, matching the OCI
+/// Docker Hub's token service host - the default registry when none is given, matching the OCI
 /// pull path's `DEFAULT_REGISTRY`.
 const DEFAULT_REGISTRY: &str = "registry-1.docker.io";
 
-/// `kern login [registry] [--username U]` — prompt for (or take) a username, read a password without
+/// `kern login [registry] [--username U]` - prompt for (or take) a username, read a password without
 /// echo, and store the credentials for `registry` (default: Docker Hub).
 pub fn login(registry: Option<&str>, username: Option<&str>) -> Result<(), Error> {
     let registry = registry.unwrap_or(DEFAULT_REGISTRY);
@@ -30,7 +30,7 @@ pub fn login(registry: Option<&str>, username: Option<&str>) -> Result<(), Error
     Ok(())
 }
 
-/// `kern logout [registry]` — remove the stored credentials for `registry` (default: Docker Hub).
+/// `kern logout [registry]` - remove the stored credentials for `registry` (default: Docker Hub).
 pub fn logout(registry: Option<&str>) -> Result<(), Error> {
     let registry = registry.unwrap_or(DEFAULT_REGISTRY);
     let removed = kern_common::registry_auth::remove(registry)
@@ -64,7 +64,7 @@ fn read_password(prompt_text: &str) -> Result<String, Error> {
     eprint!("{prompt_text}");
     let _ = std::io::stderr().flush();
 
-    // Save termios, clear ECHO, read, restore — best-effort and panic-safe (restored on every path).
+    // Save termios, clear ECHO, read, restore - best-effort and panic-safe (restored on every path).
     let mut saved: libc::termios = unsafe { std::mem::zeroed() };
     let echo_off = is_tty && unsafe { libc::tcgetattr(0, &mut saved) } == 0;
     if echo_off {
@@ -76,7 +76,7 @@ fn read_password(prompt_text: &str) -> Result<String, Error> {
     let read = std::io::stdin().lock().read_line(&mut line);
     if echo_off {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
-        eprintln!(); // the user's Enter wasn't echoed — move to a fresh line
+        eprintln!(); // the user's Enter wasn't echoed - move to a fresh line
     }
     read.map_err(|e| Error::Sandbox(format!("reading password: {e}")))?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())

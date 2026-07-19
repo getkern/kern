@@ -7,13 +7,13 @@ members = [
     "crates/kern-oci",
     "crates/kern-isolation",
 ]
-# The fuzz harness is its own (nightly + sanitizer) workspace — never built by the normal `cargo build`.
+# The fuzz harness is its own (nightly + sanitizer) workspace - never built by the normal `cargo build`.
 # `windows/kern-win` is the Windows→WSL2 shim: a Windows-target crate the release CI cross-compiles on
 # its own; excluding it keeps the normal Linux `cargo build`/`clippy`/`test` from touching a foreign target.
 exclude = ["fuzz", "windows/kern-win"]
 
 [workspace.package]
-version = "0.6.5"
+version = "0.6.7"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -24,10 +24,10 @@ authors = ["kern contributors"]
 # Release: optimized for a small, fast single binary. Startup speed is the headline
 # (opt-level = 3); fat LTO + one codegen unit give whole-program optimization; panic = abort
 # drops unwinding tables; strip removes symbols + debuginfo. (For a min-SIZE build instead of
-# min-startup, switch opt-level to "z" — kept at 3 here on purpose.)
+# min-startup, switch opt-level to "z" - kept at 3 here on purpose.)
 [profile.release]
 # opt-level "z" (size): kern's cold start is syscall-bound (unshare/mount/exec), not CPU-bound, so
-# size-optimised codegen shrinks the binary noticeably with no measurable latency cost — verified a
+# size-optimised codegen shrinks the binary noticeably with no measurable latency cost - verified a
 # hair faster, likely better I-cache. There is no hot CPU path to slow down.
 opt-level = "z"
 lto = "fat"

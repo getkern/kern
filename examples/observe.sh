@@ -1,10 +1,10 @@
 #!/bin/sh
-# Observe running boxes — daemonless. A detached box's output is captured to a log, and its
+# Observe running boxes - daemonless. A detached box's output is captured to a log, and its
 # memory/CPU are read straight from its cgroup. No background service.
 #
 #   kern logs <name>   replay captured stdout/stderr (works after the box exits, too)
 #   kern stats [--json]  one-shot memory + CPU per box
-#   kern top           live, auto-refreshing view (Ctrl-C to exit) — try it interactively
+#   kern top           live, auto-refreshing view (Ctrl-C to exit) - try it interactively
 set -eu
 kern="${KERN:-kern}"
 

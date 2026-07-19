@@ -2,7 +2,7 @@
 **/*.rs.bk
 .DS_Store
 
-# Pulled/built OCI rootfs — `kern pull`/`kern build` with no --dest writes into the CWD as
+# Pulled/built OCI rootfs - `kern pull`/`kern build` with no --dest writes into the CWD as
 # `<name>_<tag>-<hash>/` plus `.image`/`.lock`/`.layers`/`.base`/`.diff` sidecars. Never commit a
 # rootfs; match the hash-suffixed names (anchored to the repo root so real files are untouched).
 /*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*/
@@ -18,13 +18,13 @@
 /kern-final-prompt*
 /kern-review-packet*
 
-# Reviewer prompts / working notes — never in the repo
+# Reviewer prompts / working notes - never in the repo
 /REVISORE-*.md
 
-# Whitepaper draft — provenance/authorship lives on Zenodo, not in the code repo
+# Whitepaper draft - provenance/authorship lives on Zenodo, not in the code repo
 /paper/
 
-# --- Secrets & sensitive material — NEVER commit (defensive: a stray `git add -A` can't sweep these
+# --- Secrets & sensitive material - NEVER commit (defensive: a stray `git add -A` can't sweep these
 # in). .gitignore only guards UNTRACKED files, which is exactly the accidental-add case. ---
 # Private keys / certs / keystores
 *.pem

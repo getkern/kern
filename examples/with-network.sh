@@ -1,6 +1,6 @@
 #!/bin/sh
 # Networking is OFF by default (isolated, loopback-only). Opt in with --net to share the host
-# network namespace — outbound connectivity for build/fetch steps. kern copies the host's
+# network namespace - outbound connectivity for build/fetch steps. kern copies the host's
 # resolv.conf into the box so DNS resolves out of the box.
 #
 # Trade-off: --net means NO network isolation (host localhost + abstract sockets are reachable).

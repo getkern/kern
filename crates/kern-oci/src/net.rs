@@ -64,11 +64,11 @@ pub(crate) fn curl_with_config(args: &[&str], config: &str) -> Result<Vec<u8>, O
 
 /// Fetch just the response **headers** for `url` (body discarded), so the caller can read a
 /// registry's `WWW-Authenticate` challenge and status line. https-only and does NOT follow
-/// redirects (`-L` absent) — the `401` challenge is on the direct response, and a non-2xx status is
+/// redirects (`-L` absent) - the `401` challenge is on the direct response, and a non-2xx status is
 /// still a successful curl run (no `-f`), so it's returned rather than raised as an error.
 pub(crate) fn head_headers(url: &str) -> Result<String, OciError> {
     // Pin to HTTPS for a real registry; allow plain HTTP only for a loopback `http://` URL (the
-    // local-dev / `registry:2` case — the same insecure-OK-on-loopback rule the pull/push URLs use).
+    // local-dev / `registry:2` case - the same insecure-OK-on-loopback rule the pull/push URLs use).
     // A non-loopback `http://` never reaches here: `reg_base` only emits `http://` for loopback hosts.
     let proto: &[&str] = if url.starts_with("http://") {
         &["--proto", "=http"]
@@ -79,7 +79,7 @@ pub(crate) fn head_headers(url: &str) -> Result<String, OciError> {
     args.extend_from_slice(proto);
     args.extend_from_slice(&[
         "--max-filesize",
-        "1000000", // headers only — cap so a hostile registry can't stream an endless body at us
+        "1000000", // headers only - cap so a hostile registry can't stream an endless body at us
         "--connect-timeout",
         "10",
         "--max-time",
@@ -95,7 +95,7 @@ pub(crate) fn head_headers(url: &str) -> Result<String, OciError> {
     String::from_utf8(body).map_err(|_| OciError::Registry("non-UTF-8 headers".into()))
 }
 
-/// A plain `GET <url>` returning the body as a UTF-8 string — for small JSON APIs (Hub search).
+/// A plain `GET <url>` returning the body as a UTF-8 string - for small JSON APIs (Hub search).
 /// Silent (`-s`), surfaces errors (`-S`), follows redirects (`-L`), bounded timeouts.
 pub(crate) fn get(url: &str) -> Result<String, OciError> {
     let body = curl(&[
@@ -103,7 +103,7 @@ pub(crate) fn get(url: &str) -> Result<String, OciError> {
         "--proto",
         "=https", // the request itself must be https
         "--proto-redir",
-        "=https", // …and every redirect too — no `file://`/`http://` SSRF via a hostile redirect
+        "=https", // …and every redirect too - no `file://`/`http://` SSRF via a hostile redirect
         "--max-redirs",
         "5",
         "--max-filesize",
