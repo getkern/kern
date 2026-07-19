@@ -607,7 +607,10 @@ fn child_setup_and_exec(
     // stay invisible. The process is already IN its box cgroup here (the supervisor moved into it via
     // `apply_limits` before the fork), so the namespace root is exactly that cgroup. Best-effort: a
     // kernel without cgroup namespaces just leaves the box without a cgroup view (prior behaviour).
-    unsafe { libc::unshare(libc::CLONE_NEWCGROUP) };
+    // SECURITY: capture whether the unshare succeeded. If it FAILED (no cgroupns), we must NOT mount a
+    // fresh `cgroup2` below: without our own cgroup-ns root it would expose the WHOLE host cgroup tree
+    // (every sibling box + systemd unit) read-only. Gate the mount on this.
+    let cgroupns_ok = unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } == 0;
     set_hostname(&spec.hostname);
     make_private()?;
     t.mark("unshare+private");
@@ -674,8 +677,11 @@ fn child_setup_and_exec(
     // Give the box a read-only view of its OWN cgroup at `/sys/fs/cgroup` (see `mount_cgroup`), so
     // memory-aware runtimes read the real cap. After the `/proc` masks so their mount ordering matches
     // the rest of the hardened set; before the optional read-only root remount below, while the root is
-    // still writable for the mountpoint mkdir.
-    mount_cgroup();
+    // still writable for the mountpoint mkdir. ONLY when we own a cgroup namespace (else a fresh cgroup2
+    // mount would reveal the whole host cgroup tree instead of just this box's leaf).
+    if cgroupns_ok {
+        mount_cgroup();
+    }
     t.mark("pivot+proc");
     // Optional read-only remount LAST — the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep
