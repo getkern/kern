@@ -22,7 +22,7 @@ pub fn help() -> Result<(), Error> {
     println!("{}", crate::ui::logo(&p));
     println!(
         "\
-  {b}kern {ver}{z} {d}— a fast, lightweight sandbox & virtual resource manager{z}
+  {b}kern {ver}{z}{d}: a fast, lightweight sandbox & virtual resource manager{z}
 
 {b}USAGE:{z}
     kern <COMMAND> [ARGS]
@@ -72,7 +72,7 @@ pub fn help() -> Result<(), Error> {
 
   {d}Config & storage{z}
     {c}config{z} [list|edit|setup|probe|clear]                          List resource profiles; manage kern.toml
-    {c}config add{z} <kind:name> [--flags]                              Create a profile (vcpu/vgpio/vdisk) — CLI twin of `kern top`
+    {c}config add{z} <kind:name> [--flags]                              Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     {c}config rm{z} <kind:name>                                         Delete a profile
     {c}validate{z} [path]                                                Check a kern.toml
     {c}examples{z}                                                       Print an example kern.toml
@@ -101,7 +101,7 @@ pub fn help() -> Result<(), Error> {
     --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
     -it, -t, -i         Allocate an interactive PTY (shells/REPLs); foreground only
     -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; a port RANGE
-                        like 8000-8010:8000-8010 works; binds 127.0.0.1 by default — use
+                        like 8000-8010:8000-8010 works; binds 127.0.0.1 by default, use
                         0.0.0.0:H:B to expose on all interfaces; repeatable)
     --add-host N:IP     Add an /etc/hosts entry N → IP in the box; IP may be `host-gateway`
                         (the host's address, to reach a service on the host); repeatable
@@ -124,8 +124,8 @@ pub fn help() -> Result<(), Error> {
     --hostname <name>   Set the box's hostname (default: the box name)
     --tun               Expose /dev/net/tun in the box (WireGuard / userspace VPN)
     --init              Run a built-in reaping init as PID 1 (no zombies; forwards SIGTERM)
-    --pids-limit <N>    Cap the box's process count (pids.max) — fork-bomb containment
-    --io-weight <N>     cgroup-v2 io.weight — relative I/O priority (1–10000; best-effort)
+    --pids-limit <N>    Cap the box's process count (pids.max), fork-bomb containment
+    --io-weight <N>     cgroup-v2 io.weight, relative I/O priority (1-10000; best-effort)
     --nice <n>          Scheduling niceness for the box workload (-20 high … 19 low)
     --env-file <file>   Load K=V lines from a file into the box env (repeatable; --env wins)
     --config <path>     Use this kern.toml for resource-profile tokens (vcpu:/vgpio:/vdisk:)
@@ -138,9 +138,9 @@ pub fn help() -> Result<(), Error> {
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
                         only the caller (faster + more isolated)
-    --bind-rootfs       Bind --rootfs directly instead of an overlay — faster on kernels with a
+    --bind-rootfs       Bind --rootfs directly instead of an overlay, faster on kernels with a
                         slow overlayfs, but the source is mutable & shared (no per-box isolation)
-    --privileged        Relax seccomp so a NESTED `kern box` (docker-in-docker style) can start —
+    --privileged        Relax seccomp so a NESTED `kern box` (docker-in-docker style) can start,
                         rootless-only; still blocks kexec/modules/bpf/io_uring (unlike Docker)
     --plan              Preview the isolation sequence instead of running
 
@@ -162,7 +162,7 @@ pub fn banner() -> Result<(), Error> {
     println!("{}", crate::ui::logo(&p));
     println!(
         "\
-  {b}kern {ver}{z} {d}— a fast, lightweight sandbox & virtual resource manager{z}
+  {b}kern {ver}{z}{d}: a fast, lightweight sandbox & virtual resource manager{z}
 
     {b}kern box{z} <name> --image alpine -- sh   {d}run a command in a sandbox{z}
     {b}kern box{z} app --image alpine vcpu:big -- sh  {d}attach a resource profile (make one: {z}{b}kern config{z}{d}){z}
