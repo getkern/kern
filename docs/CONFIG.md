@@ -236,7 +236,7 @@ profile:
 
 | Variable | Effect | Kind |
 |---|---|---|
-| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative.** First-party governor. A caller can unset it, so it is NOT a security boundary. The count is crash-safe (a dead box's slot frees automatically). |
+| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative, best-effort.** First-party governor, NOT a security boundary (a caller can unset it). The count is crash-safe (a dead box's slot frees automatically). It is checked per box start, so a **concurrent burst** (`kern compose up`, `xargs -P kern box`) can race the count and overshoot `N` by the burst size. For a hard, race-free cap use `KERN_FLEET_PIDS_MAX` / `KERN_FLEET_MEMORY_MAX` (cgroup-enforced on the shared slice). |
 | `KERN_FLEET_MEMORY_MAX` | A hard `memory.max` on kern's shared `kern.slice`, bounding the SUM of all boxes' memory. Accepts `512m`, `4g`, or bare bytes. | **Real.** Kernel-enforced: the sum is capped even past the cooperative ceiling, and a box cannot raise it (the slice is outside every box's cgroup view). |
 | `KERN_FLEET_PIDS_MAX` | A hard `pids.max` on `kern.slice`, bounding total tasks across all boxes. | **Real**, kernel-enforced. |
 
