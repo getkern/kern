@@ -3172,24 +3172,30 @@ mod uid_range_root_traversable {
     use std::os::unix::fs::PermissionsExt;
 
     // The fix is a mode on the overlay upper (→ the box root). Assert the exact rule the box path uses:
-    // root becomes world-traversable (0755) iff a non-root --user is set OR --uid-range is on.
-    fn root_should_be_traversable(user_non_root: bool, uid_range: bool) -> bool {
-        user_non_root || uid_range
+    // root becomes world-traversable (0755) iff a non-root --user is set, OR --uid-range is on, OR the
+    // box is a POD MEMBER (it joins a shared user ns that may map a range, and its image may drop
+    // privilege — the box's own uid_range flag is false there, so pod membership must count too).
+    fn root_should_be_traversable(user_non_root: bool, uid_range: bool, pod_member: bool) -> bool {
+        user_non_root || uid_range || pod_member
     }
 
     #[test]
     fn root_is_traversable_when_privilege_may_be_dropped() {
         assert!(
-            root_should_be_traversable(false, true),
+            root_should_be_traversable(false, true, false),
             "--uid-range → 0755 (entrypoint may drop)"
         );
         assert!(
-            root_should_be_traversable(true, false),
+            root_should_be_traversable(true, false, false),
             "--user non-root → 0755"
         );
-        assert!(root_should_be_traversable(true, true));
         assert!(
-            !root_should_be_traversable(false, false),
+            root_should_be_traversable(false, false, true),
+            "pod member → 0755 (shared range userns, image may drop, e.g. postgres/redis)"
+        );
+        assert!(root_should_be_traversable(true, true, true));
+        assert!(
+            !root_should_be_traversable(false, false, false),
             "plain root box stays own-only 0700"
         );
     }
