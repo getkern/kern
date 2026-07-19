@@ -316,12 +316,14 @@ pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
     unsafe { cmd.pre_exec(helper_pre_exec) };
     let proxy = cmd.spawn().map_err(|e| format!("egress: spawn proxy: {e}"))?;
-    // Wait briefly for the proxy to bind, so the box's first request doesn't race it.
-    for _ in 0..200 {
+    // Wait briefly for the proxy to bind, so the box's first request doesn't race it. Poll at 1 ms (not
+    // 10 ms) granularity: the proxy usually binds in 1-3 ms, and a coarse 10 ms sleep added ~10 ms of dead
+    // time to EVERY egress box start (a real bottleneck when a fleet spins many). Same ~2 s total ceiling.
+    for _ in 0..2000 {
         if sock_path.exists() {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     Ok((proxy, sock_path))
 }
