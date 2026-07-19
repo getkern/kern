@@ -14,12 +14,19 @@
 //! numbers from `libc::SYS_landlock_*`. Applied on the box's PID-1 thread just before `execve` (after
 //! `no_new_privs`, before seccomp), so it covers the workload and every descendant.
 //!
-//! What Landlock does NOT cover (by design, stated so it is never assumed): a file DESCRIPTOR already
-//! open for write before `restrict_self` keeps its access (Landlock governs path resolution, not open
-//! fds). kern applies the ruleset on PID 1 before `execve` while no workload code has run, so the
-//! workload never gets a pre-opened writable fd to a path the allowlist would deny. It is also a WRITE
-//! allowlist, not a read confinement: the box root stays readable/executable everywhere (programs need
-//! their libs/config). For read confinement use the mount namespace (`-v`, RO remounts), not this.
+//! What Landlock does NOT cover (by design, stated so it is never assumed):
+//!  * A file DESCRIPTOR already open for write before `restrict_self` keeps its access (Landlock governs
+//!    path resolution, not open fds). kern applies the ruleset on PID 1 before `execve` while no workload
+//!    code has run, so the workload never gets a pre-opened writable fd to a denied path.
+//!  * It is a WRITE allowlist, not a read confinement: the box root stays readable/executable everywhere
+//!    (programs need their libs/config). For read confinement use the mount namespace (`-v`, RO remounts).
+//!  * `rename`/link ACROSS directories (`LANDLOCK_ACCESS_FS_REFER`) is DENIED by default on ABI >= 2 (we
+//!    do not grant REFER), so a workload can't move a file out of an allowlisted subtree into a denied
+//!    one. On ABI 1 REFER does not exist and the kernel governs cross-dir rename differently; kern's real
+//!    write boundary on such kernels is the combination below, not Landlock alone.
+//!  * Landlock does not stop a new `mount`/`pivot_root`/`umount2` that could re-expose a path; those are
+//!    blocked by kern's always-on SECCOMP filter, not by Landlock. The two are defense-in-depth TOGETHER:
+//!    seccomp closes the mount vector, Landlock the path-write vector. Neither alone is the whole story.
 
 use crate::Error;
 use std::ffi::CString;

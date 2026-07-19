@@ -154,13 +154,23 @@ fn connect_vetted(host: &str, port: u16) -> std::io::Result<std::net::TcpStream>
 /// unknown range is treated as public, but every host-local range is refused.
 pub fn ip_is_public(ip: std::net::IpAddr) -> bool {
     fn v4_public(a: std::net::Ipv4Addr) -> bool {
+        let o = a.octets();
+        // `is_private()` misses ranges that are still NOT routable-public and are reachable inside cloud /
+        // carrier networks, so add them explicitly: CGNAT 100.64.0.0/10 (RFC 6598 — the one that bites in
+        // practice), IETF protocol assignments 192.0.0.0/24, and benchmarking 198.18.0.0/15.
+        let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
+        let is_ietf_proto = o[0] == 192 && o[1] == 0 && o[2] == 0;
+        let is_benchmark = o[0] == 198 && (o[1] == 18 || o[1] == 19);
         !(a.is_loopback()
             || a.is_private()
             || a.is_link_local()
             || a.is_multicast()
             || a.is_broadcast()
             || a.is_unspecified()
-            || a.octets()[0] == 0)
+            || o[0] == 0
+            || is_cgnat
+            || is_ietf_proto
+            || is_benchmark)
     }
     match ip {
         std::net::IpAddr::V4(a) => v4_public(a),
@@ -705,11 +715,20 @@ mod tests {
             "::ffff:127.0.0.1",     // IPv4-mapped loopback (must not smuggle past V6 checks)
             "::ffff:169.254.169.254", // IPv4-mapped cloud metadata
             "::ffff:10.0.0.1",      // IPv4-mapped RFC-1918
+            "100.64.0.1",           // CGNAT (RFC 6598)
+            "100.127.255.255",      // CGNAT upper edge
+            "192.0.0.1",            // IETF protocol assignments
+            "198.18.0.1",           // benchmarking
+            "198.19.255.255",       // benchmarking upper edge
         ];
         for s in bad {
             assert!(!ip_is_public(s.parse::<IpAddr>().unwrap()), "{s} must be refused");
         }
-        for s in ["1.1.1.1", "8.8.8.8", "93.184.215.14", "2606:4700:4700::1111"] {
+        for s in [
+            "1.1.1.1", "8.8.8.8", "93.184.215.14", "2606:4700:4700::1111",
+            "100.63.255.255", // just below CGNAT — public
+            "100.128.0.1",    // just above CGNAT — public
+        ] {
             assert!(ip_is_public(s.parse::<IpAddr>().unwrap()), "{s} must be allowed");
         }
     }
@@ -739,5 +758,29 @@ mod tests {
             Some("files.pypi.org".into())
         );
         assert_eq!(parse_http_host("GET /x HTTP/1.1", "X-Foo: bar\r\n"), None);
+    }
+
+    #[test]
+    fn decision_uses_request_target_not_a_spoofable_host_header() {
+        // The allowlist decision must key on the ACTUAL connection target, never a `Host:` header a
+        // client can set freely.
+        // HTTPS: the CONNECT authority is the target; a `Host: evil.com` header is irrelevant because
+        // `parse_connect_host` reads only the request LINE.
+        assert_eq!(
+            parse_connect_host("CONNECT allowed.com:443 HTTP/1.1"),
+            Some("allowed.com".into())
+        );
+        // Plain HTTP: absolute-form request-target wins over the Host header, so a proxied
+        // `GET http://evil.com/` with `Host: allowed.com` is vetted as evil.com (and refused), not
+        // laundered through the header.
+        assert_eq!(
+            parse_http_host("GET http://evil.com/ HTTP/1.1", "Host: allowed.com\r\n"),
+            Some("evil.com".into())
+        );
+        // The dual: an absolute-form to an allowed host isn't fooled by a Host header naming another.
+        assert_eq!(
+            parse_http_host("GET http://allowed.com/ HTTP/1.1", "Host: evil.com\r\n"),
+            Some("allowed.com".into())
+        );
     }
 }

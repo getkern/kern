@@ -5042,17 +5042,16 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
 /// `write`, and the signal is re-raised with its default disposition.
 static FREEZE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// Async-signal-safe: thaw the frozen box (raw `write` of "0") then re-raise `sig` with SIG_DFL so the
-/// process still dies as the signal intends. Only `write`/`signal`/`raise` are used, all async-signal-safe.
+/// Async-signal-safe: thaw the frozen box (raw `write` of "0") then re-raise `sig` so the process still
+/// dies as the signal intends. Installed with `SA_RESETHAND`, so the disposition is already reset to
+/// `SIG_DFL` on entry and the re-raise takes the default action. Only `write` and `raise` are used here,
+/// both on POSIX's async-signal-safe list (`signal()` is NOT guaranteed to be, so it is avoided).
 extern "C" fn thaw_on_fatal_signal(sig: i32) {
     let fd = FREEZE_FD.load(std::sync::atomic::Ordering::SeqCst);
     if fd >= 0 {
         unsafe { libc::write(fd, b"0".as_ptr() as *const libc::c_void, 1) };
     }
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
+    unsafe { libc::raise(sig) };
 }
 
 /// RAII cgroup-freezer guard: freezes a box's cgroup on construction and thaws it on drop. Used by
@@ -5087,7 +5086,11 @@ impl FreezeGuard {
         };
         let freeze = cg.join("cgroup.freeze");
         // Preserve a pre-existing freeze: if the box is already paused, snapshot under it and do NOT thaw
-        // on drop (that would un-pause a box the user deliberately paused).
+        // on drop (that would un-pause a box the user deliberately paused). NOTE: `cgroup.freeze` has no
+        // compare-and-swap, so a `kern pause` racing in the window between this read and our write below
+        // could be undone by our drop-thaw. The window is tiny (a pause landing during an active commit)
+        // and the consequence is a resumed box, not a security boundary crossing; a lossless fix isn't
+        // possible with a plain cgroup file, so this is a documented known window rather than a guarantee.
         let already_frozen = std::fs::read_to_string(&freeze)
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
@@ -5098,14 +5101,25 @@ impl FreezeGuard {
             return none();
         }
         // The freeze is asynchronous; wait (bounded) until the cgroup reports `frozen 1` so the snapshot
-        // starts only once every task is actually stopped. If it never settles, proceed anyway rather
-        // than block commit forever.
+        // starts only once every task is actually stopped. If it never settles within the budget, warn
+        // and proceed rather than block commit forever, so the operator knows the TOCTOU protection did
+        // not fully engage for this snapshot.
         let events = cg.join("cgroup.events");
+        let mut settled = false;
         for _ in 0..200 {
             match std::fs::read_to_string(&events) {
-                Ok(s) if s.lines().any(|l| l.trim() == "frozen 1") => break,
+                Ok(s) if s.lines().any(|l| l.trim() == "frozen 1") => {
+                    settled = true;
+                    break;
+                }
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
+        }
+        if !settled {
+            eprintln!(
+                "kern: warning: box did not report 'frozen' within 1s; the commit snapshot proceeds \
+                 WITHOUT the freeze, so a concurrent write could race it"
+            );
         }
         // Arm the signal-safe thaw: publish an fd to the freeze file and trap the interactive/kill signals
         // that would otherwise skip Drop and strand the box frozen.
@@ -5122,6 +5136,10 @@ impl FreezeGuard {
                         new.sa_sigaction =
                             thaw_on_fatal_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
                         libc::sigemptyset(&mut new.sa_mask);
+                        // SA_RESETHAND: the kernel resets the handler to SIG_DFL before invoking it, so the
+                        // handler's re-raise dies by default action without any (non-async-signal-safe)
+                        // signal() call. Restore-via-sigaction on Drop covers the normal path.
+                        new.sa_flags = libc::SA_RESETHAND;
                         let mut old: libc::sigaction = std::mem::zeroed();
                         if libc::sigaction(sig, &new, &mut old) == 0 {
                             old_handlers.push((sig, old));
