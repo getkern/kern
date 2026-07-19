@@ -402,6 +402,50 @@ fn null_over(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Mount the box's OWN cgroup v2 hierarchy READ-ONLY at `/sys/fs/cgroup`, exactly like Docker/runc
+/// (`cgroupns=private` + a `cgroup2` mount). Combined with the `CLONE_NEWCGROUP` the child unshared,
+/// the box sees ONLY its own cgroup as the root of the hierarchy: memory-aware runtimes (the JVM,
+/// .NET, Node) then read the real `memory.max` and size their heap to the cap instead of the host's
+/// RAM, while the host tree and sibling boxes stay invisible.
+///
+/// `MS_RDONLY` is load-bearing security, not cosmetic: the box may READ its limits but can never write
+/// `cgroup.procs` (no self-migration out of the cap) or edit a `*.max` file, so exposing the cgroup
+/// buys the runtimes correctness without handing the workload a lever on its own limits. `NOSUID`,
+/// `NODEV`, `NOEXEC` harden the mount. Only `/sys/fs/cgroup` is mounted — the rest of `/sys` is left
+/// absent, so the host sysfs stays masked (kern's deny-by-default `/sys` property is unchanged).
+///
+/// Best-effort throughout: a kernel without cgroup namespaces, a host that refuses the `cgroup2` mount,
+/// or a `--privileged` nested box where `mount_too_revealing` bites, simply leaves the box without a
+/// cgroup view (kern's prior behaviour) — it never fails the box.
+fn mount_cgroup() {
+    // Create the mountpoint on the (still-writable) box root WITHOUT mounting a full sysfs, so `/sys`
+    // otherwise stays empty and the host sysfs is never revealed. Neutralize a hostile image symlink at
+    // `/sys/fs/cgroup` first (same guard as `/dev`), so the mount can't be redirected elsewhere.
+    for d in ["/sys", "/sys/fs", "/sys/fs/cgroup"] {
+        if let Ok(c) = cstr(d) {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::lstat(c.as_ptr(), &mut st) } == 0
+                && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+            {
+                unsafe { libc::unlink(c.as_ptr()) };
+            }
+            unsafe { libc::mkdir(c.as_ptr(), 0o755) };
+        }
+    }
+    if let (Ok(ty), Ok(tgt)) = (cstr("cgroup2"), cstr("/sys/fs/cgroup")) {
+        unsafe {
+            libc::mount(
+                ty.as_ptr(),
+                tgt.as_ptr(),
+                ty.as_ptr(),
+                (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC)
+                    as libc::c_ulong,
+                ptr::null(),
+            );
+        }
+    }
+}
+
 /// Neutralize the host-global procfs surface — the runc "readonlyPaths" + "maskedPaths" set. These
 /// files/dirs are NOT namespaced, so on a kernel where the box's root maps to a privileged host uid
 /// (kern run as root, in WSL, under `sudo`, or in CI), an in-box write reaches the HOST. The escape
@@ -551,6 +595,14 @@ fn child_setup_and_exec(
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(Error::last("unshare(CLONE_NEWNS)"));
     }
+    // Own cgroup namespace: make the box's OWN cgroup the root of the `cgroup2` hierarchy it mounts
+    // below (see `mount_cgroup`), so memory-aware runtimes (the JVM, .NET, Node) read the real
+    // `memory.max` and size their heap to the cap instead of the host's RAM — without it they assume
+    // host RAM and get OOM-killed under load despite the cap — while the host tree and sibling boxes
+    // stay invisible. The process is already IN its box cgroup here (the supervisor moved into it via
+    // `apply_limits` before the fork), so the namespace root is exactly that cgroup. Best-effort: a
+    // kernel without cgroup namespaces just leaves the box without a cgroup view (prior behaviour).
+    unsafe { libc::unshare(libc::CLONE_NEWCGROUP) };
     set_hostname(&spec.hostname);
     make_private()?;
     t.mark("unshare+private");
@@ -614,6 +666,11 @@ fn child_setup_and_exec(
     if !allow_nesting {
         mask_proc_paths()?;
     }
+    // Give the box a read-only view of its OWN cgroup at `/sys/fs/cgroup` (see `mount_cgroup`), so
+    // memory-aware runtimes read the real cap. After the `/proc` masks so their mount ordering matches
+    // the rest of the hardened set; before the optional read-only root remount below, while the root is
+    // still writable for the mountpoint mkdir.
+    mount_cgroup();
     t.mark("pivot+proc");
     // Optional read-only remount LAST — the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep
@@ -1184,6 +1241,31 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
                     ptr::null(),
                 )
             };
+        }
+    }
+    // `/dev/shm`: POSIX shared memory as a SEPARATE tmpfs, exactly like Docker/runc. Postgres' dynamic
+    // shared memory, Python `multiprocessing`, Chromium and many runtimes open `/dev/shm/...`; without
+    // this mount they fail "No such file or directory". `mode=1777` (sticky + world-writable) is the
+    // standard shm mode so an unprivileged workload creates its OWN segments (which it then owns, so
+    // `fs.protected_regular` doesn't bite). `MS_NOSUID|MS_NODEV`: shm never hosts a setuid binary or a
+    // device node. The tmpfs is charged to the box's memory cgroup, so `--memory` bounds it and there is
+    // no separate `--shm-size` footgun (Docker's 64 MB default is what breaks Postgres under load).
+    // Best-effort: a host/kernel that refuses it just leaves the box without `/dev/shm` (prior behaviour).
+    {
+        let shmdir = format!("{root}/dev/shm");
+        if let Ok(sd) = cstr(&shmdir) {
+            unsafe { libc::mkdir(sd.as_ptr(), 0o1777) };
+            if let (Ok(ty), Ok(opts)) = (cstr("tmpfs"), cstr("mode=1777")) {
+                unsafe {
+                    libc::mount(
+                        ty.as_ptr(),
+                        sd.as_ptr(),
+                        ty.as_ptr(),
+                        (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+                        opts.as_ptr() as *const libc::c_void,
+                    )
+                };
+            }
         }
     }
     // `-it`: bind the controlling-PTY SLAVE onto `/dev/console` (like runc/Docker). kern's `-it` slave
