@@ -470,7 +470,12 @@ fn clamp_cpuset(set: Option<String>) -> Option<String> {
 ///  * `KERN_MAX_CONCURRENT=N`: a COOPERATIVE ceiling on the number of running boxes. Refuses the N+1th
 ///    box so a runaway (an agent spawning `box fn` in a loop) can't exhaust the host. Counts LIVE boxes
 ///    via the registry, which prunes dead entries on read, so a crashed box frees its slot. First-party
-///    and cooperative (a caller can unset the env): NOT a security boundary.
+///    and cooperative (a caller can unset the env): NOT a security boundary. It is also BEST-EFFORT under
+///    a concurrent burst: each starting box counts independently, so a batch launched in parallel
+///    (`kern compose up`, `xargs -P kern box`) can race the count and overshoot N by up to the burst size
+///    before any of them register. For a HARD, race-free bound on total fleet resources use
+///    `KERN_FLEET_PIDS_MAX` / `KERN_FLEET_MEMORY_MAX` below (cgroup-enforced on the shared slice, so the
+///    kernel caps the SUM no matter how the boxes are started).
 ///  * `KERN_FLEET_MEMORY_MAX` / `KERN_FLEET_PIDS_MAX`: a REAL, kernel-enforced budget on kern's shared
 ///    `kern.slice`, bounding the SUM of all boxes' memory / pids. This is the hard backstop the counter
 ///    lacks: even past the cooperative ceiling, the kernel caps total fleet memory. Best-effort (needs
