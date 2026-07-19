@@ -1,7 +1,7 @@
 # Contributing to kern
 
 Thanks for considering a contribution. kern is security-critical (it runs untrusted images as
-a sandbox), so the bar on the sandbox/OCI paths is high — and the tests are the proof.
+a sandbox), so the bar on the sandbox/OCI paths is high, and the tests are the proof.
 
 ## Before you start
 
@@ -19,7 +19,7 @@ cargo fmt --check
 ```
 
 CI runs the above on x86 plus `cargo-audit` / `cargo-deny`. ARM is manually validated on real
-boards (not yet in CI — tracked in the issues); hardware-dependent tests **skip gracefully** when
+boards (not yet in CI, tracked in the issues); hardware-dependent tests **skip gracefully** when
 the precondition is absent.
 
 ## Tests are not optional
@@ -29,7 +29,7 @@ the precondition is absent.
 - **Anything touching the sandbox path** must keep the **characterization** assertion
   (recorded mount/pivot sequence) green AND, where it changes behaviour, add/keep a
   **real-syscall** correctness test (escape-blocked / canary-unreadable).
-- **Security fixtures must be synthetic, minimal, and self-contained** — no private paths, no
+- **Security fixtures must be synthetic, minimal, and self-contained**: no private paths, no
   real-world exploit payloads. See `kern-oci`'s symlink-escape regression for the template.
 
 ## Changing a flag or config key (deprecation policy)
@@ -51,7 +51,7 @@ without warning. This is **blocking** on review, same as tests:
 
 ## Reporting security issues
 
-Do **not** open a public issue — see `SECURITY.md`.
+Do **not** open a public issue, see `SECURITY.md`.
 
 ## Scope reminder
 

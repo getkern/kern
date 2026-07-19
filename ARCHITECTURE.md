@@ -8,7 +8,7 @@ designed project, not a script.
 ```
 crates/
   kern-cli/        the `kern` binary (published as `getkern`); thin main + cli + commands/ + sandbox/
-  kern-common/     shared newtypes (BoxName, …) — units can't be mixed up
+  kern-common/     shared newtypes (BoxName, …), units can't be mixed up
   kern-oci/        OCI pull / layer extraction / whiteout (security-critical path-safety)
   kern-isolation/  namespace / cgroup / mount primitives + the characterization seam
 ```
@@ -20,21 +20,21 @@ default**, so the core carries zero EULA exposure.
 ## Design choices (and why)
 
 - **Real `mod`s, no `include!()`.** The binary uses ordinary modules with `pub(crate)`
-  boundaries and a command enum + `match` dispatch — a real module tree, not a concatenated
+  boundaries and a command enum + `match` dispatch, a real module tree, not a concatenated
   script.
 - **The sandbox is a sequence of steps against a seam.** Mount/pivot/remount operations go
   through the `kern_isolation::MountOps` trait. A `Recorder` impl captures the exact ordered
-  call list so a test asserts it byte-identical before/after a refactor — the *refactor-safety*
+  call list so a test asserts it byte-identical before/after a refactor, the *refactor-safety*
   net for the setup sequence. This does **not** replace the real-syscall correctness tests that
   actually mount/pivot and assert escape-blocked.
 - **Mount-ordering as a typestate (0.2).** `Rootfs<Mounted>` → `create_old_root()` →
   `Rootfs<OldRootReady>` → `into_readonly()` makes "remount read-only before `.old_root`
   exists" a *compile error*, not a runtime bug.
 - **GPU backends as a closed enum (roadmap 0.9).** `enum Backend { Cuda, Hip, Vulkan }` with
-  exhaustive `match` — the compiler forces every vendor to be handled; `Box<dyn>` only if/when
+  exhaustive `match`, the compiler forces every vendor to be handled; `Box<dyn>` only if/when
   third-party backends are allowed.
 - **One driver proxy (roadmap 0.9).** `GovernedDriver<D: RealDriver>` checks the quota then
-  forwards via the public API — a single, inspectable interception boundary (the auditability
+  forwards via the public API, a single, inspectable interception boundary (the auditability
   story).
 - **Errors:** `Result`-based in libraries (the 0.x target is `thiserror` enums), mapped to an
   exit code in exactly one place in the binary. Post-fork, pre-exec child code stays
@@ -47,6 +47,6 @@ default**, so the core carries zero EULA exposure.
 Four layers (Rust-standard): unit (inline `#[cfg(test)]`), integration (`tests/`, black-box
 binary), the characterization seam (deterministic, privilege-free), and real-syscall
 correctness tests (skip-graceful where namespaces/HW are unavailable). CI x86 stays
-always-green via skip-graceful gates; ARM is manually validated on real boards (not yet in CI —
+always-green via skip-graceful gates; ARM is manually validated on real boards (not yet in CI,
 tracked in the issues), and the real-GPU tests land with the GPU layer (roadmap). See
 `CONTRIBUTING.md`.
