@@ -21,7 +21,7 @@ or the author required.
 
 ```sh
 pip install opentimestamps-client        # provides `ots`
-ots verify provenance/v0.6.5.provenance.txt.ots
+ots verify provenance/v0.6.7.provenance.txt.ots
 ```
 
 `ots verify` confirms the `.txt` against the Bitcoin block it is anchored to (a local or public
@@ -29,7 +29,7 @@ Bitcoin node is used to read the block header time). You can also inspect the ra
 without a node:
 
 ```sh
-ots info provenance/v0.6.5.provenance.txt.ots   # shows BitcoinBlockHeaderAttestation(<block height>)
+ots info provenance/v0.6.7.provenance.txt.ots   # shows BitcoinBlockHeaderAttestation(<block height>)
 ```
 
 Cross-check the reported block height and merkle root on any block explorer.
@@ -37,6 +37,6 @@ Cross-check the reported block height and merkle root on any block explorer.
 ## Cross-check the tag
 
 ```sh
-git verify-tag v0.6.5          # GPG signature on the tag
-git rev-parse v0.6.5^{}        # must equal the commit hash in the .txt
+git verify-tag v0.6.7          # GPG signature on the tag
+git rev-parse v0.6.7^{}        # must equal the commit hash in the .txt
 ```
