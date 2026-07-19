@@ -262,6 +262,42 @@ fn kern_slice_path() -> Option<PathBuf> {
     Some(root.join("kern.slice"))
 }
 
+/// Apply a FLEET-WIDE budget to kern's shared parent slice (`kern.slice`): a hard `memory.max` and/or
+/// `pids.max` on the PARENT of every box, so the kernel bounds the SUM of all running boxes, not just
+/// each box on its own. This is the REAL-enforcement backstop to the cooperative `--max-concurrent`
+/// counter: even if a caller unsets that env, the slice cap still bounds total box memory/pids at the
+/// kernel level. `None` leaves that dimension untouched.
+///
+/// Best-effort and idempotent, safe to call on every box start: writing a `*.max` file on the slice
+/// takes only when systemd-user has delegated `kern.slice` with the controller enabled (the same
+/// condition per-box caps need). A slice that doesn't exist yet (no box has created it) is skipped, so
+/// the fleet cap engages from the moment `kern.slice` first appears, exactly when a fleet exists. A
+/// value of `u64::MAX` is written as the literal `max` (uncapped) so a caller can clear a prior budget.
+pub fn set_fleet_caps(memory_max: Option<u64>, pids_max: Option<u64>) {
+    let Some(slice) = kern_slice_path() else {
+        return;
+    };
+    if !slice.is_dir() {
+        return; // no box has created the slice yet; a later start applies the cap once it exists
+    }
+    if let Some(m) = memory_max {
+        let _ = fs::write(slice.join("memory.max"), render_cgroup_max(m));
+    }
+    if let Some(p) = pids_max {
+        let _ = fs::write(slice.join("pids.max"), render_cgroup_max(p));
+    }
+}
+
+/// Render a cgroup v2 `*.max` value: a plain number, or the literal `max` for [`u64::MAX`] (uncapped),
+/// which cgroup v2 uses to clear a limit. Pure, so the wire format is unit-tested without a cgroupfs.
+fn render_cgroup_max(n: u64) -> String {
+    if n == u64::MAX {
+        "max".to_string()
+    } else {
+        n.to_string()
+    }
+}
+
 /// Reap orphaned box cgroup dirs under kern.slice: a `kern-box-<tag>-<pid>` whose supervisor `<pid>` is
 /// DEAD. Self-heals the one leak the RAII guard can't cover — a DETACHED box whose supervisor is
 /// SIGKILL'd by `kern stop` never runs `Drop`, leaving its (now-empty) dir behind. RACE-SAFE: a LIVE box's
@@ -787,6 +823,16 @@ mod tests {
         // A cgroup-v1 multi-line body (no `0::`) → None, not a panic.
         assert_eq!(parse_box_cgroup_line("12:pids:/kern-box-db-1\n0::\n"), None);
         assert_eq!(parse_box_cgroup_line(""), None);
+    }
+
+    #[test]
+    fn render_cgroup_max_writes_number_or_literal_max() {
+        // A fleet budget renders as a plain byte/count for the kernel...
+        assert_eq!(render_cgroup_max(268_435_456), "268435456"); // 256 MiB
+        assert_eq!(render_cgroup_max(100), "100"); // pids
+        assert_eq!(render_cgroup_max(0), "0");
+        // ...and u64::MAX is the sentinel that clears the cap (cgroup v2 `max`), never a huge number.
+        assert_eq!(render_cgroup_max(u64::MAX), "max");
     }
 
     #[test]

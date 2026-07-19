@@ -34,6 +34,10 @@ pub use cgroup::gc_orphan_box_cgroups;
 /// the cgroup tree). False on kernels that don't delegate it — a stock Raspberry Pi OS and the
 /// default WSL2 kernel — where a `memory.max` write is accepted but never bites. Used only to warn.
 pub use cgroup::memory_cap_enforceable;
+/// Apply a fleet-wide `memory.max`/`pids.max` budget to kern's shared `kern.slice`, bounding the SUM of
+/// all running boxes at the kernel. The real-enforcement backstop to the cooperative box counter. See
+/// [`cgroup::set_fleet_caps`].
+pub use cgroup::set_fleet_caps;
 /// The systemd manager kern drives for its scope/slice: `--system` as real root, else `--user`. See
 /// [`cgroup::systemd_scope_mode`].
 pub use cgroup::systemd_scope_mode;

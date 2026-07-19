@@ -455,6 +455,43 @@ fn clamp_cpuset(set: Option<String>) -> Option<String> {
 /// a command in a real sandbox: a fresh user + PID + (net) + UTS + IPC + mount namespace, the
 /// rootfs pivoted in, seccomp-filtered, cgroup-capped. `--image` pulls an OCI image (cached).
 /// Defaults to `/bin/sh`. Foreground propagates the exit code; `-d` detaches (track via `kern ps`).
+/// Enforce deployment-level FLEET limits from the environment before a box starts.
+///
+///  * `KERN_MAX_CONCURRENT=N`: a COOPERATIVE ceiling on the number of running boxes. Refuses the N+1th
+///    box so a runaway (an agent spawning `box fn` in a loop) can't exhaust the host. Counts LIVE boxes
+///    via the registry, which prunes dead entries on read, so a crashed box frees its slot. First-party
+///    and cooperative (a caller can unset the env): NOT a security boundary.
+///  * `KERN_FLEET_MEMORY_MAX` / `KERN_FLEET_PIDS_MAX`: a REAL, kernel-enforced budget on kern's shared
+///    `kern.slice`, bounding the SUM of all boxes' memory / pids. This is the hard backstop the counter
+///    lacks: even past the cooperative ceiling, the kernel caps total fleet memory. Best-effort (needs
+///    systemd-user delegation); engages once the slice exists (from the first box onward).
+///
+/// Returns an error only for the max-concurrent refusal; the budget is best-effort and never fails a box.
+fn fleet_gate_and_budget() -> Result<(), Error> {
+    if let Some(max) = std::env::var("KERN_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        let live = registry::list().len(); // prunes dead entries as a side effect (crash-safe count)
+        if live >= max {
+            return Err(Error::Sandbox(format!(
+                "fleet limit reached: {live} box(es) already running (KERN_MAX_CONCURRENT={max}); \
+                 stop one, or raise/unset the limit"
+            )));
+        }
+    }
+    let mem = std::env::var("KERN_FLEET_MEMORY_MAX")
+        .ok()
+        .and_then(|v| kern_common::parse_binary_size(v.trim()));
+    let pids = std::env::var("KERN_FLEET_PIDS_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if mem.is_some() || pids.is_some() {
+        kern_isolation::set_fleet_caps(mem, pids);
+    }
+    Ok(())
+}
+
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
@@ -472,6 +509,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             "a box named '{}' is already running",
             name.as_str()
         )));
+    }
+    // FLEET LIMITS (env-configured, deployment-level). Checked only in the OUTER process (KERN_SCOPE
+    // unset), like the name check: the scoped inner re-run is the SAME box, already counted.
+    if std::env::var_os("KERN_SCOPE").is_none() {
+        fleet_gate_and_budget()?;
     }
     // `--ssh` PREFLIGHT: sshd's privilege separation calls `setgroups()`, which a single-uid userns
     // forbids (`/proc/self/setgroups=deny`). It works only with a real uid RANGE via newuidmap/subuid.
