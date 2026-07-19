@@ -435,10 +435,18 @@ fn proxy_main(listener: UnixListener, allow: Vec<String>) -> ! {
 }
 
 fn handle_client(mut client: UnixStream, allow: &[String]) {
-    // Read the request head (up to the blank line), bounded so a client can't make us buffer forever.
+    // Read the request head (up to the blank line), bounded on BOTH size and time so a client that
+    // connects and then dribbles (or goes silent) can't pin this per-connection proxy child: the 16 KiB
+    // cap stops unbounded buffering, the per-read timeout kills a silent peer, and the wall-clock deadline
+    // stops a maximally-slow byte-per-timeout dribbler. A well-formed head arrives in well under a second.
+    let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(HEAD_READ_SECS)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HEAD_READ_SECS);
     let mut head = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     while head.len() < 16 * 1024 {
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
         match client.read(&mut byte) {
             Ok(0) => return,
             Ok(_) => {
@@ -631,6 +639,10 @@ where
 /// Idle read timeout for a relayed connection (see `pump_streams`): long enough never to disturb an
 /// active `pip`/`npm`/`curl` transfer, short enough to reap a stalled relay well before the OS TCP timeout.
 const RELAY_IDLE_SECS: u64 = 300;
+
+/// Deadline for reading a request head in the proxy (see `handle_client`): a well-formed head arrives in
+/// well under a second, so this only ever fires on a stalled / slowloris client, bounding its per-child cost.
+const HEAD_READ_SECS: u64 = 30;
 
 pub trait TryCloneStream: Sized {
     fn try_clone_stream(&self) -> std::io::Result<Self>;
