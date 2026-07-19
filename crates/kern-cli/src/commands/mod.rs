@@ -619,11 +619,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             ));
         }
         eprintln!(
-            "kern: warning: --egress-allow is EXPERIMENTAL. Known gaps (see docs/EGRESS.md): a foreground \
-             box may not exit cleanly (helper-lifecycle bug); the allowlist gates domain NAMES only, so a \
-             name resolving to a loopback/link-local/metadata/private IP is still reachable (SSRF), and \
-             any PORT on an allowlisted host is reachable. The netns has no other route, so the box can't \
-             bypass the proxy, but do not rely on this as a hard boundary yet."
+            "kern: note: --egress-allow gives the box outbound to the listed domains only (over an HTTP \
+             CONNECT/forward proxy; the box's isolated netns has no other route). It resolves and pins the \
+             dialed host, refuses non-public resolved IPs (SSRF), and tunnels only ports 80/443. The one \
+             hole it can't close is domain fronting on a SHARED CDN (SNI != CONNECT host); see \
+             docs/EGRESS.md. For a fully hostile workload prefer a microVM with a real firewall."
         );
         let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
         for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
@@ -1105,17 +1105,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let timeout_wd = (args.timeout > 0 && !managed)
         .then(|| spawn_foreground_timeout(args.timeout))
         .flatten();
-    // Egress filter: spawn the filtering proxy NOW, while we're still in the HOST net namespace (it needs
-    // a route to a DNS server; the box's own netns is isolated). The box-netns pump is attached in the
-    // `on_started` callback once the box's init pid exists. The completed guard is held for the box's
-    // lifetime; dropping it (after the box exits) SIGKILLs both helpers. Fail-CLOSED: on any failure the
-    // box simply has no outbound.
-    let mut egress_pending: Option<(std::process::Child, std::path::PathBuf)> = None;
+    // Egress filter: spawn BOTH helpers NOW, while box_run is still in the HOST pid namespace (before
+    // `run_in_sandbox_with` does `unshare(CLONE_NEWPID)`). Spawning them from the `on_started` callback
+    // instead would land them in the BOX pid namespace (box_run's `pid_for_children` is the box pidns by
+    // then), where a helper becomes an un-reapable zombie on box exit and deadlocks the pidns teardown:
+    // the box "runs, filters, then never exits" until `--timeout`. The pump does not know the box init
+    // pid yet; it is delivered over a pipe in the callback below. The guard is held for the box's
+    // lifetime; dropping it (after the box exits) SIGKILLs and reaps both helpers. Fail-CLOSED: on any
+    // failure the box simply has no outbound.
+    let mut egress_pending: Option<crate::egress::EgressPending> = None;
     if !args.egress_allow.is_empty() {
-        match crate::egress::spawn_proxy(args.egress_allow) {
+        match crate::egress::spawn(args.egress_allow, EGRESS_PROXY_PORT) {
             Ok(p) => egress_pending = Some(p),
             Err(e) => eprintln!(
-                "kern: warning: egress proxy failed to start ({e}); the box will have NO outbound"
+                "kern: warning: egress filter failed to start ({e}); the box has NO outbound"
             ),
         }
     }
@@ -1131,13 +1134,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     let _ = registry::register(inst);
                 }
             }
-            if let Some((proxy, sock)) = egress_pending.take() {
-                match crate::egress::attach_pump(proxy, sock, pid1, EGRESS_PROXY_PORT) {
-                    Ok(g) => egress_guard = Some(g),
-                    Err(e) => eprintln!(
-                        "kern: warning: egress pump failed to start ({e}); the box has NO outbound"
-                    ),
-                }
+            if let Some(p) = egress_pending.take() {
+                egress_guard = Some(p.deliver(pid1));
             }
         },
         None,

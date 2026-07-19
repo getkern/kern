@@ -1,16 +1,15 @@
 # Egress allowlist (`--egress-allow`): threat model & design
 
-> ⚠️ **EXPERIMENTAL, not in the shippable set yet.** Three known gaps must close first: (1) a foreground
-> box may not exit cleanly (a helper-lifecycle bug, the box does its work and filters correctly but can
-> linger until `--timeout`); (2) the allowlist gates domain NAMES only, so an allowlisted name that
-> resolves to a loopback / link-local / `169.254.169.254` / RFC-1918 IP is reachable via the host-netns
-> proxy (SSRF), until a resolved-IP guard is added; (3) any PORT on an allowlisted host is reachable.
-> The enforceable core below (the box has no route except the proxy, and the proxy dials exactly the
-> allowlisted name) is real and verified, but treat the feature as experimental until gaps (1) to (3) are fixed.
-
 > Written **before** the code, on purpose. Egress filtering is the one feature where a half-honest
 > implementation is worse than none: it invites a false sense of safety. This document states exactly
 > what the allowlist enforces, what it does **not**, and why.
+>
+> **Status.** The three gaps this doc originally flagged are now closed: the foreground box exits cleanly
+> (the helper is spawned in the host PID namespace, before box_run's `unshare(CLONE_NEWPID)`, so it never
+> becomes the box-pidns zombie that used to deadlock teardown); an allowlisted NAME that resolves to a
+> loopback / link-local / `169.254.169.254` / RFC-1918 IP is refused (resolved-IP SSRF guard); and only
+> ports 80/443 are tunnelled. The one hole that remains is inherent to any name-based HTTP-proxy
+> allowlist and is stated plainly below: domain fronting on a **shared CDN** (SNI != CONNECT host).
 
 ## What it is
 
@@ -38,7 +37,11 @@ loopback-only netns). `--egress-allow` is strictly *more* open than the default,
    an entry) is refused with `403`, and no connection is dialed. An **IP-literal** target (`CONNECT
    1.2.3.4:443`) never matches a domain entry, so it is refused too.
 4. **The proxy pins the dialed host to what it allowed.** It resolves and connects to the *allowlisted*
-   name itself; the client cannot ask it to connect to one host and stream to another.
+   name itself; the client cannot ask it to connect to one host and stream to another. It connects only
+   to a **public unicast** resolved address (loopback / link-local / `169.254.169.254` / RFC-1918 / ULA /
+   multicast are refused), which closes the SSRF where an allowlisted name resolves to a host-local
+   service, and it tunnels **only ports 80 and 443**, so an allowlisted host's `:22` or `:6379` is not
+   reachable.
 
 Because the box has no route except the proxy (point 1), a workload that simply ignores `HTTP_PROXY` and
 tries to open a raw socket to `evil.com:443` gets `ENETUNREACH`: there is nowhere for the packet to go.
@@ -69,8 +72,8 @@ The proxy is not a suggestion; it is the only door.
 | Box has no egress except the proxy | **Hard** (isolated netns; kernel-enforced) |
 | Non-allowlisted domain refused | **Hard** for a normal client (proxy refuses `CONNECT`, no dial) |
 | IP-literal target refused | **Hard** (never matches a domain entry) |
-| Connecting an allowlisted NAME that resolves to a private/loopback/metadata IP | **Not addressed yet** (the allowlist gates names, not resolved IP ranges; a resolved-IP guard is planned) |
-| Restricting the PORT on an allowlisted host | **Not addressed yet** (any port on an allowlisted host is reachable) |
+| Connecting an allowlisted NAME that resolves to a private/loopback/metadata IP | **Hard** (resolved-IP guard: the proxy connects only to a public unicast address, refusing loopback/link-local/`169.254.169.254`/RFC-1918/ULA/multicast) |
+| Restricting the PORT on an allowlisted host | **Hard** (only 80 and 443 are tunnelled; `:22`, `:6379`, … are refused) |
 | SNI ≠ CONNECT host on a shared CDN (domain fronting) | **Not addressed** (no ClientHello parsing today) |
 | Covert channel inside an allowed session | **Not addressed** (this is an allowlist, not DLP) |
 
