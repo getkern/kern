@@ -236,17 +236,24 @@ profile:
 
 | Variable | Effect | Kind |
 |---|---|---|
-| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative, best-effort.** First-party governor, NOT a security boundary (a caller can unset it). The count is crash-safe (a dead box's slot frees automatically). It is checked per box start, so a **concurrent burst** (`kern compose up`, `xargs -P kern box`) can race the count and overshoot `N` by the burst size. For a hard, race-free cap use `KERN_FLEET_PIDS_MAX` / `KERN_FLEET_MEMORY_MAX` (cgroup-enforced on the shared slice). |
-| `KERN_FLEET_MEMORY_MAX` | A hard `memory.max` on kern's shared `kern.slice`, bounding the SUM of all boxes' memory. Accepts `512m`, `4g`, or bare bytes. | **Real.** Kernel-enforced: the sum is capped even past the cooperative ceiling, and a box cannot raise it (the slice is outside every box's cgroup view). |
-| `KERN_FLEET_PIDS_MAX` | A hard `pids.max` on `kern.slice`, bounding total tasks across all boxes. | **Real**, kernel-enforced. |
+| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative, best-effort.** First-party governor, NOT a security boundary (a caller can unset it). The count is crash-safe (a dead box's slot frees automatically). It is checked per box start, so a **concurrent burst** (`kern compose up`, `xargs -P kern box`) can race the count and overshoot `N` by the burst size. |
+| `KERN_FLEET_MEMORY_MAX` | A `memory.max` on kern's shared `kern.slice`, bounding the SUM of all boxes' memory. Accepts `512m`, `4g`, or bare bytes. | **Kernel-enforced ONLY when boxes share `kern.slice`** (see below). |
+| `KERN_FLEET_PIDS_MAX` | A `pids.max` on `kern.slice`, bounding total tasks across all boxes. | Same condition as above. |
 
-The two real caps engage once `kern.slice` exists (from the first box onward) and require the
-systemd-user delegation that per-box caps already use; where it is absent they are a best-effort no-op
-and per-box caps still apply. Example:
+**Important scope of the fleet caps.** The fleet SUM caps write `memory.max` / `pids.max` on kern's
+`kern.slice` and only bound boxes that actually run INSIDE that slice, which happens on the **direct-cap
+path** (kern as root, or a host where a delegated `kern.slice` is ensured). In the common ROOTLESS setup
+kern puts each box in its OWN per-box systemd scope (under `app.slice`, NOT `kern.slice`), so the fleet
+SUM is currently **not** enforced there. kern does not stay silent about it: when a fleet cap is set but
+the direct-cap path is not taken, it prints a one-line warning at box start. The **per-box `--memory` /
+`--pids` caps are the reliable knob and enforce everywhere the controller is delegated** (verified on
+x86, the ARM boards, and the VPS: a box over its `--memory` is OOM-killed). For a guaranteed fleet bound
+today, run kern as root, or cap each box with `--memory` / `--pids`. A rootless shared-slice fleet cap is
+tracked as a post-launch improvement. Example:
 
 ```sh
 export KERN_MAX_CONCURRENT=200        # at most 200 boxes at once
-export KERN_FLEET_MEMORY_MAX=16g      # all boxes together capped at 16 GiB, kernel-enforced
+export KERN_FLEET_MEMORY_MAX=16g      # SUM cap, enforced only when boxes share kern.slice (see above)
 export KERN_FLEET_PIDS_MAX=20000
 ```
 

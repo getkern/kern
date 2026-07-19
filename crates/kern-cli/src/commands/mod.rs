@@ -503,6 +503,23 @@ fn fleet_gate_and_budget() -> Result<(), Error> {
         .and_then(|v| v.trim().parse::<u64>().ok());
     if mem.is_some() || pids.is_some() {
         kern_isolation::set_fleet_caps(mem, pids);
+        // The fleet SUM cap lives on kern's delegated `kern.slice` and only bounds boxes that actually
+        // run INSIDE it (the direct-cap path). Where kern falls back to per-box systemd scopes (the
+        // common ROOTLESS case: verified on Jetson/Pi5, boxes land in `app.slice/run-*.scope`), the boxes
+        // are NOT under kern.slice, so the SUM is unbounded even though `set_fleet_caps` wrote the limit.
+        // Do NOT silently no-op a security-relevant cap: warn once (same posture as the `--memory`
+        // not-enforced warning). Per-box `--memory`/`--pids` still enforce; those are the reliable knob.
+        if !kern_isolation::choose_direct_cap_path() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "kern: warning: KERN_FLEET_MEMORY_MAX / KERN_FLEET_PIDS_MAX bound the SUM across boxes \
+                     ONLY when boxes share kern's delegated kern.slice, which this host does not use (boxes \
+                     run in per-box systemd scopes). The fleet SUM is NOT enforced here; per-box \
+                     --memory / --pids still are. For a hard fleet bound, run kern as root, or cap each box."
+                );
+            });
+        }
     }
     Ok(())
 }
