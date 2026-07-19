@@ -618,6 +618,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     .to_string(),
             ));
         }
+        eprintln!(
+            "kern: warning: --egress-allow is EXPERIMENTAL. Known gaps (see docs/EGRESS.md): a foreground \
+             box may not exit cleanly (helper-lifecycle bug); the allowlist gates domain NAMES only, so a \
+             name resolving to a loopback/link-local/metadata/private IP is still reachable (SSRF), and \
+             any PORT on an allowlisted host is reachable. The netns has no other route, so the box can't \
+             bypass the proxy, but do not rely on this as a hard boundary yet."
+        );
         let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
         for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
             env.push((k.to_string(), proxy.clone()));
