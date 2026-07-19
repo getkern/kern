@@ -152,7 +152,7 @@ Daemonless, rootless, and complete: the full container UX plus resource slices, 
 - **Governed slices**: hard cgroup v2 caps on any `box`/`run`: `--memory` · `--cpus` · `--cpuset-cpus` · `--memory-swap-max` · `--pids-limit` · `--io-weight` · `--nice`. `kern run` is the governor with no sandbox.
 - **Data & devices**: `-v` volumes (symlink-safe) · named volumes with a `--size` quota · network volumes (`nfs`/`smb`/`sshfs`) · `--secret` → `/run/secrets` (RAM, `0400`) · `vdisk:` scratch · `vgpio:` device passthrough (deny-by-default) · `--tmpfs`.
 - **Network & identity**: isolated by default; `--network host` for outbound; **`--egress-allow d1,d2`** restricts outbound to an allowlist of domains via a kern-run filtering proxy (an agent can `pip install` but can't exfiltrate, see [docs/EGRESS.md](docs/EGRESS.md)); `-p` rootless publish (loopback unless you ask); in-box `--ssh`; `--pod` shared-net pods (`--no-outbound`); `--tun`; `--user`.
-- **Least privilege**: 13 dangerous caps always dropped (`--cap-add`/`--cap-drop`); an always-on **seccomp** denylist (kexec, modules, ptrace, mount API, `setns`, …) that also kills wrong-arch + x86_64 x32-ABI aliases.
+- **Least privilege**: 13 dangerous caps always dropped (`--cap-add`/`--cap-drop`); an always-on **seccomp** denylist (kexec, modules, ptrace, mount API, `setns`, …) that also kills wrong-arch + x86_64 x32-ABI aliases; opt-in **Landlock** (LSM) write-allowlist (`--landlock-rw <path>`): the box root is read+exec and writes are confined to the paths you name, a kernel-enforced second boundary the workload can't lift.
 - **Lifecycle, no daemon**: `--restart` + `--health-cmd`; `cp`/`pause`/`attach`/`exec`; `ps`/`top`/`stats`/`logs`/`inspect`/`prune`/`gc`/`history`/`recover`; `compose` (reads `docker-compose.yml` too); reusable `[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]` profiles; `kern doctor`.
 
 <details>
@@ -617,8 +617,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 ## Security
 
 kern isolates with Linux **namespaces + seccomp + a read-only userns root**, a kernel-level boundary,
-deny-by-default on devices, with the host's sysfs/procfs masked. That's strong for first-party and
-noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
+deny-by-default on devices, with the host's sysfs/procfs masked, and opt-in **Landlock** (LSM) and
+**egress-allowlist** layers on top. That's strong for first-party and noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
 hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't: a deliberate trade for
 ~1.9 ms starts and a ~1.6 MB footprint.
 
