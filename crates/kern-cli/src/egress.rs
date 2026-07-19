@@ -93,6 +93,11 @@ pub fn parse_http_host(request_line: &str, headers: &str) -> Option<String> {
 /// stripped. Rejects an empty host.
 fn host_of_authority(authority: &str) -> Option<String> {
     let a = authority.trim();
+    // Strip any `[userinfo@]` FIRST (RFC 3986 authority = `[userinfo@]host[:port]`). Without this, an
+    // absolute-URI like `http://allowed.com@evil.com/` would leave the vetted string holding `allowed.com`
+    // while the RFC host is `evil.com`: a mismatch between what we allowlist-check and what we would dial.
+    // `rsplit_once('@')` takes the LAST `@`, since userinfo may itself contain an (encoded) `@`.
+    let a = a.rsplit_once('@').map(|(_, h)| h).unwrap_or(a);
     let host = if let Some(rest) = a.strip_prefix('[') {
         // [v6]:port → v6
         rest.split(']').next()?
@@ -161,6 +166,7 @@ pub fn ip_is_public(ip: std::net::IpAddr) -> bool {
         let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
         let is_ietf_proto = o[0] == 192 && o[1] == 0 && o[2] == 0;
         let is_benchmark = o[0] == 198 && (o[1] == 18 || o[1] == 19);
+        let is_reserved_e = o[0] >= 240; // 240.0.0.0/4 class E, not routable
         !(a.is_loopback()
             || a.is_private()
             || a.is_link_local()
@@ -170,7 +176,8 @@ pub fn ip_is_public(ip: std::net::IpAddr) -> bool {
             || o[0] == 0
             || is_cgnat
             || is_ietf_proto
-            || is_benchmark)
+            || is_benchmark
+            || is_reserved_e)
     }
     match ip {
         std::net::IpAddr::V4(a) => v4_public(a),
@@ -604,6 +611,13 @@ where
     let (Ok(mut b_r), Ok(mut b_w)) = (b.try_clone_stream(), b.try_clone_stream()) else {
         return;
     };
+    // Idle read timeout on both directions: an allowlisted host (or the proxy) that accepts a connection
+    // and then never sends and never closes would otherwise pin this relay's two fds + thread until the
+    // OS TCP timeout (~2h). Under a hostile / stalling upstream that is a slow resource leak. A generous
+    // idle window tears a stalled relay down without touching a legitimately active transfer (steady data
+    // resets the per-read timer; only a silence longer than the window trips it).
+    a_r.set_read_idle_timeout();
+    b_r.set_read_idle_timeout();
     let t = std::thread::spawn(move || {
         let _ = std::io::copy(&mut a_r, &mut b_w);
         b_w.shutdown_write();
@@ -614,9 +628,14 @@ where
 }
 
 /// A stream we can clone (for the two-direction pump) and half-close.
+/// Idle read timeout for a relayed connection (see `pump_streams`): long enough never to disturb an
+/// active `pip`/`npm`/`curl` transfer, short enough to reap a stalled relay well before the OS TCP timeout.
+const RELAY_IDLE_SECS: u64 = 300;
+
 pub trait TryCloneStream: Sized {
     fn try_clone_stream(&self) -> std::io::Result<Self>;
     fn shutdown_write(&self);
+    fn set_read_idle_timeout(&self);
 }
 impl TryCloneStream for std::net::TcpStream {
     fn try_clone_stream(&self) -> std::io::Result<Self> {
@@ -625,6 +644,9 @@ impl TryCloneStream for std::net::TcpStream {
     fn shutdown_write(&self) {
         let _ = self.shutdown(std::net::Shutdown::Write);
     }
+    fn set_read_idle_timeout(&self) {
+        let _ = self.set_read_timeout(Some(std::time::Duration::from_secs(RELAY_IDLE_SECS)));
+    }
 }
 impl TryCloneStream for UnixStream {
     fn try_clone_stream(&self) -> std::io::Result<Self> {
@@ -632,6 +654,9 @@ impl TryCloneStream for UnixStream {
     }
     fn shutdown_write(&self) {
         let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+    fn set_read_idle_timeout(&self) {
+        let _ = self.set_read_timeout(Some(std::time::Duration::from_secs(RELAY_IDLE_SECS)));
     }
 }
 
@@ -720,6 +745,8 @@ mod tests {
             "192.0.0.1",            // IETF protocol assignments
             "198.18.0.1",           // benchmarking
             "198.19.255.255",       // benchmarking upper edge
+            "240.0.0.1",            // class E reserved (240.0.0.0/4)
+            "255.255.255.254",      // class E upper (broadcast itself caught by is_broadcast)
         ];
         for s in bad {
             assert!(!ip_is_public(s.parse::<IpAddr>().unwrap()), "{s} must be refused");
@@ -782,5 +809,25 @@ mod tests {
             parse_http_host("GET http://allowed.com/ HTTP/1.1", "Host: evil.com\r\n"),
             Some("allowed.com".into())
         );
+    }
+
+    #[test]
+    fn userinfo_in_authority_is_stripped_so_vet_equals_dial() {
+        // RFC 3986 authority is `[userinfo@]host[:port]`; the host is what follows the LAST '@'. Without
+        // stripping, the vetted string would differ from the host a resolver dials.
+        // Benign: userinfo before the real (allowed) host.
+        assert_eq!(
+            parse_http_host("GET http://user:pw@allowed.com/ HTTP/1.1", ""),
+            Some("allowed.com".into())
+        );
+        // THE BYPASS (now closed): an allowlisted-looking userinfo in front of the REAL host. Must vet
+        // `evil.com` (the RFC host), not `allowed.com` (the userinfo), so the allowlist refuses it.
+        assert_eq!(
+            parse_http_host("GET http://allowed.com@evil.com/ HTTP/1.1", ""),
+            Some("evil.com".into())
+        );
+        // Same via CONNECT authority + with a port; last '@' wins even if userinfo contains one.
+        assert_eq!(host_of_authority("a@b@evil.com:443"), Some("evil.com".into()));
+        assert_eq!(host_of_authority("user@[2606:4700::1]:443"), Some("2606:4700::1".into()));
     }
 }
