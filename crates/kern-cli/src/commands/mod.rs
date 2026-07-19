@@ -5007,7 +5007,13 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         let _ = std::fs::remove_file(&p);
     }
     let out = cache.join(&dst_safe);
+    // Freeze the box for the snapshot so the workload cannot swap a file between our metadata read and the
+    // content copy (a commit-time TOCTOU): a frozen cgroup runs no task. Best-effort and RAII: a box with
+    // no dedicated cgroup simply isn't frozen (as `pause` reports), and the guard thaws on EVERY exit,
+    // including the `?` early return from the copy below.
+    let _freeze = FreezeGuard::freeze(inst.pid);
     copy_rootfs_snapshot(&root, &out, &skip)?;
+    drop(_freeze); // thaw before the (non-filesystem) config/marker writes below
 
     // A minimal runtime config: default the command to a shell so `kern box --image <image>` works with
     // no args, while `--image <image> -- <cmd>` still overrides it. (The base image's entrypoint/env are
@@ -5025,6 +5031,47 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         .map_err(|e| Error::Oci(format!("commit marker: {e}")))?;
     println!("committed box '{box_ref}' → image '{image}'  (run: kern box <name> --image {image})");
     Ok(())
+}
+
+/// RAII cgroup-freezer guard: freezes a box's cgroup on construction and thaws it on drop. Used by
+/// `commit` to stop the workload for the duration of the rootfs snapshot (a frozen cgroup runs no task,
+/// so no file can be swapped mid-copy). Best-effort: if the box has no dedicated cgroup, or the freeze
+/// write fails, `path` is `None` and drop is a no-op (the snapshot still runs, just without the freeze).
+struct FreezeGuard {
+    path: Option<std::path::PathBuf>,
+}
+
+impl FreezeGuard {
+    fn freeze(box_pid: i32) -> FreezeGuard {
+        let Some(cg) = registry::box_cgroup(box_pid) else {
+            return FreezeGuard { path: None };
+        };
+        let freeze = cg.join("cgroup.freeze");
+        if std::fs::write(&freeze, "1").is_err() {
+            return FreezeGuard { path: None };
+        }
+        // The freeze is asynchronous; wait (bounded) until the cgroup reports `frozen 1` so the snapshot
+        // starts only once every task is actually stopped. If it never settles, proceed anyway rather
+        // than block commit forever.
+        let events = cg.join("cgroup.events");
+        for _ in 0..200 {
+            match std::fs::read_to_string(&events) {
+                Ok(s) if s.lines().any(|l| l.trim() == "frozen 1") => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        FreezeGuard {
+            path: Some(freeze),
+        }
+    }
+}
+
+impl Drop for FreezeGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.path {
+            let _ = std::fs::write(p, "0");
+        }
+    }
 }
 
 /// The mount points inside a box's mount namespace, box-root-relative (e.g. `/proc`, `/dev`, `/dev/shm`,

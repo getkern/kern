@@ -249,3 +249,12 @@ export KERN_MAX_CONCURRENT=200        # at most 200 boxes at once
 export KERN_FLEET_MEMORY_MAX=16g      # all boxes together capped at 16 GiB, kernel-enforced
 export KERN_FLEET_PIDS_MAX=20000
 ```
+
+**Cross-box OOM semantics.** `KERN_FLEET_MEMORY_MAX` caps the SUM of all boxes on the shared
+`kern.slice`. When that shared ceiling is hit, the kernel's cgroup OOM killer acts at the slice level: it
+picks a victim task by the usual heuristic (roughly the largest RSS) across ALL boxes, so one box's
+memory spike can cause a task in a DIFFERENT box to be killed. This is the intended pooled-budget
+behavior (the fleet shares one hard limit), but it means a fleet cap is not a per-box guarantee. For a
+workload that must not be collateral, ALSO give it a per-box `--memory`: a box with its own `memory.max`
+is OOM-scoped to itself first (its own cgroup limit is hit before it can push the slice over), so the
+fleet cap becomes a backstop for the aggregate rather than the thing that kills your critical box.
