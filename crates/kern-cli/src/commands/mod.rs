@@ -250,7 +250,10 @@ pub struct BoxRunArgs<'a> {
     /// kern-run filtering proxy; empty = the default (no outbound unless `--net`/`--pod`).
     pub egress_allow: &'a [String],
     /// `--landlock-rw <path>` (repeatable): a Landlock (LSM) write-allowlist; the box root is read+exec
-    /// and writes are confined to these paths (+ box scratch dirs). Empty = no Landlock.
+    /// and writes are confined to these paths (+ box scratch dirs). Empty = no Landlock. Each path must
+    /// EXIST at box start (typically a `-v` volume or a dir the image ships): the box root is read-only
+    /// under Landlock, so the workload cannot `mkdir` a missing allowlist dir, and a path absent at start
+    /// is skipped (fail-safe, so the box is only ever MORE confined, never less).
     pub landlock_rw: &'a [String],
     pub workdir: Option<&'a str>,
     pub share_net: bool,
@@ -5035,20 +5038,30 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
 
 /// RAII cgroup-freezer guard: freezes a box's cgroup on construction and thaws it on drop. Used by
 /// `commit` to stop the workload for the duration of the rootfs snapshot (a frozen cgroup runs no task,
-/// so no file can be swapped mid-copy). Best-effort: if the box has no dedicated cgroup, or the freeze
-/// write fails, `path` is `None` and drop is a no-op (the snapshot still runs, just without the freeze).
+/// so no file can be swapped mid-copy). `thaw_path` is `Some` ONLY when this guard is the one that
+/// transitioned the cgroup 0 -> 1; if the box has no dedicated cgroup, the write fails, or the box was
+/// ALREADY frozen (the user ran `kern pause`), it is `None` and drop leaves the freeze state untouched,
+/// so committing a paused box never silently un-pauses it.
 struct FreezeGuard {
-    path: Option<std::path::PathBuf>,
+    thaw_path: Option<std::path::PathBuf>,
 }
 
 impl FreezeGuard {
     fn freeze(box_pid: i32) -> FreezeGuard {
         let Some(cg) = registry::box_cgroup(box_pid) else {
-            return FreezeGuard { path: None };
+            return FreezeGuard { thaw_path: None };
         };
         let freeze = cg.join("cgroup.freeze");
+        // Preserve a pre-existing freeze: if the box is already paused, snapshot under it and do NOT thaw
+        // on drop (that would un-pause a box the user deliberately paused).
+        let already_frozen = std::fs::read_to_string(&freeze)
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        if already_frozen {
+            return FreezeGuard { thaw_path: None };
+        }
         if std::fs::write(&freeze, "1").is_err() {
-            return FreezeGuard { path: None };
+            return FreezeGuard { thaw_path: None };
         }
         // The freeze is asynchronous; wait (bounded) until the cgroup reports `frozen 1` so the snapshot
         // starts only once every task is actually stopped. If it never settles, proceed anyway rather
@@ -5061,14 +5074,14 @@ impl FreezeGuard {
             }
         }
         FreezeGuard {
-            path: Some(freeze),
+            thaw_path: Some(freeze),
         }
     }
 }
 
 impl Drop for FreezeGuard {
     fn drop(&mut self) {
-        if let Some(p) = &self.path {
+        if let Some(p) = &self.thaw_path {
             let _ = std::fs::write(p, "0");
         }
     }
