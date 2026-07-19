@@ -226,3 +226,26 @@ Every key maps to a flag one-to-one, nothing to learn twice. If you know the fla
 - **Not public:** the `[[vgpu]]` / `[[gpu]]` family (VRAM/compute/GPU slices), and the `intelligence`
   / `pool` sections, are on the [roadmap](../README.md#roadmap), not in the schema yet. A config that
   declares them still loads (the keys are ignored) so it stays portable.
+
+## Fleet limits (environment)
+
+Per-box caps (`--memory`, `--cpus`, `--pids-limit`) bound each box on its own. For a HOST that runs many
+boxes (a serverless `box fn` pattern, an agent platform), three environment variables bound the fleet as
+a whole. They are deployment-level, so they live in the environment kern runs under, not in a `kern.toml`
+profile:
+
+| Variable | Effect | Kind |
+|---|---|---|
+| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative.** First-party governor. A caller can unset it, so it is NOT a security boundary. The count is crash-safe (a dead box's slot frees automatically). |
+| `KERN_FLEET_MEMORY_MAX` | A hard `memory.max` on kern's shared `kern.slice`, bounding the SUM of all boxes' memory. Accepts `512m`, `4g`, or bare bytes. | **Real.** Kernel-enforced: the sum is capped even past the cooperative ceiling, and a box cannot raise it (the slice is outside every box's cgroup view). |
+| `KERN_FLEET_PIDS_MAX` | A hard `pids.max` on `kern.slice`, bounding total tasks across all boxes. | **Real**, kernel-enforced. |
+
+The two real caps engage once `kern.slice` exists (from the first box onward) and require the
+systemd-user delegation that per-box caps already use; where it is absent they are a best-effort no-op
+and per-box caps still apply. Example:
+
+```sh
+export KERN_MAX_CONCURRENT=200        # at most 200 boxes at once
+export KERN_FLEET_MEMORY_MAX=16g      # all boxes together capped at 16 GiB, kernel-enforced
+export KERN_FLEET_PIDS_MAX=20000
+```
