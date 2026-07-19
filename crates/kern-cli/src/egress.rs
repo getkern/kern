@@ -115,20 +115,30 @@ fn port_allowed(port: u16) -> bool {
     port == 443 || port == 80
 }
 
-/// Resolve `host:port` and connect to the FIRST address that is a routable PUBLIC unicast IP, refusing
-/// loopback / link-local / private / multicast / unspecified. Closes the SSRF where an allowlisted NAME
-/// resolves to `127.0.0.1`, `169.254.169.254` (cloud metadata), or an RFC-1918 host-local service.
+/// Resolve `host:port` and connect, but ONLY if EVERY resolved address is a routable public unicast IP.
+/// If ANY record is loopback / link-local / metadata / private / multicast / unspecified, the whole name
+/// is refused: a name on the allowlist that also resolves to `127.0.0.1` or `169.254.169.254` is
+/// compromised or hostile, and we do not negotiate with the record set (an operator who orders the
+/// records `[public, private]`, or flips them on re-resolution, gets nothing rather than the private
+/// one). Closes the SSRF where an allowlisted NAME points at a host-local service.
 fn connect_vetted(host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
     use std::net::ToSocketAddrs;
-    let mut last = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no public address");
-    for addr in (host, port).to_socket_addrs()? {
-        if !ip_is_public(addr.ip()) {
-            last = std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("refusing non-public address {}", addr.ip()),
-            );
-            continue;
-        }
+    let addrs: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{host} did not resolve"),
+        ));
+    }
+    if let Some(bad) = addrs.iter().find(|a| !ip_is_public(a.ip())) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing {host}: resolves to non-public address {}", bad.ip()),
+        ));
+    }
+    // Every resolved address is public; connect to the first that accepts.
+    let mut last = std::io::Error::other("no address connected");
+    for addr in addrs {
         match std::net::TcpStream::connect(addr) {
             Ok(s) => return Ok(s),
             Err(e) => last = e,
@@ -139,19 +149,26 @@ fn connect_vetted(host: &str, port: u16) -> std::io::Result<std::net::TcpStream>
 
 /// Is `ip` a routable public unicast address? Rejects loopback, link-local (incl. IPv4 `169.254/16`, the
 /// cloud metadata range, and IPv6 `fe80::/10`), private (RFC1918 / ULA `fc00::/7`), multicast, and
-/// unspecified. Conservative: an unknown range is treated as public, but every host-local range is refused.
+/// unspecified. An IPv4-mapped / IPv4-compatible IPv6 address (`::ffff:127.0.0.1`) is canonicalized to its
+/// V4 form and checked as V4, so a host-local V4 can't be smuggled past the V6 checks. Conservative: an
+/// unknown range is treated as public, but every host-local range is refused.
 pub fn ip_is_public(ip: std::net::IpAddr) -> bool {
+    fn v4_public(a: std::net::Ipv4Addr) -> bool {
+        !(a.is_loopback()
+            || a.is_private()
+            || a.is_link_local()
+            || a.is_multicast()
+            || a.is_broadcast()
+            || a.is_unspecified()
+            || a.octets()[0] == 0)
+    }
     match ip {
-        std::net::IpAddr::V4(a) => {
-            !(a.is_loopback()
-                || a.is_private()
-                || a.is_link_local()
-                || a.is_multicast()
-                || a.is_broadcast()
-                || a.is_unspecified()
-                || a.octets()[0] == 0)
-        }
+        std::net::IpAddr::V4(a) => v4_public(a),
         std::net::IpAddr::V6(a) => {
+            // `::ffff:a.b.c.d` (mapped) and `::a.b.c.d` (compat) both reduce to a V4 host; check it as V4.
+            if let Some(v4) = a.to_ipv4() {
+                return v4_public(v4);
+            }
             let hi = a.segments()[0];
             !(a.is_loopback()
                 || a.is_multicast()
@@ -682,9 +699,12 @@ mod tests {
             "255.255.255.255",
             "224.0.0.1", // multicast
             "::1",
-            "fe80::1",  // link-local
-            "fc00::1",  // ULA
-            "fd12::34", // ULA
+            "fe80::1",              // link-local
+            "fc00::1",              // ULA
+            "fd12::34",             // ULA
+            "::ffff:127.0.0.1",     // IPv4-mapped loopback (must not smuggle past V6 checks)
+            "::ffff:169.254.169.254", // IPv4-mapped cloud metadata
+            "::ffff:10.0.0.1",      // IPv4-mapped RFC-1918
         ];
         for s in bad {
             assert!(!ip_is_public(s.parse::<IpAddr>().unwrap()), "{s} must be refused");
