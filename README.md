@@ -348,9 +348,17 @@ kern build -t app:1 --build-arg VER=9 .       # build args; multi-stage (FROM �
 kern save app:1 -o app.tar                    # export a docker-load-compatible image tar …
 kern load -i app.tar                          # … and import one (docker save format)
 kern tag app:1 registry.example/app:1         # give a cached image a second name
+kern commit devbox warmenv:1                  # snapshot a running box's fs into a reusable image
 kern login registry.example                   # (private) creds stored 0600
 kern push registry.example/app:1              # publish as a single-layer OCI image
 ```
+
+**Warm start (`kern commit`).** Bake an expensive one-time setup (`apt`/`pip` installs, a warmed cache,
+compiled artifacts) into a local image once, then start the next box from it instantly. It reads the
+box's kernel-merged overlay through `/proc/<pid1>/root`, so whiteouts are already resolved, and skips
+every nested mount, so a `-v` volume or a secret is never baked into the image. It's `docker commit`,
+daemonless. A filesystem snapshot, not live memory: processes restart fresh (write state to disk if you
+need it back).
 
 kern parses **real-world Dockerfiles** as-is (comments inside `\` continuations, `SHELL`, BuildKit
 `RUN --mount`/`ADD <url>` with `--checksum`/`--chmod`, `COPY <<heredoc`, `FROM scratch`, `# escape`
@@ -458,6 +466,7 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context: keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: export/import an image tar, `docker load`-compatible |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
+| **`docker commit`** (container → image) | ✅ `kern commit <box> <image>`: snapshots the box's filesystem to a reusable image (warm start); skips volumes/secrets |
 | **Docker Engine API** / `docker.sock` | ❌: tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
 | **Swarm** | ❌: use `compose` / `--pod` |
 

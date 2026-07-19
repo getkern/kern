@@ -42,6 +42,7 @@ pub fn help() -> Result<(), Error> {
     {c}pull{z} <image> [--dest <dir>] [--platform os/arch]              Download an OCI image
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
+    {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
     {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
     {c}images{z} [--json]                                                List pulled (cached) images
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
@@ -4891,6 +4892,178 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// `kern commit <box> <image>`: snapshot a RUNNING box's current filesystem into a reusable local
+/// image, so an expensive setup (apt/pip installs, warmed caches, compiled artifacts) is baked once and
+/// the next `kern box --image <image>` starts warm. This is kern's answer to a "resume the session"
+/// workflow WITHOUT CRIU: it captures the FILESYSTEM, not live memory, so processes restart fresh (write
+/// state to disk if you need it back). Docker's `commit`, daemonless.
+///
+/// The box's kernel-MERGED overlay view is read straight from `/proc/<pid1>/root` (the same confined
+/// handle `kern cp` uses), so overlay whiteouts and opaque dirs are already resolved by the kernel, no
+/// manual layer-flattening. The copy stays on the rootfs's own filesystem, so every separate mount (the
+/// box's `/proc`, `/sys`, `/dev`, `/dev/shm`, and every `-v` volume / workspace / secret) is skipped
+/// automatically: the snapshot is the image content, never a bind-mounted host path.
+pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
+    let inst = registry::find_ref(box_ref).ok_or_else(|| {
+        Error::Sandbox(format!("no running box '{box_ref}'; `kern ps` lists them"))
+    })?;
+    // PID 1 inside the box: the registry value when known, else the supervisor's sole child.
+    let pid1 = if inst.pid1 > 0 {
+        inst.pid1
+    } else {
+        registry::child_of(inst.pid).ok_or_else(|| {
+            Error::Sandbox(format!(
+                "box '{box_ref}' has no resolvable init pid (is it still running?)"
+            ))
+        })?
+    };
+    let root = std::path::PathBuf::from(format!("/proc/{pid1}/root"));
+    std::fs::metadata(&root).map_err(|e| {
+        Error::Sandbox(format!(
+            "box '{box_ref}' is not accessible ({e}); is it running?"
+        ))
+    })?;
+    // The set of NESTED mount points to skip: the box's `/proc`, `/sys/fs/cgroup`, `/dev` (+ its device
+    // nodes and `/dev/shm`), and every `-v` volume / workspace / secret. Read from the box's own mount
+    // table so nothing outside the image's own filesystem is baked in (a secret in a volume must never
+    // land in the committed image). NOT filterable by `st_dev`: overlayfs (xino=off) reports a different
+    // device per underlying layer, so the rootfs itself spans several devices.
+    let skip = box_mount_points(pid1);
+
+    let cache = cache_dir();
+    own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
+    let dst_safe = sanitize_ref(image);
+    // Replace any prior image at this ref (all rootfs forms + sidecars), exactly like `tag`. The `.ok`
+    // marker is written LAST, so an interrupted commit never leaves a half-image that `images` trusts.
+    let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.ok")));
+    for suffix in ["", ".diff", ".layers", ".base", ".image"] {
+        let p = cache.join(format!("{dst_safe}{suffix}"));
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+    let out = cache.join(&dst_safe);
+    copy_rootfs_snapshot(&root, &out, &skip)?;
+
+    // A minimal runtime config: default the command to a shell so `kern box --image <image>` works with
+    // no args, while `--image <image> -- <cmd>` still overrides it. (The base image's entrypoint/env are
+    // OCI metadata, not part of the rootfs, so a filesystem snapshot can't recover them; pass what you
+    // need explicitly; this matches `docker commit` without `--change`.)
+    let cfg = kern_oci::ImageConfig {
+        entrypoint: Vec::new(),
+        cmd: vec!["/bin/sh".to_string()],
+        env: Vec::new(),
+        workdir: None,
+        user: None,
+    };
+    write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg);
+    std::fs::write(cache.join(format!("{dst_safe}.ok")), image.as_bytes())
+        .map_err(|e| Error::Oci(format!("commit marker: {e}")))?;
+    println!("committed box '{box_ref}' → image '{image}'  (run: kern box <name> --image {image})");
+    Ok(())
+}
+
+/// The mount points inside a box's mount namespace, box-root-relative (e.g. `/proc`, `/dev`, `/dev/shm`,
+/// `/sys/fs/cgroup`, and every `-v` volume / workspace / secret), EXCLUDING the root `/` itself. Read
+/// from `/proc/<pid1>/mountinfo` (field 5 is the mount point). Used by `commit` to skip everything that
+/// is not the image's own filesystem. `mountinfo` octal-escapes space/tab/newline/backslash in the path.
+fn box_mount_points(pid1: i32) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let Ok(body) = std::fs::read_to_string(format!("/proc/{pid1}/mountinfo")) else {
+        return set;
+    };
+    for line in body.lines() {
+        // Fields up to the optional-fields marker are fixed; the mount point is field 5 (index 4).
+        if let Some(mp) = line.split_whitespace().nth(4) {
+            let unescaped = unescape_mountinfo(mp);
+            if unescaped != "/" {
+                set.insert(unescaped);
+            }
+        }
+    }
+    set
+}
+
+/// Decode `mountinfo`'s octal escapes (`\040` space, `\011` tab, `\012` newline, `\134` backslash).
+fn unescape_mountinfo(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            let code = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
+            out.push(code as char);
+            i += 4;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Recursively copy a box's merged rootfs at `src_root` into `dst_root`, skipping the box-root-relative
+/// paths in `skip` (its nested mounts: pseudo-fs, bind volumes, secrets). The overlay is read through
+/// `/proc/<pid1>/root`, so the kernel has already resolved whiteouts/opaque dirs; a plain recursive copy
+/// captures the merged view. Symlinks are copied verbatim (NEVER followed), directories are recreated
+/// with their mode, regular files are copied with their permission bits; devices / fifos / sockets are
+/// skipped (not image content). Descent is via `read_dir`, so a symlinked directory is copied as a link
+/// and never traversed into: a box-planted symlink cannot steer the copy outside the box root.
+fn copy_rootfs_snapshot(
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+    skip: &std::collections::HashSet<String>,
+) -> Result<(), Error> {
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    std::fs::create_dir_all(dst_root).map_err(|e| Error::Sandbox(format!("commit mkdir: {e}")))?;
+    // Each frame: (source dir, destination dir, box-root-relative path of the source dir).
+    let mut stack = vec![(
+        src_root.to_path_buf(),
+        dst_root.to_path_buf(),
+        "/".to_string(),
+    )];
+    while let Some((sdir, ddir, rel)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&sdir) else {
+            continue;
+        };
+        for ent in entries.flatten() {
+            let name = ent.file_name();
+            let child_rel = if rel == "/" {
+                format!("/{}", name.to_string_lossy())
+            } else {
+                format!("{rel}/{}", name.to_string_lossy())
+            };
+            if skip.contains(&child_rel) {
+                continue; // a nested mount: proc/sys/dev/shm, a -v volume, workspace, or a secret
+            }
+            let sp = ent.path();
+            let dp = ddir.join(&name);
+            let Ok(md) = std::fs::symlink_metadata(&sp) else {
+                continue;
+            };
+            let ft = md.file_type();
+            let mode = md.mode() & 0o7777;
+            if ft.is_symlink() {
+                if let Ok(target) = std::fs::read_link(&sp) {
+                    let _ = symlink(&target, &dp);
+                }
+            } else if ft.is_dir() {
+                let _ = std::fs::create_dir(&dp);
+                let _ = std::fs::set_permissions(&dp, std::fs::Permissions::from_mode(mode));
+                stack.push((sp, dp, child_rel));
+            } else if ft.is_file() && std::fs::copy(&sp, &dp).is_ok() {
+                let _ = std::fs::set_permissions(&dp, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Copy from an image's KERNEL-MERGED overlay view into `out_dir`, honouring overlay opaque/whiteout
 /// semantics so a file DELETED in an upper layer (`rm -rf dir && mkdir dir` → an OPAQUE directory, or a
 /// per-file `.wh.` whiteout) can never resurface. This is the ONE correct reader for a ≥2-layer image:
@@ -9604,6 +9777,25 @@ name = "scratch"
 backend = "data"
 size = "2g"
 "#;
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    #[test]
+    fn unescape_mountinfo_decodes_octal_and_leaves_plain_paths() {
+        // Plain paths (the common case) pass through untouched.
+        assert_eq!(unescape_mountinfo("/proc"), "/proc");
+        assert_eq!(unescape_mountinfo("/mnt/vol"), "/mnt/vol");
+        assert_eq!(unescape_mountinfo("/"), "/");
+        // mountinfo octal-escapes space (\040), tab (\011), newline (\012), backslash (\134).
+        assert_eq!(unescape_mountinfo("/mnt/my\\040vol"), "/mnt/my vol");
+        assert_eq!(unescape_mountinfo("/a\\134b"), "/a\\b");
+        // A lone backslash not starting a 3-octal escape is preserved verbatim (never panics).
+        assert_eq!(unescape_mountinfo("/a\\b"), "/a\\b");
+        assert_eq!(unescape_mountinfo("/end\\"), "/end\\");
+    }
+}
 
 #[cfg(test)]
 mod net_resource_tests {
