@@ -363,6 +363,13 @@ pub fn proxy_reexec(sock_path: &str, allow_csv: &str) -> ! {
             unsafe { libc::_exit(1) };
         }
     };
+    // Owner-only (0600): the socket already lives in $XDG_RUNTIME_DIR (0700, per-user), so this is
+    // belt-and-suspenders against another same-user process opening the proxy. Connect permission on a
+    // UNIX socket is governed by the socket file's mode.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600));
+    }
     let allow: Vec<String> = allow_csv
         .split(',')
         .map(str::trim)

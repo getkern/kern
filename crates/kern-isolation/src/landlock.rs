@@ -128,6 +128,19 @@ fn handled_for_abi(abi: i32) -> u64 {
 
 /// Add a `path_beneath` rule granting `access` on the subtree at `path`. Best-effort per path: a path
 /// that doesn't exist in the box is skipped (it can't be a target for the workload anyway), never fatal.
+///
+/// Symlink safety (why a symlinked `--landlock-rw` path cannot WIDEN the allowlist):
+///  * `O_NOFOLLOW` refuses a path whose FINAL component is a symlink, so `--landlock-rw /app` where the
+///    image ships `/app -> /` fails the open and is skipped. The box then runs WITHOUT that grant, i.e.
+///    a STRICTER allowlist, never write-anywhere. A hostile image can only tighten, never loosen.
+///  * An INTERMEDIATE symlink (`/app/data` with `/app -> /etc`) is resolved to the real inode
+///    (`/etc/data`), and Landlock binds the rule to that inode. The kernel resolves the workload's own
+///    `/app/data` to the SAME inode at write time, so enforcement matches the grant exactly: the writable
+///    subtree is precisely the path the operator named (by its resolved identity), never a broader one.
+///  * The rule is bound at open time on pid1 BEFORE `execve`, while no workload runs, so there is no
+///    TOCTOU between resolving the path and enforcing the ruleset.
+/// Hence `RESOLVE_NO_SYMLINKS` is deliberately NOT used: it would reject legitimate symlinked dirs (a
+/// common `/var/run -> /run`) for no security gain, since symlinks here are already fail-safe.
 fn add_path(ruleset_fd: i32, path: &str, access: u64) -> Result<(), Error> {
     let c = CString::new(path).map_err(|_| Error::Unsupported("landlock path has a NUL"))?;
     let fd = unsafe {
@@ -137,7 +150,7 @@ fn add_path(ruleset_fd: i32, path: &str, access: u64) -> Result<(), Error> {
         )
     };
     if fd < 0 {
-        return Ok(()); // absent path → nothing to grant, and never a target
+        return Ok(()); // absent path (or a symlink final component) → nothing to grant, and never a target
     }
     let attr = PathBeneathAttr {
         allowed_access: access,
