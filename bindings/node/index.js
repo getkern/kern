@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -210,7 +210,16 @@ function toRc(code, signal) {
 /** True iff kern (the PARENT, before the box exists) failed to start the box. Anchored on kern's OWN
  * diagnostic prefixes so the workload can't forge them by writing the marker to its own stderr. */
 function looksLikeStartupFailure(stderr) {
-  const markers = ["kern:", "error: pull:", "error: sandbox:", "error: box:", "error: oci:", "error: image:"];
+  const markers = [
+    "kern:",
+    "error: pull:",
+    "error: registry:",
+    "error: manifest:",
+    "error: sandbox:",
+    "error: box:",
+    "error: oci:",
+    "error: image:",
+  ];
   for (const line of stderr.split("\n")) {
     const s = line.replace(/^\s+/, "");
     if (s.includes("sandbox setup failed") || markers.some((m) => s.startsWith(m))) return true;

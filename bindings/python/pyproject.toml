@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kern-sandbox"
-version = "0.1.1"
+version = "0.1.2"
 description = "Run code in a fast, local, daemonless kernel sandbox. No cloud, no account, no KVM."
 readme = "README.md"
 requires-python = ">=3.9"
