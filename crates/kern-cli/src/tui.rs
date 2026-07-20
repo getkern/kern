@@ -304,6 +304,9 @@ struct Row {
     /// How this box DEVIATES from the secure default - `net:host` and/or `root-mapped`, empty when
     /// fully isolated (the common case). Flags only the LESS-confined boxes, never a vanity badge.
     iso: String,
+    /// Extra-confinement badge: `egress` and/or `landlock` (0.6.7 policies), empty when neither applies.
+    /// Unlike `iso` (which flags LESS-confined boxes), this marks the MORE-confined ones.
+    sec: String,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -1722,6 +1725,16 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         // every box. `pid1 == 0` (unrecorded / old entry) → the /proc reads fail → no flag, no false
         // positive.
         let iso = box_isolation(b.pid1);
+        let mut sec = String::new();
+        if !b.egress.is_empty() {
+            sec.push_str("egress");
+        }
+        if !b.landlock_rw.is_empty() {
+            if !sec.is_empty() {
+                sec.push('+');
+            }
+            sec.push_str("landlock");
+        }
         rows.push(Row {
             uptime: now_u.saturating_sub(b.started),
             mem: st.mem,
@@ -1734,6 +1747,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
             pid: b.pid,
             pod: b.pod,
             iso,
+            sec,
         });
     }
     // Group for the pod-tree view: standalone boxes first, then each pod's members contiguous (pods in
@@ -2643,6 +2657,20 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     s.push_str(&row("CPU", format!("{total_cpu:.1} %")));
     s.push_str(&row("Tasks", format!("{total_tasks}")));
     s.push_str(&row("Resource cap", format!("{d}{cap}{z}")));
+    // Fleet budget: the SUM cap across all boxes on `kern.slice` (KERN_FLEET_MEMORY_MAX / _PIDS_MAX),
+    // the real-enforcement backstop to the cooperative KERN_MAX_CONCURRENT counter. Shown only when a
+    // budget is actually set (otherwise the slice usually doesn't even exist).
+    if let Some(f) = kern_isolation::fleet_status().filter(|f| f.is_capped()) {
+        let mem = match f.memory_max {
+            Some(m) => format!("mem {}/{}", human_bytes(f.memory_current), human_bytes(m)),
+            None => format!("mem {}", human_bytes(f.memory_current)),
+        };
+        let pids = match f.pids_max {
+            Some(p) => format!("pids {}/{p}", f.pids_current),
+            None => format!("pids {}", f.pids_current),
+        };
+        s.push_str(&row("Fleet cap", format!("{mem} · {pids}")));
+    }
     if rows.is_empty() {
         s.push_str(&format!(
             "\n  {d}no running boxes - start one with `kern box <name> -d …`{z}\n"
@@ -2936,9 +2964,16 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String
         } else {
             format!("  {y}{}{z}", r.iso)
         };
+        // Positive-confinement badge (egress/landlock, 0.6.7 policies), in cyan so it reads distinct
+        // from the yellow `iso` heads-up: it marks the MORE-confined boxes, not a deviation.
+        let sec = if r.sec.is_empty() {
+            String::new()
+        } else {
+            format!("  {c}{}{z}", r.sec)
+        };
         let (lead, name_col) = sel_marker(p, i == sel);
         s.push_str(&format!(
-            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}{iso}\n",
+            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}{iso}{sec}\n",
             name_cell,
             r.pid,
             fmt_uptime(r.uptime),
@@ -3002,7 +3037,19 @@ mod tests {
             ports: String::new(),
             pod: String::new(),
             iso: String::new(),
+            sec: String::new(),
         }
+    }
+
+    #[test]
+    fn boxes_tab_shows_egress_landlock_badge() {
+        // A box carrying 0.6.7 confinement policies surfaces a `sec` badge in the Boxes tab, so the TUI
+        // reflects egress/landlock rather than looking identical to an unconfined box.
+        let mut r = row("guarded", false);
+        r.sec = "egress+landlock".to_string();
+        let out = boxes_table(&plain(), &[r], 10, usize::MAX);
+        let line = out.lines().find(|l| l.contains("guarded")).unwrap();
+        assert!(line.contains("egress+landlock"), "badge missing: {line}");
     }
 
     #[test]

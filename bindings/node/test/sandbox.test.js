@@ -31,10 +31,313 @@ try {
 }
 const exec = { skip: !KERN_OK && "kern binary not found (set KERN_BIN)" };
 
+// snapshot/restore is opt-in in the Node binding (KERN_SANDBOX_SNAPSHOT=1); enable it for the suite.
+// The dedicated gate test below temporarily unsets it to prove it fails closed.
+process.env.KERN_SANDBOX_SNAPSHOT = "1";
+
 // ---- pure logic (no kern needed) ---------------------------------------------------------------
 
 test("version is exported", () => {
   assert.strictEqual(typeof kern.version, "string");
+});
+
+test("profiles validated and placed in argv", () => {
+  // valid vcpu:/vgpio:/vdisk: profiles land as positional tokens (fake kern so the ctor completes)
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  try {
+    const s = new Sandbox({ profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"] });
+    const argv = s._baseArgv("n", { network: false, timeoutS: s.timeoutS });
+    for (const tok of ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"])
+      assert.ok(argv.includes(tok), `${tok} missing from argv`);
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+  // a profile entry can never smuggle a flag / unknown prefix / unsafe name (rejected before findKern)
+  for (const bad of ["--net", "-v /etc:/etc", "vgpu:x", "vcpu:", "vcpu:bad name", "vcpu:a;b",
+                     "vdisk:../x", "vgpio:a/b", "vcpu:x=y", "vcpu:-lead", "", "profile"])
+    assert.throws(() => new Sandbox({ profiles: [bad] }), SandboxError, `should reject ${JSON.stringify(bad)}`);
+});
+
+test("egressAllow validated and scoped to run boxes", () => {
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  try {
+    const s = new Sandbox({ egressAllow: ["pypi.org", "files.pythonhosted.org"] });
+    const run = s._baseArgv("n", { network: false, timeoutS: 30, isSetup: false });
+    const setup = s._baseArgv("n", { network: true, timeoutS: 30, isSetup: true });
+    assert.ok(run.includes("--egress-allow") && run.includes("pypi.org,files.pythonhosted.org"));
+    assert.ok(!run.includes("--net"));
+    assert.ok(!setup.includes("--egress-allow") && setup.includes("--net"));
+    assert.throws(() => new Sandbox({ egressAllow: ["x.com"], network: true }), SandboxError);
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+  for (const bad of ["http://x.com", "x.com/p", "x.com:80", "*.x.com", "a,b.com", "localhost", "", "-x.com", "no dom"])
+    assert.throws(() => new Sandbox({ egressAllow: [bad] }), SandboxError, `should reject ${JSON.stringify(bad)}`);
+});
+
+test("snapshot/restore roundtrips and rejects hostile archives", async () => {
+  const zlib = require("node:zlib");
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true"; // file ops are host-side; no real box is run
+  const tmp = () => path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
+  try {
+    const snap = tmp() + ".tgz";
+    const s = new Sandbox({});
+    await s.open();
+    try {
+      await s.writeFile("a.txt", "hi");
+      await s.writeFile("sub/b.txt", "deep");
+      s.snapshot(snap);
+    } finally {
+      await s.close();
+    }
+    const s2 = new Sandbox({});
+    await s2.open();
+    try {
+      s2.restore(snap);
+      assert.strictEqual((await s2.readFile("a.txt")).toString(), "hi");
+      assert.strictEqual((await s2.readFile("sub/b.txt")).toString(), "deep");
+    } finally {
+      await s2.close();
+    }
+    const badTar = (name, flag) => {
+      const h = Buffer.alloc(512);
+      h.write(name, 0, 100);
+      h.write("0000644\0", 100, 8);
+      h.write("0000000\0", 108, 8);
+      h.write("0000000\0", 116, 8);
+      h.write("00000000000\0", 124, 12);
+      h.write("00000000000\0", 136, 12);
+      h.write("        ", 148, 8);
+      h.write(flag, 156, 1);
+      h.write("ustar\0", 257, 6);
+      h.write("00", 263, 2);
+      let sum = 0;
+      for (const b of h) sum += b;
+      h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148, 8);
+      return zlib.gzipSync(Buffer.concat([h, Buffer.alloc(1024)]));
+    };
+    for (const [name, flag] of [
+      ["/etc/evil", "0"],
+      ["../escape", "0"],
+      ["link", "2"],
+    ]) {
+      const p = tmp() + ".tgz";
+      fs.writeFileSync(p, badTar(name, flag));
+      const s3 = new Sandbox({});
+      await s3.open();
+      try {
+        assert.throws(() => s3.restore(p), SandboxError, `should reject ${name}`);
+      } finally {
+        await s3.close();
+      }
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
+
+test("restore refuses a member routed through a planted symlink, and a negative-size tar", async () => {
+  const zlib = require("node:zlib");
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  const wsdir = () => {
+    const d = path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
+    fs.mkdirSync(d);
+    return d;
+  };
+  const tmpf = () => path.join(os.tmpdir(), "ktf-" + Math.random().toString(36).slice(2)) + ".tgz";
+  const hdr = (name, size, flag) => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100);
+    h.write("0000644\0", 100, 8);
+    h.write("0000000\0", 108, 8);
+    h.write("0000000\0", 116, 8);
+    h.write(size + "\0", 124, 12);
+    h.write("00000000000\0", 136, 12);
+    h.write("        ", 148, 8);
+    h.write(flag, 156, 1);
+    h.write("ustar\0", 257, 6);
+    h.write("00", 263, 2);
+    let s = 0;
+    for (const b of h) s += b;
+    h.write(s.toString(8).padStart(6, "0") + "\0 ", 148, 8);
+    return h;
+  };
+  const fileTar = (name, content) => {
+    const pad = (512 - (content.length % 512)) % 512;
+    return zlib.gzipSync(
+      Buffer.concat([
+        hdr(name, content.length.toString(8).padStart(11, "0"), "0"),
+        content,
+        Buffer.alloc(pad),
+        Buffer.alloc(1024),
+      ]),
+    );
+  };
+  try {
+    // HIGH: a symlink the box planted in the workspace must not let a member escape through it.
+    const ws = wsdir();
+    const target = wsdir();
+    fs.symlinkSync(target, path.join(ws, "evil"));
+    const p = tmpf();
+    fs.writeFileSync(p, fileTar("evil/pwned.txt", Buffer.from("owned")));
+    const s = new Sandbox({ workspace: ws });
+    await s.open();
+    try {
+      assert.throws(() => s.restore(p), SandboxError);
+      assert.ok(!fs.existsSync(path.join(target, "pwned.txt")), "must not write outside the workspace");
+    } finally {
+      await s.close();
+    }
+    // MEDIUM: a negative octal size must throw, never spin forever.
+    const p2 = tmpf();
+    fs.writeFileSync(p2, zlib.gzipSync(Buffer.concat([hdr("x", "-1000", "0"), Buffer.alloc(1024)])));
+    const s2 = new Sandbox({ workspace: wsdir() });
+    await s2.open();
+    try {
+      assert.throws(() => s2.restore(p2), SandboxError);
+    } finally {
+      await s2.close();
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
+
+test("restore rejects a malformed ustar header (bad checksum, non-octal or over-long size)", async () => {
+  const zlib = require("node:zlib");
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  const wsdir = () => {
+    const d = path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
+    fs.mkdirSync(d);
+    return d;
+  };
+  const tmpf = () => path.join(os.tmpdir(), "ktf-" + Math.random().toString(36).slice(2)) + ".tgz";
+  const mk = (sizeField, { badck = false, content = Buffer.alloc(0) } = {}) => {
+    const h = Buffer.alloc(512);
+    h.write("f", 0, 100);
+    h.write("0000644\0", 100, 8);
+    h.write("0000000\0", 108, 8);
+    h.write("0000000\0", 116, 8);
+    h.write(sizeField + "\0", 124, 12);
+    h.write("00000000000\0", 136, 12);
+    h.write("        ", 148, 8);
+    h.write("0", 156, 1);
+    h.write("ustar\0", 257, 6);
+    h.write("00", 263, 2);
+    let s = 0;
+    for (const b of h) s += b;
+    h.write((badck ? s + 1 : s).toString(8).padStart(6, "0") + "\0 ", 148, 8);
+    const pad = (512 - (content.length % 512)) % 512;
+    return zlib.gzipSync(Buffer.concat([h, content, Buffer.alloc(pad), Buffer.alloc(1024)]));
+  };
+  try {
+    for (const [label, gz] of [
+      ["bad checksum", mk("00000000000", { badck: true })],
+      ["non-octal size", mk("0000000012x")],
+      ["size exceeds archive", mk("77777777777", { content: Buffer.from("short") })],
+    ]) {
+      const p = tmpf();
+      fs.writeFileSync(p, gz);
+      const s = new Sandbox({ workspace: wsdir() });
+      await s.open();
+      try {
+        assert.throws(() => s.restore(p), SandboxError, `should reject: ${label}`);
+      } finally {
+        await s.close();
+      }
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
+
+test("snapshot/restore fails closed when KERN_SANDBOX_SNAPSHOT is unset", async () => {
+  const prevKern = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  const prevSnap = process.env.KERN_SANDBOX_SNAPSHOT;
+  delete process.env.KERN_SANDBOX_SNAPSHOT;
+  try {
+    const s = new Sandbox({});
+    await s.open();
+    try {
+      assert.throws(() => s.snapshot("/tmp/none.tgz"), /KERN_SANDBOX_SNAPSHOT=1/);
+      assert.throws(() => s.restore("/tmp/none.tgz"), /KERN_SANDBOX_SNAPSHOT=1/);
+    } finally {
+      await s.close();
+    }
+  } finally {
+    if (prevKern === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prevKern;
+    if (prevSnap === undefined) delete process.env.KERN_SANDBOX_SNAPSHOT;
+    else process.env.KERN_SANDBOX_SNAPSHOT = prevSnap;
+  }
+});
+
+test("restore rejects a dir member colliding with a planted symlink, and a dir with non-zero size", async () => {
+  const zlib = require("node:zlib");
+  const prevKern = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  const wsdir = () => {
+    const d = path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
+    fs.mkdirSync(d);
+    return d;
+  };
+  const tmpf = () => path.join(os.tmpdir(), "ktf-" + Math.random().toString(36).slice(2)) + ".tgz";
+  const one = (name, sizeField, flag, content = Buffer.alloc(0)) => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100);
+    h.write("0000644\0", 100, 8);
+    h.write("0000000\0", 108, 8);
+    h.write("0000000\0", 116, 8);
+    h.write(sizeField + "\0", 124, 12);
+    h.write("00000000000\0", 136, 12);
+    h.write("        ", 148, 8);
+    h.write(flag, 156, 1);
+    h.write("ustar\0", 257, 6);
+    h.write("00", 263, 2);
+    let s = 0;
+    for (const b of h) s += b;
+    h.write(s.toString(8).padStart(6, "0") + "\0 ", 148, 8);
+    const pad = (512 - (content.length % 512)) % 512;
+    return zlib.gzipSync(Buffer.concat([h, content, Buffer.alloc(pad), Buffer.alloc(1024)]));
+  };
+  try {
+    // a dir member named `d` while the box has planted `d` as a symlink out of the workspace
+    const ws = wsdir();
+    fs.symlinkSync(wsdir(), path.join(ws, "d"));
+    const p1 = tmpf();
+    fs.writeFileSync(p1, one("d/", "00000000000", "5"));
+    const s = new Sandbox({ workspace: ws });
+    await s.open();
+    try {
+      assert.throws(() => s.restore(p1), SandboxError);
+    } finally {
+      await s.close();
+    }
+    // a dir member carrying a non-zero size is malformed
+    const p2 = tmpf();
+    fs.writeFileSync(p2, one("d/", "00000000001", "5"));
+    const s2 = new Sandbox({ workspace: wsdir() });
+    await s2.open();
+    try {
+      assert.throws(() => s2.restore(p2), SandboxError);
+    } finally {
+      await s2.close();
+    }
+  } finally {
+    if (prevKern === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prevKern;
+  }
 });
 
 test("bad timeout throws SandboxError", () => {

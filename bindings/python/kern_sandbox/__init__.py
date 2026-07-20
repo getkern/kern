@@ -34,17 +34,19 @@ multi-tenant code (for that: a microVM / gVisor). A deny-by-default allowlist mo
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Mapping, Sequence
+from typing import Callable, Literal, Mapping, Sequence
 
 __all__ = [
     "Sandbox",
@@ -138,21 +140,35 @@ class ExecutionResult:
 
 class _CappedReader(threading.Thread):
     """Drain a pipe into a bounded buffer: keep at most ``cap`` bytes but KEEP reading past it
-    (discarding overflow) so a flooding box never blocks on a full pipe. RAM is bounded to ``cap``."""
+    (discarding overflow) so a flooding box never blocks on a full pipe. RAM is bounded to ``cap``.
 
-    def __init__(self, pipe, cap: int) -> None:
+    If ``on_data`` is given, every chunk is also delivered live (``read1`` returns as soon as any bytes
+    are available, so it's prompt, not batched). The full (capped) buffer is STILL captured, so a caller
+    can both stream and read ``result.stdout``. A callback exception is swallowed: it must never kill the
+    drain, or the box would deadlock on a full pipe."""
+
+    def __init__(self, pipe, cap: int, on_data=None) -> None:
         super().__init__(daemon=True)
         self._pipe = pipe
         self._cap = cap
+        self._on_data = on_data
         self.buf = bytearray()
         self.truncated = False
 
     def run(self) -> None:
+        # read1 (vs read) hands back each chunk as it arrives instead of blocking for a full 64 KiB, so
+        # a streaming callback sees output live; it also drains a flooding box just as well.
+        read = self._pipe.read1 if hasattr(self._pipe, "read1") else self._pipe.read
         try:
             while True:
-                chunk = self._pipe.read(65536)
+                chunk = read(65536)
                 if not chunk:
                     break
+                if self._on_data is not None:
+                    try:
+                        self._on_data(bytes(chunk))
+                    except Exception:  # noqa: BLE001 - a user callback must not break the drain
+                        pass
                 room = self._cap - len(self.buf)
                 if room > 0:
                     self.buf += chunk[:room]
@@ -206,6 +222,43 @@ def _validate_mount(source: str, target: str) -> tuple[str, str]:
     return real, target
 
 
+# A resource-profile token (`vcpu:`/`vgpio:`/`vdisk:` + a named profile from the user's kern.toml).
+# ANCHORED and charset-restricted: the token is passed as a POSITIONAL arg to `kern box`, so it must be
+# EXACTLY a known prefix plus a safe name. This is what stops a caller (or agent-chosen value) from
+# smuggling another flag through the profile list, e.g. "--net", "-v /etc:/etc", "vgpu:x" (unsupported),
+# or a name with a space / `=` / `/` / leading dash. The three prefixes mirror `config::classify` in kern.
+_PROFILE_RE = re.compile(r"^(?:vcpu|vgpio|vdisk):[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_profile(token: str) -> str:
+    """Validate one `vcpu:`/`vgpio:`/`vdisk:NAME` resource-profile token before it reaches the argv."""
+    if not isinstance(token, str) or not _PROFILE_RE.fullmatch(token):
+        raise SandboxError(
+            f"invalid resource profile {token!r}: expected 'vcpu:NAME', 'vgpio:NAME' or 'vdisk:NAME' "
+            "with an alphanumeric profile name (the profile must be defined in your kern.toml)"
+        )
+    return token
+
+
+# A public DNS domain for the egress allowlist. LDH labels, at least one dot (an FQDN), alphabetic TLD.
+# Restrictive on purpose: the value is joined with commas and handed to `kern box --egress-allow`, so it
+# must not contain a comma, scheme, path, port, wildcard or whitespace that could change the argument's
+# meaning. kern re-validates and SSRF-checks the resolved IPs; this is the binding's first gate.
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
+)
+
+
+def _validate_domain(domain: str) -> str:
+    """Validate one egress-allowlist domain (an FQDN like ``pypi.org``) before it reaches the argv."""
+    if not isinstance(domain, str) or not _DOMAIN_RE.fullmatch(domain):
+        raise SandboxError(
+            f"invalid egress domain {domain!r}: expected a bare hostname like 'pypi.org' "
+            "(no scheme, port, path, wildcard or spaces)"
+        )
+    return domain
+
+
 # Signal-derived exit codes (128 + signum) we classify.
 _EXIT_SIGKILL = 137  # 128 + 9  - SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
 _EXIT_SIGSYS = 159  # 128 + 31 - SIGSYS: a seccomp-denied syscall = a blocked escape attempt
@@ -233,8 +286,19 @@ class Sandbox:
         network: **RELAXES ISOLATION.** ``True`` shares the host network for every ``run_code`` (kern
             ``--net``). Default ``False``. There is no per-call network override - network is a
             session-level, explicit choice.
+        egress_allow: restrict ``run_code``/``run`` to a DOMAIN ALLOWLIST instead of all-or-nothing,
+            e.g. ``["pypi.org", "files.pythonhosted.org"]``. The box runs in an isolated network
+            namespace and reaches the internet only through kern's filtering proxy, which permits just
+            these domains (an agent can fetch from the index you allow but cannot exfiltrate elsewhere).
+            Mutually exclusive with ``network=True``. The ``setup=`` box keeps full network to install
+            deps; the allowlist governs the untrusted run phase.
         mounts: extra host paths to bind, ``{host_src: box_target}`` (or ``{src: (target, "ro")}``).
             Sensitive sources are refused. The workspace is mounted automatically; this is for extras.
+        profiles: reusable kern resource profiles to attach, as ``["vcpu:NAME", "vgpio:NAME",
+            "vdisk:NAME"]``. Each names a ``[[vcpu]]``/``[[vgpio]]``/``[[vdisk]]`` block in your
+            ``~/.config/kern/kern.toml``: a CPU+memory slice, a specific GPIO/I2C/SPI device set (the
+            only way to grant the box hardware), or a size-capped scratch disk. Tokens are strictly
+            validated (prefix + alphanumeric name) so a profile entry can never smuggle another flag.
         env: extra environment variables for the workload.
         max_output_bytes: cap on captured stdout/stderr EACH; a flooding box can't OOM the host.
         enforce_limits: ``True`` (default) hard-enforces caps via a systemd scope (~6 ms start);
@@ -249,14 +313,22 @@ class Sandbox:
     pids: int | None = 256
     timeout_s: int = 30
     network: bool = False
+    egress_allow: Sequence[str] | None = None
     mounts: Mapping[str, "str | tuple[str, str]"] | None = None
+    profiles: Sequence[str] | None = None
     env: Mapping[str, str] | None = None
     max_output_bytes: int = 64 * 1024 * 1024
     enforce_limits: bool = True
     deps_readonly: bool = False  # mount setup= deps read-only for run_code (block cross-run poisoning)
+    # live output callbacks: called with each raw chunk (bytes) as it arrives, in a reader thread. The
+    # full capped output is still captured in the result, so you can stream AND read result.stdout.
+    on_stdout: "Callable[[bytes], None] | None" = None
+    on_stderr: "Callable[[bytes], None] | None" = None
 
     _kern: str = field(default="", repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
+    _profile_args: list = field(default_factory=list, init=False, repr=False)
+    _egress_allow: list = field(default_factory=list, init=False, repr=False)
     _ws: str = field(default="", init=False, repr=False)
     _own_ws: bool = field(default=False, init=False, repr=False)  # we created it → we delete it
     _entered: bool = field(default=False, init=False, repr=False)
@@ -278,6 +350,13 @@ class Sandbox:
                     target, ro = spec, False
                 real, tgt = _validate_mount(source, target)
                 self._mount_args += ["-v", f"{real}:{tgt}:ro" if ro else f"{real}:{tgt}"]
+        self._profile_args = [_validate_profile(p) for p in (self.profiles or [])]
+        self._egress_allow = [_validate_domain(d) for d in (self.egress_allow or [])]
+        if self._egress_allow and self.network:
+            raise SandboxError(
+                "egress_allow and network=True are mutually exclusive: egress_allow gives a restricted "
+                "domain allowlist for run_code, network=True gives the full host network"
+            )
         self._kern = _find_kern()
 
     # -- lifecycle -----------------------------------------------------------------------------------
@@ -330,8 +409,16 @@ class Sandbox:
             argv += ["--cpus", str(self.cpus)]
         if self.pids is not None:
             argv += ["--pids-limit", str(self.pids)]
-        if network:
+        # Network mode for THIS box. egress_allow (a domain allowlist via an isolated netns + kern's
+        # filtering proxy) governs the untrusted run_code/run boxes; the setup box keeps the full network
+        # it needs to install deps. egress_allow and network are mutually exclusive (checked at construct).
+        if self._egress_allow and not is_setup:
+            argv += ["--egress-allow", ",".join(self._egress_allow)]
+        elif network:
             argv += ["--net"]
+        # Resource profiles (vcpu:/vgpio:/vdisk:NAME) are positional tokens `kern box` resolves against the
+        # user's kern.toml. Validated at construction, so nothing here can be a smuggled flag.
+        argv += self._profile_args
         argv += self._mount_args
         merged_env = dict(self.env or {})
         # Deps installed by `setup` live in <workspace>/.deps - put them on PYTHONPATH for run_code.
@@ -377,7 +464,7 @@ class Sandbox:
         before = self._snapshot()
         name = _unique_name()
         argv = self._base_argv(name, network=network, timeout_s=timeout_s, is_setup=is_setup) + ["--"] + list(command)
-        child_env = {**os.environ, "KERN_ACCEPT_EULA": "1"}
+        child_env = dict(os.environ)
         if not self.enforce_limits:
             child_env["KERN_NO_SCOPE"] = "1"
         started = time.monotonic()
@@ -393,8 +480,8 @@ class Sandbox:
             # E2BIG (argv too long) and other spawn-time OS errors → a clean typed error, not a raw
             # OSError leaking out of the binding. (run_code already routes large code via a file.)
             raise SandboxError(f"could not spawn the box: {e}") from e
-        out = _CappedReader(proc.stdout, self.max_output_bytes)
-        err = _CappedReader(proc.stderr, self.max_output_bytes)
+        out = _CappedReader(proc.stdout, self.max_output_bytes, self.on_stdout)
+        err = _CappedReader(proc.stderr, self.max_output_bytes, self.on_stderr)
         out.start()
         err.start()
         we_timed_out = False
@@ -570,6 +657,51 @@ class Sandbox:
         root = self._ws_path(subdir) if subdir else self._ws  # _ws is canonical (set at enter)
         return [FileInfo(path=p, size=s, change="created") for p, (_, s) in self._walk(root).items()]
 
+    # -- workspace snapshot (a cheap FILESYSTEM checkpoint; NOT a memory snapshot) --------------------
+
+    def snapshot(self, dest: str) -> None:
+        """Write a gzip tar of the whole workspace to ``dest`` on the host, a portable filesystem
+        checkpoint. Pair with :meth:`restore` (or seed a new ``Sandbox(workspace=...)``) to resume the
+        FILE state later or elsewhere. This is NOT a memory snapshot: processes are ephemeral, only the
+        on-disk workspace is captured. The private host-side env file is never included."""
+        self._require_entered()
+        import tarfile
+
+        # USTAR_FORMAT (not the Python PAX default): PAX writes an 'x' extended header before each member
+        # that the deliberately-strict Node reader rejects, so PAX would break cross-binding interop. USTAR
+        # is the plain format the Node binding also writes, keeping a snapshot readable by both (and by
+        # `tar`). The trade is a 100-byte name limit, matching Node, and second-resolution mtimes.
+        # compresslevel=1: a checkpoint is local and often large or already-compressed; level 1 is several
+        # times faster than the default 9 with a negligible ratio penalty. Speed over ratio here.
+        with tarfile.open(dest, "w:gz", compresslevel=1, format=tarfile.USTAR_FORMAT) as tf:
+            for entry in sorted(os.listdir(self._ws)):
+                if entry == _ENV_FILE:
+                    continue  # our private 0600 --env-file, not user state
+                tf.add(os.path.join(self._ws, entry), arcname=entry)
+
+    def restore(self, src: str) -> None:
+        """Extract a snapshot tar (from :meth:`snapshot`) into the workspace, SAFELY. Every member is
+        vetted first: absolute paths, ``..`` escapes, and non-regular/non-directory members (symlinks,
+        devices, fifos, hardlinks) are refused, and each resolved path must stay under the workspace, so
+        a hostile tar can never write outside it. Colliding files are overwritten."""
+        self._require_entered()
+        import tarfile
+
+        base = os.path.realpath(self._ws)
+        with tarfile.open(src, "r:*") as tf:
+            members = tf.getmembers()
+            for m in members:
+                if m.name.startswith("/") or ".." in m.name.split("/"):
+                    raise SandboxError(f"unsafe path in snapshot: {m.name!r}")
+                if not (m.isreg() or m.isdir()):
+                    raise SandboxError(f"unsafe member type in snapshot (only files/dirs): {m.name!r}")
+                resolved = os.path.realpath(os.path.join(base, m.name))
+                if resolved != base and not resolved.startswith(base + os.sep):
+                    raise SandboxError(f"snapshot member escapes the workspace: {m.name!r}")
+            # members already vetted (regular/dir, no escape); `filter="data"` (3.12+) is defense in depth.
+            extra = {"filter": "data"} if sys.version_info >= (3, 12) else {}
+            tf.extractall(base, members=members, **extra)
+
     # -- setup (the only network window) -------------------------------------------------------------
 
     def _run_setup(self, cmd: str) -> None:
@@ -630,22 +762,33 @@ class Sandbox:
     # large agent-generated script can't blow ARG_MAX (~2 MB) with a raw OSError. Well under the limit.
     _INLINE_CODE_MAX = 128 * 1024
 
-    def run_code(self, code: str, *, language: Literal["python", "bash"] = "python") -> ExecutionResult:
+    # runner binary, inline-eval flag, and cell-file extension per language (node evals with -e, not -c).
+    _LANGS = {
+        "python": ("python3", "-c", "py"),
+        "bash": ("sh", "-c", "sh"),
+        "node": ("node", "-e", "js"),
+    }
+
+    def run_code(
+        self, code: str, *, language: Literal["python", "bash", "node"] = "python"
+    ) -> ExecutionResult:
         """Run a snippet of ``code`` on the workspace in a fresh, network-off box. File state written to
         the workspace persists to the next call; in-memory state does NOT (fresh process each time).
-        Large code is written to a workspace file and executed from there (transparent to the caller),
-        so an arbitrarily large script works instead of hitting the argv length limit."""
+        ``language`` is ``"python"`` (default), ``"bash"``, or ``"node"`` (the image must provide the
+        interpreter). Large code is written to a workspace file and executed from there (transparent to
+        the caller), so an arbitrarily large script works instead of hitting the argv length limit."""
         self._require_entered()
-        if language not in ("python", "bash"):
-            raise SandboxError(f"unsupported language {language!r} (v1: 'python' | 'bash')")
-        runner = "python3" if language == "python" else "sh"
+        spec = self._LANGS.get(language)
+        if spec is None:
+            raise SandboxError(f"unsupported language {language!r} (v1: 'python' | 'bash' | 'node')")
+        runner, inline_flag, ext = spec
         if len(code.encode()) > self._INLINE_CODE_MAX:
             # Write to a per-call cell file in the workspace and run it by path (no argv-size limit).
-            cell = f".cell-{uuid.uuid4().hex[:8]}.{'py' if language == 'python' else 'sh'}"
+            cell = f".cell-{uuid.uuid4().hex[:8]}.{ext}"
             self.write_file(cell, code)
             command: list[str] = [runner, f"{_WORKSPACE}/{cell}"]
         else:
-            command = [runner, "-c", code]
+            command = [runner, inline_flag, code]
         return self._spawn(command, network=self.network, timeout_s=self.timeout_s)
 
     def run(self, command: Sequence[str]) -> ExecutionResult:
@@ -675,7 +818,9 @@ def _looks_like_startup_failure(stderr: str) -> bool:
     return False
 
 
-def run_code(code: str, *, language: Literal["python", "bash"] = "python", **kwargs: object) -> ExecutionResult:
+def run_code(
+    code: str, *, language: Literal["python", "bash", "node"] = "python", **kwargs: object
+) -> ExecutionResult:
     """One-shot convenience: run ``code`` in a throwaway session (workspace created and deleted). This is
     literally ``with Sandbox(**kwargs) as s: return s.run_code(code)`` - one tested code path, no state
     persists. For multi-step work (write a file, then read it), use ``Sandbox`` as a context manager."""

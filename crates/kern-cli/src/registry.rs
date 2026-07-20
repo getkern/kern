@@ -36,6 +36,17 @@ pub struct Instance {
     /// The **pod** (`--pod <name>`, e.g. a compose stack) this box belongs to - the grouping key for
     /// `kern ps`'s tree view and `kern stop <pod>`. Empty for a standalone box; absent in older entries.
     pub pod: String,
+    /// The `--egress-allow` domain allowlist (comma-joined) governing this box's outbound traffic;
+    /// empty when the box is fully isolated or shares the host network. Absent in older entries.
+    pub egress: String,
+    /// The `--landlock-rw` write-allowlist paths (comma-joined) confining the box's writes via the
+    /// Landlock LSM; empty when no Landlock policy applies. Absent in older entries.
+    pub landlock_rw: String,
+    /// The box's requested `memory.max` cap in bytes (`--memory`); `None` when uncapped or absent in
+    /// older entries. This is the REQUESTED cap recorded at start, not live usage.
+    pub memory_max: Option<u64>,
+    /// The box's requested `pids.max` cap (`--pids-limit`); `None` when uncapped or absent.
+    pub pids_max: Option<u64>,
 }
 
 impl Instance {
@@ -310,11 +321,11 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Write the entry. Returns the file path (so the supervisor can remove it on exit).
-pub fn register(inst: &Instance) -> io::Result<PathBuf> {
-    let path = dir()?.join(format!("{}-{}", inst.name, inst.pid));
-    let body = format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\n",
+/// Encode an entry to its `key=value` wire format (paired with [`parse`]). Extracted so the format is
+/// round-trip unit-tested without touching the filesystem.
+fn encode(inst: &Instance) -> String {
+    format!(
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -325,8 +336,17 @@ pub fn register(inst: &Instance) -> io::Result<PathBuf> {
         one_line(&inst.ports),
         one_line(&inst.volumes),
         one_line(&inst.pod),
-    );
-    fs::write(&path, body)?;
+        one_line(&inst.egress),
+        one_line(&inst.landlock_rw),
+        inst.memory_max.map(|v| v.to_string()).unwrap_or_default(),
+        inst.pids_max.map(|v| v.to_string()).unwrap_or_default(),
+    )
+}
+
+/// Write the entry. Returns the file path (so the supervisor can remove it on exit).
+pub fn register(inst: &Instance) -> io::Result<PathBuf> {
+    let path = dir()?.join(format!("{}-{}", inst.name, inst.pid));
+    fs::write(&path, encode(inst))?;
     Ok(path)
 }
 
@@ -733,8 +753,14 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut rootfs, mut command, mut ports) = (String::new(), String::new(), String::new());
     let (mut pid1, mut started, mut starttime) = (0i32, 0u64, 0u64);
     let (mut volumes, mut pod) = (String::new(), String::new());
+    let (mut egress, mut landlock_rw) = (String::new(), String::new());
+    let (mut memory_max, mut pids_max) = (None, None);
     for line in body.lines() {
-        let (k, v) = line.split_once('=')?;
+        // Skip a malformed line (e.g. a half-written record from a crash mid-write) rather than `?`-ing
+        // out, which would evaporate the WHOLE entry and silently drop a live box from the registry.
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         match k {
             "name" => name = Some(v.to_string()),
             "pid" => pid = v.parse().ok(),
@@ -746,6 +772,11 @@ fn parse(body: &str) -> Option<Instance> {
             "ports" => ports = v.to_string(),
             "volumes" => volumes = v.to_string(),
             "pod" => pod = v.to_string(),
+            "egress" => egress = v.to_string(),
+            "landlock" => landlock_rw = v.to_string(),
+            // empty string (uncapped) parses to None; a bad value is ignored, not fatal
+            "memory_max" => memory_max = v.parse().ok(),
+            "pids_max" => pids_max = v.parse().ok(),
             _ => {}
         }
     }
@@ -760,12 +791,63 @@ fn parse(body: &str) -> Option<Instance> {
         ports,
         volumes,
         pod,
+        egress,
+        landlock_rw,
+        memory_max,
+        pids_max,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_parse_roundtrips_0_6_7_fields() {
+        let inst = Instance {
+            name: "rt".into(),
+            pid: 7,
+            pid1: 8,
+            rootfs: "/r".into(),
+            command: "sleep 1".into(),
+            started: 1,
+            starttime: 2,
+            ports: String::new(),
+            volumes: String::new(),
+            pod: "stack".into(),
+            egress: "pypi.org,files.pythonhosted.org".into(),
+            landlock_rw: "/tmp,/data".into(),
+            memory_max: Some(134_217_728),
+            pids_max: Some(64),
+        };
+        let got = parse(&encode(&inst)).expect("parse a well-formed entry");
+        assert_eq!(got.pod, "stack");
+        assert_eq!(got.egress, "pypi.org,files.pythonhosted.org");
+        assert_eq!(got.landlock_rw, "/tmp,/data");
+        assert_eq!(got.memory_max, Some(134_217_728));
+        assert_eq!(got.pids_max, Some(64));
+        // an uncapped box round-trips to None (empty value), never Some(0)
+        let uncapped = Instance {
+            memory_max: None,
+            pids_max: None,
+            ..inst.clone()
+        };
+        let got2 = parse(&encode(&uncapped)).expect("parse");
+        assert_eq!(got2.memory_max, None);
+        assert_eq!(got2.pids_max, None);
+        // an OLD entry with none of the new keys still parses (backward compatible), fields default
+        let legacy = "name=old\npid=3\npid1=0\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nports=\nvolumes=\npod=\n";
+        let g = parse(legacy).expect("legacy entry still parses");
+        assert!(g.egress.is_empty() && g.landlock_rw.is_empty());
+        assert_eq!(g.memory_max, None);
+        assert_eq!(g.pids_max, None);
+        // a corrupt line (e.g. a truncated write) is SKIPPED, not fatal: the box stays in the registry
+        let corrupt = "name=surv\npid=9\nthis-line-has-no-equals\npod=stack\n";
+        let s = parse(corrupt).expect("a corrupt line must not evaporate the whole entry");
+        assert_eq!(s.name, "surv");
+        assert_eq!(s.pid, 9);
+        assert_eq!(s.pod, "stack");
+    }
 
     // Registry-mutating tests all share ONE process-wide instances dir AND one pid
     // (`std::process::id()`), so a pid-keyed `find_ref` in one test can observe a box another test
@@ -861,6 +943,10 @@ mod tests {
                 ports: String::new(),
                 volumes: String::new(),
                 pod: String::new(),
+                egress: String::new(),
+                landlock_rw: String::new(),
+                memory_max: None,
+                pids_max: None,
             })
             .unwrap()
         };
@@ -903,6 +989,10 @@ mod tests {
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),
+            egress: String::new(),
+            landlock_rw: String::new(),
+            memory_max: None,
+            pids_max: None,
         })
         .unwrap();
         let got = claim_name(&name).unwrap();

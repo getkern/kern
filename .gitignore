@@ -2,6 +2,9 @@
 **/*.rs.bk
 .DS_Store
 
+# Runtime env file the sandbox bindings write into a workspace (0600, PYTHONPATH etc.); never a source file.
+.kern-env
+
 # Pulled/built OCI rootfs - `kern pull`/`kern build` with no --dest writes into the CWD as
 # `<name>_<tag>-<hash>/` plus `.image`/`.lock`/`.layers`/`.base`/`.diff` sidecars. Never commit a
 # rootfs; match the hash-suffixed names (anchored to the repo root so real files are untouched).

@@ -124,12 +124,39 @@ new Sandbox({
   timeoutS,        // default 30, MANDATORY per-call deadline
   network,         // default false (RELAXES ISOLATION)
   mounts,          // { hostSrc: boxTarget } or { src: [target, "ro"] }
+  profiles,        // reusable kern.toml profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]
   env,             // { KEY: "value" }
   maxOutputBytes,  // default 64 MiB
   enforceLimits,   // default true (systemd scope, ~6 ms); false = best-effort, ~3 ms
   depsReadonly,    // default false
+  onStdout,        // (chunk: Buffer) => void, live stdout streaming (result.stdout still captured)
+  onStderr,        // (chunk: Buffer) => void, live stderr streaming
 });
 ```
+
+## Charts, live output, and checkpoints
+
+**Charts / artifacts (the "code interpreter" pattern).** No Jupyter kernel: have the code WRITE the
+artifact to the workspace, then read it back with `readFile`.
+
+```js
+await kern.withSandbox({ setup: "pip install matplotlib" }, async (sbx) => {
+  await sbx.runCode("import matplotlib; matplotlib.use('Agg')\n" +
+    "import matplotlib.pyplot as plt; plt.plot([1,4,9]); plt.savefig('chart.png')");
+  const png = await sbx.readFile("chart.png"); // Buffer, ready to return to the model / user
+});
+```
+
+**Live output.** Pass `onStdout` / `onStderr` to stream each chunk as it arrives. The callback is
+best-effort, not lossless: a SLOW callback drops chunks rather than applying backpressure to the box
+(the full capped output is always in `result.stdout`).
+
+**Checkpoints.** `sbx.snapshot(dest)` writes a portable `.tar.gz` of the workspace (a FILESYSTEM
+checkpoint, not memory); `sbx.restore(src)` extracts it back, refusing absolute / `..` / symlink
+members. Interoperable with `tar` and the Python binding (both write plain USTAR, so a workspace path
+must be under 100 bytes). The Node path uses a hand-rolled tar reader,
+so while it is new it is **opt-in**: set `KERN_SANDBOX_SNAPSHOT=1` to enable it (it fails closed with a
+clear error otherwise). The Python binding uses the stdlib `tarfile` and has no such gate.
 
 ## Honest threat model
 

@@ -48,7 +48,7 @@ set +e
 "$kern" box outer --image alpine --privileged --net \
   -v "$kbin:/usr/local/bin/kern:ro" -- \
   sh -c 'command -v kern >/dev/null 2>&1 &&
-         KERN_ACCEPT_EULA=1 kern box inner --image alpine -- echo "hello from the INNER box"'
+         kern box inner --image alpine -- echo "hello from the INNER box"'
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then

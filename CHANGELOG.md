@@ -17,6 +17,38 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.8], 2026-07-20
+
+Coherence and agent-DX release: the 0.6.7 isolation features are now visible in `kern top`/`inspect`
+and reachable from the language bindings, with live streaming and a workspace checkpoint.
+
+### Added
+- **`kern inspect` and `kern top` now surface the 0.6.7 isolation policies.** `inspect` shows the
+  configured `mem-cap`/`pids-cap`, plus `landlock`, `egress` and `pod` when set (and the same fields in
+  `--json`); the Boxes tab in `kern top` flags an egress/landlock box with a cyan badge, and the Overview
+  shows a fleet-budget line when `KERN_FLEET_*` is in force. A box's requested caps and policies are
+  recorded in its registry entry so they can be read back.
+- **`--egress-allow` and `--landlock-rw` are now listed in the box help.**
+- **Language bindings (Python + Node) gained the runtime features:** `profiles=["vcpu:…","vgpio:…",
+  "vdisk:…"]` (attach a kern.toml resource profile, strictly validated), `egress_allow=[domains]` (a
+  domain allowlist for the untrusted run box, mutually exclusive with full network), `on_stdout`/
+  `on_stderr` live output callbacks (best-effort, the full capped output is still captured), and
+  `snapshot`/`restore` of the workspace (a portable `.tar.gz` filesystem checkpoint, not a memory
+  snapshot). `run_code` also accepts `language="node"`.
+
+### Changed
+- The Python binding no longer injects a `KERN_ACCEPT_EULA` variable (the public build has no EULA gate);
+  the vestigial passthrough was removed from the bindings, examples and tests.
+
+### Security
+- **Snapshot `restore` is hardened against a hostile archive:** absolute paths, `..` traversal, symlink/
+  device/hardlink members, a trailing-slash that could make a stat follow a planted symlink, a member
+  size past the archive, a non-octal or negative size, and a bad ustar checksum are all refused; writes
+  use `O_NOFOLLOW` with a symlink-rejecting parent descent. The Node hand-rolled tar reader is **opt-in**
+  behind `KERN_SANDBOX_SNAPSHOT=1` (fail-closed) while it matures; the Python path uses the stdlib
+  `tarfile`. The `egress_allow` and `profiles` values are strictly validated so a binding argument can
+  never smuggle a CLI flag.
+
 ## [0.6.7], 2026-07-19
 
 Agent and fleet sprint: run LLM/agent-generated code and dense per-request workloads with a real
