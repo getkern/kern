@@ -24,13 +24,13 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 > `bubblewrap`), and with a hard cgroup cap it **ties `crun`** (the fastest OCI runtime) and is
 > **~2× `runc`**: while being the only one of them that ships a complete daemonless container UX
 > (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~1.6 MB** binary. Against the real
-> engines it's **~80–160× faster to start** (`podman` ~155 ms, Docker ~308 ms) and carries no
+> engines it's **~80-160× faster to start** (`podman` ~155 ms, Docker ~308 ms) and carries no
 > resident daemon. It is *not* "the fastest in the world", the top tier is within a couple ms,
 > i.e. noise; the honest claim is **top-tier speed + a full runtime in a tiny daemonless binary**.
 
 ## Cold start, one isolated `/bin/true` (time per run = total ÷ 200 sequential runs)
 
-> Reproduce: `python3 examples/benchmark.py` (the per-runtime `median (min–max)` line).
+> Reproduce: `python3 examples/benchmark.py` (the per-runtime `median (min-max)` line).
 
 | Runtime | Cold start | What it does at that price |
 |---|---:|---|
@@ -50,10 +50,10 @@ fork/exec would otherwise dominate. Latency and the throughput numbers below are
 Two honest tiers. **No cgroup cap** (lightest): kern's bare box leads at **1.9 ms**, ahead of
 bubblewrap (2.6 ms), both skip the cgroup. **With a cgroup cap** (what a real container wants):
 kern at **5.5 ms ties `crun`** (5.2 ms, the fastest OCI runtime) and is **~2× faster than
-`runc`** (12.2 ms). The physical floor for `unshare`+`exec` is ~1–2 ms, so everyone in the top
+`runc`** (12.2 ms). The physical floor for `unshare`+`exec` is ~1-2 ms, so everyone in the top
 tier sits within a couple ms of each other and of each other's run-to-run noise, nobody "wins"
 single-shot latency outright. The real gap is to the **engines**: `podman` (~155 ms) and Docker
-(~308 ms) fork `conmon` / round-trip a daemon every run, so kern is **~80–160× faster** than the
+(~308 ms) fork `conmon` / round-trip a daemon every run, so kern is **~80-160× faster** than the
 tools people actually compare it to, while shipping the same UX (OCI pull, overlay,
 `ps`/`exec`/`logs`, compose) in ~1.6 MB with no resident daemon.
 
@@ -133,7 +133,7 @@ overlayfs pathology, see below).
 
 kern is **first on every board**: and the one place it took work is itself the most interesting.
 Profiled with `KERN_TIMING=1`, kern's *default* (overlay) startup on the Arduino breaks down as:
-overlay mount **~31 ms** (highly variable on this kernel, ~25–95 ms across runs), everything else
+overlay mount **~31 ms** (highly variable on this kernel, ~25-95 ms across runs), everything else
 (unshare, /dev, pivot, proc, seccomp) **~1.9 ms** combined. The overlay *mount syscall itself* is the whole gap: on this Android-derived 6.16 kernel
 an overlayfs mount takes ~31 ms (vs ~8 ms for a plain bind), yet only **104 µs on x86** and ~1 ms
 on the Pi/Jetson. It's a property of that kernel's overlayfs, not of kern; kern uses an overlay so
@@ -211,7 +211,7 @@ docker run --rm alpine /bin/true
 ## Honest caveats
 
 - One machine, warm cache, `/bin/true`, a microbenchmark of *startup overhead*, not a workload.
-- **kern ties `crun` and is ~2× `runc` as measured**: but the whole top tier hits the same ~1–2 ms
+- **kern ties `crun` and is ~2× `runc` as measured**: but the whole top tier hits the same ~1-2 ms
   `unshare`+`exec` floor, so single-shot "wins" are mostly run-to-run noise. The honest claim is
   "fastest tier, complete UX, tiny, daemonless", not "fastest of all".
 - The comparison isn't perfectly apples-to-apples: runc's per-run number **excludes** the

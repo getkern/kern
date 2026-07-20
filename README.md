@@ -549,7 +549,7 @@ process start + teardown. Adding a hard cgroup cap (the row above doesn't) bring
 **most of that is external `systemd-run` + D-Bus scope creation, not kern** (`systemd-run --user --scope
 -- true` alone is ~4 ms), opt-out with `KERN_NO_SCOPE` (back to ~1.9 ms, best-effort in-process cgroup). The
 top tier is all within a few ms: *nobody* wins single-shot latency outright. The real gap is to the
-**engines**: **~80–160× faster** than podman (~155 ms) / Docker (~308 ms), which round-trip a daemon every run, yet
+**engines**: **~80-160× faster** than podman (~155 ms) / Docker (~308 ms), which round-trip a daemon every run, yet
 kern alone ships a full daemonless container UX in ~1.6 MB. Beyond one start: **~500 boxes/s**, **~7 MB**
 RSS/box, **0 resident** (Docker keeps ~186 MB resident before you run anything).
 

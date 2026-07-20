@@ -923,7 +923,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
   with the systemd cgroup scope), the same a foreground box already pays. `compose` inherits this:
   a dependent box now starts only after its dependency is genuinely running.
 - **Overlay scratch on tmpfs**: the writable upper/work layer now lives under `$XDG_RUNTIME_DIR`
-  (tmpfs) instead of the disk cache, `box --image` cold-start dropped from ~25–32 ms to ~6 ms,
+  (tmpfs) instead of the disk cache, `box --image` cold-start dropped from ~25-32 ms to ~6 ms,
   and the writable layer is ephemeral and counts against the box's memory cap.
 - `MountOps` is now fallible (`Result`), so the recorder and the real syscall path share one
   ordered, error-checked op log. First real dependency: `libc` (the single kernel boundary).
