@@ -91,6 +91,7 @@ Sandbox(
     timeout_s=30,               # MANDATORY per-call wall-clock limit
     network=False,              # RELAXES ISOLATION, True shares the host network for every run
     mounts=None,                # {host_src: box_target} or {src: (target, "ro")}; sensitive sources refused
+    profiles=None,              # reusable kern.toml profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]
     max_output_bytes=64 << 20,  # cap on captured stdout/stderr EACH; overflow discarded, result.truncated set
     deps_readonly=False,        # True → run_code can't modify setup= deps (blocks cross-run poisoning)
     enforce_limits=True,        # hard-enforce caps via a systemd scope; False = best-effort, faster under load
@@ -99,6 +100,17 @@ Sandbox(
 
 Host mounts over sensitive sources (`/`, `/etc`, `$HOME`, the docker socket, …) are **refused even if
 you ask**. Captured output is **bounded** (`max_output_bytes` each), a flooding box can't OOM the host.
+
+**Resource profiles (`profiles=`)** attach reusable slices you defined once in
+`~/.config/kern/kern.toml`: `vcpu:NAME` (a CPU + memory slice), `vdisk:NAME` (a size-capped scratch
+disk), and `vgpio:NAME` (a specific GPIO/I2C/SPI device set, the **only** way to grant the box
+hardware, for edge/robotics agents). Each token is strictly validated (`prefix:alphanumeric-name`), so
+a profile entry can never smuggle another flag:
+
+```python
+with kern.Sandbox(profiles=["vcpu:heavy", "vgpio:sensors"]) as sbx:
+    sbx.run_code("import board  # only /dev/i2c-1 from the vgpio:sensors profile is visible")
+```
 
 **Network policy:** the network is on **only** during `setup=` (a separate box that dies when setup
 ends); every `run_code` runs network-off. There is no per-call network override, `network=True` is a
@@ -135,10 +147,35 @@ class ExecutionResult:
 ## API
 
 - `kern.run_code(code, **kwargs)`, one-shot: a throwaway `Sandbox` under the hood. Returns an `ExecutionResult`.
-- `Sandbox(...).run_code(code, language="python"|"bash")`, run code on the session workspace (fresh box).
+- `Sandbox(...).run_code(code, language="python"|"bash"|"node")`, run code on the session workspace (fresh box).
 - `Sandbox(...).run(argv_list)`, run an arbitrary command (an **argv list**, never a shell string).
 - `Sandbox(...).write_file(path, data)` / `.read_file(path)` / `.list_files(subdir="")`, workspace I/O,
   confined to `/workspace` (symlink- and `..`-safe).
+- `Sandbox(...).snapshot(dest)` / `.restore(src)`, a portable `.tar.gz` FILESYSTEM checkpoint of the
+  workspace (not a memory snapshot). `restore` refuses absolute, `..` and symlink members.
+
+## Returning charts, live output, and checkpoints
+
+**Charts / artifacts (the "code interpreter" pattern).** kern has no Jupyter kernel, so instead of
+auto-capturing `plt.show()`, have the code WRITE the artifact to the workspace, then read it back:
+
+```python
+with kern.Sandbox(setup="pip install matplotlib") as sbx:
+    sbx.run_code("import matplotlib; matplotlib.use('Agg')\n"
+                 "import matplotlib.pyplot as plt; plt.plot([1,4,9]); plt.savefig('chart.png')")
+    png = sbx.read_file("chart.png")   # bytes, ready to send back to the model / user
+```
+
+**Live output.** Pass `on_stdout` / `on_stderr` callbacks to stream each chunk as it arrives (the full
+capped output is still in `result.stdout`). The callback is best-effort, not lossless: a slow callback
+drops chunks rather than applying backpressure to the box.
+
+```python
+kern.run_code("for i in range(3): print(i)", on_stdout=lambda b: print(b.decode(), end=""))
+```
+
+**Checkpoints.** `snapshot`/`restore` (or reusing a `workspace=` path) resume the file state of a
+session later or on another host, cheaply and without a running VM.
 
 ## Threat model (honest)
 

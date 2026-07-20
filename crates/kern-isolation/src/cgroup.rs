@@ -288,6 +288,55 @@ pub fn set_fleet_caps(memory_max: Option<u64>, pids_max: Option<u64>) {
     }
 }
 
+/// A snapshot of the shared `kern.slice` fleet budget and its live usage, for display (`kern top`).
+pub struct FleetStatus {
+    /// `memory.max` on the slice: `Some(bytes)` when a fleet memory cap is set, `None` when uncapped.
+    pub memory_max: Option<u64>,
+    /// `memory.current`: live total bytes across every box in the slice.
+    pub memory_current: u64,
+    /// `pids.max`: `Some(n)` when a fleet pids cap is set, `None` when uncapped.
+    pub pids_max: Option<u64>,
+    /// `pids.current`: live total task count across the slice.
+    pub pids_current: u64,
+}
+
+impl FleetStatus {
+    /// True when a fleet budget is actually in force (a memory or pids cap is set on the slice); a bare
+    /// slice with no cap isn't worth surfacing.
+    pub fn is_capped(&self) -> bool {
+        self.memory_max.is_some() || self.pids_max.is_some()
+    }
+}
+
+/// Read the live `kern.slice` fleet budget + usage (the SUM cap across all boxes). `None` when the slice
+/// isn't present (no box created it, or no systemd-user delegation), so a caller shows nothing.
+pub fn fleet_status() -> Option<FleetStatus> {
+    let slice = kern_slice_path()?;
+    if !slice.is_dir() {
+        return None;
+    }
+    // A `*.max` of the literal `max`, a missing file, or an unparseable value all read as "uncapped".
+    let read_max = |f: &str| -> Option<u64> {
+        let s = fs::read_to_string(slice.join(f)).ok()?;
+        match s.trim() {
+            "max" => None,
+            n => n.parse().ok(),
+        }
+    };
+    let read_cur = |f: &str| -> u64 {
+        fs::read_to_string(slice.join(f))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    Some(FleetStatus {
+        memory_max: read_max("memory.max"),
+        memory_current: read_cur("memory.current"),
+        pids_max: read_max("pids.max"),
+        pids_current: read_cur("pids.current"),
+    })
+}
+
 /// Render a cgroup v2 `*.max` value: a plain number, or the literal `max` for [`u64::MAX`] (uncapped),
 /// which cgroup v2 uses to clear a limit. Pure, so the wire format is unit-tested without a cgroupfs.
 fn render_cgroup_max(n: u64) -> String {

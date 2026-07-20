@@ -50,6 +50,7 @@ pub use cgroup::user_systemd_present;
 /// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,
 /// `env_claims_enforcer_but_none_real`) stay crate-internal - only `real.rs` reads them.
 pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
+pub use cgroup::{fleet_status, FleetStatus};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::{preflight as preflight_ports, PortMap};
 pub use real::{

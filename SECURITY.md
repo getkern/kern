@@ -52,7 +52,7 @@ host **kernel**: a kernel privilege-escalation bug is an escape.
 kern's bet is startup latency, footprint and daemonless simplicity, not being a hypervisor. Pick
 the boundary your threat model needs; kern is honest about which one it is.
 
-## Current status (0.6.5, honest)
+## Current status (0.6.8, honest)
 
 What is **enforced now** by `kern box`:
 - user + PID + network (loopback-only) + UTS + IPC + mount namespaces;
@@ -88,7 +88,19 @@ What is **enforced now** by `kern box`:
   mount also carry `MS_NODEV`, so this holds without relying on the implicit userns behaviour. The
   boundary is the namespace + the allowlist, so no eBPF device-cgroup filter is needed (and none would
   load unprivileged); GPIO device nodes (via a `vgpio:` profile) are added to this allowlist
-  explicitly today, and GPU nodes will be at 0.9, never by opening `/dev` up.
+  explicitly today, and GPU nodes will be at 0.9, never by opening `/dev` up;
+- **Landlock write-allowlist** (`--landlock-rw <path>`, opt-in): a kernel LSM confines the box's writes
+  to the named paths while the root stays read+exec, a second boundary the workload cannot lift
+  (symlinks are fail-safe, opened `O_NOFOLLOW`). Kernel-dependent (needs Landlock, Linux 5.13+); where
+  it is absent the box still runs with the namespace + seccomp + cgroup boundary. **This is a REAL
+  boundary**: verified that a box with `--landlock-rw /tmp` writes `/tmp` but is denied `/etc` and `/root`;
+- **egress allowlist** (`--egress-allow d1,d2`, opt-in, foreground): the box runs in an isolated network
+  namespace and reaches the internet only through a kern-run filtering proxy that permits the listed
+  domains. **SSRF-guarded**: a domain that resolves to any non-public address (loopback, RFC1918, CGNAT,
+  link-local, reserved) is refused at connect time, even if the caller allow-listed it. Honest residual:
+  a domain sharing a CDN IP + SNI with an allowed one can be reached, so this is an application-layer
+  allowlist for a semi-trusted workload, **not a hard exfiltration boundary**. Full threat model in
+  [docs/EGRESS.md](docs/EGRESS.md).
 
 **Read-only and cgroup-mask integrity.** A `--read-only` box's root, and the masks over the host
 cgroup tree, are protected by two independent layers. The always-on seccomp filter blocks the

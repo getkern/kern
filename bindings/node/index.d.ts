@@ -57,8 +57,22 @@ export interface SandboxOptions {
   timeoutS?: number;
   /** RELAXES ISOLATION. true shares the host network for every runCode. Default false. */
   network?: boolean;
+  /**
+   * Restrict runCode/run to a DOMAIN ALLOWLIST instead of all-or-nothing, e.g. ["pypi.org",
+   * "files.pythonhosted.org"]. The box runs in an isolated network namespace and reaches the internet
+   * only through kern's filtering proxy, which permits just these domains. Mutually exclusive with
+   * network:true; the setup box keeps full network to install deps, the allowlist governs the run phase.
+   */
+  egressAllow?: string[];
   /** Extra host->box binds: { hostSrc: boxTarget } or { src: [target, "ro"] }. Sensitive sources refused. */
   mounts?: Record<string, MountSpec>;
+  /**
+   * kern resource profiles to attach, e.g. ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]. Each names a
+   * [[vcpu]]/[[vgpio]]/[[vdisk]] block in your ~/.config/kern/kern.toml: a CPU+memory slice, a specific
+   * GPIO/I2C/SPI device set (the only way to grant the box hardware), or a size-capped scratch disk.
+   * Tokens are strictly validated (prefix + alphanumeric name) so an entry can never smuggle a flag.
+   */
+  profiles?: string[];
   /** Extra environment variables for the workload (passed via a private 0600 file, not argv). */
   env?: Record<string, string>;
   /** Cap on captured stdout/stderr EACH, in bytes. Default 64 MiB. */
@@ -67,6 +81,11 @@ export interface SandboxOptions {
   enforceLimits?: boolean;
   /** Mount setup= deps read-only for runCode (blocks cross-run dependency poisoning). Default false. */
   depsReadonly?: boolean;
+  /** Called with each stdout Buffer chunk as it arrives (live streaming). The full capped output is
+   * still captured in the result, so you can stream AND read result.stdout. */
+  onStdout?: (chunk: Buffer) => void;
+  /** Called with each stderr Buffer chunk as it arrives. */
+  onStderr?: (chunk: Buffer) => void;
 }
 
 export type Language = "python" | "bash" | "node";
@@ -87,6 +106,10 @@ export class Sandbox {
   writeFile(path: string, data: Buffer | string): Promise<void>;
   /** Read a workspace-relative path (host-direct, O_NOFOLLOW). */
   readFile(path: string): Promise<Buffer>;
+  /** Write a gzip tar of the whole workspace to `dest`, a portable filesystem checkpoint (NOT memory). */
+  snapshot(dest: string): void;
+  /** Extract a snapshot (from snapshot()) into the workspace, safely (rejects symlink/.. /absolute members). */
+  restore(src: string): void;
   /** List regular files under the workspace (excludes .deps). */
   listFiles(subdir?: string): Promise<FileInfo[]>;
 }

@@ -4,17 +4,18 @@
 
 **A fast, lightweight sandbox & virtual resource manager.**
 
-kern is a daemonless **virtual resource manager**: it partitions CPU, memory, disk, devices (and
-isolation itself) into lightweight, per-process allocations, provisioned in single-digit
-milliseconds from one **~1.6 MB** rootless binary. Isolation is the first resource: run untrusted
-or agent-generated code in a real, kernel-enforced box that starts in **~1.9 ms**. The same model
-caps a bare process's CPU (`vcpu:`), memory or disk (`vdisk:`), or grants it exactly one device
-(`vgpio:`), with or without a full box. **Runs everywhere Linux does: bare Linux, Windows (via
-WSL2), and ARM boards** (Raspberry Pi, NVIDIA Jetson, Arduino UNO Q), where a 186 MB Docker daemon
-is a poor fit (on the Pi 5 tested here, no engine was installed at all). Embed it from Python, Node or
-Rust, or drive it from the CLI.
+Run untrusted or agent-generated code in a real, kernel-enforced box that starts in **~2 ms**, from one
+**~1.6 MB** rootless binary with no daemon. Embed it from Python, Node or Rust, or run it from the CLI.
 
-**~1.9 ms** cold start (vs **~308 ms** `docker run`) · **~1.6 MB** static binary · **0 RAM at rest** · **rootless**
+Isolation is just the first resource kern manages this way: the same model also slices CPU (`vcpu:`),
+memory, disk (`vdisk:`) and devices (`vgpio:`) per process, with or without a full box. The container is
+one case of a smaller idea.
+
+**Runs everywhere Linux does: bare Linux, Windows (via WSL2), and ARM boards** (Raspberry Pi, NVIDIA
+Jetson, Arduino UNO Q), where a 186 MB Docker daemon is a poor fit (on the Pi 5 tested here, no engine
+was installed at all).
+
+**~2 ms** cold start (vs **~308 ms** `docker run`) · **~1.6 MB** static binary · **0 RAM at rest** · **rootless**
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -60,7 +61,7 @@ print(r.stdout, r.success)                     # → a fresh, discarded-after bo
 
 - ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.6 MB static binary, **one Rust dependency**
   (`libc`); it shells out to the system's `curl`/`tar` only to *pull* images (running a box needs
-  neither). Cold start **~1.9 ms** vs ~308 ms for `docker run`; **~7 MB** RSS per box vs an always-on
+  neither). Cold start **~2 ms** vs ~308 ms for `docker run`; **~7 MB** RSS per box vs an always-on
   ~186 MB daemon (`dockerd` + `containerd`). `kern ps` reads state straight from the kernel.
 - 👤 **Rootless by default.** Unprivileged user namespaces: your uid maps to root *inside* the box,
   and only there. Single-uid is the default and is `libc`-pure (no helper, smallest id surface);
@@ -390,14 +391,18 @@ let out = Sandbox::builder()
 assert!(out.success());              // + out.stdout / .stderr / .exit_code / .wall_ms
 ```
 
-**Python**, the `kern_sandbox` package (`pip install kern-sandbox`), built for *"run this untrusted / agent-generated code safely"*:
+**Python**, the `kern_sandbox` package (`pip install kern-sandbox`), for running semi-trusted or agent-generated code with fast local isolation:
 
 ```python
-import kern_sandbox as kern
+import kern_sandbox as kern     # kernel-boundary isolation, not a microVM
 
 # one-shot: throwaway box, network OFF, hard caps, a mandatory timeout the binding enforces
 r = kern.run_code("print(sum(range(100)))")
 print(r.stdout, r.success)
+
+# restrict the network to an allowlist: an agent can pip-install but cannot exfiltrate elsewhere
+r = kern.run_code("import urllib.request as u; ...",
+                  egress_allow=["pypi.org", "files.pythonhosted.org"])
 
 # a session: files persist across calls; deps installed once in the ONLY network-on step
 with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
@@ -574,17 +579,19 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 
 ## Project status
 
-**0.6.7, a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (**454 tests**, clippy-clean,
+**0.6.8, a daemonless container + resource runtime that does less than Docker, on purpose.**
+Everything in [Features](#features) works today and is tested (**477 tests**, clippy-clean,
 `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It deliberately skips a
 lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast, honest core. The
 CLI and config surface are **not frozen until 1.0**.
 
-**Recent work:** local image **build** + **`tag`**/**`push`** to any registry, **zstd** layers,
-**`--init`**, **`--platform`** select, pods, the **Python** binding, and a Dockerfile/compose parser
-verified against a real `docker build` differential, with the newest `build`/`push` surface audited
-(COPY-from confinement, setuid/opaque hardening, fail-closed on a rootless-overlay kernel). The
-per-release detail is in **[CHANGELOG.md](CHANGELOG.md)**.
+**Recent work (0.6.7 / 0.6.8):** `kern commit` warm-start snapshots, an `--egress-allow` domain
+allowlist and an `--landlock-rw` write-allowlist, fleet budgets, and the **Python + Node** bindings
+gaining resource profiles, egress control, live output streaming and workspace snapshot/restore. Before
+that: local image **build** + **`tag`**/**`push`**, **zstd** layers, **`--init`**, **`--platform`**,
+pods, and a Dockerfile/compose parser verified against a real `docker build` differential, with the
+`build`/`push` surface audited (COPY-from confinement, setuid/opaque hardening, fail-closed on a
+rootless-overlay kernel). Per-release detail in **[CHANGELOG.md](CHANGELOG.md)**.
 
 **Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
 overlay networking.
@@ -594,8 +601,9 @@ overlay networking.
 kern starts as a small, fast sandbox/OCI runtime and grows deliberately; the set of resources it
 governs is driven by what proves useful.
 
-- **Shipped:** build + tag + push, zstd layers, `--init`, `--platform`, pods, the Python binding;
-  ongoing polish + broader (ARM) CI and edge/I/O ergonomics.
+- **Shipped:** build + tag + push, zstd layers, `--init`, `--platform`, pods, `kern commit`,
+  `--egress-allow`, `--landlock-rw`, fleet budgets, and the Python + Node bindings; ongoing polish +
+  broader (ARM) CI and edge/I/O ergonomics.
 - **Windows, via WSL2 (shipped, one line: see [Install](#install)).** kern runs on Windows inside WSL2
   (a real Linux kernel) so hard caps (`--memory`/`--cpus`) are real there, verified. A `kern.exe` shim
   and a pre-baked kern WSL2 distro (Alpine + kern, no Ubuntu, no manual steps) install with a single
@@ -625,7 +633,7 @@ kern isolates with Linux **namespaces + seccomp + a read-only userns root**, a k
 deny-by-default on devices, with the host's sysfs/procfs masked, and an opt-in **Landlock** (LSM) layer
 on top (plus an experimental egress allowlist). That's strong for first-party and noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
 hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't: a deliberate trade for
-~1.9 ms starts and a ~1.6 MB footprint.
+~2 ms starts and a ~1.6 MB footprint.
 
 The full threat model, per-feature notes, and the honest *"kern vs a microVM, when to use what"*
 guidance live in [SECURITY.md](SECURITY.md). Found a vulnerability? Report it **privately** via GitHub

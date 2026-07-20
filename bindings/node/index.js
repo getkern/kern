@@ -33,9 +33,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -165,6 +166,39 @@ function validateMount(source, target) {
   return [real, target];
 }
 
+// A resource-profile token (`vcpu:`/`vgpio:`/`vdisk:` + a named profile from the user's kern.toml).
+// ANCHORED and charset-restricted: the token is passed as a POSITIONAL arg to `kern box`, so it must be
+// EXACTLY a known prefix plus a safe name. This is what stops a caller (or agent-chosen value) from
+// smuggling another flag through the profile list ("--net", "-v /etc:/etc", "vgpu:x", a name with a
+// space / `=` / `/` / leading dash). The three prefixes mirror `config::classify` in kern.
+const PROFILE_RE = /^(?:vcpu|vgpio|vdisk):[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** Validate one `vcpu:`/`vgpio:`/`vdisk:NAME` resource-profile token before it reaches the argv. */
+function validateProfile(token) {
+  if (typeof token !== "string" || !PROFILE_RE.test(token))
+    throw new SandboxError(
+      `invalid resource profile ${JSON.stringify(token)}: expected 'vcpu:NAME', 'vgpio:NAME' or ` +
+        "'vdisk:NAME' with an alphanumeric profile name (the profile must be defined in your kern.toml)",
+    );
+  return token;
+}
+
+// A public DNS domain for the egress allowlist. LDH labels, at least one dot (an FQDN), alphabetic TLD.
+// Restrictive on purpose: the value is comma-joined and handed to `kern box --egress-allow`, so it must
+// not carry a comma, scheme, path, port, wildcard or whitespace that could change the argument. kern
+// re-validates and SSRF-checks the resolved IPs; this is the binding's first gate.
+const DOMAIN_RE = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
+
+/** Validate one egress-allowlist domain (an FQDN like "pypi.org") before it reaches the argv. */
+function validateDomain(domain) {
+  if (typeof domain !== "string" || !DOMAIN_RE.test(domain))
+    throw new SandboxError(
+      `invalid egress domain ${JSON.stringify(domain)}: expected a bare hostname like 'pypi.org' ` +
+        "(no scheme, port, path, wildcard or spaces)",
+    );
+  return domain;
+}
+
 /** Map a Node close event {code, signal} to a unix-style rc (128 + signum for a signal). */
 function toRc(code, signal) {
   if (typeof code === "number") return code;
@@ -190,11 +224,20 @@ function uniqueName() {
 
 /** Drain a readable stream into a bounded buffer: keep at most `cap` bytes but KEEP reading past it
  * (discarding overflow) so a flooding box never blocks on a full pipe. RAM is bounded to `cap`. */
-function cappedCollector(stream, cap) {
+function cappedCollector(stream, cap, onData) {
   const chunks = [];
   let len = 0;
   const state = { truncated: false };
   stream.on("data", (chunk) => {
+    if (onData) {
+      // stream every chunk live; a callback throw must never break the drain (the box would then
+      // block on a full pipe), so swallow it, the buffered result still returns.
+      try {
+        onData(chunk);
+      } catch {
+        /* user callback error ignored on purpose */
+      }
+    }
     if (len < cap) {
       const room = cap - len;
       if (chunk.length <= room) {
@@ -215,6 +258,98 @@ function cappedCollector(stream, cap) {
   return state;
 }
 
+// --- Minimal ustar (POSIX tar) over gzip, for workspace snapshots -------------------------------
+// Dependency-free (Node's zlib does the gzip) and interoperable with `tar tzf` and the Python binding:
+// a snapshot is a real .tar.gz. Only regular files are written; on restore only files/dirs are accepted
+// (symlinks, devices, hardlinks and any absolute or `..`-escaping name are refused), and the final
+// component is opened O_NOFOLLOW, so a hostile archive can never write outside the workspace.
+
+function tarWriteFile(out, name, content) {
+  if (Buffer.byteLength(name) > 100)
+    throw new SandboxError(`snapshot: path too long for the tar format (>100 bytes): ${name}`);
+  const h = Buffer.alloc(512);
+  h.write(name, 0, 100, "utf8");
+  h.write("0000644\0", 100, 8); // mode
+  h.write("0000000\0", 108, 8); // uid
+  h.write("0000000\0", 116, 8); // gid
+  h.write(content.length.toString(8).padStart(11, "0") + "\0", 124, 12); // size (octal)
+  h.write("00000000000\0", 136, 12); // mtime 0 (deterministic)
+  h.write("        ", 148, 8); // checksum field = 8 spaces while summing
+  h.write("0", 156, 1); // typeflag '0' = regular file
+  h.write("ustar\0", 257, 6); // magic
+  h.write("00", 263, 2); // version
+  let sum = 0;
+  for (const b of h) sum += b;
+  h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148, 8); // checksum: 6 octal digits, NUL, space
+  out.push(h, content);
+  const pad = (512 - (content.length % 512)) % 512;
+  if (pad) out.push(Buffer.alloc(pad));
+}
+
+function tarCollect(dir, base, skip, out) {
+  for (const entry of fs.readdirSync(dir).sort()) {
+    const abs = path.join(dir, entry);
+    const st = fs.lstatSync(abs);
+    if (st.isSymbolicLink()) continue; // never archive a symlink
+    if (st.isDirectory()) tarCollect(abs, base, skip, out);
+    else if (st.isFile()) {
+      const rel = path.relative(base, abs);
+      if (rel === skip) continue; // our private --env-file, not user state
+      tarWriteFile(out, rel.split(path.sep).join("/"), fs.readFileSync(abs));
+    }
+  }
+}
+
+function tarPack(base, skip) {
+  const out = [];
+  tarCollect(base, base, skip, out);
+  out.push(Buffer.alloc(1024)); // two zero blocks = end of archive
+  // level 1: a local checkpoint is often large or already-compressed; level 1 is several times faster
+  // than the default with a negligible size penalty. Speed over ratio here.
+  return zlib.gzipSync(Buffer.concat(out), { level: 1 });
+}
+
+function tarParse(gz) {
+  // Cap the inflated size so a tiny gzip bomb can't force a huge allocation before we even vet members.
+  const buf = zlib.gunzipSync(gz, { maxOutputLength: 1024 * 1024 * 1024 });
+  const members = [];
+  let off = 0;
+  while (off + 512 <= buf.length) {
+    const h = buf.subarray(off, off + 512);
+    if (h.every((b) => b === 0)) break; // end-of-archive zero block
+    // Verify the ustar header checksum (sum of all header bytes with the 8-byte checksum field taken as
+    // spaces): a single corrupt header field is rejected wholesale, before the per-field vetting runs.
+    const stored = parseInt(h.toString("utf8", 148, 156).replace(/\0.*$/s, "").trim(), 8);
+    let ck = 0;
+    for (let i = 0; i < 512; i++) ck += i >= 148 && i < 156 ? 0x20 : h[i];
+    if (stored !== ck) throw new SandboxError("malformed snapshot: bad header checksum");
+    // Strip a trailing slash (the ustar dir convention "d/"): otherwise path.join keeps it, and a
+    // trailing slash makes lstat FOLLOW a planted symlink ("d/" resolves the link to its target dir)
+    // instead of seeing the link, which would defeat the symlink-vet on a dir member.
+    const name = h.toString("utf8", 0, 100).replace(/\0.*$/s, "").replace(/\/+$/, "");
+    // Size is octal ASCII by spec; reject anything else rather than let parseInt guess ("12x" -> 10).
+    // This also makes a negative size impossible (no `-` in the field), closing the spin-forever case.
+    const sizeField = h.toString("utf8", 124, 136).replace(/\0.*$/s, "").trim();
+    if (!/^[0-7]*$/.test(sizeField)) throw new SandboxError("malformed snapshot: non-octal member size");
+    const size = parseInt(sizeField, 8) || 0;
+    const flag = String.fromCharCode(h[156]);
+    off += 512;
+    const type = flag === "0" || flag === "\0" ? "file" : flag === "5" ? "dir" : "other";
+    // A dir/other member carries no content in ustar; a non-zero size there is malformed, so reject it
+    // rather than silently ignore it (reject-not-guess).
+    if (type !== "file" && size !== 0)
+      throw new SandboxError("malformed snapshot: non-file member with a non-zero size");
+    // Refuse a member claiming more bytes than remain: reject the malformed archive instead of silently
+    // truncating the restored file (subarray would clamp to the buffer end).
+    if (type === "file" && off + size > buf.length)
+      throw new SandboxError("malformed snapshot: member size exceeds archive");
+    const content = type === "file" ? buf.subarray(off, off + size) : Buffer.alloc(0);
+    members.push({ name, type, content });
+    off += Math.ceil(size / 512) * 512;
+  }
+  return members;
+}
+
 class Sandbox {
   /**
    * @param {object} [opts]
@@ -227,7 +362,9 @@ class Sandbox {
    * @param {number|null} [opts.pids]        task/fork-bomb ceiling. Default 256.
    * @param {number} [opts.timeoutS]         MANDATORY per-call wall-clock limit (binding-owned). Default 30.
    * @param {boolean} [opts.network]         RELAXES ISOLATION. true shares the host network. Default false.
+   * @param {string[]} [opts.egressAllow]    restrict runCode/run to a DOMAIN ALLOWLIST, e.g. ["pypi.org"]; isolated netns + kern's filtering proxy. Mutually exclusive with network:true.
    * @param {Object<string, string|[string,string]>} [opts.mounts] extra host->box binds. Sensitive refused.
+   * @param {string[]} [opts.profiles] kern resource profiles to attach, e.g. ["vcpu:heavy","vgpio:leds","vdisk:scratch"]; each names a block in your kern.toml. Strictly validated.
    * @param {Object<string,string>} [opts.env] extra environment for the workload.
    * @param {number} [opts.maxOutputBytes]   cap on captured stdout/stderr EACH. Default 64 MiB.
    * @param {boolean} [opts.enforceLimits]   true (default) hard-enforces caps via a systemd scope.
@@ -242,9 +379,15 @@ class Sandbox {
     this.pids = opts.pids === undefined ? 256 : opts.pids;
     this.timeoutS = opts.timeoutS ?? 30;
     this.network = opts.network ?? false;
+    this.egressAllow = opts.egressAllow ?? null;
     this.mounts = opts.mounts ?? null;
+    this.profiles = opts.profiles ?? null;
     this.env = opts.env ?? null;
     this.maxOutputBytes = opts.maxOutputBytes ?? 64 * 1024 * 1024;
+    // live output callbacks: called with each Buffer chunk as it arrives. The full capped output is
+    // still captured in the result, so you can stream AND read result.stdout.
+    this.onStdout = opts.onStdout ?? null;
+    this.onStderr = opts.onStderr ?? null;
     this.enforceLimits = opts.enforceLimits ?? true;
     this.depsReadonly = opts.depsReadonly ?? false;
 
@@ -269,6 +412,13 @@ class Sandbox {
         this._mountArgs.push("-v", ro ? `${real}:${tgt}:ro` : `${real}:${tgt}`);
       }
     }
+    this._profileArgs = (this.profiles || []).map(validateProfile);
+    this._egressAllow = (this.egressAllow || []).map(validateDomain);
+    if (this._egressAllow.length && this.network)
+      throw new SandboxError(
+        "egressAllow and network:true are mutually exclusive: egressAllow gives a restricted domain " +
+          "allowlist for runCode, network:true gives the full host network",
+      );
     this._kern = findKern();
     this._ws = "";
     this._ownWs = false;
@@ -332,7 +482,14 @@ class Sandbox {
     if (this.memoryMb !== null) argv.push("--memory", `${this.memoryMb}m`);
     if (this.cpus !== null) argv.push("--cpus", String(this.cpus));
     if (this.pids !== null) argv.push("--pids-limit", String(this.pids));
-    if (network) argv.push("--net");
+    // Network mode: egressAllow (a domain allowlist via an isolated netns + kern's filtering proxy)
+    // governs the untrusted runCode/run boxes; the setup box keeps the full network it needs to install
+    // deps. egressAllow and network are mutually exclusive (checked at construction).
+    if (this._egressAllow.length && !isSetup) argv.push("--egress-allow", this._egressAllow.join(","));
+    else if (network) argv.push("--net");
+    // Resource profiles (vcpu:/vgpio:/vdisk:NAME): positional tokens `kern box` resolves against the
+    // user's kern.toml. Validated at construction, so nothing here can be a smuggled flag.
+    argv.push(...this._profileArgs);
     argv.push(...this._mountArgs);
 
     const mergedEnv = { ...(this.env || {}) };
@@ -379,7 +536,7 @@ class Sandbox {
     const before = this._snapshot();
     const name = uniqueName();
     const argv = [...this._baseArgv(name, { network, timeoutS, isSetup }), "--", ...command];
-    const childEnv = { ...process.env, KERN_ACCEPT_EULA: "1" };
+    const childEnv = { ...process.env };
     if (!this.enforceLimits) childEnv.KERN_NO_SCOPE = "1";
 
     const started = process.hrtime.bigint();
@@ -396,8 +553,8 @@ class Sandbox {
         return reject(new SandboxError(`could not spawn the box: ${e.message}`));
       }
 
-      const out = cappedCollector(child.stdout, this.maxOutputBytes);
-      const err = cappedCollector(child.stderr, this.maxOutputBytes);
+      const out = cappedCollector(child.stdout, this.maxOutputBytes, this.onStdout);
+      const err = cappedCollector(child.stderr, this.maxOutputBytes, this.onStderr);
       let timedOut = false;
       let settled = false;
 
@@ -579,6 +736,90 @@ class Sandbox {
     const root = subdir ? this._wsPath(subdir) : this._ws;
     const walked = this._walk(root);
     return Object.entries(walked).map(([p, [, size]]) => ({ path: p, size, change: "created" }));
+  }
+
+  // -- workspace snapshot (a cheap FILESYSTEM checkpoint; NOT a memory snapshot) --------------------
+
+  /** Write a gzip tar of the whole workspace to `dest` on the host, a portable filesystem checkpoint.
+   * Pair with restore() (or seed a new Sandbox({ workspace })) to resume the FILE state later or
+   * elsewhere. NOT a memory snapshot: processes are ephemeral, only on-disk state is captured. */
+  // The Node snapshot/restore path uses a HAND-ROLLED ustar parser. While it is new, it is opt-in: set
+  // KERN_SANDBOX_SNAPSHOT=1 to enable it. Fails CLOSED (refuses, never silently degrades). The Python
+  // binding uses the stdlib `tarfile` and has no such gate. Remove this once the parser is battle-tested.
+  _requireSnapshotOptIn() {
+    if (process.env.KERN_SANDBOX_SNAPSHOT !== "1")
+      throw new SandboxError(
+        "snapshot/restore is opt-in in the Node binding while its archive parser is new: " +
+          "set KERN_SANDBOX_SNAPSHOT=1 to enable it (the Python binding uses stdlib tarfile and is always on)",
+      );
+  }
+
+  snapshot(dest) {
+    this._requireEntered();
+    this._requireSnapshotOptIn();
+    fs.writeFileSync(dest, tarPack(fs.realpathSync(this._ws), ENV_FILE));
+  }
+
+  /** Extract a snapshot (from snapshot()) into the workspace, SAFELY. Every member is vetted first:
+   * absolute paths, `..` escapes and non-file/dir members (symlinks, devices, hardlinks) are refused,
+   * and each path must resolve under the workspace; the final component is opened O_NOFOLLOW. Colliding
+   * files are overwritten. */
+  restore(src) {
+    this._requireEntered();
+    this._requireSnapshotOptIn();
+    const base = fs.realpathSync(this._ws);
+    const members = tarParse(fs.readFileSync(src));
+    for (const m of members) {
+      if (m.name === "") continue;
+      if (m.name.startsWith("/") || m.name.split("/").includes(".."))
+        throw new SandboxError(`unsafe path in snapshot: ${JSON.stringify(m.name)}`);
+      if (m.type === "other")
+        throw new SandboxError(`unsafe member type in snapshot (only files/dirs): ${JSON.stringify(m.name)}`);
+      const resolved = path.resolve(base, m.name);
+      if (resolved !== base && !resolved.startsWith(base + path.sep))
+        throw new SandboxError(`snapshot member escapes the workspace: ${JSON.stringify(m.name)}`);
+    }
+    for (const m of members) {
+      if (m.name === "") continue;
+      const dest = path.join(base, m.name);
+      // _ensureParentDirs descends one level at a time and REFUSES a symlinked component, so a symlink
+      // the box planted in the workspace (e.g. `evil -> ~/.ssh`) can't steer a member outside it. A
+      // plain mkdir -p would follow that symlink (the lexical pre-vet above does not resolve it).
+      this._ensureParentDirs(dest);
+      if (m.type === "dir") {
+        let st = null;
+        try {
+          st = fs.lstatSync(dest);
+        } catch {
+          st = null;
+        }
+        if (st === null) {
+          // mkdirSync is not O_NOFOLLOW: a box could swap `dest` for a symlink between _ensureParentDirs
+          // and here (mkdir-through-symlink -> an empty dir created OUTSIDE the workspace). Node has no
+          // mkdirat, so close the race by re-lstat'ing after: a symlink swapped in is caught. No member
+          // content is ever written through it (file writes use O_NOFOLLOW leaves).
+          try {
+            fs.mkdirSync(dest);
+          } catch (e) {
+            if (e.code !== "EEXIST") throw e;
+          }
+          const post = fs.lstatSync(dest);
+          if (post.isSymbolicLink() || !post.isDirectory())
+            throw new SandboxError(`snapshot dir member is not a real directory: ${JSON.stringify(m.name)}`);
+        } else if (st.isSymbolicLink() || !st.isDirectory()) {
+          throw new SandboxError(`snapshot dir member collides with a non-directory: ${JSON.stringify(m.name)}`);
+        }
+        continue;
+      }
+      // O_NOFOLLOW: a symlink already planted at this leaf can't redirect the write outside the workspace.
+      const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+      const fd = fs.openSync(dest, flags, 0o644);
+      try {
+        fs.writeSync(fd, m.content);
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
   }
 
   // -- setup (the only network window) -------------------------------------------------------------

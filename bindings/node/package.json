@@ -1,6 +1,6 @@
 {
   "name": "kern-sandbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run LLM/agent-generated code in a fast, local, daemonless kernel sandbox. A thin, dependency-free wrapper around the kern binary.",
   "keywords": [
     "sandbox",

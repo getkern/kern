@@ -46,6 +46,87 @@ def test_defaults_are_fail_closed():
     assert "--net" not in argv and "--timeout" in argv and "--ro" in argv
 
 
+def test_profiles_validated_and_placed_in_argv():
+    # valid vcpu:/vgpio:/vdisk: profiles appear as positional tokens before the `--`
+    s = _cfg(profiles=["vcpu:heavy", "vgpio:leds", "vdisk:scratch"])
+    argv = s._base_argv("n", network=False, timeout_s=s.timeout_s)
+    for tok in ("vcpu:heavy", "vgpio:leds", "vdisk:scratch"):
+        assert tok in argv, f"{tok} missing from argv"
+    # a profile entry can NEVER smuggle another flag, an unknown prefix, or an unsafe name
+    for bad in ("--net", "-v /etc:/etc", "vgpu:x", "vcpu:", "vcpu:bad name", "vcpu:a;b",
+                "vdisk:../x", "vgpio:a/b", "vcpu:x=y", "vcpu:-lead", "", "profile", "vcpu:heavy\n"):
+        with pytest.raises(SandboxError):
+            _cfg(profiles=[bad])
+
+
+def test_egress_allow_validated_and_scoped_to_run_boxes():
+    s = _cfg(egress_allow=["pypi.org", "files.pythonhosted.org"])
+    run = s._base_argv("n", network=False, timeout_s=s.timeout_s, is_setup=False)
+    setup = s._base_argv("n", network=True, timeout_s=s.timeout_s, is_setup=True)
+    assert "--egress-allow" in run and "pypi.org,files.pythonhosted.org" in run and "--net" not in run
+    # the setup box keeps full network to install deps; the allowlist governs only the untrusted run box
+    assert "--egress-allow" not in setup and "--net" in setup
+    for bad in ("http://x.com", "x.com/p", "x.com:80", "*.x.com", "a,b.com", "localhost", "", "-x.com",
+                "no dom", "pypi.org\n", "pypi.org\r\n"):  # a trailing newline must not slip past
+        with pytest.raises(SandboxError):
+            _cfg(egress_allow=[bad])
+    with pytest.raises(SandboxError):  # egress_allow and network are mutually exclusive
+        _cfg(egress_allow=["x.com"], network=True)
+
+
+def test_snapshot_restore_roundtrip_and_rejects_hostile_archives(tmp_path):
+    import io
+    import tarfile
+
+    snap = str(tmp_path / "s.tgz")
+    with _cfg() as s:  # file ops are host-side; the fake kern is never invoked
+        s.write_file("a.txt", "hi")
+        s.write_file("sub/b.txt", "deep")
+        s.snapshot(snap)
+    with _cfg() as s2:
+        s2.restore(snap)
+        assert s2.read_file("a.txt") == b"hi"
+        assert s2.read_file("sub/b.txt") == b"deep"
+    # a hostile archive can never write outside the workspace
+    def _tar(build) -> str:
+        p = str(tmp_path / f"bad{id(build)}.tar")
+        with tarfile.open(p, "w") as tf:
+            build(tf)
+        return p
+
+    abs_tar = _tar(lambda tf: tf.addfile(tarfile.TarInfo("/etc/evil"), io.BytesIO(b"x")))
+    esc_tar = _tar(lambda tf: tf.addfile(tarfile.TarInfo("../escape"), io.BytesIO(b"x")))
+    link = tarfile.TarInfo("link")
+    link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
+    link_tar = _tar(lambda tf: tf.addfile(link))
+    for bad in (abs_tar, esc_tar, link_tar):
+        with _cfg() as s3, pytest.raises(SandboxError):
+            s3.restore(bad)
+
+
+def test_snapshot_is_ustar_not_pax_for_cross_binding_interop(tmp_path):
+    # Python's default PAX format writes an 'x' extended header before each member that the strict Node
+    # reader rejects; the snapshot must be plain USTAR so a .tar.gz round-trips between both bindings.
+    import gzip
+    import tarfile
+
+    p = str(tmp_path / "s.tgz")
+    with _cfg() as s:
+        s.write_file("f.txt", "hi")
+        s.snapshot(p)
+    with tarfile.open(p) as tf:
+        assert all(not m.pax_headers for m in tf.getmembers()), "PAX headers must not leak (breaks Node)"
+    raw = gzip.open(p).read()
+    assert chr(raw[156]) in ("0", "5"), "first tar record must be a plain ustar file/dir, not a pax 'x' header"
+
+
+def test_run_code_language_table():
+    # node evaluates inline with -e (NOT -c); python/bash use -c. File cells keep the right extension.
+    assert Sandbox._LANGS["node"] == ("node", "-e", "js")
+    assert Sandbox._LANGS["python"] == ("python3", "-c", "py")
+    assert Sandbox._LANGS["bash"] == ("sh", "-c", "sh")
+
+
 def test_timeout_is_mandatory():
     for bad in (None, 0, -5):
         with pytest.raises(SandboxError):
@@ -136,11 +217,6 @@ def _kern_runnable() -> bool:
 
 
 integration = pytest.mark.skipif(not _kern_runnable(), reason="no runnable kern (set KERN_BIN)")
-
-
-@pytest.fixture(autouse=True)
-def _eula():
-    os.environ.setdefault("KERN_ACCEPT_EULA", "1")
 
 
 @integration

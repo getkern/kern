@@ -121,6 +121,7 @@ pub fn help() -> Result<(), Error> {
     --net [host|none]   Share the host network (bare/host); none = isolated (default)
     --network <mode>    host = share host net (= --net); none = isolated (default)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
+    --egress-allow d,d  Restrict outbound to an allowlist of domains via a filtering proxy (foreground-only)
     --hostname <name>   Set the box's hostname (default: the box name)
     --tun               Expose /dev/net/tun in the box (WireGuard / userspace VPN)
     --init              Run a built-in reaping init as PID 1 (no zombies; forwards SIGTERM)
@@ -136,6 +137,7 @@ pub fn help() -> Result<(), Error> {
     -u, --user <u[:g]>  Run the box command as this uid[:gid] (numeric; needs the id mapped)
     --cap-add <CAP>     Keep a capability kern would otherwise drop (e.g. NET_ADMIN, or ALL); repeatable
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
+    --landlock-rw <path> Confine writes to these paths with the Landlock LSM; root stays read+exec (repeatable)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
                         only the caller (faster + more isolated)
     --bind-rootfs       Bind --rootfs directly instead of an overlay, faster on kernels with a
@@ -1111,6 +1113,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             ports: ports_summary(ports),
             volumes: mounted_vols.clone(),
             pod: args.pod.unwrap_or("").to_string(),
+            egress: args.egress_allow.join(","),
+            landlock_rw: spec.landlock_rw.join(","),
+            memory_max: spec.memory_max,
+            pids_max: spec.pids_max,
         };
         let path = registry::register(&inst).ok();
         Some((inst, path))
@@ -3053,6 +3059,10 @@ fn run_detached(
         ports: ports_summary(ports),
         volumes: volumes.to_string(),
         pod: pod.to_string(),
+        egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
+        landlock_rw: spec.landlock_rw.join(","),
+        memory_max: spec.memory_max,
+        pids_max: spec.pids_max,
     };
     let path = registry::register(&inst).ok();
     // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
@@ -3716,7 +3726,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         // `null` (not 0) for a resource the box has no dedicated cgroup to read - "unknown".
         let num = json_num;
         println!(
-            "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{}}}",
+            "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"pids_max\":{}}}",
             json_str(&b.name),
             b.pid,
             b.pid1,
@@ -3729,6 +3739,11 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             num(mem),
             num(cpu),
             num(tasks),
+            json_str(&b.pod),
+            json_str(&b.egress),
+            json_str(&b.landlock_rw),
+            num(b.memory_max),
+            num(b.pids_max),
         );
     } else {
         let p = crate::ui::Palette::detect();
@@ -3751,6 +3766,22 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             &cpu.map_or("-".into(), |u| format!("{:.1}s", u as f64 / 1e6)),
         );
         row("tasks", &tasks.map_or("-".into(), |t| t.to_string()));
+        // Configured caps (the REQUESTED limits, distinct from the live usage above, which reads `-`
+        // when the box has no dedicated cgroup) and the 0.6.7 isolation policies, shown when set.
+        row("mem-cap", &b.memory_max.map_or("-".into(), human_bytes));
+        row(
+            "pids-cap",
+            &b.pids_max.map_or("-".into(), |v| v.to_string()),
+        );
+        if !b.pod.is_empty() {
+            row("pod", &b.pod);
+        }
+        if !b.egress.is_empty() {
+            row("egress", &crate::ui::scrub(&b.egress));
+        }
+        if !b.landlock_rw.is_empty() {
+            row("landlock", &crate::ui::scrub(&b.landlock_rw));
+        }
     }
     Ok(())
 }
@@ -10062,6 +10093,10 @@ mod net_resource_tests {
             ports: String::new(),
             volumes: String::new(),
             pod: pod.to_string(),
+            egress: String::new(),
+            landlock_rw: String::new(),
+            memory_max: None,
+            pids_max: None,
         }
     }
 
