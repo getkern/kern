@@ -58,7 +58,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -810,7 +810,16 @@ def _looks_like_startup_failure(stderr: str) -> bool:
     diagnostic prefixes - printed by kern, not by the workload - so the workload can't forge them by
     writing the marker to its own stderr. (Same discipline as the tar vetter: don't trust text the
     adversary controls; kern's setup errors precede any workload output and carry kern's prefixes.)"""
-    markers = ("kern:", "error: pull:", "error: sandbox:", "error: box:", "error: oci:", "error: image:")
+    markers = (
+        "kern:",
+        "error: pull:",
+        "error: registry:",
+        "error: manifest:",
+        "error: sandbox:",
+        "error: box:",
+        "error: oci:",
+        "error: image:",
+    )
     for line in stderr.splitlines():
         s = line.lstrip()
         if "sandbox setup failed" in s or any(s.startswith(m) for m in markers):
