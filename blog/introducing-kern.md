@@ -67,7 +67,7 @@ One isolated `/bin/true`, warm image cache, on an x86_64 desktop (Linux 6.17, me
 The honest version: **nobody wins single-shot latency outright**: the top tier is all within a couple
 of milliseconds, i.e. noise. kern leads that tier while being the only one of them that ships a full
 daemonless container UX (OCI pull *and build*, overlay, volumes, secrets, `ps`/`exec`/`logs`, compose)
-in ~1.6 MB. The real gap is to the *engines*: **~80–160× faster to start** than podman/Docker, which
+in ~1.6 MB. The real gap is to the *engines*: **~80-160× faster to start** than podman/Docker, which
 fork `conmon` or round-trip a daemon every run, and kern keeps **0 RAM resident** where Docker holds
 ~186 MB before you run anything. Full method, including where kern *ties* (I/O, cold pull, in-box
 compute overhead, all physics, not runtime), is in

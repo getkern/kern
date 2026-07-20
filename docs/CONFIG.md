@@ -134,7 +134,7 @@ cpus       = "1.5"                # --cpus                (quota)
 cpuset     = "0-3"                # --cpuset-cpus         (pinning, via sched_setaffinity, rootless)
 swap_max   = "1g"                 # --memory-swap-max
 pids_limit = "512"                # --pids-limit
-io_weight  = "200"                # --io-weight (cgroup v2 io.weight, 1–10000)
+io_weight  = "200"                # --io-weight (cgroup v2 io.weight, 1-10000)
 nice       = "5"                  # --nice (-20..19)
 # (Resource profiles attach on the CLI, `kern run vcpu:heavy vgpio:sensors -- cmd`, not via a box
 #  key yet. Docker's `profiles: [...]` service-gating key IS honored: a service with a non-empty

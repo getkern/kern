@@ -16,7 +16,7 @@ That difference is the whole game on a device where memory is the scarce resourc
 | install | drop one static binary | service + socket + root setup |
 | privileges | rootless (user namespaces) | typically a root daemon/group |
 
-On a 4–8 GB board, "give back 186 MB and run rootless" is often the difference between *fits* and
+On a 4-8 GB board, "give back 186 MB and run rootless" is often the difference between *fits* and
 *doesn't*. You can run several isolated services, a per-job pipeline, or CI **on the device
 itself** without standing up an always-on engine.
 
