@@ -48,8 +48,8 @@ container UX (OCI pull **and build**, overlay, volumes, secrets, in-box SSH, `cp
 kern box dev --image alpine -- sh        # a throwaway, isolated Alpine shell, in a few ms
 ```
 
-…or embed it, a fresh isolated box per call, for untrusted or agent-generated code (E2B/Firecracker
-territory, but *local* and ~1.6 MB: no cloud, no account, no VM):
+…or embed it, a fresh isolated box per call, for untrusted or agent-generated code (microVM-grade
+isolation territory, but *local* and ~1.6 MB: no cloud, no account, no VM):
 
 ```python
 import kern_sandbox as kern                     # pip install kern-sandbox
@@ -374,7 +374,7 @@ surface, see [Project status](#project-status).)
 
 Run a sandboxed command straight from your program: a fresh isolated box per call (untrusted code,
 agent tools, per-request workers), a structured result back, including rich mime-typed results
-(charts, tables, the last expression) the way a Jupyter/E2B cell returns them, but local and daemonless.
+(charts, tables, the last expression) the way a Jupyter cell returns them, but local and daemonless.
 
 **Rust**, the `kern-isolation` crate:
 

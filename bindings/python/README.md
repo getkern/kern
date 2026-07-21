@@ -13,7 +13,7 @@ r = kern.run_code("import sys; print(sys.version)")
 print(r.stdout, r.success)
 
 # a session: FILE state persists across steps (a workspace on disk); each step is a fresh box.
-# rich results are captured like a Jupyter/E2B cell (no Jupyter kernel): the last expression, any
+# rich results are captured like a Jupyter cell (no Jupyter kernel): the last expression, any
 # display(), and every matplotlib figure land in result.results as mime-typed values.
 with kern.Sandbox(setup="pip install pandas matplotlib") as sbx:
     sbx.write_file("data.csv", "a,b\n1,2\n3,4\n")
@@ -172,7 +172,7 @@ class ExecutionResult:
 
 ## Returning charts, rich results, live output, and checkpoints
 
-**Rich results (the "code interpreter" pattern).** Like a Jupyter/E2B cell, `run_code` captures rich,
+**Rich results (the "code interpreter" pattern).** Like a Jupyter cell, `run_code` captures rich,
 mime-typed values into `result.results` (a list of `Result`), with **no Jupyter kernel**: it captures
 the value of the code's **last bare expression**, every **`display(obj)`** call, and **every open
 matplotlib figure automatically** (no `savefig` needed). Each `Result.data` maps a MIME type to its
