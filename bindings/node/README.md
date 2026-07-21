@@ -77,6 +77,7 @@ const r = await kern.runCode("console.log([1,2,3].map(x => x * x))", {
 | `success` | `true` iff `exitCode === 0` **and** no sandbox fault |
 | `fault` | a sandbox event, or `null`. `{ type, message }` |
 | `files` | files created/modified in the workspace this call |
+| `results` | rich mime-typed values (`Result[]`): last expression, `display()`, matplotlib figures |
 | `truncated` | output hit the cap and overflow was discarded |
 
 A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it is a normal result.
@@ -134,18 +135,27 @@ new Sandbox({
 });
 ```
 
-## Charts, live output, and checkpoints
+## Charts, rich results, live output, and checkpoints
 
-**Charts / artifacts (the "code interpreter" pattern).** No Jupyter kernel: have the code WRITE the
-artifact to the workspace, then read it back with `readFile`.
+**Rich results (the "code interpreter" pattern).** `runCode` runs Python by default, and like a
+Jupyter/E2B cell it captures rich, mime-typed values into `result.results` (a list of `Result`) with
+**no Jupyter kernel**: the value of the code's **last bare expression**, every **`display(obj)`** call,
+and **every open matplotlib figure automatically** (no `savefig`). Accessors: `.png`/`.jpeg` (Buffer),
+`.html`, `.svg`, `.markdown`, `.json`, `.text`.
 
 ```js
-await kern.withSandbox({ setup: "pip install matplotlib" }, async (sbx) => {
-  await sbx.runCode("import matplotlib; matplotlib.use('Agg')\n" +
-    "import matplotlib.pyplot as plt; plt.plot([1,4,9]); plt.savefig('chart.png')");
-  const png = await sbx.readFile("chart.png"); // Buffer, ready to return to the model / user
+await kern.withSandbox({ setup: "pip install matplotlib pandas" }, async (sbx) => {
+  let r = await sbx.runCode("import matplotlib; matplotlib.use('Agg')\n" +
+    "import matplotlib.pyplot as plt; plt.plot([1,4,9])");
+  const png = r.results[0].png;                 // Buffer of the figure, auto-captured
+
+  r = await sbx.runCode("import pandas as pd; pd.DataFrame({'a':[1,2]})");
+  r.results[0].html;                            // the DataFrame as an HTML table (also .text)
 });
 ```
+
+Capture never touches `stdout`/`stderr`/`exitCode`; a statement returning `None` yields no result. You
+can still WRITE an artifact to the workspace and `readFile` it if you prefer.
 
 **Live output.** Pass `onStdout` / `onStderr` to stream each chunk as it arrives. The callback is
 best-effort, not lossless: a SLOW callback drops chunks rather than applying backpressure to the box

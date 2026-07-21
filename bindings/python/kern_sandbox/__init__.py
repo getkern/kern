@@ -33,6 +33,8 @@ multi-tenant code (for that: a microVM / gVisor). A deny-by-default allowlist mo
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import re
 import shutil
@@ -51,6 +53,7 @@ from typing import Callable, Literal, Mapping, Sequence
 __all__ = [
     "Sandbox",
     "ExecutionResult",
+    "Result",
     "SandboxFault",
     "FileInfo",
     "SandboxError",
@@ -58,7 +61,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -68,6 +71,96 @@ _DEFAULT_IMAGE = "python:3.12-slim"
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
 _DEPS_DIR = ".deps"  # pip --target dir inside the workspace (added to PYTHONPATH for run_code)
 _ENV_FILE = ".kern-env"  # host-side 0600 env file (kept out of argv so values don't show in `ps`)
+
+# Python cell runner (P1: rich mime-typed results, Jupyter/E2B-style, WITHOUT a Jupyter kernel). It
+# execs the user cell, then captures (a) the value of a trailing bare expression, (b) every display(obj)
+# call, and (c) every open matplotlib figure, writing them as a JSON mime-bundle list to a results file
+# the binding reads back. stdout/stderr/exit-code are UNTOUCHED (results go to a file, not stdout); an
+# uncaught error is re-formatted so the traceback shows the user's frames, not this runner's. Every step
+# is best-effort: any failure leaves results empty and the run otherwise identical to a plain `python3`.
+_PY_RUNNER = r'''
+import sys, os, json, base64, io, ast, traceback, builtins
+_CELL = "__KERN_CELL__"
+_RES = "__KERN_RES__"
+_out = []
+def _bundle(o):
+    d = {}
+    for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
+                      ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if isinstance(v, str) and v:
+                    d[key] = v
+        except Exception:
+            pass
+    try:
+        fn = getattr(o, "_repr_json_", None)
+        if callable(fn):
+            v = fn()
+            if v is not None:
+                d["application/json"] = v if isinstance(v, str) else json.dumps(v)
+    except Exception:
+        pass
+    for meth, key in (("_repr_png_", "image/png"), ("_repr_jpeg_", "image/jpeg")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if v:
+                    raw = v if isinstance(v, (bytes, bytearray)) else str(v).encode()
+                    d[key] = base64.b64encode(raw).decode()
+        except Exception:
+            pass
+    if "text/plain" not in d:  # always carry a plain-text repr alongside any rich reprs (Jupyter/E2B do)
+        try:
+            d["text/plain"] = repr(o)
+        except Exception:
+            d["text/plain"] = "<unrepresentable>"
+    return d
+def display(o=None, **kw):
+    if o is not None:
+        _out.append(_bundle(o))
+builtins.display = display
+sys.argv = [_CELL]
+_g = {"__name__": "__main__", "__file__": _CELL, "display": display}
+_rc = 0
+try:
+    _src = open(_CELL, "r", encoding="utf-8").read()
+    _tree = ast.parse(_src, _CELL, "exec")
+    _tail = None
+    if _tree.body and isinstance(_tree.body[-1], ast.Expr):
+        _tail = _tree.body.pop().value
+    exec(compile(_tree, _CELL, "exec"), _g)
+    if _tail is not None:
+        _val = eval(compile(ast.Expression(_tail), _CELL, "eval"), _g)
+        if _val is not None:
+            _out.append(_bundle(_val))
+except SystemExit as _e:
+    _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
+except BaseException as _e:
+    _tb = _e.__traceback__
+    while _tb is not None and _tb.tb_frame.f_code.co_filename != _CELL:
+        _tb = _tb.tb_next
+    sys.stderr.write("".join(traceback.format_exception(type(_e), _e, _tb)))
+    _rc = 1
+try:
+    if "matplotlib.pyplot" in sys.modules:
+        _plt = sys.modules["matplotlib.pyplot"]
+        for _n in _plt.get_fignums():
+            _buf = io.BytesIO()
+            _plt.figure(_n).savefig(_buf, format="png")
+            _out.append({"image/png": base64.b64encode(_buf.getvalue()).decode()})
+except Exception:
+    pass
+try:
+    with open(_RES, "w", encoding="utf-8") as _fh:
+        json.dump(_out, _fh)
+except Exception:
+    pass
+sys.exit(_rc)
+'''
 
 # Host paths a `-v` mount must never target - mounting the host's real root/config/secrets into a
 # sandbox defeats the point; the docker socket is the classic escape. A footgun guard: refused even
@@ -117,6 +210,51 @@ class FileInfo:
 
 
 @dataclass
+class Result:
+    """A rich, mime-typed value captured from ``run_code`` (Python), the way a Jupyter/E2B cell captures
+    output: the value of the code's last bare expression, every ``display(obj)`` call, and every open
+    matplotlib figure. ``data`` maps a MIME type to its payload: text/* and application/json are strings,
+    image/* are base64 strings (use the ``.png``/``.jpeg`` byte accessors). A single value can carry
+    several representations (e.g. a DataFrame has both text/plain and text/html)."""
+
+    data: dict[str, str]
+
+    @property
+    def text(self) -> "str | None":
+        return self.data.get("text/plain")
+
+    @property
+    def html(self) -> "str | None":
+        return self.data.get("text/html")
+
+    @property
+    def markdown(self) -> "str | None":
+        return self.data.get("text/markdown")
+
+    @property
+    def svg(self) -> "str | None":
+        return self.data.get("image/svg+xml")
+
+    @property
+    def json(self) -> "str | None":
+        return self.data.get("application/json")
+
+    @property
+    def png(self) -> "bytes | None":
+        v = self.data.get("image/png")
+        return base64.b64decode(v) if v else None
+
+    @property
+    def jpeg(self) -> "bytes | None":
+        v = self.data.get("image/jpeg")
+        return base64.b64decode(v) if v else None
+
+    def formats(self) -> "list[str]":
+        """The MIME types this value was captured as, most-rich first is not guaranteed."""
+        return list(self.data.keys())
+
+
+@dataclass
 class ExecutionResult:
     """The outcome of one ``run_code``/``run``. ``fault`` is the source of truth for "did the SANDBOX
     act"; ``exit_code``/``stdout`` are what the user's code did. ``success`` requires both clean."""
@@ -128,6 +266,7 @@ class ExecutionResult:
     fault: SandboxFault | None = None
     files: list[FileInfo] = field(default_factory=list)
     truncated: bool = False  # stdout/stderr hit the capture cap and overflow was discarded
+    results: list[Result] = field(default_factory=list)  # rich mime-typed values (Python run_code)
 
     @property
     def success(self) -> bool:
@@ -782,6 +921,8 @@ class Sandbox:
         if spec is None:
             raise SandboxError(f"unsupported language {language!r} (v1: 'python' | 'bash' | 'node')")
         runner, inline_flag, ext = spec
+        if language == "python":
+            return self._run_python_cell(code)
         if len(code.encode()) > self._INLINE_CODE_MAX:
             # Write to a per-call cell file in the workspace and run it by path (no argv-size limit).
             cell = f".cell-{uuid.uuid4().hex[:8]}.{ext}"
@@ -790,6 +931,36 @@ class Sandbox:
         else:
             command = [runner, inline_flag, code]
         return self._spawn(command, network=self.network, timeout_s=self.timeout_s)
+
+    def _run_python_cell(self, code: str) -> ExecutionResult:
+        """Run Python through the cell runner so a trailing expression, ``display()`` calls and matplotlib
+        figures are captured as rich mime-typed ``result.results`` (Jupyter/E2B-style). stdout/stderr/exit
+        are identical to a plain run; result capture is best-effort and never alters them. The cell,
+        runner and results files are internal and are removed and hidden from ``result.files``."""
+        uid = uuid.uuid4().hex[:8]
+        cell, resf, runf = f".cell-{uid}.py", f".res-{uid}.json", f".run-{uid}.py"
+        self.write_file(cell, code)
+        shim = _PY_RUNNER.replace("__KERN_CELL__", f"{_WORKSPACE}/{cell}").replace(
+            "__KERN_RES__", f"{_WORKSPACE}/{resf}"
+        )
+        self.write_file(runf, shim)
+        result = self._spawn(
+            ["python3", f"{_WORKSPACE}/{runf}"], network=self.network, timeout_s=self.timeout_s
+        )
+        try:
+            parsed = json.loads(self.read_file(resf))
+            if isinstance(parsed, list):
+                result.results = [Result(data=r) for r in parsed if isinstance(r, dict)]
+        except Exception:
+            pass  # no results file / unreadable / bad JSON: leave results empty, run is otherwise intact
+        internal = {cell, resf, runf}
+        for name in internal:
+            try:
+                os.unlink(os.path.join(self._ws, name))
+            except OSError:
+                pass
+        result.files = [fi for fi in result.files if fi.path not in internal]
+        return result
 
     def run(self, command: Sequence[str]) -> ExecutionResult:
         """Run an arbitrary ``command`` (an argv LIST, never a shell string) in a fresh box."""
