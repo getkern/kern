@@ -130,7 +130,7 @@ export class Sandbox {
   /** Write data to a workspace-relative path (host-direct, O_NOFOLLOW on the final component). */
   writeFile(path: string, data: Buffer | string): Promise<void>;
   /** Read a workspace-relative path (host-direct, O_NOFOLLOW). */
-  readFile(path: string): Promise<Buffer>;
+  readFile(path: string, opts?: { maxBytes?: number }): Promise<Buffer>;
   /** Write a gzip tar of the whole workspace to `dest`, a portable filesystem checkpoint (NOT memory). */
   snapshot(dest: string): void;
   /** Extract a snapshot (from snapshot()) into the workspace, safely (rejects symlink/.. /absolute members). */

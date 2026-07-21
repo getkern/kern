@@ -447,3 +447,13 @@ def test_write_file_refuses_intermediate_symlink(tmp_path):
         with pytest.raises(SandboxError):
             s.write_file("evil/pwned.txt", "x")
     assert not (outside / "pwned.txt").exists()
+
+
+@integration
+def test_p1_read_file_max_bytes_caps_the_read():
+    # P1 reads the box-written results file back; max_bytes bounds an untrusted box from OOMing the host.
+    with Sandbox(timeout_s=30) as s:
+        s.run_code("open('big.bin', 'wb').write(b'x' * 200_000)")
+        with pytest.raises(SandboxError):
+            s.read_file("big.bin", max_bytes=1000)
+        assert len(s.read_file("big.bin", max_bytes=500_000)) == 200_000
