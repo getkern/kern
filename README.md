@@ -392,7 +392,7 @@ let out = Sandbox::builder()
 assert!(out.success());              // + out.stdout / .stderr / .exit_code / .wall_ms
 ```
 
-**Python**, the `kern_sandbox` package (`pip install kern-sandbox`), for running semi-trusted or agent-generated code with fast local isolation:
+**Python**, the `kern_sandbox` package on PyPI ([`pip install kern-sandbox`](https://pypi.org/project/kern-sandbox/)), for running semi-trusted or agent-generated code with fast local isolation:
 
 ```python
 import kern_sandbox as kern     # kernel-boundary isolation, not a microVM
@@ -415,7 +415,7 @@ with kern.Sandbox(setup="pip install matplotlib pandas", timeout_s=60) as s:
     r.results[0].html                      # the DataFrame as an HTML table (also .text)
 ```
 
-**Node / TypeScript**, the `kern-sandbox` package (`npm install kern-sandbox`), the same model for
+**Node / TypeScript**, the `kern-sandbox` package on npm ([`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox)), the same model for
 the other half of the agent ecosystem (LangChain JS, the Vercel AI SDK), with types in the box:
 
 ```js
@@ -432,9 +432,22 @@ await withSandbox({ memoryMb: 512, timeoutS: 30 }, async (s) => {
 });
 ```
 
+**Warm kernel (sub-millisecond cells).** For a REPL/notebook or an agent's tool loop, open a persistent
+warm interpreter with `Sandbox.kernel()` (Python and Node): in-memory state persists across cells and the
+per-cell cost drops from a full interpreter boot (about 10 ms) to sub-millisecond (about 300x, 25k
+cells/s), with the same rich results, still network-off and resource-capped.
+
+**MCP server for Claude Desktop / Cursor / Windsurf.** The Python package also ships **`kern-mcp`**, a
+dependency-free MCP stdio server that hands any MCP client a local, **network-off** code interpreter
+backed by kern: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`, with charts
+returned as image blocks. Point your client at the `kern-mcp` command (from
+[`pip install kern-sandbox`](https://pypi.org/project/kern-sandbox/)); set `KERN_MCP_KERNEL=1` to route
+`run_code` through the warm kernel. See [bindings/python](bindings/python).
+
 Safe by default: every relaxing argument (`network`, extra `mounts`) says so, and the binding owns
-the timeout, so a `timeout` fault is a fact, not a guess. All three use the installed `kern` (`PATH` or
-`KERN_BIN`); see [bindings/python](bindings/python), [bindings/node](bindings/node), and the
+the timeout, so a `timeout` fault is a fact, not a guess. Both bindings use the installed `kern` (`PATH`
+or `KERN_BIN`); see [bindings/python](bindings/python) ([PyPI](https://pypi.org/project/kern-sandbox/)),
+[bindings/node](bindings/node) ([npm](https://www.npmjs.com/package/kern-sandbox)), and the
 `kern-isolation` crate (git/path, not yet crates.io).
 
 ## Platforms
@@ -583,19 +596,21 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 
 ## Project status
 
-**0.6.8, a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (**477 tests**, clippy-clean,
-`cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It deliberately skips a
-lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast, honest core. The
-CLI and config surface are **not frozen until 1.0**.
+**0.6.9, a daemonless container + resource runtime that does less than Docker, on purpose.**
+Everything in [Features](#features) works today and is tested (hundreds of tests across Rust, Python and
+Node, clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It
+deliberately skips a lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast,
+honest core. The CLI and config surface are **not frozen until 1.0**.
 
-**Recent work (0.6.7 / 0.6.8):** `kern commit` warm-start snapshots, an `--egress-allow` domain
-allowlist and an `--landlock-rw` write-allowlist, fleet budgets, and the **Python + Node** bindings
-gaining resource profiles, egress control, live output streaming and workspace snapshot/restore. Before
-that: local image **build** + **`tag`**/**`push`**, **zstd** layers, **`--init`**, **`--platform`**,
-pods, and a Dockerfile/compose parser verified against a real `docker build` differential, with the
-`build`/`push` surface audited (COPY-from confinement, setuid/opaque hardening, fail-closed on a
-rootless-overlay kernel). Per-release detail in **[CHANGELOG.md](CHANGELOG.md)**.
+**Recent work (0.6.9):** a **warm kernel** for the Python + Node bindings (`Sandbox.kernel()`, a
+persistent interpreter that makes the code-interpreter path sub-millisecond) and an **MCP server**
+(`kern-mcp`) for Claude Desktop / Cursor, plus a box-start rate in `kern top`. Before that (0.6.7 / 0.6.8):
+`kern commit` warm-start snapshots, an `--egress-allow` domain allowlist and an `--landlock-rw`
+write-allowlist, fleet budgets, and the bindings gaining resource profiles, egress control, live output
+streaming, rich mime-typed results and workspace snapshot/restore. Earlier: local image **build** +
+**`tag`**/**`push`**, **zstd** layers, **`--init`**, **`--platform`**, pods, and a Dockerfile/compose
+parser verified against a real `docker build` differential. Per-release detail in
+**[CHANGELOG.md](CHANGELOG.md)**.
 
 **Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
 overlay networking.

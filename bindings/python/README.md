@@ -2,6 +2,9 @@
 
 Run LLM/agent-generated code in a fast, **local**, daemonless kernel sandbox from Python.
 
+On PyPI: [`pip install kern-sandbox`](https://pypi.org/project/kern-sandbox/). For Node / TypeScript, the
+same package is on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
+
 ```python
 import kern_sandbox as kern
 
