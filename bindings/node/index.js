@@ -36,24 +36,48 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.3";
+const VERSION = "0.1.4";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
 const DEPS_DIR = ".deps"; // pip --target dir inside the workspace (added to PYTHONPATH for python)
 const ENV_FILE = ".kern-env"; // host-side 0600 env file (kept out of argv so values don't show in `ps`)
 const INLINE_CODE_MAX = 128 * 1024; // above this, pass code via a file instead of argv (ARG_MAX guard)
+// Cap the results file the (untrusted) box writes before the binding reads it into host RAM: a malicious
+// cell could stream a multi-GB `.res` to disk (past its own memory cap) and OOM the host.
+const RESULTS_MAX = 64 * 1024 * 1024; // 64 MiB: generous for charts/tables, bounds the attacker read
 
 // Python cell runner (P1: rich mime-typed results, Jupyter/E2B-style, no Jupyter kernel). Runs INSIDE
 // the box (it is Python, regardless of which binding drove it): execs the user cell, then captures the
 // trailing bare expression's value, every display(obj) call, and every open matplotlib figure, writing
-// them as a JSON mime-bundle list the binding reads back. stdout/stderr/exit are UNTOUCHED. Kept byte-
-// identical to the Python binding's runner. __KERN_CELL__/__KERN_RES__ are substituted per call.
+// them as a JSON mime-bundle list the binding reads back. stdout/stderr/exit are UNTOUCHED. On the hot
+// path it imports only C builtins (no .py to recompile in the read-only slim box); base64/io/traceback/
+// json are lazy. Mirrors the Python binding's runner. __KERN_CELL__/__KERN_RES__ are substituted per call.
 const PY_RUNNER = `
-import sys, os, json, base64, io, ast, traceback, builtins
+import sys, builtins  # C builtins: no .py to recompile in the read-only slim box (the P1 hot path).
 _CELL = "__KERN_CELL__"
 _RES = "__KERN_RES__"
 _out = []
+def _js(s):  # minimal JSON string encoder, so the box needs no \`import json\` (~80ms in a pyc-less slim box)
+    r = ['"']
+    for ch in s:
+        o = ord(ch)
+        if ch == '"':
+            r.append('\\\\"')
+        elif ch == '\\\\':
+            r.append('\\\\\\\\')
+        elif o == 10:
+            r.append('\\\\n')
+        elif o == 13:
+            r.append('\\\\r')
+        elif o == 9:
+            r.append('\\\\t')
+        elif o < 32:
+            r.append('\\\\u%04x' % o)
+        else:
+            r.append(ch)
+    r.append('"')
+    return "".join(r)
 def _bundle(o):
     d = {}
     for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
@@ -71,7 +95,11 @@ def _bundle(o):
         if callable(fn):
             v = fn()
             if v is not None:
-                d["application/json"] = v if isinstance(v, str) else json.dumps(v)
+                if isinstance(v, str):
+                    d["application/json"] = v
+                else:
+                    import json
+                    d["application/json"] = json.dumps(v)
     except Exception:
         pass
     for meth, key in (("_repr_png_", "image/png"), ("_repr_jpeg_", "image/jpeg")):
@@ -80,6 +108,7 @@ def _bundle(o):
             if callable(fn):
                 v = fn()
                 if v:
+                    import base64
                     raw = v if isinstance(v, (bytes, bytearray)) else str(v).encode()
                     d[key] = base64.b64encode(raw).decode()
         except Exception:
@@ -99,18 +128,27 @@ _g = {"__name__": "__main__", "__file__": _CELL, "display": display}
 _rc = 0
 try:
     _src = open(_CELL, "r", encoding="utf-8").read()
-    _tree = ast.parse(_src, _CELL, "exec")
+    _tree = compile(_src, _CELL, "exec", 0x400)
     _tail = None
-    if _tree.body and isinstance(_tree.body[-1], ast.Expr):
-        _tail = _tree.body.pop().value
+    if _tree.body and type(_tree.body[-1]).__name__ == "Expr":
+        _n = _tree.body.pop()
+        _lines = _src.split("\\n")
+        if _n.lineno == _n.end_lineno:
+            _tail = _lines[_n.lineno - 1].encode()[_n.col_offset:_n.end_col_offset].decode("utf-8", "replace")
+        else:
+            _seg = [_lines[_n.lineno - 1].encode()[_n.col_offset:].decode("utf-8", "replace")]
+            _seg += _lines[_n.lineno:_n.end_lineno - 1]
+            _seg.append(_lines[_n.end_lineno - 1].encode()[:_n.end_col_offset].decode("utf-8", "replace"))
+            _tail = "\\n".join(_seg)
     exec(compile(_tree, _CELL, "exec"), _g)
     if _tail is not None:
-        _val = eval(compile(ast.Expression(_tail), _CELL, "eval"), _g)
+        _val = eval(compile(_tail, _CELL, "eval"), _g)
         if _val is not None:
             _out.append(_bundle(_val))
 except SystemExit as _e:
     _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
 except BaseException as _e:
+    import traceback
     _tb = _e.__traceback__
     while _tb is not None and _tb.tb_frame.f_code.co_filename != _CELL:
         _tb = _tb.tb_next
@@ -118,16 +156,17 @@ except BaseException as _e:
     _rc = 1
 try:
     if "matplotlib.pyplot" in sys.modules:
+        import base64, io
         _plt = sys.modules["matplotlib.pyplot"]
-        for _n in _plt.get_fignums():
+        for _fig in _plt.get_fignums():
             _buf = io.BytesIO()
-            _plt.figure(_n).savefig(_buf, format="png")
+            _plt.figure(_fig).savefig(_buf, format="png")
             _out.append({"image/png": base64.b64encode(_buf.getvalue()).decode()})
 except Exception:
     pass
 try:
-    with open(_RES, "w", encoding="utf-8") as _fh:
-        json.dump(_out, _fh)
+    _parts = ["{" + ",".join(_js(str(_k)) + ":" + _js(str(_v)) for _k, _v in _d.items()) + "}" for _d in _out]
+    open(_RES, "w", encoding="utf-8").write("[" + ",".join(_parts) + "]")
 except Exception:
     pass
 sys.exit(_rc)
@@ -851,7 +890,7 @@ class Sandbox {
   }
 
   /** Read `path` (workspace-relative) from the workspace - host-direct. Final component O_NOFOLLOW. */
-  async readFile(rel) {
+  async readFile(rel, { maxBytes = null } = {}) {
     this._requireEntered();
     const full = this._wsPath(rel);
     let fd;
@@ -861,6 +900,10 @@ class Sandbox {
       throw new SandboxError(`cannot read ${JSON.stringify(rel)}: ${e.message}`);
     }
     try {
+      // maxBytes caps the read so a file a not-fully-trusted box wrote can't OOM the host; the box has
+      // already exited by the time we read, so fstat -> read is race-free.
+      if (maxBytes !== null && fs.fstatSync(fd).size > maxBytes)
+        throw new SandboxError(`${JSON.stringify(rel)} exceeds maxBytes=${maxBytes}`);
       return fs.readFileSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -1078,11 +1121,11 @@ class Sandbox {
       timeoutS: this.timeoutS,
     });
     try {
-      const parsed = JSON.parse(await this.readFile(resf));
+      const parsed = JSON.parse(await this.readFile(resf, { maxBytes: RESULTS_MAX }));
       if (Array.isArray(parsed))
         result.results = parsed.filter((r) => r && typeof r === "object").map((r) => new Result(r));
     } catch {
-      /* no results file / unreadable / bad JSON: leave results empty, run otherwise intact */
+      /* missing / too-large / unreadable / bad JSON: leave results empty, run otherwise intact */
     }
     const internal = new Set([cell, resf, runf]);
     for (const name of internal) {

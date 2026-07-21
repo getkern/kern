@@ -547,3 +547,12 @@ test("P1 internal cell/runner/result files are hidden and cleaned", exec, async 
     assert.strictEqual(r.results[0].text, "'done'");
   });
 });
+
+test("P1 readFile maxBytes caps the read (results DoS guard)", exec, async () => {
+  await withSandbox(async (s) => {
+    await s.runCode("open('big.bin','wb').write(b'x'*200000)");
+    await assert.rejects(() => s.readFile("big.bin", { maxBytes: 1000 }), SandboxError);
+    const d = await s.readFile("big.bin", { maxBytes: 500000 });
+    assert.strictEqual(d.length, 200000);
+  });
+});
