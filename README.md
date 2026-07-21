@@ -26,6 +26,8 @@ was installed at all).
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.6 MB static binary, no daemon.">
 </p>
 
+<sub>Demo timings on an Intel i7-14700KF (28-core x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2 ms</b>; a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. Your hardware and cgroup delegation differ: see <a href="BENCHMARKS.md">Benchmarks</a> for the labeled table, methodology, and on-device board numbers.</sub>
+
 [Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
 </div>
