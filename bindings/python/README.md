@@ -9,15 +9,17 @@ import kern_sandbox as kern
 r = kern.run_code("import sys; print(sys.version)")
 print(r.stdout, r.success)
 
-# a session: FILE state persists across steps (a workspace on disk); each step is a fresh box
+# a session: FILE state persists across steps (a workspace on disk); each step is a fresh box.
+# rich results are captured like a Jupyter/E2B cell (no Jupyter kernel): the last expression, any
+# display(), and every matplotlib figure land in result.results as mime-typed values.
 with kern.Sandbox(setup="pip install pandas matplotlib") as sbx:
     sbx.write_file("data.csv", "a,b\n1,2\n3,4\n")
-    r = sbx.run_code("import pandas as pd; print(pd.read_csv('data.csv').shape)")   # (2, 2)
-    sbx.run_code(
-        "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as p; "
-        "p.plot([1, 4, 9]); p.savefig('out.png')"
-    )
-    png = sbx.read_file("out.png")   # bytes of the plot the previous step created
+    r = sbx.run_code("import pandas as pd; pd.read_csv('data.csv').describe()")
+    r.results[0].html   # the DataFrame as an HTML table (also .text)
+
+    r = sbx.run_code("import matplotlib; matplotlib.use('Agg')\n"
+                     "import matplotlib.pyplot as p; p.plot([1, 4, 9])")
+    png = r.results[0].png   # PNG bytes of the chart, auto-captured (no savefig)
 ```
 
 A thin, safe wrapper around the [`kern`](https://github.com/getkern/kern) binary, it shells out to

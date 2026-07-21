@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kern-sandbox"
-version = "0.1.4"
-description = "Run code in a fast, local, daemonless kernel sandbox. No cloud, no account, no KVM."
+version = "0.1.5"
+description = "A fast, local, daemonless code-interpreter sandbox for agent/LLM code: run Python/JS/Bash, get rich results (charts, tables). No cloud, no account, no VM."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "getkern" }]
-keywords = ["sandbox", "isolation", "namespaces", "seccomp", "agent", "code-execution", "edge", "ci"]
+keywords = ["sandbox", "code-interpreter", "isolation", "namespaces", "seccomp", "agent", "llm", "code-execution", "e2b", "jupyter", "edge", "ci"]
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",

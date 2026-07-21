@@ -1,7 +1,7 @@
 {
   "name": "kern-sandbox",
-  "version": "0.1.4",
-  "description": "Run LLM/agent-generated code in a fast, local, daemonless kernel sandbox. A thin, dependency-free wrapper around the kern binary.",
+  "version": "0.1.5",
+  "description": "A fast, local, daemonless code-interpreter sandbox for agent/LLM code: run Python/JS/Bash, get rich results (charts, tables), no cloud/account/VM. A thin, dependency-free wrapper around the kern binary.",
   "keywords": [
     "sandbox",
     "kern",
@@ -11,6 +11,8 @@
     "isolation",
     "seccomp",
     "container",
+    "code-interpreter",
+    "jupyter",
     "e2b"
   ],
   "homepage": "https://github.com/getkern/kern/tree/main/bindings/node",
