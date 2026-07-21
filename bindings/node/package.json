@@ -1,6 +1,6 @@
 {
   "name": "kern-sandbox",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "A fast, local, daemonless code-interpreter sandbox for agent/LLM code: run Python/JS/Bash, get rich results (charts, tables), no cloud/account/VM. A thin, dependency-free wrapper around the kern binary.",
   "keywords": [
     "sandbox",
