@@ -48,7 +48,7 @@ print(r.stdout, r.success)                     # → a fresh box, discarded afte
 
 Safe by default: every *relaxing* argument (`network=True`, extra `mounts`) has to be spelled out, and
 the binding owns the timeout, so a `timeout` fault is a fact, not a guess. There's a Rust crate
-(`kern-isolation`, `Sandbox::builder()`) with the same story. This is E2B/Firecracker territory, but
+(`kern-isolation`, `Sandbox::builder()`) with the same story. This is microVM-grade isolation territory, but
 *local* and ~1.6 MB, no cloud, no account, no VM.
 
 ## Fast, and honest about it

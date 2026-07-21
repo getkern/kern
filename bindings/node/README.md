@@ -7,7 +7,7 @@ package is on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/).
 
 It is a thin, dependency-free wrapper around the [`kern`](https://github.com/getkern/kern) binary:
 a fresh, isolated box per call, network off by default, hard resource caps, and a timeout the binding
-itself enforces. E2B/Firecracker territory, but local and about 1.6 MB, with no cloud, no account, no VM.
+itself enforces. microVM-grade isolation, but local and about 1.6 MB, with no cloud, no account, no VM.
 
 ```js
 const kern = require("kern-sandbox");
@@ -150,7 +150,7 @@ Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-
 ## Charts, rich results, live output, and checkpoints
 
 **Rich results (the "code interpreter" pattern).** `runCode` runs Python by default, and like a
-Jupyter/E2B cell it captures rich, mime-typed values into `result.results` (a list of `Result`) with
+Jupyter cell it captures rich, mime-typed values into `result.results` (a list of `Result`) with
 **no Jupyter kernel**: the value of the code's **last bare expression**, every **`display(obj)`** call,
 and **every open matplotlib figure automatically** (no `savefig`). Accessors: `.png`/`.jpeg` (Buffer),
 `.html`, `.svg`, `.markdown`, `.json`, `.text`.
