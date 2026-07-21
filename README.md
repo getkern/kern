@@ -103,7 +103,8 @@ cgroup v2 or kernel control; devices are deny-by-default. GPU slices are on the 
 
 ¹ On the default WSL2 kernel the `memory` controller isn't delegated: kern warns and shows the one-line
 `.wslconfig` fix; enforced natively on Linux. Profiles (`vcpu:`/`vdisk:`/`vgpio:`) are reusable presets in
-`~/.config/kern/kern.toml`, see [docs/CONFIG.md](docs/CONFIG.md).
+`~/.config/kern/kern.toml`, see [docs/CONFIG.md](docs/CONFIG.md). Author them with `kern probe` (list the
+host resources you can slice), `kern examples` (print a sample `kern.toml`), and `kern validate` (check one).
 
 ## What you can do in one line
 
@@ -487,6 +488,7 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context: keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: export/import an image tar, `docker load`-compatible |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
+| **Image management** (`docker images` / `rmi` / `search`) | ✅ `kern images` (list cached), `kern rmi` (remove, frees unshared layers), `kern search` (Docker Hub) |
 | **`docker commit`** (container → image) | ✅ `kern commit <box> <image>`: snapshots the box's filesystem to a reusable image (warm start); skips volumes/secrets |
 | **Docker Engine API** / `docker.sock` | ❌: tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
 | **Swarm** | ❌: use `compose` / `--pod` |
