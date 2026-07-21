@@ -17,6 +17,28 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.9], 2026-07-21
+
+A small CLI addition plus a big step for the language bindings (shipped separately as `kern-sandbox`
+0.1.7 on PyPI + npm): a persistent warm interpreter that turns the code-interpreter path sub-millisecond.
+
+### Added
+- **`kern top` now shows a box-start rate.** The Boxes tab surfaces a per-second box-start rate with a
+  sparkline, mirroring the existing runs rate, read from the daemonless mmap counter (offset 16). It is
+  reader-side only: zero cost on the box-start hot path.
+
+### Bindings (`kern-sandbox` 0.1.7, on PyPI + npm)
+- **Warm kernel (`Sandbox.kernel()` / `Kernel`), Python and Node.** One persistent, warm Python
+  interpreter in a long-lived box: cells run in a single resident process, so in-memory state persists
+  across cells and the per-cell cost drops from a full CPython boot (about 10 ms) to sub-millisecond
+  (about 300x, 25k cells/s). It captures the same rich mime-typed results as `run_code`, tears the box
+  down on a per-cell timeout, caps oversize replies (a host-memory guard), and isolates the control
+  channel on private fds so raw writes, C extensions and subprocess output are captured rather than
+  corrupting the protocol (a raw `os.fork()` no longer spawns rogue clones). Trade: call-fast, not
+  call-isolated (one process, one box, still network-off and resource-capped).
+- **MCP kernel mode (`KERN_MCP_KERNEL=1`).** Routes the MCP server's Python `run_code` through a warm
+  kernel, still network-off, respawning transparently on a timeout.
+
 ## [0.6.8], 2026-07-20
 
 Coherence and agent-DX release: the 0.6.7 isolation features are now visible in `kern top`/`inspect`
