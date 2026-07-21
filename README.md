@@ -373,7 +373,8 @@ surface, see [Project status](#project-status).)
 ## Embed it
 
 Run a sandboxed command straight from your program: a fresh isolated box per call (untrusted code,
-agent tools, per-request workers), structured result back.
+agent tools, per-request workers), a structured result back, including rich mime-typed results
+(charts, tables, the last expression) the way a Jupyter/E2B cell returns them, but local and daemonless.
 
 **Rust**, the `kern-isolation` crate:
 
@@ -404,12 +405,14 @@ print(r.stdout, r.success)
 r = kern.run_code("import urllib.request as u; ...",
                   egress_allow=["pypi.org", "files.pythonhosted.org"])
 
-# a session: files persist across calls; deps installed once in the ONLY network-on step
-with kern.Sandbox(image="python:3.12-slim", setup="pip install pandas",
-                  memory_mb=512, cpus=1.0, timeout_s=30) as s:
-    s.write_file("data.csv", csv_bytes)
-    out = s.run_code("import pandas as pd; print(pd.read_csv('data.csv').describe())")
-    print(out.stdout)          # network-off, capped, isolated; a fault is a typed SandboxFault
+# rich results, the "code interpreter" pattern (no Jupyter kernel): the last expression, any
+# display(), and every matplotlib figure are auto-captured as mime-typed result.results
+with kern.Sandbox(setup="pip install matplotlib pandas", timeout_s=60) as s:
+    r = s.run_code("import matplotlib; matplotlib.use('Agg')\n"
+                   "import matplotlib.pyplot as plt; plt.plot([1, 4, 9])")
+    png = r.results[0].png                 # PNG bytes of the chart, no savefig; send to the model
+    r = s.run_code("import pandas as pd; pd.DataFrame({'a': [1, 2]})")
+    r.results[0].html                      # the DataFrame as an HTML table (also .text)
 ```
 
 **Node / TypeScript**, the `kern-sandbox` package (`npm install kern-sandbox`), the same model for

@@ -4,7 +4,8 @@
 What it shows, each an actual agent-harness need:
   1. Egress allowlist    : the agent may `pip install` from PyPI but CANNOT exfiltrate to anywhere else.
   2. Live streaming      : tokens of stdout stream back as the code runs (on_stdout), not just at the end.
-  3. Chart return        : no Jupyter kernel; the code writes chart.png, the host reads the bytes back.
+  3. Chart return        : no Jupyter kernel, yet the matplotlib figure is auto-captured as a rich,
+                           mime-typed result (result.results[i].png) the way an E2B/Jupyter cell returns it.
   4. Faults as data      : a timeout, an OOM kill, and a blocked syscall come back as data, never crash.
   5. Snapshot / restore  : checkpoint the workspace after an expensive step, resume it in a fresh session.
   6. Node language       : the same sandbox runs JavaScript, not just Python.
@@ -37,11 +38,11 @@ with kern.Sandbox(
         "import matplotlib; matplotlib.use('Agg')\n"
         "import matplotlib.pyplot as plt\n"
         "for i in range(3): print('rendering pass', i, flush=True)\n"
-        "plt.plot([1, 4, 9, 16]); plt.title('from the agent'); plt.savefig('chart.png')\n"
+        "plt.plot([1, 4, 9, 16]); plt.title('from the agent')\n"  # no savefig: the figure is auto-captured
         "print('done')\n"
     )
-    png = sbx.read_file("chart.png")
-    print(f"[host] chart.png is {len(png)} bytes, PNG header ok: {png[:8] == bytes.fromhex('89504e470d0a1a0a')}")
+    png = next((res.png for res in r.results if res.png), b"")  # rich mime-typed result, Jupyter/E2B-style
+    print(f"[host] chart auto-captured: {len(png)} bytes, PNG header ok: {png[:8] == bytes.fromhex('89504e470d0a1a0a')}")
 
     # EDGE: the agent tries to phone home to a NON-allowlisted host. It must fail closed.
     leak = sbx.run_code(
