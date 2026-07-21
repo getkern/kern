@@ -429,13 +429,22 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut prev_cpu: Option<(u64, u64)> = None;
     let mut prev_runs: Option<(u64, std::time::Instant)> = None;
     let mut runs_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the Runs tab
+    let mut prev_box: Option<(u64, std::time::Instant)> = None;
+    let mut box_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the box-start rate
 
     // Live wake: an inotify watch on the box registry dir so a box created/removed by ANY kern
     // process shows up INSTANTLY, with zero poll lag. Best-effort - if inotify or the dir is
     // unavailable, the 1 s timer below still keeps the view fresh (just not sub-second on changes).
     let ino_fd = setup_registry_watch();
 
-    let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist);
+    let mut snap = refresh_full(
+        &mut prev,
+        &mut prev_cpu,
+        &mut prev_runs,
+        &mut runs_hist,
+        &mut prev_box,
+        &mut box_hist,
+    );
     loop {
         let (cols, term_rows) = term_size();
         let list_len = tab_list_len(
@@ -489,7 +498,14 @@ pub fn run() -> Result<(), crate::error::Error> {
         ];
         let nfds = if ino_fd >= 0 { 2 } else { 1 };
         if unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 1000) } <= 0 {
-            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist); // timeout → periodic refresh (CPU% window)
+            snap = refresh_full(
+                &mut prev,
+                &mut prev_cpu,
+                &mut prev_runs,
+                &mut runs_hist,
+                &mut prev_box,
+                &mut box_hist,
+            ); // timeout → periodic refresh (CPU% window)
             continue;
         }
         // A registry change woke us: drain the inotify queue and refresh NOW. If no key is also
@@ -497,7 +513,14 @@ pub fn run() -> Result<(), crate::error::Error> {
         if ino_fd >= 0 && pfds[1].revents & libc::POLLIN != 0 {
             let mut ibuf = [0u8; 4096];
             while unsafe { libc::read(ino_fd, ibuf.as_mut_ptr().cast(), ibuf.len()) } > 0 {}
-            snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_runs, &mut runs_hist);
+            snap = refresh_full(
+                &mut prev,
+                &mut prev_cpu,
+                &mut prev_runs,
+                &mut runs_hist,
+                &mut prev_box,
+                &mut box_hist,
+            );
             if pfds[0].revents & libc::POLLIN == 0 {
                 continue;
             }
@@ -1586,7 +1609,10 @@ pub fn snapshot() -> Result<(), crate::error::Error> {
         host.cores
     );
     let (rows, _) = collect_rows(&HashMap::new());
-    print!("{}", boxes_table(&p, &rows, usize::MAX, usize::MAX));
+    print!(
+        "{}",
+        boxes_table(&p, &rows, usize::MAX, usize::MAX, &HostStats::default())
+    );
     Ok(())
 }
 
@@ -1606,40 +1632,61 @@ struct Snapshot {
     images: Vec<crate::commands::ImageEntry>,
 }
 
+/// One daemonless throughput lens: from a monotonic `total` and the prior `(total, instant)`, derive the
+/// rate/sec since the last sample, push it onto a bounded reader-side sparkline ring, and return
+/// `(rate_per_sec, session_peak, spark)`. Advances `prev` to now. Shared by the runs and box-start lenses.
+fn sample_rate(
+    total: u64,
+    prev: &mut Option<(u64, Instant)>,
+    hist: &mut Vec<f64>,
+) -> (f64, f64, Vec<f64>) {
+    const SPARK_N: usize = 48;
+    let mut rate = 0.0;
+    if let Some((pt, pi)) = *prev {
+        let dt = pi.elapsed().as_secs_f64();
+        if dt > 0.05 {
+            rate = total.saturating_sub(pt) as f64 / dt;
+        }
+    }
+    hist.push(rate);
+    if hist.len() > SPARK_N {
+        hist.remove(0);
+    }
+    let peak = hist.iter().copied().fold(0.0_f64, f64::max);
+    *prev = Some((total, Instant::now()));
+    (rate, peak, hist.clone())
+}
+
 /// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) - used
 /// on the 1 s tick, where the ~1 s delta gives a meaningful CPU percentage.
+#[allow(clippy::too_many_arguments)]
 fn refresh_full(
     prev: &mut HashMap<i32, (u64, Instant)>,
     prev_cpu: &mut Option<(u64, u64)>,
     prev_runs: &mut Option<(u64, Instant)>,
     runs_hist: &mut Vec<f64>,
+    prev_box: &mut Option<(u64, Instant)>,
+    box_hist: &mut Vec<f64>,
 ) -> Snapshot {
     let (rows, seen) = collect_rows(prev);
     *prev = seen;
     let (mut host, cpu_now) = read_host(*prev_cpu);
     *prev_cpu = cpu_now;
-    // Live `kern run` throughput from the mmap counter: cumulative total + rate since the last sample,
-    // plus the honest average setup latency (summed entry→exec µs / total).
+    // Two daemonless throughput lenses from the same mmap counter, same reader-side rate+sparkline shape
+    // (see `sample_rate`): `kern run` invocations (offset 0, + an honest average setup latency), and box
+    // STARTS (offset 16). The box lens is what makes an ephemeral agent firehose visible - the live list
+    // can't show a ~ms box, the rate can. Neither is a live "peak concurrent" (that would need a reaper).
     let (rt, lat_sum_us) = crate::runstats::snapshot();
-    if let Some((pt, pi)) = *prev_runs {
-        let dt = pi.elapsed().as_secs_f64();
-        if dt > 0.05 {
-            host.runs_per_sec = rt.saturating_sub(pt) as f64 / dt;
-        }
-    }
+    (host.runs_per_sec, host.runs_peak, host.runs_spark) = sample_rate(rt, prev_runs, runs_hist);
     host.runs_total = rt;
     host.runs_avg_us = lat_sum_us.checked_div(rt).unwrap_or(0);
-    // Reader-side sparkline: keep the last N runs/sec samples so the Runs tab shows recent shape, and
-    // track the session peak. The very first sample (no prior baseline) is 0 - harmless. One push per
-    // refresh, so at most one drop keeps the ring bounded.
-    const SPARK_N: usize = 48;
-    runs_hist.push(host.runs_per_sec);
-    if runs_hist.len() > SPARK_N {
-        runs_hist.remove(0);
-    }
-    host.runs_peak = runs_hist.iter().copied().fold(0.0_f64, f64::max);
-    host.runs_spark = runs_hist.clone();
-    *prev_runs = Some((rt, Instant::now()));
+    let bt = crate::runstats::box_total();
+    (
+        host.box_starts_per_sec,
+        host.box_starts_peak,
+        host.box_starts_spark,
+    ) = sample_rate(bt, prev_box, box_hist);
+    host.box_starts_total = bt;
     let cfg = crate::config::load(None).unwrap_or_default();
     let profs = profile_rows(&cfg);
     let vols = crate::volume::entries();
@@ -1762,6 +1809,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
 }
 
 /// A snapshot of host-wide resource use, shown in the Overview tab (like the private's `kern top`).
+#[derive(Default)]
 struct HostStats {
     mem_used: u64,
     mem_total: u64,
@@ -1780,6 +1828,14 @@ struct HostStats {
     /// recent runs/sec samples for the Runs-tab sparkline - both derived from the monotonic total.
     runs_peak: f64,
     runs_spark: Vec<f64>,
+    /// Cumulative box STARTS (daemonless runstats counter, offset 16) + derived rate/sec, session peak,
+    /// and a reader-side sparkline. This is the lens the live Boxes list can't give for EPHEMERAL boxes:
+    /// a `kern box` lives ~ms (below a 1 s refresh), so an agent firing hundreds/sec (via the SDK/MCP)
+    /// is invisible in the list but shows here as a rate. Same daemonless mmap-counter shape as runs.
+    box_starts_total: u64,
+    box_starts_per_sec: f64,
+    box_starts_peak: f64,
+    box_starts_spark: Vec<f64>,
 }
 
 impl HostStats {
@@ -1963,6 +2019,10 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
             runs_avg_us: 0,
             runs_peak: 0.0,
             runs_spark: Vec::new(),
+            box_starts_total: 0,
+            box_starts_per_sec: 0.0,
+            box_starts_peak: 0.0,
+            box_starts_spark: Vec::new(),
         },
         sample,
     )
@@ -2072,7 +2132,7 @@ fn render(
         }
         Mode::Nav => {
             match tab {
-                TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel)),
+                TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel, host)),
                 TAB_RUNS => s.push_str(&runs_table(p, host)),
                 TAB_IMAGES => s.push_str(&images_table(p, images, body_rows, sel)),
                 TAB_BUILDS => s.push_str(&builds_table(p, builds, body_rows, sel)),
@@ -2899,9 +2959,23 @@ fn builds_table(
     s
 }
 
-fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize) -> String {
+fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &HostStats) -> String {
     let (b, c, d, g, y, z) = (p.b, p.c, p.d, p.g, p.y, p.z);
     let mut s = String::new();
+    // Box-START rate. The live list below shows only boxes alive right NOW, but a `kern box` lives ~ms:
+    // an agent firing hundreds/sec (via the SDK / kern-mcp) flickers past a 1 s refresh and never appears
+    // in the list. This header counts STARTS as a rate + sparkline (same daemonless counter as the Runs
+    // tab uses for `kern run`), so the ephemeral firehose is visible even when the list is empty.
+    if host.box_starts_total > 0 {
+        let rate = host.box_starts_per_sec.round().max(0.0) as u64;
+        let col = if host.box_starts_per_sec > 0.5 { g } else { d };
+        s.push_str(&format!(
+            "  {d}box starts {z}{col}{rate}{d}/sec{z}  {d}peak {z}{}{d}/s  total {z}{}{d}   {}{z}\n",
+            host.box_starts_peak.round() as u64,
+            host.box_starts_total,
+            spark(&host.box_starts_spark)
+        ));
+    }
     s.push_str(&format!(
         "    {b}{:<16}  {:>7}  {:>8}  {:>8}  {:>5}  {:>4}  {:<9}  {:<14}  STATUS{z}\n",
         "NAME", "PID", "UPTIME", "MEM", "CPU%", "PIDS", "HEALTH", "PORTS"
@@ -3047,7 +3121,7 @@ mod tests {
         // reflects egress/landlock rather than looking identical to an unconfined box.
         let mut r = row("guarded", false);
         r.sec = "egress+landlock".to_string();
-        let out = boxes_table(&plain(), &[r], 10, usize::MAX);
+        let out = boxes_table(&plain(), &[r], 10, usize::MAX, &HostStats::default());
         let line = out.lines().find(|l| l.contains("guarded")).unwrap();
         assert!(line.contains("egress+landlock"), "badge missing: {line}");
     }
@@ -3055,7 +3129,13 @@ mod tests {
     #[test]
     fn boxes_flag_only_reduced_isolation_never_a_secure_badge() {
         // A default (fully isolated) box carries NO isolation marker - no vanity "secure" badge.
-        let out = boxes_table(&plain(), &[row("safe", false)], 10, usize::MAX);
+        let out = boxes_table(
+            &plain(),
+            &[row("safe", false)],
+            10,
+            usize::MAX,
+            &HostStats::default(),
+        );
         let safe = out.lines().find(|l| l.contains("safe")).unwrap();
         assert!(
             !safe.contains("net:host") && !safe.contains("root-mapped"),
@@ -3064,7 +3144,7 @@ mod tests {
         // A box that deviates (net:host / root-mapped / caps:+) surfaces exactly that, as a heads-up.
         let mut r = row("loose", false);
         r.iso = "net:host root-mapped caps:+".into();
-        let out2 = boxes_table(&plain(), &[r], 10, usize::MAX);
+        let out2 = boxes_table(&plain(), &[r], 10, usize::MAX, &HostStats::default());
         let loose = out2.lines().find(|l| l.contains("loose")).unwrap();
         assert!(
             loose.contains("net:host") && loose.contains("root-mapped") && loose.contains("caps:+"),
@@ -3075,11 +3155,36 @@ mod tests {
     #[test]
     fn selected_row_gets_a_caret() {
         let rows = [row("web", false), row("db", false)];
-        let out = boxes_table(&plain(), &rows, 10, 1); // db selected
+        let out = boxes_table(&plain(), &rows, 10, 1, &HostStats::default()); // db selected
         let line = out.lines().find(|l| l.contains("db")).unwrap();
         assert!(line.contains('›'), "selected row should show the caret");
         let web = out.lines().find(|l| l.contains("web")).unwrap();
         assert!(!web.contains('›'), "unselected row must not show the caret");
+    }
+
+    #[test]
+    fn boxes_table_shows_the_box_start_rate() {
+        // The ephemeral-firehose lens: when boxes have STARTED (counter > 0) the header shows a rate +
+        // total, even with an EMPTY live list (every box already flickered past). Absent when total is 0.
+        let host = HostStats {
+            box_starts_total: 1234,
+            box_starts_per_sec: 87.0,
+            box_starts_peak: 90.0,
+            box_starts_spark: vec![10.0, 40.0, 87.0],
+            ..HostStats::default()
+        };
+        let out = boxes_table(&plain(), &[], 10, usize::MAX, &host); // empty list, but starts happened
+        assert!(out.contains("box starts"), "shows the start-rate header");
+        assert!(
+            out.contains("87") && out.contains("1234"),
+            "shows rate/sec and cumulative total"
+        );
+        // absent when nothing has started
+        let none = boxes_table(&plain(), &[], 10, usize::MAX, &HostStats::default());
+        assert!(
+            !none.contains("box starts"),
+            "no rate header before any box has started"
+        );
     }
 
     #[test]
@@ -3088,13 +3193,13 @@ mod tests {
         let mut r = row("web", false);
         r.health = "healthy".into();
         r.ports = "8080->80".into();
-        let out = boxes_table(&plain(), &[r], 10, 0);
+        let out = boxes_table(&plain(), &[r], 10, 0, &HostStats::default());
         assert!(out.contains("HEALTH"), "header must include HEALTH");
         assert!(out.contains("PORTS"), "header must include PORTS");
         assert!(out.contains("healthy"), "row must show the health state");
         assert!(out.contains("8080->80"), "row must show the ports");
         // A box with no healthcheck / no ports shows a dim `-`, never an empty gap.
-        let out2 = boxes_table(&plain(), &[row("db", false)], 10, 0);
+        let out2 = boxes_table(&plain(), &[row("db", false)], 10, 0, &HostStats::default());
         let dbrow = out2.lines().find(|l| l.contains("db")).unwrap();
         assert!(dbrow.contains('-'), "no-health/no-ports row shows a dash");
     }
@@ -3116,6 +3221,10 @@ mod tests {
             runs_avg_us: 0,
             runs_peak: 0.0,
             runs_spark: Vec::new(),
+            box_starts_total: 0,
+            box_starts_per_sec: 0.0,
+            box_starts_peak: 0.0,
+            box_starts_spark: Vec::new(),
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
         // A wide terminal (≥ the ~87-col full bar) shows the live counts.
@@ -3238,7 +3347,7 @@ mod tests {
     #[test]
     fn out_of_range_selection_highlights_nothing() {
         let rows = [row("web", false)];
-        let out = boxes_table(&plain(), &rows, 10, usize::MAX); // snapshot mode
+        let out = boxes_table(&plain(), &rows, 10, usize::MAX, &HostStats::default()); // snapshot mode
         assert!(!out.contains('›'));
     }
 
@@ -3246,7 +3355,7 @@ mod tests {
     fn negative_zero_cpu_renders_as_zero() {
         let mut rows = [row("web", false)];
         rows[0].cpu_pct = -0.0;
-        let out = boxes_table(&plain(), &rows, 10, usize::MAX);
+        let out = boxes_table(&plain(), &rows, 10, usize::MAX, &HostStats::default());
         assert!(out.contains("0%"), "cpu% should render 0");
         assert!(!out.contains("-0"), "a stray -0.0 must be normalised to 0");
     }

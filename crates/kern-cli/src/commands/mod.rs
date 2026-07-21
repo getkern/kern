@@ -1119,6 +1119,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             pids_max: spec.pids_max,
         };
         let path = registry::register(&inst).ok();
+        crate::runstats::record_box(); // count this box start for kern top's box-start rate
         Some((inst, path))
     };
     // Registered → the registry entry guards the name from here on; release the start-claim
@@ -3065,8 +3066,9 @@ fn run_detached(
         pids_max: spec.pids_max,
     };
     let path = registry::register(&inst).ok();
-    // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
-    // `kern ps`. Lives in this supervisor's process group, so it's reaped on stop with everything else.
+    crate::runstats::record_box(); // count this box start for kern top's box-start rate
+                                   // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
+                                   // `kern ps`. Lives in this supervisor's process group, so it's reaped on stop with everything else.
     let health_pid = health.cmd.map(|hc| {
         spawn_health_checker(
             name.as_str().to_string(),

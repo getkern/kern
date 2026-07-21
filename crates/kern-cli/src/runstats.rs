@@ -18,7 +18,8 @@
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// A page (room for future fields). Offset 0 = u64 total count, offset 8 = u64 sum of setup-latency µs.
+// A page (room for future fields). Offset 0 = u64 `kern run` count, offset 8 = u64 sum of run
+// setup-latency µs, offset 16 = u64 box-START count (kern top's box-rate lens for ephemeral boxes).
 const MAP_LEN: usize = 4096;
 
 /// Captured once at process entry (see [`mark_start`]); [`record`] measures entry→exec against it to
@@ -71,6 +72,36 @@ pub fn record() {
             (*((ptr as *const u8).add(8) as *const AtomicU64)).fetch_add(micros, Ordering::Relaxed);
         },
     );
+}
+
+/// Record one box START. Same lock-free mmap page as [`record`], at offset 16 (box starts, kept
+/// distinct from `kern run`s at offset 0). Called once when a `kern box` registers, so `kern top` can
+/// show a box-start RATE the flickering live list can't: a box lives ~ms, below a 1 s refresh, so an
+/// agent firing hundreds of ephemeral boxes/sec is otherwise invisible except as a rate.
+pub fn record_box() {
+    let p = path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    with_map(
+        &p,
+        libc::O_RDWR | libc::O_CREAT,
+        libc::PROT_READ | libc::PROT_WRITE,
+        |ptr| unsafe {
+            // SAFETY: offset 16 is a naturally-aligned u64 within the page, only ever touched atomically.
+            (*((ptr as *const u8).add(16) as *const AtomicU64)).fetch_add(1, Ordering::Relaxed);
+        },
+    );
+}
+
+/// Cumulative box-START count (offset 16), 0 if the counter file is absent/unreadable. Read-only and
+/// lock-free, safe to sample from `kern top` each refresh; the rate is derived reader-side like runs.
+pub fn box_total() -> u64 {
+    let mut out = 0u64;
+    with_map(&path(), libc::O_RDONLY, libc::PROT_READ, |ptr| unsafe {
+        out = (*((ptr as *const u8).add(16) as *const AtomicU64)).load(Ordering::Relaxed);
+    });
+    out
 }
 
 /// `(total, setup_latency_µs_sum)` - the cumulative `kern run` count and the summed entry→exec latency
@@ -140,6 +171,32 @@ mod tests {
         record();
         record();
         assert_eq!(snapshot().0, 3, "three records → total 3");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn box_starts_count_independently_of_runs() {
+        // The box-start counter (offset 16) must be independent of the `kern run` counter (offset 0):
+        // recording box starts must not move the run total, and vice-versa.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-boxstats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+
+        assert_eq!(box_total(), 0, "fresh box counter starts at 0");
+        record_box();
+        record_box();
+        record(); // one `kern run` - must NOT bump the box counter
+        assert_eq!(box_total(), 2, "two box starts → box total 2");
+        assert_eq!(
+            snapshot().0,
+            1,
+            "one run → run total 1, unaffected by box starts"
+        );
 
         std::env::remove_var("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
