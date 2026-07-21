@@ -500,3 +500,50 @@ test("run() takes an argv array, not a string", exec, async () => {
     assert.strictEqual(r.stdout.trim(), "hi");
   });
 });
+
+// -- P1: rich mime-typed results (Jupyter/E2B-style), non-network --------------------------------
+
+test("P1 trailing expression is captured as a result", exec, async () => {
+  const r = await runCode("a = 20\nb = 22\na + b");
+  assert.strictEqual(r.success, true);
+  assert.ok(r.results.length >= 1);
+  assert.strictEqual(r.results[0].text, "42");
+});
+
+test("P1 a statement makes no result and leaves stdout intact", exec, async () => {
+  const r = await runCode("print('hello')");
+  assert.strictEqual(r.stdout.trim(), "hello");
+  assert.deepStrictEqual(r.results, []); // print returns None -> no spurious result
+});
+
+test("P1 display() and rich _repr_html_", exec, async () => {
+  const r = await runCode("display(1); display(2); print('done')");
+  assert.strictEqual(r.results.length, 2);
+  assert.strictEqual(r.results[0].text, "1");
+  assert.strictEqual(r.stdout.trim(), "done");
+  const rh = await runCode('class H:\n    def _repr_html_(self): return "<b>hi</b>"\nH()');
+  assert.strictEqual(rh.results[0].html, "<b>hi</b>");
+  assert.ok(rh.results[0].text); // html AND text/plain both present
+});
+
+test("P1 capture never alters exit code or traceback", exec, async () => {
+  const rc = await runCode("import sys; sys.exit(3)");
+  assert.strictEqual(rc.exitCode, 3);
+  const rx = await runCode('def boom():\n    raise ValueError("kaboom")\nboom()');
+  assert.strictEqual(rx.success, false);
+  assert.strictEqual(rx.fault, null);
+  assert.ok(rx.stderr.includes("ValueError: kaboom"));
+  assert.ok(!rx.stderr.includes("PY_RUNNER") && rx.stderr.includes(".cell-")); // user frames only
+});
+
+test("P1 internal cell/runner/result files are hidden and cleaned", exec, async () => {
+  await withSandbox(async (s) => {
+    const r = await s.runCode("open('user.txt', 'w').write('hi')\n'done'");
+    const names = r.files.map((f) => f.path);
+    assert.ok(names.includes("user.txt"));
+    assert.ok(!names.some((n) => n.startsWith(".cell-") || n.startsWith(".run-") || n.startsWith(".res-")));
+    const left = fs.readdirSync(s._ws).filter((n) => /^\.(cell|run|res)-/.test(n));
+    assert.deepStrictEqual(left, []);
+    assert.strictEqual(r.results[0].text, "'done'");
+  });
+});

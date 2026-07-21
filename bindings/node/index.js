@@ -36,13 +36,102 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.2";
+const VERSION = "0.1.3";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
 const DEPS_DIR = ".deps"; // pip --target dir inside the workspace (added to PYTHONPATH for python)
 const ENV_FILE = ".kern-env"; // host-side 0600 env file (kept out of argv so values don't show in `ps`)
 const INLINE_CODE_MAX = 128 * 1024; // above this, pass code via a file instead of argv (ARG_MAX guard)
+
+// Python cell runner (P1: rich mime-typed results, Jupyter/E2B-style, no Jupyter kernel). Runs INSIDE
+// the box (it is Python, regardless of which binding drove it): execs the user cell, then captures the
+// trailing bare expression's value, every display(obj) call, and every open matplotlib figure, writing
+// them as a JSON mime-bundle list the binding reads back. stdout/stderr/exit are UNTOUCHED. Kept byte-
+// identical to the Python binding's runner. __KERN_CELL__/__KERN_RES__ are substituted per call.
+const PY_RUNNER = `
+import sys, os, json, base64, io, ast, traceback, builtins
+_CELL = "__KERN_CELL__"
+_RES = "__KERN_RES__"
+_out = []
+def _bundle(o):
+    d = {}
+    for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
+                      ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if isinstance(v, str) and v:
+                    d[key] = v
+        except Exception:
+            pass
+    try:
+        fn = getattr(o, "_repr_json_", None)
+        if callable(fn):
+            v = fn()
+            if v is not None:
+                d["application/json"] = v if isinstance(v, str) else json.dumps(v)
+    except Exception:
+        pass
+    for meth, key in (("_repr_png_", "image/png"), ("_repr_jpeg_", "image/jpeg")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if v:
+                    raw = v if isinstance(v, (bytes, bytearray)) else str(v).encode()
+                    d[key] = base64.b64encode(raw).decode()
+        except Exception:
+            pass
+    if "text/plain" not in d:
+        try:
+            d["text/plain"] = repr(o)
+        except Exception:
+            d["text/plain"] = "<unrepresentable>"
+    return d
+def display(o=None, **kw):
+    if o is not None:
+        _out.append(_bundle(o))
+builtins.display = display
+sys.argv = [_CELL]
+_g = {"__name__": "__main__", "__file__": _CELL, "display": display}
+_rc = 0
+try:
+    _src = open(_CELL, "r", encoding="utf-8").read()
+    _tree = ast.parse(_src, _CELL, "exec")
+    _tail = None
+    if _tree.body and isinstance(_tree.body[-1], ast.Expr):
+        _tail = _tree.body.pop().value
+    exec(compile(_tree, _CELL, "exec"), _g)
+    if _tail is not None:
+        _val = eval(compile(ast.Expression(_tail), _CELL, "eval"), _g)
+        if _val is not None:
+            _out.append(_bundle(_val))
+except SystemExit as _e:
+    _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
+except BaseException as _e:
+    _tb = _e.__traceback__
+    while _tb is not None and _tb.tb_frame.f_code.co_filename != _CELL:
+        _tb = _tb.tb_next
+    sys.stderr.write("".join(traceback.format_exception(type(_e), _e, _tb)))
+    _rc = 1
+try:
+    if "matplotlib.pyplot" in sys.modules:
+        _plt = sys.modules["matplotlib.pyplot"]
+        for _n in _plt.get_fignums():
+            _buf = io.BytesIO()
+            _plt.figure(_n).savefig(_buf, format="png")
+            _out.append({"image/png": base64.b64encode(_buf.getvalue()).decode()})
+except Exception:
+    pass
+try:
+    with open(_RES, "w", encoding="utf-8") as _fh:
+        json.dump(_out, _fh)
+except Exception:
+    pass
+sys.exit(_rc)
+`;
 
 // Signal-derived exit codes (128 + signum) we classify.
 const EXIT_SIGKILL = 137; // SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
@@ -80,10 +169,47 @@ class MountRefused extends SandboxError {
   }
 }
 
+/** A rich, mime-typed value captured from a Python `runCode` (the way a Jupyter/E2B cell captures
+ * output): the value of the code's last bare expression, every `display(obj)` call, and every open
+ * matplotlib figure. `data` maps a MIME type to its payload; text/* and application/json are strings,
+ * image/* are base64 strings (use `.png`/`.jpeg` for Buffers). One value can carry several forms. */
+class Result {
+  constructor(data) {
+    this.data = data || {};
+  }
+  get text() {
+    return this.data["text/plain"];
+  }
+  get html() {
+    return this.data["text/html"];
+  }
+  get markdown() {
+    return this.data["text/markdown"];
+  }
+  get svg() {
+    return this.data["image/svg+xml"];
+  }
+  get json() {
+    return this.data["application/json"];
+  }
+  get png() {
+    const v = this.data["image/png"];
+    return v ? Buffer.from(v, "base64") : null;
+  }
+  get jpeg() {
+    const v = this.data["image/jpeg"];
+    return v ? Buffer.from(v, "base64") : null;
+  }
+  /** The MIME types this value was captured as. */
+  formats() {
+    return Object.keys(this.data);
+  }
+}
+
 /** The outcome of one runCode()/run(). `fault` is the source of truth for "did the SANDBOX act";
  * `exitCode`/`stdout` are what the user's code did. `success` requires both clean. */
 class ExecutionResult {
-  constructor({ stdout, stderr, exitCode, durationMs, fault, files, truncated }) {
+  constructor({ stdout, stderr, exitCode, durationMs, fault, files, truncated, results }) {
     this.stdout = stdout;
     this.stderr = stderr;
     this.exitCode = exitCode;
@@ -92,6 +218,8 @@ class ExecutionResult {
     this.fault = fault || null;
     this.files = files || [];
     this.truncated = !!truncated;
+    /** @type {Result[]} rich mime-typed values (Python runCode) */
+    this.results = results || [];
   }
   /** True iff the code exited 0 AND no sandbox fault fired. */
   get success() {
@@ -918,6 +1046,7 @@ class Sandbox {
     if (!spec)
       throw new SandboxError(`unsupported language ${JSON.stringify(language)} (v1: 'python' | 'bash' | 'node')`);
     const [runner, evalFlag, ext] = spec;
+    if (language === "python") return this._runPythonCell(code);
     let command;
     if (Buffer.byteLength(code, "utf8") > INLINE_CODE_MAX) {
       const cell = `.cell-${crypto.randomBytes(4).toString("hex")}.${ext}`;
@@ -927,6 +1056,44 @@ class Sandbox {
       command = [runner, evalFlag, code];
     }
     return this._spawn(command, { network: this.network, timeoutS: this.timeoutS });
+  }
+
+  /** Run Python through the cell runner so a trailing expression, display() calls and matplotlib
+   * figures are captured as rich mime-typed `result.results` (Jupyter/E2B-style). stdout/stderr/exit
+   * are identical to a plain run; capture is best-effort. Internal cell/runner/results files are
+   * removed and hidden from `result.files`. */
+  async _runPythonCell(code) {
+    const uid = crypto.randomBytes(4).toString("hex");
+    const cell = `.cell-${uid}.py`;
+    const resf = `.res-${uid}.json`;
+    const runf = `.run-${uid}.py`;
+    await this.writeFile(cell, code);
+    const shim = PY_RUNNER.replace("__KERN_CELL__", `${WORKSPACE}/${cell}`).replace(
+      "__KERN_RES__",
+      `${WORKSPACE}/${resf}`,
+    );
+    await this.writeFile(runf, shim);
+    const result = await this._spawn(["python3", `${WORKSPACE}/${runf}`], {
+      network: this.network,
+      timeoutS: this.timeoutS,
+    });
+    try {
+      const parsed = JSON.parse(await this.readFile(resf));
+      if (Array.isArray(parsed))
+        result.results = parsed.filter((r) => r && typeof r === "object").map((r) => new Result(r));
+    } catch {
+      /* no results file / unreadable / bad JSON: leave results empty, run otherwise intact */
+    }
+    const internal = new Set([cell, resf, runf]);
+    for (const name of internal) {
+      try {
+        fs.unlinkSync(path.join(this._ws, name));
+      } catch {
+        /* ignore */
+      }
+    }
+    result.files = result.files.filter((fi) => !internal.has(fi.path));
+    return result;
   }
 
   /** Run an arbitrary `command` (an argv ARRAY, never a shell string) in a fresh box. */
@@ -968,6 +1135,7 @@ module.exports = {
   withSandbox,
   runCode,
   ExecutionResult,
+  Result,
   SandboxError,
   MountRefused,
   version: VERSION,

@@ -132,6 +132,7 @@ class ExecutionResult:
     duration_ms: int
     fault: SandboxFault | None   # set ONLY when the SANDBOX acted; None for ordinary user-code failures
     files: list[FileInfo]        # workspace files created/modified this step (.deps excluded)
+    results: list[Result]        # rich mime-typed values: last expression, display(), matplotlib figures
     success: bool                # exit_code == 0 AND fault is None
 ```
 
@@ -154,17 +155,26 @@ class ExecutionResult:
 - `Sandbox(...).snapshot(dest)` / `.restore(src)`, a portable `.tar.gz` FILESYSTEM checkpoint of the
   workspace (not a memory snapshot). `restore` refuses absolute, `..` and symlink members.
 
-## Returning charts, live output, and checkpoints
+## Returning charts, rich results, live output, and checkpoints
 
-**Charts / artifacts (the "code interpreter" pattern).** kern has no Jupyter kernel, so instead of
-auto-capturing `plt.show()`, have the code WRITE the artifact to the workspace, then read it back:
+**Rich results (the "code interpreter" pattern).** Like a Jupyter/E2B cell, `run_code` captures rich,
+mime-typed values into `result.results` (a list of `Result`), with **no Jupyter kernel**: it captures
+the value of the code's **last bare expression**, every **`display(obj)`** call, and **every open
+matplotlib figure automatically** (no `savefig` needed). Each `Result.data` maps a MIME type to its
+payload; convenience accessors: `.png`/`.jpeg` (bytes), `.html`, `.svg`, `.markdown`, `.json`, `.text`.
 
 ```python
-with kern.Sandbox(setup="pip install matplotlib") as sbx:
-    sbx.run_code("import matplotlib; matplotlib.use('Agg')\n"
-                 "import matplotlib.pyplot as plt; plt.plot([1,4,9]); plt.savefig('chart.png')")
-    png = sbx.read_file("chart.png")   # bytes, ready to send back to the model / user
+with kern.Sandbox(setup="pip install matplotlib pandas") as sbx:
+    r = sbx.run_code("import matplotlib; matplotlib.use('Agg')\n"
+                     "import matplotlib.pyplot as plt; plt.plot([1, 4, 9])")
+    png = r.results[0].png              # PNG bytes of the figure, auto-captured; send to the model
+
+    r = sbx.run_code("import pandas as pd; pd.DataFrame({'a': [1, 2]})")
+    r.results[0].html                  # the DataFrame as an HTML table (also .text for plain)
 ```
+
+Capture never touches `stdout`/`stderr`/`exit_code`; a statement that returns `None` (e.g. `print(...)`)
+produces no result. You can still write an artifact to the workspace and `read_file` it if you prefer.
 
 **Live output.** Pass `on_stdout` / `on_stderr` callbacks to stream each chunk as it arrives (the full
 capped output is still in `result.stdout`). The callback is best-effort, not lossless: a slow callback

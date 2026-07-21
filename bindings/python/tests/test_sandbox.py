@@ -14,7 +14,7 @@ import time
 import pytest
 
 import kern_sandbox as kern
-from kern_sandbox import ExecutionResult, MountRefused, Sandbox, SandboxError
+from kern_sandbox import ExecutionResult, MountRefused, Result, Sandbox, SandboxError
 
 _FAKE_KERN = shutil.which("true") or "/bin/true"
 
@@ -260,6 +260,53 @@ def test_c5b_blocked_syscall_is_escape_blocked():
     with Sandbox(timeout_s=20) as s:
         r = s.run_code("import ctypes; ctypes.CDLL(None).mount(0, 0, 0, 0, 0)")
     assert r.fault is not None and r.fault.type == "escape_blocked"
+
+
+# -- P1: rich mime-typed results (Jupyter/E2B-style), non-network ------------------------------------
+
+
+@integration
+def test_p1_trailing_expression_is_a_result():
+    with Sandbox(timeout_s=30) as s:
+        r = s.run_code("a = 20\nb = 22\na + b")
+    assert r.success and r.results and isinstance(r.results[0], Result)
+    assert r.results[0].text == "42"
+
+
+@integration
+def test_p1_statement_produces_no_result_and_stdout_intact():
+    with Sandbox(timeout_s=30) as s:
+        r = s.run_code("print('hello')")
+    assert r.stdout.strip() == "hello" and r.results == []  # print returns None -> no spurious result
+
+
+@integration
+def test_p1_display_and_rich_repr():
+    with Sandbox(timeout_s=30) as s:
+        r = s.run_code("display(1); display(2); print('done')")
+        rh = s.run_code("class H:\n    def _repr_html_(self): return '<b>hi</b>'\nH()")
+    assert len(r.results) == 2 and r.results[0].text == "1" and r.stdout.strip() == "done"
+    assert rh.results and rh.results[0].html == "<b>hi</b>" and rh.results[0].text  # html + plain both
+
+
+@integration
+def test_p1_capture_never_alters_exit_or_traceback():
+    with Sandbox(timeout_s=30) as s:
+        rc = s.run_code("import sys; sys.exit(3)")
+        rx = s.run_code("def boom():\n    raise ValueError('kaboom')\nboom()")
+    assert rc.exit_code == 3  # exit code preserved through the runner
+    assert not rx.success and rx.fault is None and "ValueError: kaboom" in rx.stderr
+    assert "_PY_RUNNER" not in rx.stderr and "traceback.format_exception" not in rx.stderr  # user frames only
+
+
+@integration
+def test_p1_internal_files_hidden_and_cleaned():
+    with Sandbox(timeout_s=30) as s:
+        r = s.run_code("open('user.txt', 'w').write('hi')\n'done'")
+        left = [n for n in os.listdir(s._ws) if n.startswith((".cell-", ".run-", ".res-"))]
+    names = [fi.path for fi in r.files]
+    assert "user.txt" in names and not any(n.startswith((".cell-", ".run-", ".res-")) for n in names)
+    assert left == [] and r.results[0].text == "'done'"
 
 
 @integration

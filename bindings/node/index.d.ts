@@ -17,6 +17,29 @@ export interface FileInfo {
   change: "created" | "modified";
 }
 
+/** A rich, mime-typed value captured from a Python `runCode` (Jupyter/E2B-style): the code's last bare
+ * expression, every `display(obj)` call, and every open matplotlib figure. `data` maps a MIME type to
+ * its payload (text/* and application/json are strings; image/* are base64). One value, several forms. */
+export class Result {
+  data: Record<string, string>;
+  /** text/plain */
+  readonly text?: string;
+  /** text/html */
+  readonly html?: string;
+  /** text/markdown */
+  readonly markdown?: string;
+  /** image/svg+xml */
+  readonly svg?: string;
+  /** application/json */
+  readonly json?: string;
+  /** image/png decoded to a Buffer, or null */
+  readonly png: Buffer | null;
+  /** image/jpeg decoded to a Buffer, or null */
+  readonly jpeg: Buffer | null;
+  /** The MIME types this value was captured as. */
+  formats(): string[];
+}
+
 /** The outcome of one runCode()/run(). `fault` is the source of truth for "did the sandbox act";
  * `exitCode`/`stdout` are what the user's code did. `success` requires both clean. */
 export class ExecutionResult {
@@ -29,6 +52,8 @@ export class ExecutionResult {
   files: FileInfo[];
   /** stdout/stderr hit the capture cap and overflow was discarded. */
   truncated: boolean;
+  /** Rich mime-typed values (Python runCode): last expression, display(), matplotlib figures. */
+  results: Result[];
   /** True iff the code exited 0 AND no sandbox fault fired. */
   readonly success: boolean;
 }
