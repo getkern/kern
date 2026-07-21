@@ -240,7 +240,7 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 
 Served from **github.com** (read the script first if you like). It downloads the release binary for
 your arch and verifies the sha256 before installing. No Rust toolchain required. (`getkern.dev/install.sh`
-is a short alias. On macOS, run it inside a Linux VM.)
+is a short alias.)
 
 **🪟 Windows.** One line in PowerShell (no Docker Desktop, no Ubuntu):
 
@@ -463,7 +463,6 @@ or `KERN_BIN`); see [bindings/python](bindings/python) ([PyPI](https://pypi.org/
 | NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated |
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
-| macOS (Intel / Apple Silicon) | any | ⚠️ inside a Linux VM only (Lima / Colima / OrbStack); no native port, by design |
 
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux
@@ -630,11 +629,6 @@ governs is driven by what proves useful.
   distro are **built by the release CI from tagged source and sha256-signed**; the installer verifies
   every download, so it's the same trust level as the Linux binaries, not a hand-uploaded exe. Honest caveat: kern runs *inside* the WSL2
   kernel, so it doesn't shed the VM weight native Linux does; the win is "no Docker Desktop", not "no VM".
-- **macOS, via a Linux VM (planned).** The same model as Windows: a thin `kern` shim on the Mac drives a
-  lightweight Linux VM (Lima / Apple's Virtualization.framework) where the real boxes run, so namespaces
-  and hard caps stay kernel-real *inside* the VM. Same honest caveat as WSL2: macOS has no Linux kernel to
-  borrow, so the win is "no Docker Desktop", not "no VM". Targets local agent/dev workflows on Apple
-  Silicon; a native macOS sandbox is a non-goal (it would contradict the daemonless, kernel-cgroup model).
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. It lands incrementally,
   each stage useful on its own and each opt-in (`--no-gpu` stays the default): first **safe access +
   visibility** (device passthrough, driver-gated, sysfs/procfs masked; per-box VRAM + utilisation in

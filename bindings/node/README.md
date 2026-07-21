@@ -35,8 +35,8 @@ You also need the `kern` binary on `PATH` (or point `$KERN_BIN` at it). One line
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-kern needs a Linux kernel with unprivileged user namespaces + cgroup v2. On Windows it runs under WSL2;
-on macOS, inside a Linux VM. Node 18+.
+kern needs a Linux kernel with unprivileged user namespaces + cgroup v2. On Windows it runs under WSL2.
+Node 18+.
 
 ## A session: files persist, processes are ephemeral
 
