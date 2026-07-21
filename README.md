@@ -410,7 +410,7 @@ r = kern.run_code("import urllib.request as u; ...",
 with kern.Sandbox(setup="pip install matplotlib pandas", timeout_s=60) as s:
     r = s.run_code("import matplotlib; matplotlib.use('Agg')\n"
                    "import matplotlib.pyplot as plt; plt.plot([1, 4, 9])")
-    png = r.results[0].png                 # PNG bytes of the chart, no savefig; send to the model
+    png = next((x.png for x in r.results if x.png), None)   # chart PNG bytes, no savefig; send to the model
     r = s.run_code("import pandas as pd; pd.DataFrame({'a': [1, 2]})")
     r.results[0].html                      # the DataFrame as an HTML table (also .text)
 ```
@@ -450,6 +450,7 @@ the timeout, so a `timeout` fault is a fact, not a guess. All three use the inst
 | NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated |
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
+| macOS (Intel / Apple Silicon) | any | ⚠️ inside a Linux VM only (Lima / Colima / OrbStack); no native port, by design |
 
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux

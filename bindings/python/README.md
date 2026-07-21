@@ -19,7 +19,7 @@ with kern.Sandbox(setup="pip install pandas matplotlib") as sbx:
 
     r = sbx.run_code("import matplotlib; matplotlib.use('Agg')\n"
                      "import matplotlib.pyplot as p; p.plot([1, 4, 9])")
-    png = r.results[0].png   # PNG bytes of the chart, auto-captured (no savefig)
+    png = next((x.png for x in r.results if x.png), None)   # chart PNG bytes, auto-captured (no savefig)
 ```
 
 A thin, safe wrapper around the [`kern`](https://github.com/getkern/kern) binary, it shells out to
@@ -97,7 +97,8 @@ Sandbox(
     max_output_bytes=64 << 20,  # cap on captured stdout/stderr EACH; overflow discarded, result.truncated set
     deps_readonly=False,        # True → run_code can't modify setup= deps (blocks cross-run poisoning)
     enforce_limits=True,        # hard-enforce caps via a systemd scope; False = best-effort, faster under load
-)
+    track_files=True,           # populate result.files by diffing the workspace each call (O(files)); a long
+)                               # session that accretes files slows run_code -> set False (result.files [], O(1))
 ```
 
 Host mounts over sensitive sources (`/`, `/etc`, `$HOME`, the docker socket, …) are **refused even if
@@ -114,6 +115,11 @@ with kern.Sandbox(profiles=["vcpu:heavy", "vgpio:sensors"]) as sbx:
     sbx.run_code("import board  # only /dev/i2c-1 from the vgpio:sensors profile is visible")
 ```
 
+A `vcpu:` profile can carry both `cpus=` and `memory=`. **Precedence:** `memory_mb`/`cpus` are passed as
+explicit flags, and kern's "explicit flag wins over profile" rule means they **override** the profile's
+own values. Since `memory_mb` defaults to `512`, that default **shadows** a profile's `memory=`; pass
+`memory_mb=None` (and/or `cpus=None`) to let the profile's slice apply, or set the value you want.
+
 **Network policy:** the network is on **only** during `setup=` (a separate box that dies when setup
 ends); every `run_code` runs network-off. There is no per-call network override, `network=True` is a
 session-level, explicit choice.
@@ -122,6 +128,10 @@ session-level, explicit choice.
 writable, so code run in a session *can* modify the deps a later step in the **same session** sees
 (sessions are isolated from each other, distinct workspace). If you run untrusted code and need dep
 integrity across steps, pass `deps_readonly=True`.
+
+The setup box runs under the **same `memory_mb` cap** as your `run_code` calls. A heavy install
+(`pip install pandas numpy matplotlib`, `torch`, ...) can OOM-kill setup (exit -9) at the default
+512 MB, raise `memory_mb` for the session (e.g. `memory_mb=1536`) when you install a large stack.
 
 ## Results, and what a fault means
 
@@ -169,7 +179,7 @@ payload; convenience accessors: `.png`/`.jpeg` (bytes), `.html`, `.svg`, `.markd
 with kern.Sandbox(setup="pip install matplotlib pandas") as sbx:
     r = sbx.run_code("import matplotlib; matplotlib.use('Agg')\n"
                      "import matplotlib.pyplot as plt; plt.plot([1, 4, 9])")
-    png = r.results[0].png              # PNG bytes of the figure, auto-captured; send to the model
+    png = next((x.png for x in r.results if x.png), None)   # figure PNG bytes; send to the model
 
     r = sbx.run_code("import pandas as pd; pd.DataFrame({'a': [1, 2]})")
     r.results[0].html                  # the DataFrame as an HTML table (also .text for plain)
@@ -177,6 +187,29 @@ with kern.Sandbox(setup="pip install matplotlib pandas") as sbx:
 
 Capture never touches `stdout`/`stderr`/`exit_code`; a statement that returns `None` (e.g. `print(...)`)
 produces no result. You can still write an artifact to the workspace and `read_file` it if you prefer.
+
+**Warm kernel (kill the interpreter boot).** Each `run_code` starts a **fresh** interpreter, so it pays
+the CPython boot (~10 ms) every call. When you run many cells that share state (a REPL, a notebook, an
+agent's tool loop), open a `kernel()`: ONE warm interpreter in a long-lived box, fed cells over a pipe.
+In-memory state persists across cells and the per-cell cost drops from ~16 ms to **sub-millisecond**
+(~400x). Same rich `results` capture as `run_code`.
+
+```python
+with kern.Sandbox() as sbx, sbx.kernel() as k:
+    k.run_code("import numpy as np; a = np.arange(1_000_000)")   # imports paid once
+    r = k.run_code("a.sum()")                                    # 'a' is still here; ~sub-ms
+    print(r.results[0].text)                                     # 499999500000
+```
+
+The trade vs `run_code`: cells in a kernel share one process and one box, so it is call-fast but not
+call-isolated (still network-off and resource-capped like any box; a fresh session or kernel is clean).
+An uncaught error is confined (rc=1, traceback on `stderr`, the kernel keeps serving); a per-cell
+`timeout_s` tears the kernel down (a running cell cannot be interrupted without killing the interpreter),
+after which the kernel refuses further cells with a clear error.
+
+**Per-call overrides.** `run_code(...)` and `run(...)` accept `timeout_s`, `on_stdout` and `on_stderr`
+as per-call arguments that override the session defaults for that one call (`timeout_s=None` inherits
+the session's; a callback defaults to the session's, an explicit `None` disables it for the call).
 
 **Live output.** Pass `on_stdout` / `on_stderr` callbacks to stream each chunk as it arrives (the full
 capped output is still in `result.stdout`). The callback is best-effort, not lossless: a slow callback
@@ -188,6 +221,30 @@ kern.run_code("for i in range(3): print(i)", on_stdout=lambda b: print(b.decode(
 
 **Checkpoints.** `snapshot`/`restore` (or reusing a `workspace=` path) resume the file state of a
 session later or on another host, cheaply and without a running VM.
+
+## Use it from Claude Desktop / Cursor (MCP)
+
+The package ships **`kern-mcp`**, a dependency-free [Model Context Protocol](https://modelcontextprotocol.io)
+stdio server that exposes the sandbox as a **local** code-interpreter tool: the model writes code, kern
+runs it on your machine, and charts come back as images the model can see. Point any MCP client at it:
+
+```json
+{
+  "mcpServers": {
+    "kern": {
+      "command": "kern-mcp",
+      "env": { "KERN_MCP_SETUP": "pip install numpy pandas matplotlib" }
+    }
+  }
+}
+```
+
+Tools: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`. File state persists across
+calls (a workspace on disk); each call is a fresh, **network-off** box. Optional env: `KERN_MCP_IMAGE`,
+`KERN_MCP_SETUP` (a one-time `pip install`), `KERN_MCP_MEMORY_MB`, `KERN_MCP_TIMEOUT`, `KERN_MCP_WORKSPACE`
+(persist the workspace), `KERN_MCP_PROFILES` (comma-separated kern.toml profiles, e.g.
+`vcpu:heavy,vgpio:sensors`, the only way to grant an edge agent a hardware device set). Run it standalone
+with `python -m kern_sandbox.mcp`.
 
 ## Threat model (honest)
 

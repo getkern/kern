@@ -72,7 +72,9 @@ export interface SandboxOptions {
   setup?: string;
   /** Host dir to persist as the workspace. Omit -> a temp dir, created on open() and deleted on close(). */
   workspace?: string;
-  /** RAM cap in MiB (kern --memory). Default 512. null = uncapped default. */
+  /** RAM cap in MiB (kern --memory). Default 512. Passed as an explicit --memory, so by kern's
+   * "explicit flag wins over profile" rule the default OVERRIDES a `vcpu:` profile's own `memory=`;
+   * pass `null` to let the profile's memory apply (uncapped if the profile carries none). */
   memoryMb?: number | null;
   /** CPU cap in cores (kern --cpus). null (default) = uncapped. */
   cpus?: number | null;
@@ -106,6 +108,9 @@ export interface SandboxOptions {
   enforceLimits?: boolean;
   /** Mount setup= deps read-only for runCode (blocks cross-run dependency poisoning). Default false. */
   depsReadonly?: boolean;
+  /** true (default) populates result.files by walking the workspace before AND after each call (O(N) in
+   * file count; a long session that accretes files slows every runCode). false = result.files [], O(1). */
+  trackFiles?: boolean;
   /** Called with each stdout Buffer chunk as it arrives (live streaming). The full capped output is
    * still captured in the result, so you can stream AND read result.stdout. */
   onStdout?: (chunk: Buffer) => void;
@@ -115,6 +120,17 @@ export interface SandboxOptions {
 
 export type Language = "python" | "bash" | "node";
 
+/** Per-call overrides for runCode()/run(): each defaults to the Sandbox's constructor value; an explicit
+ * value applies to this call only (a `null` callback disables streaming for the call). */
+export interface PerCallOptions {
+  /** Wall-clock limit in seconds for THIS call. Omit to inherit the session's timeoutS. */
+  timeoutS?: number;
+  /** Stream each stdout Buffer chunk for this call; null disables. Omit to inherit the session's. */
+  onStdout?: ((chunk: Buffer) => void) | null;
+  /** Stream each stderr Buffer chunk for this call; null disables. Omit to inherit the session's. */
+  onStderr?: ((chunk: Buffer) => void) | null;
+}
+
 /** A configured kernel sandbox. FILE state persists across runCode/run in a workspace on disk; each
  * call runs in a FRESH ephemeral box. Safe by default; every relaxing option says so. */
 export class Sandbox {
@@ -123,10 +139,12 @@ export class Sandbox {
   open(): Promise<this>;
   /** Delete the workspace iff we created it. Idempotent. */
   close(): Promise<void>;
-  /** Run a snippet on the workspace in a fresh, network-off box. File state persists; memory does not. */
-  runCode(code: string, opts?: { language?: Language }): Promise<ExecutionResult>;
-  /** Run an argv ARRAY (never a shell string) in a fresh box. */
-  run(command: string[]): Promise<ExecutionResult>;
+  /** Run a snippet on the workspace in a fresh, network-off box. File state persists; memory does not.
+   * `timeoutS`/`onStdout`/`onStderr` override the session defaults for this call only. */
+  runCode(code: string, opts?: { language?: Language } & PerCallOptions): Promise<ExecutionResult>;
+  /** Run an argv ARRAY (never a shell string) in a fresh box. `timeoutS`/`onStdout`/`onStderr` override
+   * the session defaults for this call only. */
+  run(command: string[], opts?: PerCallOptions): Promise<ExecutionResult>;
   /** Write data to a workspace-relative path (host-direct, O_NOFOLLOW on the final component). */
   writeFile(path: string, data: Buffer | string): Promise<void>;
   /** Read a workspace-relative path (host-direct, O_NOFOLLOW). */
@@ -137,6 +155,25 @@ export class Sandbox {
   restore(src: string): void;
   /** List regular files under the workspace (excludes .deps). */
   listFiles(subdir?: string): Promise<FileInfo[]>;
+  /** Open a persistent, WARM Python interpreter in a long-lived box (warm-start): cells run in ONE
+   * resident process, so in-memory state PERSISTS across cells and the per-cell cost drops from a full
+   * interpreter boot (~10 ms) to sub-millisecond. Returns an OPEN Kernel; call `await k.close()` when
+   * done. Trade vs runCode: call-fast but NOT call-isolated (one process, one box; still network-off and
+   * resource-capped; a fresh session/kernel is clean). A per-cell timeout tears the kernel down. */
+  kernel(opts?: { timeoutS?: number }): Promise<Kernel>;
+}
+
+/** A warm, persistent Python interpreter in one long-lived box (see `Sandbox.kernel`). `runCode` sends a
+ * cell over a pipe to the resident interpreter and resolves to an ExecutionResult with captured
+ * stdout/stderr, exit code and rich `results`. In-memory state persists across cells; the box stays
+ * network-off and resource-capped. `close()` (or a per-cell timeout) tears the box down. */
+export class Kernel {
+  /** Execute `code` in the warm interpreter; in-memory state persists from the previous cell. A trailing
+   * expression, display() calls and matplotlib figures are captured into `results`. `timeoutS` overrides
+   * the kernel's deadline for this cell; exceeding it tears the kernel down and returns a timeout fault. */
+  runCode(code: string, opts?: { timeoutS?: number }): Promise<ExecutionResult>;
+  /** Tear down the kernel box (close its stdin, then SIGKILL its process group) and remove its driver. */
+  close(): Promise<void>;
 }
 
 /** Open a Sandbox, run `fn(sandbox)`, and close it even if `fn` throws. The session helper. */
