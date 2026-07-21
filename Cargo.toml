@@ -13,7 +13,7 @@ members = [
 exclude = ["fuzz", "windows/kern-win"]
 
 [workspace.package]
-version = "0.6.8"
+version = "0.6.9"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"

@@ -1,0 +1,11 @@
+# Strip build-machine paths from the SHIPPED binary so a panic Location or embedded path never leaks who
+# built it or where. Remaps the paths that actually ship: the GitHub Actions runner home (`/home/runner`,
+# which also covers its `.cargo`/`.rustup`/workspace subdirs) and container `/root` builds, to a neutral
+# `/build`. A prefix that does not match on a given machine is simply a no-op, so this is safe for local
+# contributor builds. `trim-paths` would be cleaner but is not stabilized on the pinned stable Cargo, and
+# the release workflow deliberately sets no RUSTFLAGS (env RUSTFLAGS would OVERRIDE, not merge with, this).
+[build]
+rustflags = [
+    "--remap-path-prefix=/home/runner=/build",
+    "--remap-path-prefix=/root=/build",
+]
