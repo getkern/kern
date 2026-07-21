@@ -563,9 +563,12 @@ alone is a ~186 MB daemon stack).
 
 kern is the fastest sandbox here at **~1.9 ms** (ahead of bubblewrap). Its *own* box setup is **~1 ms**
 (the `KERN_TIMING` phases: `unshare` + overlay + `/dev` + pivot + seccomp, each sub-ms); the rest is
-process start + teardown. Adding a hard cgroup cap (the row above doesn't) brings it to **~5.5 ms**, but
-**most of that is external `systemd-run` + D-Bus scope creation, not kern** (`systemd-run --user --scope
--- true` alone is ~4 ms), opt-out with `KERN_NO_SCOPE` (back to ~1.9 ms, best-effort in-process cgroup). The
+process start + teardown. Adding a hard cgroup cap costs about **+1 ms** when the cgroup is already
+delegated (a systemd user session writes `memory.max` directly, **~2.7 ms** total, this is the common
+desktop case and what the demo shows). Where kern must create the delegated scope itself it shells out
+to `systemd-run`, which brings it to **~5.5 ms**, but **most of that is external `systemd-run` + D-Bus
+scope creation, not kern** (`systemd-run --user --scope -- true` alone is ~4 ms); `KERN_NO_SCOPE` opts
+out (back to ~1.9 ms, best-effort in-process cgroup). The
 top tier is all within a few ms: *nobody* wins single-shot latency outright. The real gap is to the
 **engines**: **~80-160× faster** than podman (~155 ms) / Docker (~308 ms), which round-trip a daemon every run, yet
 kern alone ships a full daemonless container UX in ~1.6 MB. Beyond one start: **~500 boxes/s**, **~7 MB**
