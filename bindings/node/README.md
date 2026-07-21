@@ -2,6 +2,9 @@
 
 Run LLM/agent-generated code in a fast, **local**, daemonless kernel sandbox, straight from Node.
 
+On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). For Python, the same
+package is on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/).
+
 It is a thin, dependency-free wrapper around the [`kern`](https://github.com/getkern/kern) binary:
 a fresh, isolated box per call, network off by default, hard resource caps, and a timeout the binding
 itself enforces. E2B/Firecracker territory, but local and about 1.6 MB, with no cloud, no account, no VM.
