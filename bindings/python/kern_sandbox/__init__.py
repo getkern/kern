@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -52,6 +53,7 @@ from typing import Callable, Literal, Mapping, Sequence
 
 __all__ = [
     "Sandbox",
+    "Kernel",
     "ExecutionResult",
     "Result",
     "SandboxFault",
@@ -61,7 +63,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.5"
+__version__ = "0.1.7"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -74,6 +76,10 @@ _ENV_FILE = ".kern-env"  # host-side 0600 env file (kept out of argv so values d
 # Cap the results file the (untrusted) box writes before the binding reads it back into host RAM: a
 # malicious cell could stream a multi-GB `.res` to disk (past its own memory cap) and OOM the host.
 _RESULTS_MAX = 64 * 1024 * 1024  # 64 MiB: generous for charts/tables, bounds the attacker-controlled read
+
+# Sentinel for per-call kwargs that DEFAULT to the Sandbox value: `_UNSET` means "inherit the
+# constructor's", whereas an explicit `None` means "disable" (used for on_stdout/on_stderr overrides).
+_UNSET: object = object()
 
 # Python cell runner (P1: rich mime-typed results, Jupyter/E2B-style, WITHOUT a Jupyter kernel). It
 # execs the user cell, then captures (a) the value of a trailing bare expression, (b) every display(obj)
@@ -198,6 +204,193 @@ try:
 except Exception:
     pass
 sys.exit(_rc)
+'''
+
+# Persistent-kernel driver (warm-start: kill the ~10 ms CPython boot). Unlike _PY_RUNNER (a fresh
+# interpreter per call), this runs ONCE inside a long-lived box and then services many cells from one
+# resident process, so in-memory state PERSISTS across cells (a REPL/notebook, not a fresh box) and the
+# per-cell cost drops to sub-millisecond. It is warm, so its imports are paid once at startup (not on any
+# hot path), which is why it can freely `import json/ast/io/base64` where _PY_RUNNER hand-rolls them.
+# Protocol on the box's stdin/stdout (length-prefixed frames): host writes `<n>\n` + n UTF-8 bytes of
+# cell source; the driver execs it (capturing stdout/stderr into buffers, the trailing expression, every
+# display(), and matplotlib figures) and writes back `<m>\n` + m UTF-8 bytes of a JSON reply
+# {stdout, stderr, rc, results:[mime-bundle,...]}. User prints go to a buffer, never the real stdout, so
+# the control channel stays clean. Any per-cell error is confined; the driver keeps serving.
+_PY_KERNEL_DRIVER = r'''
+import sys, io, json, base64, builtins, ast, os, threading
+_g = {"__name__": "__main__"}
+_out = []
+def _bundle(o):
+    d = {}
+    for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
+                      ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if isinstance(v, str) and v:
+                    d[key] = v
+        except Exception:
+            pass
+    try:
+        fn = getattr(o, "_repr_json_", None)
+        if callable(fn):
+            v = fn()
+            if v is not None:
+                d["application/json"] = v if isinstance(v, str) else json.dumps(v)
+    except Exception:
+        pass
+    for meth, key in (("_repr_png_", "image/png"), ("_repr_jpeg_", "image/jpeg")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if v:
+                    raw = v if isinstance(v, (bytes, bytearray)) else str(v).encode()
+                    d[key] = base64.b64encode(raw).decode()
+        except Exception:
+            pass
+    if "text/plain" not in d:
+        try:
+            d["text/plain"] = repr(o)
+        except Exception:
+            d["text/plain"] = "<unrepresentable>"
+    return d
+def display(o=None, **kw):
+    if o is not None:
+        _out.append(_bundle(o))
+builtins.display = display
+# Make the CONTROL channel private so user code (a raw os.write, a C extension, a subprocess reading
+# stdin) can NEVER corrupt a reply on stdout nor steal a cell off stdin. dup the real stdin(0)/stdout(1)
+# to close-on-exec control fds; then point fd 0 at /dev/null and fd 1/2 at pipes drained in the
+# background, so raw/subprocess output is CAPTURED (and >64 KiB never deadlocks) instead of hitting the
+# control channel. Uses only fds 0/1 (which always survive kern's box setup) and re-plumbs inside the box.
+_ctrl_in = os.dup(0)
+_ctrl_out = os.dup(1)
+os.set_inheritable(_ctrl_in, False)
+os.set_inheritable(_ctrl_out, False)
+_nul = os.open(os.devnull, os.O_RDONLY)
+os.dup2(_nul, 0)
+os.close(_nul)
+_u1r, _u1w = os.pipe()
+os.dup2(_u1w, 1)
+os.close(_u1w)
+_u2r, _u2w = os.pipe()
+os.dup2(_u2w, 2)
+os.close(_u2w)
+_CAP = 64 * 1024 * 1024
+_MARK = b"\x00\x01KRNCELLDONE\x01\x00"  # per-cell barrier sentinel written to user fd 1/2 after exec
+_ulock = threading.Lock()
+_ubuf = {1: bytearray(), 2: bytearray()}
+_mevt = {1: threading.Event(), 2: threading.Event()}
+def _drain(fd, key):
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        with _ulock:
+            _b = _ubuf[key]
+            _b += chunk
+            _i = _b.find(_MARK)
+            if _i >= 0:
+                del _b[_i:_i + len(_MARK)]  # strip the barrier sentinel; signal the cell it is drained
+                _mevt[key].set()
+            if len(_b) > _CAP:
+                del _b[_CAP:]
+threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
+threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
+_MAIN_PID = os.getpid()  # a cell that raw os.fork()s copies this whole process; the child must NOT re-enter
+_rin = os.fdopen(_ctrl_in, "rb")
+def _read():
+    line = _rin.readline()
+    if not line:
+        return None
+    n = int(line.strip())
+    buf = b""
+    while len(buf) < n:
+        chunk = _rin.read(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf.decode("utf-8")
+def _write(obj):
+    b = json.dumps(obj).encode("utf-8")
+    _data = memoryview(str(len(b)).encode() + b"\n" + b)
+    while _data:
+        _data = _data[os.write(_ctrl_out, _data):]
+while True:
+    _code = _read()
+    if _code is None:
+        break
+    _out.clear()
+    with _ulock:
+        _m1, _m2 = len(_ubuf[1]), len(_ubuf[2])
+    _so, _se = io.StringIO(), io.StringIO()
+    _rc = 0
+    _oo, _oe, _oi = sys.stdout, sys.stderr, sys.stdin
+    sys.stdout, sys.stderr = _so, _se
+    # Point user stdin at an empty stream so input()/sys.stdin.read() gets EOF instead of consuming the
+    # NEXT control frame off the real pipe (which would deadlock the kernel and desync the protocol).
+    sys.stdin = io.StringIO("")
+    try:
+        _tree = ast.parse(_code, "<cell>", "exec")
+        _tail = None
+        if _tree.body and isinstance(_tree.body[-1], ast.Expr):
+            _tail = ast.Expression(_tree.body.pop().value)
+            ast.fix_missing_locations(_tail)
+        exec(compile(_tree, "<cell>", "exec"), _g)
+        if _tail is not None:
+            _v = eval(compile(_tail, "<cell>", "eval"), _g)
+            if _v is not None:
+                _out.append(_bundle(_v))
+    except SystemExit as _e:
+        _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
+    except BaseException as _e:
+        import traceback
+        _tb = _e.__traceback__
+        while _tb is not None and _tb.tb_frame.f_code.co_filename != "<cell>":
+            _tb = _tb.tb_next
+        _se.write("".join(traceback.format_exception(type(_e), _e, _tb)))
+        _rc = 1
+    finally:
+        sys.stdout, sys.stderr, sys.stdin = _oo, _oe, _oi
+    if os.getpid() != _MAIN_PID:
+        # A cell called raw os.fork(): this is the CHILD. It must not re-enter the loop, write a reply,
+        # or touch the control channel (that would spawn a rogue driver clone corrupting the protocol).
+        os._exit(0)
+    try:
+        if "matplotlib.pyplot" in sys.modules:
+            _plt = sys.modules["matplotlib.pyplot"]
+            for _num in _plt.get_fignums():
+                _b = io.BytesIO()
+                _plt.figure(_num).savefig(_b, format="png")
+                _out.append({"image/png": base64.b64encode(_b.getvalue()).decode()})
+    except Exception:
+        pass
+    # Barrier: write the sentinel to fd 1/2 and wait until the drainers have consumed up to it, so this
+    # cell's raw/subprocess output is FULLY captured (not racily missed) before we snapshot. The captured
+    # raw bytes are appended AFTER the precise in-order print() capture from the redirected sys.stdout.
+    _mevt[1].clear()
+    _mevt[2].clear()
+    try:
+        os.write(1, _MARK)
+        os.write(2, _MARK)
+    except OSError:
+        pass
+    _mevt[1].wait(2.0)
+    _mevt[2].wait(2.0)
+    with _ulock:
+        _r1 = bytes(_ubuf[1][_m1:])
+        _r2 = bytes(_ubuf[2][_m2:])
+    _write({
+        "stdout": _so.getvalue() + _r1.decode("utf-8", "replace"),
+        "stderr": _se.getvalue() + _r2.decode("utf-8", "replace"),
+        "rc": _rc,
+        "results": list(_out),
+    })
 '''
 
 # Host paths a `-v` mount must never target - mounting the host's real root/config/secrets into a
@@ -455,8 +648,12 @@ class Sandbox:
         workspace: host directory to use as the persistent workspace. ``None`` (default) → a temp dir
             created on ``__enter__`` and DELETED on ``__exit__`` (session-ephemeral). A given path is
             validated like a mount, is NOT deleted on exit, and its contents persist across sessions.
-        memory_mb: RAM cap (kern ``--memory``). Default 512.
-        cpus: CPU cap in cores; ``None`` = uncapped (kern ``--cpus``).
+        memory_mb: RAM cap in MiB (kern ``--memory``). Default 512. NOTE on profiles: this is passed as
+            an explicit ``--memory`` flag, and kern's "explicit flag wins over profile" rule means the
+            default **overrides** a ``vcpu:`` profile's own ``memory=``. To let a profile's memory apply,
+            pass ``memory_mb=None`` (which also means uncapped if the profile carries no memory).
+        cpus: CPU cap in cores; ``None`` = uncapped and lets a ``vcpu:`` profile's ``cpus=`` apply (kern
+            ``--cpus``). A set value overrides the profile, like ``memory_mb``.
         pids: task/fork-bomb ceiling (kern ``--pids-limit``). Default 256.
         timeout_s: MANDATORY per-call wall-clock limit. The BINDING owns this deadline (it kills the
             box), so a ``timeout`` fault is a known fact, never guessed. Default 30.
@@ -497,6 +694,10 @@ class Sandbox:
     max_output_bytes: int = 64 * 1024 * 1024
     enforce_limits: bool = True
     deps_readonly: bool = False  # mount setup= deps read-only for run_code (block cross-run poisoning)
+    # track_files=True populates result.files by walking the workspace before AND after each call, which
+    # is O(workspace file count): a long session that accumulates thousands of files makes every run_code
+    # slower. Set False (result.files always []) when you don't need the per-call file diff - O(1) then.
+    track_files: bool = True
     # live output callbacks: called with each raw chunk (bytes) as it arrives, in a reader thread. The
     # full capped output is still captured in the result, so you can stream AND read result.stdout.
     on_stdout: "Callable[[bytes], None] | None" = None
@@ -544,10 +745,12 @@ class Sandbox:
             self._own_ws = True
         else:
             # A caller-supplied workspace is host input → validate it like a mount source, and DON'T
-            # delete it on exit (its contents persist across sessions - documented).
+            # delete it on exit (its contents persist across sessions - documented). Create it FIRST so
+            # a fresh persistent path is usable on the first run: mkdir is a no-op on an existing
+            # sensitive source (e.g. /etc), which _validate_mount then still refuses.
+            Path(self.workspace).mkdir(parents=True, exist_ok=True)
             _validate_mount(self.workspace, _WORKSPACE)
             self._ws = os.path.realpath(self.workspace)
-            Path(self._ws).mkdir(parents=True, exist_ok=True)
             self._own_ws = False
         self._entered = True
         if self.setup:
@@ -579,7 +782,7 @@ class Sandbox:
         # the in-PID-namespace box (a CPU-bound box survives a SIGKILL of kern's parent process, but not
         # kern's own timeout teardown). OUR proc.wait deadline is the authority that LABELS a `timeout`
         # fault; kern's backstop guarantees the box is actually gone a few seconds later.
-        argv += ["--timeout", str(timeout_s + 5)]
+        argv += ["--timeout", str(int(timeout_s) + 5)]
         if self.memory_mb is not None:
             argv += ["--memory", f"{self.memory_mb}m"]
         if self.cpus is not None:
@@ -634,11 +837,22 @@ class Sandbox:
             argv += ["--env-file", env_path]
         return argv
 
-    def _spawn(self, command: Sequence[str], *, network: bool, timeout_s: int, is_setup: bool = False) -> ExecutionResult:
+    def _spawn(
+        self,
+        command: Sequence[str],
+        *,
+        network: bool,
+        timeout_s: int,
+        is_setup: bool = False,
+        on_stdout: object = _UNSET,
+        on_stderr: object = _UNSET,
+    ) -> ExecutionResult:
+        cb_out = self.on_stdout if on_stdout is _UNSET else on_stdout
+        cb_err = self.on_stderr if on_stderr is _UNSET else on_stderr
         for part in command:
             if "\0" in part:
                 raise SandboxError("command/code must not contain a NUL byte")
-        before = self._snapshot()
+        before = self._snapshot() if self.track_files else None  # skip the O(N) walk when not tracked
         name = _unique_name()
         argv = self._base_argv(name, network=network, timeout_s=timeout_s, is_setup=is_setup) + ["--"] + list(command)
         child_env = dict(os.environ)
@@ -657,8 +871,8 @@ class Sandbox:
             # E2BIG (argv too long) and other spawn-time OS errors → a clean typed error, not a raw
             # OSError leaking out of the binding. (run_code already routes large code via a file.)
             raise SandboxError(f"could not spawn the box: {e}") from e
-        out = _CappedReader(proc.stdout, self.max_output_bytes, self.on_stdout)
-        err = _CappedReader(proc.stderr, self.max_output_bytes, self.on_stderr)
+        out = _CappedReader(proc.stdout, self.max_output_bytes, cb_out)
+        err = _CappedReader(proc.stderr, self.max_output_bytes, cb_err)
         out.start()
         err.start()
         we_timed_out = False
@@ -682,8 +896,8 @@ class Sandbox:
         stdout = out.buf.decode("utf-8", "replace")
         stderr = err.buf.decode("utf-8", "replace")
         rc = proc.returncode if proc.returncode is not None else -1
-        fault = self._classify(rc, stderr, we_timed_out)
-        files = self._diff(before)
+        fault = self._classify(rc, stderr, we_timed_out, timeout_s)
+        files = self._diff(before) if before is not None else []
         return ExecutionResult(
             stdout=stdout,
             stderr=stderr,
@@ -715,7 +929,9 @@ class Sandbox:
         except OSError:
             pass
 
-    def _classify(self, rc: int, stderr: str, we_timed_out: bool) -> SandboxFault | None:
+    def _classify(
+        self, rc: int, stderr: str, we_timed_out: bool, timeout_s: "int | float | None" = None
+    ) -> SandboxFault | None:
         # ORDER IS A SECURITY PROPERTY. The classes that are DETERMINISTIC by exit code are decided
         # FIRST, BEFORE we ever look at stderr - because stderr is a channel the workload controls, and
         # `startup_failed` is recognised by a pattern on it. If we checked the stderr marker first, a
@@ -726,7 +942,8 @@ class Sandbox:
         # adversary-influenceable channel.)
         if we_timed_out:
             # OUR deadline fired and we killed the box - a known fact, never guessed.
-            return SandboxFault("timeout", f"exceeded the {self.timeout_s}s time limit (killed by the binding)")
+            limit = self.timeout_s if timeout_s is None else timeout_s
+            return SandboxFault("timeout", f"exceeded the {limit}s time limit (killed by the binding)")
         if rc == _EXIT_SIGSYS:
             # A seccomp-denied syscall. Decided by exit code, so no stderr content can mask it.
             return SandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)")
@@ -807,24 +1024,44 @@ class Sandbox:
         full = self._ws_path(path)
         self._ensure_parent_dirs(full)  # symlink-safe descent, NOT mkdir(parents) which follows symlinks
         payload = data.encode() if isinstance(data, str) else data
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        try:
-            fd = os.open(full, flags, 0o644)
+        try:  # openat descent re-checks every component O_NOFOLLOW, closing the create->open TOCTOU too
+            fd = self._open_nofollow(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         except OSError as e:
             raise SandboxError(f"cannot write {path!r}: {e}") from e
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
 
+    def _open_nofollow(self, full: str, flags: int, mode: int = 0o644) -> int:
+        """Open ``full`` (already lexically contained) descending from the workspace base ONE component at
+        a time, each with ``O_NOFOLLOW`` via ``openat``, so a symlink the box planted in ANY component -
+        not just the last - can't redirect host I/O outside the workspace. This also closes the TOCTOU a
+        plain lstat-then-open would leave. Returns an fd (caller owns it)."""
+        base = self._ws
+        rel = os.path.relpath(full, base)
+        parts = [p for p in rel.split(os.sep) if p and p != "."]
+        if not parts:
+            raise SandboxError("refusing to open the workspace root as a file")
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+        try:
+            for part in parts[:-1]:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec, dir_fd=dir_fd)
+                os.close(dir_fd)
+                dir_fd = nxt
+            return os.open(parts[-1], flags | os.O_NOFOLLOW | cloexec, mode, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+
     def read_file(self, path: str, *, max_bytes: "int | None" = None) -> bytes:
-        """Read ``path`` (workspace-relative) from the workspace - host-direct. The final component is
-        opened O_NOFOLLOW: a symlink there can't redirect the read outside the workspace. ``max_bytes``
-        caps the read: if the file is larger, ``SandboxError`` is raised rather than loading it all into
-        host RAM (use it when reading a file a box you don't fully trust may have written)."""
+        """Read ``path`` (workspace-relative) from the workspace - host-direct. Every path component is
+        opened O_NOFOLLOW (via ``openat`` descent), so a symlink the box planted in the final OR an
+        intermediate component can't redirect the read outside the workspace. ``max_bytes`` caps the read:
+        if the file is larger, ``SandboxError`` is raised rather than loading it all into host RAM (use it
+        when reading a file a box you don't fully trust may have written)."""
         self._require_entered()
         full = self._ws_path(path)
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         try:
-            fd = os.open(full, flags)
+            fd = self._open_nofollow(full, os.O_RDONLY)
         except OSError as e:
             raise SandboxError(f"cannot read {path!r}: {e}") from e
         with os.fdopen(fd, "rb") as f:
@@ -836,9 +1073,20 @@ class Sandbox:
             return data
 
     def list_files(self, subdir: str = "") -> list[FileInfo]:
-        """List files under the workspace (excluding the ``.deps`` install dir)."""
+        """List files under the workspace (excluding the ``.deps`` install dir). A ``subdir`` is validated
+        with the same O_NOFOLLOW descent as read_file: a box that plants ``peek -> /tmp`` can't make
+        ``list_files("peek")`` enumerate a host directory's filenames (an info leak that ``os.walk``'s
+        followlinks=False does NOT stop, since it still follows the ROOT of the walk)."""
         self._require_entered()
-        root = self._ws_path(subdir) if subdir else self._ws  # _ws is canonical (set at enter)
+        if subdir:
+            root = self._ws_path(subdir)
+            try:  # opens the final as a DIRECTORY, O_NOFOLLOW at every level: a symlinked component fails
+                fd = self._open_nofollow(root, os.O_RDONLY | os.O_DIRECTORY)
+                os.close(fd)
+            except OSError as e:
+                raise SandboxError(f"cannot list {subdir!r}: {e}") from e
+        else:
+            root = self._ws  # _ws is canonical (set at enter)
         return [FileInfo(path=p, size=s, change="created") for p, (_, s) in self._walk(root).items()]
 
     # -- workspace snapshot (a cheap FILESYSTEM checkpoint; NOT a memory snapshot) --------------------
@@ -953,21 +1201,41 @@ class Sandbox:
         "node": ("node", "-e", "js"),
     }
 
+    def _eff_timeout(self, timeout_s: "int | float | None") -> "int | float":
+        """Resolve a per-call ``timeout_s`` override against the constructor default. ``None`` inherits
+        the session's ``timeout_s``; any override must be a positive number of seconds."""
+        if timeout_s is None:
+            return self.timeout_s
+        if not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool) or timeout_s <= 0:
+            raise SandboxError("timeout_s must be a positive number of seconds")
+        return timeout_s
+
     def run_code(
-        self, code: str, *, language: Literal["python", "bash", "node"] = "python"
+        self,
+        code: str,
+        *,
+        language: Literal["python", "bash", "node"] = "python",
+        timeout_s: "int | float | None" = None,
+        on_stdout: object = _UNSET,
+        on_stderr: object = _UNSET,
     ) -> ExecutionResult:
         """Run a snippet of ``code`` on the workspace in a fresh, network-off box. File state written to
         the workspace persists to the next call; in-memory state does NOT (fresh process each time).
         ``language`` is ``"python"`` (default), ``"bash"``, or ``"node"`` (the image must provide the
         interpreter). Large code is written to a workspace file and executed from there (transparent to
-        the caller), so an arbitrarily large script works instead of hitting the argv length limit."""
+        the caller), so an arbitrarily large script works instead of hitting the argv length limit.
+
+        ``timeout_s``, ``on_stdout`` and ``on_stderr`` override the session defaults for THIS call only:
+        ``timeout_s=None`` inherits the constructor's deadline, a number sets a per-call one; the stream
+        callbacks default to the session's, an explicit ``None`` disables them for this call."""
         self._require_entered()
         spec = self._LANGS.get(language)
         if spec is None:
             raise SandboxError(f"unsupported language {language!r} (v1: 'python' | 'bash' | 'node')")
         runner, inline_flag, ext = spec
+        eff = self._eff_timeout(timeout_s)
         if language == "python":
-            return self._run_python_cell(code)
+            return self._run_python_cell(code, timeout_s=eff, on_stdout=on_stdout, on_stderr=on_stderr)
         if len(code.encode()) > self._INLINE_CODE_MAX:
             # Write to a per-call cell file in the workspace and run it by path (no argv-size limit).
             cell = f".cell-{uuid.uuid4().hex[:8]}.{ext}"
@@ -975,9 +1243,18 @@ class Sandbox:
             command: list[str] = [runner, f"{_WORKSPACE}/{cell}"]
         else:
             command = [runner, inline_flag, code]
-        return self._spawn(command, network=self.network, timeout_s=self.timeout_s)
+        return self._spawn(
+            command, network=self.network, timeout_s=eff, on_stdout=on_stdout, on_stderr=on_stderr
+        )
 
-    def _run_python_cell(self, code: str) -> ExecutionResult:
+    def _run_python_cell(
+        self,
+        code: str,
+        *,
+        timeout_s: "int | float | None" = None,
+        on_stdout: object = _UNSET,
+        on_stderr: object = _UNSET,
+    ) -> ExecutionResult:
         """Run Python through the cell runner so a trailing expression, ``display()`` calls and matplotlib
         figures are captured as rich mime-typed ``result.results`` (Jupyter/E2B-style). stdout/stderr/exit
         are identical to a plain run; result capture is best-effort and never alters them. The cell,
@@ -990,7 +1267,11 @@ class Sandbox:
         )
         self.write_file(runf, shim)
         result = self._spawn(
-            ["python3", f"{_WORKSPACE}/{runf}"], network=self.network, timeout_s=self.timeout_s
+            ["python3", f"{_WORKSPACE}/{runf}"],
+            network=self.network,
+            timeout_s=self._eff_timeout(timeout_s),
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
         )
         try:
             parsed = json.loads(self.read_file(resf, max_bytes=_RESULTS_MAX))
@@ -1007,14 +1288,261 @@ class Sandbox:
         result.files = [fi for fi in result.files if fi.path not in internal]
         return result
 
-    def run(self, command: Sequence[str]) -> ExecutionResult:
-        """Run an arbitrary ``command`` (an argv LIST, never a shell string) in a fresh box."""
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        timeout_s: "int | float | None" = None,
+        on_stdout: object = _UNSET,
+        on_stderr: object = _UNSET,
+    ) -> ExecutionResult:
+        """Run an arbitrary ``command`` (an argv LIST, never a shell string) in a fresh box. ``timeout_s``,
+        ``on_stdout`` and ``on_stderr`` override the session defaults for this call only (see ``run_code``)."""
         self._require_entered()
         if isinstance(command, str):
             raise SandboxError('run() takes an argv LIST, not a string. Use run(["sh","-c","..."]).')
         if not command:
             raise SandboxError("run() needs a non-empty command")
-        return self._spawn(command, network=self.network, timeout_s=self.timeout_s)
+        return self._spawn(
+            command,
+            network=self.network,
+            timeout_s=self._eff_timeout(timeout_s),
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
+
+    def kernel(self, *, timeout_s: "int | float | None" = None) -> "Kernel":
+        """Open a persistent, WARM Python interpreter in a long-lived box (warm-start). Returns a
+        :class:`Kernel` context manager whose ``run_code`` executes cells in ONE resident process, so
+        in-memory state PERSISTS across cells (a REPL/notebook) and the per-cell cost drops from a full
+        interpreter boot (~10 ms) to sub-millisecond::
+
+            with Sandbox() as sbx, sbx.kernel() as k:
+                k.run_code("import numpy as np; a = np.arange(1_000_000)")
+                k.run_code("a.sum()").results[0].text   # 'a' is still here; ~sub-ms per cell
+
+        Trade-off vs ``run_code``: cells in a kernel share process state and a single box, so it is
+        call-fast but not call-isolated (still network-off and resource-capped like any box; a fresh
+        session/kernel is clean). A per-cell ``timeout_s`` tears the kernel down, because a running cell
+        cannot be interrupted without killing the interpreter."""
+        self._require_entered()
+        return Kernel(self, self._eff_timeout(timeout_s))
+
+
+# Sentinel: the box declared (or streamed) a reply frame larger than the cap. The box is UNTRUSTED and
+# controls the length prefix + body, so an uncapped reader would let it stream a multi-GB frame and OOM
+# the HOST (the box's own memory cap bounds what it BUILDS, not what the host ACCEPTS). run_code maps this
+# to a fault and tears the kernel down. Mirrors the one-shot path's _RESULTS_MAX guard.
+_KERNEL_OVERSIZE: object = object()
+
+
+class _FrameReader(threading.Thread):
+    """Read length-prefixed reply frames (`<n>\\n` + n bytes) from the kernel box stdout and hand each
+    complete frame to a queue. A dedicated thread with blocking reads avoids the select()+buffered-IO
+    race (data buffered in the BufferedReader is invisible to select on the fd). A short/closed pipe
+    enqueues ``None`` so a waiting ``run_code`` learns the box died; a frame past ``cap`` enqueues
+    ``_KERNEL_OVERSIZE`` so an untrusted box cannot OOM the host with a huge reply."""
+
+    def __init__(self, out, q: "queue.Queue", cap: int) -> None:
+        super().__init__(daemon=True)
+        self._out = out
+        self._q = q
+        self._cap = cap
+
+    def run(self) -> None:
+        try:
+            while True:
+                # readline(cap+32): bound the header scan too, so a box that streams bytes with NO newline
+                # can't grow the line buffer unboundedly. A header longer than that fails the int() below.
+                line = self._out.readline(self._cap + 32)
+                if not line:
+                    self._q.put(None)
+                    return
+                try:
+                    n = int(line.strip())
+                except ValueError:
+                    self._q.put(None)
+                    return
+                if n < 0 or n > self._cap:
+                    self._q.put(_KERNEL_OVERSIZE)
+                    return
+                buf = bytearray()  # amortized O(1) append: b"" += chunk would be O(n^2) on a big reply
+                while len(buf) < n:
+                    chunk = self._out.read(n - len(buf))
+                    if not chunk:
+                        self._q.put(None)
+                        return
+                    buf += chunk
+                self._q.put(bytes(buf))
+        except Exception:
+            self._q.put(None)
+
+
+class Kernel:
+    """A warm, persistent Python interpreter living in one long-lived box (see :meth:`Sandbox.kernel`).
+    Opened as a context manager; ``run_code`` sends a cell over a length-prefixed pipe to the resident
+    driver and returns an :class:`ExecutionResult` with captured stdout/stderr, exit code and rich
+    ``results``. In-memory state persists across cells; the box stays network-off and resource-capped.
+    Closing the context (or a per-cell timeout) tears the box down."""
+
+    # kern's own --timeout reliably kills the in-PID-namespace box; a kernel is long-lived, so give it a
+    # large backstop and let __exit__/timeout own the real lifetime.
+    _BACKSTOP_S = 24 * 3600
+
+    def __init__(self, sandbox: "Sandbox", timeout_s: int) -> None:
+        self._sbx = sandbox
+        self._timeout = timeout_s
+        self._proc: "subprocess.Popen | None" = None
+        self._name = ""
+        self._driver = ""
+        self._q: "queue.Queue" = queue.Queue()
+        self._err: "_CappedReader | None" = None
+        self._dead = False
+
+    def __enter__(self) -> "Kernel":
+        sbx = self._sbx
+        sbx._require_entered()
+        uid = uuid.uuid4().hex[:8]
+        self._driver = f".kernel-{uid}.py"
+        sbx.write_file(self._driver, _PY_KERNEL_DRIVER)
+        self._name = _unique_name()
+        argv = sbx._base_argv(self._name, network=sbx.network, timeout_s=self._BACKSTOP_S) + [
+            "--",
+            "python3",
+            "-S",
+            f"{_WORKSPACE}/{self._driver}",
+        ]
+        child_env = dict(os.environ)
+        if not sbx.enforce_limits:
+            child_env["KERN_NO_SCOPE"] = "1"
+        self._proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+            start_new_session=True,
+        )
+        _FrameReader(self._proc.stdout, self._q, sbx.max_output_bytes).start()
+        # Drain stderr so the box never blocks on a full stderr pipe; the control protocol is on stdout,
+        # so stderr only carries kern setup errors / stray driver noise.
+        self._err = _CappedReader(self._proc.stderr, sbx.max_output_bytes)
+        self._err.start()
+        return self
+
+    def run_code(self, code: str, *, timeout_s: "int | float | None" = None) -> ExecutionResult:
+        """Execute ``code`` in the warm interpreter; in-memory state persists from the previous cell. A
+        trailing bare expression, ``display()`` calls and matplotlib figures are captured into
+        ``results`` (like the one-shot ``run_code``). ``timeout_s`` overrides the kernel's deadline for
+        this cell; exceeding it tears the kernel down and returns a ``timeout`` fault."""
+        if self._proc is None:
+            raise SandboxError("kernel not started (use `with sbx.kernel() as k:`)")
+        if self._dead:
+            raise SandboxError("kernel is dead (a prior cell timed out, or the box exited)")
+        if "\0" in code:
+            raise SandboxError("code must not contain a NUL byte")
+        eff = self._sbx._eff_timeout(timeout_s) if timeout_s is not None else self._timeout
+        started = time.monotonic()
+        payload = code.encode("utf-8")
+        try:
+            self._proc.stdin.write(str(len(payload)).encode() + b"\n")
+            self._proc.stdin.write(payload)
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return self._teardown_result("killed", "the kernel process exited", started)
+        try:
+            reply = self._q.get(timeout=eff)
+        except queue.Empty:
+            return self._teardown_result("timeout", f"cell exceeded {eff}s", started)
+        if reply is _KERNEL_OVERSIZE:
+            return self._teardown_result(
+                "killed", f"the kernel reply exceeded the {self._sbx.max_output_bytes}-byte cap", started
+            )
+        if reply is None:
+            err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
+            fault = "startup_failed" if _looks_like_startup_failure(err) else "killed"
+            return self._teardown_result(fault, err.strip() or "the kernel box exited", started)
+        dur = int((time.monotonic() - started) * 1000)
+        try:
+            obj = json.loads(reply.decode("utf-8", "replace"))
+        except Exception:
+            return self._teardown_result("killed", "the kernel sent a malformed reply", started)
+        if not isinstance(obj, dict):
+            return self._teardown_result("killed", "the kernel sent a non-object reply", started)
+        # obj is UNTRUSTED (box-controlled JSON): coerce the scalar fields so a non-string stdout / non-int
+        # rc can't crash a caller that does r.stdout.strip() or arithmetic on r.exit_code.
+        results = [Result(data=d) for d in obj.get("results", []) if isinstance(d, dict)]
+        try:
+            rc = int(obj.get("rc", 0))
+        except (TypeError, ValueError):
+            rc = 0
+        return ExecutionResult(
+            stdout=str(obj.get("stdout", "")),
+            stderr=str(obj.get("stderr", "")),
+            exit_code=rc,
+            duration_ms=dur,
+            fault=None,
+            files=[],
+            truncated=False,
+            results=results,
+        )
+
+    def _teardown_result(self, kind: str, msg: str, started: float) -> ExecutionResult:
+        self._kill()
+        return ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=-1,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            fault=SandboxFault(type=kind, message=msg),  # type: ignore[arg-type]
+            files=[],
+            truncated=False,
+            results=[],
+        )
+
+    def _kill(self) -> None:
+        self._dead = True
+        if self._proc is not None:
+            # `kern stop` cgroup-kills the box by name: a CPU-bound cell in its own PID namespace can
+            # outlive a plain SIGKILL of kern's supervisor until the (24 h) --timeout backstop, so stop it
+            # explicitly first, then SIGKILL the process group. Same discipline as the one-shot _teardown.
+            if self._name:
+                try:
+                    subprocess.run(  # noqa: S603 - argv list, no shell
+                        [self._sbx._kern, "stop", self._name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def __exit__(self, *exc: object) -> None:
+        proc = self._proc
+        if proc is not None and not self._dead:
+            # Graceful: closing stdin makes the driver's _read() return None, so the box exits cleanly.
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                self._kill()
+        elif proc is not None:
+            self._kill()
+        try:
+            os.unlink(os.path.join(self._sbx._ws, self._driver))
+        except OSError:
+            pass
 
 
 def _unique_name() -> str:
@@ -1029,6 +1557,7 @@ def _looks_like_startup_failure(stderr: str) -> bool:
     markers = (
         "kern:",
         "error: pull:",
+        "error: curl failed:",
         "error: registry:",
         "error: manifest:",
         "error: sandbox:",

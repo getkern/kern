@@ -349,6 +349,24 @@ test("bad maxOutputBytes throws SandboxError", () => {
   assert.throws(() => new Sandbox({ maxOutputBytes: 0 }), SandboxError);
 });
 
+test("per-call timeoutS is validated", () => {
+  const s = new Sandbox({ timeoutS: 30 });
+  for (const bad of [0, -1, "x"]) assert.throws(() => s._effTimeout(bad), SandboxError);
+  assert.strictEqual(s._effTimeout(undefined), 30);
+  assert.strictEqual(s._effTimeout(2), 2);
+});
+
+test("pull network failure classifies as startup_failed (curl marker)", () => {
+  // A box that never started because the PULL failed (network/DNS down) prints kern's
+  // "error: curl failed:" prefix -> a startup failure, not the user's code failing.
+  const s = new Sandbox({ timeoutS: 30 });
+  const curl =
+    "-> resolving bad.invalid/x (linux/amd64)\n" +
+    "error: curl failed: exit Some(28): curl: (28) Resolving timed out after 10000 ms\n";
+  assert.strictEqual(s._classify(1, null, curl, false).type, "startup_failed");
+  assert.strictEqual(s._classify(1, null, "boom\n", false), null); // plain user error stays null
+});
+
 test("sensitive mount source is refused", () => {
   assert.throws(() => new Sandbox({ mounts: { "/etc": "/host-etc" } }), MountRefused);
   assert.throws(() => new Sandbox({ mounts: { "/": "/root-fs" } }), MountRefused);
@@ -444,6 +462,56 @@ test("timeout is owned by the binding (fault=timeout)", exec, async () => {
   const r = await runCode("import time; time.sleep(30)", { timeoutS: 2 });
   assert.strictEqual(r.success, false);
   assert.strictEqual(r.fault && r.fault.type, "timeout");
+});
+
+test("per-call timeoutS overrides the session (method-level)", exec, async () => {
+  const s = await new Sandbox({ timeoutS: 30 }).open();
+  try {
+    const r = await s.runCode("while True: pass", { timeoutS: 1 });
+    assert.strictEqual(r.fault && r.fault.type, "timeout");
+    assert.ok(r.fault.message.includes("1s"));
+    const r2 = await s.run(["sleep", "5"], { timeoutS: 1 });
+    assert.strictEqual(r2.fault && r2.fault.type, "timeout");
+  } finally {
+    await s.close();
+  }
+});
+
+test("per-call onStdout streams without disturbing captured stdout", exec, async () => {
+  const s = await new Sandbox({ timeoutS: 20 }).open();
+  try {
+    const chunks = [];
+    const r = await s.runCode("for i in range(3): print(i)", { onStdout: (b) => chunks.push(b.toString()) });
+    assert.deepStrictEqual(chunks.join("").split("\n").filter(Boolean), ["0", "1", "2"]);
+    assert.deepStrictEqual(r.stdout.split("\n").filter(Boolean), ["0", "1", "2"]);
+  } finally {
+    await s.close();
+  }
+});
+
+test("trackFiles=false skips the diff but keeps results", exec, async () => {
+  const s = await new Sandbox({ trackFiles: false, timeoutS: 20 }).open();
+  try {
+    const r = await s.runCode("open('/workspace/x.txt','w').write('hi'); 6*7");
+    assert.deepStrictEqual(r.files, []);
+    assert.ok(r.results.length && r.results[0].text === "42");
+  } finally {
+    await s.close();
+  }
+});
+
+test("read/write refuse a symlinked intermediate dir component (host-leak guard)", exec, async () => {
+  const s = await new Sandbox({ trackFiles: false }).open();
+  try {
+    await s.runCode("import os; os.makedirs('/workspace/d', exist_ok=True); os.symlink('/etc', '/workspace/d/esc')");
+    await assert.rejects(() => s.readFile("d/esc/hostname"), SandboxError); // would leak host /etc/hostname
+    await assert.rejects(() => s.listFiles("d/esc"), SandboxError); // would enumerate a host dir's names
+    await s.writeFile("sub/ok.txt", "hi"); // normal nested I/O still works
+    assert.strictEqual((await s.readFile("sub/ok.txt")).toString(), "hi");
+    assert.deepStrictEqual((await s.listFiles("sub")).map((f) => f.path), ["sub/ok.txt"]);
+  } finally {
+    await s.close();
+  }
 });
 
 test("network is OFF by default", exec, async () => {
@@ -554,5 +622,138 @@ test("P1 readFile maxBytes caps the read (results DoS guard)", exec, async () =>
     await assert.rejects(() => s.readFile("big.bin", { maxBytes: 1000 }), SandboxError);
     const d = await s.readFile("big.bin", { maxBytes: 500000 });
     assert.strictEqual(d.length, 200000);
+  });
+});
+
+// ---- warm kernel (persistent interpreter, warm-start) ------------------------------------------
+
+test("kernel: state persists across cells and captures results", exec, async () => {
+  await withSandbox(async (s) => {
+    const k = await s.kernel();
+    try {
+      assert.ok(k instanceof kern.Kernel);
+      let r = await k.runCode("x = 40");
+      assert.ok(r.success && r.results.length === 0);
+      r = await k.runCode("y = x + 2\nprint('y =', y)");
+      assert.strictEqual(r.stdout.trim(), "y = 42"); // x survived the previous cell
+      r = await k.runCode("x * 100"); // trailing expression -> rich result
+      assert.strictEqual(r.results[0].text, "4000");
+    } finally {
+      await k.close();
+    }
+  });
+});
+
+test("kernel: survives a cell error, state intact", exec, async () => {
+  await withSandbox(async (s) => {
+    const k = await s.kernel();
+    try {
+      await k.runCode("z = 7");
+      const r = await k.runCode("1 / 0");
+      assert.strictEqual(r.exitCode, 1);
+      assert.ok(!r.success && r.stderr.includes("ZeroDivisionError") && r.fault === null);
+      const r2 = await k.runCode("z"); // kernel alive, z still here
+      assert.strictEqual(r2.results[0].text, "7");
+    } finally {
+      await k.close();
+    }
+  });
+});
+
+test("kernel: per-cell timeout tears down and then guards", exec, async () => {
+  await withSandbox(async (s) => {
+    const k = await s.kernel({ timeoutS: 2 });
+    const t = Date.now();
+    const r = await k.runCode("while True: pass");
+    assert.ok(r.fault && r.fault.type === "timeout" && !r.success);
+    assert.ok(Date.now() - t < 8000);
+    await assert.rejects(() => k.runCode("1 + 1"), SandboxError);
+    await k.close();
+  });
+});
+
+test("kernel: stdin is EOF, not the control channel", exec, async () => {
+  await withSandbox(async (s) => {
+    const k = await s.kernel();
+    try {
+      const r = await k.runCode("import sys; print('in=' + repr(sys.stdin.readline()))");
+      assert.strictEqual(r.stdout.trim(), "in=''");
+      assert.ok(r.success);
+      const r2 = await k.runCode("print(2 + 2)"); // protocol still aligned
+      assert.strictEqual(r2.stdout.trim(), "4");
+    } finally {
+      await k.close();
+    }
+  });
+});
+
+test("kernel: raw fd writes are captured, not corrupting", exec, async () => {
+  await withSandbox(async (s) => {
+    const k = await s.kernel();
+    try {
+      let r = await k.runCode("import os; os.write(1, b'RAW\\n'); print('P')");
+      assert.ok(r.success && r.stdout.includes("RAW") && r.stdout.includes("P")); // both captured
+      assert.strictEqual((await k.runCode("print(6 * 7)")).stdout.trim(), "42"); // still aligned
+      r = await k.runCode("import subprocess; subprocess.run(['printf', 'sub'])");
+      assert.ok(r.stdout.includes("sub") && r.success); // subprocess stdout captured
+      r = await k.runCode("import sys; print('in=' + repr(sys.stdin.read()))");
+      assert.strictEqual(r.stdout.trim(), "in=''"); // stdin is EOF, never a cell frame
+    } finally {
+      await k.close();
+    }
+  });
+});
+
+test("kernel: survives raw fork and multiprocessing", exec, async () => {
+  await withSandbox({ memoryMb: 512, pids: 128, timeoutS: 15 }, async (s) => {
+    const k = await s.kernel();
+    try {
+      let r = await k.runCode(
+        "import os\n" +
+          "for _ in range(15):\n" +
+          "    pid = os.fork()\n" +
+          "    if pid == 0: os._exit(0)\n" +
+          "    os.waitpid(pid, 0)\n" +
+          "print('forked-clean')",
+      );
+      assert.ok(r.stdout.trim() === "forked-clean" && r.success);
+      assert.strictEqual((await k.runCode("print(7 * 7)")).stdout.trim(), "49"); // aligned after forks
+      r = await k.runCode(
+        "from concurrent.futures import ProcessPoolExecutor as P\n" +
+          "with P(2) as e: print('mp', sum(e.map(abs, [-1, -2, -3])))",
+      );
+      assert.ok(r.stdout.includes("mp 6") && r.success); // multiprocessing works
+      assert.strictEqual((await k.runCode("print('alive')")).stdout.trim(), "alive");
+    } finally {
+      await k.close();
+    }
+  });
+});
+
+test("kernel: oversize reply is capped, not host-OOM", exec, async () => {
+  await withSandbox({ maxOutputBytes: 4 * 1024 * 1024, timeoutS: 20 }, async (s) => {
+    const k = await s.kernel();
+    const r = await k.runCode("print('A' * 20_000_000)"); // 20 MB reply vs a 4 MB cap
+    assert.ok(r.fault && r.fault.type === "killed" && r.fault.message.includes("cap"));
+    await assert.rejects(() => k.runCode("1 + 1"), SandboxError); // torn down
+    await k.close();
+  });
+});
+
+test("kernel: warm cells are far faster than a cold one-shot", exec, async () => {
+  await withSandbox(async (s) => {
+    let t = Date.now();
+    await s.runCode("1 + 1"); // cold: fresh interpreter boot
+    const cold = Date.now() - t;
+    const k = await s.kernel();
+    try {
+      await k.runCode("1 + 1"); // warm up the pipe
+      t = Date.now();
+      for (let i = 0; i < 20; i++) await k.runCode("sum(range(1000))");
+      const warm = (Date.now() - t) / 20;
+      assert.ok(warm < cold / 10, `warm ${warm}ms should be << cold ${cold}ms`);
+    } finally {
+      await k.close();
+    }
   });
 });

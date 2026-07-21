@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.5";
+const VERSION = "0.1.7";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -172,10 +172,199 @@ except Exception:
 sys.exit(_rc)
 `;
 
+// Persistent-kernel driver (warm-start: kill the ~10 ms CPython boot). Runs ONCE in a long-lived box and
+// then services many cells from one resident process, so in-memory state PERSISTS across cells and the
+// per-cell cost drops to sub-millisecond. It is warm, so imports (json/ast/io/base64) are paid once at
+// startup, not on any hot path. Protocol on the box's stdin/stdout (length-prefixed frames): host writes
+// `<n>\n` + n UTF-8 bytes of cell source; the driver execs it (capturing stdout/stderr into buffers, the
+// trailing expression, every display() and matplotlib figure) and writes back `<m>\n` + m UTF-8 bytes of
+// {stdout, stderr, rc, results}. User prints go to a buffer, so the control channel stays clean. String.raw
+// keeps the single `\n` byte-literal intact (the driver has no backtick or ${...}). Byte-identical to the
+// Python binding's _PY_KERNEL_DRIVER so both bindings behave the same.
+const PY_KERNEL_DRIVER = String.raw`import sys, io, json, base64, builtins, ast, os, threading
+_g = {"__name__": "__main__"}
+_out = []
+def _bundle(o):
+    d = {}
+    for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
+                      ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if isinstance(v, str) and v:
+                    d[key] = v
+        except Exception:
+            pass
+    try:
+        fn = getattr(o, "_repr_json_", None)
+        if callable(fn):
+            v = fn()
+            if v is not None:
+                d["application/json"] = v if isinstance(v, str) else json.dumps(v)
+    except Exception:
+        pass
+    for meth, key in (("_repr_png_", "image/png"), ("_repr_jpeg_", "image/jpeg")):
+        try:
+            fn = getattr(o, meth, None)
+            if callable(fn):
+                v = fn()
+                if v:
+                    raw = v if isinstance(v, (bytes, bytearray)) else str(v).encode()
+                    d[key] = base64.b64encode(raw).decode()
+        except Exception:
+            pass
+    if "text/plain" not in d:
+        try:
+            d["text/plain"] = repr(o)
+        except Exception:
+            d["text/plain"] = "<unrepresentable>"
+    return d
+def display(o=None, **kw):
+    if o is not None:
+        _out.append(_bundle(o))
+builtins.display = display
+# Make the CONTROL channel private so user code (a raw os.write, a C extension, a subprocess reading
+# stdin) can NEVER corrupt a reply on stdout nor steal a cell off stdin. dup the real stdin(0)/stdout(1)
+# to close-on-exec control fds; then point fd 0 at /dev/null and fd 1/2 at pipes drained in the
+# background, so raw/subprocess output is CAPTURED (and >64 KiB never deadlocks) instead of hitting the
+# control channel. Uses only fds 0/1 (which always survive kern's box setup) and re-plumbs inside the box.
+_ctrl_in = os.dup(0)
+_ctrl_out = os.dup(1)
+os.set_inheritable(_ctrl_in, False)
+os.set_inheritable(_ctrl_out, False)
+_nul = os.open(os.devnull, os.O_RDONLY)
+os.dup2(_nul, 0)
+os.close(_nul)
+_u1r, _u1w = os.pipe()
+os.dup2(_u1w, 1)
+os.close(_u1w)
+_u2r, _u2w = os.pipe()
+os.dup2(_u2w, 2)
+os.close(_u2w)
+_CAP = 64 * 1024 * 1024
+_MARK = b"\x00\x01KRNCELLDONE\x01\x00"  # per-cell barrier sentinel written to user fd 1/2 after exec
+_ulock = threading.Lock()
+_ubuf = {1: bytearray(), 2: bytearray()}
+_mevt = {1: threading.Event(), 2: threading.Event()}
+def _drain(fd, key):
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        with _ulock:
+            _b = _ubuf[key]
+            _b += chunk
+            _i = _b.find(_MARK)
+            if _i >= 0:
+                del _b[_i:_i + len(_MARK)]  # strip the barrier sentinel; signal the cell it is drained
+                _mevt[key].set()
+            if len(_b) > _CAP:
+                del _b[_CAP:]
+threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
+threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
+_MAIN_PID = os.getpid()  # a cell that raw os.fork()s copies this whole process; the child must NOT re-enter
+_rin = os.fdopen(_ctrl_in, "rb")
+def _read():
+    line = _rin.readline()
+    if not line:
+        return None
+    n = int(line.strip())
+    buf = b""
+    while len(buf) < n:
+        chunk = _rin.read(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf.decode("utf-8")
+def _write(obj):
+    b = json.dumps(obj).encode("utf-8")
+    _data = memoryview(str(len(b)).encode() + b"\n" + b)
+    while _data:
+        _data = _data[os.write(_ctrl_out, _data):]
+while True:
+    _code = _read()
+    if _code is None:
+        break
+    _out.clear()
+    with _ulock:
+        _m1, _m2 = len(_ubuf[1]), len(_ubuf[2])
+    _so, _se = io.StringIO(), io.StringIO()
+    _rc = 0
+    _oo, _oe, _oi = sys.stdout, sys.stderr, sys.stdin
+    sys.stdout, sys.stderr = _so, _se
+    # Point user stdin at an empty stream so input()/sys.stdin.read() gets EOF instead of consuming the
+    # NEXT control frame off the real pipe (which would deadlock the kernel and desync the protocol).
+    sys.stdin = io.StringIO("")
+    try:
+        _tree = ast.parse(_code, "<cell>", "exec")
+        _tail = None
+        if _tree.body and isinstance(_tree.body[-1], ast.Expr):
+            _tail = ast.Expression(_tree.body.pop().value)
+            ast.fix_missing_locations(_tail)
+        exec(compile(_tree, "<cell>", "exec"), _g)
+        if _tail is not None:
+            _v = eval(compile(_tail, "<cell>", "eval"), _g)
+            if _v is not None:
+                _out.append(_bundle(_v))
+    except SystemExit as _e:
+        _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
+    except BaseException as _e:
+        import traceback
+        _tb = _e.__traceback__
+        while _tb is not None and _tb.tb_frame.f_code.co_filename != "<cell>":
+            _tb = _tb.tb_next
+        _se.write("".join(traceback.format_exception(type(_e), _e, _tb)))
+        _rc = 1
+    finally:
+        sys.stdout, sys.stderr, sys.stdin = _oo, _oe, _oi
+    if os.getpid() != _MAIN_PID:
+        # A cell called raw os.fork(): this is the CHILD. It must not re-enter the loop, write a reply,
+        # or touch the control channel (that would spawn a rogue driver clone corrupting the protocol).
+        os._exit(0)
+    try:
+        if "matplotlib.pyplot" in sys.modules:
+            _plt = sys.modules["matplotlib.pyplot"]
+            for _num in _plt.get_fignums():
+                _b = io.BytesIO()
+                _plt.figure(_num).savefig(_b, format="png")
+                _out.append({"image/png": base64.b64encode(_b.getvalue()).decode()})
+    except Exception:
+        pass
+    # Barrier: write the sentinel to fd 1/2 and wait until the drainers have consumed up to it, so this
+    # cell's raw/subprocess output is FULLY captured (not racily missed) before we snapshot. The captured
+    # raw bytes are appended AFTER the precise in-order print() capture from the redirected sys.stdout.
+    _mevt[1].clear()
+    _mevt[2].clear()
+    try:
+        os.write(1, _MARK)
+        os.write(2, _MARK)
+    except OSError:
+        pass
+    _mevt[1].wait(2.0)
+    _mevt[2].wait(2.0)
+    with _ulock:
+        _r1 = bytes(_ubuf[1][_m1:])
+        _r2 = bytes(_ubuf[2][_m2:])
+    _write({
+        "stdout": _so.getvalue() + _r1.decode("utf-8", "replace"),
+        "stderr": _se.getvalue() + _r2.decode("utf-8", "replace"),
+        "rc": _rc,
+        "results": list(_out),
+    })
+`;
+
 // Signal-derived exit codes (128 + signum) we classify.
 const EXIT_SIGKILL = 137; // SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
 const EXIT_SIGSYS = 159; // SIGSYS: a seccomp-denied syscall = a blocked escape attempt
 const EXIT_SIGTERM = 143; // SIGTERM: kern's --timeout backstop reaping the box
+
+// Per-call kwargs that DEFAULT to the Sandbox value: UNSET means "inherit the constructor's", whereas
+// an explicit `null` means "disable" (used for onStdout/onStderr overrides).
+const UNSET = Symbol("unset");
 
 // Host paths a `-v` mount must never target - mounting the host's real root/config/secrets into a
 // sandbox defeats the point; the docker socket is the classic escape. Refused even when asked.
@@ -380,6 +569,7 @@ function looksLikeStartupFailure(stderr) {
   const markers = [
     "kern:",
     "error: pull:",
+    "error: curl failed:",
     "error: registry:",
     "error: manifest:",
     "error: sandbox:",
@@ -566,6 +756,9 @@ class Sandbox {
     this.onStderr = opts.onStderr ?? null;
     this.enforceLimits = opts.enforceLimits ?? true;
     this.depsReadonly = opts.depsReadonly ?? false;
+    // trackFiles=true populates result.files by walking the workspace before AND after each call (O(N)
+    // in file count); a long session that accretes files slows every runCode. false = result.files [], O(1).
+    this.trackFiles = opts.trackFiles ?? true;
 
     if (!(this.timeoutS > 0)) throw new SandboxError("timeoutS must be a positive number of seconds");
     if (!(this.maxOutputBytes > 0)) throw new SandboxError("maxOutputBytes must be positive");
@@ -611,8 +804,10 @@ class Sandbox {
       this._ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "kern-ws-")));
       this._ownWs = true;
     } else {
-      validateMount(this.workspace, WORKSPACE);
+      // Create the persistent workspace FIRST so a fresh path is usable on the first run; mkdir is a
+      // no-op on an existing sensitive source (e.g. /etc), which validateMount then still refuses.
       fs.mkdirSync(this.workspace, { recursive: true });
+      validateMount(this.workspace, WORKSPACE);
       this._ws = fs.realpathSync(this.workspace);
       this._ownWs = false;
     }
@@ -654,7 +849,7 @@ class Sandbox {
       }
     }
     // kern's own --timeout is a tight BACKSTOP just beyond our deadline; OUR wait is the authority.
-    argv.push("--timeout", String(timeoutS + 5));
+    argv.push("--timeout", String(Math.floor(timeoutS) + 5));
     if (this.memoryMb !== null) argv.push("--memory", `${this.memoryMb}m`);
     if (this.cpus !== null) argv.push("--cpus", String(this.cpus));
     if (this.pids !== null) argv.push("--pids-limit", String(this.pids));
@@ -705,11 +900,13 @@ class Sandbox {
     return argv;
   }
 
-  _spawn(command, { network, timeoutS, isSetup = false }) {
+  _spawn(command, { network, timeoutS, isSetup = false, onStdout = UNSET, onStderr = UNSET }) {
+    const cbOut = onStdout === UNSET ? this.onStdout : onStdout;
+    const cbErr = onStderr === UNSET ? this.onStderr : onStderr;
     for (const part of command)
       if (typeof part !== "string" || part.includes("\0"))
         throw new SandboxError("command/code must be strings with no NUL byte");
-    const before = this._snapshot();
+    const before = this.trackFiles ? this._snapshot() : null; // skip the O(N) walk when not tracked
     const name = uniqueName();
     const argv = [...this._baseArgv(name, { network, timeoutS, isSetup }), "--", ...command];
     const childEnv = { ...process.env };
@@ -729,8 +926,8 @@ class Sandbox {
         return reject(new SandboxError(`could not spawn the box: ${e.message}`));
       }
 
-      const out = cappedCollector(child.stdout, this.maxOutputBytes, this.onStdout);
-      const err = cappedCollector(child.stderr, this.maxOutputBytes, this.onStderr);
+      const out = cappedCollector(child.stdout, this.maxOutputBytes, cbOut);
+      const err = cappedCollector(child.stderr, this.maxOutputBytes, cbErr);
       let timedOut = false;
       let settled = false;
 
@@ -751,8 +948,8 @@ class Sandbox {
         const stdout = out.buffer().toString("utf8");
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
-        const fault = this._classify(rc, signal, stderr, timedOut);
-        const files = this._diff(before);
+        const fault = this._classify(rc, signal, stderr, timedOut, timeoutS);
+        const files = before ? this._diff(before) : [];
         resolve(
           new ExecutionResult({
             stdout, stderr, exitCode: rc, durationMs: wallMs, fault, files,
@@ -807,11 +1004,14 @@ class Sandbox {
     }
   }
 
-  _classify(rc, signal, stderr, timedOut) {
+  _classify(rc, signal, stderr, timedOut, timeoutS) {
     // ORDER IS A SECURITY PROPERTY: deterministic-by-exit-code classes are decided BEFORE the stderr
     // heuristic, because stderr is a channel the workload controls.
     if (timedOut)
-      return sandboxFault("timeout", `exceeded the ${this.timeoutS}s time limit (killed by the binding)`);
+      return sandboxFault(
+        "timeout",
+        `exceeded the ${timeoutS ?? this.timeoutS}s time limit (killed by the binding)`,
+      );
     if (rc === EXIT_SIGSYS || signal === "SIGSYS")
       return sandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)");
     if (rc === EXIT_SIGKILL || signal === "SIGKILL")
@@ -889,10 +1089,55 @@ class Sandbox {
     }
   }
 
-  /** Read `path` (workspace-relative) from the workspace - host-direct. Final component O_NOFOLLOW. */
+  /** Verify no INTERMEDIATE path component under the workspace is a symlink (read-only counterpart of
+   * _ensureParentDirs). readFile follows directory components on open, so a box that plants `d -> /etc`
+   * would otherwise leak host files via `readFile("d/x")` even with O_NOFOLLOW on the last component.
+   * Descend one level at a time, reject a symlinked component. */
+  _verifyParentDirs(full) {
+    const base = this._ws;
+    const relDir = path.relative(base, path.dirname(full));
+    if (relDir === "" || relDir === ".") return;
+    let cur = base;
+    for (const part of relDir.split(path.sep)) {
+      if (!part || part === ".") continue;
+      const next = path.join(cur, part);
+      let st;
+      try {
+        st = fs.lstatSync(next);
+      } catch {
+        throw new SandboxError(`cannot resolve workspace path component: ${JSON.stringify(part)}`);
+      }
+      if (st.isSymbolicLink())
+        throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(part)}`);
+      if (!st.isDirectory())
+        throw new SandboxError(`workspace path component is not a directory: ${JSON.stringify(part)}`);
+      cur = next;
+    }
+  }
+
+  /** RACE-FREE containment on an ALREADY-OPEN fd: the fd is pinned to the real file, so read WHERE it
+   * actually landed via `/proc/self/fd` and refuse if a symlinked PARENT component (which O_NOFOLLOW on
+   * the final component does not stop) redirected the open outside the workspace. Node has no `openat`,
+   * so this closes the lstat-then-open TOCTOU that _verifyParentDirs alone would leave. */
+  _assertFdInWorkspace(fd, rel) {
+    let real;
+    try {
+      real = fs.readlinkSync(`/proc/self/fd/${fd}`);
+    } catch {
+      return; // /proc unavailable (non-Linux): the lstat pre-check already ran
+    }
+    const base = fs.realpathSync(this._ws);
+    if (real !== base && !real.startsWith(base + path.sep))
+      throw new SandboxError(`path escapes the workspace: ${JSON.stringify(rel)}`);
+  }
+
+  /** Read `path` (workspace-relative) from the workspace - host-direct. A symlink in the final component
+   * is refused by O_NOFOLLOW; a symlinked intermediate component is caught by _verifyParentDirs (fast) AND
+   * _assertFdInWorkspace (race-free, on the open fd) - no lstat-then-open TOCTOU. */
   async readFile(rel, { maxBytes = null } = {}) {
     this._requireEntered();
     const full = this._wsPath(rel);
+    this._verifyParentDirs(full); // fast reject + nice error before we open (host-leak guard)
     let fd;
     try {
       fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
@@ -900,8 +1145,8 @@ class Sandbox {
       throw new SandboxError(`cannot read ${JSON.stringify(rel)}: ${e.message}`);
     }
     try {
-      // maxBytes caps the read so a file a not-fully-trusted box wrote can't OOM the host; the box has
-      // already exited by the time we read, so fstat -> read is race-free.
+      this._assertFdInWorkspace(fd, rel); // race-free backstop: a swapped-in parent symlink is caught here
+      // maxBytes caps the read so a file a not-fully-trusted box wrote can't OOM the host.
       if (maxBytes !== null && fs.fstatSync(fd).size > maxBytes)
         throw new SandboxError(`${JSON.stringify(rel)} exceeds maxBytes=${maxBytes}`);
       return fs.readFileSync(fd);
@@ -913,7 +1158,25 @@ class Sandbox {
   /** List regular files under the workspace (excluding the .deps install dir and our env file). */
   async listFiles(subdir = "") {
     this._requireEntered();
-    const root = subdir ? this._wsPath(subdir) : this._ws;
+    let root;
+    if (subdir) {
+      root = this._wsPath(subdir);
+      // a box that plants `peek -> /tmp` must not make listFiles("peek") enumerate a host dir's names
+      // (the walk's followlinks=false does NOT stop it, since it follows the ROOT). Reject a symlinked
+      // subdir (parents via _verifyParentDirs, the final component via lstat).
+      this._verifyParentDirs(root);
+      let st;
+      try {
+        st = fs.lstatSync(root);
+      } catch {
+        throw new SandboxError(`cannot list ${JSON.stringify(subdir)}`);
+      }
+      if (st.isSymbolicLink())
+        throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(subdir)}`);
+      if (!st.isDirectory()) throw new SandboxError(`not a directory: ${JSON.stringify(subdir)}`);
+    } else {
+      root = this._ws;
+    }
     const walked = this._walk(root);
     return Object.entries(walked).map(([p, [, size]]) => ({ path: p, size, change: "created" }));
   }
@@ -1076,7 +1339,16 @@ class Sandbox {
   /** Run a snippet of `code` on the workspace in a fresh, network-off box. File state persists to the
    * next call; in-memory state does NOT. `language` is "python" (default), "bash", or "node". Large
    * code is written to a workspace file and run by path (no argv-size limit). */
-  async runCode(code, { language = "python" } = {}) {
+  /** Resolve a per-call `timeoutS` override against the constructor default: undefined/null inherits
+   * the session's, any override must be a positive number of seconds. */
+  _effTimeout(timeoutS) {
+    if (timeoutS === undefined || timeoutS === null) return this.timeoutS;
+    if (typeof timeoutS !== "number" || !(timeoutS > 0))
+      throw new SandboxError("timeoutS must be a positive number of seconds");
+    return timeoutS;
+  }
+
+  async runCode(code, { language = "python", timeoutS, onStdout = UNSET, onStderr = UNSET } = {}) {
     this._requireEntered();
     // Each runner: [binary, inline-eval-flag, file-extension]. Note node evaluates with `-e`, NOT `-c`
     // (which is node's syntax-CHECK flag and would run nothing); python/sh use `-c`.
@@ -1089,7 +1361,9 @@ class Sandbox {
     if (!spec)
       throw new SandboxError(`unsupported language ${JSON.stringify(language)} (v1: 'python' | 'bash' | 'node')`);
     const [runner, evalFlag, ext] = spec;
-    if (language === "python") return this._runPythonCell(code);
+    const eff = this._effTimeout(timeoutS);
+    if (language === "python")
+      return this._runPythonCell(code, { timeoutS: eff, onStdout, onStderr });
     let command;
     if (Buffer.byteLength(code, "utf8") > INLINE_CODE_MAX) {
       const cell = `.cell-${crypto.randomBytes(4).toString("hex")}.${ext}`;
@@ -1098,14 +1372,14 @@ class Sandbox {
     } else {
       command = [runner, evalFlag, code];
     }
-    return this._spawn(command, { network: this.network, timeoutS: this.timeoutS });
+    return this._spawn(command, { network: this.network, timeoutS: eff, onStdout, onStderr });
   }
 
   /** Run Python through the cell runner so a trailing expression, display() calls and matplotlib
    * figures are captured as rich mime-typed `result.results` (Jupyter/E2B-style). stdout/stderr/exit
    * are identical to a plain run; capture is best-effort. Internal cell/runner/results files are
    * removed and hidden from `result.files`. */
-  async _runPythonCell(code) {
+  async _runPythonCell(code, { timeoutS, onStdout = UNSET, onStderr = UNSET } = {}) {
     const uid = crypto.randomBytes(4).toString("hex");
     const cell = `.cell-${uid}.py`;
     const resf = `.res-${uid}.json`;
@@ -1118,7 +1392,9 @@ class Sandbox {
     await this.writeFile(runf, shim);
     const result = await this._spawn(["python3", `${WORKSPACE}/${runf}`], {
       network: this.network,
-      timeoutS: this.timeoutS,
+      timeoutS: this._effTimeout(timeoutS),
+      onStdout,
+      onStderr,
     });
     try {
       const parsed = JSON.parse(await this.readFile(resf, { maxBytes: RESULTS_MAX }));
@@ -1139,14 +1415,266 @@ class Sandbox {
     return result;
   }
 
-  /** Run an arbitrary `command` (an argv ARRAY, never a shell string) in a fresh box. */
-  async run(command) {
+  /** Run an arbitrary `command` (an argv ARRAY, never a shell string) in a fresh box. `timeoutS`,
+   * `onStdout` and `onStderr` override the session defaults for this call only (see `runCode`). */
+  async run(command, { timeoutS, onStdout = UNSET, onStderr = UNSET } = {}) {
     this._requireEntered();
     if (typeof command === "string")
       throw new SandboxError('run() takes an argv ARRAY, not a string. Use run(["sh","-c","..."]).');
     if (!Array.isArray(command) || command.length === 0)
       throw new SandboxError("run() needs a non-empty command array");
-    return this._spawn(command, { network: this.network, timeoutS: this.timeoutS });
+    return this._spawn(command, {
+      network: this.network,
+      timeoutS: this._effTimeout(timeoutS),
+      onStdout,
+      onStderr,
+    });
+  }
+
+  /** Open a persistent, WARM Python interpreter in a long-lived box (warm-start): cells run in ONE
+   * resident process, so in-memory state PERSISTS across cells and the per-cell cost drops from a full
+   * interpreter boot (~10 ms) to sub-millisecond. Returns an OPEN Kernel; call `await k.close()` when
+   * done (or wrap in try/finally). Trade vs runCode: cells share one process and one box, so it is
+   * call-fast but NOT call-isolated (still network-off and resource-capped; a fresh session/kernel is
+   * clean). A per-cell timeout tears the kernel down. */
+  async kernel({ timeoutS } = {}) {
+    this._requireEntered();
+    const k = new Kernel(this, this._effTimeout(timeoutS));
+    await k._open();
+    return k;
+  }
+}
+
+const KERNEL_BACKSTOP_S = 24 * 3600; // long-lived box; close()/timeout owns the real lifetime
+const KERNEL_TIMEOUT = Symbol("kernel-timeout");
+// The box is UNTRUSTED and controls the reply length prefix + body; without a cap it could stream a
+// multi-GB frame and OOM the HOST (its own memory cap bounds what it BUILDS, not what the host ACCEPTS).
+// A frame past the cap resolves the waiter with this sentinel, which tears the kernel down. Mirrors the
+// one-shot path's RESULTS_MAX guard.
+const KERNEL_OVERSIZE = Symbol("kernel-oversize");
+
+/** A warm, persistent Python interpreter living in one long-lived box (see `Sandbox.kernel`). `runCode`
+ * sends a cell over a length-prefixed pipe to the resident driver and resolves to an ExecutionResult with
+ * captured stdout/stderr, exit code and rich `results`. In-memory state persists across cells; the box
+ * stays network-off and resource-capped. `close()` (or a per-cell timeout) tears the box down. */
+class Kernel {
+  constructor(sbx, timeoutS) {
+    this._sbx = sbx;
+    this._timeout = timeoutS;
+    this._child = null;
+    this._name = "";
+    this._childEnv = null;
+    this._driver = "";
+    // Frame reader state: accumulate chunks, concat ONCE per frame (not per chunk) so a large reply is
+    // O(n), not O(n^2). `_need`/`_headerBytes` cache the parsed header so the body phase only counts bytes.
+    this._chunks = []; // Buffer[]
+    this._total = 0; // bytes buffered across _chunks
+    this._need = -1; // body length once the header is parsed, else -1
+    this._headerBytes = -1; // header line length incl newline, once parsed
+    this._cap = 0; // max accepted frame bytes (set from sbx.maxOutputBytes in _open)
+    this._waiters = []; // FIFO of { resolve, timer }; one reply per request keeps them in order
+    this._stderr = Buffer.alloc(0);
+    this._dead = false;
+  }
+
+  async _open() {
+    const sbx = this._sbx;
+    this._cap = sbx.maxOutputBytes;
+    const uid = crypto.randomBytes(4).toString("hex");
+    this._driver = `.kernel-${uid}.py`;
+    await sbx.writeFile(this._driver, PY_KERNEL_DRIVER);
+    this._name = uniqueName();
+    this._childEnv = { ...process.env };
+    if (!sbx.enforceLimits) this._childEnv.KERN_NO_SCOPE = "1";
+    const argv = [
+      ...sbx._baseArgv(this._name, { network: sbx.network, timeoutS: KERNEL_BACKSTOP_S }),
+      "--", "python3", "-S", `${WORKSPACE}/${this._driver}`,
+    ];
+    // detached: own process group so we can killpg the box + kern as a unit, like _spawn.
+    this._child = spawn(argv[0], argv.slice(1), {
+      env: this._childEnv, detached: true, stdio: ["pipe", "pipe", "pipe"],
+    });
+    this._child.on("error", () => { this._dead = true; this._flush(null); });
+    this._child.on("close", () => { this._dead = true; this._flush(null); });
+    this._child.stdout.on("data", (d) => this._onData(d));
+    this._child.stderr.on("data", (d) => {
+      this._stderr = Buffer.concat([this._stderr, d]);
+      if (this._stderr.length > sbx.maxOutputBytes)
+        this._stderr = this._stderr.subarray(0, sbx.maxOutputBytes); // bound host RAM on a flooding box
+    });
+    return this;
+  }
+
+  _onData(d) {
+    this._chunks.push(d);
+    this._total += d.length;
+    // Hard cap on buffered bytes (header slack + body): an untrusted box streaming without a valid frame
+    // can't grow host RAM past the cap. Tear down rather than accept an unbounded reply.
+    if (this._total > this._cap + 64) return this._flush(KERNEL_OVERSIZE);
+    this._tryParse();
+  }
+
+  _coalesce() {
+    // Materialize the buffered chunks into one Buffer (and keep it as the single chunk). Called only when
+    // we must search/slice; the body phase avoids it until the whole frame is present, keeping it O(n).
+    if (this._chunks.length > 1) this._chunks = [Buffer.concat(this._chunks, this._total)];
+    return this._chunks.length ? this._chunks[0] : Buffer.alloc(0);
+  }
+
+  _tryParse() {
+    for (;;) {
+      if (this._need < 0) {
+        const buf = this._coalesce();
+        const nl = buf.indexOf(0x0a);
+        if (nl < 0) {
+          if (buf.length > 64) return this._flush(KERNEL_OVERSIZE); // header line with no newline
+          return;
+        }
+        const n = parseInt(buf.subarray(0, nl).toString("ascii").trim(), 10);
+        if (!Number.isInteger(n) || n < 0) return this._flush(null); // malformed framing
+        if (n > this._cap) return this._flush(KERNEL_OVERSIZE);
+        this._headerBytes = nl + 1;
+        this._need = n;
+      }
+      if (this._total < this._headerBytes + this._need) return; // body incomplete: buffer, no concat
+      const buf = this._coalesce();
+      const body = buf.subarray(this._headerBytes, this._headerBytes + this._need).toString("utf8");
+      const rest = buf.subarray(this._headerBytes + this._need);
+      this._chunks = rest.length ? [rest] : [];
+      this._total = rest.length;
+      this._need = -1;
+      this._headerBytes = -1;
+      const w = this._waiters.shift();
+      if (w) {
+        clearTimeout(w.timer);
+        w.resolve(body);
+      }
+    }
+  }
+
+  _flush(val) {
+    // A protocol error (oversize/malformed) marks the kernel dead: the stream is desynced, do not keep it.
+    if (val === KERNEL_OVERSIZE || val === null) this._dead = true;
+    while (this._waiters.length) {
+      const w = this._waiters.shift();
+      clearTimeout(w.timer);
+      w.resolve(val);
+    }
+  }
+
+  async runCode(code, { timeoutS } = {}) {
+    if (!this._child) throw new SandboxError("kernel not started");
+    if (this._dead) throw new SandboxError("kernel is dead (a prior cell timed out, or the box exited)");
+    if (typeof code !== "string" || code.includes("\0"))
+      throw new SandboxError("code must be a string with no NUL byte");
+    const eff = timeoutS != null ? this._sbx._effTimeout(timeoutS) : this._timeout;
+    const started = Date.now();
+    const payload = Buffer.from(code, "utf8");
+    const reply = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const i = this._waiters.findIndex((w) => w.timer === timer);
+        if (i >= 0) this._waiters.splice(i, 1);
+        resolve(KERNEL_TIMEOUT);
+      }, eff * 1000);
+      this._waiters.push({ resolve, timer });
+      try {
+        this._child.stdin.write(`${payload.length}\n`);
+        this._child.stdin.write(payload);
+      } catch {
+        const i = this._waiters.findIndex((w) => w.timer === timer);
+        if (i >= 0) this._waiters.splice(i, 1);
+        clearTimeout(timer);
+        resolve(null);
+      }
+    });
+    if (reply === KERNEL_TIMEOUT) return this._teardownResult("timeout", `cell exceeded ${eff}s`, started);
+    if (reply === KERNEL_OVERSIZE)
+      return this._teardownResult("killed", `the kernel reply exceeded the ${this._cap}-byte cap`, started);
+    if (reply === null) {
+      const err = this._stderr.toString("utf8");
+      const kind = looksLikeStartupFailure(err) ? "startup_failed" : "killed";
+      return this._teardownResult(kind, err.trim() || "the kernel box exited", started);
+    }
+    let obj;
+    try {
+      obj = JSON.parse(reply);
+    } catch {
+      return this._teardownResult("killed", "the kernel sent a malformed reply", started);
+    }
+    if (!obj || typeof obj !== "object")
+      return this._teardownResult("killed", "the kernel sent a non-object reply", started);
+    const results = Array.isArray(obj.results)
+      ? obj.results.filter((r) => r && typeof r === "object").map((r) => new Result(r))
+      : [];
+    // obj is UNTRUSTED (box-controlled JSON): coerce scalars so a non-string stdout / non-int rc can't
+    // crash a caller doing r.stdout.trim() or arithmetic on r.exitCode.
+    return new ExecutionResult({
+      stdout: typeof obj.stdout === "string" ? obj.stdout : "",
+      stderr: typeof obj.stderr === "string" ? obj.stderr : "",
+      exitCode: Number.isInteger(obj.rc) ? obj.rc : 0,
+      durationMs: Date.now() - started,
+      fault: null,
+      files: [],
+      truncated: false,
+      results,
+    });
+  }
+
+  _teardownResult(type, message, started) {
+    this._kill();
+    return new ExecutionResult({
+      stdout: "",
+      stderr: "",
+      exitCode: -1,
+      durationMs: Date.now() - started,
+      fault: sandboxFault(type, message),
+      files: [],
+      truncated: false,
+      results: [],
+    });
+  }
+
+  _kill() {
+    this._dead = true;
+    this._flush(null);
+    const child = this._child;
+    if (!child) return;
+    try {
+      spawnSync(this._sbx._kern, ["stop", this._name], { env: this._childEnv, timeout: 5000, stdio: "ignore" });
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (child.pid) process.kill(-child.pid, "SIGKILL"); // whole process group (detached)
+    } catch {
+      /* ignore */
+    }
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async close() {
+    const child = this._child;
+    if (child && !this._dead) {
+      // Graceful: closing stdin makes the driver's _read() return None, so the box exits cleanly.
+      try {
+        child.stdin.end();
+      } catch {
+        /* ignore */
+      }
+      await new Promise((r) => setTimeout(r, 150));
+      this._kill();
+    } else {
+      this._kill();
+    }
+    try {
+      fs.unlinkSync(path.join(this._sbx._ws, this._driver));
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -1175,6 +1703,7 @@ async function runCode(code, opts = {}) {
 
 module.exports = {
   Sandbox,
+  Kernel,
   withSandbox,
   runCode,
   ExecutionResult,

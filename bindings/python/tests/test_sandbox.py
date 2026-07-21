@@ -14,7 +14,7 @@ import time
 import pytest
 
 import kern_sandbox as kern
-from kern_sandbox import ExecutionResult, MountRefused, Result, Sandbox, SandboxError
+from kern_sandbox import ExecutionResult, Kernel, MountRefused, Result, Sandbox, SandboxError
 
 _FAKE_KERN = shutil.which("true") or "/bin/true"
 
@@ -194,6 +194,15 @@ def test_classify_order_escape_not_masked_by_stderr_marker():
     assert s._classify(1, "boom\n", False) is None  # non-zero, no marker: user code, no fault
 
 
+def test_pull_network_failure_is_startup_failed():
+    # A box that never started because the PULL failed (network/DNS down) prints kern's
+    # "error: curl failed:" prefix. That is a startup failure, not the user's code failing.
+    s = _cfg()
+    curl = ("-> resolving bad.invalid/x (linux/amd64)\n"
+            "error: curl failed: exit Some(28): curl: (28) Resolving timed out after 10000 ms\n")
+    assert s._classify(1, curl, False).type == "startup_failed"
+
+
 def test_classify_signal_exit_codes():
     # Every signal-derived exit maps to the right fault (or None for user crashes).
     s = _cfg()
@@ -243,6 +252,70 @@ def test_c4_infinite_loop_times_out():
         dt = time.monotonic() - t
     assert r.fault is not None and r.fault.type == "timeout"
     assert not r.success and dt < 16  # our deadline labels it; not the 21s backstop-only path
+
+
+@integration
+def test_per_call_timeout_overrides_session():
+    # A generous session deadline, but a tight PER-CALL one wins for that call.
+    with Sandbox(timeout_s=30) as s:
+        t = time.monotonic()
+        r = s.run_code("while True: pass", timeout_s=1)
+        dt = time.monotonic() - t
+    assert r.fault is not None and r.fault.type == "timeout"
+    assert "1s" in r.fault.message and dt < 10
+    # run() honours the per-call override too.
+    with Sandbox(timeout_s=30) as s:
+        r = s.run(["sleep", "5"], timeout_s=1)
+    assert r.fault is not None and r.fault.type == "timeout"
+
+
+def test_per_call_timeout_is_validated():
+    s = _cfg(timeout_s=30)
+    for bad in (0, -1, "x"):
+        with pytest.raises(SandboxError):
+            s._eff_timeout(bad)
+    assert s._eff_timeout(None) == 30 and s._eff_timeout(2) == 2
+
+
+@integration
+def test_per_call_on_stdout_streams():
+    chunks = []
+    with Sandbox(timeout_s=20) as s:
+        r = s.run_code("for i in range(3): print(i)", on_stdout=lambda b: chunks.append(bytes(b)))
+    assert b"".join(chunks).split() == [b"0", b"1", b"2"]
+    assert r.stdout.split() == ["0", "1", "2"]  # streaming does not disturb the captured stdout
+
+
+@integration
+def test_track_files_off_skips_diff_but_keeps_results():
+    # track_files=False skips the O(N) per-call workspace walk: result.files is empty, but rich results
+    # (which come from the runner's results file, not the diff) still work.
+    with Sandbox(track_files=False, timeout_s=20) as s:
+        r = s.run_code("open('/workspace/x.txt','w').write('hi'); 6*7")
+    assert r.files == []
+    assert r.results and r.results[0].text == "42"
+    # the default still tracks the created file
+    with Sandbox(timeout_s=20) as s:
+        r = s.run_code("open('/workspace/y.txt','w').write('hi')")
+    assert any(f.path == "y.txt" for f in r.files)
+
+
+@integration
+def test_read_write_refuse_symlinked_dir_component():
+    # SECURITY REGRESSION: a box plants a symlinked DIRECTORY component (`d/esc -> /etc`); host-side
+    # read_file/write_file must NOT follow it out of the workspace (else read leaks arbitrary host files).
+    # O_NOFOLLOW only guards the FINAL component; the fix descends every component O_NOFOLLOW (openat).
+    with Sandbox(track_files=False) as s:
+        s.run_code("import os; os.makedirs('/workspace/d', exist_ok=True); os.symlink('/etc', '/workspace/d/esc')")
+        with pytest.raises(SandboxError):
+            s.read_file("d/esc/hostname")   # would otherwise return the HOST's /etc/hostname
+        with pytest.raises(SandboxError):
+            s.write_file("d/esc/pwned", b"x")
+        with pytest.raises(SandboxError):
+            s.list_files("d/esc")          # symlinked subdir must not enumerate a host dir's filenames
+        s.write_file("sub/ok.txt", b"hi")   # normal nested I/O still works
+        assert s.read_file("sub/ok.txt") == b"hi"
+        assert [f.path for f in s.list_files("sub")] == ["sub/ok.txt"]
 
 
 @integration
@@ -457,3 +530,129 @@ def test_p1_read_file_max_bytes_caps_the_read():
         with pytest.raises(SandboxError):
             s.read_file("big.bin", max_bytes=1000)
         assert len(s.read_file("big.bin", max_bytes=500_000)) == 200_000
+
+
+# -- warm kernel (persistent interpreter, warm-start) --------------------------------------------
+
+
+@integration
+def test_kernel_state_persists_and_captures_results():
+    # A kernel is ONE warm interpreter: in-memory state persists across cells (unlike run_code), and a
+    # trailing expression is still captured into rich results.
+    with Sandbox(timeout_s=30) as s:
+        with s.kernel() as k:
+            assert isinstance(k, Kernel)
+            r = k.run_code("x = 40")
+            assert r.success and r.results == []
+            r = k.run_code("y = x + 2\nprint('y =', y)")
+            assert r.stdout.strip() == "y = 42" and r.success  # x survived from the previous cell
+            r = k.run_code("x * 100")  # trailing bare expression -> a rich result
+            assert r.results and r.results[0].text == "4000"
+
+
+@integration
+def test_kernel_survives_a_cell_error():
+    # An uncaught error in a cell is confined: rc=1, the user traceback is on stderr, and the kernel
+    # keeps serving with its state intact.
+    with Sandbox(timeout_s=30) as s:
+        with s.kernel() as k:
+            k.run_code("z = 7")
+            r = k.run_code("1 / 0")
+            assert r.exit_code == 1 and not r.success and "ZeroDivisionError" in r.stderr
+            assert r.fault is None  # a user error is NOT a sandbox fault
+            r = k.run_code("z")  # kernel is alive, z is still here
+            assert r.results and r.results[0].text == "7"
+
+
+@integration
+def test_kernel_timeout_tears_down_and_guards():
+    # A per-cell timeout kills the kernel (a running cell cannot be interrupted); afterwards the kernel
+    # is dead and refuses further cells with a clear error.
+    with Sandbox(timeout_s=30) as s:
+        with s.kernel(timeout_s=2) as k:
+            assert k.run_code("print('alive')").stdout.strip() == "alive"
+            t = time.monotonic()
+            r = k.run_code("while True: pass")
+            assert r.fault is not None and r.fault.type == "timeout" and not r.success
+            assert time.monotonic() - t < 8
+            with pytest.raises(SandboxError):
+                k.run_code("1 + 1")
+
+
+@integration
+def test_kernel_stdin_is_eof_not_the_control_channel():
+    # A cell that reads stdin must get EOF, NOT the next control frame (which would deadlock the kernel
+    # and desync the protocol). The kernel must stay aligned for the following cell.
+    with Sandbox(timeout_s=6) as s:
+        with s.kernel() as k:
+            r = k.run_code("import sys; print('in=' + repr(sys.stdin.readline()))")
+            assert r.stdout.strip() == "in=''" and r.success
+            assert k.run_code("print(2 + 2)").stdout.strip() == "4"  # protocol still aligned
+
+
+@integration
+def test_kernel_raw_fd_writes_are_captured_not_corrupting():
+    # A cell writing RAW to fd 1 (bypassing sys.stdout) or via a subprocess must NOT corrupt the control
+    # channel (control lives on private fds); the raw output is captured, and the kernel stays aligned.
+    with Sandbox(timeout_s=10) as s:
+        with s.kernel() as k:
+            r = k.run_code("import os; os.write(1, b'RAW\\n'); print('P')")
+            assert r.success and "RAW" in r.stdout and "P" in r.stdout  # both captured, no fault
+            assert k.run_code("print(6 * 7)").stdout.strip() == "42"  # protocol still aligned
+            r = k.run_code("import subprocess; subprocess.run(['printf', 'sub'])")
+            assert "sub" in r.stdout and r.success  # subprocess stdout captured
+            r = k.run_code("import sys; print('in=' + repr(sys.stdin.read()))")
+            assert r.stdout.strip() == "in=''"  # a subprocess/read of stdin gets EOF, never a cell frame
+
+
+@integration
+def test_kernel_survives_raw_fork_and_multiprocessing():
+    # A cell that raw os.fork()s (or uses multiprocessing) must not spawn rogue driver clones that corrupt
+    # the control channel: the forked child exits instead of re-entering the loop. The kernel stays aligned.
+    with Sandbox(memory_mb=512, pids=128, timeout_s=15) as s:
+        with s.kernel() as k:
+            r = k.run_code(
+                "import os\n"
+                "for _ in range(15):\n"
+                "    pid = os.fork()\n"
+                "    if pid == 0: os._exit(0)\n"
+                "    os.waitpid(pid, 0)\n"
+                "print('forked-clean')"
+            )
+            assert r.stdout.strip() == "forked-clean" and r.success
+            assert k.run_code("print(7 * 7)").stdout.strip() == "49"  # protocol aligned after forks
+            r = k.run_code(
+                "from concurrent.futures import ProcessPoolExecutor as P\n"
+                "with P(2) as e: print('mp', sum(e.map(abs, [-1, -2, -3])))"
+            )
+            assert "mp 6" in r.stdout and r.success  # multiprocessing works in the kernel
+            assert k.run_code("print('alive')").stdout.strip() == "alive"
+
+
+@integration
+def test_kernel_oversize_reply_is_capped_not_host_oom():
+    # The box controls the reply length; a reply past max_output_bytes must be refused (host-OOM guard),
+    # tearing the kernel down with a clear fault rather than buffering gigabytes into host RAM.
+    with Sandbox(timeout_s=20, max_output_bytes=4 * 1024 * 1024) as s:
+        with s.kernel() as k:
+            r = k.run_code("print('A' * 20_000_000)")  # 20 MB reply vs a 4 MB cap
+            assert r.fault is not None and r.fault.type == "killed" and "cap" in r.fault.message
+            with pytest.raises(SandboxError):
+                k.run_code("1 + 1")  # torn down
+
+
+@integration
+def test_kernel_is_warm_far_faster_than_a_cold_cell():
+    # The whole point: a warm cell skips the ~10 ms CPython boot. Assert it is at least 10x faster than
+    # a cold one-shot run_code on the same session (generous bound; real gap is ~400x).
+    with Sandbox(timeout_s=30) as s:
+        t = time.monotonic()
+        s.run_code("1 + 1")  # cold: a fresh interpreter boot
+        cold = time.monotonic() - t
+        with s.kernel() as k:
+            k.run_code("1 + 1")  # warm up the pipe
+            t = time.monotonic()
+            for _ in range(20):
+                k.run_code("sum(range(1000))")
+            warm = (time.monotonic() - t) / 20
+    assert warm < cold / 10

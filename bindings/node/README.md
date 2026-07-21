@@ -53,7 +53,9 @@ await kern.withSandbox({ setup: "pip install pandas" }, async (sbx) => {
 ```
 
 `setup` is the **only** moment the network is on (a separate box that installs deps into the workspace
-and dies); every `runCode` after it is network-off.
+and dies); every `runCode` after it is network-off. The setup box runs under the **same `memoryMb`
+cap** as your runs: a heavy install (pandas, torch, ...) can OOM-kill setup at the default 512 MB, so
+raise `memoryMb` (e.g. `memoryMb: 1536`) for the session when installing a large stack.
 
 ## Run JavaScript in the box too
 
@@ -130,10 +132,17 @@ new Sandbox({
   maxOutputBytes,  // default 64 MiB
   enforceLimits,   // default true (systemd scope, ~6 ms); false = best-effort, ~3 ms
   depsReadonly,    // default false
+  trackFiles,      // default true: diff the workspace each call for result.files (O(files)); false = [], O(1)
   onStdout,        // (chunk: Buffer) => void, live stdout streaming (result.stdout still captured)
   onStderr,        // (chunk: Buffer) => void, live stderr streaming
 });
 ```
+
+`runCode`/`run` also take `timeoutS`/`onStdout`/`onStderr` as **per-call** options that override the
+session defaults for that one call. A `vcpu:` profile can carry `cpus`+`memory`; `memoryMb`/`cpus` are
+explicit flags that **override** a profile's values (and the `memoryMb` default `512` shadows a profile's
+`memory`, so pass `memoryMb: null` to let the profile apply). The **MCP server** (`kern-mcp`, for Claude
+Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-sandbox`).
 
 ## Charts, rich results, live output, and checkpoints
 
@@ -147,7 +156,7 @@ and **every open matplotlib figure automatically** (no `savefig`). Accessors: `.
 await kern.withSandbox({ setup: "pip install matplotlib pandas" }, async (sbx) => {
   let r = await sbx.runCode("import matplotlib; matplotlib.use('Agg')\n" +
     "import matplotlib.pyplot as plt; plt.plot([1,4,9])");
-  const png = r.results[0].png;                 // Buffer of the figure, auto-captured
+  const png = r.results.map((x) => x.png).find(Boolean) ?? null;  // figure Buffer, auto-captured
 
   r = await sbx.runCode("import pandas as pd; pd.DataFrame({'a':[1,2]})");
   r.results[0].html;                            // the DataFrame as an HTML table (also .text)
@@ -156,6 +165,30 @@ await kern.withSandbox({ setup: "pip install matplotlib pandas" }, async (sbx) =
 
 Capture never touches `stdout`/`stderr`/`exitCode`; a statement returning `None` yields no result. You
 can still WRITE an artifact to the workspace and `readFile` it if you prefer.
+
+**Warm kernel (kill the interpreter boot).** Each `runCode` starts a **fresh** interpreter, paying the
+CPython boot (~10 ms) every call. When you run many cells that share state (a REPL, a notebook, an
+agent's tool loop), open a `kernel()`: ONE warm interpreter in a long-lived box, fed cells over a pipe.
+In-memory state persists across cells and the per-cell cost drops from ~16 ms to **sub-millisecond**
+(~300x). Same rich `results` capture as `runCode`.
+
+```js
+await kern.withSandbox(async (sbx) => {
+  const k = await sbx.kernel();
+  try {
+    await k.runCode("import numpy as np; a = np.arange(1_000_000)");  // imports paid once
+    const r = await k.runCode("a.sum()");                            // 'a' is still here; ~sub-ms
+    console.log(r.results[0].text);                                  // 499999500000
+  } finally {
+    await k.close();                                                 // tears the box down
+  }
+});
+```
+
+The trade vs `runCode`: cells in a kernel share one process and one box, so it is call-fast but not
+call-isolated (still network-off and resource-capped; a fresh session or kernel is clean). An uncaught
+error is confined (`exitCode` 1, traceback on `stderr`, the kernel keeps serving); a per-cell `timeoutS`
+tears the kernel down (a running cell cannot be interrupted), after which it refuses further cells.
 
 **Live output.** Pass `onStdout` / `onStderr` to stream each chunk as it arrives. The callback is
 best-effort, not lossless: a SLOW callback drops chunks rather than applying backpressure to the box
