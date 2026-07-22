@@ -199,13 +199,10 @@ name = "scratch"
 backend = "data"               # REQUIRED: a [[disk]] name above, or "ram" for a RAM-backed tmpfs
 size = "8g"
 
-[[gpio]]                       # a host I2C controller (physical): the bus the board exposes
-id = "gpio:0"
-i2c = ["/dev/i2c-1"]
-[[vgpio]]                      # expose ONLY what is listed here, nothing else  ->  vgpio:sensor
+[[vgpio]]                      # expose ONLY these device nodes, nothing else  ->  vgpio:sensor
 name = "sensor"
-backend = "gpio:0"             # REQUIRED: a [[gpio]] id above, or "host" for the host's own devices
-i2c = ["/dev/i2c-1"]           # grant just I2C bus 1 (e.g. a temp/pressure sensor)
+backend = "host"               # I2C/SPI/... are host device nodes (not GPIO lines): "host" grants them
+i2c = ["/dev/i2c-1"]           # grant just I2C bus 1 (a temp/pressure sensor); nothing else crosses in
 ```
 
 ## What you can do in one line
