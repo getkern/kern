@@ -10072,8 +10072,7 @@ pins = [17, 27, 22]
 [[vgpio]]
 name = "leds"
 backend = "gpio:0"    # REQUIRED: a [[gpio]] id above, or "host" for the host's own device nodes
-pins = [17, 27]
-i2c = ["1"]
+pins = [17, 27]       # a subset of the [[gpio]]'s pins - expose ONLY these lines, nothing else
 
 # ── Disk - `kern box vdisk:scratch …` mounts a size-capped volume at /vdisk/scratch ──
 [[disk]]
