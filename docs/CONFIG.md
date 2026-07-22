@@ -27,7 +27,7 @@ GPU family stays private, see [Roadmap](../README.md#roadmap).
 > 1. **Attach by prefix.** `[[vcpu]] name = "heavy"` is used as `vcpu:heavy` on the command line
 >    (`kern run vcpu:heavy -- ./job`); same for `vgpio:` and `vdisk:`.
 > 2. **Every profile MUST name a `backend`** (the host resource it slices): a declared
->    `[[cpu]]`/`[[gpio]]`/`[[disk]]` id, or a reserved keyword . **`host`** (the whole host CPU, or the
+>    `[[cpu]]`/`[[gpio]]`/`[[disk]]` id, or a reserved keyword: **`host`** (the whole host CPU, or the
 >    host's own device nodes) or **`ram`** (a RAM-backed vdisk).
 > 3. **Key == flag.** Every key is spelled exactly like its CLI flag (`cpus` = `--cpus`, `memory` =
 >    `--memory`, `cpuset` = `--cpuset-cpus`), so if you know the flag you know the field.
@@ -46,7 +46,7 @@ GPU family stays private, see [Roadmap](../README.md#roadmap).
 > cpus    = 2
 >
 > [[disk]]                # physical: a disk pool for volumes
-> name = "pool"
+> id = "pool"
 > path = "/var/lib/kern/disks"
 > [[vdisk]]               # a size-capped scratch on it  ->  vdisk:scratch
 > name    = "scratch"
@@ -165,7 +165,7 @@ id = "0"; total_pins = 40; pins = [2, 3, 4, 17, 27]; i2c = ["1"]; leds = ["led0"
 bus = 1; port = 2; name = "sensor-hub"
 
 [[disk]]  # a physical disk pool a [[vdisk]] places volumes on
-name = "pool"; path = "/var/lib/kern/disks"; default = true; size = "100g"; iops = 5000
+id = "pool"; path = "/var/lib/kern/disks"; default = true; size = "100g"; iops = 5000
 ```
 
 ---
