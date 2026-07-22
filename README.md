@@ -199,10 +199,13 @@ name = "scratch"
 backend = "data"               # REQUIRED: a [[disk]] name above, or "ram" for a RAM-backed tmpfs
 size = "8g"
 
-[[vgpio]]                      # expose ONLY these device nodes, nothing else  ->  vgpio:sensor
+[[gpio]]                       # the host controller `kern config setup -c` records: an inventory of
+id = "gpio:0"                  # what's present (and the backend menu in `kern top`)
+i2c = ["/dev/i2c-1", "/dev/i2c-2"]
+[[vgpio]]                      # a profile that exposes a SUBSET of it, nothing else  ->  vgpio:sensor
 name = "sensor"
-backend = "host"               # I2C/SPI/... are host device nodes (not GPIO lines): "host" grants them
-i2c = ["/dev/i2c-1"]           # grant just I2C bus 1 (a temp/pressure sensor); nothing else crosses in
+backend = "gpio:0"             # REQUIRED: the [[gpio]] id above (like vcpu -> cpu:0, vdisk -> data)
+i2c = ["/dev/i2c-1"]           # grant ONLY bus 1 to the box; bus 2 stays hidden
 ```
 
 ## What you can do in one line
