@@ -2,10 +2,11 @@
 
 # kern
 
-**A fast, lightweight sandbox & virtual resource manager. Runs untrusted and AI-generated code.**
+**A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
 
-Run untrusted or agent-generated code in a real, kernel-enforced box that starts in **~2 ms**, from one
-**~1.6 MB** rootless binary with no daemon. Embed it from Python, Node or Rust, or run it from the CLI.
+A fast, daemonless container for your inner loop: a real, kernel-enforced box that starts in **~2 ms**,
+from one **~1.6 MB** rootless binary, with no `dockerd` sitting in the background. The same box also runs
+untrusted or agent-generated code, isolated. Embed it from Python, Node or Rust, or run it from the CLI.
 
 Isolation is just the first resource kern manages this way: the same model also slices CPU (`vcpu:`),
 memory, disk (`vdisk:`) and devices (`vgpio:`) per process, with or without a full box. The container is
@@ -17,6 +18,16 @@ was installed at all).
 
 **~2 ms** cold start (vs **~308 ms** `docker run`) · **~1.6 MB** static binary · **0 RAM at rest** · **rootless**
 
+**🐧 Linux & ARM boards**
+```sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+**🪟 Windows (via WSL2)**
+```powershell
+irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+```
+then `kern box dev --image alpine -- sh`
+
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](#platforms)
@@ -26,7 +37,7 @@ was installed at all).
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.6 MB static binary, no daemon.">
 </p>
 
-<sub>Demo timings on an Intel i7-14700KF (28-core x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2 ms</b>; a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. Your hardware and cgroup delegation differ: see <a href="BENCHMARKS.md">Benchmarks</a> for the labeled table, methodology, and on-device board numbers.</sub>
+<sub>Demo timings on an Intel i7-14700KF (28-core x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2 ms</b>; a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. The comparison table under <a href="#performance">Performance</a> is a separate Linux 6.17 desktop; your hardware and cgroup delegation differ, so measure your own. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology and on-device board numbers.</sub>
 
 [Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
@@ -61,14 +72,14 @@ print(r.stdout, r.success)                     # → a fresh, discarded-after bo
 
 ## kern vs Docker vs Podman
 
-|  | Docker | Podman | **kern** |
+|  | **kern** | Docker | Podman |
 |---|---|---|---|
-| Daemon | yes (`dockerd` + `containerd`) | no | **no** |
-| Rootless | partial | yes | **yes** |
-| Cold start (a bare box) | ~308 ms | ~155 ms | **~2 ms** |
-| Footprint | ~186 MB daemon stack | multi-package install | **one 1.6 MB static binary** |
-| OCI images (pull / build) | yes | yes | **yes** |
-| Resource caps without a full box | no | no | **yes (`kern run`)** |
+| Daemon | **no** | yes (`dockerd` + `containerd`) | no |
+| Rootless | **yes** | opt-in (rootless mode) | yes |
+| Cold start (a bare box) | **~2 ms** | ~308 ms | ~155 ms |
+| Footprint | **one 1.6 MB static binary** | ~186 MB daemon stack | multi-binary install |
+| OCI images (pull / build) | **yes** | yes | yes |
+| Resource caps without a full box | **yes (`kern run`)** | no | no |
 
 Startup numbers are from a labeled [benchmark](BENCHMARKS.md) on one machine, measure your own. kern
 deliberately does *less* than Docker (no overlay networks, no swarm): a small, fast, honest core. It is a
@@ -77,11 +88,20 @@ microVM is the right tool, and [SECURITY.md](SECURITY.md) says exactly where the
 
 ## What you'd use it for
 
+One move under all of these: a fresh, isolated, resource-capped box in **~2 ms**, wherever you would
+otherwise reach for a container, a cloud sandbox, or root.
+
+- **Development:** a fast, daemonless Docker for your inner loop. Spin up a service, a database, or a
+  clean per-language build box in **~2 ms**, run it, throw it away, your host stays untouched and no
+  `dockerd` sits in the background eating RAM ([familiar-commands.sh](examples/familiar-commands.sh) · [database-box.sh](examples/database-box.sh)).
 - **AI agents:** run each model-generated tool call in a fresh, network-off box, sandbox faults come back
   as data, not crashes ([warm-kernel.py](examples/warm-kernel.py) · [kern-mcp for Claude Desktop / Cursor](examples/mcp-code-interpreter.md) · [agent-tool-runner.py](examples/agent-tool-runner.py)).
 - **CI:** run each step in a capped, daemonless box, no Docker-in-Docker ([ci-in-a-box.sh](examples/ci-in-a-box.sh)).
 - **Edge / ARM:** one 1.6 MB binary on a Pi 5 / Jetson where a Docker daemon does not fit ([edge-many-services.sh](examples/edge-many-services.sh)).
+- **Device access / IoT:** hand a workload *exactly* the device nodes you name (an I2C or SPI bus, a GPIO chip, a sensor) and nothing else, deny-by-default, with no direct equivalent I know of in Docker (`--device` is unnamed and per-run) or systemd ([device-isolation.sh](examples/device-isolation.sh)).
 - **Untrusted or customer code:** execute it isolated and resource-capped, on your own machine, no cloud ([code-interpreter.py](examples/code-interpreter.py)).
+- **Serverless / functions:** a fresh, throwaway box per request, so one call's crash or timeout stays contained to its own box ([per-request-workers.py](examples/per-request-workers.py)).
+- **Data & batch:** ETL, scraping, per-file fan-out, each input in its own capped box ([data-pipeline.sh](examples/data-pipeline.sh) · [batch-process.sh](examples/batch-process.sh)).
 - **Build and run OCI images:** `kern build` / `kern box`, speaks Docker formats, no daemon.
 
 ## Why kern
@@ -115,14 +135,15 @@ slices **without** the sandbox. They compose (`run` inside `box`). Both ship tod
 
 ## Virtual resources
 
-One model: a box (or a bare `run`) gets *only* the resources you slice for it. Every cap is a real
-cgroup v2 or kernel control; devices are deny-by-default. GPU slices are on the [Roadmap](#roadmap).
+One model: a box gets *only* what you slice for it; a bare `run` adds the same caps to a process that
+otherwise still sees the host. Every shipping cap is a real cgroup v2 or kernel control; devices are
+deny-by-default. GPU slices are on the [Roadmap](#roadmap).
 
 | Resource | Flag / profile | What the box gets | Enforcement |
 |---|---|---|---|
 | **CPU** | `--cpus` · `--cpuset-cpus` · `--nice` · `vcpu:` | Fractional CPU-time quota, core pinning, priority | cgroup `cpu.max` / `cpuset`, hard |
 | **Memory** | `--memory` · `--memory-swap-max` | Hard RAM ceiling (+ swap allowance) | cgroup `memory.max`, hard¹ |
-| **Disk** | `vdisk:` · `--size` (named volumes) | Size-capped scratch at `/vdisk/<name>` | tmpfs charged to the box cgroup (rootless), or ext4-on-loop quota (privileged) |
+| **Disk** | `vdisk:` · `--size` (named volumes) | Size-capped scratch at `/vdisk/<name>` | rootless: a **RAM-backed tmpfs** (counts against the box's memory cap); privileged: ext4-on-loop quota on real disk |
 | **Devices** | `vgpio:` | *Only* the named GPIO/I²C/SPI/LED nodes, nothing else | fresh `/dev` + fd-pinned bind + capability deny-list (raw-mem/disk/kvm refused) |
 | **PIDs** | `--pids-limit` | Fork-bomb ceiling | cgroup `pids.max`, hard |
 | **Block I/O** | `--io-weight` | I/O bandwidth weight | cgroup `io` |
@@ -132,6 +153,42 @@ cgroup v2 or kernel control; devices are deny-by-default. GPU slices are on the 
 `.wslconfig` fix; enforced natively on Linux. Profiles (`vcpu:`/`vdisk:`/`vgpio:`) are reusable presets in
 `~/.config/kern/kern.toml`, see [docs/CONFIG.md](docs/CONFIG.md). Author them with `kern probe` (list the
 host resources you can slice), `kern examples` (print a sample `kern.toml`), and `kern validate` (check one).
+
+### Profiles
+
+Define a named slice of resources once in `~/.config/kern/kern.toml` (optional, the flags work without
+it) and attach it to any run by a token, instead of retyping `--cpus 2 --memory 1g --device /dev/i2c-1`
+on every call. The same profile attaches to `kern box` (isolated) **and** `kern run` (no sandbox), on any
+Linux, with **no daemon** (hard cgroup caps still need a delegated cgroup; kern warns and falls back to
+best-effort if there is not one):
+
+```sh
+kern box tool --image python vcpu:agent vgpio:sensor -- ./tool.py   # the same tokens on every call in a loop
+```
+
+Three kinds ship today (a GPU slice is on the [Roadmap](#roadmap)):
+
+- `vcpu`: a hard CPU + memory slice (cgroup `cpu.max` / `memory.max`).
+- `vdisk`: a size-capped scratch at `/vdisk/<name>` (rootless: a **RAM-backed tmpfs** that counts against
+  the memory cap, so an 8 GB scratch uses 8 GB of RAM; privileged: ext4-on-loop on real disk).
+- `vgpio`: *exactly* the named GPIO / I²C / SPI device nodes, nothing else (a fresh `/dev` + an fd-pinned
+  bind). A reusable, deny-by-default device set attached by name is the one piece with no direct equivalent I know of
+  in Docker (`--device` is per-run, unnamed) or systemd (`DeviceAllow` is per-unit, not a portable preset).
+
+```toml
+[[vcpu]]
+name = "agent"
+cpus = 2
+memory = "1 GB"
+
+[[vdisk]]
+name = "scratch"
+size = "8 GB"
+
+[[vgpio]]
+name = "sensor"
+i2c = ["/dev/i2c-1"]
+```
 
 ## What you can do in one line
 
@@ -462,8 +519,9 @@ await withSandbox({ memoryMb: 512, timeoutS: 30 }, async (s) => {
 
 **Warm kernel (sub-millisecond cells).** For a REPL/notebook or an agent's tool loop, open a persistent
 warm interpreter with `Sandbox.kernel()` (Python and Node): in-memory state persists across cells and the
-per-cell cost drops from a full interpreter boot (about 10 ms) to sub-millisecond (about 300x, 25k
-cells/s), with the same rich results, still network-off and resource-capped.
+per-cell cost drops from a full interpreter boot (about 10 ms) to sub-millisecond (about 300x, ~25k
+cells/s on the [Benchmarks](BENCHMARKS.md) host), with the same rich results, still network-off and
+resource-capped.
 
 **MCP server for Claude Desktop / Cursor / Windsurf.** The Python package also ships **`kern-mcp`**, a
 dependency-free MCP stdio server that hands any MCP client a local, **network-off** code interpreter
@@ -571,9 +629,10 @@ travel off-argv. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Performance
 
-One isolated `/bin/true`, warm image cache, one box per run. The x86_64 comparison is the **28-core,
-Linux 6.17, NVMe, systemd-user** host in **[BENCHMARKS.md](BENCHMARKS.md)** (exact per-runtime commands
-there). kern's figure is informally reproduced on a second machine, an **Intel i7-14700KF**, same class, where a P-core-pinned
+One isolated `/bin/true`, warm image cache, one box per run. The x86_64 table below was measured on a
+**28-core, Linux 6.17, NVMe, systemd-user** desktop (exact per-runtime commands in
+**[BENCHMARKS.md](BENCHMARKS.md)**). kern's figure is informally reproduced on the machine the hero and
+demo numbers come from, an **Intel i7-14700KF, Linux 7.0**, same class, where a P-core-pinned
 `/bin/true` box lands in the low-single-digit-ms range (an E-core is slightly higher). Your
 numbers vary with hardware and load; board rows are from on-device runs.
 
@@ -628,10 +687,13 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 ## Project status
 
 **0.6.9, a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (479 Rust, 61 Python and 50 Node tests; clippy-clean and
-Node, clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It
+Everything in [Features](#features) works today and is tested (479 Rust, 61 Python and 50 Node tests;
+clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It
 deliberately skips a lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast,
-honest core. The CLI and config surface are **not frozen until 1.0**.
+honest core. **Every numbered release is a tested, production-intent build, not a beta or a preview:** it
+is the official release of that version. Pre-1.0 means only that the CLI and config *surface* can still
+change between minor versions (changes are called out in [CHANGELOG.md](CHANGELOG.md)), not that a
+release is unfinished.
 
 **Recent work (0.6.9):** a **warm kernel** for the Python + Node bindings (`Sandbox.kernel()`, a
 persistent interpreter that makes the code-interpreter path sub-millisecond) and an **MCP server**
@@ -648,19 +710,11 @@ overlay networking.
 
 ## Roadmap
 
-kern starts as a small, fast sandbox/OCI runtime and grows deliberately; the set of resources it
-governs is driven by what proves useful.
+kern starts as a small, fast sandbox/OCI runtime and grows deliberately: the resources it governs are
+driven by what proves useful. These are directions under consideration, **not commitments or dates**,
+and some may never ship if they would change what kern is. Recently shipped work is under
+[Project status](#project-status), not here.
 
-- **Shipped:** build + tag + push, zstd layers, `--init`, `--platform`, pods, `kern commit`,
-  `--egress-allow`, `--landlock-rw`, fleet budgets, and the Python + Node bindings; ongoing polish +
-  broader (ARM) CI and edge/I/O ergonomics.
-- **Windows, via WSL2 (shipped, one line: see [Install](#install)).** kern runs on Windows inside WSL2
-  (a real Linux kernel) so hard caps (`--memory`/`--cpus`) are real there, verified. A `kern.exe` shim
-  and a pre-baked kern WSL2 distro (Alpine + kern, no Ubuntu, no manual steps) install with a single
-  `irm … | iex` that self-elevates, imports the distro and drops the shim on PATH. Both the shim and the
-  distro are **built by the release CI from tagged source and sha256-signed**; the installer verifies
-  every download, so it's the same trust level as the Linux binaries, not a hand-uploaded exe. Honest caveat: kern runs *inside* the WSL2
-  kernel, so it doesn't shed the VM weight native Linux does; the win is "no Docker Desktop", not "no VM".
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. It lands incrementally,
   each stage useful on its own and each opt-in (`--no-gpu` stays the default): first **safe access +
   visibility** (device passthrough, driver-gated, sysfs/procfs masked; per-box VRAM + utilisation in
@@ -668,6 +722,19 @@ governs is driven by what proves useful.
   first, honest trust model: for first-party / noisy-neighbour isolation, *not* a hard boundary
   against a hostile tenant), then **time-sliced compute** + AMD (HIP) / Vulkan. A cross-vendor GPU
   merge pool stays an optional plugin, not core.
+- **More governed resources.** The same profile model could extend to other cgroup or kernel-real
+  resources (I/O bandwidth, network shaping) as they prove useful.
+- **Snapshot / warm-start (CRIU).** Same-host checkpoint and restore of a *warm* box for subsecond
+  restarts. Feasible but gated: rootless CRIU needs a capability and suspending the seccomp filter, so it
+  would be an explicit opt-in mode, not the default, and only for same-host, non-GPU boxes. Not committed.
+- **macOS.** There is **no native port**: a daemonless kernel + cgroup sandbox has no macOS equivalent,
+  so a native macOS kern is a non-goal. The only path considered is a thin shim driving a Linux VM (the
+  same shape as WSL2 on Windows), with the same honest caveat, the win would be "no Docker Desktop", not
+  "no VM". Not committed.
+- **A microVM (`--vm`) mode.** An obvious question, given the threat model: to run *actively hostile* code. It would be a
+  different tool with a different threat model: kern today is a **kernel-boundary** sandbox, not a
+  microVM, and says so plainly. If it ever shipped it would be an explicit, separate mode, never a silent
+  change to what kern is. Not committed.
 - **1.0, freeze:** CLI + config under semver, threat model + architecture finalised.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
