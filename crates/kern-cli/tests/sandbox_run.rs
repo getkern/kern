@@ -1969,3 +1969,97 @@ fn compose_full_schema_brings_box_up() {
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::remove_file(&toml);
 }
+
+/// Regression: `kern exec` must place the exec'd process in the BOX'S cgroup, so a command run
+/// via `kern exec` is bound by the box's `--memory`/`--pids` caps (like `docker exec`), not the
+/// launcher's ambient cgroup. Before the cgroup-join in `exec_in_box`, a fork bomb or memory hog
+/// run via `kern exec` escaped the box's limits entirely (namespaces + seccomp still held; only
+/// the resource cap leaked). We compare the exec'd process's own cgroup (`/proc/self/cgroup`)
+/// with the box PID 1's (`/proc/1/cgroup`): the join makes them the SAME `kern-box-*` cgroup.
+///
+/// Skip-graceful on two axes: no busybox / no userns (like the tests above), AND no cgroup
+/// delegation - on a best-effort host the box's own PID 1 isn't in a `kern-box-*` cgroup either,
+/// so there is nothing for exec to join and nothing to assert. Gating on PID 1's cgroup (an
+/// INDEPENDENT signal of "the box got capped here") is what lets a broken join FAIL rather than
+/// silently skip on the hosts where the cap actually applies.
+#[test]
+fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces unavailable");
+        return;
+    }
+    let tag = "cgexec";
+    let _ = kern().args(["stop", tag]).output(); // clear any leftover from a prior aborted run
+    let root = build_rootfs(&busybox, tag);
+    let rootfs = root.to_str().unwrap();
+
+    let start = kern()
+        .args([
+            "box",
+            tag,
+            "--rootfs",
+            rootfs,
+            "--memory",
+            "64m",
+            "--pids-limit",
+            "32",
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("start detached box");
+    if !start.status.success() {
+        eprintln!(
+            "skip: box did not start ({})",
+            String::from_utf8_lossy(&start.stderr).trim()
+        );
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+
+    // One exec prints the exec'd process's own cgroup AND the box PID 1's cgroup (v2 `0::<path>`).
+    let out = kern_out(&[
+        "exec",
+        tag,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "cat /proc/self/cgroup; echo SEP; cat /proc/1/cgroup",
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let leaf = |s: &str| -> String {
+        s.lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let mut parts = text.split("SEP");
+    let exec_leaf = leaf(parts.next().unwrap_or(""));
+    let box_leaf = leaf(parts.next().unwrap_or(""));
+
+    // Stop + clean BEFORE asserting so a failing assert never leaks a running box.
+    let _ = kern().args(["stop", tag]).output();
+    let _ = fs::remove_dir_all(&root);
+
+    // No cgroup delegation here → the box PID 1 isn't in a `kern-box-*` cgroup, so there is nothing
+    // for exec to join. Skip rather than assert (matches the runtime's best-effort fallback).
+    if !box_leaf.starts_with("kern-box-") {
+        eprintln!("skip: host has no delegated cgroup (box PID 1 cgroup leaf: {box_leaf:?})");
+        return;
+    }
+    assert_eq!(
+        exec_leaf, box_leaf,
+        "`kern exec` must join the box's cgroup ({box_leaf:?}); the exec'd process was in \
+         {exec_leaf:?}, so it would escape the box's --memory/--pids caps"
+    );
+}

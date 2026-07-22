@@ -139,6 +139,19 @@ delegated cgroup, containment is not guaranteed.
 
 - **`--pids-limit N`** sets the box's `pids.max` (and the scope's `TasksMax`), a fork-bomb ceiling.
   Default 512. Like the memory cap, it's cgroup-enforced where a scope / delegated hierarchy exists.
+- **`kern exec` and the box's caps.** A `kern exec`'d command joins the box's cgroup (so it inherits
+  the box's `--memory`/`--pids`, like `docker exec`) **only where the box sits in a delegated cgroup
+  kern can write** - kern under the systemd **user manager** (`user@<uid>.service`), or kern as root.
+  On the rootless **per-box-scope** path (e.g. an SSH login session on an edge board, whose shell is a
+  `session-*.scope` sibling of the user manager), the box runs in a transient `run-*.scope` that the
+  kernel will **not** let `kern exec` migrate into from another branch of the tree (moving between
+  sibling scopes needs write on the common ancestor `user@<uid>.service`, which systemd owns). There an
+  exec'd command runs **outside** the box's `--memory`/`--pids` caps; kern **warns** when the box has
+  explicit caps rather than leak it silently. The box's OWN workload (`kern box` / the SDK's
+  `run_code`) is always capped by its scope; namespaces + seccomp isolate the exec'd command
+  regardless. (kern deliberately does **not** re-run each exec in its own capped scope: that would give
+  every exec the box's full limit, so N concurrent execs could use N× the box's memory - breaking the
+  aggregate guarantee the shared cgroup provides. An honest "not enforced" beats a false one.)
 - **`--user UID[:GID]`** drops the workload to a uid/gid *after* all privileged setup and the
   capability drop, just before seccomp (`setgroups`→`setgid`→`setuid`). Only ids **mapped into the
   box's user namespace** work, so a non-root `--user` implies the uid/gid-range mapping (like

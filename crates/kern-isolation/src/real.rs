@@ -2877,6 +2877,7 @@ fn wait_code(status: i32) -> i32 {
 /// Not a descendant of PID 1, so the box's own seccomp filter doesn't block the `setns` calls
 /// here; the new process gets its own copy of the filter for parity. Requires that the caller is
 /// the same user that created the box (its user namespace owner).
+#[allow(clippy::too_many_arguments)] // each arg is a distinct exec knob; grouping would only hide it
 pub fn exec_in_box(
     pid1: i32,
     command: &[String],
@@ -2885,6 +2886,7 @@ pub fn exec_in_box(
     tty_slave: Option<i32>,
     tty_master: Option<i32>,
     timeout_secs: Option<u64>,
+    box_has_explicit_caps: bool,
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -2925,6 +2927,41 @@ pub fn exec_in_box(
             ));
         }
     }
+    // Join the box's cgroup (its `--memory`/`--pids` caps) BEFORE entering the mount namespace.
+    // Once we `setns(CLONE_NEWNS)` into the box, `/sys/fs/cgroup` is the box's masked view and the
+    // host cgroupfs is unreachable, so this MUST happen here, in the host mount ns. We move THIS
+    // (pre-fork) process, so the child forked below inherits the cgroup atomically - the same
+    // "cap before fork" order the box's own PID 1 setup uses, with no fork→move→exec race.
+    //
+    // Without it an `exec`'d workload stays in the LAUNCHER's cgroup and escapes the box's resource
+    // caps entirely: a fork bomb or memory hog run via `kern exec` would NOT be bounded by the box's
+    // `--pids`/`--memory` (unlike `docker exec`, which places the exec'd process in the container's
+    // cgroup). The namespace + seccomp isolation holds regardless; this closes the RESOURCE gap on
+    // the delegated direct-cap path (kern.slice/kern-box-*).
+    //
+    // On the rootless per-box-systemd-scope path (Jetson/Pi 5 and the common rootless case) the box
+    // lives in a `run-*.scope` that the kernel will NOT let us migrate into from our own session
+    // scope (the common ancestor `user@<uid>.service` isn't user-writable - verified EPERM), so the
+    // exec runs outside the caps there. `join_box_cgroup_for_exec` reports that as `Unbounded`.
+    //
+    // We always ATTEMPT the join (it caps the exec on the direct path; a harmless no-op elsewhere)
+    // but only WARN when the user set an EXPLICIT `--memory`/`--pids` on the box (`box_has_explicit_
+    // caps`): a default box on a scope host also sits in a scope with a default MemoryMax, so warning
+    // on `Unbounded` alone would fire on EVERY exec on every rootless host (a `kern exec box ls`
+    // included) - noise the user never asked about. A `--health-cmd` probe passes `false` too, so it
+    // never spams the box log every interval.
+    let cgroup_join = crate::cgroup::join_box_cgroup_for_exec(pid1);
+    if box_has_explicit_caps {
+        if let crate::cgroup::ExecCgroupJoin::Unbounded = cgroup_join {
+            eprintln!(
+                "kern: exec: warning: this host runs the box in a per-box systemd scope that the \
+                 kernel won't let `kern exec` join, so the command runs OUTSIDE the box's \
+                 --memory/--pids caps (its namespaces + seccomp still isolate it). A host with \
+                 kern's delegated kern.slice (e.g. running kern as root) caps exec'd commands too."
+            );
+        }
+    }
+
     for (fd, flag) in &fds {
         if unsafe { libc::setns(*fd, *flag) } != 0 {
             let e = std::io::Error::last_os_error();
