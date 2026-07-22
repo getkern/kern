@@ -17,6 +17,23 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.12], 2026-07-22
+
+A fix so `kern config setup` produces a config that passes `kern validate`.
+
+### Fixed
+- **`kern config setup` generated `[[vcpu]]` profiles without a `backend`**, so the starter config it
+  tailors for a host failed its own `kern validate` under 0.6.11's mandatory-backend rule. Both
+  generated vcpu profiles now carry `backend = "cpu:0"` (vdisk/vgpio already did). Verified end to end
+  on x86_64, Jetson Orin (aarch64), and Raspberry Pi 5. A regression test now runs `config setup` and
+  asserts `kern validate` accepts the output.
+
+### Documentation
+- README: an architecture diagram, links to the security-relevant source (isolation, seccomp, cgroup,
+  OCI pull), and a Requirements & limitations section.
+- CONFIG.md: a full `[[vgpio]]` device-field reference and an extreme-clarity hand-editing guide; the
+  starter snippet now shows the hardware blocks (`[[cpu]]`/`[[disk]]`/`[[gpio]]`) alongside the profiles.
+
 ## [0.6.11], 2026-07-22
 
 A stricter, unambiguous resource-profile schema.
