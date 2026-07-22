@@ -140,6 +140,8 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 |---|---|
 | [agent-tool-runner.py](agent-tool-runner.py) | The canonical "code execution tool" an LLM calls: run model-generated Python in a network-off box, return `{success, stdout, fault}`, a runaway loop returns a `timeout` fault, an exfiltration attempt gets no route out |
 | [code-interpreter.py](code-interpreter.py) | A stateful notebook-style session where **file** state persists turn to turn (write CSV → aggregate → format), a dep installed once via `setup=` |
+| [warm-kernel.py](warm-kernel.py) | The **warm kernel** (`sbx.kernel()`): one persistent interpreter so **in-memory** state persists across cells and each cell is **sub-millisecond** (vs ~16 ms cold), with rich chart results, confined errors, network still off, and a per-cell timeout that tears it down |
+| [mcp-code-interpreter.md](mcp-code-interpreter.md) | Wire **`kern-mcp`** into Claude Desktop / Cursor / Windsurf: a local, **network-off** code interpreter (run_code / write_file / read_file / list_files, charts as image blocks); `KERN_MCP_KERNEL=1` routes it through the warm kernel |
 | [per-request-workers.py](per-request-workers.py) | A stdlib-only pool mapping N requests to N fresh throwaway boxes, so one request's timeout/crash is contained to its own box |
 | [sandboxed-eval.sh](sandboxed-eval.sh) | The shell angle for agents that shell out: eval an untrusted snippet `--read-only --network none` + capped, using the exit code as the signal (benign / blocked / timeout-killed) |
 
