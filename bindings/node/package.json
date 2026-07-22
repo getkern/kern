@@ -1,7 +1,7 @@
 {
   "name": "kern-sandbox",
-  "version": "0.1.8",
-  "description": "A fast, local, daemonless code-interpreter sandbox for agent/LLM code: run Python/JS/Bash, get rich results (charts, tables), no cloud/account/VM. A thin, dependency-free wrapper around the kern binary.",
+  "version": "0.1.9",
+  "description": "kern is a fast, rootless, daemonless Linux sandbox runtime; kern-sandbox is its Node/TypeScript binding. Run untrusted or agent-generated code (Python/JS/Bash) in a real, kernel-enforced box, ~2 ms, no cloud, no account, no VM.",
   "keywords": [
     "sandbox",
     "kern",

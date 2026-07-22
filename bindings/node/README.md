@@ -1,13 +1,15 @@
 # kern-sandbox (Node.js / TypeScript)
 
-Run LLM/agent-generated code in a fast, **local**, daemonless kernel sandbox, straight from Node.
+**[kern](https://github.com/getkern/kern)** is a fast, rootless, daemonless Linux sandbox runtime: a real,
+kernel-enforced box that starts in **~2 ms**, from one **~1.6 MB** binary, with no daemon. **kern-sandbox**
+is its Node / TypeScript binding: run untrusted or agent-generated code in a fresh, isolated box, from Node.
 
 On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). For Python, the same
 package is on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/).
 
 It is a thin, dependency-free wrapper around the [`kern`](https://github.com/getkern/kern) binary:
 a fresh, isolated box per call, network off by default, hard resource caps, and a timeout the binding
-itself enforces. microVM-grade isolation, but local and about 1.6 MB, with no cloud, no account, no VM.
+itself enforces. Kernel-enforced isolation (namespaces, cgroups v2, seccomp), local, about 1.6 MB, with no cloud, no account, no VM.
 
 ```js
 const kern = require("kern-sandbox");
@@ -79,6 +81,7 @@ const r = await kern.runCode("console.log([1,2,3].map(x => x * x))", {
 |---|---|
 | `stdout`, `stderr` | captured output (each capped at `maxOutputBytes`) |
 | `exitCode` | the process exit code |
+| `durationMs` | wall-clock duration of the call, in ms |
 | `success` | `true` iff `exitCode === 0` **and** no sandbox fault |
 | `fault` | a sandbox event, or `null`. `{ type, message }` |
 | `files` | files created/modified in the workspace this call |
@@ -170,7 +173,7 @@ Capture never touches `stdout`/`stderr`/`exitCode`; a statement returning `None`
 can still WRITE an artifact to the workspace and `readFile` it if you prefer.
 
 **Warm kernel (kill the interpreter boot).** Each `runCode` starts a **fresh** interpreter, paying the
-CPython boot (~10 ms) every call. When you run many cells that share state (a REPL, a notebook, an
+CPython boot (~12 ms) every call. When you run many cells that share state (a REPL, a notebook, an
 agent's tool loop), open a `kernel()`: ONE warm interpreter in a long-lived box, fed cells over a pipe.
 In-memory state persists across cells and the per-cell cost drops from ~16 ms to **sub-millisecond**
 (~300x). Same rich `results` capture as `runCode`.
@@ -208,8 +211,9 @@ clear error otherwise). The Python binding uses the stdlib `tarfile` and has no 
 
 kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code (CI, dev, edge, your
 agents' code). Its seccomp filter is a **denylist**: right for semi-trusted agent code, **not** a hard
-boundary against deliberately hostile multi-tenant code. For that, reach for a microVM (Firecracker) or
-gVisor. See the project's [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
+boundary against deliberately hostile multi-tenant code. For that, reach for a microVM (Firecracker /
+Kata) or gVisor. A deny-by-default allowlist mode is on the roadmap. See the project's
+[SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
 
 ## License
 

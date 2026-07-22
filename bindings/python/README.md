@@ -1,6 +1,8 @@
 # kern-sandbox
 
-Run LLM/agent-generated code in a fast, **local**, daemonless kernel sandbox from Python.
+**[kern](https://github.com/getkern/kern)** is a fast, rootless, daemonless Linux sandbox runtime: a real,
+kernel-enforced box that starts in **~2 ms**, from one **~1.6 MB** binary, with no daemon. **kern-sandbox**
+is its Python binding: run untrusted or agent-generated code in a fresh, isolated box, straight from Python.
 
 On PyPI: [`pip install kern-sandbox`](https://pypi.org/project/kern-sandbox/). For Node / TypeScript, the
 same package is on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
@@ -39,8 +41,9 @@ measured numbers.
   anyway: it survives crashes and is inspectable).
 
 This is deliberate. It keeps the cold-start/density win (hundreds of ephemeral boxes, not hundreds of
-resident interpreters holding RAM) instead of a cloud-session model. If you need in-memory Jupyter-style
-state, this isn't that, and that's the point.
+resident interpreters holding RAM) instead of a cloud-session model. When you *do* want in-memory state
+across steps (a REPL, a notebook, an agent loop), open a `kernel()` (see below): one warm interpreter
+that keeps state, with an explicit isolation trade. The default `run_code` stays ephemeral.
 
 ## Why this and not a cloud sandbox
 
@@ -50,8 +53,8 @@ no KVM. The sandbox for an agent's dev loop, a CI step, or an air-gapped host.
 
 ## Performance
 
-Measured on one x86_64 laptop (kern 0.6.5, `python:3.12-slim`), not aspirational. Your hardware will
-differ, measure and claim your own number.
+Measured on one x86_64 desktop (Intel i7-14700KF, Linux 7.0), kern 0.6.x, `python:3.12-slim`, not
+aspirational. Your hardware will differ, measure and claim your own number.
 
 **Single call, sequential** (p50):
 
@@ -61,7 +64,7 @@ differ, measure and claim your own number.
 | `run_code("print(1)")` (+ Python interpreter start) | ~16 ms | ~32 ms |
 | `docker run python:3.12-slim python3 -c` | n/a | ~344 ms |
 
-For reference, `kern box` **natively** (no Python wrapper) is ~1.9 ms, the ~3.5 ms bare-box row is that
+For reference, `kern box` **natively** (no Python wrapper) is ~2 ms, the ~3.5 ms bare-box row is that
 plus the wrapper's subprocess + reader-thread overhead.
 
 `run_code` runs *Python code*, so it pays the **CPython interpreter start** (~12 ms) on top of the box,
@@ -148,6 +151,7 @@ class ExecutionResult:
     fault: SandboxFault | None   # set ONLY when the SANDBOX acted; None for ordinary user-code failures
     files: list[FileInfo]        # workspace files created/modified this step (.deps excluded)
     results: list[Result]        # rich mime-typed values: last expression, display(), matplotlib figures
+    truncated: bool              # stdout/stderr hit max_output_bytes and the overflow was discarded
     success: bool                # exit_code == 0 AND fault is None
 ```
 
@@ -192,10 +196,10 @@ Capture never touches `stdout`/`stderr`/`exit_code`; a statement that returns `N
 produces no result. You can still write an artifact to the workspace and `read_file` it if you prefer.
 
 **Warm kernel (kill the interpreter boot).** Each `run_code` starts a **fresh** interpreter, so it pays
-the CPython boot (~10 ms) every call. When you run many cells that share state (a REPL, a notebook, an
+the CPython boot (~12 ms) every call. When you run many cells that share state (a REPL, a notebook, an
 agent's tool loop), open a `kernel()`: ONE warm interpreter in a long-lived box, fed cells over a pipe.
 In-memory state persists across cells and the per-cell cost drops from ~16 ms to **sub-millisecond**
-(~400x). Same rich `results` capture as `run_code`.
+(~300x). Same rich `results` capture as `run_code`.
 
 ```python
 with kern.Sandbox() as sbx, sbx.kernel() as k:
@@ -259,7 +263,8 @@ allowlist mode is on the roadmap. See the project
 
 ## Requirements
 
-The `kern` binary on `PATH` (or set `$KERN_BIN`). Linux only.
+The `kern` binary on `PATH` (or set `$KERN_BIN`). A Linux kernel with unprivileged user namespaces +
+cgroup v2; on Windows it runs under WSL2. Python 3.9+.
 
 ## License
 
