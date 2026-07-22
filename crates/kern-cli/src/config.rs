@@ -155,6 +155,7 @@ pub struct VGpioEntry {
 /// `[[disk]]` - a physical disk pool volumes are placed on.
 #[derive(Debug, Clone, Default)]
 pub struct DiskEntry {
+    /// Pool identifier a `[[vdisk]]` names in `backend`. TOML key `id` (alias: `name`).
     pub name: String,
     pub path: String,
     pub default: bool,
@@ -169,7 +170,7 @@ pub struct DiskEntry {
 #[derive(Debug, Clone, Default)]
 pub struct VDiskEntry {
     pub name: String,
-    /// `backend = "disk:0"` → a `[[disk]]` name.
+    /// `backend = "disk:0"` → a `[[disk]]` id.
     pub backend: String,
     /// Quota, e.g. `"2g"`.
     pub size: Option<String>,
@@ -467,7 +468,9 @@ fn apply_vgpio(e: &mut VGpioEntry, key: &str, v: &str) -> Result<(), String> {
 
 fn apply_disk(e: &mut DiskEntry, key: &str, v: &str) -> Result<(), String> {
     match key {
-        "name" => e.name = value_string(v)?,
+        // `id` is the canonical identifier key (matches [[cpu]]/[[gpio]]); `name` stays a
+        // back-compat alias so configs written before the rename keep loading.
+        "id" | "name" => e.name = value_string(v)?,
         "path" => e.path = value_string(v)?,
         "default" => e.default = value_bool(v)?,
         "size" => e.size = Some(value_string(v)?),
@@ -2283,6 +2286,26 @@ mod tests {
         assert!(r.persistent);
         assert_eq!(r.backend_dir.as_deref(), Some("/srv/disks"));
         assert!(resolve_vdisk(&cfg, "ghost").is_err());
+    }
+
+    #[test]
+    fn disk_id_is_canonical_with_name_as_backcompat_alias() {
+        // [[disk]] identifies with `id`, like [[cpu]]/[[gpio]] (physical blocks). `name` stays a
+        // back-compat alias so a config written before the rename still resolves its vdisk backend.
+        for key in ["id", "name"] {
+            let doc = format!(
+                "[[disk]]\n{key} = \"pool\"\npath = \"/srv/disks\"\n\
+                 [[vdisk]]\nname = \"data\"\nbackend = \"disk:pool\"\nsize = \"1g\"\n"
+            );
+            let cfg = parse(&doc).unwrap();
+            let r = resolve_vdisk(&cfg, "data")
+                .unwrap_or_else(|e| panic!("[[disk]] {key} must resolve the backend: {e}"));
+            assert_eq!(r.backend_dir.as_deref(), Some("/srv/disks"), "key={key}");
+            assert!(
+                validate_profile_refs(&cfg, "vdisk", "data").is_ok(),
+                "key={key}"
+            );
+        }
     }
 
     #[test]

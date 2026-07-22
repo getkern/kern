@@ -1,6 +1,6 @@
 # Benchmarks
 
-Measured on one machine, 28-core x86_64, Linux 6.17, NVMe, systemd-user, against the runtimes
+Measured on one machine, 20-core / 28-thread x86_64, Linux 6.17, NVMe, systemd-user, against the runtimes
 installed there: **Docker 29.1.3** (daemon up), **Podman 4.9.3** (rootless), **crun 1.28**,
 **runc 1.3.3** (rootless), **bubblewrap 0.9**. The workload is `/bin/true` in Alpine with the
 **image/rootfs already local**, so this measures *runtime overhead*, not download time. All ran the

@@ -9690,7 +9690,7 @@ fn tailored_kern_toml(h: &HostInv) -> String {
         };
         s.push_str(&format!(
             "\n# ── Disk - `kern box … vdisk:scratch` gets a size-capped ext4 volume ──\n\
-             [[disk]]\nname = \"disk:0\"\npath = \"/\"\ndevice = \"{dev}\"   # {size} {kind}{model}\n\n\
+             [[disk]]\nid = \"disk:0\"\npath = \"/\"\ndevice = \"{dev}\"   # {size} {kind}{model}\n\n\
              [[vdisk]]\nname = \"scratch\"\nbackend = \"disk:0\"\nsize = \"2g\"\n",
             dev = d.name,
             size = human_bytes(d.size),
@@ -10076,12 +10076,12 @@ pins = [17, 27]       # a subset of the [[gpio]]'s pins - expose ONLY these line
 
 # ── Disk - `kern box vdisk:scratch …` mounts a size-capped volume at /vdisk/scratch ──
 [[disk]]
-name = "data"
+id = "data"
 path = "/var/lib/kern/volumes"
 
 [[vdisk]]
 name = "scratch"
-backend = "data"      # REQUIRED: a [[disk]] name above, or "ram" for a RAM-backed tmpfs
+backend = "data"      # REQUIRED: a [[disk]] id above, or "ram" for a RAM-backed tmpfs
 size = "2g"
 "#;
 

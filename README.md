@@ -2,7 +2,7 @@
 
 # kern
 
-**A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
+**A fast, daemonless container for your inner loop, plus a rootless sandbox for untrusted and agent-generated code.**
 
 A fast, daemonless container for your inner loop: a real, kernel-enforced box that starts in **~2 ms**,
 from one **~1.6 MB** rootless binary, with no `dockerd` sitting in the background. The same box also runs
@@ -34,10 +34,10 @@ then `kern box dev --image alpine -- sh`
 [![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 2 GB, 8 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.6 MB static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.6 MB static binary, no daemon.">
 </p>
 
-<sub>Demo timings on an Intel i7-14700KF (28-core x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2 ms</b>; a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. The comparison table under <a href="#performance">Performance</a> is a separate Linux 6.17 desktop; your hardware and cgroup delegation differ, so measure your own. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology and on-device board numbers.</sub>
+<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2 ms</b>; a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. The comparison table under <a href="#performance">Performance</a> is a separate Linux 6.17 desktop; your hardware and cgroup delegation differ, so measure your own. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology and on-device board numbers.</sub>
 
 [Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
@@ -82,9 +82,10 @@ print(r.stdout, r.success)                     # → a fresh, discarded-after bo
 | Resource caps without a full box | **yes (`kern run`)** | no | no |
 
 Startup numbers are from a labeled [benchmark](BENCHMARKS.md) on one machine, measure your own. kern
-deliberately does *less* than Docker (no overlay networks, no swarm): a small, fast, honest core. It is a
-**kernel-boundary** sandbox for your own or semi-trusted code; for actively hostile multi-tenant code, a
-microVM is the right tool, and [SECURITY.md](SECURITY.md) says exactly where the line is.
+covers a *smaller* surface than Docker (no overlay networks, no swarm) and spends it on a fast, rootless
+core: single-digit-millisecond starts from one ~1.6 MB binary, no daemon. It is a **kernel-boundary**
+sandbox for your own or semi-trusted code; for actively hostile multi-tenant code, a microVM is the
+right tool, and [SECURITY.md](SECURITY.md) says exactly where the line is.
 
 ## What you'd use it for
 
@@ -98,7 +99,7 @@ otherwise reach for a container, a cloud sandbox, or root.
   as data, not crashes ([warm-kernel.py](examples/warm-kernel.py) · [kern-mcp for Claude Desktop / Cursor](examples/mcp-code-interpreter.md) · [agent-tool-runner.py](examples/agent-tool-runner.py)).
 - **CI:** run each step in a capped, daemonless box, no Docker-in-Docker ([ci-in-a-box.sh](examples/ci-in-a-box.sh)).
 - **Edge / ARM:** one 1.6 MB binary on a Pi 5 / Jetson where a Docker daemon does not fit ([edge-many-services.sh](examples/edge-many-services.sh)).
-- **Device access / IoT:** hand a workload *exactly* the device nodes you name (an I2C or SPI bus, a GPIO chip, a sensor) and nothing else, deny-by-default, with no direct equivalent I know of in Docker (`--device` is unnamed and per-run) or systemd ([device-isolation.sh](examples/device-isolation.sh)).
+- **Device access / IoT:** hand a workload *exactly* the device nodes you name (an I2C or SPI bus, a GPIO chip, a sensor) and nothing else, deny-by-default. The closest thing is CDI (the Container Device Interface), but that's a JSON spec you register with a supporting engine; kern's is a line of TOML, engine included, and it works on a bare `kern run` too ([device-isolation.sh](examples/device-isolation.sh)).
 - **Untrusted or customer code:** execute it isolated and resource-capped, on your own machine, no cloud ([code-interpreter.py](examples/code-interpreter.py)).
 - **Serverless / functions:** a fresh, throwaway box per request, so one call's crash or timeout stays contained to its own box ([per-request-workers.py](examples/per-request-workers.py)).
 - **Data & batch:** ETL, scraping, per-file fan-out, each input in its own capped box ([data-pipeline.sh](examples/data-pipeline.sh) · [batch-process.sh](examples/batch-process.sh)).
@@ -113,7 +114,7 @@ otherwise reach for a container, a cloud sandbox, or root.
 - 👤 **Rootless by default.** Unprivileged user namespaces: your uid maps to root *inside* the box,
   and only there. Single-uid is the default and is `libc`-pure (no helper, smallest id surface);
   `--uid-range` opts into a full sub-id range (`apt`, `www-data`-style drops) via the standard
-  `newuidmap` + `/etc/subuid`. We state plainly that path is not helper-free. No host privilege
+  `newuidmap` + `/etc/subuid`. kern says plainly that path is not helper-free. No host privilege
   is gained either way.
 - 🧱 **Correct by construction.** The mount sequence is a **typestate**: remounting the root read-only
   *before* pivoting into it doesn't compile, so a class of sandbox-escape bug is unrepresentable, not
@@ -172,12 +173,15 @@ Three kinds ship today (a GPU slice is on the [Roadmap](#roadmap)):
 - `vdisk`: a size-capped scratch at `/vdisk/<name>` (rootless: a **RAM-backed tmpfs** that counts against
   the memory cap, so an 8 GB scratch uses 8 GB of RAM; privileged: ext4-on-loop on real disk).
 - `vgpio`: *exactly* the named GPIO / I²C / SPI device nodes, nothing else (a fresh `/dev` + an fd-pinned
-  bind). A reusable, deny-by-default device set attached by name is the one piece with no direct equivalent I know of
-  in Docker (`--device` is per-run, unnamed) or systemd (`DeviceAllow` is per-unit, not a portable preset).
+  bind). A reusable, deny-by-default device set attached by name is closest to CDI (the Container Device
+  Interface), but CDI is a JSON spec you author and register with an engine that supports it (Podman,
+  containerd, Docker 25+); kern's is one line of TOML, the engine is included, it stays deny-by-default,
+  and it attaches to a bare `kern run` with no box at all. Docker's own `--device` is per-run and unnamed;
+  systemd's `DeviceAllow` is per-unit, not a portable preset.
 
 Two layers: declare the host resource (the physical layer), then carve named virtual profiles from it.
 Every profile **must name a `backend`** so it is never ambiguously attached to nothing: a declared
-`[[cpu]]`/`[[gpio]]`/`[[disk]]` id, or a reserved keyword . **`host`** (the whole host CPU, or the
+`[[cpu]]`/`[[gpio]]`/`[[disk]]` id, or a reserved keyword: **`host`** (the whole host CPU, or the
 host's own device nodes) or **`ram`** (a RAM-backed vdisk). The physical block itself stays optional:
 use `backend = "host"` / `"ram"` without declaring one. Run `kern examples` for the full reference.
 
@@ -192,12 +196,13 @@ cpus = 2
 memory = "1g"
 
 [[disk]]                       # a host path for scratch volumes (physical)
-name = "data"
+id = "data"
 path = "/var/lib/kern/volumes"
 [[vdisk]]                      # a size-capped scratch on it  ->  vdisk:scratch
 name = "scratch"
-backend = "data"               # REQUIRED: a [[disk]] name above, or "ram" for a RAM-backed tmpfs
-size = "8g"
+backend = "data"               # REQUIRED: a [[disk]] id above, or "ram" for a RAM-backed tmpfs
+size = "8g"                    # a real ext4 quota only when privileged; rootless it is a RAM tmpfs
+                               # charged to --memory, so size it under the box's memory cap
 
 [[gpio]]                       # a named controller anchor; `kern config setup` writes one per host
 id = "gpio:0"
@@ -351,11 +356,10 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
 kern runs inside **WSL2**, a real Linux kernel, so the isolation (namespaces + seccomp) and `--cpus`
-cap work for real. **One honest exception:** `--memory` needs the cgroup v2 *memory* controller, which
-Microsoft's default WSL2 kernel doesn't enable; kern **warns** and points you to the one-time fix
-(`kernelCommandLine = cgroup_enable=memory cgroup_memory=1` under `[wsl2]` in `%UserProfile%\.wslconfig`,
-then `wsl --shutdown`). Same limit as Docker/Podman on WSL; on a native Linux host `--memory` is
-enforced out of the box. The installer ensures the WSL2 engine (self-elevating for the one reboot it may need, then
+cap work for real. **One honest exception:** `--memory` needs a one-line WSL kernel tweak the default
+omits (kern **warns** and shows it; the fix and the same note for Raspberry Pi OS live under
+[Requirements & limitations](#requirements--limitations)). On a native Linux host `--memory` is enforced
+out of the box. The installer ensures the WSL2 engine (self-elevating for the one reboot it may need, then
 resuming on its own), imports kern's **own** pre-baked distro (a tiny Alpine + kern, no Ubuntu, no
 manual steps), drops the `kern.exe` shim on your PATH, and verifies end-to-end. Every download is
 sha256-checked. After it finishes: `kern box dev --image alpine -it -- sh`. Honest caveat: kern runs
@@ -426,11 +430,14 @@ kern stop svc             # stop it   (kern stop --all for everything)
 
 ### Hand it a secret
 
-Never baked into the image or env; delivered on a pipe, readable only inside the box.
+Never baked into the image or env; delivered on a pipe, readable only inside the box. The network is
+isolated by default, so `--egress-allow` opens exactly the one host it may reach (and `wget` is
+Alpine's busybox built-in, no extra install):
 
 ```sh
 printf "$DB_TOKEN" | kern box job --image alpine --secret TOKEN=- --cap-drop ALL \
-  -- sh -c 'curl -H "Authorization: Bearer $(cat /run/secrets/TOKEN)" https://api/…'
+  --egress-allow api.example.com \
+  -- sh -c 'wget -qO- --header="Authorization: Bearer $(cat /run/secrets/TOKEN)" https://api.example.com/v1/me'
 ```
 
 ### Before you rely on it
@@ -571,9 +578,9 @@ kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux
 userland (the Arduino UNO Q). **On Windows, WSL2 *is* that Linux kernel**, and the one-line PowerShell
 installer sets up WSL2 and drops in a pre-baked kern distro, so isolation and `--cpus` are enforced
-for real (`--memory` needs `cgroup_enable=memory` in the WSL kernel, which the default doesn't set;
-kern warns and shows the one-line `.wslconfig` fix; enforced natively on real Linux). Honest caveat:
-you're inside the WSL2 VM, so it's "no Docker Desktop", not "no VM". kern does **not** run on stock Android-the-OS (Bionic, SELinux, userns off). Daemonless is a big
+for real (`--memory` needs a one-line WSL kernel tweak the default omits, see
+[Requirements & limitations](#requirements--limitations); enforced natively on real Linux). Honest
+caveat: you're inside the WSL2 VM, so it's "no Docker Desktop", not "no VM". kern does **not** run on stock Android-the-OS (Bionic, SELinux, userns off). Daemonless is a big
 win on RAM-constrained boards (0 resident vs ~186 MB), see **[EDGE.md](EDGE.md)**. ARM CI is tracked
 in the issues.
 
@@ -668,7 +675,7 @@ travel off-argv. See [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Performance
 
 One isolated `/bin/true`, warm image cache, one box per run. The x86_64 table below was measured on a
-**28-core, Linux 6.17, NVMe, systemd-user** desktop (exact per-runtime commands in
+**20-core / 28-thread, Linux 6.17, NVMe, systemd-user** desktop (exact per-runtime commands in
 **[BENCHMARKS.md](BENCHMARKS.md)**). kern's figure is informally reproduced on the machine the hero and
 demo numbers come from, an **Intel i7-14700KF, Linux 7.0**, same class, where a P-core-pinned
 `/bin/true` box lands in the low-single-digit-ms range (an E-core is slightly higher). Your
@@ -732,7 +739,10 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 - Hard `--memory`/`--cpus`/`--pids` caps need a **delegated cgroup** (a systemd user manager, or root);
   without one they degrade to best-effort and kern says so. Microsoft's default WSL2 kernel and a stock
   Raspberry Pi OS don't delegate the `memory` controller, so `--memory` is accepted-but-unenforced there
-  (same as Docker/Podman) until you enable it.
+  (same as Docker/Podman) until you enable it: on **WSL**, add `cgroup_enable=memory cgroup_memory=1` to
+  `kernelCommandLine` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`; on **Raspberry
+  Pi OS**, add `cgroup_enable=memory` to `/boot/firmware/cmdline.txt`, then reboot. This is the canonical
+  note; Install and Platforms point here.
 - `newuidmap` + `/etc/subuid` for a full uid range (`--uid-range`, `--ssh`); a single-uid box works
   without them.
 
@@ -750,31 +760,19 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.12, a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (482 Rust, 61 Python and 50 Node tests;
-clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It
-deliberately skips a lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast,
-honest core. **Every numbered release is a tested, production-intent build, not a beta or a preview:** it
-is the official release of that version. Pre-1.0 means only that the CLI and config *surface* can still
-change between minor versions (changes are called out in [CHANGELOG.md](CHANGELOG.md)), not that a
-release is unfinished.
+**0.6.13.** Everything in [Features](#features) works today and is tested (483 Rust, 61 Python and 50
+Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
+real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
+starts in **~2 ms** from one **~1.6 MB** binary. Versioned under semver: each release is the official
+build of that version, and pre-1.0 means only that the CLI and config *surface* can still change between
+minor versions, always called out in [CHANGELOG.md](CHANGELOG.md).
 
-**Recent work (0.6.12 / 0.6.11 / 0.6.10):** `kern config setup` now writes a `backend` on every
-profile it generates, so the starter config it tailors for a host passes `kern validate`. `kern exec`
-joins the box's cgroup, so an exec'd command
-inherits the box's `--memory`/`--pids` caps like `docker exec` (an honest warning where a rootless
-per-box scope can't be joined); and resource profiles now **require an explicit `backend`** (a declared
-`[[cpu]]`/`[[gpio]]`/`[[disk]]`, or the reserved `host`/`ram`) so a profile is never ambiguously
-attached to a default. Before (0.6.9): a **warm kernel** for the Python + Node bindings
-(`Sandbox.kernel()`, a persistent interpreter that makes the code-interpreter path sub-millisecond) and
-an **MCP server** (`kern-mcp`) for Claude Desktop / Cursor, plus a box-start rate in `kern top`. Before
-that (0.6.7 / 0.6.8):
-`kern commit` warm-start snapshots, an `--egress-allow` domain allowlist and an `--landlock-rw`
-write-allowlist, fleet budgets, and the bindings gaining resource profiles, egress control, live output
-streaming, rich mime-typed results and workspace snapshot/restore. Earlier: local image **build** +
-**`tag`**/**`push`**, **zstd** layers, **`--init`**, **`--platform`**, pods, and a Dockerfile/compose
-parser verified against a real `docker build` differential. Per-release detail in
-**[CHANGELOG.md](CHANGELOG.md)**.
+**Recently:** an explicit-`backend` resource-profile schema; `kern exec` joins the box's cgroup so an
+exec'd command inherits its `--memory`/`--pids` caps (with an honest warning where a rootless per-box
+scope can't be joined); a **warm kernel** and an **MCP server** (`kern-mcp`) for the Python/Node
+bindings; `kern commit` warm-start snapshots; an `--egress-allow` allowlist and `--landlock-rw`; and
+daemonless image **build** / **`tag`** / **`push`** with a Dockerfile/compose parser checked against a
+real `docker build`. Full per-release detail in **[CHANGELOG.md](CHANGELOG.md)**.
 
 **Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
 overlay networking.
@@ -812,9 +810,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 
 ## Security
 
-kern isolates with Linux **namespaces + seccomp + a read-only userns root**, a kernel-level boundary,
-deny-by-default on devices, with the host's sysfs/procfs masked, and an opt-in **Landlock** (LSM) layer
-on top (plus an experimental egress allowlist). That's strong for first-party and noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
+kern isolates with Linux **namespaces + seccomp + a self-pivoted root** (a copy-on-write overlay by
+default: the image stays immutable, writes land in a private upper discarded on exit, and `--read-only`
+locks the whole root), a kernel-level boundary, deny-by-default on devices, with the host's sysfs/procfs
+masked, and an opt-in **Landlock** (LSM) layer on top (plus an experimental egress allowlist). That's
+strong for first-party and noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
 hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't: a deliberate trade for
 ~2 ms starts and a ~1.6 MB footprint.
 

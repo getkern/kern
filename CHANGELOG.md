@@ -17,6 +17,32 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.13], 2026-07-23
+
+Schema consistency and a README pass.
+
+### Changed
+- **`[[disk]]` now identifies with `id`**, matching `[[cpu]]` and `[[gpio]]`. The rule is now uniform:
+  physical blocks (`[[cpu]]`/`[[gpio]]`/`[[disk]]`) use `id`, virtual profiles
+  (`[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]`) use `name`. `name` on a `[[disk]]` keeps working as a
+  back-compat alias, so existing configs load unchanged; `kern config setup` and `kern examples` now
+  emit `id`.
+
+### Documentation
+- The terminal demo was self-contradictory: it showed an 8 GB scratch inside a 2 GB cap, but a rootless
+  `vdisk` is a RAM tmpfs charged to `--memory`, so it would OOM. Retuned to 8 GB RAM + a 2 GB scratch,
+  and the docs now say a `[[disk]]` backend is a real ext4 quota only when privileged (rootless it is a
+  RAM tmpfs, size it under the memory cap).
+- The `--secret` quickstart now runs as written: it opens the one host it needs with `--egress-allow`
+  (the network is isolated by default) and uses Alpine's busybox `wget` instead of a `curl` that isn't
+  installed.
+- The named-device-set pitch now acknowledges CDI (the Container Device Interface) and states the real
+  edge: a line of TOML with the engine included and deny-by-default, versus a JSON spec plus a
+  supporting engine.
+- The WSL2/`memory`-controller note is consolidated under Requirements & limitations (Install and
+  Platforms point to it); the Security intro describes the default copy-on-write overlay root precisely;
+  the benchmark CPU is labeled 20-core / 28-thread.
+
 ## [0.6.12], 2026-07-22
 
 A fix so `kern config setup` produces a config that passes `kern validate`.
