@@ -59,6 +59,31 @@ r = kern.run_code("print(sum(range(100)))")   # network OFF, hard caps, a timeou
 print(r.stdout, r.success)                     # → a fresh, discarded-after box
 ```
 
+## kern vs Docker vs Podman
+
+|  | Docker | Podman | **kern** |
+|---|---|---|---|
+| Daemon | yes (`dockerd` + `containerd`) | no | **no** |
+| Rootless | partial | yes | **yes** |
+| Cold start (a bare box) | ~308 ms | ~155 ms | **~2 ms** |
+| Footprint | ~186 MB daemon stack | multi-package install | **one 1.6 MB static binary** |
+| OCI images (pull / build) | yes | yes | **yes** |
+| Resource caps without a full box | no | no | **yes (`kern run`)** |
+
+Startup numbers are from a labeled [benchmark](BENCHMARKS.md) on one machine, measure your own. kern
+deliberately does *less* than Docker (no overlay networks, no swarm): a small, fast, honest core. It is a
+**kernel-boundary** sandbox for your own or semi-trusted code; for actively hostile multi-tenant code, a
+microVM is the right tool, and [SECURITY.md](SECURITY.md) says exactly where the line is.
+
+## What you'd use it for
+
+- **AI agents:** run each model-generated tool call in a fresh, network-off box, sandbox faults come back
+  as data, not crashes ([warm-kernel.py](examples/warm-kernel.py) · [kern-mcp for Claude Desktop / Cursor](examples/mcp-code-interpreter.md) · [agent-tool-runner.py](examples/agent-tool-runner.py)).
+- **CI:** run each step in a capped, daemonless box, no Docker-in-Docker ([ci-in-a-box.sh](examples/ci-in-a-box.sh)).
+- **Edge / ARM:** one 1.6 MB binary on a Pi 5 / Jetson where a Docker daemon does not fit ([edge-many-services.sh](examples/edge-many-services.sh)).
+- **Untrusted or customer code:** execute it isolated and resource-capped, on your own machine, no cloud ([code-interpreter.py](examples/code-interpreter.py)).
+- **Build and run OCI images:** `kern build` / `kern box`, speaks Docker formats, no daemon.
+
 ## Why kern
 
 - ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.6 MB static binary, **one Rust dependency**
