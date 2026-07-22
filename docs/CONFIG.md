@@ -32,23 +32,32 @@ GPU family stays private, see [Roadmap](../README.md#roadmap).
 > 3. **Key == flag.** Every key is spelled exactly like its CLI flag (`cpus` = `--cpus`, `memory` =
 >    `--memory`, `cpuset` = `--cpuset-cpus`), so if you know the flag you know the field.
 >
-> Copy-paste a minimal valid profile of each kind, then edit. **One key per line** (the parser wants
-> the multi-line form, not `[[vcpu]] name = "x" cpus = 2` on a single line):
+> Copy-paste this starter, then edit. It shows the **declare-then-carve** shape: a physical
+> `[[cpu]]`/`[[disk]]`/`[[gpio]]` block, then a profile that references it by `backend`. **One key per
+> line** (the parser wants the multi-line form, not `[[vcpu]] name = "x" cpus = 2` on one line):
 >
 > ```toml
-> [[vcpu]]
+> [[cpu]]                 # physical: the host CPU budget
+> id    = "cpu:0"
+> cores = 8.0
+> [[vcpu]]                # a slice of it  ->  attach with  vcpu:cpu
 > name    = "cpu"
-> backend = "host"        # or a declared [[cpu]] id
+> backend = "cpu:0"       # or "host" for the whole host CPU, with no [[cpu]] block
 > cpus    = 2
 >
-> [[vdisk]]
+> [[disk]]                # physical: a disk pool for volumes
+> name = "pool"
+> path = "/var/lib/kern/disks"
+> [[vdisk]]               # a size-capped scratch on it  ->  vdisk:scratch
 > name    = "scratch"
-> backend = "ram"         # or a declared [[disk]] name
+> backend = "disk:pool"   # or "ram" for a RAM tmpfs, with no [[disk]] block
 > size    = "8g"
 >
-> [[vgpio]]
+> [[gpio]]                # physical: a controller anchor (kern config setup writes one per host)
+> id = "gpio:0"
+> [[vgpio]]               # the device grant  ->  vgpio:sensor
 > name    = "sensor"
-> backend = "host"        # or a declared [[gpio]] id (needed for pins/pwm/adc/onewire)
+> backend = "gpio:0"      # or "host"; pins/pwm/adc/onewire NEED a [[gpio]] id here
 > i2c     = ["/dev/i2c-1"]
 > ```
 >
