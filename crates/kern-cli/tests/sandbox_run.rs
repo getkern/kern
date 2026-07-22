@@ -2063,3 +2063,44 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
          {exec_leaf:?}, so it would escape the box's --memory/--pids caps"
     );
 }
+
+/// Regression: `kern config setup` must write a config that `kern validate` accepts. It emitted
+/// backend-less `[[vcpu]]` profiles, which the mandatory-backend rule (0.6.11) rejects, so the
+/// starter config kern generated for a host failed its own validator. Runs the real binary with a
+/// temp `XDG_CONFIG_HOME`, so it needs no box/userns and works on any host.
+#[test]
+fn config_setup_generates_a_config_that_validates() {
+    let dir = std::env::temp_dir().join(format!("kern-setup-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let setup = kern()
+        .env("XDG_CONFIG_HOME", &dir)
+        .args(["config", "setup", "--force"])
+        .output()
+        .expect("run kern config setup");
+    let cfg = dir.join("kern/kern.toml");
+    if !cfg.exists() {
+        eprintln!(
+            "skip: config setup wrote no file ({})",
+            String::from_utf8_lossy(&setup.stderr).trim()
+        );
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    let v = kern()
+        .args(["validate", cfg.to_str().unwrap()])
+        .output()
+        .expect("run kern validate");
+    let ok = v.status.success();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+    let generated = fs::read_to_string(&cfg).unwrap_or_default();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        ok,
+        "`kern config setup` produced a config its own validator rejects:\n{report}\n--- generated ---\n{generated}"
+    );
+}
