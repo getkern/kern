@@ -3976,7 +3976,10 @@ leds = [\"led0\"]
         for (kind, sentinel) in [("vcpu", "host"), ("vgpio", "host"), ("vdisk", "ram")] {
             let f = backend_field(kind);
             assert!(f.radio, "{kind}: backend must be a single-select radio");
-            assert!(!f.info, "{kind}: backend must never be an empty info dead-end");
+            assert!(
+                !f.info,
+                "{kind}: backend must never be an empty info dead-end"
+            );
             assert_eq!(
                 f.options.first().map(String::as_str),
                 Some(sentinel),
