@@ -65,7 +65,7 @@ onewire = [4]
 [[vdisk]]
 name       = "data"
 size       = "2g"          # quota
-backend    = "disk:pool"   # optional: place it on a declared [[disk]] pool; omit = standalone scratch
+backend    = "disk:pool"   # REQUIRED: a declared [[disk]] pool, or "ram" for a RAM-backed tmpfs
 iops       = 1000          # optional I/O-ops limit
 bandwidth  = "50m"         # optional throughput limit
 persistent = true          # survive box removal (default: false → scratch, discarded)
@@ -76,8 +76,9 @@ with a real quota when privileged.
 
 ### Physical declarations, what a profile's `backend` points at
 
-Optional. Declare the host resources your profiles carve from; a profile with no `backend` is
-standalone. Field shapes:
+Declaring these is optional (a profile can use the reserved `host`/`ram` backend without them), but
+every profile **must name a `backend`**: a declared block below, or `host` (vcpu/vgpio) / `ram` (vdisk).
+Field shapes:
 
 ```toml
 [[cpu]]   # a physical CPU budget a [[vcpu]] splits
