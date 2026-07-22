@@ -199,13 +199,12 @@ name = "scratch"
 backend = "data"               # REQUIRED: a [[disk]] name above, or "ram" for a RAM-backed tmpfs
 size = "8g"
 
-[[gpio]]                       # the host controller `kern config setup -c` records: an inventory of
-id = "gpio:0"                  # what's present (and the backend menu in `kern top`)
-i2c = ["/dev/i2c-1", "/dev/i2c-2"]
-[[vgpio]]                      # a profile that exposes a SUBSET of it, nothing else  ->  vgpio:sensor
+[[gpio]]                       # a named controller anchor; `kern config setup` writes one per host
+id = "gpio:0"
+[[vgpio]]                      # the grant: deny-by-default, ONLY these nodes cross in  ->  vgpio:sensor
 name = "sensor"
 backend = "gpio:0"             # REQUIRED: the [[gpio]] id above (like vcpu -> cpu:0, vdisk -> data)
-i2c = ["/dev/i2c-1"]           # grant ONLY bus 1 to the box; bus 2 stays hidden
+i2c = ["/dev/i2c-1"]           # expose just I2C bus 1; every other /dev node is refused
 ```
 
 ## What you can do in one line
