@@ -22,6 +22,40 @@ you like by its prefix. This mirrors the private runtime's model (declare-then-c
 the CPU field names are spelled to match the CLI flags here, see the divergence note at the end. The
 GPU family stays private, see [Roadmap](../README.md#roadmap).
 
+> **Editing by hand? Three rules cover everything:**
+>
+> 1. **Attach by prefix.** `[[vcpu]] name = "heavy"` is used as `vcpu:heavy` on the command line
+>    (`kern run vcpu:heavy -- ./job`); same for `vgpio:` and `vdisk:`.
+> 2. **Every profile MUST name a `backend`** (the host resource it slices): a declared
+>    `[[cpu]]`/`[[gpio]]`/`[[disk]]` id, or a reserved keyword . **`host`** (the whole host CPU, or the
+>    host's own device nodes) or **`ram`** (a RAM-backed vdisk).
+> 3. **Key == flag.** Every key is spelled exactly like its CLI flag (`cpus` = `--cpus`, `memory` =
+>    `--memory`, `cpuset` = `--cpuset-cpus`), so if you know the flag you know the field.
+>
+> Copy-paste a minimal valid profile of each kind, then edit. **One key per line** (the parser wants
+> the multi-line form, not `[[vcpu]] name = "x" cpus = 2` on a single line):
+>
+> ```toml
+> [[vcpu]]
+> name    = "cpu"
+> backend = "host"        # or a declared [[cpu]] id
+> cpus    = 2
+>
+> [[vdisk]]
+> name    = "scratch"
+> backend = "ram"         # or a declared [[disk]] name
+> size    = "8g"
+>
+> [[vgpio]]
+> name    = "sensor"
+> backend = "host"        # or a declared [[gpio]] id (needed for pins/pwm/adc/onewire)
+> i2c     = ["/dev/i2c-1"]
+> ```
+>
+> Prefer not to hand-edit? `kern config setup` writes a starter tuned to this host, `kern top` edits
+> profiles live (validated, with device pickers), `kern validate <file>` checks one, and
+> `kern examples` prints a full annotated reference.
+
 ### `[[vcpu]]`, a CPU + memory slice · attach with `vcpu:<name>`
 
 ```toml
@@ -32,7 +66,7 @@ memory   = "2 GB"      # RAM limit (cgroup memory.max), like --memory
 cpuset   = "0-7"       # optional CPU PINNING (cpulist), like --cpuset-cpus; exclusive with `numa`
 numa     = 0           # optional: pin to this NUMA node's CPUs
 nice     = -5          # optional: scheduling priority, like --nice (-20 high … 19 low)
-backend  = "cpu:0"     # optional: reference a [[cpu]] declaration to carve from; omit = standalone
+backend  = "cpu:0"     # REQUIRED: a [[cpu]] id to carve from, or "host" for the whole host CPU
 extends  = "base"      # optional: inherit another [[vcpu]] by name
 ```
 
