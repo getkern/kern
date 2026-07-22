@@ -187,7 +187,7 @@ id = "cpu:0"
 cores = 8.0
 [[vcpu]]                       # a named CPU + memory slice of it  ->  attach with  vcpu:agent
 name = "agent"
-backend = "cpu:0"              # optional link to the [[cpu]] above
+backend = "cpu:0"              # REQUIRED: a [[cpu]] id above, or "host" for the whole host CPU
 cpus = 2
 memory = "1g"
 
@@ -196,7 +196,7 @@ name = "data"
 path = "/var/lib/kern/volumes"
 [[vdisk]]                      # a size-capped scratch on it  ->  vdisk:scratch
 name = "scratch"
-backend = "data"
+backend = "data"               # REQUIRED: a [[disk]] name above, or "ram" for a RAM-backed tmpfs
 size = "8g"
 
 [[gpio]]                       # the host GPIO / I2C controller (physical)
@@ -204,7 +204,7 @@ id = "gpio:0"
 pins = [17, 27, 22]
 [[vgpio]]                      # expose ONLY these device nodes, nothing else  ->  vgpio:sensor
 name = "sensor"
-backend = "gpio:0"
+backend = "gpio:0"             # REQUIRED: a [[gpio]] id above, or "host" for the host's own devices
 i2c = ["/dev/i2c-1"]           # "1", "i2c-1" and "/dev/i2c-1" all resolve to the same bus
 ```
 
