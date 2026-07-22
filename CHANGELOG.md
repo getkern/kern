@@ -17,6 +17,21 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.11], 2026-07-22
+
+A stricter, unambiguous resource-profile schema.
+
+### Changed
+- **`backend` is now REQUIRED on every `[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]` profile** (breaking,
+  pre-1.0). A profile must name the host resource it slices: a declared `[[cpu]]`/`[[gpio]]`/`[[disk]]`
+  id, or a reserved keyword . **`host`** (the whole host CPU, or the host's own device nodes) or
+  **`ram`** (a RAM-backed vdisk). This removes an ambiguity where a backend-less profile, or a typo in
+  a backend, silently attached to a default/RAM resource. A missing or dangling backend is now
+  rejected with a clear, actionable error at `kern validate`, at `kern box`/`kern run` attach time, at
+  `kern config add`, and in the `kern top` form (which offers `host`/`ram` first). Migration: add
+  `backend = "host"` (vcpu/vgpio) or `backend = "ram"` (vdisk) to a bare profile, or name a declared
+  physical block. See `kern examples`.
+
 ## [0.6.10], 2026-07-22
 
 A resource-isolation fix for `kern exec`.

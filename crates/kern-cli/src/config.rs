@@ -648,6 +648,9 @@ pub struct ResolvedCpu {
 /// Resolve a `[[vcpu]]` entry to concrete limits: `cpus`→quota, `cpuset`/`numa`→pinning,
 /// `memory`→bytes, `nice`→nice. `extends` is followed one level (a base profile).
 pub fn resolve_vcpu(cfg: &KernConfig, name: &str) -> Result<ResolvedCpu, String> {
+    // A profile attached at the box/run boundary enforces the mandatory `backend` here too (not just
+    // at save time), so a hand-edited kern.toml with a missing/dangling backend fails loudly.
+    validate_profile_refs(cfg, "vcpu", name).map_err(|m| format!("[[vcpu]] '{name}': {m}"))?;
     resolve_vcpu_seen(cfg, name, &mut Vec::new())
 }
 
@@ -735,9 +738,10 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
         .iter()
         .find(|e| e.name == name)
         .ok_or_else(|| format!("no [[vgpio]] profile named '{name}' in kern.toml"))?;
-    // A vgpio may legitimately have no `backend` (e.g. an i2c/spi-only profile with no pins), so the
-    // backend is not required here - only the pin numbers are range-checked.
+    // `backend` is MANDATORY (`gpio:<id>` or the reserved `host`): enforced here so an attached,
+    // hand-edited profile with a missing/dangling backend fails loudly, not silently.
     let ctx = |m: String| format!("[[vgpio]] '{name}': {m}");
+    validate_profile_refs(cfg, "vgpio", name).map_err(ctx)?;
     validate_profile_name(&e.name).map_err(ctx)?;
     check_pins(&e.pins).map_err(ctx)?;
     let mut devs = Vec::new();
@@ -1081,6 +1085,9 @@ pub fn resolve_vdisk(cfg: &KernConfig, name: &str) -> Result<ResolvedVdisk, Stri
         .find(|e| e.name == name)
         .ok_or_else(|| format!("no [[vdisk]] profile named '{name}' in kern.toml"))?;
     validate_profile_name(&e.name).map_err(|m| format!("[[vdisk]] '{name}': {m}"))?;
+    // `backend` is MANDATORY (`disk:<name>` or the reserved `ram` for a tmpfs): enforced here so an
+    // attached, hand-edited profile with a missing/dangling backend fails loudly, not on RAM silently.
+    validate_profile_refs(cfg, "vdisk", name).map_err(|m| format!("[[vdisk]] '{name}': {m}"))?;
     let size = match &e.size {
         Some(s) => {
             Some(size_to_bytes(s).ok_or_else(|| format!("bad size '{s}' in [[vdisk]] '{name}'"))?)
@@ -1664,15 +1671,13 @@ pub(crate) fn validate_profile_refs(
     match section {
         "vcpu" => {
             if let Some(e) = cfg.vcpu.iter().find(|e| e.name == name) {
-                if let Some(b) = e.backend.as_deref().filter(|b| !b.is_empty()) {
-                    if !cfg
-                        .cpu
-                        .iter()
-                        .any(|c| backend_ref_matches(b, "cpu:", &c.id))
-                    {
-                        return Err(format!("backend '{b}' is not a configured [[cpu]] id"));
-                    }
-                }
+                require_backend(
+                    e.backend.as_deref().unwrap_or(""),
+                    BACKEND_HOST,
+                    "cpu:",
+                    "[[cpu]]",
+                    cfg.cpu.iter().map(|c| c.id.as_str()),
+                )?;
                 if let Some(x) = e.extends.as_deref().filter(|x| !x.is_empty()) {
                     if !cfg.vcpu.iter().any(|v| v.name == x) {
                         return Err(format!("extends '{x}' is not another vcpu profile"));
@@ -1682,37 +1687,69 @@ pub(crate) fn validate_profile_refs(
         }
         "vgpio" => {
             if let Some(e) = cfg.vgpio.iter().find(|e| e.name == name) {
-                if !e.backend.is_empty()
-                    && !cfg
-                        .gpio
-                        .iter()
-                        .any(|g| backend_ref_matches(&e.backend, "gpio:", &g.id))
-                {
-                    return Err(format!(
-                        "backend '{}' is not a configured [[gpio]] id (run: kern config setup)",
-                        e.backend
-                    ));
-                }
+                require_backend(
+                    &e.backend,
+                    BACKEND_HOST,
+                    "gpio:",
+                    "[[gpio]]",
+                    cfg.gpio.iter().map(|g| g.id.as_str()),
+                )?;
             }
         }
         "vdisk" => {
             if let Some(e) = cfg.vdisk.iter().find(|e| e.name == name) {
-                if !e.backend.is_empty()
-                    && !cfg
-                        .disk
-                        .iter()
-                        .any(|d| backend_ref_matches(&e.backend, "disk:", &d.name))
-                {
-                    return Err(format!(
-                        "backend '{}' is not a configured [[disk]]",
-                        e.backend
-                    ));
-                }
+                require_backend(
+                    &e.backend,
+                    BACKEND_RAM,
+                    "disk:",
+                    "[[disk]]",
+                    cfg.disk.iter().map(|d| d.name.as_str()),
+                )?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Reserved `backend` sentinels: a profile whose backend is the sentinel binds to the WHOLE host
+/// resource, so it needs no physical `[[cpu]]`/`[[gpio]]`/`[[disk]]` block. `host` (vcpu = the whole
+/// host CPU, applied as flag caps; vgpio = the host's own device nodes) and `ram` (vdisk = a
+/// RAM-backed tmpfs). Every other backend value MUST name a declared physical resource.
+pub(crate) const BACKEND_HOST: &str = "host";
+pub(crate) const BACKEND_RAM: &str = "ram";
+
+/// A virtual profile's `backend` is MANDATORY - there is no ambiguous "attach to whatever" default.
+/// It must be either the reserved `sentinel` (the whole host) or a declared physical id/name (matched
+/// via the `prefix:` form on either side). Empty/absent, or a value naming nothing, is a hard error
+/// that names the fix - so a config (hand-written or LLM-generated) can never silently attach a
+/// profile to an ambiguous or non-existent host resource. Pure + allocation-light (one `trim`, an
+/// iterator scan, a format only on the error path); panic-free (no `unwrap`/`expect`/`panic!`).
+fn require_backend<'a>(
+    backend: &str,
+    sentinel: &str,
+    prefix: &str,
+    phys: &str,
+    declared: impl Iterator<Item = &'a str>,
+) -> Result<(), String> {
+    let b = backend.trim();
+    if b.is_empty() {
+        return Err(format!(
+            "a `backend` is required (the host resource this profile slices): use \
+             `backend = \"{sentinel}\"` for the whole host, or name a declared {phys} id"
+        ));
+    }
+    if b == sentinel {
+        return Ok(());
+    }
+    let mut declared = declared;
+    if declared.any(|id| backend_ref_matches(b, prefix, id)) {
+        return Ok(());
+    }
+    Err(format!(
+        "backend '{b}' is not a configured {phys} id (use `backend = \"{sentinel}\"` for the whole \
+         host, or declare a matching {phys})"
+    ))
 }
 
 /// Match a `backend = "kind:name"` reference against a declared `[[cpu]]`/`[[gpio]]`/`[[disk]]`
@@ -1951,7 +1988,7 @@ mod tests {
     #[test]
     fn vcpu_extends_inherits_then_overrides() {
         let doc = "[[vcpu]]\nname = \"base\"\ncpus = 1.0\nmemory = \"1g\"\n\
-                   [[vcpu]]\nname = \"big\"\nextends = \"base\"\nmemory = \"4g\"";
+                   [[vcpu]]\nname = \"big\"\nbackend = \"host\"\nextends = \"base\"\nmemory = \"4g\"";
         let c = parse(doc).unwrap();
         let r = resolve_vcpu(&c, "big").unwrap();
         assert_eq!(r.cpus, Some(1.0)); // inherited from base
@@ -1965,7 +2002,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mk = |n: &str, cpu: &str| {
             let f = dir.join(n);
-            std::fs::write(&f, format!("[[vcpu]]\nname=\"p\"\ncpus={cpu}\n")).unwrap();
+            std::fs::write(
+                &f,
+                format!("[[vcpu]]\nname=\"p\"\nbackend=\"host\"\ncpus={cpu}\n"),
+            )
+            .unwrap();
             f
         };
         let cfg_file = mk("a.toml", "1.0");
@@ -1996,11 +2037,12 @@ mod tests {
     #[test]
     fn vcpu_extends_cycle_errors_not_stack_overflow() {
         // Self-cycle and mutual cycle must be reported, never recurse until the stack overflows.
-        let self_c = parse("[[vcpu]]\nname = \"a\"\nextends = \"a\"").unwrap();
+        let self_c = parse("[[vcpu]]\nname = \"a\"\nbackend = \"host\"\nextends = \"a\"").unwrap();
         let e = resolve_vcpu(&self_c, "a").unwrap_err();
         assert!(e.contains("cycle"), "got: {e}");
         let mutual = parse(
-            "[[vcpu]]\nname = \"a\"\nextends = \"b\"\n[[vcpu]]\nname = \"b\"\nextends = \"a\"",
+            "[[vcpu]]\nname = \"a\"\nbackend = \"host\"\nextends = \"b\"\n\
+             [[vcpu]]\nname = \"b\"\nbackend = \"host\"\nextends = \"a\"",
         )
         .unwrap();
         assert!(resolve_vcpu(&mutual, "a").unwrap_err().contains("cycle"));
@@ -2024,6 +2066,7 @@ mod tests {
         let mut cfg = KernConfig::default();
         cfg.vgpio.push(VGpioEntry {
             name: "t".into(),
+            backend: "host".into(),
             // `/dev/null` exists everywhere and is under /dev - it must be taken.
             i2c: vec!["/dev/null".into()],
             // a device that doesn't exist is silently skipped, not an error.
@@ -2092,6 +2135,7 @@ mod tests {
             let mut cfg = KernConfig::default();
             cfg.vgpio.push(VGpioEntry {
                 name: "x".into(),
+                backend: "host".into(),
                 extra: vec![d.to_string()],
                 ..Default::default()
             });
@@ -2214,6 +2258,7 @@ mod tests {
         let mut cfg = KernConfig::default();
         cfg.vgpio.push(VGpioEntry {
             name: "danger".into(),
+            backend: "host".into(),
             extra: vec!["/dev/mem".into(), "/dev/../dev/mem".into()],
             ..Default::default()
         });
@@ -2268,9 +2313,41 @@ mod tests {
         .unwrap();
         assert!(validate_profile_refs(&cfg3, "vdisk", "ok").is_ok());
         assert!(validate_profile_refs(&cfg3, "vdisk", "bad").is_err());
-        // No backend set → nothing to resolve → fine.
+        // backend is MANDATORY now: a profile without one is REJECTED (no ambiguous default), for
+        // every kind.
         let cfg4 = parse("[[vgpio]]\nname=\"n\"\npins=[17]\n").unwrap();
-        assert!(validate_profile_refs(&cfg4, "vgpio", "n").is_ok());
+        assert!(validate_profile_refs(&cfg4, "vgpio", "n").is_err());
+        assert!(validate_profile_refs(
+            &parse("[[vcpu]]\nname=\"x\"\ncpus=2.0\n").unwrap(),
+            "vcpu",
+            "x"
+        )
+        .is_err());
+        assert!(validate_profile_refs(
+            &parse("[[vdisk]]\nname=\"d\"\nsize=\"1g\"\n").unwrap(),
+            "vdisk",
+            "d"
+        )
+        .is_err());
+        // The reserved sentinels satisfy it WITHOUT a physical block: `host` (vcpu/vgpio), `ram` (vdisk).
+        assert!(validate_profile_refs(
+            &parse("[[vcpu]]\nname=\"h\"\nbackend=\"host\"\ncpus=1.0\n").unwrap(),
+            "vcpu",
+            "h"
+        )
+        .is_ok());
+        assert!(validate_profile_refs(
+            &parse("[[vgpio]]\nname=\"g\"\nbackend=\"host\"\npins=[17]\n").unwrap(),
+            "vgpio",
+            "g"
+        )
+        .is_ok());
+        assert!(validate_profile_refs(
+            &parse("[[vdisk]]\nname=\"r\"\nbackend=\"ram\"\nsize=\"1g\"\n").unwrap(),
+            "vdisk",
+            "r"
+        )
+        .is_ok());
         // The `kind:` prefix is tolerated on EITHER side: the docs form (`[[cpu]] id = "0"` +
         // `backend = "cpu:0"`) and a bare `backend = "0"` both resolve, not just the literal match.
         let cfg5 = parse(
@@ -2452,15 +2529,17 @@ mod tests {
 
     #[test]
     fn resolve_rejects_a_hand_edited_out_of_range_profile() {
-        // A file the TUI would never have written (a reversed cpuset range) fails at attach with a clear message.
-        let cfg = parse("[[vcpu]]\nname=\"p\"\ncpus=1\ncpuset=\"9-0\"\n").unwrap();
+        // A file the TUI would never have written (a reversed cpuset range) fails at attach with a
+        // clear message. `backend = "host"` so we reach the cpuset check, not the backend gate.
+        let cfg =
+            parse("[[vcpu]]\nname=\"p\"\nbackend=\"host\"\ncpus=1\ncpuset=\"9-0\"\n").unwrap();
         let e = resolve_vcpu(&cfg, "p").unwrap_err();
         assert!(e.contains("cpuset"), "got: {e}");
         // A ':' in a name is refused at resolve too, matching the form.
-        let cfg2 = parse("[[vcpu]]\nname=\"a:b\"\ncpus=1\n").unwrap();
+        let cfg2 = parse("[[vcpu]]\nname=\"a:b\"\nbackend=\"host\"\ncpus=1\n").unwrap();
         assert!(resolve_vcpu(&cfg2, "a:b").is_err());
         // A GPIO pin far out of range is refused.
-        let cfg3 = parse("[[vgpio]]\nname=\"g\"\nbackend=\"gpio:0\"\npins=[70000]\n").unwrap();
+        let cfg3 = parse("[[vgpio]]\nname=\"g\"\nbackend=\"host\"\npins=[70000]\n").unwrap();
         assert!(resolve_vgpio(&cfg3, "g").is_err());
     }
 

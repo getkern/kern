@@ -175,11 +175,11 @@ Three kinds ship today (a GPU slice is on the [Roadmap](#roadmap)):
   bind). A reusable, deny-by-default device set attached by name is the one piece with no direct equivalent I know of
   in Docker (`--device` is per-run, unnamed) or systemd (`DeviceAllow` is per-unit, not a portable preset).
 
-Two layers: declare the host resource once (the physical layer), then carve named virtual profiles
-from it. `backend =` links a profile to its host resource; both the link and the whole physical block
-are **optional** (a bare `[[vcpu]]` works, capped by its flag values), so start simple and add the
-host layer only when you want to pin a slice to specific hardware. Run `kern examples` for the full
-reference.
+Two layers: declare the host resource (the physical layer), then carve named virtual profiles from it.
+Every profile **must name a `backend`** so it is never ambiguously attached to nothing: a declared
+`[[cpu]]`/`[[gpio]]`/`[[disk]]` id, or a reserved keyword . **`host`** (the whole host CPU, or the
+host's own device nodes) or **`ram`** (a RAM-backed vdisk). The physical block itself stays optional:
+use `backend = "host"` / `"ram"` without declaring one. Run `kern examples` for the full reference.
 
 ```toml
 [[cpu]]                        # host CPU budget (physical)
