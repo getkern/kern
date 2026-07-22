@@ -175,19 +175,37 @@ Three kinds ship today (a GPU slice is on the [Roadmap](#roadmap)):
   bind). A reusable, deny-by-default device set attached by name is the one piece with no direct equivalent I know of
   in Docker (`--device` is per-run, unnamed) or systemd (`DeviceAllow` is per-unit, not a portable preset).
 
+Two layers: declare the host resource once (the physical layer), then carve named virtual profiles
+from it. `backend =` links a profile to its host resource; both the link and the whole physical block
+are **optional** (a bare `[[vcpu]]` works, capped by its flag values), so start simple and add the
+host layer only when you want to pin a slice to specific hardware. Run `kern examples` for the full
+reference.
+
 ```toml
-[[vcpu]]
+[[cpu]]                        # host CPU budget (physical)
+id = "cpu:0"
+cores = 8.0
+[[vcpu]]                       # a named CPU + memory slice of it  ->  attach with  vcpu:agent
 name = "agent"
+backend = "cpu:0"              # optional link to the [[cpu]] above
 cpus = 2
-memory = "1 GB"
+memory = "1g"
 
-[[vdisk]]
+[[disk]]                       # a host path for scratch volumes (physical)
+name = "data"
+path = "/var/lib/kern/volumes"
+[[vdisk]]                      # a size-capped scratch on it  ->  vdisk:scratch
 name = "scratch"
-size = "8 GB"
+backend = "data"
+size = "8g"
 
-[[vgpio]]
+[[gpio]]                       # the host GPIO / I2C controller (physical)
+id = "gpio:0"
+pins = [17, 27, 22]
+[[vgpio]]                      # expose ONLY these device nodes, nothing else  ->  vgpio:sensor
 name = "sensor"
-i2c = ["/dev/i2c-1"]
+backend = "gpio:0"
+i2c = ["/dev/i2c-1"]           # "1", "i2c-1" and "/dev/i2c-1" all resolve to the same bus
 ```
 
 ## What you can do in one line
