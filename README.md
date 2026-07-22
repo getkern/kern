@@ -2,7 +2,7 @@
 
 # kern
 
-**A fast, lightweight sandbox & virtual resource manager for AI agents and untrusted code.**
+**A fast, lightweight sandbox & virtual resource manager. Runs untrusted and AI-generated code.**
 
 Run untrusted or agent-generated code in a real, kernel-enforced box that starts in **~2 ms**, from one
 **~1.6 MB** rootless binary with no daemon. Embed it from Python, Node or Rust, or run it from the CLI.
