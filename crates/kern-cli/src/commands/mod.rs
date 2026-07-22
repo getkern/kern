@@ -9979,6 +9979,24 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
     }
     let cfg = crate::config::parse(text)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
+    // Every virtual profile's `backend` is MANDATORY and must resolve (a declared physical id, or the
+    // reserved `host`/`ram`). Enforce it for ALL profiles here so `kern validate` rejects a
+    // missing/dangling backend that `parse` alone (syntax only) would pass as "valid".
+    for e in &cfg.vcpu {
+        crate::config::validate_profile_refs(&cfg, "vcpu", &e.name).map_err(|m| {
+            Error::Config(format!("{}: [[vcpu]] '{}': {m}", target.display(), e.name))
+        })?;
+    }
+    for e in &cfg.vgpio {
+        crate::config::validate_profile_refs(&cfg, "vgpio", &e.name).map_err(|m| {
+            Error::Config(format!("{}: [[vgpio]] '{}': {m}", target.display(), e.name))
+        })?;
+    }
+    for e in &cfg.vdisk {
+        crate::config::validate_profile_refs(&cfg, "vdisk", &e.name).map_err(|m| {
+            Error::Config(format!("{}: [[vdisk]] '{}': {m}", target.display(), e.name))
+        })?;
+    }
     let p = crate::ui::Palette::detect();
     println!(
         "{g}valid{z} {} {d}-{z} {} vcpu, {} vgpio, {} vdisk profile(s)",
@@ -10026,14 +10044,15 @@ const EXAMPLE_KERN_TOML: &str = r#"# ~/.config/kern/kern.toml - resource profile
 log_level = "info"
 
 # ── CPU ──────────────────────────────────────────────────────────────────
-# Declare the host CPU budget (optional), then carve named vCPU profiles.
+# Declare the host CPU budget (optional), then carve named vCPU profiles. Every [[vcpu]] MUST name a
+# `backend`: a [[cpu]] id below, or the reserved "host" (the whole host CPU, no [[cpu]] needed).
 [[cpu]]
 id = "cpu:0"
 cores = 8.0           # host capacity (physical cores)
 
 [[vcpu]]
 name = "heavy"
-backend = "cpu:0"     # optional link to a [[cpu]]
+backend = "cpu:0"     # REQUIRED: a [[cpu]] id above, or "host" for the whole host CPU
 cpus = 4.0            # core quota (like --cpus): 4 cores
 cpuset = "0-3"        # pin to CPUs 0-3 (like --cpuset-cpus)
 memory = "2g"         # RAM cap (like --memory)
@@ -10041,6 +10060,7 @@ nice = -5             # scheduling priority (like --nice): -20..19
 
 [[vcpu]]
 name = "lean"
+backend = "host"      # no [[cpu]] to declare: slice the whole host directly
 cpus = 0.5
 memory = "256m"
 
@@ -10051,7 +10071,7 @@ pins = [17, 27, 22]
 
 [[vgpio]]
 name = "leds"
-backend = "gpio:0"
+backend = "gpio:0"    # REQUIRED: a [[gpio]] id above, or "host" for the host's own device nodes
 pins = [17, 27]
 i2c = ["1"]
 
@@ -10062,7 +10082,7 @@ path = "/var/lib/kern/volumes"
 
 [[vdisk]]
 name = "scratch"
-backend = "data"
+backend = "data"      # REQUIRED: a [[disk]] name above, or "ram" for a RAM-backed tmpfs
 size = "2g"
 "#;
 

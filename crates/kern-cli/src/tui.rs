@@ -1007,26 +1007,38 @@ fn trim_f(v: f64) -> String {
 
 /// The `backend` field for every profile kind - a SELECTION of the configured backends, never free text
 /// (that's how `disk:0sfsf…` / `gpio:0sfsf…` were possible). vgpio→`[[gpio]]` ids, vcpu→`[[cpu]]` ids,
-/// vdisk→`disk:<[[disk]] name>`. A single-select radio (a profile uses ONE backend); if none are
-/// configured, a "run kern config setup" note instead of a blank box. Optional - leave it unticked and
-/// the profile uses the default. One helper so all three kinds behave identically.
+/// vdisk→`disk:<[[disk]] name>`. A single-select radio (a profile uses ONE backend). `backend` is
+/// MANDATORY, so the reserved sentinel (`host` for vcpu/vgpio, `ram` for vdisk = the whole host, no
+/// physical block needed) is ALWAYS offered first - the field is never an empty dead-end, and the save
+/// (`validate_profile_refs`) refuses a profile that leaves it unset. One helper for all three kinds.
 fn backend_field(kind: &str) -> Field {
     let cfg = crate::config::load(None).unwrap_or_default();
-    let ids: Vec<String> = match kind {
-        "vgpio" => cfg.gpio.iter().map(|g| g.id.clone()).collect(),
-        "vcpu" => cfg.cpu.iter().map(|c| c.id.clone()).collect(),
+    let (sentinel, hint): (&str, &'static str) = match kind {
+        "vdisk" => (
+            crate::config::BACKEND_RAM,
+            "required: pick a backend (ram = a RAM tmpfs, or a configured disk)",
+        ),
+        "vgpio" => (
+            crate::config::BACKEND_HOST,
+            "required: pick a backend (host = the host's own devices, or a configured id)",
+        ),
+        _ => (
+            crate::config::BACKEND_HOST,
+            "required: pick a backend (host = the whole host CPU, or a configured id)",
+        ),
+    };
+    let mut ids: Vec<String> = vec![sentinel.to_string()];
+    ids.extend(match kind {
+        "vgpio" => cfg.gpio.iter().map(|g| g.id.clone()).collect::<Vec<_>>(),
+        "vcpu" => cfg.cpu.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
         "vdisk" => cfg
             .disk
             .iter()
             .map(|d| format!("disk:{}", d.name))
-            .collect(),
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
-    };
-    if ids.is_empty() {
-        Field::info("backend", "no backend configured (run: kern config setup)")
-    } else {
-        Field::radio("backend", "the backend to use (optional)", ids)
-    }
+    });
+    Field::radio("backend", hint, ids)
 }
 
 /// The editable fields for a compute/IO profile section (`vcpu`/`vgpio`) - used for new and edit.
@@ -3953,6 +3965,29 @@ leds = [\"led0\"]
         let form = feed(mk("cpus"), b"0.5");
         let pane = form_pane(&plain(), &form, 80, 24);
         assert!(pane.contains('✓'), "valid shows a tick:\n{pane}");
+    }
+
+    #[test]
+    fn backend_field_is_required_and_offers_the_sentinel_first() {
+        // `backend` is MANDATORY on every profile kind. Its `kern top` form field is a single-select
+        // radio (never free text), lists the reserved sentinel FIRST (host for vcpu/vgpio, ram for
+        // vdisk) so a profile can bind to the whole host with no physical block declared, is never an
+        // empty "info" dead-end, and its hint says "required".
+        for (kind, sentinel) in [("vcpu", "host"), ("vgpio", "host"), ("vdisk", "ram")] {
+            let f = backend_field(kind);
+            assert!(f.radio, "{kind}: backend must be a single-select radio");
+            assert!(!f.info, "{kind}: backend must never be an empty info dead-end");
+            assert_eq!(
+                f.options.first().map(String::as_str),
+                Some(sentinel),
+                "{kind}: the reserved sentinel must be offered first"
+            );
+            assert!(
+                f.hint.contains("required"),
+                "{kind}: hint must say required, got {:?}",
+                f.hint
+            );
+        }
     }
 
     #[test]
