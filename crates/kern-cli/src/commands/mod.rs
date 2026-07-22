@@ -9675,8 +9675,8 @@ fn tailored_kern_toml(h: &HostInv) -> String {
          # ── CPU ──  (profile fields match the CLI flags: cpus=--cpus, cpuset=--cpuset-cpus, memory=--memory, nice=--nice)\n\
          [[cpu]]\nid = \"cpu:0\"\ncores = {n}.0\n\n\
          [[vcpu]]\nname = \"heavy\"     # ~half this host, pinned to the first cores\n\
-         cpus = {half}\ncpuset = \"0-{pin_hi}\"\nmemory = \"512 MB\"\n\n\
-         [[vcpu]]\nname = \"lean\"\ncpus = 0.5\nmemory = \"256m\"\n",
+         backend = \"cpu:0\"\ncpus = {half}\ncpuset = \"0-{pin_hi}\"\nmemory = \"512 MB\"\n\n\
+         [[vcpu]]\nname = \"lean\"\nbackend = \"cpu:0\"\ncpus = 0.5\nmemory = \"256m\"\n",
         ram = h.ram
     );
     // A [[disk]] pool + a vdisk profile that references it, seeded from this host's primary disk, so
