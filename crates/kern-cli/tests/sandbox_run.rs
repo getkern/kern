@@ -593,7 +593,7 @@ fn box_vdisk_mounts_size_capped_volume() {
     let _ = fs::create_dir_all(cfgdir.join("kern"));
     fs::write(
         cfgdir.join("kern/kern.toml"),
-        "[[vdisk]]\nname = \"scratch\"\nsize = \"8m\"\n",
+        "[[vdisk]]\nname = \"scratch\"\nbackend = \"ram\"\nsize = \"8m\"\n",
     )
     .unwrap();
     let root = build_rootfs(&busybox, "vdisk");
@@ -663,7 +663,7 @@ fn box_vgpio_passes_listed_devices_only() {
     let _ = fs::create_dir_all(cfgdir.join("kern"));
     fs::write(
         cfgdir.join("kern/kern.toml"),
-        format!("[[vgpio]]\nname = \"io\"\ni2c = [\"{grant}\"]\n"),
+        format!("[[vgpio]]\nname = \"io\"\nbackend = \"host\"\ni2c = [\"{grant}\"]\n"),
     )
     .unwrap();
     let root = build_rootfs(&busybox, "vgpio");
@@ -720,7 +720,7 @@ fn box_applies_vcpu_profile() {
     let _ = fs::create_dir_all(cfgdir.join("kern"));
     fs::write(
         cfgdir.join("kern/kern.toml"),
-        "[[vcpu]]\nname = \"pin0\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
+        "[[vcpu]]\nname = \"pin0\"\nbackend = \"host\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
     )
     .unwrap();
     let root = build_rootfs(&busybox, "boxprof");
@@ -801,7 +801,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
     let _ = fs::create_dir_all(cfgdir.join("kern"));
     fs::write(
         cfgdir.join("kern/kern.toml"),
-        "[[vcpu]]\nname = \"pinned\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
+        "[[vcpu]]\nname = \"pinned\"\nbackend = \"host\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
     )
     .unwrap();
     // Retry on empty stdout - `kern run` re-execs into a systemd scope whose piped output can come
