@@ -616,6 +616,22 @@ kern states every boundary that is cooperative or opt-in plainly in **[SECURITY.
 
 ## How it works
 
+```text
+   kern  ·  one static binary, no daemon        box · run · compose · exec · pull · top …
+     │
+     ▼
+   runtime  (kern-isolation)
+     ├─ namespaces   user · pid · net · mnt · uts · ipc
+     ├─ rootfs       OCI overlay → pivot_root   (typestate: Mounted → OldRootReady → ReadOnly)
+     ├─ devices      fresh /dev · vgpio passthrough · -v volumes (symlink-safe)
+     ├─ cgroups v2   MemoryMax · CPUQuota · TasksMax
+     ├─ seccomp      always-on denylist (+ wrong-arch / x32)
+     └─ supervisor   fork → PID 1 → reap → exec / stats / stop
+     │
+     ▼
+   images  (kern-oci)   registry v2 · sha256 per blob · in-process tar vetting
+```
+
 A `kern box` is one short-lived process tree: no daemon, no shared state.
 
 1. **Namespaces.** `unshare` into a fresh user + PID + UTS + IPC namespace (and, by default, an
@@ -644,6 +660,11 @@ paths, device nodes, escaping hardlink/symlink targets, decompression- & inode-b
 extracts into isolated staging and merges no-follow, closed by *parsing* the layer, not by trusting
 the host tar, so it holds on GNU tar and BusyBox tar alike. Every layer is HTTPS-fetched and sha256-verified; credentials
 travel off-argv. See [ARCHITECTURE.md](ARCHITECTURE.md).
+
+**Verify the claims in the source:** [namespaces + the mount pipeline](crates/kern-isolation/src/real.rs)
+· [the always-on seccomp denylist](crates/kern-isolation/src/seccomp.rs)
+· [cgroup caps (memory/pids)](crates/kern-isolation/src/cgroup.rs)
+· [OCI pull + in-process tar vetting](crates/kern-oci/src/pull.rs).
 
 ## Performance
 
@@ -702,9 +723,35 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 …plus governed runs, port-published services, compose stacks and more, see
 **[examples/README.md](examples/README.md)**.
 
+## Requirements & limitations
+
+kern trades breadth for a small, honest core. What it needs, and what it deliberately does not do:
+
+**Requires:**
+- A **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**. On Windows it runs under
+  WSL2; there is no native macOS/Windows port ([Roadmap](#roadmap)).
+- Hard `--memory`/`--cpus`/`--pids` caps need a **delegated cgroup** (a systemd user manager, or root);
+  without one they degrade to best-effort and kern says so. Microsoft's default WSL2 kernel and a stock
+  Raspberry Pi OS don't delegate the `memory` controller, so `--memory` is accepted-but-unenforced there
+  (same as Docker/Podman) until you enable it.
+- `newuidmap` + `/etc/subuid` for a full uid range (`--uid-range`, `--ssh`); a single-uid box works
+  without them.
+
+**Deliberately not here:**
+- **Not a microVM, not for hostile multi-tenancy.** kern is a **kernel-boundary** sandbox (namespaces +
+  an always-on seccomp denylist) for your own or semi-trusted code. A kernel vulnerability is not
+  contained; for actively hostile tenants reach for a microVM (Firecracker) or gVisor. The
+  [threat model](SECURITY.md) says so plainly.
+- **No overlay / software-defined networking** (a box gets an isolated netns, or the host's; a pod
+  shares one) and no Docker plugin ecosystem.
+- **`kern exec` caps** are inherited only where kern can join the box's cgroup (root, or a delegated
+  `kern.slice`); on a rootless per-box-scope host the exec'd command runs outside the box's
+  `--memory`/`--pids` (namespaces + seccomp still isolate it), and kern warns.
+- **GPU** slices are on the [Roadmap](#roadmap), not shipped.
+
 ## Project status
 
-**0.6.9, a daemonless container + resource runtime that does less than Docker, on purpose.**
+**0.6.11, a daemonless container + resource runtime that does less than Docker, on purpose.**
 Everything in [Features](#features) works today and is tested (479 Rust, 61 Python and 50 Node tests;
 clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It
 deliberately skips a lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast,
@@ -713,9 +760,14 @@ is the official release of that version. Pre-1.0 means only that the CLI and con
 change between minor versions (changes are called out in [CHANGELOG.md](CHANGELOG.md)), not that a
 release is unfinished.
 
-**Recent work (0.6.9):** a **warm kernel** for the Python + Node bindings (`Sandbox.kernel()`, a
-persistent interpreter that makes the code-interpreter path sub-millisecond) and an **MCP server**
-(`kern-mcp`) for Claude Desktop / Cursor, plus a box-start rate in `kern top`. Before that (0.6.7 / 0.6.8):
+**Recent work (0.6.11 / 0.6.10):** `kern exec` now joins the box's cgroup, so an exec'd command
+inherits the box's `--memory`/`--pids` caps like `docker exec` (an honest warning where a rootless
+per-box scope can't be joined); and resource profiles now **require an explicit `backend`** (a declared
+`[[cpu]]`/`[[gpio]]`/`[[disk]]`, or the reserved `host`/`ram`) so a profile is never ambiguously
+attached to a default. Before (0.6.9): a **warm kernel** for the Python + Node bindings
+(`Sandbox.kernel()`, a persistent interpreter that makes the code-interpreter path sub-millisecond) and
+an **MCP server** (`kern-mcp`) for Claude Desktop / Cursor, plus a box-start rate in `kern top`. Before
+that (0.6.7 / 0.6.8):
 `kern commit` warm-start snapshots, an `--egress-allow` domain allowlist and an `--landlock-rw`
 write-allowlist, fleet budgets, and the bindings gaining resource profiles, egress control, live output
 streaming, rich mime-typed results and workspace snapshot/restore. Earlier: local image **build** +
