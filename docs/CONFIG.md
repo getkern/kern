@@ -59,6 +59,37 @@ onewire = [4]
 # deny-list (raw memory, disks, VFIO/DMA, kvm, HID injection, the console, …) rejects it first.
 ```
 
+**Every supported device field** (list what you want, nothing else crosses in). Hand-edit the TOML, or
+let `kern top` / `kern config setup` pre-fill it from what it detects on the host:
+
+| field | grants | host path | needs a `[[gpio]]`? |
+|---|---|---|---|
+| `pins` | GPIO lines (chip-granular) | `/dev/gpiochip*` | yes |
+| `pwm` | PWM channels | sysfs pwm | yes |
+| `adc` | ADC channels | sysfs | yes |
+| `onewire` | 1-Wire | sysfs | yes |
+| `i2c` | I2C buses | `/dev/i2c-*` | no |
+| `spi` | SPI buses | `/dev/spidev*` | no |
+| `uart` | serial | `/dev/ttyS*` `ttyUSB*` `ttyACM*` | no |
+| `can` | CAN bus | `/dev/can*` | no |
+| `camera` | cameras | `/dev/video*` | no |
+| `audio` | ALSA audio | `/dev/snd/pcm*` `controlC*` | no |
+| `midi` | ALSA MIDI | `/dev/snd/midi*` | no |
+| `input` | keyboards / mice / sensors | `/dev/input/event*` | no |
+| `leds` | on-board LEDs | `/sys/class/leds/*` | no |
+| `bluetooth` | BT controllers | `/sys/class/bluetooth/hci*` | no |
+| `net` | network interfaces | `/sys/class/net/*` (eth0, wlan0) | no |
+| `display` | GPU render node | `/dev/dri/renderD*` (never `card*`) | no |
+| `usb` | USB devices | by bus / port | no |
+| `extra` | explicit `/dev/*` paths | any (validated) | no |
+
+`pins`/`pwm`/`adc`/`onewire` are lines of a controller, so they need a `backend` naming a `[[gpio]]`
+id. The rest are standalone host device nodes: use `backend = "host"`, or any declared `[[gpio]]` id as
+the anchor. Whatever you list, kern binds only the paths that **exist** on this host (absent ones are
+skipped) and **refuses** any node that grants host control (disk, raw memory, kvm, tun, fuse, the
+console, ...) by device **identity**, even via `extra`. A `[[gpio]]` block is a bare named anchor
+(`id = "..."`); it holds no device list of its own, the grant lives on the `[[vgpio]]`.
+
 ### `[[vdisk]]`, a size-capped disk · attach with `vdisk:<name>`
 
 ```toml
