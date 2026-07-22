@@ -750,8 +750,8 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.11, a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (479 Rust, 61 Python and 50 Node tests;
+**0.6.12, a daemonless container + resource runtime that does less than Docker, on purpose.**
+Everything in [Features](#features) works today and is tested (482 Rust, 61 Python and 50 Node tests;
 clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It
 deliberately skips a lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast,
 honest core. **Every numbered release is a tested, production-intent build, not a beta or a preview:** it
@@ -759,7 +759,9 @@ is the official release of that version. Pre-1.0 means only that the CLI and con
 change between minor versions (changes are called out in [CHANGELOG.md](CHANGELOG.md)), not that a
 release is unfinished.
 
-**Recent work (0.6.11 / 0.6.10):** `kern exec` now joins the box's cgroup, so an exec'd command
+**Recent work (0.6.12 / 0.6.11 / 0.6.10):** `kern config setup` now writes a `backend` on every
+profile it generates, so the starter config it tailors for a host passes `kern validate`. `kern exec`
+joins the box's cgroup, so an exec'd command
 inherits the box's `--memory`/`--pids` caps like `docker exec` (an honest warning where a rootless
 per-box scope can't be joined); and resource profiles now **require an explicit `backend`** (a declared
 `[[cpu]]`/`[[gpio]]`/`[[disk]]`, or the reserved `host`/`ram`) so a profile is never ambiguously
