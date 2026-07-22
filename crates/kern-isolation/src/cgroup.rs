@@ -438,6 +438,67 @@ fn parse_box_cgroup_line(raw: &str) -> Option<PathBuf> {
     Some(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }
 
+/// The cgroup v2 directory host-pid `pid` currently belongs to (the `0::<path>` line of
+/// `/proc/<pid>/cgroup`), absolute under `/sys/fs/cgroup`, or `None` (proc entry gone, a v1-only
+/// host, or a `..` in the path). Unlike [`box_cgroup_dir`] this returns the cgroup WHATEVER it is -
+/// a `kern-box-*` leaf on the delegated direct-cap path, a `run-*.scope` on the rootless per-box
+/// systemd-scope path, or an ambient scope for an uncapped box - because `kern exec` must join the
+/// box's EFFECTIVE cgroup to inherit its caps, and on the scope path the enforcer is the scope
+/// itself, not a `kern-box-*` child.
+fn proc_cgroup_dir(pid: i32) -> Option<PathBuf> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = raw
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))?
+        .trim()
+        .trim_start_matches('/');
+    if rel.split('/').any(|c| c == "..") {
+        return None;
+    }
+    Some(PathBuf::from("/sys/fs/cgroup").join(rel))
+}
+
+/// Outcome of trying to place a `kern exec`'d process into its box's cgroup - see
+/// [`join_box_cgroup_for_exec`].
+pub enum ExecCgroupJoin {
+    /// Joined the box's cgroup (so the exec'd workload inherits its caps), OR the box has no cap to
+    /// inherit - either way there is nothing to flag.
+    Bound,
+    /// The box IS capped but the kernel refused the migration into its cgroup. The rootless per-box
+    /// systemd-scope case: a process in the caller's own session scope can't be moved into a sibling
+    /// `--user` scope, because that needs write on the common ancestor `user@<uid>.service`, which
+    /// systemd owns (verified EPERM on a Pi 5). The exec'd command then runs OUTSIDE the box's
+    /// `--memory`/`--pids` caps; namespaces + seccomp still isolate it. The caller surfaces this.
+    Unbounded,
+}
+
+/// Move THIS process into the cgroup that box PID 1 (`pid1`) lives in, so a child forked afterwards
+/// (the `kern exec`'d command) inherits the box's memory/pids caps - the same "cap before fork"
+/// order the box's own PID 1 uses. Side-effect-only (never creates/removes a cgroup, only ADDS this
+/// pid), so it's safe against any target. On the delegated direct-cap path the target is the box's
+/// `kern-box-*` cgroup and the write succeeds ([`ExecCgroupJoin::Bound`]); where the kernel forbids
+/// the migration (rootless per-box scope) it returns [`ExecCgroupJoin::Unbounded`] IFF the box is
+/// really capped, so the caller warns instead of silently running the command uncapped.
+pub fn join_box_cgroup_for_exec(pid1: i32) -> ExecCgroupJoin {
+    let Some(cg) = proc_cgroup_dir(pid1) else {
+        return ExecCgroupJoin::Bound; // no v2 cgroup to speak of - nothing to inherit
+    };
+    if cg.as_path() == std::path::Path::new("/sys/fs/cgroup") {
+        return ExecCgroupJoin::Bound; // the root - never "join" it
+    }
+    if fs::write(cg.join("cgroup.procs"), std::process::id().to_string()).is_ok() {
+        return ExecCgroupJoin::Bound;
+    }
+    // Couldn't migrate in. Only a resource concern if the box's own cgroup enforces a real cap
+    // (its `memory.max`/`pids.max` reads a value, not the `max` no-limit sentinel).
+    let real = |f: &str| fs::read_to_string(cg.join(f)).is_ok_and(|v| is_real_limit(&v));
+    if real("memory.max") || real("pids.max") {
+        ExecCgroupJoin::Unbounded
+    } else {
+        ExecCgroupJoin::Bound
+    }
+}
+
 /// Ensure kern's own DELEGATED slice exists and return its cgroup path, or `None` if unavailable.
 ///
 /// This is the fast-path enabler: a one-time `systemd-run --user -p Delegate=yes --slice=kern.slice

@@ -2274,6 +2274,10 @@ pub fn exec(
         .as_ref()
         .and_then(|p| crate::pty::raw_with_resize(p.master));
 
+    // Warn (in `exec_in_box`) only if the user set an EXPLICIT cap on the box: on a rootless
+    // scope-path host the exec can't join the box's cgroup, and a default box would otherwise warn
+    // on every `kern exec`. `None` caps → the user asked for nothing to enforce → stay quiet.
+    let box_has_explicit_caps = inst.memory_max.is_some() || inst.pids_max.is_some();
     let result = exec_in_box(
         pid1,
         &cmd,
@@ -2282,6 +2286,7 @@ pub fn exec(
         pty.as_ref().map(|p| p.slave),
         pty.as_ref().map(|p| p.master),
         None, // `kern exec` has no timeout
+        box_has_explicit_caps,
     );
 
     if let Some(prev) = saved.as_ref() {
@@ -2744,7 +2749,8 @@ fn run_probe(pid1: i32, probe: &[String], timeout: u64) -> bool {
     let to = (timeout > 0).then_some(timeout);
     let probe_pid = unsafe { libc::fork() };
     if probe_pid == 0 {
-        let code = exec_in_box(pid1, probe, &[], None, None, None, to).unwrap_or(1);
+        // A health probe never warns about the scope-path cap gap (it runs every interval).
+        let code = exec_in_box(pid1, probe, &[], None, None, None, to, false).unwrap_or(1);
         unsafe { libc::_exit(code) };
     }
     if probe_pid <= 0 {

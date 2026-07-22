@@ -17,6 +17,20 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.10], 2026-07-22
+
+A resource-isolation fix for `kern exec`.
+
+### Fixed
+- **`kern exec` now inherits the box's `--memory`/`--pids` caps.** An exec'd command joins the box's
+  cgroup before entering its namespaces (the same "cap before fork" order the box's own PID 1 uses),
+  so a fork bomb or memory hog run via `kern exec` is bounded by the box's limits, like `docker
+  exec`. Previously it stayed in the launcher's cgroup and could exceed them. On the rootless
+  per-box-scope path (e.g. an SSH login session on an edge board) the kernel won't let `kern exec`
+  migrate into the box's transient scope; there it can't be enforced, so kern now warns when the box
+  has explicit caps instead of leaking it silently. Namespaces + seccomp isolate the exec'd command
+  either way. See [SECURITY.md](SECURITY.md).
+
 ## [0.6.9], 2026-07-21
 
 A small CLI addition plus a big step for the language bindings (shipped separately as `kern-sandbox`
