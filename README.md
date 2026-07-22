@@ -50,8 +50,8 @@ container UX (OCI pull **and build**, overlay, volumes, secrets, in-box SSH, `cp
 kern box dev --image alpine -- sh        # a throwaway, isolated Alpine shell, in a few ms
 ```
 
-…or embed it, a fresh isolated box per call, for untrusted or agent-generated code (microVM-grade
-isolation territory, but *local* and ~1.6 MB: no cloud, no account, no VM):
+…or embed it, a fresh isolated box per call, for untrusted or agent-generated code (cloud-code-interpreter
+territory, but *local* and ~1.6 MB: no cloud, no account, no VM):
 
 ```python
 import kern_sandbox as kern                     # pip install kern-sandbox
@@ -541,7 +541,7 @@ OCI images pull with `curl` + `tar` (registry v2, `WWW-Authenticate` auth, multi
 each blob **sha256-verified**, each layer **vetted in-process from its raw tar headers** (absolute/`..`
 paths, device nodes, escaping hardlink/symlink targets, decompression- & inode-bomb caps) before it
 extracts into isolated staging and merges no-follow, closed by *parsing* the layer, not by trusting
-the host tar, so it holds on GNU tar and BusyBox tar alike. Every request is TLS-pinned; credentials
+the host tar, so it holds on GNU tar and BusyBox tar alike. Every layer is HTTPS-fetched and sha256-verified; credentials
 travel off-argv. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Performance
@@ -559,7 +559,7 @@ numbers vary with hardware and load; board rows are from on-device runs.
 | Raspberry Pi 5 | v6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Arduino UNO Q | **v6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
 
-✗ = not installed (nor readily installable) on that board. On the **Pi 5, kern is the only runtime
+✗ = not installed on the boards tested. On the **Pi 5, kern is the only runtime
 present at all**: one ~1.6 MB static binary just works where the others are each a setup step (Docker
 alone is a ~186 MB daemon stack).
 
@@ -603,7 +603,7 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 ## Project status
 
 **0.6.9, a daemonless container + resource runtime that does less than Docker, on purpose.**
-Everything in [Features](#features) works today and is tested (hundreds of tests across Rust, Python and
+Everything in [Features](#features) works today and is tested (479 Rust, 61 Python and 50 Node tests; clippy-clean and
 Node, clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is real. It
 deliberately skips a lot Docker has (overlay networks, a plugin ecosystem): the point is a small, fast,
 honest core. The CLI and config surface are **not frozen until 1.0**.
