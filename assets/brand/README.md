@@ -2,7 +2,7 @@
 
 Official logo and marks for kern. The code is [Apache-2.0](../../LICENSE), but **"kern" is a
 trademark**: please do not use these marks for a fork, a modified build, or a competing product or
-service without permission. See [TRADEMARK.md](../../TRADEMARK.md).
+service without permission. See [TRADEMARK.md](../../TRADEMARK.md), or ask at hello@getkern.dev.
 
 ## Files
 - `kern-logo.png` . stencil KERN wordmark, transparent background (works on light or dark)

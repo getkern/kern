@@ -6,8 +6,8 @@ driver. It *will* receive security reports, here is the model and how to report.
 ## Reporting a vulnerability
 
 **Please do not open a public issue for security bugs.** Report privately via GitHub Security
-Advisories ("Report a vulnerability" on the repo) or email the maintainer listed on the GitHub
-profile. You'll get an acknowledgement and a coordinated-disclosure timeline.
+Advisories ("Report a vulnerability" on the repo) or email hello@getkern.dev. You'll get an
+acknowledgement and a coordinated-disclosure timeline.
 
 ## Threat model
 
