@@ -22,9 +22,40 @@ fn help_lists_commands() {
     let out = kern().arg("--help").output().expect("run kern");
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    for verb in ["box", "run", "pull", "compose"] {
+    for verb in [
+        "box", "run", "pull", "compose", // core
+        "rename", "update", "wait", "diff", "events", // container-lifecycle verbs
+    ] {
         assert!(s.contains(verb), "help missing {verb}");
     }
+}
+
+/// The new lifecycle verbs reject bad invocation at the parse/resolution layer - no sandbox needed,
+/// so this runs everywhere (unlike a real box start). Covers both the usage errors and the
+/// "no such running box" path each verb shares.
+#[test]
+fn lifecycle_verbs_reject_bad_input() {
+    let fails = |args: &[&str]| {
+        let out = kern().args(args).output().expect("run kern");
+        assert!(
+            !out.status.success(),
+            "expected failure for `kern {}`",
+            args.join(" ")
+        );
+    };
+    // Usage errors (missing/invalid args), all before any box work.
+    fails(&["rename", "only-one-arg"]); // needs <old> <new>
+    fails(&["wait"]); // needs at least one box
+    fails(&["diff"]); // needs a box
+    fails(&["update", "somebox"]); // needs at least one of --memory/--cpus/--pids-limit
+    fails(&["update", "b", "--cpus", "-1"]); // invalid cpus
+    fails(&["update", "b", "--pids-limit", "abc"]); // invalid pids
+                                                    // "no such running box" resolution errors (kern keeps no stopped boxes).
+    let ghost = "kern-smoke-no-such-box-zzz";
+    fails(&["rename", ghost, "newname"]);
+    fails(&["wait", ghost]);
+    fails(&["diff", ghost]);
+    fails(&["update", ghost, "--memory", "64m"]);
 }
 
 #[test]

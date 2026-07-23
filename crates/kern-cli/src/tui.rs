@@ -1768,7 +1768,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
     let mut rows = Vec::new();
     for b in registry::list() {
         // One cgroup resolve for all four readings (mem/cpu/tasks/frozen) instead of four.
-        let st = registry::box_stats(b.pid);
+        let st = registry::box_stats(b.cgroup_pid());
         let cpu_now = st.cpu_usec.unwrap_or(0);
         let cpu_pct = match prev.get(&b.pid) {
             Some((pu, t)) => {
