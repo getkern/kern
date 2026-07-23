@@ -19,7 +19,9 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
-Docker-parity flags on the read/inspect commands (no isolation-core change).
+## [0.6.14], 2026-07-23
+
+Everyday-CLI parity on the read/inspect and lifecycle commands (no isolation-core change).
 
 ### Added
 - **`kern logs --tail N`** prints only the last N lines; **`-f`/`--follow`** streams new output until
@@ -40,6 +42,15 @@ Docker-parity flags on the read/inspect commands (no isolation-core change).
   **`kern diff <box>`** (overlay-upper filesystem changes: `C` created/modified, `D` deleted); and
   **`kern events`** (poll-based stream of box `start`/`die`/`rename`; daemonless, best-effort - it can
   miss a start+stop that both fall inside one poll gap).
+
+### Fixed
+- **Box cgroup stats/pause/update resolve via the box's own pid1**, not the supervisor pid. On the
+  direct `kern.slice` cap path the supervisor stays in the launcher's cgroup by design, so
+  `stats`/`pause`/`update`/`ps --filter status=paused` previously read the wrong cgroup there; they now
+  key off the host-namespace box init, correct on both the direct and the re-exec scope path.
+- **`kern rename` builds on aarch64/x86_64-musl**: the atomic name swap now issues `renameat2` via the
+  raw syscall (the musl `libc` bindings do not expose the wrapper), so release builds link on every
+  target.
 
 ## [0.6.13], 2026-07-23
 
