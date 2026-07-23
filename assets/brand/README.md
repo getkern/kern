@@ -5,10 +5,10 @@ trademark**: please do not use these marks for a fork, a modified build, or a co
 service without permission. See [TRADEMARK.md](../../TRADEMARK.md).
 
 ## Files
+- `kern-logo.png` . stencil KERN wordmark, transparent background (works on light or dark)
+- `kern-logo-dark.png` . stencil KERN wordmark on dark (`#0d1117`)
 - `kern-banner.png` . 1500x500 header (X / social banner)
 - `og-image.png` . 1200x630 social card (the getkern.dev Open Graph / Twitter preview image)
-
-The standalone wordmark and avatar marks are being redesigned and are not shipped right now.
 
 ## Palette
 - background: `#0d1117`
