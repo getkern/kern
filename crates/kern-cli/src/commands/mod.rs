@@ -33,8 +33,8 @@ pub fn help() -> Result<(), Error> {
     {c}box{z} <name> --plan                                              Preview the isolation sequence
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [-- CMD...]           Run CMD in a running box
-    {c}ps{z} [--json]                                                    List running boxes
-    {c}logs{z} <name>                                                    Show a box's output
+    {c}ps{z} [--json] [-q] [--filter k=v] [--format T]                   List running boxes
+    {c}logs{z} <name> [--tail N] [-f|--follow]                           Show a box's output
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
 
   {d}Images{z}
@@ -60,6 +60,11 @@ pub fn help() -> Result<(), Error> {
     {c}pause{z} <name>... | --all                                        Freeze box(es) (cgroup freezer)
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
     {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
+    {c}rename{z} <old> <new>                                             Give a running box a new name
+    {c}update{z} <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
+    {c}wait{z} <box>...                                                  Wait for running box(es) to exit; print exit code
+    {c}diff{z} <box>                                                     List filesystem changes vs the image (C/D)
+    {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     {c}prune{z}                                                          Remove stopped-box sidecar files (logs/health)
     {c}gc{z} [--images]                                                  Full cleanup: prune + scratch + build layers (+ --images)
     {c}recover{z}                                                        Reclaim orphaned scratch of dead boxes (also done by gc)
@@ -89,6 +94,9 @@ pub fn help() -> Result<(), Error> {
 {b}OPTIONS for box:{z}
     --rootfs <dir>      Root filesystem to enter
     --image <ref>       OCI image to pull and run (e.g. alpine, alpine:3.19)
+    --pull missing|never|always  missing = default (pull only when absent); never = fail if not
+                        already cached (no network pull); always = force a fresh pull (atomic swap;
+                        a locally-built image is used as-is)
     -d, --detach        Run in the background (track with `kern ps`)
     --read-only         Read-only root (default is a writable overlay)
     -v, --volume S:D[:ro]   Mount into the box (repeatable). S = a host path, a named volume
@@ -237,12 +245,27 @@ impl RestartPolicy {
     }
 }
 
+/// `--pull <policy>` - when an `--image` names a registry ref, decide whether to hit the network.
+/// `Missing` (Docker's default) pulls only when the image is not already cached; `Never` fails closed
+/// if it is not local (never touches the network); `Always` forces a fresh pull with an atomic cache
+/// swap. A locally-built (`.layers`/`.base`) or `scratch` image is used as-is under every policy -
+/// kern has nothing to re-pull for it, so those resolve before the network decision is ever reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PullPolicy {
+    #[default]
+    Missing,
+    Never,
+    Always,
+}
+
 /// Arguments for [`box_run`]. A struct (not a long parameter list) keeps the call site readable
 /// as box options grow (`-v`, `--env`, `--workdir`, `--net`).
 pub struct BoxRunArgs<'a> {
     pub name: &'a str,
     pub rootfs: Option<&'a str>,
     pub image: Option<&'a str>,
+    /// `--pull <missing|never|always>`: registry-image fetch policy (see [`PullPolicy`]).
+    pub pull: PullPolicy,
     pub command: &'a [String],
     pub detached: bool,
     pub read_only: bool,
@@ -787,8 +810,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // Build RUN step: an explicit (possibly colon-joined multi-) lower, no image config.
         (Some(ol), _, _) => (ol.to_string(), kern_oci::ImageConfig::default()),
         (None, Some(r), _) => (r.to_string(), kern_oci::ImageConfig::default()),
-        // `--image` may be a pulled (flat) OR a locally-built (layered) image - resolve both.
-        (None, None, Some(img)) => resolve_image(img)?,
+        // `--image` may be a pulled (flat) OR a locally-built (layered) image - resolve both. The
+        // `--pull` policy rides all the way down to the one site that hits the network (`pull_to_cache`);
+        // `scratch` and locally-built images short-circuit before that, so `never` naturally passes them.
+        (None, None, Some(img)) => resolve_image_depth(img, 0, args.pull)?,
         (None, None, None) => return Err(Error::Sandbox("need --rootfs or --image".to_string())),
     };
     // Resolve the effective command from the image config (docker semantics: Entrypoint + the user's
@@ -2494,10 +2519,13 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
             unsafe { libc::sleep(hc.interval as libc::c_uint) };
             elapsed = elapsed.saturating_add(hc.interval);
         }
-        // Current box PID 1 (changes across `--restart`); read it from the registry by name. `find`
-        // opens ONLY this box's entry - critical here: this runs in a per-box checker loop forever, so a
-        // full `list()` would be O(running boxes) every interval → O(N²) steady-state across N checkers.
-        let pid1 = registry::find(&name).map(|b| b.pid1).unwrap_or(0);
+        // The box may have been `kern rename`d since we started: resolve its CURRENT name by pid so we
+        // follow the rename instead of writing health under (and looking up) the stale original name.
+        // `name_for_pid` is a readdir + filename match (no per-entry file reads), far cheaper than a
+        // `list()`. Then `find(cur)` opens ONLY this box's entry - a full `list()` per interval per
+        // checker would be O(N²) steady-state across N checkers.
+        let cur = registry::name_for_pid(pid).unwrap_or_else(|| name.clone());
+        let pid1 = registry::find(&cur).map(|b| b.pid1).unwrap_or(0);
         let status = if pid1 > 0 {
             let ok = run_probe(pid1, &probe, hc.timeout);
             if ok {
@@ -2519,7 +2547,7 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
         } else {
             "starting"
         };
-        registry::set_health(&name, pid, status);
+        registry::set_health(&cur, pid, status);
         // `--health-action`: when the box first turns unhealthy, act once (not every interval).
         if status == "unhealthy" && !acted {
             acted = true;
@@ -2912,6 +2940,12 @@ fn supervise_box(
                 ready,
                 |pid1| {
                     inst.pid1 = pid1;
+                    // If the box was `kern rename`d since the last (re)register, adopt its CURRENT
+                    // on-disk name so a `--restart` re-register updates that entry instead of
+                    // resurrecting the original name as a duplicate live entry.
+                    if let Some(cur) = registry::name_for_pid(inst.pid) {
+                        inst.name = cur;
+                    }
                     let _ = registry::register(inst);
                 },
                 None,  // detached boxes have no terminal to attach
@@ -2956,9 +2990,11 @@ fn supervise_box(
         }
         break code;
     };
-    // The box has finished for good (no restart left). If compose is waiting on our completion, record
-    // the final exit code under its stack+run-scoped key. Written LAST, after the box is truly gone
-    // from the run, so a reader that sees the sidecar knows the box is done.
+    // The box has finished for good (no restart left). Record the final exit code for `kern wait`,
+    // keyed `<name>-<pid>` (our own pid = the registered pid). Written LAST here, and this whole call
+    // returns BEFORE the caller unregisters the instance file, so a `wait` that sees the box leave
+    // `list()` finds the code. If compose is also waiting, record it under its stack+run-scoped key too.
+    registry::set_box_exit(std::process::id() as i32, inst.starttime, final_code);
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
     }
@@ -3487,8 +3523,166 @@ fn detach_stdio(log: Option<&std::path::Path>) {
 }
 
 /// `kern ps [--json]` - list running boxes. Dead entries are pruned on read.
-pub fn ps(json: bool) -> Result<(), Error> {
-    let boxes = registry::list();
+/// True if `b` satisfies every `--filter` (AND semantics). Keys are pre-validated by [`ps`]. `name`
+/// is a substring match (like `docker ps --filter name=`), `id` is an exact host-pid match, `status`
+/// is running/paused (a kern box is never persistently exited/created/dead/restarting, so those match
+/// nothing).
+fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
+    filters.iter().all(|(k, v)| match k.as_str() {
+        "name" => b.name.contains(v.as_str()),
+        "id" => b.pid.to_string() == *v,
+        "status" => match v.as_str() {
+            "running" => !registry::is_paused(b.cgroup_pid()),
+            "paused" => registry::is_paused(b.cgroup_pid()),
+            _ => false,
+        },
+        _ => false, // unreachable: keys are validated in `ps` before this runs (fail closed anyway)
+    })
+}
+
+/// One box's display status: `paused` (frozen by `kern pause`), else its health-check verdict, else
+/// `empty` when no health check is configured. The single source of truth for `ps`'s HEALTH column,
+/// `ps --format {{.Status}}`, and `--filter status=` - so they never drift on what "paused" means.
+fn box_status(b: &registry::Instance, empty: &str) -> String {
+    if registry::is_paused(b.cgroup_pid()) {
+        return "paused".to_string();
+    }
+    let h = registry::health_of(&b.name, b.pid);
+    if h.is_empty() {
+        empty.to_string()
+    } else {
+        h
+    }
+}
+
+/// Append `s` to `out`, turning the two-char escapes `\t`/`\n` into a tab / newline (the docker
+/// `--format` convention); any other backslash is kept verbatim. Pure.
+fn push_unescaped(out: &mut String, s: &str) {
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.peek() {
+                Some('t') => {
+                    out.push('\t');
+                    it.next();
+                }
+                Some('n') => {
+                    out.push('\n');
+                    it.next();
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// Render one box through a `ps --format` template: the `{{.Field}}` placeholders below, plus `\t`/`\n`
+/// in literal text. A Go-template with logic (ranges/conditionals/functions) is NOT supported: an
+/// unterminated `{{` or an unknown token is a hard error (use `--json` for arbitrary shaping). Validated
+/// fields (name/pod/ports/status) are borrowed straight in; the UNTRUSTED command/rootfs are
+/// control-scrubbed first so a crafted box argv or `--rootfs` can't inject ANSI escapes into the
+/// terminal (the same guard the `ps` table, `images`, and `--json` already apply).
+fn render_ps_format(tmpl: &str, b: &registry::Instance, now: u64) -> Result<String, Error> {
+    let mut out = String::with_capacity(tmpl.len());
+    let mut rest = tmpl;
+    while let Some(open) = rest.find("{{") {
+        push_unescaped(&mut out, &rest[..open]);
+        let after = &rest[open + 2..];
+        let close = after
+            .find("}}")
+            .ok_or(Error::Usage("ps --format: unterminated `{{`"))?;
+        match after[..close].trim() {
+            ".Names" | ".Name" => out.push_str(&b.name),
+            ".ID" | ".Pid" => out.push_str(&b.pid.to_string()),
+            ".Image" | ".Rootfs" => out.push_str(&crate::ui::scrub(&b.rootfs)),
+            ".Command" => out.push_str(&crate::ui::scrub(&b.command)),
+            ".Ports" => out.push_str(&b.ports),
+            ".Pod" => out.push_str(&b.pod),
+            ".RunningFor" => out.push_str(&fmt_uptime(now.saturating_sub(b.started))),
+            ".Status" => out.push_str(&box_status(b, "running")),
+            _ => {
+                return Err(Error::Usage(
+                    "ps --format: unsupported token (supported: {{.Names}} {{.Pid}} {{.Image}} \
+                     {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.RunningFor}}; use --json for more)",
+                ))
+            }
+        }
+        rest = &after[close + 2..];
+    }
+    push_unescaped(&mut out, rest);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod ps_format_tests {
+    use super::push_unescaped;
+
+    #[test]
+    fn unescape_t_n_and_keep_others() {
+        let mut o = String::new();
+        push_unescaped(&mut o, "a\\tb\\nc");
+        assert_eq!(o, "a\tb\nc");
+        let mut o = String::new();
+        push_unescaped(&mut o, "plain text");
+        assert_eq!(o, "plain text");
+        let mut o = String::new();
+        push_unescaped(&mut o, "trailing\\");
+        assert_eq!(o, "trailing\\");
+        let mut o = String::new();
+        push_unescaped(&mut o, "\\x kept");
+        assert_eq!(o, "\\x kept");
+    }
+}
+
+pub fn ps(
+    json: bool,
+    quiet: bool,
+    filters: &[(String, String)],
+    format: Option<&str>,
+) -> Result<(), Error> {
+    // Validate every filter once, fail-fast on an unsupported key or status value.
+    for (k, v) in filters {
+        match k.as_str() {
+            "name" | "id" => {}
+            "status" => {
+                if !matches!(
+                    v.as_str(),
+                    "running" | "paused" | "exited" | "created" | "dead" | "restarting"
+                ) {
+                    return Err(Error::Usage(
+                        "ps --filter status=: running | paused (kern boxes are ephemeral; \
+                         exited/created/dead/restarting always match nothing)",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::Usage(
+                    "ps --filter: supported keys are name=, status=, id=",
+                ))
+            }
+        }
+    }
+    let boxes: Vec<registry::Instance> = registry::list()
+        .into_iter()
+        .filter(|b| ps_matches(b, filters))
+        .collect();
+    // `-q`/`--quiet`: names only, one per line - scriptable, e.g. `kern stop $(kern ps -q)`.
+    if quiet {
+        for b in &boxes {
+            println!("{}", b.name);
+        }
+        return Ok(());
+    }
+    // `--format '{{.Field}}'`: render each box through the bounded template (no Go-template logic).
+    if let Some(tmpl) = format {
+        let now = registry::now_unix();
+        for b in &boxes {
+            println!("{}", render_ps_format(tmpl, b, now)?);
+        }
+        return Ok(());
+    }
     if json {
         let mut out = String::from("[");
         for (i, b) in boxes.iter().enumerate() {
@@ -3518,17 +3712,8 @@ pub fn ps(json: bool) -> Result<(), Error> {
             .map(|b| {
                 let up = now.saturating_sub(b.started);
                 // A frozen box (`kern pause`) is reported as "paused" here - otherwise it looks
-                // identical to a running one in `ps`.
-                let health = if registry::is_paused(b.pid) {
-                    "paused".to_string()
-                } else {
-                    let h = registry::health_of(&b.name, b.pid);
-                    if h.is_empty() {
-                        "-".to_string()
-                    } else {
-                        h
-                    }
-                };
+                // identical to a running one in `ps`. `-` when no health check is configured.
+                let health = box_status(b, "-");
                 let ports = if b.ports.is_empty() {
                     "-".to_string()
                 } else {
@@ -3689,8 +3874,8 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
                 "{{\"name\":{},\"pid\":{},\"mem_bytes\":{},\"cpu_usec\":{}}}",
                 json_str(&b.name),
                 b.pid,
-                num(registry::mem_bytes(b.pid)),
-                num(registry::cpu_usec(b.pid))
+                num(registry::mem_bytes(b.cgroup_pid())),
+                num(registry::cpu_usec(b.cgroup_pid()))
             ));
         }
         out.push(']');
@@ -3707,9 +3892,9 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
             z = p.z
         );
         for b in &boxes {
-            let mem = registry::mem_bytes(b.pid).map_or("-".into(), human_bytes);
-            let cpu =
-                registry::cpu_usec(b.pid).map_or("-".into(), |u| format!("{:.1}s", u as f64 / 1e6));
+            let mem = registry::mem_bytes(b.cgroup_pid()).map_or("-".into(), human_bytes);
+            let cpu = registry::cpu_usec(b.cgroup_pid())
+                .map_or("-".into(), |u| format!("{:.1}s", u as f64 / 1e6));
             let name = format!("{}{}{:<16}{}", p.b, p.c, b.name, p.z);
             println!("{name} {:>8} {:>9} {:>9}", b.pid, mem, cpu);
         }
@@ -3726,9 +3911,9 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     let b = registry::find_ref(name)
         .ok_or_else(|| Error::NotRunning(format!("no running box named '{name}'")))?;
     let health = registry::health_of(&b.name, b.pid);
-    let mem = registry::mem_bytes(b.pid);
-    let cpu = registry::cpu_usec(b.pid);
-    let tasks = registry::tasks(b.pid);
+    let mem = registry::mem_bytes(b.cgroup_pid());
+    let cpu = registry::cpu_usec(b.cgroup_pid());
+    let tasks = registry::tasks(b.cgroup_pid());
     let up = registry::now_unix().saturating_sub(b.started);
     if json {
         // `null` (not 0) for a resource the box has no dedicated cgroup to read - "unknown".
@@ -3816,6 +4001,47 @@ pub fn prune() -> Result<(), Error> {
 
 /// `kern gc [--images]` - `prune` the dead-box sidecars, and with `--images` also reclaim the pulled
 /// OCI image cache. Never touches a running box or a partially-in-use image dir.
+/// Remove retired (`<ref>.old-*`) and abandoned staging (`<ref>.pull-*`) image dirs left by a
+/// `--pull always` swap. Returns the count removed. Fail-safe on two axes. First: it only runs when no
+/// REGISTERED box is live (a foreground/detached box may still reference a retired dir via its overlay
+/// mount, and stays registered for the whole mount lifetime). Second: it skips a leftover whose creator
+/// pid is still alive (an in-flight concurrent pull). Per-dir errors are swallowed so one stuck dir
+/// never aborts the sweep. Known residual: an interactive `-it` box is not registered, so a concurrent
+/// `--pull always` and `gc` racing the exact image it holds could still yank a lower it opens lazily;
+/// tracked separately (interactive-box registration).
+fn sweep_retired_images() -> usize {
+    if !registry::list().is_empty() {
+        return 0; // a live (registered) box might still reference a retired image dir
+    }
+    let cache = cache_dir();
+    let mut n = 0usize;
+    if let Ok(rd) = std::fs::read_dir(&cache) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // Only `<ref>.old-<pid>` / `<ref>.pull-<pid>` swap leftovers (take the LAST marker).
+            let Some((_, pid_str)) = name
+                .rsplit_once(".old-")
+                .or_else(|| name.rsplit_once(".pull-"))
+            else {
+                continue;
+            };
+            // Skip a leftover whose creator process is still ALIVE: a `.pull-<pid>` may be an in-flight
+            // concurrent `--pull always` writing its staging dir. A parse failure or a dead pid falls
+            // through to deletion; pid reuse only delays cleanup, it never deletes early.
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+                    continue;
+                }
+            }
+            if e.path().is_dir() && std::fs::remove_dir_all(e.path()).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub fn gc(images: bool) -> Result<(), Error> {
     prune()?;
     // Sweep orphaned build layers: a `kern build` that changes a RUN/COPY leaves its old layer dirs
@@ -3843,6 +4069,30 @@ pub fn gc(images: bool) -> Result<(), Error> {
             p.z,
             if rec == 1 { "" } else { "s" },
             human_bytes(rfreed)
+        );
+    }
+    // Retired/staging image dirs left by `--pull always` (`<ref>.old-*` / `<ref>.pull-*`). Removed
+    // ONLY when no box is running: a live box may still hold a retired dir's inodes via its overlay
+    // mount (overlayfs opens lower files on demand), so deleting one under a running box would yank it.
+    let retired = sweep_retired_images();
+    if retired > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}removed{} {retired} stale --pull-always image dir{}",
+            p.g,
+            p.z,
+            if retired == 1 { "" } else { "s" }
+        );
+    }
+    // Reap `kern wait` exit sidecars of boxes whose supervisor is gone and were never waited on.
+    let waited = registry::sweep_waitexit_dead();
+    if waited > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}removed{} {waited} stale wait-exit record{}",
+            p.g,
+            p.z,
+            if waited == 1 { "" } else { "s" }
         );
     }
     // Reap orphaned box CGROUP dirs under kern.slice too (the direct-cap path leaves an empty
@@ -4051,6 +4301,319 @@ pub fn recover() -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+/// `kern rename <old> <new>` - give a running box a new name (Docker parity). The box keeps running
+/// under the new name; its pid is unchanged. Refuses an invalid name or one already held by a live
+/// box. Foreground/detached boxes only (an interactive `-it` box is not registered).
+pub fn rename(old: &str, new: &str) -> Result<(), Error> {
+    let parsed = BoxName::parse(new).map_err(Error::InvalidBox)?;
+    let new = parsed.as_str();
+    let Some(inst) = registry::find_ref(old) else {
+        return Err(Error::NotRunning(format!("no running box named '{old}'")));
+    };
+    if inst.name == new {
+        return Ok(()); // already named that - a no-op, not an error
+    }
+    if registry::find_ref(new).is_some() {
+        return Err(Error::AlreadyRunning(format!(
+            "a box named '{new}' is already running"
+        )));
+    }
+    registry::rename(&inst.name, new, inst.pid)
+        .map_err(|e| Error::Sandbox(format!("rename '{}' to '{new}': {e}", inst.name)))?;
+    let p = crate::ui::Palette::detect();
+    println!("{}renamed{} {} → {new}", p.g, p.z, inst.name);
+    Ok(())
+}
+
+/// cgroup v2 CPU period (µs) for `cpu.max` (`cpu.max = "<quota> <period>"`, cores = quota/period).
+/// Matches the value the isolation layer uses at box start so a live update stays consistent.
+const CPU_PERIOD_US: u64 = 100_000;
+
+/// `kern update <box> [--memory M] [--cpus N] [--pids-limit P]` - change a RUNNING box's cgroup v2
+/// caps in place (Docker `update`), no restart. Writes `memory.max`/`cpu.max`/`pids.max` straight into
+/// the box's delegated cgroup; each knob is best-effort where its controller isn't delegated (the same
+/// policy as box start). At least one knob is required. Note: lowering `--memory` below live usage can
+/// trigger the OOM killer inside the box, exactly as `docker update` does. Caveat: when a box runs
+/// under a systemd scope/service (the `--restart`/managed path), an OUTER unit also caps it, so the
+/// effective limit is `min(inner, outer)` - RAISING a cap above the outer one takes no effect until a
+/// restart (which the managed path rebuilds from the original spec); LOWERING always bites.
+pub fn update(
+    name: &str,
+    memory: Option<u64>,
+    cpus: Option<f64>,
+    pids: Option<u64>,
+) -> Result<(), Error> {
+    if memory.is_none() && cpus.is_none() && pids.is_none() {
+        return Err(Error::Usage(
+            "update <box> [--memory M] [--cpus N] [--pids-limit P] (at least one)",
+        ));
+    }
+    let Some(inst) = registry::find_ref(name) else {
+        return Err(Error::NotRunning(format!("no running box named '{name}'")));
+    };
+    let Some(cg) = registry::box_cgroup(inst.cgroup_pid()) else {
+        return Err(Error::Sandbox(format!(
+            "box '{}' has no dedicated cgroup - caps are not enforced on this host, nothing to update",
+            inst.name
+        )));
+    };
+    // Best-effort PER KNOB: apply each independently so one controller that isn't delegated doesn't
+    // discard the knobs that DID take effect. Collect what applied vs what failed, and record back
+    // ONLY the caps that actually stuck (so `ps`/`inspect` never show a cap that silently failed).
+    let mut applied: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let (mut mem_ok, mut pids_ok) = (None, None);
+    if let Some(m) = memory {
+        match write_cgroup(&cg, "memory.max", &m.to_string()) {
+            Ok(()) => {
+                applied.push(format!("memory={}", human_bytes(m)));
+                mem_ok = Some(m);
+            }
+            Err(why) => failed.push(why),
+        }
+    }
+    if let Some(c) = cpus {
+        // cores → quota µs (clamped to ≥1); period fixed. Matches the box-start rendering.
+        let quota = (c * CPU_PERIOD_US as f64).round().max(1.0) as u64;
+        match write_cgroup(&cg, "cpu.max", &format!("{quota} {CPU_PERIOD_US}")) {
+            Ok(()) => applied.push(format!("cpus={c}")),
+            Err(why) => failed.push(why),
+        }
+    }
+    if let Some(p) = pids {
+        // Docker parity: `--pids-limit 0` means UNLIMITED (`pids.max = max`), NOT "forbid every fork".
+        let (val, label) = if p == 0 {
+            ("max".to_string(), "pids=unlimited".to_string())
+        } else {
+            (p.to_string(), format!("pids={p}"))
+        };
+        match write_cgroup(&cg, "pids.max", &val) {
+            Ok(()) => {
+                applied.push(label);
+                // Record a real cap; "unlimited" (0) isn't stored, so `ps`/`inspect` don't show a `0`.
+                if p != 0 {
+                    pids_ok = Some(p);
+                }
+            }
+            Err(why) => failed.push(why),
+        }
+    }
+    if mem_ok.is_some() || pids_ok.is_some() {
+        registry::update_caps(&inst.name, inst.pid, mem_ok, pids_ok);
+    }
+    if !applied.is_empty() {
+        let pal = crate::ui::Palette::detect();
+        println!(
+            "{}updated{} {}: {}",
+            pal.g,
+            pal.z,
+            inst.name,
+            applied.join(", ")
+        );
+    }
+    for why in &failed {
+        eprintln!("kern: update {}: {why}", inst.name);
+    }
+    if applied.is_empty() {
+        // Every requested knob failed - surface an error, not a silent success.
+        return Err(Error::Sandbox(format!(
+            "update {}: no cap could be applied",
+            inst.name
+        )));
+    }
+    Ok(())
+}
+
+/// Write one cgroup v2 control file for [`update`]. On failure returns a short reason string. The
+/// delegation hint is appended ONLY for the delegation-shaped errnos (EACCES/EPERM/ENOENT/ENODEV); a
+/// value the kernel rejects (e.g. EINVAL) is left to speak for itself rather than misattributed to
+/// delegation.
+fn write_cgroup(cg: &std::path::Path, file: &str, val: &str) -> Result<(), String> {
+    std::fs::write(cg.join(file), val).map_err(|e| {
+        let delegation = matches!(
+            e.raw_os_error(),
+            Some(libc::EACCES | libc::EPERM | libc::ENOENT | libc::ENODEV)
+        );
+        let ctrl = file.split('.').next().unwrap_or(file);
+        if delegation {
+            format!("{file}: {e} (the {ctrl} controller may not be delegated here)")
+        } else {
+            format!("{file}: {e}")
+        }
+    })
+}
+
+/// `kern wait <box>...` - block until each box exits, then print its exit code, one per line, in
+/// argument order (Docker `wait`). The box must be RUNNING when `wait` starts (kern is ephemeral - it
+/// keeps no stopped boxes; an interactive `-it` box isn't registered either). The command itself
+/// returns 0 unless a name doesn't resolve. Polls the registry every 100 ms - no daemon, no busy-spin.
+pub fn wait(names: &[String]) -> Result<(), Error> {
+    for name in names {
+        let Some(inst) = registry::find_ref(name) else {
+            return Err(Error::NotRunning(format!(
+                "no running box named '{name}' (kern keeps no stopped boxes; `wait` needs it running)"
+            )));
+        };
+        // Block on the EXACT (name,pid) pair leaving the registry, so a reused pid or name can't make
+        // a still-live box read as gone. The supervisor (self-exit) and `stop`/`kill` both write the
+        // `(pid,starttime)`-keyed exit sidecar before the box leaves `list()`, so once the pair is gone
+        // the code is already recorded. The read is NON-consuming, so parallel/repeat waiters all see it.
+        while registry::pair_alive(&inst.name, inst.pid) {
+            unsafe { libc::usleep(100_000) }; // 100 ms poll
+        }
+        match registry::box_exit(inst.pid, inst.starttime) {
+            Some(code) => println!("{code}"),
+            None => {
+                // Gone but no recorded code: a foreground/-it box (no supervisor to capture it), or a
+                // crash/OOM that killed the supervisor before it could record. Name the likely cause so
+                // the empty stdout reads as expected, not a bug; don't invent a 0.
+                eprintln!(
+                    "kern: box '{}' exited without a recorded exit code (a foreground or -it box has no supervisor to capture one)",
+                    inst.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `kern diff <box>` - list filesystem changes vs the box's image (Docker `diff`). Walks the box's
+/// overlay UPPER (writable) layer: `C <path>` = a path created or modified, `D <path>` = a deletion
+/// (an overlayfs whiteout). Deletions (`D`) are exact; kern does not distinguish brand-new (`A`) from
+/// modified (`C`) without diffing against the base image, so both surface as `C`. Likewise a directory
+/// wholly replaced in the box (`rm -rf d && mkdir d`, an overlayfs *opaque* dir) shows as `C d` without
+/// a per-file `D` for the wiped lower contents. Only overlay boxes have an upper: a `--bind-rootfs` box
+/// writes through to its source (nothing to diff) and a `--read-only` box has an empty upper (no changes).
+pub fn diff(name: &str) -> Result<(), Error> {
+    let Some(inst) = registry::find_ref(name) else {
+        return Err(Error::NotRunning(format!("no running box named '{name}'")));
+    };
+    // `rootfs` is `<scratch>/<name>-<pid>/merged`; the writable upper is its sibling `upper`.
+    let merged = std::path::Path::new(&inst.rootfs);
+    let is_overlay = merged.file_name().and_then(|s| s.to_str()) == Some("merged");
+    let upper = merged.parent().map(|s| s.join("upper"));
+    match (is_overlay, upper) {
+        (true, Some(u)) if u.is_dir() => {
+            let mut out: Vec<(char, String)> = Vec::new();
+            walk_diff(&u, &u, 0, &mut out);
+            out.sort_by(|a, b| a.1.cmp(&b.1));
+            if out.len() >= DIFF_MAX_ENTRIES {
+                eprintln!("kern: diff truncated at {DIFF_MAX_ENTRIES} entries (upper too large)");
+            }
+            for (kind, path) in &out {
+                // The path comes from an UNTRUSTED box-controlled filename: scrub control bytes so a
+                // name like `a\nD /etc/shadow` or an ANSI-escape filename can't forge a diff line or
+                // inject into the operator's terminal (same guard `ps --format` applies).
+                println!("{kind} {}", crate::ui::scrub(path));
+            }
+            Ok(())
+        }
+        _ => Err(Error::Sandbox(format!(
+            "box '{}' has no overlay to diff - it uses --bind-rootfs, which writes straight through \
+             to the source directory (nothing is layered to compare)",
+            inst.name
+        ))),
+    }
+}
+
+/// Bounds for [`walk_diff`] against a box that fills its own overlay upper to exhaust the host `kern
+/// diff` process. `DIFF_MAX_DEPTH` caps recursion (a box can't stack-overflow the walker); paths are
+/// already ~PATH_MAX-bounded, so this is generous belt-and-suspenders. `DIFF_MAX_ENTRIES` caps the
+/// collected output against an inode-bomb upper (millions of files) that would otherwise OOM the Vec.
+const DIFF_MAX_DEPTH: usize = 4096;
+const DIFF_MAX_ENTRIES: usize = 1_000_000;
+
+/// Recursively classify overlay-upper entries into Docker `diff` markers, appending `(marker, in-box
+/// absolute path)`. A whiteout (a char device with rdev 0:0) is a deletion `D`; every other entry
+/// present in the upper is a change `C` (a changed dir is also recursed). Best-effort: an unreadable
+/// subdir is skipped rather than aborting the whole diff. `metadata()` on a `DirEntry` does NOT follow
+/// symlinks, so a whiteout or a symlink is classified by its own type, never its target's. Each
+/// directory's fd is released (the `ReadDir` is dropped) BEFORE recursing, so open fds don't grow with
+/// depth - otherwise a deep tree hits EMFILE and the diff silently truncates.
+fn walk_diff(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<(char, String)>,
+) {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if depth > DIFF_MAX_DEPTH || out.len() >= DIFF_MAX_ENTRIES {
+        return;
+    }
+    let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if out.len() >= DIFF_MAX_ENTRIES {
+                break;
+            }
+            let path = e.path();
+            let Ok(md) = e.metadata() else { continue };
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let inbox = format!("/{}", rel.to_string_lossy());
+            let ft = md.file_type();
+            if ft.is_char_device() && md.rdev() == 0 {
+                out.push(('D', inbox)); // overlayfs whiteout = deleted in the box
+            } else if ft.is_dir() {
+                out.push(('C', inbox));
+                subdirs.push(path); // defer: recurse AFTER this dir's fd is released below
+            } else {
+                out.push(('C', inbox));
+            }
+        }
+    } // `rd` dropped here -> this level's directory fd is freed before we descend
+    for sub in subdirs {
+        walk_diff(root, &sub, depth + 1, out);
+    }
+}
+
+/// `kern events` - stream box lifecycle events (Docker `events`), best-effort. kern is DAEMONLESS, so
+/// there is no authoritative event bus: this OBSERVES the registry by polling `list()` every 500 ms
+/// and emits `start` when a box appears, `die` when it leaves, and `rename` when a live box's name
+/// changes. A box that both starts AND ends inside one 500 ms gap can be missed - it is a convenience
+/// monitor, not a guaranteed audit log. Boxes already running when `events` starts are NOT replayed
+/// (only NEW transitions are shown), matching `docker events`. Runs until interrupted (Ctrl-C).
+pub fn events() -> Result<(), Error> {
+    use std::collections::HashMap;
+    // Key on (pid, starttime), NOT pid alone: if a box dies and a NEW box reuses its pid within one
+    // poll gap, the differing start-time makes them distinct keys -> a correct `die`+`start`, never a
+    // fabricated `rename`. A genuine rename keeps (pid, starttime) and only the name changes.
+    let snapshot = || -> HashMap<(i32, u64), String> {
+        registry::list()
+            .into_iter()
+            .map(|b| ((b.pid, b.starttime), b.name))
+            .collect()
+    };
+    let mut seen = snapshot();
+    loop {
+        unsafe { libc::usleep(500_000) }; // 500 ms poll - no daemon, negligible cost
+        let now = snapshot();
+        for (key, name) in &now {
+            match seen.get(key) {
+                None => emit_event("start", name, key.0, None),
+                Some(old) if old != name => emit_event("rename", name, key.0, Some(old)),
+                _ => {}
+            }
+        }
+        for (key, name) in &seen {
+            if !now.contains_key(key) {
+                emit_event("die", name, key.0, None);
+            }
+        }
+        seen = now;
+    }
+}
+
+/// Print one `kern events` line: `<unix-seconds> box <action> <name> (pid <pid>)`, with `from <old>`
+/// appended for a rename. Unix seconds (not a localized clock) keeps it timezone-unambiguous and
+/// dependency-free.
+fn emit_event(action: &str, name: &str, pid: i32, from: Option<&str>) {
+    let t = registry::now_unix();
+    match from {
+        Some(old) => println!("{t} box {action} {name} (pid {pid}, from {old})"),
+        None => println!("{t} box {action} {name} (pid {pid})"),
+    }
 }
 
 /// `kern history [-n N]` - the most recent boxes, reconstructed from their captured log files
@@ -4666,19 +5229,217 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// `kern logs <name>` - print the captured stdout/stderr of the most recent box named `name`.
-pub fn logs(name: &str) -> Result<(), Error> {
+pub fn logs(name: &str, tail: Option<usize>, follow: bool) -> Result<(), Error> {
+    use std::io::{Read, Seek, SeekFrom, Write};
     // Accept a `kern ps` PID too: a live box's pid resolves to its name; a name (incl. a stopped box,
     // whose log file persists) is used as-is.
     let by_pid = registry::find_ref(name).map(|i| i.name);
     let name = by_pid.as_deref().unwrap_or(name);
-    match newest_log(name)? {
-        Some(path) => {
-            let body = std::fs::read_to_string(&path)
-                .map_err(|e| Error::Sandbox(format!("reading log: {e}")))?;
-            print!("{body}");
-            Ok(())
+    let Some(path) = newest_log(name)? else {
+        return Err(Error::NotRunning(format!("no logs for box '{name}'")));
+    };
+    let mut f =
+        std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
+    // `--tail N` seeks a bounded window near EOF (cost O(bytes shown), not O(file size)); a plain
+    // `logs` reads the whole file. Either way `f` ends positioned at EOF so `--follow` streams NEW
+    // appends without re-printing. (Narrow race on `--tail N -f` of an actively-appending box: a line
+    // written between the tail read and the re-seek to EOF can be skipped - acceptable for a log tail.)
+    let shown: Vec<u8> = match tail {
+        Some(n) => {
+            let t = tail_file(&mut f, n)?;
+            if follow {
+                f.seek(SeekFrom::End(0))
+                    .map_err(|e| Error::Sandbox(format!("seeking log: {e}")))?;
+            }
+            t
         }
-        None => Err(Error::NotRunning(format!("no logs for box '{name}'"))),
+        None => {
+            let mut content = Vec::new();
+            f.read_to_end(&mut content)
+                .map_err(|e| Error::Sandbox(format!("reading log: {e}")))?;
+            content
+        }
+    };
+    {
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        lock.write_all(&shown)
+            .map_err(|e| Error::Sandbox(format!("writing log: {e}")))?;
+        let _ = lock.flush();
+    }
+    if follow {
+        // Only a live box appends more output; a stopped box's log is already complete.
+        if let Some(bx) = registry::find_ref(name) {
+            return follow_log(f, name, bx.pid);
+        }
+    }
+    Ok(())
+}
+
+/// The byte slice of the last `n` lines of `content` (each line keeps its trailing `\n`). A single
+/// trailing newline is not counted as an extra empty line, so `tail_lines(b"a\nb\n", 1) == b"b\n"`.
+/// Zero-copy: returns a subslice of `content`. `n == 0` yields an empty slice; fewer than `n` lines
+/// present yields all of `content`.
+fn tail_lines(content: &[u8], n: usize) -> &[u8] {
+    if n == 0 {
+        return &[];
+    }
+    // Ignore one trailing newline so the final line is not read as an empty line after it.
+    let scan_end = match content.last() {
+        Some(b'\n') => content.len() - 1,
+        _ => content.len(),
+    };
+    let mut seen = 0usize;
+    let mut i = scan_end;
+    while i > 0 {
+        i -= 1;
+        if content[i] == b'\n' {
+            seen += 1;
+            if seen == n {
+                return &content[i + 1..];
+            }
+        }
+    }
+    content
+}
+
+/// Read only the last `n` lines of an already-open log `f`, seeking backward in bounded chunks so a
+/// small `--tail` off a huge detached-box log costs O(bytes shown) plus one chunk, never a full slurp.
+/// (A `--tail` larger than the file simply degrades to a single linear pass, like `read_to_end`.) Line
+/// semantics match [`tail_lines`] (each line keeps its `\n`; a single trailing newline is not an extra
+/// empty line). Leaves `f`'s cursor mid-file; the caller re-seeks to EOF for `--follow`.
+fn tail_file(f: &mut std::fs::File, n: usize) -> Result<Vec<u8>, Error> {
+    use std::io::{Read, Seek, SeekFrom};
+    let map = |e: std::io::Error| Error::Sandbox(format!("reading log: {e}"));
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut pos = f.seek(SeekFrom::End(0)).map_err(map)?;
+    const CHUNK: u64 = 8192;
+    // Chunks are read high-offset first; collect them reversed and stitch ONCE at the end. Prepending
+    // into one growing buffer would recopy it (and re-scan it for newlines) every iteration - O(size^2)
+    // on a pathological `--tail 999999999`; here it stays O(bytes read). Newlines counted incrementally.
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut newlines = 0usize;
+    // Walk backward a chunk at a time until the window holds more than `n` newlines (so the n-th line
+    // from the end is fully captured - see the `> n` proof in `tail_lines`) or we reach the start of
+    // the file (fewer than `n` lines exist -> return them all).
+    while pos > 0 {
+        let read_len = CHUNK.min(pos);
+        pos -= read_len;
+        let mut chunk = vec![0u8; read_len as usize];
+        f.seek(SeekFrom::Start(pos)).map_err(map)?;
+        f.read_exact(&mut chunk).map_err(map)?;
+        newlines += chunk.iter().filter(|&&b| b == b'\n').count();
+        chunks.push(chunk);
+        if newlines > n {
+            break;
+        }
+    }
+    // Stitch the chunks back into file order (they were pushed EOF-first).
+    let total: usize = chunks.iter().map(Vec::len).sum();
+    let mut buf = Vec::with_capacity(total);
+    for chunk in chunks.iter().rev() {
+        buf.extend_from_slice(chunk);
+    }
+    Ok(tail_lines(&buf, n).to_vec())
+}
+
+/// Stream new appends of an already-open log `f` (from its current read offset) to stdout, polling
+/// every 200 ms until the box `(name, pid)` leaves the registry. Panic-free; a stdout write error
+/// (a closed pipe) ends the follow quietly. Shared by `kern attach` and `kern logs -f`.
+fn follow_log(mut f: std::fs::File, name: &str, pid: i32) -> Result<(), Error> {
+    use std::io::{Read, Write};
+    let mut buf = [0u8; 8192];
+    let stdout = std::io::stdout();
+    loop {
+        // Drain whatever is currently appended.
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => {
+                    let mut lock = stdout.lock();
+                    if lock.write_all(&buf[..k]).is_err() {
+                        return Ok(());
+                    }
+                    let _ = lock.flush();
+                }
+                Err(_) => break,
+            }
+        }
+        // Exact (name,pid) pair: a duplicate same-name entry must not make a live box read as exited.
+        if !registry::pair_alive(name, pid) {
+            return Ok(());
+        }
+        unsafe { libc::usleep(200_000) }; // 200 ms - cheap follow poll
+    }
+}
+
+#[cfg(test)]
+mod logs_tail_tests {
+    use super::tail_lines;
+
+    #[test]
+    fn tail_lines_counts_and_boundaries() {
+        assert_eq!(tail_lines(b"a\nb\nc\n", 2), b"b\nc\n");
+        assert_eq!(tail_lines(b"a\nb\nc\n", 1), b"c\n");
+        assert_eq!(tail_lines(b"a\nb\nc", 2), b"b\nc"); // no trailing newline
+        assert_eq!(tail_lines(b"a\nb\nc\n", 5), b"a\nb\nc\n"); // fewer lines than n
+        assert_eq!(tail_lines(b"only\n", 3), b"only\n");
+    }
+
+    #[test]
+    fn tail_lines_edge_cases() {
+        assert_eq!(tail_lines(b"", 3), b"");
+        assert_eq!(tail_lines(b"a\nb\n", 0), b"");
+        assert_eq!(tail_lines(b"no newline", 1), b"no newline");
+        assert_eq!(tail_lines(b"x\n", 1), b"x\n");
+    }
+
+    // The bounded backward-seek reader must return exactly what `tail_lines` would over the whole
+    // file, including across multiple 8 KiB chunks, without a trailing newline, and on an empty file.
+    #[test]
+    fn tail_file_matches_tail_lines() {
+        use super::tail_file;
+        let path = std::env::temp_dir().join(format!("kern-tailfile-{}", std::process::id()));
+        let check = |content: &[u8], n: usize| {
+            std::fs::write(&path, content).unwrap();
+            let mut f = std::fs::File::open(&path).unwrap();
+            assert_eq!(
+                tail_file(&mut f, n).unwrap(),
+                tail_lines(content, n),
+                "len={} n={n}",
+                content.len()
+            );
+        };
+        // Multi-chunk (> 8192 B) so the backward loop runs several iterations, trailing newline.
+        let mut big = Vec::new();
+        for i in 0..5000 {
+            big.extend_from_slice(format!("line {i}\n").as_bytes());
+        }
+        for &n in &[0usize, 1, 3, 50, 5000, 9999, usize::MAX] {
+            check(&big, n);
+        }
+        // Multi-chunk WITHOUT a trailing newline (the `> n` trailing-nl edge across chunk seams).
+        let mut big_no_nl = big.clone();
+        assert_eq!(big_no_nl.pop(), Some(b'\n'));
+        for &n in &[1usize, 3, 5000, usize::MAX] {
+            check(&big_no_nl, n);
+        }
+        check(
+            &{
+                let mut e = vec![b'x'; 8191];
+                e.push(b'\n');
+                e
+            },
+            1,
+        ); // exactly one CHUNK (8192 B): last backward read lands on pos == 0
+        check(b"\n\n\n", 2); // only newlines
+        check(b"\n\n\n", usize::MAX);
+        check(b"alpha\nbeta\ngamma", 2); // single chunk, no trailing nl
+        check(b"", 3); // empty
+        check(b"solo", 1); // one line, no newline
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -4724,7 +5485,6 @@ fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
 /// output-only). Prints the log so far, then follows appends by polling the file, and stops when the
 /// box leaves the registry.
 pub fn attach(name: &str) -> Result<(), Error> {
-    use std::io::{Read, Write};
     let bx = registry::find_ref(name);
     let Some(bx) = bx else {
         return Err(Error::NotRunning(format!("no running box named '{name}'")));
@@ -4738,30 +5498,11 @@ pub fn attach(name: &str) -> Result<(), Error> {
         "kern: attached to '{name}' (pid {}) - Ctrl-C detaches (box keeps running)",
         bx.pid
     );
-    let mut f =
-        std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
-    let mut buf = [0u8; 8192];
-    let stdout = std::io::stdout();
-    loop {
-        // Drain whatever is currently appended.
-        loop {
-            match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = stdout.lock().write_all(&buf[..n]);
-                    let _ = stdout.lock().flush();
-                }
-                Err(_) => break,
-            }
-        }
-        // Stop once the box is gone (drain one final time first, above). Exact (name,pid) pair -
-        // a duplicate same-name entry must not make a live box read as exited (see `pair_alive`).
-        if !registry::pair_alive(name, bx.pid) {
-            eprintln!("kern: box '{name}' exited");
-            return Ok(());
-        }
-        unsafe { libc::usleep(200_000) }; // 200 ms - cheap follow poll
-    }
+    let f = std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
+    // Print the log so far (from offset 0), then poll appends until the box exits (shared with `logs -f`).
+    follow_log(f, name, bx.pid)?;
+    eprintln!("kern: box '{name}' exited");
+    Ok(())
 }
 
 /// `kern top` - live, auto-refreshing view of running boxes (name, pid, uptime, mem, cpu%).
@@ -5083,7 +5824,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     // content copy (a commit-time TOCTOU): a frozen cgroup runs no task. Best-effort and RAII: a box with
     // no dedicated cgroup simply isn't frozen (as `pause` reports), and the guard thaws on EVERY exit,
     // including the `?` early return from the copy below.
-    let _freeze = FreezeGuard::freeze(inst.pid);
+    let _freeze = FreezeGuard::freeze(inst.cgroup_pid());
     copy_rootfs_snapshot(&root, &out, &skip)?;
     drop(_freeze); // thaw before the (non-filesystem) config/marker writes below
 
@@ -6135,10 +6876,14 @@ fn strip_whiteout_markers(root: &std::path::Path) {
 /// and re-pulled if the base was pruned, so layered images are prune-safe. The returned `lowerdir`
 /// may be a colon-joined chain (top layer first, exactly overlayfs's ordering).
 fn resolve_image(image: &str) -> Result<(String, kern_oci::ImageConfig), Error> {
-    resolve_image_depth(image, 0)
+    resolve_image_depth(image, 0, PullPolicy::Missing)
 }
 
-fn resolve_image_depth(image: &str, depth: u32) -> Result<(String, kern_oci::ImageConfig), Error> {
+fn resolve_image_depth(
+    image: &str,
+    depth: u32,
+    policy: PullPolicy,
+) -> Result<(String, kern_oci::ImageConfig), Error> {
     // Bound the chain so a self-referential build (`FROM` its own tag) can't recurse forever.
     if depth > 128 {
         return Err(Error::Oci(
@@ -6165,7 +6910,8 @@ fn resolve_image_depth(image: &str, depth: u32) -> Result<(String, kern_oci::Ima
             .map_err(|e| Error::Oci(format!("read layers of '{image}': {e}")))?;
         let mut lines = body.lines();
         let base_ref = lines.next().unwrap_or("").trim();
-        let (base_lower, _) = resolve_image_depth(base_ref, depth + 1)?;
+        // Base layers of a built image are used as-is; `--pull always` never force-repulls them.
+        let (base_lower, _) = resolve_image_depth(base_ref, depth + 1, PullPolicy::Missing)?;
         let lc = layer_cache_dir();
         let mut chain = vec![base_lower];
         for k in lines.map(str::trim).filter(|k| !k.is_empty()) {
@@ -6193,13 +6939,13 @@ fn resolve_image_depth(image: &str, depth: u32) -> Result<(String, kern_oci::Ima
             .map_err(|e| Error::Oci(format!("read base of '{image}': {e}")))?
             .trim()
             .to_string();
-        let (base_lower, _) = resolve_image_depth(&base_ref, depth + 1)?;
+        let (base_lower, _) = resolve_image_depth(&base_ref, depth + 1, PullPolicy::Missing)?;
         let diff = cache.join(format!("{safe}.diff"));
         let config = read_image_config(&cache.join(format!("{safe}.image")));
         // Top (this image's diff) first, then the base chain - overlayfs shadows left-to-right.
         return Ok((format!("{}:{base_lower}", diff.to_string_lossy()), config));
     }
-    pull_to_cache(image)
+    pull_to_cache(image, policy)
 }
 
 /// Pull `image` into a local cache and return `(rootfs path, its OCI runtime config)`. Reuse is gated
@@ -6207,16 +6953,28 @@ fn resolve_image_depth(image: &str, depth: u32) -> Result<(String, kern_oci::Ima
 /// pull (or a stray file) never makes a partial/poisoned rootfs look valid; we re-pull cleanly. The
 /// image config is persisted to a `<ref>.image` sidecar (outside the rootfs) so a cache hit reapplies
 /// it without re-pulling.
-fn pull_to_cache(image: &str) -> Result<(String, kern_oci::ImageConfig), Error> {
+fn pull_to_cache(
+    image: &str,
+    policy: PullPolicy,
+) -> Result<(String, kern_oci::ImageConfig), Error> {
     use std::os::unix::io::AsRawFd;
     let cache = cache_dir();
-    own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
     let safe = sanitize_ref(image);
     let dir = cache.join(&safe);
     let sentinel = cache.join(format!("{safe}.ok"));
     let cfgfile = cache.join(format!("{safe}.image"));
-    if sentinel.exists() {
-        // fast path: already cached
+    // `--pull never`: fail closed BEFORE creating the cache dir or a lock file. `scratch`/`.layers`/
+    // `.base` already returned in `resolve_image_depth`, so reaching here with no sentinel means this
+    // registry image is genuinely not cached. Lock-free with zero fs side-effects (matches the old
+    // pre-check); the `.image` sidecar layout stays owned by this one function.
+    if policy == PullPolicy::Never && !sentinel.exists() {
+        return Err(Error::Oci(format!(
+            "image '{image}' is not present locally and `--pull never` was given"
+        )));
+    }
+    own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
+    if policy != PullPolicy::Always && sentinel.exists() {
+        // fast path: already cached (and not a forced `--pull always` re-fetch)
         return Ok((
             dir.to_string_lossy().into_owned(),
             read_image_config(&cfgfile),
@@ -6230,7 +6988,81 @@ fn pull_to_cache(image: &str) -> Result<(String, kern_oci::ImageConfig), Error> 
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(Error::Oci("could not acquire pull lock".into()));
     }
+    if policy == PullPolicy::Always {
+        // `--pull always`: fetch into a scratch dir, then swap it in with an atomic `rename`. A box
+        // already using `dir` as its overlay lower is UNDISTURBED: overlayfs pinned that dentry at
+        // mount time, so renaming the path out from under it is invisible to the live box. The retired
+        // dir is left for `kern gc` (a live box still holds its inodes on demand; deleting it now would
+        // yank files overlayfs opens lazily). Fail-safe: on any error `dir` is left untouched/restored.
+        let pid = std::process::id();
+        let staging = cache.join(format!("{safe}.pull-{pid}"));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
+        eprintln!("→ re-pulling image '{image}' (--pull always)");
+        let config = match kern_oci::pull(image, &staging, None) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(Error::Oci(e.to_string()));
+            }
+        };
+        if dir.exists() {
+            let retired = cache.join(format!("{safe}.old-{pid}"));
+            let _ = std::fs::remove_dir_all(&retired);
+            // Atomic swap: exchange `dir` <-> `staging` in ONE syscall so `dir` is NEVER momentarily
+            // absent for a concurrent reader. A two-step rename leaves a window in which a fast-path
+            // box (which resolves `dir` WITHOUT the pull lock) could mount an absent `dir` -> ENOENT.
+            // After the exchange, `staging` holds the retired image.
+            let cd = cstring(&dir.to_string_lossy())?;
+            let cs = cstring(&staging.to_string_lossy())?;
+            // Invoke `renameat2` via the raw syscall, NOT `libc::renameat2`: the wrapper is absent from
+            // the musl `libc` bindings (the aarch64/x86_64-musl RELEASE build fails to link it), while
+            // `SYS_renameat2` + `RENAME_EXCHANGE` are defined for every Linux target. Same ABI, portable.
+            let exchanged = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    cd.as_ptr(),
+                    libc::AT_FDCWD,
+                    cs.as_ptr(),
+                    libc::RENAME_EXCHANGE,
+                )
+            } == 0;
+            if exchanged {
+                let _ = std::fs::rename(&staging, &retired); // old content aside for `kern gc`
+            } else {
+                // RENAME_EXCHANGE unsupported (pre-3.15 kernel / a fs without it): fall back to the
+                // two-step rename. The residual window is two rename syscalls; the flock already
+                // serializes same-image writers, so only a fast-path reader could observe it.
+                std::fs::rename(&dir, &retired)
+                    .map_err(|e| Error::Oci(format!("cache swap (retire): {e}")))?;
+                if let Err(e) = std::fs::rename(&staging, &dir) {
+                    // Put the previous image back. If THAT also fails, `dir` is gone; clear the sentinel
+                    // so the cache reads as "not present" and a later run re-pulls, instead of the fast
+                    // path serving a missing `dir` -> permanent ENOENT until `gc --images`.
+                    if std::fs::rename(&retired, &dir).is_err() {
+                        let _ = std::fs::remove_file(&sentinel);
+                    }
+                    return Err(Error::Oci(format!("cache swap (install): {e}")));
+                }
+            }
+        } else {
+            std::fs::rename(&staging, &dir)
+                .map_err(|e| Error::Oci(format!("cache install: {e}")))?;
+        }
+        // Config follows the rootfs swap. The `<ref>.image` sidecar is a separate path, so a lock-free
+        // fast-path reader that starts the SAME image in the tiny window between the `dir` swap and
+        // this write could pair the new rootfs with the old config. Harmless for a same-tag refresh
+        // (identical config); a genuinely different image at the same tag is a known concurrency edge
+        // of `--pull always` (don't re-pull a tag while concurrently starting it).
+        write_image_config(&cfgfile, &config);
+        let _ = std::fs::write(&sentinel, image.as_bytes());
+        return Ok((dir.to_string_lossy().into_owned(), config));
+    }
     if !sentinel.exists() {
+        // Only `missing` reaches here uncached (`never` failed closed at the top; `always` returned in
+        // its own branch). Re-checked under the lock: a concurrent pull may have finished while we
+        // waited, in which case the sentinel now exists and we skip the fetch.
         eprintln!("→ image '{image}' not cached - pulling once (reused after)");
         let _ = std::fs::remove_dir_all(&dir); // clear any partial extraction
         std::fs::create_dir_all(&dir).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
@@ -8710,6 +9542,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         } else {
             kill_box(b.pid, b.pid1)
         };
+        // A `stop` SIGKILLs the supervisor, which then never records its own exit code. Record 137
+        // (128 + SIGKILL) here - BEFORE removing the instance file - so `kern wait` on a stopped box
+        // returns 137 like Docker, instead of "no exit code recorded".
+        registry::set_box_exit(b.pid, b.starttime, 137);
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
         registry::clear_health(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
@@ -8831,7 +9667,7 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
         return Err(Error::NotRunning(format!("no running box to {verb}")));
     }
     for b in &targets {
-        match registry::box_cgroup(b.pid) {
+        match registry::box_cgroup(b.cgroup_pid()) {
             Some(cg) => {
                 let path = cg.join("cgroup.freeze");
                 match std::fs::write(&path, if freeze { "1" } else { "0" }) {

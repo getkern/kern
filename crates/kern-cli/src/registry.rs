@@ -56,6 +56,20 @@ impl Instance {
     pub fn volume_names(&self) -> impl Iterator<Item = &str> {
         self.volumes.split(',').filter(|v| !v.is_empty())
     }
+
+    /// The pid to resolve the box's DEDICATED cgroup from (for `pause`/`stats`/`update`/freeze).
+    /// Use the box's in-box PID 1 (`pid1`, host-namespace numbering) - it always lives in the box's
+    /// real cgroup on BOTH cap paths: the direct `kern.slice/kern-box-*` path (where the SUPERVISOR
+    /// pid does NOT - it stays in the launcher's cgroup) and the systemd-scope re-exec path (where
+    /// both do). Fall back to the supervisor `pid` when `pid1` isn't learned yet (0) or for an older
+    /// registry entry, matching the pre-existing behaviour.
+    pub fn cgroup_pid(&self) -> i32 {
+        if self.pid1 > 0 {
+            self.pid1
+        } else {
+            self.pid
+        }
+    }
 }
 
 /// The instances directory (one file per running box), created on demand.
@@ -151,6 +165,84 @@ pub fn clear_exit(key: &str) {
     if let Ok(d) = exit_dir() {
         let _ = fs::remove_file(d.join(key));
     }
+}
+
+/// The `kern wait` exit directory - a `<pid>-<starttime>` sidecar holding a completed box's exit code
+/// as decimal text. SEPARATE from compose's `exit/` (whose keys are `<pod>-<token>-<name>`). Keyed on
+/// the supervisor pid AND its kernel start-time, NOT the name: (a) a `kern rename` never orphans the
+/// record (it isn't name-derived), and (b) a recycled pid with a different start-time can't be read as
+/// the old box. Written by EVERY detached supervisor and by `stop`/`kill`. Kept out of `instances/` so
+/// `list()` never mistakes it for a live box.
+fn waitexit_dir() -> io::Result<PathBuf> {
+    runtime_subdir("waitexit")
+}
+
+/// Record a completed box's exit code for `kern wait`, keyed `<pid>-<starttime>`. Written by the
+/// detached supervisor as its LAST act (before it unregisters) and by `stop`/`kill` (which SIGKILL the
+/// supervisor before it can record its own). Best-effort.
+pub fn set_box_exit(pid: i32, starttime: u64, code: i32) {
+    if let Ok(d) = waitexit_dir() {
+        let _ = fs::write(d.join(format!("{pid}-{starttime}")), code.to_string());
+    }
+}
+
+/// A completed box's recorded exit code for `(pid, starttime)`, or `None` if it never completed here.
+/// NON-consuming: several `kern wait` on the same box all read the same code (matching Docker); the
+/// sidecar is reaped by `prune`/`gc` once the pid is dead, not on read.
+pub fn box_exit(pid: i32, starttime: u64) -> Option<i32> {
+    waitexit_dir()
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join(format!("{pid}-{starttime}"))).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Sweep `wait` exit sidecars whose `(pid, starttime)` is no longer a live box - bounds the dir against
+/// boxes that exited but were never `wait`ed on. Returns the count removed. Called from `prune` and
+/// `gc`. A live box's sidecar is kept (via [`is_alive`], which also rejects a reused pid whose
+/// start-time differs). Best-effort.
+pub fn sweep_waitexit_dead() -> usize {
+    let Ok(d) = waitexit_dir() else { return 0 };
+    let mut n = 0usize;
+    if let Ok(rd) = fs::read_dir(&d) {
+        for e in rd.flatten() {
+            let fname = e.file_name();
+            let Some(f) = fname.to_str() else { continue };
+            // `<pid>-<starttime>` (both numeric). Reap unless that exact box is still alive.
+            let dead = match f.split_once('-') {
+                Some((pid, st)) => match (pid.parse::<i32>(), st.parse::<u64>()) {
+                    (Ok(p), Ok(s)) => !is_alive(p, s),
+                    _ => true, // malformed -> orphan, safe to remove
+                },
+                None => true,
+            };
+            if dead && fs::remove_file(e.path()).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The CURRENT on-disk name of the live box whose supervisor pid is `pid`, or `None`. Long-lived
+/// writers (the supervisor's restart re-register, the health checker, `update_caps`) call this so a
+/// `kern rename` is honoured instead of resurrecting the box's ORIGINAL name. Only an entry whose body
+/// `name=` AGREES with its filename AND that is a live box is trusted, so a planted, inconsistent, or
+/// stale `<x>-<pid>` file can't steer a box's identity. O(n) scan of the (small) instances dir.
+pub fn name_for_pid(pid: i32) -> Option<String> {
+    let d = dir().ok()?;
+    for e in fs::read_dir(&d).ok()?.flatten() {
+        let fname = e.file_name();
+        let Some((name, p)) = entry_split(&fname) else {
+            continue;
+        };
+        if p.parse::<i32>() != Ok(pid) {
+            continue;
+        }
+        if load_live(&e.path()).is_some_and(|inst| inst.name == name) {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// Remove every exit sidecar whose filename starts with `prefix` (compose passes `<pod>-`). Used by
@@ -355,17 +447,122 @@ pub fn unregister(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+/// Read `entry`, transform its body with `f`, and swap the result back atomically through a hidden,
+/// CALLER-pid-keyed temp (`.<tag>-<selfpid>-<pid>.tmp`). Keying the temp on the CALLING process means
+/// two concurrent writers on the SAME box (e.g. `rename` racing `update`) never share a temp and so
+/// never tear each other's write - a torn body would fail `parse` and make `load_live` unregister the
+/// LIVE box. The temp's trailing `-` segment isn't all-digits, so `entry_split`/`well_formed_entry`
+/// skip it and `list()` never mistakes it for a second box. No-op if `entry` is already gone.
+/// Best-effort. `dir` is the instances directory (where `entry` lives).
+fn atomic_rewrite(dir: &Path, entry: &Path, pid: i32, tag: &str, f: impl FnOnce(&str) -> String) {
+    let Some(body) = read_entry_capped(entry) else {
+        return;
+    };
+    let tmp = dir.join(format!(".{tag}-{}-{pid}.tmp", std::process::id()));
+    if fs::write(&tmp, f(&body)).is_ok() {
+        let _ = fs::rename(&tmp, entry); // atomic body replace
+    }
+}
+
+/// Rename a running box: move its `instances/<old>-<pid>` entry to `<new>-<pid>`, rewrite the `name=`
+/// field, and move its log/health sidecars. `fs::rename` keeps EXACTLY ONE entry visible to a
+/// concurrent `list()` throughout (never a double, never a gap); the `name=` fix is then swapped in
+/// atomically through a hidden temp so a reader never sees a torn body. The live supervisor still
+/// holds the OLD entry path for its final `unregister` - that becomes a harmless no-op and the renamed
+/// entry is pruned by `list()` when the box exits, so nothing leaks. The caller has already validated
+/// `new` and verified it is free. Best-effort on the sidecars (a box may have neither).
+pub fn rename(old: &str, new: &str, pid: i32) -> io::Result<()> {
+    let d = dir()?;
+    let old_entry = d.join(format!("{old}-{pid}"));
+    let new_entry = d.join(format!("{new}-{pid}"));
+    fs::rename(&old_entry, &new_entry)?; // atomic: one entry at all times (body name= still `old` here)
+    atomic_rewrite(&d, &new_entry, pid, "rename", |body| {
+        rewrite_name_field(body, new)
+    });
+    if let Ok(l) = logs_dir() {
+        let _ = fs::rename(
+            l.join(format!("{old}-{pid}.log")),
+            l.join(format!("{new}-{pid}.log")),
+        );
+    }
+    if let Ok(h) = health_dir() {
+        let _ = fs::rename(
+            h.join(format!("{old}-{pid}")),
+            h.join(format!("{new}-{pid}")),
+        );
+    }
+    Ok(())
+}
+
+/// Replace the `name=` line of a `key=value` registry body, preserving every other line verbatim.
+/// Pure (filesystem-free), unit-tested alongside `encode`/`parse`.
+fn rewrite_name_field(body: &str, new: &str) -> String {
+    let mut out = String::with_capacity(body.len() + new.len());
+    for line in body.lines() {
+        if line.starts_with("name=") {
+            out.push_str("name=");
+            out.push_str(new);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Sync a running box entry's recorded `memory_max`/`pids_max` after a live `kern update`, so
+/// `ps`/`inspect` show the new caps. Only the given (`Some`) fields are rewritten; the rest is
+/// preserved. Atomic body swap via a hidden temp (same discipline as [`rename`]). Best-effort.
+pub fn update_caps(name: &str, pid: i32, memory_max: Option<u64>, pids_max: Option<u64>) {
+    let Ok(d) = dir() else { return };
+    // Target the box's CURRENT entry by pid: if a concurrent `rename` moved it since the caller
+    // resolved the name, update the LIVE file (or skip if it's genuinely gone) instead of recreating
+    // the old-name entry - which would duplicate the box under two names.
+    let cur = name_for_pid(pid).unwrap_or_else(|| name.to_string());
+    let entry = d.join(format!("{cur}-{pid}"));
+    atomic_rewrite(&d, &entry, pid, "update", |body| {
+        rewrite_caps(body, memory_max, pids_max)
+    });
+}
+
+/// Rewrite only the `memory_max=`/`pids_max=` lines that have a `Some` replacement, preserving every
+/// other line. Pure; unit-tested alongside `encode`/`parse`.
+fn rewrite_caps(body: &str, memory_max: Option<u64>, pids_max: Option<u64>) -> String {
+    let mut out = String::with_capacity(body.len() + 16);
+    for line in body.lines() {
+        match (memory_max, pids_max) {
+            (Some(m), _) if line.starts_with("memory_max=") => {
+                out.push_str("memory_max=");
+                out.push_str(&m.to_string());
+            }
+            (_, Some(p)) if line.starts_with("pids_max=") => {
+                out.push_str("pids_max=");
+                out.push_str(&p.to_string());
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// A real entry is well under 1 KiB; only read a bounded prefix so a same-user process can't wedge
 /// `list()` (which `kern ps`/`volume rm`/`stop` all call) with a multi-gigabyte junk file.
 const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 
-/// The `<name>` of a well-formed `<name>-<pid>` entry filename (name non-empty, pid all digits), else
-/// `None`. The SOLE decoder of the on-disk key grammar (paired with `register`'s `format!("{name}-{pid}")`
-/// encoder) - so `well_formed_entry` and `find`'s filename pre-filter can't drift on what a valid entry
-/// is (they had already diverged: one required a non-empty name, the other didn't).
-fn entry_name(fname: &std::ffi::OsStr) -> Option<&str> {
+/// Split a `<name>-<pid>` entry filename into `(name, pid-digits)`, or `None` (grammar check only: name
+/// non-empty, pid non-empty all-ASCII-digits; no integer parse). The SOLE decoder of the on-disk key
+/// grammar (paired with `register`'s `format!("{name}-{pid}")` encoder) - `entry_name`, `well_formed_entry`,
+/// `find`'s pre-filter, and `name_for_pid` all go through it so they can't drift on what a valid entry is.
+fn entry_split(fname: &std::ffi::OsStr) -> Option<(&str, &str)> {
     let (n, pid) = fname.to_str()?.rsplit_once('-')?;
-    (!n.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then_some(n)
+    (!n.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        .then_some((n, pid))
+}
+
+/// The `<name>` of a well-formed `<name>-<pid>` entry filename, else `None`.
+fn entry_name(fname: &std::ffi::OsStr) -> Option<&str> {
+    entry_split(fname).map(|(n, _)| n)
 }
 
 /// Is this a well-formed registry filename (`<name>-<pid>`, pid all digits)? Skips anything else a
@@ -677,6 +874,11 @@ pub fn prune() -> (usize, u64) {
     let inst = instances.as_deref();
     sweep_orphans(logs_dir(), ".log", &live, inst, &mut removed, &mut freed);
     sweep_orphans(health_dir(), "", &live, inst, &mut removed, &mut freed);
+    // `kern wait` exit sidecars of boxes whose supervisor is gone (dead-pid). Reaped here too, not
+    // only in `gc`, so `prune` - the routine cleanup - bounds this dir (it would otherwise leak one
+    // tiny file per never-waited detached box). A wait consumes its own sidecar within ~100 ms of the
+    // box exiting, so a concurrent prune only ever costs an already-late wait its code, never a box.
+    removed += sweep_waitexit_dead();
     // Claims whose starter is gone (a crash between claim and register leaves one behind). Swept
     // under the same dir-wide flock as `claim_name`, so a prune can never delete a claim that a
     // concurrent starter is (re)taking right now.
@@ -801,6 +1003,34 @@ fn parse(body: &str) -> Option<Instance> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_name_field_swaps_only_the_name_line() {
+        let body = "name=old\npid=7\nrootfs=/r\ncommand=sleep 1\n";
+        assert_eq!(
+            rewrite_name_field(body, "new"),
+            "name=new\npid=7\nrootfs=/r\ncommand=sleep 1\n"
+        );
+        // a `name=` appearing mid-value (not at line start) is left untouched
+        let b2 = "command=echo name=x\nname=a\n";
+        assert_eq!(rewrite_name_field(b2, "b"), "command=echo name=x\nname=b\n");
+    }
+
+    #[test]
+    fn rewrite_caps_touches_only_requested_lines() {
+        let body = "name=a\nmemory_max=100\npids_max=200\n";
+        assert_eq!(
+            rewrite_caps(body, Some(50), Some(64)),
+            "name=a\nmemory_max=50\npids_max=64\n"
+        );
+        // memory only: pids_max preserved
+        assert_eq!(
+            rewrite_caps(body, Some(50), None),
+            "name=a\nmemory_max=50\npids_max=200\n"
+        );
+        // neither: body unchanged
+        assert_eq!(rewrite_caps(body, None, None), body);
+    }
 
     #[test]
     fn encode_parse_roundtrips_0_6_7_fields() {

@@ -30,6 +30,8 @@ pub enum Command {
         name: String,
         rootfs: Option<String>,
         image: Option<String>,
+        /// `--pull <missing|never|always>`: registry-image fetch policy (see [`commands::PullPolicy`]).
+        pull: commands::PullPolicy,
         command: Vec<String>,
         detached: bool,
         read_only: bool,
@@ -283,6 +285,9 @@ pub enum Command {
     /// `kern ps [--json]`: list running boxes.
     Ps {
         json: bool,
+        quiet: bool,
+        filters: Vec<(String, String)>,
+        format: Option<String>,
     },
     /// `kern stats [--json] [name...]`: per-box memory + CPU (all boxes, or just the named ones).
     Stats {
@@ -292,6 +297,8 @@ pub enum Command {
     /// `kern logs <name>`: print a box's captured output.
     Logs {
         name: String,
+        tail: Option<usize>,
+        follow: bool,
     },
     /// `kern inspect <name> [--json]`: full detail for one running box (identity + resources).
     Inspect {
@@ -315,6 +322,28 @@ pub enum Command {
     },
     /// `kern recover`: clean up stale registry entries / orphaned scratch of dead boxes.
     Recover,
+    /// `kern rename <old> <new>`: give a running box a new name.
+    Rename {
+        old: String,
+        new: String,
+    },
+    /// `kern update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
+    Update {
+        name: String,
+        memory: Option<u64>,
+        cpus: Option<f64>,
+        pids: Option<u64>,
+    },
+    /// `kern wait <box>...`: block until each box exits, print its exit code.
+    Wait {
+        names: Vec<String>,
+    },
+    /// `kern diff <box>`: list filesystem changes vs the box's image.
+    Diff {
+        name: String,
+    },
+    /// `kern events`: stream box lifecycle events (start/die/rename) until interrupted.
+    Events,
     /// `kern history [-n N]`: recent boxes (from their captured logs).
     History {
         count: usize,
@@ -633,10 +662,39 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 }
             }
         }
-        // `ps`: list running boxes.
-        Some("ps") => Command::Ps {
-            json: rest.contains(&"--json"),
-        },
+        // `ps [--json] [-q|--quiet] [--filter key=value]...`: list running boxes.
+        Some("ps") => {
+            let json = rest.contains(&"--json");
+            let quiet = rest.iter().any(|a| *a == "-q" || *a == "--quiet");
+            let mut filters = Vec::new();
+            let mut format = None;
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--filter" {
+                    let kv = rest
+                        .get(i + 1)
+                        .ok_or(Error::Usage("ps --filter needs key=value"))?;
+                    let (k, v) = kv.split_once('=').ok_or(Error::Usage(
+                        "ps --filter expects key=value (e.g. name=web, status=running)",
+                    ))?;
+                    filters.push((k.to_string(), v.to_string()));
+                    i += 1;
+                } else if rest[i] == "--format" {
+                    let f = rest.get(i + 1).ok_or(Error::Usage(
+                        "ps --format needs a template (e.g. '{{.Names}}')",
+                    ))?;
+                    format = Some((*f).to_string());
+                    i += 1;
+                }
+                i += 1;
+            }
+            Command::Ps {
+                json,
+                quiet,
+                filters,
+                format,
+            }
+        }
         // `stats`: per-box memory + CPU.
         Some("stats") => Command::Stats {
             json: rest.contains(&"--json"),
@@ -646,13 +704,37 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .map(|s| (*s).to_string())
                 .collect(),
         },
-        // `logs <name>`: a box's captured output.
-        Some("logs") => match rest.get(1) {
-            Some(n) if !n.starts_with('-') => Command::Logs {
-                name: (*n).to_string(),
-            },
-            _ => return Err(Error::Usage("logs <name>")),
-        },
+        // `logs <name> [--tail N] [-f|--follow]`: a box's captured output.
+        Some("logs") => {
+            let (mut lname, mut tail, mut follow) = (None, None, false);
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i] {
+                    "-f" | "--follow" => follow = true,
+                    "--tail" => {
+                        let v = rest
+                            .get(i + 1)
+                            .ok_or(Error::Usage("logs: --tail needs a number"))?;
+                        tail =
+                            Some(v.parse::<usize>().map_err(|_| {
+                                Error::Usage("logs: --tail expects a whole number")
+                            })?);
+                        i += 1;
+                    }
+                    s if !s.starts_with('-') => {
+                        if lname.is_none() {
+                            lname = Some(s.to_string());
+                        }
+                    }
+                    _ => return Err(Error::Usage("logs <name> [--tail N] [-f|--follow]")),
+                }
+                i += 1;
+            }
+            match lname {
+                Some(name) => Command::Logs { name, tail, follow },
+                None => return Err(Error::Usage("logs <name> [--tail N] [-f|--follow]")),
+            }
+        }
         // `inspect <name> [--json]`: full detail for one box.
         Some("inspect") => match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
             Some(n) => Command::Inspect {
@@ -685,6 +767,82 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .unwrap_or(20),
         },
         Some("recover") => Command::Recover,
+        // `update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
+        Some("update") => {
+            let name = rest
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .ok_or(Error::Usage(
+                    "update <box> [--memory M] [--cpus N] [--pids-limit P]",
+                ))?;
+            let memory = match flag_value(&rest, "-m").or_else(|| flag_value(&rest, "--memory")) {
+                Some(v) => Some(kern_common::parse_binary_size(&v).ok_or(Error::Usage(
+                    "update: --memory expects a size (e.g. 512m, 1g)",
+                ))?),
+                None => None,
+            };
+            let cpus = match flag_value(&rest, "--cpus") {
+                Some(v) => {
+                    let c = v
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|c| *c > 0.0 && c.is_finite())
+                        .ok_or(Error::Usage(
+                            "update: --cpus expects a positive number (e.g. 1.5)",
+                        ))?;
+                    Some(c)
+                }
+                None => None,
+            };
+            let pids = match flag_value(&rest, "--pids-limit") {
+                Some(v) => Some(
+                    v.parse::<u64>()
+                        .map_err(|_| Error::Usage("update: --pids-limit expects a whole number"))?,
+                ),
+                None => None,
+            };
+            Command::Update {
+                name,
+                memory,
+                cpus,
+                pids,
+            }
+        }
+        // `events`: stream box lifecycle events until Ctrl-C (Docker parity, best-effort/daemonless).
+        Some("events") => Command::Events,
+        // `diff <box>`: list filesystem changes vs the box's image (Docker parity).
+        Some("diff") => match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
+            Some(n) => Command::Diff {
+                name: (*n).to_string(),
+            },
+            None => return Err(Error::Usage("diff <box>")),
+        },
+        // `wait <box>...`: block until each box exits, print its exit code (Docker parity).
+        Some("wait") => {
+            let names: Vec<String> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if names.is_empty() {
+                return Err(Error::Usage("wait <box>..."));
+            }
+            Command::Wait { names }
+        }
+        // `rename <old> <new>`: give a running box a new name (Docker parity).
+        Some("rename") => {
+            let mut pos = rest.iter().skip(1).filter(|a| !a.starts_with('-'));
+            match (pos.next(), pos.next()) {
+                (Some(old), Some(new)) => Command::Rename {
+                    old: (*old).to_string(),
+                    new: (*new).to_string(),
+                },
+                _ => return Err(Error::Usage("rename <old> <new>")),
+            }
+        }
         Some("history") => Command::History {
             count: flag_value(&rest, "-n")
                 .and_then(|v| v.parse().ok())
@@ -795,6 +953,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut name: Option<&str> = None;
     let mut rootfs: Option<String> = None;
     let mut image: Option<String> = None;
+    let mut pull = commands::PullPolicy::default();
     let mut plan = false;
     let mut detached = false;
     let mut read_only = false;
@@ -1118,6 +1277,22 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     i += 1;
                     image = rest.get(i).map(|v| (*v).to_string());
                 }
+                // `--pull missing|never|always` (Docker parity). `missing` (default) = pull only if
+                // absent; `never` = fail if not already cached, never touch the network; `always` =
+                // force a fresh network pull with an atomic cache swap.
+                "--pull" => {
+                    i += 1;
+                    pull = match rest.get(i).copied() {
+                        Some("never") => commands::PullPolicy::Never,
+                        Some("always") => commands::PullPolicy::Always,
+                        Some("missing") => commands::PullPolicy::Missing,
+                        _ => {
+                            return Err(Error::Usage(
+                                "--pull: expected `missing`, `never`, or `always`",
+                            ))
+                        }
+                    };
+                }
                 "-v" | "--volume" => {
                     i += 1;
                     if let Some(v) = rest.get(i) {
@@ -1293,6 +1468,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 .unwrap_or_else(|| format!("box-{}", std::process::id())),
             rootfs,
             image,
+            pull,
             command,
             detached,
             read_only,
@@ -1732,6 +1908,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             name,
             rootfs,
             image,
+            pull,
             command,
             detached,
             read_only,
@@ -1785,6 +1962,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             name: &name,
             rootfs: rootfs.as_deref(),
             image: image.as_deref(),
+            pull,
             command: &command,
             detached,
             read_only,
@@ -1911,9 +2089,14 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
         Command::Attach { name } => commands::attach(&name),
         Command::Cp { src, dst } => crate::boxcp::cp(&src, &dst),
-        Command::Ps { json } => commands::ps(json),
+        Command::Ps {
+            json,
+            quiet,
+            filters,
+            format,
+        } => commands::ps(json, quiet, &filters, format.as_deref()),
         Command::Stats { json, names } => commands::stats(json, &names),
-        Command::Logs { name } => commands::logs(&name),
+        Command::Logs { name, tail, follow } => commands::logs(&name, tail, follow),
         Command::Inspect { name, json } => commands::inspect(&name, json),
         Command::Prune => commands::prune(),
         Command::Gc { images } => commands::gc(images),
@@ -1921,6 +2104,16 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Info => crate::doctor::info(),
         Command::Bench { rootfs, count } => commands::bench(rootfs.as_deref(), count),
         Command::Recover => commands::recover(),
+        Command::Rename { old, new } => commands::rename(&old, &new),
+        Command::Update {
+            name,
+            memory,
+            cpus,
+            pids,
+        } => commands::update(&name, memory, cpus, pids),
+        Command::Wait { names } => commands::wait(&names),
+        Command::Diff { name } => commands::diff(&name),
+        Command::Events => commands::events(),
         Command::History { count } => commands::history(count),
         Command::Login { registry, username } => {
             crate::auth::login(registry.as_deref(), username.as_deref())
