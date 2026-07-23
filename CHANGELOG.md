@@ -17,6 +17,30 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [Unreleased]
+
+Docker-parity flags on the read/inspect commands (no isolation-core change).
+
+### Added
+- **`kern logs --tail N`** prints only the last N lines; **`-f`/`--follow`** streams new output until
+  the box exits (Docker `logs -f`), sharing the poll loop with `kern attach`. `--tail` seeks a bounded
+  window near EOF, so it stays cheap on a multi-gigabyte log (cost is O(lines shown), not O(file size)).
+- **`kern ps -q` / `--quiet`** prints box names only, one per line (scriptable, e.g.
+  `kern stop $(kern ps -q)`); **`kern ps --filter`** accepts `name=<substr>`, `status=running|paused`,
+  and `id=<pid>` (AND semantics; an unsupported key fails fast); **`kern ps --format '{{.Field}}'`**
+  renders a bounded placeholder set (`{{.Names}}`, `{{.Pid}}`, `{{.Status}}`, `{{.RunningFor}}`, …) and
+  errors on an unknown token (no Go-template logic; `--json` remains for arbitrary shaping).
+- **`kern box --pull never`** fails when the `--image` is not already cached instead of pulling over
+  the network; **`--pull always`** forces a fresh pull with an **atomic cache swap** (a box already
+  running on the old image is undisturbed, its overlay-lower dentry stays pinned; a locally-built image
+  is used as-is); `missing` is the default. Retired image dirs are reaped by `kern gc` when idle.
+- **Five more Docker-parity box verbs**: **`kern rename <old> <new>`** (rename a running box in place,
+  pid unchanged); **`kern update <box> [--memory M] [--cpus N] [--pids-limit P]`** (change cgroup v2
+  caps live, no restart); **`kern wait <box>...`** (block until each box exits, print its exit code);
+  **`kern diff <box>`** (overlay-upper filesystem changes: `C` created/modified, `D` deleted); and
+  **`kern events`** (poll-based stream of box `start`/`die`/`rename`; daemonless, best-effort - it can
+  miss a start+stop that both fall inside one poll gap).
+
 ## [0.6.13], 2026-07-23
 
 Schema consistency and a README pass.

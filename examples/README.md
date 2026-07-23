@@ -72,6 +72,11 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [copy-files.sh](copy-files.sh) | `kern cp` a single file host↔box, resolved inside the box's root (`openat2`, symlinks can't escape to host paths) |
 | [pause-and-attach.sh](pause-and-attach.sh) | `kern pause` / `unpause` freeze & thaw a box (cgroup v2 freezer), and `kern attach` to reconnect a detached box's live output |
 | [monitor-top-stats.sh](monitor-top-stats.sh) | Daemonless observability: `kern stats --json` (per-box CPU/mem), a `kern top` snapshot, `kern inspect --json` |
+| [ps-scripting.sh](ps-scripting.sh) | `kern ps` for automation: `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'` TSV columns; stop a whole fleet with `kern stop $(kern ps -q)` |
+| [logs-tail-follow.sh](logs-tail-follow.sh) | `kern logs --tail N` (bounded read near EOF, cheap on GB-size logs) + `-f`/`--follow` live stream; `--tail 0 -f` follows only new output |
+| [fleet-watchdog.sh](fleet-watchdog.sh) | A daemonless supervisor in a shell loop: `ps --filter status=running` detects a crashed box, `logs --tail` grabs its crash tail, then it restarts. No daemon, no root |
+| [multi-box-logs.sh](multi-box-logs.sh) | Daemonless `compose logs -f`: follow a whole fleet at once with `logs --tail 0 -f` per box, each line prefixed with its box name, merged to one stream |
+| [log-triage.sh](log-triage.sh) | Incident triage on a huge log: `logs --tail N` seeks a bounded window near EOF (O(lines shown), not O(file size)), pulling the crash tail off a ~200k-line log instantly, plus a `ps` state snapshot |
 | [gc-prune-doctor.sh](gc-prune-doctor.sh) | Housekeeping: `kern doctor` preflight, `kern prune` (stopped-box leftovers), `kern gc` (reap dead boxes) |
 
 ### Networking & pods
@@ -91,6 +96,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [multi-stage-build.sh](multi-stage-build.sh) | `FROM … AS builder` + `COPY --from=`: compile in a fat stage, ship a slim final image with no compiler |
 | [platform-pull.sh](platform-pull.sh) | `kern pull --platform linux/amd64` vs `linux/arm64`, proven by decoding the busybox ELF header |
 | [tag-and-push-local.sh](tag-and-push-local.sh) | `kern tag` + `kern push` round-trip against a throwaway `registry:2` box on `127.0.0.1:5000` (loopback ⇒ plain-HTTP OK), then pull it back |
+| [pull-policy.sh](pull-policy.sh) | `--pull missing\|never\|always`: reuse cache (missing), fail closed offline (never), and force a fresh pull with an atomic swap a LIVE box survives (always, zero-downtime image refresh) |
 
 ### Users, edge & resource profiles
 
@@ -112,6 +118,9 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [media-transcode.sh](media-transcode.sh) | Transcode media (ffmpeg) in a box, CPU-capped, your host needs no ffmpeg |
 | [serverless-per-request.sh](serverless-per-request.sh) | A fresh, isolated box per request, the function / serverless pattern |
 | [edge-many-services.sh](edge-many-services.sh) | Many isolated services on a small board, few-MB footprint vs a ~186 MB daemon |
+| [rolling-redeploy.sh](rolling-redeploy.sh) | Zero-downtime rolling redeploy: `--pull always` swaps the image atomically (live boxes survive), bring up new instances then retire old ones, fleet never drops below target. Daemonless, no k8s |
+| [canary-deploy.sh](canary-deploy.sh) | Canary with keep-old-on-failure: `--pull always` refresh, run one canary, gate on its verdict read back via `logs --tail`; prod is never touched if the canary is unhealthy |
+| [scale-test.sh](scale-test.sh) | Burst N isolated boxes (~2 ms each, no dockerd), drive the whole set from `ps -q`: count, `--filter` sample, then reap with one `kern stop $(kern ps -q)` |
 | [device-isolation.sh](device-isolation.sh) | Give a box exactly one hardware device (i2c / serial / spi) and nothing else |
 
 ### Per-language dev & build boxes (your host stays clean)
@@ -162,6 +171,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | [git-precommit-sandbox.sh](git-precommit-sandbox.sh) | A git pre-commit hook that runs your linters/tests in a read-only, network-less box; the box's exit code gates the commit |
 | [github-actions.yml](github-actions.yml) + [ci-integration.sh](ci-integration.sh) | A minimal GitHub Actions job that installs kern and builds/tests in a capped `kern box`, plus a local script that reproduces the same CI run without pushing |
 | [Makefile.kern](Makefile.kern) + [makefile-kern-demo.sh](makefile-kern-demo.sh) | Hermetic `make lint/test/build` where each target runs in a `kern box`, a machine with only kern (no toolchain) can build and test |
+| [airgapped-ci.sh](airgapped-ci.sh) | Supply-chain-hardened CI: seed the base image once, then every step is `--pull never` (fails closed on any un-seeded image) and network-off. Deterministic, offline, no surprise pulls |
 
 ### Side-by-side with other tools
 
