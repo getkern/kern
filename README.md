@@ -261,7 +261,7 @@ Daemonless, rootless, and complete: the full container UX plus resource slices, 
 - **Data & devices**: `-v` volumes (symlink-safe) · named volumes with a `--size` quota · network volumes (`nfs`/`smb`/`sshfs`) · `--secret` → `/run/secrets` (RAM, `0400`) · `vdisk:` scratch · `vgpio:` device passthrough (deny-by-default) · `--tmpfs`.
 - **Network & identity**: isolated by default; `--network host` for outbound; **`--egress-allow d1,d2`** (⚠️ experimental) restricts outbound to an allowlist of domains via a kern-run filtering proxy (an agent can `pip install` but can't exfiltrate to an arbitrary domain), with honest known gaps documented in [docs/EGRESS.md](docs/EGRESS.md); `-p` rootless publish (loopback unless you ask); in-box `--ssh`; `--pod` shared-net pods (`--no-outbound`); `--tun`; `--user`.
 - **Least privilege**: 13 dangerous caps always dropped (`--cap-add`/`--cap-drop`); an always-on **seccomp** denylist (kexec, modules, ptrace, mount API, `setns`, …) that also kills wrong-arch + x86_64 x32-ABI aliases; opt-in **Landlock** (LSM) write-allowlist (`--landlock-rw <path>`): the box root is read+exec and writes are confined to the paths you name, a kernel-enforced second boundary the workload can't lift.
-- **Lifecycle, no daemon**: `--restart` + `--health-cmd`; `cp`/`pause`/`attach`/`exec`; `ps`/`top`/`stats`/`logs`/`inspect`/`prune`/`gc`/`history`/`recover`; `compose` (reads `docker-compose.yml` too); reusable `[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]` profiles; `kern doctor`.
+- **Lifecycle, no daemon**: `--restart` + `--health-cmd`; `cp`/`pause`/`attach`/`exec`/`rename`/`update`/`wait`/`diff`/`events`; `ps`/`top`/`stats`/`logs`/`inspect`/`prune`/`gc`/`history`/`recover`; `compose` (reads `docker-compose.yml` too); reusable `[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]` profiles; `kern doctor`.
 
 <details>
 <summary><b>Every flag &amp; command, grouped</b></summary>
@@ -424,7 +424,9 @@ kern box svc --image alpine -d -p 8080:80 --restart \
 kern ps                   # running boxes, with PORTS + HEALTH
 kern top                  # live TUI: boxes, CPU/RAM, profiles
 kern exec svc -it -- sh   # shell into a running box
-kern logs svc             # its output
+kern logs svc -f          # its output, followed live (--tail N for the last N)
+kern diff svc             # files changed vs the image (C = changed, D = deleted)
+kern update svc --memory 1g   # retune caps live; rename/wait/events too
 kern stop svc             # stop it   (kern stop --all for everything)
 ```
 
@@ -601,6 +603,33 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 | **`docker commit`** (container → image) | ✅ `kern commit <box> <image>`: snapshots the box's filesystem to a reusable image (warm start); skips volumes/secrets |
 | **Docker Engine API** / `docker.sock` | ❌: tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
 | **Swarm** | ❌: use `compose` / `--pod` |
+
+### Everyday `docker` commands
+
+Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same name where it makes sense):
+
+| `docker …` | `kern …` | Notes |
+|---|---|---|
+| `run` / `create` | `box` | one verb; `-d` detaches, `-it` for a PTY |
+| `exec` | `exec` | joins the box's namespaces |
+| `ps` | `ps` | `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
+| `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs) |
+| `stop` / `kill` | `stop` / `kill` | SIGKILL the box's process group |
+| `pause` / `unpause` | `pause` / `unpause` | cgroup v2 freezer |
+| `attach` | `attach` | Ctrl-C detaches, box keeps running |
+| `cp` | `cp` | host↔box, symlinks can't escape the box root |
+| `inspect` | `inspect` | `--json` |
+| `stats` | `stats` | per-box CPU / memory |
+| `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI for every box |
+| `rename` | `rename` | in place, pid unchanged |
+| `update` | `update` | live cgroup caps, no restart (needs a delegated cgroup) |
+| `wait` | `wait` | prints the exit code (`137` after `stop`) |
+| `diff` | `diff` | overlay-upper changes: `C` changed/added, `D` deleted |
+| `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
+| `commit` | `commit` | box → reusable image (warm start) |
+| `start` (a stopped container) | *(none)* | by design: kern boxes are **ephemeral** - a stopped box isn't resumed, you launch a fresh one |
+
+Out of scope by design (daemonless): `swarm` / `service` / `stack` / `node` / `context` / `plugin` / `trust` / `network` CRUD / `checkpoint`, and anything that attaches to `docker.sock`.
 
 ## When to use kern (and when not)
 
