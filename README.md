@@ -39,7 +39,7 @@ then `kern box dev --image alpine -- sh`
 
 <sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2 ms</b>; a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. The comparison table under <a href="#performance">Performance</a> is a separate Linux 6.17 desktop; your hardware and cgroup delegation differ, so measure your own. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology and on-device board numbers.</sub>
 
-[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
+[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Storage](docs/STORAGE.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
 </div>
 
