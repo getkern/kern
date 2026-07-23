@@ -27,7 +27,7 @@
   <circle cx="24" cy="21" r="6" fill="#ff5f56"/>
   <circle cx="46" cy="21" r="6" fill="#ffbd2e"/>
   <circle cx="68" cy="21" r="6" fill="#27c93f"/>
-  <text x="400" y="26" text-anchor="middle" class="dim" font-size="13">kern - a daemonless container + virtual resources</text>
+  <text x="400" y="26" text-anchor="middle" class="dim" font-size="13">kern - virtual resources for any workload</text>
 
   <g>
     <!-- reusable profiles: CPU, disk AND devices, in one config file -->

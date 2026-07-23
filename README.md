@@ -2,9 +2,9 @@
 
 # kern
 
-**A fast, daemonless container for your inner loop, plus a rootless sandbox for untrusted and agent-generated code.**
+**A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
 
-A fast, daemonless container for your inner loop: a real, kernel-enforced box that starts in **~2 ms**,
+It's a daemonless container for your inner loop: a real, kernel-enforced box that starts in **~2 ms**,
 from one **~1.6 MB** rootless binary, with no `dockerd` sitting in the background. The same box also runs
 untrusted or agent-generated code, isolated. Embed it from Python, Node or Rust, or run it from the CLI.
 
@@ -741,8 +741,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
   Raspberry Pi OS don't delegate the `memory` controller, so `--memory` is accepted-but-unenforced there
   (same as Docker/Podman) until you enable it: on **WSL**, add `cgroup_enable=memory cgroup_memory=1` to
   `kernelCommandLine` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`; on **Raspberry
-  Pi OS**, add `cgroup_enable=memory` to `/boot/firmware/cmdline.txt`, then reboot. This is the canonical
-  note; Install and Platforms point here.
+  Pi OS**, add `cgroup_enable=memory cgroup_memory=1` to `/boot/firmware/cmdline.txt`, then reboot.
 - `newuidmap` + `/etc/subuid` for a full uid range (`--uid-range`, `--ssh`); a single-uid box works
   without them.
 
