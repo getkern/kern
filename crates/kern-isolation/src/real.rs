@@ -660,6 +660,7 @@ fn child_setup_and_exec(
     let staged = mounted.create_old_root(&mut ops)?;
     mount_proc()?;
     detach_old_root()?;
+    t.mark("pivot+mount_proc");
     // Lock down the non-namespaced host-global procfs knobs (core_pattern, sysrq, kernel info) now that
     // `/proc` resolves to the fresh procfs - closes the classic core_pattern escape for a root-mapped box.
     //
@@ -674,6 +675,7 @@ fn child_setup_and_exec(
     if !allow_nesting {
         mask_proc_paths()?;
     }
+    t.mark("proc-mask");
     // Give the box a read-only view of its OWN cgroup at `/sys/fs/cgroup` (see `mount_cgroup`), so
     // memory-aware runtimes read the real cap. After the `/proc` masks so their mount ordering matches
     // the rest of the hardened set; before the optional read-only root remount below, while the root is
@@ -682,7 +684,7 @@ fn child_setup_and_exec(
     if cgroupns_ok {
         mount_cgroup();
     }
-    t.mark("pivot+proc");
+    t.mark("cgroup-view");
     // Optional read-only remount LAST - the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep
     // their own flags, so a writable `-v` stays writable even under a read-only root. `MS_REMOUNT`

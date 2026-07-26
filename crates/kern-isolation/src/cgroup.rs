@@ -576,16 +576,52 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     (created && slice_can_cap(&slice)).then_some(slice)
 }
 
-/// Make the controllers available to `parent`'s children. cgroup-v2 accepts several tokens in one
-/// write, so try them all at once (1 syscall); only if that fails enable them one at a time - so an
-/// unavailable controller (e.g. no `cpu` on some Android-derived kernels) can't block the others.
-/// (Controllers may already be on, or be denied by the no-internal-process rule when the parent has
-/// members - all best-effort either way.)
+/// Make the controllers available to `parent`'s children. A cgroup-v2 `subtree_control` write is
+/// ATOMIC: a batch naming any controller the parent does not export (`cpuset`/`io` are commonly NOT
+/// delegated to a user session) fails ENTIRELY, which forced a per-controller fallback - up to six
+/// syscalls, most of them failing, on *every* box's hot path. Instead read the parent's exported
+/// `cgroup.controllers` first and batch only what is actually available, so the single write always
+/// succeeds (and no-ops cheaply when the controllers are already on). The enabled set is identical to
+/// the old fallback's (only exported controllers could ever be turned on); this just drops the failing
+/// probe writes. Best-effort throughout: if the available set is unreadable, fall back to the old
+/// try-each-controller path; write errors (already-on, or the no-internal-process rule when the parent
+/// has members) are ignored either way.
+/// The controllers kern wants that a parent actually exports, formatted as a cgroup-v2
+/// `subtree_control` batch (`"+memory +pids +cpu"`), in a fixed order. Empty when the parent exports
+/// none of them. Pure and unit-tested: EXACT token match against the space-separated
+/// `cgroup.controllers` contents, so `cpu` never matches `cpuset` (a substring test would), extra
+/// controllers the kernel exports (`hugetlb`, `rdma`, `misc`, …) are ignored, and surrounding
+/// whitespace/newlines are tolerated.
+fn subtree_batch(available: &str) -> String {
+    const WANT: [&str; 5] = ["memory", "pids", "cpu", "cpuset", "io"];
+    let mut batch = String::with_capacity(32);
+    for ctrl in WANT {
+        if available.split_whitespace().any(|c| c == ctrl) {
+            if !batch.is_empty() {
+                batch.push(' ');
+            }
+            batch.push('+');
+            batch.push_str(ctrl);
+        }
+    }
+    batch
+}
+
 fn enable_subtree_controllers(parent: &std::path::Path) {
     let subtree = parent.join("cgroup.subtree_control");
-    if fs::write(&subtree, "+memory +pids +cpu +cpuset +io").is_err() {
-        for ctrl in ["+memory", "+pids", "+cpu", "+cpuset", "+io"] {
-            let _ = fs::write(&subtree, ctrl);
+    match fs::read_to_string(parent.join("cgroup.controllers")) {
+        Ok(avail) => {
+            let batch = subtree_batch(&avail);
+            if !batch.is_empty() {
+                let _ = fs::write(&subtree, batch);
+            }
+        }
+        // Available set unreadable: fall back to the old best-effort probe (try each controller
+        // individually) so an unusual host still gets whatever it will accept.
+        Err(_) => {
+            for ctrl in ["+memory", "+pids", "+cpu", "+cpuset", "+io"] {
+                let _ = fs::write(&subtree, ctrl);
+            }
         }
     }
 }
@@ -969,5 +1005,44 @@ mod tests {
                 "must resolve under the cgroup root, got {p:?}"
             );
         }
+    }
+
+    #[test]
+    fn subtree_batch_all_available_keeps_want_order() {
+        // Parent exports every controller (out of order, plus extras): batch is exactly WANT's five,
+        // in WANT order, ignoring the extras.
+        assert_eq!(
+            subtree_batch("cpuset cpu io memory pids hugetlb rdma misc"),
+            "+memory +pids +cpu +cpuset +io"
+        );
+    }
+
+    #[test]
+    fn subtree_batch_common_user_session_subset() {
+        // The case this fix targets: a systemd user session delegates memory/pids/cpu but NOT
+        // cpuset/io. Old code wrote a 5-token batch that failed atomically, then 5 singles (2 failing);
+        // now exactly the three available ones, in one write, no failing probes.
+        assert_eq!(subtree_batch("memory pids cpu"), "+memory +pids +cpu");
+    }
+
+    #[test]
+    fn subtree_batch_empty_when_none_wanted_present() {
+        assert_eq!(subtree_batch(""), "");
+        assert_eq!(subtree_batch("hugetlb rdma misc"), "");
+    }
+
+    #[test]
+    fn subtree_batch_exact_token_match_no_prefix_collision() {
+        // `cpu` must NOT enable `cpuset` and vice versa - a substring test would get this wrong.
+        assert_eq!(subtree_batch("cpu"), "+cpu");
+        assert_eq!(subtree_batch("cpuset"), "+cpuset");
+        assert_eq!(subtree_batch("cpuset memory"), "+memory +cpuset");
+    }
+
+    #[test]
+    fn subtree_batch_tolerates_whitespace_and_newlines() {
+        // `cgroup.controllers` is a single space-separated line, but be robust to tabs/extra spaces/
+        // a trailing newline from the read.
+        assert_eq!(subtree_batch("  memory   pids\tcpu  \n"), "+memory +pids +cpu");
     }
 }

@@ -19,6 +19,27 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.15], 2026-07-26
+
+Hot-path cgroup cleanup and finer setup profiling. No isolation-core or behaviour change: cap
+enforcement is verified identical (memory.max/cpu.max/pids.max readback, a real OOM kill at the cap,
+and 50 concurrent capped boxes), the full suite and the adversarial break-out battery both stay
+green.
+
+### Changed
+- **cgroup: enable only the delegated controllers, in a single write.** A cgroup-v2
+  `cgroup.subtree_control` write is atomic, so the previous fixed `+memory +pids +cpu +cpuset +io`
+  batch failed *entirely* on a typical user session (where `cpuset`/`io` are not delegated) and fell
+  back to five per-controller probe writes, most of them failing, on every box. It now reads the
+  parent's exported `cgroup.controllers` first and batches only what is actually available, so the
+  one write always succeeds: six syscalls down to one, no failing probes. The set of controllers
+  enabled is unchanged, so `--memory`/`--cpus`/`--pids` enforcement is identical.
+
+### Added
+- Finer `KERN_TIMING` phases for box setup: `pivot+mount_proc`, `proc-mask` and `cgroup-view` are
+  reported separately (previously one `pivot+proc`), so the built-in profiler shows where setup time
+  actually goes. Observability only, no behaviour change.
+
 ## [0.6.14], 2026-07-23
 
 Everyday-CLI parity on the read/inspect and lifecycle commands (no isolation-core change).
