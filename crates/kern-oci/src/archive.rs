@@ -9,7 +9,8 @@
 //! [`merge_layer`]. There is no naive `tar -xf` on attacker bytes anywhere here.
 
 use crate::pull::{
-    check_layer_safe, detect_compression, merge_layer, unpack_as_root, Compression, ImageConfig,
+    check_layer_safe, detect_compression, filter_layer, merge_layer, unpack_as_root, Compression,
+    ImageConfig,
 };
 use crate::push::{build_config_json, sha256_file, shell_quote, ImageConfigOut};
 use crate::OciError;
@@ -268,17 +269,21 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
         for (j, layer_rel) in layers.iter().enumerate() {
             let layer = under(&unpacked, layer_rel)?;
             let comp = detect_compression(&layer);
-            check_layer_safe(&layer, comp)?; // vet in the parent (detailed errors, no privilege)
+            // Strip device members into a fresh PLAIN tar and RE-VET it (the same gate as pull's
+            // `filter_layer`), so a saved image that ships an inert device node loads identically to how
+            // it pulls. A device the strip missed is rejected by the re-vet (fail-closed).
+            let filtered = filter_layer(&layer, comp)?;
             let staging = work.join(format!("stg-{i}-{j}"));
             let rootfs_c = rootfs.clone();
-            let layer_c = layer.clone();
+            let filtered_c = filtered.clone();
             let staging_c = staging.clone();
             unpack_as_root(move || {
-                extract_into(&layer_c, comp, &staging_c)?;
+                extract_into(&filtered_c, Compression::Plain, &staging_c)?;
                 let r = merge_layer(&staging_c, &rootfs_c);
                 let _ = std::fs::remove_dir_all(&staging_c);
                 r
             })?;
+            let _ = std::fs::remove_file(&filtered);
         }
         out.push(Loaded {
             repo_tags,

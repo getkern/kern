@@ -44,6 +44,11 @@ pub mod __fuzz {
         // The vetter is tar-flavour-INDEPENDENT (its verdict must not hinge on which `tar` the host
         // has - a security boundary can't trust an external tool's version), so one pass covers it.
         let _ = crate::pull::vet_tar_stream(&mut std::io::Cursor::new(data));
+        // The device-stripping re-emitter shares the SAME untrusted corpus: it parses at the same fixed
+        // offsets and must equally never panic (no OOB slice, no unbounded read / write). Its output is
+        // re-vetted by the unchanged vetter before extraction, so a parsing slip fails closed downstream.
+        let mut out: Vec<u8> = Vec::new();
+        let _ = crate::pull::strip_device_members(&mut std::io::Cursor::new(data), &mut out);
     }
 }
 

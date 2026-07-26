@@ -19,6 +19,27 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.18], 2026-07-26
+
+OCI compatibility with fail-closed security: an image that ships an inert device node in a layer
+(Amazon Linux, and any base that bakes a `/dev/*` node) now pulls and loads, instead of being refused
+with "layer has a device node". The isolation posture is unchanged and stays fail-closed.
+
+### Changed
+- **OCI pull/load: strip device members instead of refusing the whole layer.** A new in-process pass
+  (`strip_device_members`) re-emits the decompressed layer as a PLAIN tar with every char/block device
+  member (typeflag `3`/`4`) removed and every other member copied VERBATIM, then the UNCHANGED vetter
+  (`check_layer_safe`) RE-VETS that output before a single byte is extracted. `tar` then extracts the
+  device-free plain tar, so no device node can reach the box rootfs on any tar implementation (GNU or
+  BusyBox) or privilege (root or rootless): the extractor never sees a device. This ELIMINATES the
+  vetter-vs-extractor divergence surface (kern is now the source of the tar `tar` extracts) rather than
+  widening it. The box still gets its own fresh `/dev` and drops `CAP_MKNOD`, so an image's device
+  paths are inert regardless. Fail-closed: any device the strip missed, or any corruption it
+  introduced, is rejected by the re-vet, never extracted. The vetter itself is byte-identical (its
+  20+ tests and the fuzz target are unchanged). Box-start latency is unaffected (the filter runs only
+  at pull/load, never on the box hot path). Validated: 3 new unit tests, a 7.2M-run fuzz pass (ASAN,
+  no crash), the full suite, all 8 test distros plus amazonlinux, and BusyBox tar extraction.
+
 ## [0.6.15], 2026-07-26
 
 Hot-path cgroup cleanup and finer setup profiling. No isolation-core or behaviour change: cap

@@ -1030,7 +1030,6 @@ fn process_layer(
     total: usize,
 ) -> Result<(), OciError> {
     let short = short_digest(digest);
-    let tmp_s = tmp.to_string_lossy().into_owned();
 
     // INTEGRITY: the blob's content must hash to its digest - defends against a compromised or
     // MITM'd registry (TLS only protects the transport), and against a corrupt download. Report the
@@ -1050,12 +1049,21 @@ fn process_layer(
     // both the vet and the extract so they can never disagree.
     let comp = detect_compression(tmp);
 
-    // HARDENING: vet the layer BEFORE writing anything to disk - reject path traversal, absolute
-    // members, device nodes, and oversized (decompression-bomb) layers.
-    if let Err(e) = check_layer_safe(tmp, comp) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(e);
-    }
+    // HARDENING: strip any device member into a FRESH PLAIN tar and RE-VET that with the unchanged
+    // vetter - the security gate. Rejects path traversal, absolute members, oversized (bomb) layers, and
+    // any device the strip missed (fail-closed: the re-vet still refuses `3`/`4`). A legitimate image
+    // that ships an inert device node (amazonlinux's base layer) now pulls; the box's own fresh `/dev`
+    // and dropped CAP_MKNOD keep the image's device PATHS inert regardless. Because the filtered layer is
+    // a plain tar, the extraction below collapses to a single `tar -xf` - no codec branch, no zstd pipe.
+    let filtered = match filter_layer(tmp, comp) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e);
+        }
+    };
+    let _ = std::fs::remove_file(tmp); // the original compressed blob is consumed by the filter
+    let filtered_s = filtered.to_string_lossy().into_owned();
 
     // ISOLATED STAGING: extract this layer into a FRESH empty sibling dir, never directly into
     // `dest`. Then merge it into `dest` ourselves with no-follow semantics (see `merge_layer`),
@@ -1087,76 +1095,23 @@ fn process_layer(
             let _ = std::fs::remove_dir_all(&staging);
             e
         };
-        let ok = match comp {
-            Compression::Gzip | Compression::Plain => {
-                let flag = if matches!(comp, Compression::Gzip) {
-                    "-xzf"
-                } else {
-                    "-xf"
-                };
-                Command::new("tar")
-                    .args([
-                        flag,
-                        &tmp_s,
-                        "-C",
-                        &staging_s,
-                        "--no-same-owner",
-                        "--same-permissions",
-                    ])
-                    .status()
-                    .map_err(|e| OciError::Tool("tar", e.to_string()))
-                    .map(|s| s.success())
-            }
-            Compression::Zstd => {
-                if !zstd_available() {
-                    return Err(extract_err(zstd_missing()));
-                }
-                // zstd -dc <tmp>  |  head -c <cap>  |  tar -xf -  -C staging …
-                //
-                // DEFENCE IN DEPTH: unlike the `tar -xzf`/`-xf` paths (which read the on-disk blob and are
-                // bounded by tar itself), the zstd path STREAMS a decompressor into tar and does NOT re-run
-                // the size-capped vetter. `check_layer_safe` already rejected an over-2GiB bomb before we get
-                // here - but a gate shouldn't depend on ANOTHER gate being perfect. `head -c MAX_LAYER_BYTES`
-                // hard-caps the decompressed bytes reaching tar, so even if the vet ever let a gonfio blob
-                // through, the extract writes at most the cap (the truncated tar then fails cleanly). One
-                // extra tiny process; irrelevant vs the decompression cost.
-                let mut z = Command::new("zstd")
-                    .args(["-dc", &tmp_s])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map_err(|_| zstd_missing())
-                    .map_err(extract_err)?;
-                let zout = z.stdout.take().expect("zstd stdout piped");
-                let mut h = Command::new("head")
-                    .args(["-c", &MAX_LAYER_BYTES.to_string()])
-                    .stdin(zout)
-                    .stdout(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| OciError::Tool("head", e.to_string()))
-                    .map_err(extract_err)?;
-                let hout = h.stdout.take().expect("head stdout piped");
-                let tar_status = Command::new("tar")
-                    .args([
-                        "-xf",
-                        "-",
-                        "-C",
-                        &staging_s,
-                        "--no-same-owner",
-                        "--same-permissions",
-                    ])
-                    .stdin(hout)
-                    .status()
-                    .map_err(|e| OciError::Tool("tar", e.to_string()));
-                let zcode = z.wait().map(|s| s.success()).unwrap_or(false);
-                // `head` closing the pipe early (cap hit) makes zstd take SIGPIPE - that's the intended
-                // truncation, and tar then fails on the short archive, so we don't treat head's own status
-                // as authoritative; tar + a clean zstd exit are what matter.
-                let _ = h.wait();
-                tar_status.map(|s| s.success() && zcode)
-            }
-        };
-        let _ = std::fs::remove_file(tmp);
+        // The filtered layer is a PLAIN tar with device members stripped, so extraction collapses to a
+        // single `tar -xf` - no codec branch, no zstd pipe. `--same-permissions` preserves the image's
+        // exact modes (sticky bit + world-write on `/tmp`); `--no-same-owner` maps ownership to the
+        // extracting user (never the image's raw uids). `filter_layer` already re-vetted these bytes, and
+        // tar consumes exactly them, so tar never sees a device node.
+        let ok = Command::new("tar")
+            .args([
+                "-xf",
+                &filtered_s,
+                "-C",
+                &staging_s,
+                "--no-same-owner",
+                "--same-permissions",
+            ])
+            .status()
+            .map_err(|e| OciError::Tool("tar", e.to_string()))
+            .map(|s| s.success());
         let succeeded = match ok {
             Ok(s) => s,
             Err(e) => return Err(extract_err(e)),
@@ -1169,6 +1124,7 @@ fn process_layer(
         let _ = std::fs::remove_dir_all(&staging);
         merged
     });
+    let _ = std::fs::remove_file(&filtered); // remove the filtered plain tar (extraction consumed it)
     unpack
 }
 
@@ -1580,6 +1536,230 @@ fn take_data(r: &mut impl std::io::Read, len: u64, keep: usize) -> Result<Vec<u8
         left -= n as u64;
     }
     Ok(out)
+}
+
+/// Copy `ceil(size/512)*512` bytes (a member's data + tar padding) VERBATIM from `r` to `w`, streamed
+/// in 8 KiB chunks (never buffering a whole large file). Used by [`strip_device_members`] to re-emit an
+/// accepted member's body byte-for-byte, so the extractor receives exactly what was read. A short read
+/// before the expected end is a truncated layer (fail-closed).
+fn pipe_data(
+    r: &mut impl std::io::Read,
+    size: u64,
+    w: &mut impl std::io::Write,
+) -> Result<(), OciError> {
+    let mut buf = [0u8; 8192];
+    let mut left = size.div_ceil(TAR_BLOCK as u64) * TAR_BLOCK as u64;
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n =
+            read_block(r, &mut buf[..want]).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+        if n == 0 {
+            return Err(OciError::Extract("truncated layer data".into()));
+        }
+        w.write_all(&buf[..n])
+            .map_err(|e| OciError::Extract(format!("write filtered layer: {e}")))?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+/// Read exactly `ceil(size/512)*512` bytes (a small GNU-`L`/`K` or PAX `x`/`g` record's data + padding)
+/// into an owned buffer. `size` is `TAR_MAX_LONG`-capped by the caller, so the allocation is bounded.
+/// [`strip_device_members`] buffers these raw bytes so an accepted member's preceding long-name/PAX
+/// record is re-emitted verbatim before it. A short read is a truncated record (fail-closed).
+fn read_raw_blocks(r: &mut impl std::io::Read, size: u64) -> Result<Vec<u8>, OciError> {
+    let padded = (size.div_ceil(TAR_BLOCK as u64) * TAR_BLOCK as u64) as usize;
+    let mut out = vec![0u8; padded];
+    let mut off = 0;
+    while off < padded {
+        let n =
+            read_block(r, &mut out[off..]).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+        if n == 0 {
+            return Err(OciError::Extract("truncated tar meta record".into()));
+        }
+        off += n;
+    }
+    Ok(out)
+}
+
+/// Re-emit `r` (a decompressed tar) to `w`, DROPPING every char/block device member (`3`/`4`) and
+/// copying every other member VERBATIM. The output is then re-vetted by [`check_layer_safe`] and only
+/// then extracted, so this pass carries NO security guarantee of its own: a slip that leaves a device
+/// in is caught (the re-vet refuses `3`/`4`), and a slip that corrupts the stream fails the re-vet or
+/// `tar`. Its ONLY jobs are (1) drop device members so a legitimate image that ships an inert device
+/// node (amazonlinux's base layer, images with `/dev/null`) can pull, and (2) stay byte-synchronized so
+/// the output is a valid tar. It mirrors the vetter's STRUCTURAL typeflag handling (refuse sparse/
+/// multivolume, and a nonzero size on link/dir) purely to avoid desyncing the cursor; the full
+/// path/escape/bomb vetting is the re-vet's job and is deliberately NOT duplicated here.
+pub(crate) fn strip_device_members(
+    r: &mut impl std::io::Read,
+    w: &mut impl std::io::Write,
+) -> Result<(), OciError> {
+    let bad = |m: &str| OciError::Extract(m.to_string());
+    let wr = |w: &mut dyn std::io::Write, b: &[u8]| -> Result<(), OciError> {
+        w.write_all(b)
+            .map_err(|e| OciError::Extract(format!("write filtered layer: {e}")))
+    };
+    let mut header = [0u8; TAR_BLOCK];
+    let mut total: u64 = 0;
+    // Raw bytes (header + data) of GNU L/K and PAX x records staged for the NEXT member: flushed before
+    // an accepted member, DROPPED if that member is a device. PAX g (global) is written straight through.
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        let n = read_block(r, &mut header).map_err(|e| OciError::Tool("gzip", e.to_string()))?;
+        if n == 0 {
+            return Err(bad("truncated layer archive (no end-of-archive marker)"));
+        }
+        if n < TAR_BLOCK {
+            return Err(bad("truncated tar header"));
+        }
+        if header.iter().all(|&b| b == 0) {
+            // End-of-archive: emit the canonical two zero blocks and stop (a valid tar needs only the
+            // marker; we do not copy the input's trailing padding). The re-vet runs on this output next.
+            wr(w, &[0u8; TAR_BLOCK * 2])?;
+            return Ok(());
+        }
+        let typeflag = header[156];
+        let size = tar_num(&header[124..136]).ok_or_else(|| bad("bad tar size field"))?;
+        // Bound emitted bytes up front (a decompression bomb would otherwise stream forever). The
+        // re-vet caps again, but a gate must not depend on another gate.
+        total = total.saturating_add(size);
+        if size > MAX_LAYER_BYTES || total > MAX_LAYER_BYTES {
+            return Err(bad(
+                "layer exceeds the size cap (possible decompression bomb)",
+            ));
+        }
+        match typeflag {
+            // Per-member meta: buffer verbatim (header + capped data) for the following member.
+            b'L' | b'K' | b'x' => {
+                if size > TAR_MAX_LONG {
+                    return Err(bad("oversized tar meta record"));
+                }
+                let raw = read_raw_blocks(r, size)?;
+                pending.extend_from_slice(&header);
+                pending.extend_from_slice(&raw);
+            }
+            // PAX global: not tied to one member; pass straight through, preserving stickiness.
+            b'g' => {
+                if size > TAR_MAX_LONG {
+                    return Err(bad("oversized tar meta record"));
+                }
+                let raw = read_raw_blocks(r, size)?;
+                wr(w, &header)?;
+                wr(w, &raw)?;
+            }
+            // DEVICE: the whole point. Drop it and any meta that named it. A device node carries no
+            // data (size 0); a nonzero size is a desync attempt, refused (the re-vet would too).
+            b'3' | b'4' => {
+                if size != 0 {
+                    return Err(bad("device node with non-zero size (tar desync attack)"));
+                }
+                pending.clear();
+            }
+            // Sparse/multivolume: `size` is not the on-wire data length, so copying `size` bytes would
+            // desync. The vetter refuses these; mirror it (never emit them).
+            b'S' | b'M' => {
+                return Err(bad(
+                    "layer has a sparse or multivolume member (unsupported)",
+                ));
+            }
+            // Symlink/hardlink/directory carry no data: a nonzero size desyncs a non-GNU extractor.
+            // Mirror the vetter's refusal so the copy stays byte-synchronized.
+            b'1' | b'2' | b'5' if size != 0 => {
+                return Err(bad(
+                    "layer has a symlink/hardlink/directory header with non-zero size",
+                ));
+            }
+            // Every ordinary member (regular `0`/NUL/`7`, dir `5`, hardlink `1`, symlink `2`, and FIFO
+            // `6` - which the re-vet still refuses, unchanged): copy verbatim. Flush staged meta first.
+            b'0' | 0 | b'7' | b'5' | b'1' | b'2' | b'6' => {
+                if !pending.is_empty() {
+                    wr(w, &pending)?;
+                    pending.clear();
+                }
+                wr(w, &header)?;
+                pipe_data(r, size, w)?;
+            }
+            // Unknown type: refuse rather than guess `size`'s meaning and desync (mirrors the vetter).
+            other => {
+                return Err(bad(&format!(
+                    "layer has an unsupported tar member type (0x{other:02x})"
+                )));
+            }
+        }
+    }
+}
+
+/// Produce a device-free, fully-vetted PLAIN tar for a layer, ready to hand to `tar -xf`.
+///
+/// Pipeline: decompress `tar_path` (per `comp`, same codecs as [`check_layer_safe`]) ->
+/// [`strip_device_members`] into a fresh sibling temp -> [`check_layer_safe`] RE-VETS that temp with the
+/// UNCHANGED vetter. Returns the temp's path on success; the caller extracts that PLAIN tar (no codec
+/// branch) and removes it. The re-vet is the security gate: `strip` carries no guarantee of its own, so a
+/// device it failed to drop, or any corruption it introduced, is caught here (fail-closed) before a
+/// single byte is extracted. On any error the partial temp is removed.
+pub(crate) fn filter_layer(
+    tar_path: &Path,
+    comp: Compression,
+) -> Result<std::path::PathBuf, OciError> {
+    let path = tar_path.to_string_lossy();
+    let out_path = tar_path.with_extension("kernflt");
+    let mut out = std::fs::File::create(&out_path)
+        .map_err(|e| OciError::Extract(format!("create filtered layer: {e}")))?;
+    let strip_res = match comp {
+        Compression::Plain => std::fs::File::open(tar_path)
+            .map_err(|e| OciError::Extract(e.to_string()))
+            .and_then(|mut f| strip_device_members(&mut f, &mut out)),
+        Compression::Gzip | Compression::Zstd => {
+            let is_zstd = comp == Compression::Zstd;
+            if is_zstd && !zstd_available() {
+                let _ = std::fs::remove_file(&out_path);
+                return Err(zstd_missing());
+            }
+            let bin = if is_zstd { "zstd" } else { "gzip" };
+            match Command::new(bin)
+                .args(["-dc", &path])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Err(e) => Err(if is_zstd {
+                    zstd_missing()
+                } else {
+                    OciError::Tool("gzip", e.to_string())
+                }),
+                Ok(mut child) => {
+                    let res = match child.stdout.take() {
+                        None => Err(OciError::Extract("no decompressor stdout".into())),
+                        Some(mut stdout) => strip_device_members(&mut stdout, &mut out),
+                    };
+                    // We stop reading at the end-of-archive marker, so the decompressor may take a
+                    // SIGPIPE - its status is not meaningful; a truncated input is caught by `strip`.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    res
+                }
+            }
+        }
+    };
+    // Persist the output before re-vetting/extracting it, then close it so it can be re-read.
+    use std::io::Write as _;
+    let finish = strip_res.and_then(|()| {
+        out.flush()
+            .map_err(|e| OciError::Extract(format!("flush filtered layer: {e}")))
+    });
+    drop(out);
+    if let Err(e) = finish {
+        let _ = std::fs::remove_file(&out_path);
+        return Err(e);
+    }
+    // RE-VET the filtered PLAIN tar with the UNCHANGED vetter - the security gate (fail-closed): any
+    // device `strip` missed, or any corruption it introduced, is rejected here before extraction.
+    if let Err(e) = check_layer_safe(&out_path, Compression::Plain) {
+        let _ = std::fs::remove_file(&out_path);
+        return Err(e);
+    }
+    Ok(out_path)
 }
 
 /// What `parse_pax` extracted from a PAX record set: the overriding `path`/`linkpath`, and whether any
@@ -2627,6 +2807,95 @@ mod tests {
         ok.extend(end_marker());
         let mut r: &[u8] = &ok;
         assert!(vet_tar_stream(&mut r).is_ok());
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The device-stripping re-emitter drops char/block device members ('3'/'4') and copies every other
+    /// member verbatim, and its output re-vets CLEAN (device-free, structurally valid) - the fail-closed
+    /// gate `filter_layer` relies on. This is what lets an image that ships an inert device node
+    /// (amazonlinux's base layer) pull while the extractor never sees a device.
+    #[test]
+    fn strip_drops_devices_keeps_regular_and_revets_clean() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"hello.txt", b'0', 2, b""));
+        stream.extend(data_block(b"hi"));
+        stream.extend_from_slice(&hdr(b"dev/console", b'3', 0, b"")); // char device -> dropped
+        stream.extend_from_slice(&hdr(b"dev/sda", b'4', 0, b"")); // block device -> dropped
+        stream.extend_from_slice(&hdr(b"world.txt", b'0', 2, b""));
+        stream.extend(data_block(b"yo"));
+        stream.extend(end_marker());
+
+        let mut out = Vec::new();
+        {
+            let mut r: &[u8] = &stream;
+            strip_device_members(&mut r, &mut out).expect("strip a well-formed tar");
+        }
+        assert!(contains(&out, b"hello.txt"), "regular member must survive");
+        assert!(contains(&out, b"world.txt"), "regular member must survive");
+        assert!(
+            !contains(&out, b"dev/console"),
+            "char device must be stripped"
+        );
+        assert!(!contains(&out, b"dev/sda"), "block device must be stripped");
+        // The re-emitted tar is device-free and valid, so the UNCHANGED vetter accepts it.
+        let mut rr: &[u8] = &out;
+        assert!(
+            vet_tar_stream(&mut rr).is_ok(),
+            "stripped output must re-vet clean"
+        );
+    }
+
+    /// A device carried by a GNU long-name ('L') record: strip must drop BOTH the device AND the staged
+    /// 'L' that named it (no orphan meta), stay byte-synchronized so the following member survives, and
+    /// the output must re-vet clean.
+    #[test]
+    fn strip_drops_longnamed_device_with_its_meta() {
+        let longname = vec![b'a'; 160]; // > 100 chars -> needs an L record
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"././@LongLink", b'L', longname.len() as u64, b""));
+        stream.extend(data_block(&longname));
+        stream.extend_from_slice(&hdr(b"dev/long", b'3', 0, b"")); // the device the L named
+        stream.extend_from_slice(&hdr(b"after.txt", b'0', 1, b""));
+        stream.extend(data_block(b"z"));
+        stream.extend(end_marker());
+
+        let mut out = Vec::new();
+        {
+            let mut r: &[u8] = &stream;
+            strip_device_members(&mut r, &mut out).expect("strip succeeds");
+        }
+        assert!(
+            !contains(&out, &longname),
+            "the long-name record naming the device must be dropped, not orphaned"
+        );
+        assert!(
+            contains(&out, b"after.txt"),
+            "the following member must survive, in sync"
+        );
+        let mut rr: &[u8] = &out;
+        assert!(
+            vet_tar_stream(&mut rr).is_ok(),
+            "stripped output re-vets clean"
+        );
+    }
+
+    /// A device with a LYING non-zero size is a desync attempt: `strip` must refuse it (the re-vet would
+    /// too), keeping the parser byte-synchronized rather than skipping attacker-chosen "data".
+    #[test]
+    fn strip_refuses_device_with_nonzero_size() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"dev/evil", b'3', 512, b"")); // device claiming 512 data bytes
+        stream.extend(data_block(&[0x41; 512]));
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        let mut out = Vec::new();
+        assert!(
+            strip_device_members(&mut r, &mut out).is_err(),
+            "a device node with non-zero size must be refused (desync)"
+        );
     }
 
     /// REGRESSION (panic): a PAX record whose `<len>` falls INSIDE a multi-byte UTF-8 sequence must not
