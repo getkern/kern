@@ -1043,6 +1043,9 @@ mod tests {
     fn subtree_batch_tolerates_whitespace_and_newlines() {
         // `cgroup.controllers` is a single space-separated line, but be robust to tabs/extra spaces/
         // a trailing newline from the read.
-        assert_eq!(subtree_batch("  memory   pids\tcpu  \n"), "+memory +pids +cpu");
+        assert_eq!(
+            subtree_batch("  memory   pids\tcpu  \n"),
+            "+memory +pids +cpu"
+        );
     }
 }
