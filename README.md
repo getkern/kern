@@ -18,6 +18,10 @@ was installed at all).
 
 **~2 ms** cold start (vs **~308 ms** `docker run`) · **~1.6 MB** static binary · **0 RAM at rest** · **rootless**
 
+<p align="center">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern bench --rootfs ./alpine' reports median 1.4 ms, min 1.3 ms, 670 boxes/sec on a P-core; 'time docker run --rm alpine true' reports real 300 ms. The same isolated box, no daemon, from a 1.6 MB static binary, on an Intel i7-14700KF, Linux 7.0.">
+</p>
+
 **🐧 Linux & ARM boards**
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
@@ -775,10 +779,10 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
   without them.
 
 **Deliberately not here:**
-- **Not a microVM, not for hostile multi-tenancy.** kern is a **kernel-boundary** sandbox (namespaces +
-  an always-on seccomp denylist) for your own or semi-trusted code. A kernel vulnerability is not
-  contained; for actively hostile tenants reach for a microVM (Firecracker) or gVisor. The
-  [threat model](SECURITY.md) says so plainly.
+- **Not a microVM, not for hostile multi-tenancy.** A kernel vulnerability isn't contained: kern is a
+  kernel-boundary sandbox for your own or semi-trusted code. When to reach for a microVM (Firecracker)
+  or gVisor instead is spelled out in [When to use kern (and when not)](#when-to-use-kern-and-when-not)
+  and the [threat model](SECURITY.md).
 - **No overlay / software-defined networking** (a box gets an isolated netns, or the host's; a pod
   shares one) and no Docker plugin ecosystem.
 - **`kern exec` caps** are inherited only where kern can join the box's cgroup (root, or a delegated
@@ -828,10 +832,6 @@ and some may never ship if they would change what kern is. Recently shipped work
   so a native macOS kern is a non-goal. The only path considered is a thin shim driving a Linux VM (the
   same shape as WSL2 on Windows), with the same honest caveat, the win would be "no Docker Desktop", not
   "no VM". Not committed.
-- **A microVM (`--vm`) mode.** An obvious question, given the threat model: to run *actively hostile* code. It would be a
-  different tool with a different threat model: kern today is a **kernel-boundary** sandbox, not a
-  microVM, and says so plainly. If it ever shipped it would be an explicit, separate mode, never a silent
-  change to what kern is. Not committed.
 - **1.0, freeze:** CLI + config under semver, threat model + architecture finalised.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
