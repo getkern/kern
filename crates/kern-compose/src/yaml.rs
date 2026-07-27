@@ -124,6 +124,10 @@ pub(crate) fn parse_with_env(
                     warn("'networks:' ignored - kern connects pod members by name (shared netns)");
                 }
             }
+            // `x-…` is the Compose Specification's EXTENSION mechanism, not an unknown key: it is
+            // how the `x-common:` + anchors DRY idiom works, so warning about it means every file
+            // using the most common pattern in the ecosystem gets a false alarm.
+            other if other.starts_with("x-") => {}
             other => warn(&format!("top-level '{other}:' ignored (unsupported)")),
         }
     }
@@ -1787,6 +1791,8 @@ fn service_to_box(
             "configs" | "logging" | "expose" | "extends" | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
+            // Service-level extension field: defined by the spec, ignored on purpose, silently.
+            other if other.starts_with("x-") => {}
             other => warn(&format!(
                 "service '{name}': '{other}:' ignored (unsupported)"
             )),
