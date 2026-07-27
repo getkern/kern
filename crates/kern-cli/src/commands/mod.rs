@@ -146,6 +146,9 @@ pub fn help() -> Result<(), Error> {
     --cap-add <CAP>     Keep a capability kern would otherwise drop (e.g. NET_ADMIN, or ALL); repeatable
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
     --no-uid-range      Use the single-uid map (an --image box maps a uid RANGE by default)
+    --stop-signal <s>   Signal sent before the SIGKILL on stop (name or number; default SIGTERM)
+    --stop-timeout <n>  Seconds the workload gets to exit on its own before the SIGKILL (default 10)
+    --restart-max <n>   How many times --restart retries before giving up (default 10)
     --ulimit <n=s[:h]>  Set a resource limit (e.g. nofile=1024:2048); rootless can only LOWER; repeatable
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
     -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
@@ -2135,6 +2138,21 @@ fn resolve_image_command(
     let mut full = img.entrypoint.clone();
     full.extend(args);
     if full.is_empty() {
+        // The image told us NOTHING to run and the caller gave no command. That is not "run a
+        // shell": it means the cached image config is missing (an entry pulled by an older kern, or
+        // a pull that never wrote its sidecar). Falling back silently produced a box that exec'd
+        // `/bin/sh`, exited immediately under `-d`, and left no log at all - a failure with no
+        // trace, which is exactly what this codebase refuses.
+        //
+        // The fallback stays (a shell is still the useful thing for an interactive box), but it is
+        // now announced, with the way to fix the cache entry.
+        if user_command.is_empty() {
+            eprintln!(
+                "kern: this image declares no entrypoint or command in kern's cache, so the box runs \
+                 `{DEFAULT_SHELL}` - which exits at once when detached. Repair the cache entry with \
+                 `--pull always`, or pass the command explicitly after `--`."
+            );
+        }
         full.push(DEFAULT_SHELL.to_string());
     }
     full
@@ -7245,6 +7263,9 @@ fn pull_to_cache(
         let _ = std::fs::write(&sentinel, image.as_bytes());
         return Ok((dir.to_string_lossy().into_owned(), config));
     }
+    // NOTE: an entry whose sentinel exists but whose config sidecar does not is INCOMPLETE and is
+    // not repaired here - this branch is not reached for it, so a box from such an entry falls back
+    // to a shell (announced by `resolve_image_command`) and `--pull always` is the way to fix it.
     if !sentinel.exists() {
         // Only `missing` reaches here uncached (`never` failed closed at the top; `always` returned in
         // its own branch). Re-checked under the lock: a concurrent pull may have finished while we

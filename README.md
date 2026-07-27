@@ -598,7 +598,7 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 | From your Docker setup | kern |
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd** |
-| **`docker-compose.yml`** | ✅ `kern compose` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `${VAR:-default}` interpolation, network **aliases** |
+| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
 | **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), **COPY globs** (`*.txt`, `src/*`, `[ab].conf`), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, layer cache, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context: keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: export/import an image tar, `docker load`-compatible |
@@ -607,6 +607,20 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 | **`docker commit`** (container → image) | ✅ `kern commit <box> <image>`: snapshots the box's filesystem to a reusable image (warm start); skips volumes/secrets |
 | **Docker Engine API** / `docker.sock` | ❌: tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
 | **Swarm** | ❌: use `compose` / `--pod` |
+
+**One stack, one network namespace.** The services of a `kern compose` stack share a
+single network namespace, like the containers of a Kubernetes pod: they reach each
+other by service name on `127.0.0.1`, with no bridge, no IPAM and no DNS server.
+That is what makes a stack start in milliseconds, and it has one consequence worth
+knowing before you choose kern: **two services cannot both listen on the same
+container port**, even when their published ports differ. Two apps that both default
+to `:3000` is the common case, so kern refuses it *before* starting anything, names
+both services, and tells you to give one a different internal port (most images read
+one from an env var) or to use `--no-pod`. The same applies to `net.*` sysctls, which
+belong to the namespace and therefore to the whole stack.
+
+If you need per-service network isolation or overlapping ports, that is the one
+compose shape kern does not run today.
 
 ### Everyday `docker` commands
 
