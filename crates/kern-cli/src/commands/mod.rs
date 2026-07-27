@@ -7177,7 +7177,12 @@ fn pull_to_cache(
         )));
     }
     own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
-    if policy != PullPolicy::Always && sentinel.exists() {
+    // A cache entry is COMPLETE only with BOTH its sentinel and its config sidecar. An entry written
+    // before the sidecar existed stayed broken forever otherwise: the sentinel short-circuited every
+    // later pull, the config read back empty, and a box with no explicit command exec'd a shell that
+    // exits at once when detached, leaving no log. Treating it as a miss re-fetches and repairs it,
+    // once, without the user having to know that `--pull always` was the way out.
+    if policy != PullPolicy::Always && sentinel.exists() && cfgfile.exists() {
         // fast path: already cached (and not a forced `--pull always` re-fetch)
         return Ok((
             dir.to_string_lossy().into_owned(),
@@ -7263,14 +7268,16 @@ fn pull_to_cache(
         let _ = std::fs::write(&sentinel, image.as_bytes());
         return Ok((dir.to_string_lossy().into_owned(), config));
     }
-    // NOTE: an entry whose sentinel exists but whose config sidecar does not is INCOMPLETE and is
-    // not repaired here - this branch is not reached for it, so a box from such an entry falls back
-    // to a shell (announced by `resolve_image_command`) and `--pull always` is the way to fix it.
-    if !sentinel.exists() {
+    // Reached when the entry is missing OR incomplete (sentinel without config sidecar).
+    if !sentinel.exists() || !cfgfile.exists() {
         // Only `missing` reaches here uncached (`never` failed closed at the top; `always` returned in
         // its own branch). Re-checked under the lock: a concurrent pull may have finished while we
         // waited, in which case the sentinel now exists and we skip the fetch.
-        eprintln!("→ image '{image}' not cached - pulling once (reused after)");
+        if sentinel.exists() {
+            eprintln!("→ image '{image}' is cached without its config - re-fetching it once");
+        } else {
+            eprintln!("→ image '{image}' not cached - pulling once (reused after)");
+        }
         let _ = std::fs::remove_dir_all(&dir); // clear any partial extraction
         std::fs::create_dir_all(&dir).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
         // The `box --image` cache path pulls the host arch; `box --platform` (foreign-arch box) is
@@ -10571,6 +10578,182 @@ fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Err
     Ok(())
 }
 
+/// Everything `compose` needs for the verbs that do NOT start anything, grouped so the extracted
+/// dispatch keeps a readable signature instead of eight positional arguments.
+struct TerminalOpts<'a> {
+    pod: &'a str,
+    file: &'a str,
+    tail: Option<usize>,
+    follow: bool,
+    services: &'a [String],
+}
+
+/// Run the compose verbs that never launch a box, and report whether one ran.
+///
+/// `Ok(true)` means the verb was terminal and the command is done; `Ok(false)`
+/// means the caller must continue to the bring-up (`up`, `start`, and `restart` after it has
+/// stopped the stack). Extracted from `compose`, which had grown past 500 lines: the split is
+/// exactly the boundary between "answers a question about the stack" and "changes it".
+fn run_terminal_verb(
+    action: ComposeAction,
+    boxes: &mut [crate::compose::ComposeBox],
+    o: &TerminalOpts<'_>,
+) -> Result<bool, Error> {
+    let (pod, file, tail, follow, services) = (o.pod, o.file, o.tail, o.follow, o.services);
+    let selected =
+        |b: &crate::compose::ComposeBox| services.is_empty() || services.contains(&b.name);
+
+    match action {
+        // Read-only / terminal verbs: each returns, so the bring-up below is reached ONLY by the
+        // verbs that actually start something (Up, Start, Restart).
+        ComposeAction::Config => {
+            // Parse + interpolate + validate, then print what kern actually resolved - the answer to
+            // "is my file what I think it is" WITHOUT starting anything. Validation runs first so a
+            // broken graph is reported here rather than at the next `up`.
+            crate::compose::topo_levels(boxes).map_err(Error::Compose)?;
+            validate_conditions(boxes)?;
+            check_port_collisions(boxes)?;
+            // Validate every published spec HERE, with the same parser the box uses. `config` is the
+            // verb people run to check a file, so a typo must surface without starting anything (as
+            // `docker compose config` does) instead of failing one box at bring-up. ALL bad specs are
+            // reported together: fixing them one error per run is a poor loop.
+            let bad: Vec<String> = boxes
+                .iter()
+                .flat_map(|b| {
+                    b.ports
+                        .iter()
+                        .filter(|spec| crate::ports::parse(spec).is_none())
+                        .map(move |spec| format!("  {}: invalid port '{spec}'", b.name))
+                })
+                .collect();
+            if !bad.is_empty() {
+                return Err(Error::Compose(format!(
+                    "{} invalid port spec(s) - expected [ip:]host:box[/tcp|/udp], ports 1-65535:\n{}",
+                    bad.len(),
+                    bad.join("\n")
+                )));
+            }
+            println!("compose config: {} service(s) in {file}", boxes.len());
+            // `config` reports the FILE, so it prints service names as written, not the
+            // project-scoped box names the runtime uses.
+            let short = |n: &str| n.strip_prefix(&format!("{pod}-")).unwrap_or(n).to_string();
+            for b in boxes.iter().filter(|b| selected(b)) {
+                let src = b
+                    .image
+                    .as_deref()
+                    .or(b.rootfs.as_deref())
+                    .unwrap_or("(build)");
+                println!("  {}  image={src}", short(&b.name));
+                if !b.ports.is_empty() {
+                    println!("    ports: {}", b.ports.join(", "));
+                }
+                let deps: Vec<String> = b.all_deps().into_iter().map(short).collect();
+                if !deps.is_empty() {
+                    println!("    depends_on: {}", deps.join(", "));
+                }
+            }
+            return Ok(true);
+        }
+        ComposeAction::Ps => {
+            // Reuse `kern ps` itself, scoped to this stack's pod - one renderer, so the compose view
+            // can never drift from `kern ps` (same columns, same status rules, same --json).
+            return ps(false, false, &[("pod".to_string(), pod.to_string())], None).map(|()| true);
+        }
+        ComposeAction::Logs => {
+            let wanted: Vec<&str> = boxes
+                .iter()
+                .filter(|b| selected(b))
+                .map(|b| b.name.as_str())
+                .collect();
+            // `-f` on several services would need one blocking reader each; rather than interleave
+            // them badly, require a single service and say exactly how to ask for it.
+            if follow && wanted.len() != 1 {
+                return Err(Error::Compose(format!(
+                    "compose logs -f follows ONE service at a time; name it (e.g. `compose {file} logs -f {}`)",
+                    wanted.first().copied().unwrap_or("<service>")
+                )));
+            }
+            for (i, name) in wanted.iter().enumerate() {
+                if wanted.len() > 1 {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("=== {name} ===");
+                }
+                // A service that never started (or already exited) has no log: report it and keep
+                // going, so one missing service can't hide the others' output.
+                if let Err(e) = logs(name, tail, follow) {
+                    eprintln!("compose logs: {name}: {e}");
+                }
+            }
+            return Ok(true);
+        }
+        ComposeAction::Pull => {
+            let mut n = 0usize;
+            for b in boxes.iter().filter(|b| selected(b)) {
+                if let Some(img) = b.image.as_deref() {
+                    pull(img, None, None)?;
+                    n += 1;
+                }
+            }
+            println!("compose pull: {n} image(s) up to date");
+            return Ok(true);
+        }
+        ComposeAction::Build => {
+            let self_exe = std::env::current_exe()
+                .map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
+            resolve_builds(boxes, file, &self_exe)?;
+            println!("compose build: done");
+            return Ok(true);
+        }
+        ComposeAction::Down => {
+            let names = stop_stack(boxes, pod);
+            // Tear the pod down QUIETLY (we just stopped the members, so `pod::remove`'s "members keep
+            // running" note would contradict this). Only claim it was removed if one existed - a
+            // `--no-pod` stack has none.
+            let (pod_existed, _) = crate::pod::teardown(pod);
+            if pod_existed {
+                println!(
+                    "compose down: {} box(es) stopped, pod '{pod}' removed",
+                    names.len()
+                );
+            } else {
+                println!("compose down: {} box(es) stopped", names.len());
+            }
+            return Ok(true);
+        }
+        ComposeAction::Stop => {
+            // `stop` touches ONLY this file's services and never tears the pod down itself; `down`
+            // removes the pod unconditionally. The distinction is real when the pod has members that
+            // are NOT in this file (someone ran `kern box --pod <same>`): those keep running and the
+            // pod with them. With no such member the pod still goes, because `kern stop` collapses a
+            // pod once its LAST member exits (a deliberate, documented invariant - see `stop`); a
+            // later `compose start` recreates it and services reach each other by name again.
+            let names = stop_stack(boxes, pod);
+            let pod_alive = crate::pod::holder_pid(pod).is_some();
+            println!(
+                "compose stop: {} box(es) stopped, pod '{pod}' {}",
+                names.len(),
+                if pod_alive {
+                    "still up (other members remain)"
+                } else {
+                    "gone with its last member (`start` recreates it)"
+                }
+            );
+            return Ok(true);
+        }
+        // `restart` = stop everything, then fall through to the full bring-up below.
+        ComposeAction::Restart => {
+            let names = stop_stack(boxes, pod);
+            println!(
+                "compose restart: {} box(es) stopped, restarting",
+                names.len()
+            );
+        }
+        ComposeAction::Up | ComposeAction::Start => {}
+    }
+    Ok(false)
+}
 /// `kern compose <file>` - bring up a stack of boxes (detached) in `depends_on` order. Each
 /// service is launched via a fresh `kern box -d` subprocess, so it gets its own scope + registry
 /// entry; track the stack with `kern ps`.
@@ -10712,157 +10895,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             )));
         }
     }
-    let selected =
-        |b: &crate::compose::ComposeBox| services.is_empty() || services.contains(&b.name);
-
-    match action {
-        // Read-only / terminal verbs: each returns, so the bring-up below is reached ONLY by the
-        // verbs that actually start something (Up, Start, Restart).
-        ComposeAction::Config => {
-            // Parse + interpolate + validate, then print what kern actually resolved - the answer to
-            // "is my file what I think it is" WITHOUT starting anything. Validation runs first so a
-            // broken graph is reported here rather than at the next `up`.
-            crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
-            validate_conditions(&boxes)?;
-            check_port_collisions(&boxes)?;
-            // Validate every published spec HERE, with the same parser the box uses. `config` is the
-            // verb people run to check a file, so a typo must surface without starting anything (as
-            // `docker compose config` does) instead of failing one box at bring-up. ALL bad specs are
-            // reported together: fixing them one error per run is a poor loop.
-            let bad: Vec<String> = boxes
-                .iter()
-                .flat_map(|b| {
-                    b.ports
-                        .iter()
-                        .filter(|spec| crate::ports::parse(spec).is_none())
-                        .map(move |spec| format!("  {}: invalid port '{spec}'", b.name))
-                })
-                .collect();
-            if !bad.is_empty() {
-                return Err(Error::Compose(format!(
-                    "{} invalid port spec(s) - expected [ip:]host:box[/tcp|/udp], ports 1-65535:\n{}",
-                    bad.len(),
-                    bad.join("\n")
-                )));
-            }
-            println!("compose config: {} service(s) in {file}", boxes.len());
-            // `config` reports the FILE, so it prints service names as written, not the
-            // project-scoped box names the runtime uses.
-            let short = |n: &str| n.strip_prefix(&format!("{pod}-")).unwrap_or(n).to_string();
-            for b in boxes.iter().filter(|b| selected(b)) {
-                let src = b
-                    .image
-                    .as_deref()
-                    .or(b.rootfs.as_deref())
-                    .unwrap_or("(build)");
-                println!("  {}  image={src}", short(&b.name));
-                if !b.ports.is_empty() {
-                    println!("    ports: {}", b.ports.join(", "));
-                }
-                let deps: Vec<String> = b.all_deps().into_iter().map(short).collect();
-                if !deps.is_empty() {
-                    println!("    depends_on: {}", deps.join(", "));
-                }
-            }
-            return Ok(());
-        }
-        ComposeAction::Ps => {
-            // Reuse `kern ps` itself, scoped to this stack's pod - one renderer, so the compose view
-            // can never drift from `kern ps` (same columns, same status rules, same --json).
-            return ps(false, false, &[("pod".to_string(), pod.clone())], None);
-        }
-        ComposeAction::Logs => {
-            let wanted: Vec<&str> = boxes
-                .iter()
-                .filter(|b| selected(b))
-                .map(|b| b.name.as_str())
-                .collect();
-            // `-f` on several services would need one blocking reader each; rather than interleave
-            // them badly, require a single service and say exactly how to ask for it.
-            if follow && wanted.len() != 1 {
-                return Err(Error::Compose(format!(
-                    "compose logs -f follows ONE service at a time; name it (e.g. `compose {file} logs -f {}`)",
-                    wanted.first().copied().unwrap_or("<service>")
-                )));
-            }
-            for (i, name) in wanted.iter().enumerate() {
-                if wanted.len() > 1 {
-                    if i > 0 {
-                        println!();
-                    }
-                    println!("=== {name} ===");
-                }
-                // A service that never started (or already exited) has no log: report it and keep
-                // going, so one missing service can't hide the others' output.
-                if let Err(e) = logs(name, tail, follow) {
-                    eprintln!("compose logs: {name}: {e}");
-                }
-            }
-            return Ok(());
-        }
-        ComposeAction::Pull => {
-            let mut n = 0usize;
-            for b in boxes.iter().filter(|b| selected(b)) {
-                if let Some(img) = b.image.as_deref() {
-                    pull(img, None, None)?;
-                    n += 1;
-                }
-            }
-            println!("compose pull: {n} image(s) up to date");
-            return Ok(());
-        }
-        ComposeAction::Build => {
-            let self_exe = std::env::current_exe()
-                .map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
-            resolve_builds(&mut boxes, file, &self_exe)?;
-            println!("compose build: done");
-            return Ok(());
-        }
-        ComposeAction::Down => {
-            let names = stop_stack(&boxes, &pod);
-            // Tear the pod down QUIETLY (we just stopped the members, so `pod::remove`'s "members keep
-            // running" note would contradict this). Only claim it was removed if one existed - a
-            // `--no-pod` stack has none.
-            let (pod_existed, _) = crate::pod::teardown(&pod);
-            if pod_existed {
-                println!(
-                    "compose down: {} box(es) stopped, pod '{pod}' removed",
-                    names.len()
-                );
-            } else {
-                println!("compose down: {} box(es) stopped", names.len());
-            }
-            return Ok(());
-        }
-        ComposeAction::Stop => {
-            // `stop` touches ONLY this file's services and never tears the pod down itself; `down`
-            // removes the pod unconditionally. The distinction is real when the pod has members that
-            // are NOT in this file (someone ran `kern box --pod <same>`): those keep running and the
-            // pod with them. With no such member the pod still goes, because `kern stop` collapses a
-            // pod once its LAST member exits (a deliberate, documented invariant - see `stop`); a
-            // later `compose start` recreates it and services reach each other by name again.
-            let names = stop_stack(&boxes, &pod);
-            let pod_alive = crate::pod::holder_pid(&pod).is_some();
-            println!(
-                "compose stop: {} box(es) stopped, pod '{pod}' {}",
-                names.len(),
-                if pod_alive {
-                    "still up (other members remain)"
-                } else {
-                    "gone with its last member (`start` recreates it)"
-                }
-            );
-            return Ok(());
-        }
-        // `restart` = stop everything, then fall through to the full bring-up below.
-        ComposeAction::Restart => {
-            let names = stop_stack(&boxes, &pod);
-            println!(
-                "compose restart: {} box(es) stopped, restarting",
-                names.len()
-            );
-        }
-        ComposeAction::Up | ComposeAction::Start => {}
+    // Verbs that answer a question about the stack rather than changing it return here.
+    if run_terminal_verb(
+        action,
+        &mut boxes,
+        &TerminalOpts {
+            pod: &pod,
+            file,
+            tail,
+            follow,
+            services,
+        },
+    )? {
+        return Ok(());
     }
 
     let mut levels = crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
