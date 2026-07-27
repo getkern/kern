@@ -145,6 +145,7 @@ pub fn help() -> Result<(), Error> {
     -u, --user <u[:g]>  Run the box command as this uid[:gid] (numeric; needs the id mapped)
     --cap-add <CAP>     Keep a capability kern would otherwise drop (e.g. NET_ADMIN, or ALL); repeatable
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
+    --no-uid-range      Use the single-uid map (an --image box maps a uid RANGE by default)
     --ulimit <n=s[:h]>  Set a resource limit (e.g. nofile=1024:2048); rootless can only LOWER; repeatable
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
     -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
@@ -11128,8 +11129,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let dead = settle_and_collect_dead(&boxes, &pod, &up_token);
     if !dead.is_empty() {
         return Err(Error::Compose(format!(
-            "{} service(s) died during startup: {}\n  the rest of the stack is still running; \
-             inspect with `kern compose {file} logs <service>`",
+            "{} service(s) died within {BRING_UP_SETTLE_MS}ms of starting: {}\n  the rest of the \
+             stack is still running; inspect with `kern compose {file} logs <service>`\n  (`up` \
+             reports deaths at STARTUP; a service that dies later is not detected yet)",
             dead.len(),
             dead.join(", ")
         )));
@@ -13310,6 +13312,37 @@ mod label_filter_tests {
         assert!(ps_matches(&b, &f("label", "cfg=a=b")));
         assert!(ps_matches(&b, &f("label", "cfg")));
         assert!(!ps_matches(&b, &f("label", "cfg=a")));
+    }
+}
+
+#[cfg(test)]
+mod bring_up_check_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_awaited_completion_may_have_exited() {
+        // The exit sidecar is written ONLY for a service some peer awaits with
+        // `service_completed_successfully`, so the presence of a clean exit IS the declared intention:
+        // a migration task that finished passes, and a long-running service that exited 0 by mistake
+        // (a wrong command that printed help and returned 0, a config that made it terminate cleanly)
+        // does NOT, because nobody declared it was allowed to end.
+        //
+        // A reviewer read the simplified rule as "any exit 0 is legitimate", which would have left
+        // exactly that case silent. It does not, and this test pins the distinction so a future
+        // simplification cannot quietly widen it.
+        let pod = "p";
+        let token = "t";
+        let awaited = exit_key(pod, token, "migrate");
+        registry::set_exit(&awaited, 0);
+        assert_eq!(
+            registry::exit_of(&awaited),
+            Some(0),
+            "awaited: clean end recorded"
+        );
+        // A service nobody awaits has no sidecar at all, which is not `Some(0)` and therefore counts
+        // as a death - the check `settle_and_collect_dead` performs.
+        assert_eq!(registry::exit_of(&exit_key(pod, token, "web")), None);
+        registry::clear_exit(&awaited);
     }
 }
 
