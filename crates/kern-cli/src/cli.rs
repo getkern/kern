@@ -102,6 +102,8 @@ pub enum Command {
         sysctls: Vec<(String, String)>,
         /// `--label k=v` (repeatable): descriptive metadata recorded in the registry.
         labels: Vec<String>,
+        /// `--restart-max <n>`: retry cap for the on-failure policy (0 = kern's default).
+        restart_max: u32,
         /// `--stop-signal`: signal sent before the SIGKILL (default SIGTERM).
         stop_signal: i32,
         /// `--stop-timeout <secs>`: grace before the SIGKILL.
@@ -1196,6 +1198,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut ulimits: Vec<(i32, u64, u64)> = Vec::new();
     let mut sysctls: Vec<(String, String)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
+    let mut restart_max: u32 = 0;
     let mut stop_signal: i32 = libc::SIGTERM;
     let mut stop_grace: u64 = 10;
     let mut run_as: Option<String> = None;
@@ -1307,6 +1310,15 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // `--stop-signal NAME|NUM` / `--stop-timeout SECS`: Docker's shutdown contract. A
                 // hard kill makes redis lose unsaved data and postgres do crash recovery on the next
                 // start, so the default is SIGTERM with a 10 s grace, exactly like Docker.
+                // `--restart-max N`: how many times the on-failure supervisor retries before giving
+                // up. Compose's `on-failure:N` maps here; 0 keeps kern's built-in cap.
+                "--restart-max" => {
+                    i += 1;
+                    restart_max = match rest.get(i).and_then(|v| v.parse::<u32>().ok()) {
+                        Some(v) => v,
+                        None => return Err(Error::Usage("--restart-max <n>")),
+                    };
+                }
                 "--stop-signal" => {
                     i += 1;
                     stop_signal = match rest.get(i) {
@@ -1774,6 +1786,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             ulimits,
             sysctls,
             labels,
+            restart_max,
             stop_signal,
             stop_grace,
             run_as,
@@ -2219,6 +2232,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ulimits,
             sysctls,
             labels,
+            restart_max,
             stop_signal,
             stop_grace,
             run_as,
@@ -2277,6 +2291,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ulimits: &ulimits,
             sysctls: &sysctls,
             labels: &labels,
+            restart_max,
             stop_signal,
             stop_grace,
             run_as: run_as.as_deref(),

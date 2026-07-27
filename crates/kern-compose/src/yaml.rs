@@ -2630,6 +2630,23 @@ fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
     match v.as_str() {
         "" | "no" => b.restart = false,
         "on-failure" => b.restart = true,
+        // `on-failure:N` caps the retries. kern already stops after a fixed number; honouring the
+        // number the file asks for is the difference between "gives up eventually" and "gives up when
+        // you said", which is what the syntax exists for.
+        other if other.starts_with("on-failure:") => {
+            b.restart = true;
+            b.restart_max = other
+                .trim_start_matches("on-failure:")
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .map(|n| n.to_string());
+            if b.restart_max.is_none() {
+                warn(&format!(
+                    "service '{svc}': restart '{other}' has no valid retry count - using the default cap"
+                ));
+            }
+        }
         "always" | "unless-stopped" => {
             b.restart = true;
             warn(&format!(

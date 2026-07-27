@@ -103,6 +103,8 @@ pub struct ComposeBox {
     pub ulimits: Vec<String>,
     /// Compose `labels:` → one `--label k=v` per entry (mapping `k: v` or `k=v` list form).
     pub labels: Vec<String>,
+    /// Compose `restart: "on-failure:N"` → `--restart-max N` (retry cap).
+    pub restart_max: Option<String>,
     /// Compose `stop_signal:` → `--stop-signal` (the signal sent before the SIGKILL).
     pub stop_signal: Option<String>,
     /// Compose `stop_grace_period:` → `--stop-timeout` (seconds; Docker's duration form is parsed).
@@ -255,6 +257,9 @@ impl ComposeBox {
         }
         for v in &self.labels {
             cmd.arg("--label").arg(v);
+        }
+        if let Some(v) = &self.restart_max {
+            cmd.arg("--restart-max").arg(v);
         }
         if let Some(v) = &self.stop_signal {
             cmd.arg("--stop-signal").arg(v);
@@ -1619,6 +1624,24 @@ mod compat_field_tests {
         );
         let base = parse("services:\n  a:\n    image: alpine\n").expect("base");
         assert!(validate_runnable(&merge_stacks(base, over)).is_ok());
+    }
+
+    #[test]
+    fn on_failure_with_a_count_caps_the_retries() {
+        // `on-failure:3` exists to give up when the author said, not merely to give up eventually.
+        let b = one("services:\n  a:\n    image: x\n    restart: \"on-failure:3\"\n");
+        assert!(b.restart, "still an on-failure policy");
+        assert_eq!(b.restart_max.as_deref(), Some("3"));
+        // A plain policy leaves the cap to kern's default.
+        assert_eq!(
+            one("services:\n  a:\n    image: x\n    restart: on-failure\n").restart_max,
+            None
+        );
+        // A malformed count falls back to the default rather than silently meaning zero retries.
+        assert_eq!(
+            one("services:\n  a:\n    image: x\n    restart: \"on-failure:abc\"\n").restart_max,
+            None
+        );
     }
 
     #[test]

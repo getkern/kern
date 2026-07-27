@@ -333,6 +333,8 @@ pub struct BoxRunArgs<'a> {
     /// `--label k=v` metadata (repeatable). Descriptive only: it does not change how the box runs,
     /// but it is recorded in the registry so `kern ps --filter label=` and `kern inspect` can use it.
     pub labels: &'a [String],
+    /// `--restart-max <n>`: retry cap for the on-failure supervisor (0 = kern's default).
+    pub restart_max: u32,
     /// `--stop-signal <name|num>`: signal sent before the SIGKILL (default SIGTERM).
     pub stop_signal: i32,
     /// `--stop-timeout <secs>`: grace given to the workload before the SIGKILL.
@@ -1113,6 +1115,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             &args.labels.join(","),
             args.stop_signal,
             args.stop_grace,
+            args.restart_max,
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -2967,6 +2970,16 @@ fn await_box_started(
     Ok(())
 }
 
+/// The on-failure restart contract for one box: whether to retry at all, and how many times.
+/// Grouped so the supervisor keeps a readable signature as the contract grows.
+#[derive(Debug, Clone, Copy)]
+struct Restart {
+    /// `--restart` (on-failure). `false` = run once, never retry.
+    on_failure: bool,
+    /// `--restart-max` / compose `on-failure:N`. 0 = kern's built-in cap.
+    max: u32,
+}
+
 /// Supervisor loop: run the box and wait for it; with `--restart` (on-failure) re-run it on a
 /// non-zero exit, up to a cap with a 1 s backoff so a perpetually-crashing box eventually gives up.
 /// Each attempt is a FRESH child - `run_in_sandbox_with` unshares its *caller*, so it can't be
@@ -2979,10 +2992,15 @@ fn supervise_box(
     have_pipe: bool,
     wr: i32,
     ports: &[kern_isolation::PortMap],
-    restart: bool,
+    restart: Restart,
     inst: &mut registry::Instance,
 ) {
-    const MAX_RESTARTS: u32 = 10;
+    const DEFAULT_MAX_RESTARTS: u32 = 10;
+    let max_restarts = if restart.max > 0 {
+        restart.max
+    } else {
+        DEFAULT_MAX_RESTARTS
+    };
     // `compose` hands a box that is a `depends_completed` target an exit KEY via env `KERN_EXIT_KEY`.
     // The key is `<pod>-<token>-<name>` - it encodes both the stack AND the `up` epoch, so recording
     // the final code under it can't collide with a same-named service in another stack, nor with the
@@ -3046,9 +3064,9 @@ fn supervise_box(
             1 // fork or waitpid failed - treat as a failure, don't spin
         };
         attempt += 1;
-        if restart && code != 0 && attempt <= MAX_RESTARTS {
+        if restart.on_failure && code != 0 && attempt <= max_restarts {
             eprintln!(
-                "kern: box '{}' exited {code}; restarting ({attempt}/{MAX_RESTARTS})",
+                "kern: box '{}' exited {code}; restarting ({attempt}/{max_restarts})",
                 name.as_str()
             );
             unsafe { libc::sleep(1) }; // brief backoff so a crash loop can't spin
@@ -3126,6 +3144,8 @@ fn run_detached(
     // honour the shutdown contract the box was started with.
     stop_signal: i32,
     stop_grace: u64,
+    // `--restart-max`: retry cap for the on-failure supervisor (0 = kern's default).
+    restart_max: u32,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -3206,7 +3226,18 @@ fn run_detached(
         (timeout > 0).then(|| spawn_timeout_stop(name.as_str().to_string(), pid, timeout));
     // Run the box (re-registering with its PID 1 so `kern exec` can find it), restarting it per
     // `--restart`. Blocks for the box's whole lifetime.
-    supervise_box(name, &spec, have_pipe, wr, ports, restart, &mut inst);
+    supervise_box(
+        name,
+        &spec,
+        have_pipe,
+        wr,
+        ports,
+        Restart {
+            on_failure: restart,
+            max: restart_max,
+        },
+        &mut inst,
+    );
     // Box is gone - cancel the sidecars and reap them (they're our children; setsid doesn't change
     // parentage) so we don't leave brief zombies behind before this supervisor exits.
     if let Some(tp) = timeout_pid {
