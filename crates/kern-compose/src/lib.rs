@@ -103,6 +103,10 @@ pub struct ComposeBox {
     pub ulimits: Vec<String>,
     /// Compose `labels:` → one `--label k=v` per entry (mapping `k: v` or `k=v` list form).
     pub labels: Vec<String>,
+    /// Compose `stop_signal:` → `--stop-signal` (the signal sent before the SIGKILL).
+    pub stop_signal: Option<String>,
+    /// Compose `stop_grace_period:` → `--stop-timeout` (seconds; Docker's duration form is parsed).
+    pub stop_grace_period: Option<String>,
     /// Compose `sysctls:` → one `--sysctl KEY=VALUE` per entry (mapping or `KEY=VALUE` list form).
     pub sysctls: Vec<String>,
     pub cap_add: Vec<String>,
@@ -251,6 +255,12 @@ impl ComposeBox {
         }
         for v in &self.labels {
             cmd.arg("--label").arg(v);
+        }
+        if let Some(v) = &self.stop_signal {
+            cmd.arg("--stop-signal").arg(v);
+        }
+        if let Some(v) = &self.stop_grace_period {
+            cmd.arg("--stop-timeout").arg(v);
         }
         for v in &self.volumes {
             cmd.arg("--volume").arg(v);
@@ -1609,6 +1619,25 @@ mod compat_field_tests {
         );
         let base = parse("services:\n  a:\n    image: alpine\n").expect("base");
         assert!(validate_runnable(&merge_stacks(base, over)).is_ok());
+    }
+
+    #[test]
+    fn stop_contract_maps_to_flags_and_seconds() {
+        // Without this contract every service is hard-killed: redis loses whatever it had not saved
+        // and postgres does crash recovery on the NEXT start, on every stop.
+        let b = one("services:\n  a:\n    image: x\n    stop_signal: SIGUSR1\n    stop_grace_period: 1m30s\n");
+        assert_eq!(b.stop_signal.as_deref(), Some("SIGUSR1"));
+        // Docker writes durations; the flag takes seconds.
+        assert_eq!(b.stop_grace_period.as_deref(), Some("90"));
+        for (written, secs) in [("10s", "10"), ("2m", "120"), ("0s", "0"), ("45", "45")] {
+            let g = one(&format!(
+                "services:\n  a:\n    image: x\n    stop_grace_period: {written}\n"
+            ));
+            assert_eq!(g.stop_grace_period.as_deref(), Some(secs), "{written}");
+        }
+        // Sub-second rounds UP: `500ms` asked for a graceful phase, and 0 would mean none at all.
+        let ms = one("services:\n  a:\n    image: x\n    stop_grace_period: 500ms\n");
+        assert_eq!(ms.stop_grace_period.as_deref(), Some("1"));
     }
 
     #[test]

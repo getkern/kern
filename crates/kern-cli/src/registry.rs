@@ -47,6 +47,12 @@ pub struct Instance {
     pub memory_max: Option<u64>,
     /// The box's requested `pids.max` cap (`--pids-limit`); `None` when uncapped or absent.
     pub pids_max: Option<u64>,
+    /// `--stop-signal`: the signal `kern stop` sends BEFORE the SIGKILL, as a number (SIGTERM = 15).
+    /// 0 or absent in an older entry means SIGTERM.
+    pub stop_signal: i32,
+    /// `--stop-timeout`: seconds the workload gets to exit on its own before the SIGKILL. 0 or absent
+    /// keeps the historical behaviour (immediate SIGKILL).
+    pub stop_grace: u64,
     /// `--label k=v` metadata (comma-joined `k=v` pairs), the compose `labels:` target. Purely
     /// descriptive - it changes nothing about how the box runs - but it is what `kern ps --filter
     /// label=` selects on and what `kern inspect` reports, so tooling can group a stack's boxes.
@@ -422,7 +428,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -438,6 +444,8 @@ fn encode(inst: &Instance) -> String {
         inst.memory_max.map(|v| v.to_string()).unwrap_or_default(),
         inst.pids_max.map(|v| v.to_string()).unwrap_or_default(),
         one_line(&inst.labels),
+        inst.stop_signal,
+        inst.stop_grace,
     )
 }
 
@@ -964,6 +972,7 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut egress, mut landlock_rw) = (String::new(), String::new());
     let (mut memory_max, mut pids_max) = (None, None);
     let mut labels = String::new();
+    let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
     for line in body.lines() {
         // Skip a malformed line (e.g. a half-written record from a crash mid-write) rather than `?`-ing
         // out, which would evaporate the WHOLE entry and silently drop a live box from the registry.
@@ -987,6 +996,8 @@ fn parse(body: &str) -> Option<Instance> {
             "memory_max" => memory_max = v.parse().ok(),
             "pids_max" => pids_max = v.parse().ok(),
             "labels" => labels = v.to_string(),
+            "stopsig" => stop_signal = v.parse().unwrap_or(0),
+            "stopgrace" => stop_grace = v.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -1004,6 +1015,8 @@ fn parse(body: &str) -> Option<Instance> {
         egress,
         landlock_rw,
         labels,
+        stop_signal,
+        stop_grace,
         memory_max,
         pids_max,
     })
@@ -1059,6 +1072,8 @@ mod tests {
             memory_max: Some(134_217_728),
             pids_max: Some(64),
             labels: String::new(),
+            stop_signal: 0,
+            stop_grace: 0,
         };
         let got = parse(&encode(&inst)).expect("parse a well-formed entry");
         assert_eq!(got.pod, "stack");
@@ -1071,6 +1086,8 @@ mod tests {
             memory_max: None,
             pids_max: None,
             labels: String::new(),
+            stop_signal: 0,
+            stop_grace: 0,
             ..inst.clone()
         };
         let got2 = parse(&encode(&uncapped)).expect("parse");
@@ -1189,6 +1206,8 @@ mod tests {
                 memory_max: None,
                 pids_max: None,
                 labels: String::new(),
+                stop_signal: 0,
+                stop_grace: 0,
             })
             .unwrap()
         };
@@ -1236,6 +1255,8 @@ mod tests {
             memory_max: None,
             pids_max: None,
             labels: String::new(),
+            stop_signal: 0,
+            stop_grace: 0,
         })
         .unwrap();
         let got = claim_name(&name).unwrap();

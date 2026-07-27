@@ -333,6 +333,10 @@ pub struct BoxRunArgs<'a> {
     /// `--label k=v` metadata (repeatable). Descriptive only: it does not change how the box runs,
     /// but it is recorded in the registry so `kern ps --filter label=` and `kern inspect` can use it.
     pub labels: &'a [String],
+    /// `--stop-signal <name|num>`: signal sent before the SIGKILL (default SIGTERM).
+    pub stop_signal: i32,
+    /// `--stop-timeout <secs>`: grace given to the workload before the SIGKILL.
+    pub stop_grace: u64,
     /// `--user UID[:GID]`: drop to this uid/gid inside the box before the command runs.
     pub run_as: Option<&'a str>,
     /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
@@ -1107,6 +1111,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             },
             args.timeout,
             &args.labels.join(","),
+            args.stop_signal,
+            args.stop_grace,
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -1154,6 +1160,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             egress: args.egress_allow.join(","),
             landlock_rw: spec.landlock_rw.join(","),
             labels: args.labels.join(","),
+            stop_signal: args.stop_signal,
+            stop_grace: args.stop_grace,
             memory_max: spec.memory_max,
             pids_max: spec.pids_max,
         };
@@ -2710,12 +2718,50 @@ unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
 /// The pidfd is taken while the box is still alive, so both the signal and the exit-confirmation are
 /// reuse-proof: a `pidfd` polls readable precisely when its process terminates (even before it's
 /// reaped), which side-steps the zombie window a bare `kill(pid, 0)` probe would trip on.
-fn kill_box(pid: i32, pid1: i32) -> bool {
+/// Docker's shutdown contract: send `stop_signal` first, give the workload
+/// `grace_secs` to exit on its own, then SIGKILL whatever is left.
+///
+/// This is not politeness. A hard SIGKILL means redis loses everything since its last save and
+/// postgres does crash recovery on the NEXT start, on every single `stop`. The graceful phase is what
+/// lets a stateful service flush and close. `grace_secs == 0` keeps the old behaviour (straight to
+/// SIGKILL) for callers that want the box gone now.
+///
+/// The wait is a bounded poll on the pidfd, so a workload that exits immediately costs one syscall,
+/// not the whole grace. A workload that IGNORES the signal costs exactly `grace_secs` and then dies:
+/// the kernel tears down the pid namespace with its PID 1, so nothing survives the SIGKILL.
+fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_secs: u64) -> bool {
     let pidfd = if pid1 > 0 {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
+        if grace_secs > 0 {
+            // Graceful phase: the configured signal to the box init, and to the supervisor's group so
+            // a foreground box's helpers hear it too.
+            unsafe { signal_box(fd, pid1, stop_signal) };
+            if pid > 1 {
+                unsafe { libc::kill(-pid, stop_signal) };
+            }
+            if fd >= 0 {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Exited within the grace: nothing left to kill, and we say so without the SIGKILL.
+                let ms = grace_secs.saturating_mul(1000).min(i32::MAX as u64) as i32;
+                if unsafe { libc::poll(&mut pfd, 1, ms) } > 0 {
+                    unsafe { libc::close(fd) };
+                    return true;
+                }
+            }
+        }
         unsafe { signal_box(fd, pid1, libc::SIGKILL) };
         fd
     } else {
+        if grace_secs > 0 && pid > 1 {
+            unsafe { libc::kill(-pid, stop_signal) };
+            std::thread::sleep(std::time::Duration::from_millis(
+                grace_secs.saturating_mul(1000).min(60_000),
+            ));
+        }
         -1
     };
     // Never let a corrupt/degenerate `pid <= 1` turn the group sweep into `kill(-1)` (SIGKILL every
@@ -3076,6 +3122,10 @@ fn run_detached(
     timeout: u64,
     // `--label k=v` metadata, comma-joined, recorded in the registry entry (see `Instance::labels`).
     labels: &str,
+    // `--stop-signal` / `--stop-timeout`, recorded so a later `kern stop` (a different process) can
+    // honour the shutdown contract the box was started with.
+    stop_signal: i32,
+    stop_grace: u64,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -3127,6 +3177,8 @@ fn run_detached(
         egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
         landlock_rw: spec.landlock_rw.join(","),
         labels: labels.to_string(),
+        stop_signal,
+        stop_grace,
         memory_max: spec.memory_max,
         pids_max: spec.pids_max,
     };
@@ -9551,6 +9603,33 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             format!("no running box named {listed}")
         }));
     }
+    // PHASE 1: send every box its stop signal BEFORE waiting on any of them, and share ONE deadline.
+    // Stopping serially made each box burn its own full grace in turn, so an N-service stack of
+    // workloads that ignore SIGTERM took N x grace (measured: 20 s for two `sh -c sleep` services).
+    // Docker stops a project in parallel; so do we. The per-box wait below then sees processes that
+    // have already been signalled and, for the ones that exit, returns at once.
+    let stop_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(targets.iter().map(|b| b.stop_grace).max().unwrap_or(0));
+    for b in &targets {
+        if b.stop_grace > 0 {
+            let sig = if b.stop_signal > 0 {
+                b.stop_signal
+            } else {
+                libc::SIGTERM
+            };
+            if b.pid1 > 0 {
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, b.pid1, 0) as i32 };
+                unsafe { signal_box(fd, b.pid1, sig) };
+                if fd >= 0 {
+                    unsafe { libc::close(fd) };
+                }
+            }
+            if b.pid > 1 {
+                unsafe { libc::kill(-b.pid, sig) };
+            }
+        }
+    }
+
     for b in &targets {
         // A persistent box: tell systemd to stop AND disable the unit (so it neither restarts now
         // nor comes back at reboot), then remove it. Killing the process instead would just trip
@@ -9574,7 +9653,24 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         let killed = if stop_managed_unit(&b.name) {
             true // systemd owns the lifecycle and has torn the unit down
         } else {
-            kill_box(b.pid, b.pid1)
+            // Honour the shutdown contract the box was STARTED with: the registry carries it, so a
+            // later `kern stop` (a different process) sends the same signal and waits the same grace.
+            // An older entry (0/0) keeps the historical immediate SIGKILL.
+            kill_box_graceful(
+                b.pid,
+                b.pid1,
+                if b.stop_signal > 0 {
+                    b.stop_signal
+                } else {
+                    libc::SIGTERM
+                },
+                // Seconds LEFT until the shared deadline, not this box's full grace: the signal
+                // already went out in phase 1, so the stack converges instead of queueing.
+                stop_deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
+                    .max(u64::from(b.stop_grace > 0)),
+            )
         };
         // A `stop` SIGKILLs the supervisor, which then never records its own exit code. Record 137
         // (128 + SIGKILL) here - BEFORE removing the instance file - so `kern wait` on a stopped box
@@ -11391,6 +11487,8 @@ mod net_resource_tests {
             memory_max: None,
             pids_max: None,
             labels: String::new(),
+            stop_signal: 0,
+            stop_grace: 0,
         }
     }
 
@@ -12583,7 +12681,7 @@ mod image_rm_tests {
 
         // The fix: `kill_box` signals pid1 directly and confirms the exit before returning.
         assert!(
-            kill_box(child, child),
+            kill_box_graceful(child, child, libc::SIGTERM, 0),
             "kill_box must confirm the foreground box is gone"
         );
         // Reap the zombie (kill_box confirms via the pidfd BEFORE the process is reaped).
@@ -12725,6 +12823,8 @@ mod label_filter_tests {
             memory_max: None,
             pids_max: None,
             labels: labels.into(),
+            stop_signal: 0,
+            stop_grace: 0,
         }
     }
 

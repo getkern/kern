@@ -1281,6 +1281,55 @@ fn split_top_commas(s: &str) -> Vec<String> {
 /// Collect `networks.<net>.aliases` across every network of a service's `networks:` node (the map
 /// form `networks: {net: {aliases: [db, …]}}`). The list form (`networks: [net]`) has no aliases →
 /// empty. Order-stable and de-duplicated.
+/// Parse a Docker duration (`10s`, `1m30s`, `2h`, `500ms`, or a bare number of seconds) into SECONDS.
+///
+/// Compose writes durations, kern's flag takes seconds. The combined forms are the ones that bite: a
+/// naive "strip the last unit" reading turns `1m30s` into 0, which would silently mean "no graceful
+/// phase" for a service whose author asked for ninety seconds.
+///
+/// Sub-second values round UP to 1 s: someone writing `500ms` asked for a graceful phase, and 0 would
+/// remove it entirely. An unparsable value yields 0, which the caller reports through the flag's own
+/// validation rather than guessing a default here.
+fn duration_secs(v: &str) -> u64 {
+    let t = v.trim();
+    if let Ok(n) = t.parse::<u64>() {
+        return n; // bare number = seconds
+    }
+    let (mut total, mut num, mut seen) = (0u64, 0u64, false);
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(d) = c.to_digit(10) {
+            num = num.saturating_mul(10).saturating_add(d as u64);
+            seen = true;
+            continue;
+        }
+        let unit_secs = match c {
+            'h' => 3600,
+            'm' => {
+                // `ms` is milliseconds, `m` alone is minutes.
+                if chars.peek() == Some(&'s') {
+                    chars.next();
+                    total = total.saturating_add(num.div_ceil(1000).max(1));
+                    num = 0;
+                    seen = false;
+                    continue;
+                }
+                60
+            }
+            's' => 1,
+            _ => return 0, // unknown unit: refuse to guess
+        };
+        total = total.saturating_add(num.saturating_mul(unit_secs));
+        num = 0;
+        seen = false;
+    }
+    // A trailing bare number (`1m30`) counts as seconds, matching the bare-number case above.
+    if seen {
+        total = total.saturating_add(num);
+    }
+    total
+}
+
 /// Split a YAML **flow mapping** (`{a: 1, b: {c: 2}}`) into its TOP-LEVEL `key → value` pairs.
 ///
 /// The block form arrives as parsed `children`; the flow form arrives as one opaque scalar, and
@@ -1707,6 +1756,16 @@ fn service_to_box(
             // `labels:` → `--label k=v`. Descriptive metadata, but recorded so `kern ps --filter
             // label=` can select a stack's boxes - which is what compose users use labels FOR.
             "labels" => b.labels = collect_kv(node, '='),
+            // Docker's shutdown contract. Without it every service is hard-killed: redis loses
+            // whatever it had not saved and postgres does crash recovery on the next start.
+            "stop_signal" => b.stop_signal = node.scalar.as_deref().map(scalar_str),
+            "stop_grace_period" => {
+                b.stop_grace_period = node
+                    .scalar
+                    .as_deref()
+                    .map(scalar_str)
+                    .map(|v| duration_secs(&v).to_string())
+            }
             "ulimits" => b.ulimits = collect_ulimits(node, name),
             "sysctls" => b.sysctls = collect_kv(node, '='),
             "configs" | "logging" | "expose" | "extends" | "stdin_open" | "tty" | "domainname" => {

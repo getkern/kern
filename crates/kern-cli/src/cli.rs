@@ -102,6 +102,10 @@ pub enum Command {
         sysctls: Vec<(String, String)>,
         /// `--label k=v` (repeatable): descriptive metadata recorded in the registry.
         labels: Vec<String>,
+        /// `--stop-signal`: signal sent before the SIGKILL (default SIGTERM).
+        stop_signal: i32,
+        /// `--stop-timeout <secs>`: grace before the SIGKILL.
+        stop_grace: u64,
         /// `--user UID[:GID]` / `-u`: drop to this uid/gid inside the box before the command runs.
         run_as: Option<String>,
         /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
@@ -1069,6 +1073,35 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
 /// rather than ignored, because a limit the workload believes is in force but is not is exactly the
 /// silent-divergence class this codebase refuses. `unlimited`, `infinity` and `-1` mean
 /// `RLIM_INFINITY`; a bare `NAME=N` sets soft and hard alike, as Docker does.
+/// Resolve a signal written as a name (`SIGTERM`, `TERM`) or a number (`15`).
+///
+/// Only signals a stop contract can meaningfully use are accepted; an unknown name is REFUSED rather
+/// than quietly falling back to SIGTERM, because a workload trapping SIGUSR1 that silently got
+/// SIGTERM would shut down the wrong way and look like the trap never ran.
+fn parse_signal(s: &str) -> Result<i32, Error> {
+    const USAGE: &str = "--stop-signal <NAME|NUM>: TERM INT QUIT HUP USR1 USR2 KILL (or a number)";
+    let t = s.trim();
+    if let Ok(n) = t.parse::<i32>() {
+        return if (1..=64).contains(&n) {
+            Ok(n)
+        } else {
+            Err(Error::Usage(USAGE))
+        };
+    }
+    let name = t.to_ascii_uppercase();
+    let name = name.strip_prefix("SIG").unwrap_or(&name);
+    Ok(match name {
+        "TERM" => libc::SIGTERM,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "HUP" => libc::SIGHUP,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        "KILL" => libc::SIGKILL,
+        _ => return Err(Error::Usage(USAGE)),
+    })
+}
+
 fn parse_ulimit(spec: &str) -> Result<(i32, u64, u64), Error> {
     const USAGE: &str =
         "--ulimit NAME=SOFT[:HARD] where NAME is one of: core cpu data fsize locks \
@@ -1163,6 +1196,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut ulimits: Vec<(i32, u64, u64)> = Vec::new();
     let mut sysctls: Vec<(String, String)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
+    let mut stop_signal: i32 = libc::SIGTERM;
+    let mut stop_grace: u64 = 10;
     let mut run_as: Option<String> = None;
     let mut cap_add: Vec<String> = Vec::new();
     let mut cap_drop: Vec<String> = Vec::new();
@@ -1268,6 +1303,25 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                             ))
                         }
                     }
+                }
+                // `--stop-signal NAME|NUM` / `--stop-timeout SECS`: Docker's shutdown contract. A
+                // hard kill makes redis lose unsaved data and postgres do crash recovery on the next
+                // start, so the default is SIGTERM with a 10 s grace, exactly like Docker.
+                "--stop-signal" => {
+                    i += 1;
+                    stop_signal = match rest.get(i) {
+                        Some(v) => parse_signal(v)?,
+                        None => {
+                            return Err(Error::Usage("--stop-signal <NAME|NUM> (e.g. SIGTERM, 15)"))
+                        }
+                    };
+                }
+                "--stop-timeout" => {
+                    i += 1;
+                    stop_grace = match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                        Some(v) => v,
+                        None => return Err(Error::Usage("--stop-timeout <seconds>")),
+                    };
                 }
                 // `-l/--label k=v`: descriptive metadata. Requires the `=` (Docker's own rule) so a
                 // typo can't silently register a key with an empty value that no filter will match.
@@ -1720,6 +1774,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             ulimits,
             sysctls,
             labels,
+            stop_signal,
+            stop_grace,
             run_as,
             cap_add,
             cap_drop,
@@ -2163,6 +2219,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ulimits,
             sysctls,
             labels,
+            stop_signal,
+            stop_grace,
             run_as,
             cap_add,
             cap_drop,
@@ -2219,6 +2277,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ulimits: &ulimits,
             sysctls: &sysctls,
             labels: &labels,
+            stop_signal,
+            stop_grace,
             run_as: run_as.as_deref(),
             cap_add: &cap_add,
             cap_drop: &cap_drop,
