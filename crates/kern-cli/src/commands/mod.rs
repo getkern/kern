@@ -10254,6 +10254,135 @@ fn stop_stack(boxes: &[crate::compose::ComposeBox], pod: &str) -> Vec<String> {
     names
 }
 
+/// Reject, BEFORE anything starts, the conflicts a shared network namespace makes inevitable.
+///
+/// A pod is one net ns, so several properties that read as per-service in the file are in fact
+/// pod-global. Each produces either a CONFLICT (two services declare incompatible values, and which
+/// one wins depends on start order) or a silent INHERITANCE (one declares, all receive). This checks
+/// the first kind; the second is announced at bring-up.
+///
+/// The generalisation matters more than any single case: the internal-port clash was found only
+/// because a reviewer's premise was tested, and it is one member of a class, not a special case.
+///
+/// Runs only for a pod (`--no-pod` gives each service its own namespace, so none of this applies).
+fn check_pod_global_conflicts(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error> {
+    let short = |b: &crate::compose::ComposeBox| b.name.clone();
+
+    // 1. INTERNAL ports. Two services listening on the same box port share one namespace: one binds,
+    //    the other dies with EADDRINUSE. Common by default, not by accident - every framework has one
+    //    canonical port (Node 3000, Flask 5000, Spring 8080), so two services of the same stack
+    //    routinely want the same one even when their PUBLISHED ports differ.
+    let mut seen: std::collections::HashMap<(u16, bool), String> = std::collections::HashMap::new();
+    for b in boxes {
+        for spec in &b.ports {
+            let Some(maps) = crate::ports::parse(spec) else {
+                continue; // malformed: the per-box path reports it precisely
+            };
+            for m in maps {
+                if let Some(other) = seen.insert((m.box_port, m.udp), short(b)) {
+                    if other != b.name {
+                        let proto = if m.udp { "udp" } else { "tcp" };
+                        return Err(Error::Compose(format!(
+                            "services '{}' and '{}' both listen on container port {}/{proto}. Services \
+                             in a stack share ONE network namespace (like a Kubernetes pod), so only \
+                             one can bind it: give them different container ports (many images read \
+                             one from an env var such as PORT), or run with --no-pod.",
+                            other,
+                            short(b),
+                            m.box_port
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. `net.*` sysctls set to DIFFERENT values by different services. The knob belongs to the
+    //    namespace, so the last service to start wins and the file does not say which that is.
+    let mut sys: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for b in boxes {
+        for kv in b.sysctls.iter().filter(|s| s.starts_with("net.")) {
+            let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+            if let Some((prev_v, prev_svc)) = sys.get(k) {
+                if prev_v != v {
+                    return Err(Error::Compose(format!(
+                        "services '{prev_svc}' and '{}' set sysctl '{k}' to different values \
+                         ('{prev_v}' and '{v}'). `net.*` knobs belong to the pod's shared network \
+                         namespace, so the last service to start would decide: set one value, or \
+                         run with --no-pod.",
+                        short(b)
+                    )));
+                }
+            } else {
+                sys.insert(k.to_string(), (v.to_string(), short(b)));
+            }
+        }
+    }
+
+    // 3. An `extra_hosts` entry that shadows a SERVICE name. Both write the pod's /etc/hosts, so the
+    //    winner is decided by write order - and a service silently resolving to somewhere else is the
+    //    worst kind of wrong.
+    let names: std::collections::HashSet<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
+    for b in boxes {
+        for host in b.add_host.iter().filter_map(|h| h.split(':').next()) {
+            // Service names are project-scoped by now; `extra_hosts` carries what the file wrote, so
+            // compare against both spellings.
+            let clashes = names.contains(host)
+                || boxes
+                    .iter()
+                    .any(|o| o.net_aliases.iter().any(|a| a == host));
+            if clashes {
+                return Err(Error::Compose(format!(
+                    "service '{}': extra_hosts entry '{host}' has the same name as a service in this \
+                     stack. Both write the pod's shared /etc/hosts, so which one resolves would depend \
+                     on start order: rename one of them.",
+                    short(b)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How long to watch a freshly-launched stack for an IMMEDIATE death. Not "how long a service takes
+/// to start": a service is not required to be READY here, only to still exist. Half a second covers a
+/// failed `execve`, a failed bind, a permission error and a missing file, which is the entire class
+/// `up` can honestly speak about.
+const BRING_UP_SETTLE_MS: u64 = 500;
+
+/// Names of the services that are gone after the settle window, in file order.
+///
+/// A service counts as legitimately finished when its exit sidecar records 0 - that is the same
+/// signal `depends_completed` waits on, so a one-shot task that did its job is not reported as a
+/// failure. Anything else that is no longer in the registry died, and `up` must say so.
+///
+/// One sleep for the whole stack, then one registry read per service: the check adds a fixed 500 ms
+/// to a bring-up that already takes seconds, and no per-service polling.
+fn settle_and_collect_dead(
+    boxes: &[crate::compose::ComposeBox],
+    pod: &str,
+    token: &str,
+) -> Vec<String> {
+    std::thread::sleep(std::time::Duration::from_millis(BRING_UP_SETTLE_MS));
+    boxes
+        .iter()
+        .filter(|b| {
+            if is_box_alive(&b.name) {
+                return false;
+            }
+            // Gone: legitimate only if it recorded a clean completion.
+            registry::exit_of(&exit_key(pod, token, &b.name)) != Some(0)
+        })
+        .map(|b| {
+            b.name
+                .strip_prefix(&format!("{pod}-"))
+                .unwrap_or(&b.name)
+                .to_string()
+        })
+        .collect()
+}
+
 /// The compose file's own directory - Docker's "project directory", which anchors `.env`, relative
 /// bind sources and `build.context`. A bare filename (`docker-compose.yml`, no parent) means the
 /// current directory, so the empty parent is mapped to `.` rather than to the filesystem root.
@@ -10663,6 +10792,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // service in the stack and the last one to start wins. The file makes it look per-service; say so
     // rather than let an operator tune one service and silently retune the others.
     if !no_pod && boxes.len() > 1 {
+        check_pod_global_conflicts(&boxes)?;
         for b in &boxes {
             for kv in b.sysctls.iter().filter(|s| s.starts_with("net.")) {
                 let key = kv.split('=').next().unwrap_or(kv);
@@ -10852,6 +10982,28 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 }
             }
         }
+    }
+    // FAIL-CLOSED sul bring-up. Launching a box only proves the launcher returned; a service that
+    // dies half a second later (an internal port already taken by a pod peer, a missing binary, a
+    // config it reads at startup) left `up` printing "started" and exiting 0 while the stack was
+    // already broken. That is the "reports success while losing something" class this codebase
+    // refuses everywhere else.
+    //
+    // We wait for an EVENT, not for a duration: a settle window just long enough to observe an
+    // IMMEDIATE failure (failed execve, failed bind, permissions), shared by the whole stack rather
+    // than paid per service. A service that dies later is NOT `up`'s business - that is supervision,
+    // and stretching this window to catch it would reintroduce the arbitrary wait it avoids.
+    //
+    // Healthy services are left RUNNING. A stack whose database holds data in a volume must not be
+    // torn down because an unrelated service failed; the exit code and the message carry the failure.
+    let dead = settle_and_collect_dead(&boxes, &pod, &up_token);
+    if !dead.is_empty() {
+        return Err(Error::Compose(format!(
+            "{} service(s) died during startup: {}\n  the rest of the stack is still running; \
+             inspect with `kern compose {file} logs <service>`",
+            dead.len(),
+            dead.join(", ")
+        )));
     }
     println!("compose up: {total} box(es) started. track with `kern ps`.");
     if use_pod {
@@ -13027,6 +13179,106 @@ mod label_filter_tests {
         assert!(ps_matches(&b, &f("label", "cfg=a=b")));
         assert!(ps_matches(&b, &f("label", "cfg")));
         assert!(!ps_matches(&b, &f("label", "cfg=a")));
+    }
+}
+
+#[cfg(test)]
+mod pod_global_tests {
+    use super::*;
+
+    fn svc(name: &str) -> crate::compose::ComposeBox {
+        crate::compose::ComposeBox {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+    fn err(boxes: &[crate::compose::ComposeBox]) -> String {
+        match check_pod_global_conflicts(boxes) {
+            Err(Error::Compose(m)) => m,
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_container_port_is_a_conflict_even_with_different_host_ports() {
+        // The case a reviewer's premise said was rare: two DIFFERENT services on the same INTERNAL
+        // port, published on different host ports. Common by default, because every framework has one
+        // canonical port. Before this, both boxes started, one died with EADDRINUSE, and `up` exited 0.
+        let mut a = svc("api");
+        a.ports = vec!["3001:3000".into()];
+        let mut b = svc("admin");
+        b.ports = vec!["3002:3000".into()];
+        let m = err(&[a, b]);
+        assert!(m.contains("container port 3000/tcp"), "{m}");
+        assert!(m.contains("'api'") && m.contains("'admin'"), "{m}");
+        // The message must offer the way out, not just the diagnosis.
+        assert!(
+            m.contains("--no-pod") || m.contains("different container ports"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn different_container_ports_are_fine_and_so_is_one_service_alone() {
+        let mut a = svc("api");
+        a.ports = vec!["3001:3000".into()];
+        let mut b = svc("web");
+        b.ports = vec!["3002:8080".into()];
+        assert!(check_pod_global_conflicts(&[a, b]).is_ok());
+        // A single service publishing the same port twice is a HOST-port problem, caught elsewhere.
+        let mut solo = svc("solo");
+        solo.ports = vec!["1:3000".into(), "2:3000".into()];
+        assert!(check_pod_global_conflicts(&[solo]).is_ok());
+    }
+
+    #[test]
+    fn tcp_and_udp_on_the_same_number_do_not_conflict() {
+        let mut a = svc("a");
+        a.ports = vec!["1:53".into()];
+        let mut b = svc("b");
+        b.ports = vec!["2:53/udp".into()];
+        assert!(check_pod_global_conflicts(&[a, b]).is_ok());
+    }
+
+    #[test]
+    fn same_net_sysctl_with_different_values_is_a_conflict() {
+        // The knob belongs to the shared namespace: the last service to start would decide, and the
+        // file does not say which that is.
+        let mut a = svc("a");
+        a.sysctls = vec!["net.core.somaxconn=1024".into()];
+        let mut b = svc("b");
+        b.sysctls = vec!["net.core.somaxconn=2048".into()];
+        assert!(err(&[a, b]).contains("different values"));
+        // The SAME value from two services is consistent, not a conflict.
+        let mut d = svc("d");
+        d.sysctls = vec!["net.core.somaxconn=1024".into()];
+        let mut e = svc("e");
+        e.sysctls = vec!["net.core.somaxconn=1024".into()];
+        assert!(check_pod_global_conflicts(&[d, e]).is_ok());
+    }
+
+    #[test]
+    fn non_net_sysctls_are_not_pod_global() {
+        // `kernel.*`/`fs.*` are not namespaced by the network namespace: two services may differ.
+        let mut a = svc("a");
+        a.sysctls = vec!["kernel.msgmax=1".into()];
+        let mut b = svc("b");
+        b.sysctls = vec!["kernel.msgmax=2".into()];
+        assert!(check_pod_global_conflicts(&[a, b]).is_ok());
+    }
+
+    #[test]
+    fn extra_hosts_shadowing_a_service_name_is_a_conflict() {
+        // Both write the pod's shared /etc/hosts, so the winner would be decided by write order, and
+        // a service silently resolving elsewhere is the worst kind of wrong.
+        let db = svc("db");
+        let mut app = svc("app");
+        app.add_host = vec!["db:9.9.9.9".into()];
+        assert!(err(&[db, app]).contains("same name as a service"));
+        // An unrelated host entry is fine.
+        let mut ok_app = svc("app");
+        ok_app.add_host = vec!["esterno:9.9.9.9".into()];
+        assert!(check_pod_global_conflicts(&[svc("db"), ok_app]).is_ok());
     }
 }
 
