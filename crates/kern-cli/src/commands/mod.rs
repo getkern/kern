@@ -3868,10 +3868,18 @@ pub fn ps(
         let print_row =
             |b: &registry::Instance, up: u64, health: &str, ports: &str, connector: &str| {
                 let cw = connector.chars().count();
+                // Inside a pod's tree the `<pod>-` prefix is redundant - the pod is the line above -
+                // so the member shows the SERVICE name the compose file uses. The registry keeps the
+                // full, project-scoped name; this is display only, and a standalone box (no pod) is
+                // printed whole.
+                let shown = Some(b.pod.as_str())
+                    .filter(|pod| !pod.is_empty())
+                    .and_then(|pod| b.name.strip_prefix(&format!("{pod}-")))
+                    .unwrap_or(b.name.as_str());
                 // dim connector, then reset, then the standard bold-cyan NAME padded to fill the cell.
                 let name = format!(
                     "{d}{connector}{z}{b}{c}{:<nw$}{z}",
-                    b.name,
+                    shown,
                     d = p.d,
                     z = p.z,
                     b = p.b,
@@ -10422,6 +10430,47 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         None => compose_pod_name(file),
     };
 
+    // PROJECT-SCOPED BOX NAMES. Docker names a container `<project>-<service>`; kern used the bare
+    // service name, and box names are global, so two projects that both have a `db` (or `web`, or
+    // `api` - the most common names there are) could not coexist: the second `up` failed with
+    // "a box named 'db' is already running".
+    //
+    // The rename happens HERE, once, right after parsing: `depends_on` lists are rewritten with it, so
+    // everything downstream (topological order, conditional waits, exit sidecars, health lookups,
+    // liveness) keeps working on one consistent set of names without knowing about projects at all.
+    // The bare service name is registered as a pod ALIAS below, so peers still reach each other as
+    // `db` inside the stack - the name that appears in the compose file is the name that resolves.
+    let service_names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
+    let scoped = |svc: &str| format!("{pod}-{svc}");
+    for b in boxes.iter_mut() {
+        // The service name must survive as an alias: it is what peers connect to.
+        let svc = b.name.clone();
+        if !b.net_aliases.contains(&svc) {
+            b.net_aliases.push(svc);
+        }
+        b.name = scoped(&b.name);
+        for d in b
+            .depends_on
+            .iter_mut()
+            .chain(b.depends_healthy.iter_mut())
+            .chain(b.depends_completed.iter_mut())
+        {
+            *d = scoped(d);
+        }
+    }
+    // Selectors from the command line name SERVICES; map them onto the boxes they now identify.
+    let services: Vec<String> = services
+        .iter()
+        .map(|s| {
+            if service_names.iter().any(|n| n == s) {
+                scoped(s)
+            } else {
+                s.clone()
+            }
+        })
+        .collect();
+    let services = &services[..];
+
     // A `--filter`/service selection narrows the read-only verbs to the named services; empty = all.
     // Validated up front so a typo names itself instead of silently matching nothing.
     for want in services {
@@ -10470,17 +10519,20 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 )));
             }
             println!("compose config: {} service(s) in {file}", boxes.len());
+            // `config` reports the FILE, so it prints service names as written, not the
+            // project-scoped box names the runtime uses.
+            let short = |n: &str| n.strip_prefix(&format!("{pod}-")).unwrap_or(n).to_string();
             for b in boxes.iter().filter(|b| selected(b)) {
                 let src = b
                     .image
                     .as_deref()
                     .or(b.rootfs.as_deref())
                     .unwrap_or("(build)");
-                println!("  {}  image={src}", b.name);
+                println!("  {}  image={src}", short(&b.name));
                 if !b.ports.is_empty() {
                     println!("    ports: {}", b.ports.join(", "));
                 }
-                let deps = b.all_deps();
+                let deps: Vec<String> = b.all_deps().into_iter().map(short).collect();
                 if !deps.is_empty() {
                     println!("    depends_on: {}", deps.join(", "));
                 }
