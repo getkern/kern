@@ -53,6 +53,10 @@ pub struct Instance {
     /// `--stop-timeout`: seconds the workload gets to exit on its own before the SIGKILL. 0 or absent
     /// keeps the historical behaviour (immediate SIGKILL).
     pub stop_grace: u64,
+    /// Fingerprint of the compose definition this box was created from (`--def-hash`). `up`
+    /// compares it against the current file to decide whether a running service is still what the
+    /// file asks for; empty for a box created outside compose, or by an older kern.
+    pub def_hash: String,
     /// `--label k=v` metadata (comma-joined `k=v` pairs), the compose `labels:` target. Purely
     /// descriptive - it changes nothing about how the box runs - but it is what `kern ps --filter
     /// label=` selects on and what `kern inspect` reports, so tooling can group a stack's boxes.
@@ -428,7 +432,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -446,6 +450,7 @@ fn encode(inst: &Instance) -> String {
         one_line(&inst.labels),
         inst.stop_signal,
         inst.stop_grace,
+        one_line(&inst.def_hash),
     )
 }
 
@@ -973,6 +978,7 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut memory_max, mut pids_max) = (None, None);
     let mut labels = String::new();
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
+    let mut def_hash = String::new();
     for line in body.lines() {
         // Skip a malformed line (e.g. a half-written record from a crash mid-write) rather than `?`-ing
         // out, which would evaporate the WHOLE entry and silently drop a live box from the registry.
@@ -998,6 +1004,7 @@ fn parse(body: &str) -> Option<Instance> {
             "labels" => labels = v.to_string(),
             "stopsig" => stop_signal = v.parse().unwrap_or(0),
             "stopgrace" => stop_grace = v.parse().unwrap_or(0),
+            "defhash" => def_hash = v.to_string(),
             _ => {}
         }
     }
@@ -1017,6 +1024,7 @@ fn parse(body: &str) -> Option<Instance> {
         labels,
         stop_signal,
         stop_grace,
+        def_hash,
         memory_max,
         pids_max,
     })
@@ -1074,6 +1082,7 @@ mod tests {
             labels: String::new(),
             stop_signal: 0,
             stop_grace: 0,
+            def_hash: String::new(),
         };
         let got = parse(&encode(&inst)).expect("parse a well-formed entry");
         assert_eq!(got.pod, "stack");
@@ -1088,6 +1097,7 @@ mod tests {
             labels: String::new(),
             stop_signal: 0,
             stop_grace: 0,
+            def_hash: String::new(),
             ..inst.clone()
         };
         let got2 = parse(&encode(&uncapped)).expect("parse");
@@ -1208,6 +1218,7 @@ mod tests {
                 labels: String::new(),
                 stop_signal: 0,
                 stop_grace: 0,
+                def_hash: String::new(),
             })
             .unwrap()
         };
@@ -1257,6 +1268,7 @@ mod tests {
             labels: String::new(),
             stop_signal: 0,
             stop_grace: 0,
+            def_hash: String::new(),
         })
         .unwrap();
         let got = claim_name(&name).unwrap();

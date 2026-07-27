@@ -341,6 +341,9 @@ pub struct BoxRunArgs<'a> {
     pub stop_signal: i32,
     /// `--stop-timeout <secs>`: grace given to the workload before the SIGKILL.
     pub stop_grace: u64,
+    /// `--def-hash <hex>`: fingerprint of the compose definition this box comes from, recorded so a
+    /// later `up` can tell whether the file still describes the running service.
+    pub def_hash: &'a str,
     /// `--user UID[:GID]`: drop to this uid/gid inside the box before the command runs.
     pub run_as: Option<&'a str>,
     /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
@@ -1129,6 +1132,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             args.stop_signal,
             args.stop_grace,
             args.restart_max,
+            args.def_hash,
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -1178,6 +1182,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             labels: args.labels.join(","),
             stop_signal: args.stop_signal,
             stop_grace: args.stop_grace,
+            def_hash: args.def_hash.to_string(),
             memory_max: spec.memory_max,
             pids_max: spec.pids_max,
         };
@@ -3159,6 +3164,8 @@ fn run_detached(
     stop_grace: u64,
     // `--restart-max`: retry cap for the on-failure supervisor (0 = kern's default).
     restart_max: u32,
+    // `--def-hash`: fingerprint of the compose definition, recorded for drift detection.
+    def_hash: &str,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -3212,6 +3219,7 @@ fn run_detached(
         labels: labels.to_string(),
         stop_signal,
         stop_grace,
+        def_hash: def_hash.to_string(),
         memory_max: spec.memory_max,
         pids_max: spec.pids_max,
     };
@@ -10267,6 +10275,61 @@ fn stop_stack(boxes: &[crate::compose::ComposeBox], pod: &str) -> Vec<String> {
     names
 }
 
+/// Fingerprint of everything that DEFINES a box, so `up` can tell a running service apart from the
+/// file that describes it now.
+///
+/// The input is the exact argv `push_box_flags` builds plus the command: that argv IS the definition,
+/// so anything that would produce a different box produces a different hash, and anything that would
+/// not (comments, key order inside a mapping, a field kern ignores) does not. Deriving it from the
+/// argv instead of from the YAML text is what keeps it from firing on cosmetic edits.
+///
+/// FNV-1a 64: deterministic, allocation-free over the input, no dependency. This is an
+/// equality check between two runs of the SAME binary, not a security boundary - collisions here
+/// would mean a missed recreate, not a trust decision, and no adversary chooses the input.
+fn definition_hash(b: &crate::compose::ComposeBox) -> String {
+    let mut cmd = std::process::Command::new("kern");
+    b.push_box_flags(&mut cmd);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for byte in bytes {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for a in cmd.get_args() {
+        eat(a.as_encoded_bytes());
+        eat(&[0]); // separator: `["ab","c"]` must not hash like `["a","bc"]`
+    }
+    for c in &b.command {
+        eat(c.as_bytes());
+        eat(&[0]);
+    }
+    format!("{h:016x}")
+}
+
+/// What `up` must do with a service that is ALREADY running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reconcile {
+    /// Running and still matches the file: leave it alone.
+    UpToDate,
+    /// Running but the file changed since: stop it so the launch loop recreates it.
+    Recreate,
+}
+
+/// Decide, for one running service, whether the file still describes it.
+///
+/// A box registered by an older kern (or started outside compose) carries no fingerprint. Treating
+/// that as "changed" would recreate it on every `up` forever; treating it as "up to date" is the
+/// conservative choice and costs at most one missed recreate, after which the box carries a
+/// fingerprint and behaves normally.
+fn reconcile_decision(running: &registry::Instance, want: &str) -> Reconcile {
+    if running.def_hash.is_empty() || running.def_hash == want {
+        Reconcile::UpToDate
+    } else {
+        Reconcile::Recreate
+    }
+}
+
 /// Reject, BEFORE anything starts, the conflicts a shared network namespace makes inevitable.
 ///
 /// A pod is one net ns, so several properties that read as per-service in the file are in fact
@@ -10793,6 +10856,54 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             return Ok(());
         }
     }
+    // DRIFT DETECTION. `up` on a running stack used to fail with "a box named 'x' is already
+    // running", so an edit to the compose file was never applied and the user had to know to run
+    // `down` first. Reconcile instead: a service whose definition still matches is LEFT ALONE (no
+    // needless restart, no dropped connections), one whose definition changed is stopped here so the
+    // launch loop below recreates it from the new definition.
+    //
+    // This is only safe because `up` now verifies the stack after bring-up: without that check a
+    // service that dies immediately would be recreated on every invocation, silently, forever.
+    if action == ComposeAction::Up {
+        let mut kept = 0usize;
+        let mut stale: Vec<String> = Vec::new();
+        for level in &mut levels {
+            level.retain(|n| {
+                let Some(b) = boxes.iter().find(|b| &b.name == n) else {
+                    return true;
+                };
+                match registry::find(n) {
+                    None => true, // not running: launch it
+                    Some(inst) => match reconcile_decision(&inst, &definition_hash(b)) {
+                        Reconcile::UpToDate => {
+                            kept += 1;
+                            false
+                        }
+                        Reconcile::Recreate => {
+                            stale.push(n.clone());
+                            true
+                        }
+                    },
+                }
+            });
+        }
+        if !stale.is_empty() {
+            let short: Vec<&str> = stale
+                .iter()
+                .map(|n| n.strip_prefix(&format!("{pod}-")).unwrap_or(n))
+                .collect();
+            println!("→ definition changed, recreating: {}", short.join(", "));
+            // Stopped BEFORE the launch loop so the name is free when it is recreated.
+            let _ = stop(&stale, false);
+        }
+        if kept > 0 && levels.iter().all(|l| l.is_empty()) {
+            println!("compose up: {kept} service(s) already up to date");
+            return Ok(());
+        }
+        if kept > 0 {
+            println!("→ {kept} service(s) already up to date, left running");
+        }
+    }
     // Static rejection of conditions that can NEVER be satisfied - caught here, not left to time out
     // at runtime (adversarial-review 2d). `topo_order` above already rejects cycles and unknown deps.
     validate_conditions(&boxes)?;
@@ -10880,7 +10991,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         }
     }
 
-    let total = boxes.len();
+    // Count what will actually be LAUNCHED, not how many services the file has: with drift
+    // reconciliation the levels may already have been filtered down to the changed ones, and a
+    // header promising more boxes than it starts is the kind of small untruth this codebase avoids.
+    let total: usize = levels.iter().map(Vec::len).sum();
     eprintln!(
         "→ bringing up {total} box(es) in {} dependency {}: {}",
         levels.len(),
@@ -10934,6 +11048,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             eprintln!("→ [{n}/{total}] starting '{}'  {src}{dep}", b.name);
                             let mut cmd = std::process::Command::new(self_exe);
                             cmd.arg("box").arg(&b.name);
+                            // Record the fingerprint WITH the box, so the next `up` can compare.
+                            cmd.arg("--def-hash").arg(definition_hash(b));
                             b.push_box_flags(&mut cmd);
                             // A box not on the host net joins the stack pod → reachable by name from peers.
                             if use_pod && !b.net {
@@ -11776,6 +11892,7 @@ mod net_resource_tests {
             labels: String::new(),
             stop_signal: 0,
             stop_grace: 0,
+            def_hash: String::new(),
         }
     }
 
@@ -13146,6 +13263,7 @@ mod label_filter_tests {
             labels: labels.into(),
             stop_signal: 0,
             stop_grace: 0,
+            def_hash: String::new(),
         }
     }
 
@@ -13192,6 +13310,109 @@ mod label_filter_tests {
         assert!(ps_matches(&b, &f("label", "cfg=a=b")));
         assert!(ps_matches(&b, &f("label", "cfg")));
         assert!(!ps_matches(&b, &f("label", "cfg=a")));
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    fn svc(name: &str) -> crate::compose::ComposeBox {
+        crate::compose::ComposeBox {
+            name: name.to_string(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        }
+    }
+    fn inst(hash: &str) -> registry::Instance {
+        registry::Instance {
+            name: "a".into(),
+            pid: 1,
+            pid1: 0,
+            rootfs: String::new(),
+            command: String::new(),
+            started: 0,
+            starttime: 0,
+            ports: String::new(),
+            volumes: String::new(),
+            pod: String::new(),
+            egress: String::new(),
+            landlock_rw: String::new(),
+            memory_max: None,
+            pids_max: None,
+            labels: String::new(),
+            stop_signal: 0,
+            stop_grace: 0,
+            def_hash: hash.into(),
+        }
+    }
+
+    #[test]
+    fn the_hash_is_stable_and_field_order_independent() {
+        // Two readings of the same definition must agree, or `up` would recreate the whole stack on
+        // every invocation.
+        let a = svc("x");
+        assert_eq!(definition_hash(&a), definition_hash(&a));
+        // Same content, and the hash is derived from the emitted argv, so it does not depend on how
+        // the file happened to be written.
+        let b = svc("x");
+        assert_eq!(definition_hash(&a), definition_hash(&b));
+    }
+
+    #[test]
+    fn every_field_that_changes_the_box_changes_the_hash() {
+        let base = definition_hash(&svc("x"));
+        let mut env = svc("x");
+        env.env = vec!["V=1".into()];
+        let mut ports = svc("x");
+        ports.ports = vec!["1:1".into()];
+        let mut img = svc("x");
+        img.image = Some("busybox".into());
+        let mut cmd = svc("x");
+        cmd.command = vec!["echo".into(), "hi".into()];
+        let mut mem = svc("x");
+        mem.memory = Some("64m".into());
+        for (what, h) in [
+            ("environment", definition_hash(&env)),
+            ("ports", definition_hash(&ports)),
+            ("image", definition_hash(&img)),
+            ("command", definition_hash(&cmd)),
+            ("mem_limit", definition_hash(&mem)),
+        ] {
+            assert_ne!(h, base, "changing {what} must change the fingerprint");
+        }
+    }
+
+    #[test]
+    fn argv_boundaries_are_hashed_not_just_bytes() {
+        // `["ab","c"]` must not hash like `["a","bc"]`: without a separator a concatenation of two
+        // different definitions would collide and a real change would be missed.
+        let mut a = svc("x");
+        a.env = vec!["AB=".into(), "C=".into()];
+        let mut b = svc("x");
+        b.env = vec!["A=".into(), "BC=".into()];
+        assert_ne!(definition_hash(&a), definition_hash(&b));
+    }
+
+    #[test]
+    fn an_unchanged_service_is_left_alone_and_a_changed_one_is_recreated() {
+        let want = definition_hash(&svc("x"));
+        assert_eq!(reconcile_decision(&inst(&want), &want), Reconcile::UpToDate);
+        assert_eq!(
+            reconcile_decision(&inst("deadbeef"), &want),
+            Reconcile::Recreate
+        );
+    }
+
+    #[test]
+    fn a_box_without_a_fingerprint_is_not_recreated_forever() {
+        // Registered by an older kern, or started outside compose. Treating it as changed would
+        // recreate it on EVERY `up`; treating it as current costs at most one missed recreate, after
+        // which it carries a fingerprint and behaves normally.
+        assert_eq!(
+            reconcile_decision(&inst(""), "anything"),
+            Reconcile::UpToDate
+        );
     }
 }
 

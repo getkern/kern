@@ -106,6 +106,8 @@ pub enum Command {
         labels: Vec<String>,
         /// `--restart-max <n>`: retry cap for the on-failure policy (0 = kern's default).
         restart_max: u32,
+        /// `--def-hash <hex>`: fingerprint of the compose definition (drift detection).
+        def_hash: Option<String>,
         /// `--stop-signal`: signal sent before the SIGKILL (default SIGTERM).
         stop_signal: i32,
         /// `--stop-timeout <secs>`: grace before the SIGKILL.
@@ -1202,6 +1204,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut sysctls: Vec<(String, String)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     let mut restart_max: u32 = 0;
+    let mut def_hash: Option<String> = None;
     let mut stop_signal: i32 = libc::SIGTERM;
     let mut stop_grace: u64 = 10;
     let mut run_as: Option<String> = None;
@@ -1315,6 +1318,16 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // start, so the default is SIGTERM with a 10 s grace, exactly like Docker.
                 // `--restart-max N`: how many times the on-failure supervisor retries before giving
                 // up. Compose's `on-failure:N` maps here; 0 keeps kern's built-in cap.
+                // `--def-hash <hex>`: written by `kern compose`, never typed by hand. Recorded in the
+                // registry so a later `up` can tell a running service apart from the file that
+                // describes it now.
+                "--def-hash" => {
+                    i += 1;
+                    def_hash = match rest.get(i) {
+                        Some(v) => Some((*v).to_string()),
+                        None => return Err(Error::Usage("--def-hash <hex>")),
+                    };
+                }
                 "--restart-max" => {
                     i += 1;
                     restart_max = match rest.get(i).and_then(|v| v.parse::<u32>().ok()) {
@@ -1795,6 +1808,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             sysctls,
             labels,
             restart_max,
+            def_hash,
             stop_signal,
             stop_grace,
             run_as,
@@ -2242,6 +2256,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             sysctls,
             labels,
             restart_max,
+            def_hash,
             stop_signal,
             stop_grace,
             run_as,
@@ -2302,6 +2317,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             sysctls: &sysctls,
             labels: &labels,
             restart_max,
+            def_hash: def_hash.as_deref().unwrap_or(""),
             stop_signal,
             stop_grace,
             run_as: run_as.as_deref(),
