@@ -51,6 +51,8 @@ pub enum Command {
         pod: Option<String>,
         /// `--uid-range`: map a sub-uid/gid range (apt/dpkg, www-data). Default maps only the caller.
         uid_range: bool,
+        /// `--no-uid-range`: opt OUT of the range mapping an `--image` box gets by default.
+        no_uid_range: bool,
         /// `--bind-rootfs`: bind the rootfs directly instead of an overlay (faster on slow-overlay
         /// kernels; source becomes mutable & shared).
         bind_rootfs: bool,
@@ -1165,6 +1167,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut share_net = false;
     let mut pod: Option<String> = None;
     let mut uid_range = false;
+    let mut no_uid_range = false;
     let mut bind_rootfs = false;
     let mut privileged = false;
     let mut overlay_lower: Option<String> = None;
@@ -1405,6 +1408,10 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     }
                 }
                 "--uid-range" => uid_range = true,
+                // Opt OUT of the range mapping, which an `--image` box gets by default (see
+                // `box_run`). Single-uid is tighter isolation; it is a deliberate choice, not one to
+                // arrive at by accident when an official image fails to start.
+                "--no-uid-range" => no_uid_range = true,
                 "--bind-rootfs" => bind_rootfs = true,
                 "--privileged" => privileged = true,
                 // Internal build-layer flags (see the Command::BoxRun docs) - take a value.
@@ -1764,6 +1771,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             share_net,
             pod,
             uid_range,
+            no_uid_range,
             bind_rootfs,
             privileged,
             overlay_lower,
@@ -2210,6 +2218,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             share_net,
             pod,
             uid_range,
+            no_uid_range,
             bind_rootfs,
             privileged,
             overlay_lower,
@@ -2270,6 +2279,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             share_net,
             pod: pod.as_deref(),
             uid_range,
+            no_uid_range,
             bind_rootfs,
             privileged,
             overlay_lower: overlay_lower.as_deref(),

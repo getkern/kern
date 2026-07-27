@@ -288,6 +288,8 @@ pub struct BoxRunArgs<'a> {
     /// `--pod <name>`: join this pod's shared network (created by `kern pod create`).
     pub pod: Option<&'a str>,
     pub uid_range: bool,
+    /// `--no-uid-range`: opt OUT of the range mapping an `--image` box gets by default.
+    pub no_uid_range: bool,
     pub bind_rootfs: bool,
     /// `--privileged`: relax the seccomp filter to allow a NESTED `kern box` (rootless-only; see
     /// [`kern_isolation::SandboxSpec::privileged`]).
@@ -976,16 +978,27 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     //    to a uid the range doesn't cover → still fails. Tell the user to widen /etc/subuid. We NEVER
     //    silently clamp the uid into range (that would run the service as a DIFFERENT uid than the image
     //    intends - a silent lie); we surface it and let the user fix the range.
+    // An `--image` box gets the RANGE uid mapping by default, which is what `kern compose` has always
+    // done for image services. Without it the official images fail in their entrypoint, not in kern:
+    // postgres dies on `chown: /var/lib/postgresql/data: Invalid argument` and nginx on
+    // `chown("/var/cache/nginx/client_temp", 101) failed`, because both declare USER root and drop
+    // privilege INTERNALLY - so reading the image's USER is not enough to predict it.
+    //
+    // The same input reaching the two paths and behaving differently is the divergence class this
+    // codebase treats as a defect. `--no-uid-range` opts out for anyone who wants the tighter
+    // single-uid map; a `--rootfs` box is unaffected, exactly as in compose.
+    let image_default_uid_range = args.image.is_some() && !args.no_uid_range;
+
     let declared_user = image_config
         .user
         .as_deref()
         .filter(|u| !u.is_empty() && *u != "0" && *u != "root");
     if let Some(u) = declared_user {
-        if !args.uid_range {
+        if !args.uid_range && !image_default_uid_range {
             eprintln!(
                 "kern: heads-up: image runs as non-root user '{u}' - under kern's rootless model a \
                  single-uid box can't map that uid, so the entrypoint may fail (chown/setuid EINVAL). \
-                 Add --uid-range to run it (maps a subordinate uid range so the drop works)."
+                 Re-run without --no-uid-range to map a subordinate uid range."
             );
         } else if let Ok(n) = u.split(':').next().unwrap_or(u).parse::<u32>() {
             // Numeric User declared AND --uid-range: warn only if it exceeds the range we can map.
@@ -1029,7 +1042,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // working `setgroups` (a single-uid map forbids it via `/proc/self/setgroups=deny`), and a
         // non-zero target uid must be mapped in. With the range (via `newgidmap`/`newuidmap`) both
         // work; if the helpers are absent the box falls back to single-uid (warned elsewhere).
-        uid_range: args.uid_range || ssh.is_some() || non_root_user,
+        uid_range: args.uid_range || ssh.is_some() || non_root_user || image_default_uid_range,
         bind_rootfs: args.bind_rootfs,
         privileged: args.privileged,
         overlay_upper: args.overlay_upper.map(str::to_string),
