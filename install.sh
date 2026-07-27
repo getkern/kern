@@ -76,3 +76,7 @@ case ":${PATH}:" in
   *":${bindir}:"*) ;;
   *) printf "${DIM}    ${bindir} is not on your PATH - add:  export PATH=\"${bindir}:\$PATH\"${ZZ}\n" ;;
 esac
+# Optional Docker drop-in: invoked as `docker` / `docker-compose`, kern rewrites the argv (no daemon,
+# no docker.sock). NOT created automatically - a `docker` symlink would SHADOW a real Docker install.
+# Opt in deliberately (typically on a box with no Docker):
+printf "${DIM}    docker drop-in (optional, shadows any real Docker): ln -s \"${bindir}/kern\" \"${bindir}/docker\"${ZZ}\n"

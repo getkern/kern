@@ -42,4 +42,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "shim_translate"
+path = "fuzz_targets/shim_translate.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

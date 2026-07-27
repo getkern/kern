@@ -37,6 +37,7 @@ mod registry;
 mod runstats;
 mod sandbox;
 mod secret;
+mod shim;
 mod toml_surgery;
 mod tui;
 mod ui;
@@ -57,7 +58,28 @@ fn main() -> ExitCode {
     // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Runs tab). Cheap and harmless
     // on every other subcommand.
     runstats::mark_start();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Detect invocation *as* `docker` / `docker-compose` (via a symlink or wrapper) and rewrite the
+    // argv into kern's own dialect before dispatch. Pure argument translation - no daemon, no
+    // docker.sock. When invoked normally (`kern …`), this is a couple of cheap string checks.
+    let mut raw = std::env::args();
+    let arg0 = raw.next().unwrap_or_default();
+    let mut args: Vec<String> = raw.collect();
+    let invoked = std::path::Path::new(&arg0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if invoked == "docker" || invoked == "docker-compose" {
+        if invoked == "docker-compose" {
+            args.insert(0, "compose".to_string());
+        }
+        match shim::translate(&args) {
+            Ok(translated) => args = translated,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     // Map the result to an exit code in exactly ONE place (the lib/command layer returns
     // `Result`, never calls `process::exit` itself).
     match cli::run(&args) {
