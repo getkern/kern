@@ -2380,7 +2380,16 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             name,
             outbound,
             uid_range,
-        } => crate::pod::create_with_range(&name, outbound, uid_range),
+        } => crate::pod::create_with_range(
+            &name,
+            outbound,
+            // `kern pod create --uid-range` is the caller asking in as many words.
+            if uid_range {
+                kern_isolation::UidRange::Requested
+            } else {
+                kern_isolation::UidRange::Off
+            },
+        ),
         Command::PodList => crate::pod::list(),
         Command::PodRemove { names } => crate::pod::remove(&names),
         Command::PodHolder => crate::pod::run_holder(),

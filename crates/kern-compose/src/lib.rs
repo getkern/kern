@@ -126,6 +126,20 @@ pub struct ComposeBox {
 }
 
 impl ComposeBox {
+    /// Whether this box ends up with a subordinate uid RANGE: because it asked, or because it is an
+    /// OCI IMAGE box, since official images (postgres/redis/nginx/mariadb/grafana) drop privilege in
+    /// their entrypoint to a service uid and need the range to do it (the 0.6 official-image fix). A
+    /// `rootfs` box is the user's own tree and keeps the single-uid map (faster, more isolated); an
+    /// explicit `uid_range = false` is respected, only the ABSENT default flips per image.
+    ///
+    /// This is the ONE statement of that rule on the compose side. `push_box_flags` deliberately does
+    /// not restate it (it forwards intent and lets `kern box` apply the default); the pod holder needs
+    /// it here, because a member setns's into the holder's user ns and writes no map of its own, so
+    /// the decision must be made BEFORE the holder unshares.
+    pub fn wants_uid_range(&self) -> bool {
+        self.uid_range || (self.image.is_some() && !self.uid_range_explicit_false)
+    }
+
     // Every field's "flag absent" value is its type's Default (None/empty/false), so `new` only sets
     // the name - a newly-added mirror-CLI field can never be silently left out of construction.
     fn new(name: String) -> Self {
@@ -229,13 +243,15 @@ impl ComposeBox {
         if self.net {
             cmd.arg("--net");
         }
-        // `--uid-range` when the box asked for it, OR by default for an OCI IMAGE box: official images
-        // (postgres/redis/nginx/mariadb/grafana) drop privilege in their entrypoint to a service uid,
-        // which needs the subordinate uid range to work (see the 0.6 official-image fix). A `rootfs` box
-        // is the user's own tree and keeps the default single-uid map (faster, more isolated). Explicit
-        // `uid_range = false` in the compose file is respected - only the ABSENT default flips per image.
-        if self.uid_range || (self.image.is_some() && !self.uid_range_explicit_false) {
+        // Forward the box's STATED intent only, never the per-image default: `kern box` applies that
+        // default itself for any `--image` box (see `wants_uid_range`), so re-deriving it here would
+        // put the same rule in two places AND erase the difference between "the file asked" and "kern
+        // decided", which is what lets an unavailable range warn only when someone actually asked.
+        // A deliberate `uid_range = false` still has to travel, to suppress that default downstream.
+        if self.uid_range {
             cmd.arg("--uid-range");
+        } else if self.uid_range_explicit_false {
+            cmd.arg("--no-uid-range");
         }
         if self.bind_rootfs {
             cmd.arg("--bind-rootfs");
@@ -1831,9 +1847,8 @@ mod dotenv_tests {
 
     #[test]
     fn shell_environment_wins_over_dotenv() {
-        // Docker precedence: shell > .env. Verified through the real interpolation path.
-        let _g = std::sync::Mutex::new(()); // (no shared state; the var name below is unique)
-        drop(_g);
+        // Docker precedence: shell > .env. Verified through the real interpolation path. The var
+        // name is unique to this test, so it needs no lock against the other env-touching tests.
         let de = parse_dotenv("KERN_DOTENV_PREC_TEST=da-dotenv\n");
         let yaml =
             "services:\n  a:\n    image: alpine\n    command: echo ${KERN_DOTENV_PREC_TEST}\n";
@@ -1896,5 +1911,52 @@ mod dotenv_tests {
             parse_with_env(yaml, &DotEnv::default()).map(|b| b[0].command.clone()),
             parse(yaml).map(|b| b[0].command.clone())
         );
+    }
+    /// The per-image uid-range default is `kern box`'s to apply, so compose must forward INTENT and
+    /// nothing else: `--uid-range` only when the file asked, `--no-uid-range` only for a deliberate
+    /// opt-out, and NEITHER for a plain image box (whose default is applied downstream). Emitting the
+    /// default here would state the rule twice and make every image box look like an explicit request.
+    #[test]
+    fn push_box_flags_forwards_uid_range_intent_not_the_image_default() {
+        let argv = |src: &str| -> Vec<String> {
+            let s = parse(src).expect("parses");
+            let mut cmd = std::process::Command::new("kern");
+            s[0].push_box_flags(&mut cmd);
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // A plain image box: neither flag - `kern box` turns the range on for `--image` itself.
+        let plain = argv("[box.a]\nimage = \"redis\"\n");
+        assert!(!plain.iter().any(|a| a == "--uid-range"));
+        assert!(!plain.iter().any(|a| a == "--no-uid-range"));
+        // ...but it still says `--image`, which is what makes that default fire downstream.
+        assert!(plain.windows(2).any(|w| w == ["--image", "redis"]));
+
+        // An explicit ask travels, and stays distinguishable from the default.
+        let asked = argv("[box.a]\nimage = \"redis\"\nuid_range = true\n");
+        assert!(asked.iter().any(|a| a == "--uid-range"));
+
+        // A deliberate opt-out must travel too, or the downstream default would silently undo it.
+        let off = argv("[box.a]\nimage = \"redis\"\nuid_range = false\n");
+        assert!(off.iter().any(|a| a == "--no-uid-range"));
+        assert!(!off.iter().any(|a| a == "--uid-range"));
+
+        // A rootfs box keeps the single-uid map: no flag either way.
+        let rootfs = argv("[box.a]\nrootfs = \"/tmp/r\"\n");
+        assert!(!rootfs.iter().any(|a| a == "--uid-range"));
+        assert!(!rootfs.iter().any(|a| a == "--no-uid-range"));
+    }
+
+    /// `wants_uid_range` is the pod holder's input: it must answer for the whole rule, since a member
+    /// setns's into the holder's map and can't add a range of its own afterwards.
+    #[test]
+    fn wants_uid_range_covers_ask_and_image_default() {
+        let one = |src: &str| parse(src).expect("parses").remove(0);
+        assert!(one("[box.a]\nimage = \"redis\"\n").wants_uid_range());
+        assert!(one("[box.a]\nrootfs = \"/tmp/r\"\nuid_range = true\n").wants_uid_range());
+        assert!(!one("[box.a]\nimage = \"redis\"\nuid_range = false\n").wants_uid_range());
+        assert!(!one("[box.a]\nrootfs = \"/tmp/r\"\n").wants_uid_range());
     }
 }

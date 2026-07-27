@@ -26,6 +26,51 @@ use std::ptr;
 const USERNS_UNAVAILABLE: &str =
     "unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)";
 
+/// Why a subordinate-uid range is on, which is what decides whether an UNAVAILABLE range is worth a
+/// line on stderr. An unmet explicit request must be reported: the caller asked for something they
+/// did not get. A per-image default must NOT be, because the fallback single-uid map is exactly what
+/// the box did before the default existed, so the warning would fire on every image box on every
+/// host without `newuidmap` (all three of our boards) while reporting a request nobody made.
+/// `kern doctor` reports the missing helper once, as the environment capability it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UidRange {
+    /// Single-uid self-map: only the caller's id exists inside the box.
+    #[default]
+    Off,
+    /// Turned on by kern for an `--image` box, since official images drop privilege in their
+    /// entrypoint. Falls back to the single-uid map silently.
+    ImageDefault,
+    /// Asked for by `--uid-range`, `--ssh`, or a non-root `--user`. An unmet request is reported.
+    Requested,
+}
+
+impl UidRange {
+    /// True when a range should be attempted at all.
+    pub fn is_on(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Wire form for `KERN_POD_UID_RANGE`, read back by the pod holder in the child process.
+    pub fn as_env(self) -> &'static str {
+        match self {
+            Self::Off => "",
+            Self::ImageDefault => "default",
+            Self::Requested => "requested",
+        }
+    }
+
+    /// Inverse of [`Self::as_env`]. An unset variable is `Off`; anything else that is not the
+    /// literal `default` counts as `Requested`, so a holder from an older kern (which wrote `1`)
+    /// keeps its warning rather than losing it.
+    pub fn from_env(v: Option<&str>) -> Self {
+        match v {
+            None | Some("") => Self::Off,
+            Some("default") => Self::ImageDefault,
+            Some(_) => Self::Requested,
+        }
+    }
+}
+
 /// What to run, and how to provide its root filesystem.
 pub struct SandboxSpec {
     /// New-root path the box pivots into. For `Overlay` (what the CLI builds) it's the empty
@@ -69,7 +114,7 @@ pub struct SandboxSpec {
     /// 65k extra ids into the namespace; the default single-uid map is both faster and more
     /// isolated. Needed only for workloads that use multiple uids inside the box (`apt`/`dpkg`,
     /// daemons that drop to `www-data`, …).
-    pub uid_range: bool,
+    pub uid_range: UidRange,
     /// Hard memory ceiling in bytes for the box's cgroup (`--memory`). `None` → the default cap.
     pub memory_max: Option<u64>,
     /// Swap allowance in bytes (`--memory-swap-max` → `memory.swap.max`). `None` → `0` (swap off, so
@@ -648,7 +693,13 @@ fn child_setup_and_exec(
     // `-it` slave). The overwhelming common case (agent code-exec, CI, `sh -c`) never opens a PTY, so
     // gate the whole devpts mount+mkdir+symlink out of it - one fewer filesystem-mount syscall per box.
     let needs_pts = spec.ssh.is_some() || spec.tty_slave.is_some();
-    setup_dev(&spec.root, spec.tun, needs_pts, spec.tty_slave)?;
+    setup_dev(
+        &spec.root,
+        spec.tun,
+        needs_pts,
+        spec.tty_slave,
+        spec.memory_max,
+    )?;
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
     setup_volumes(&spec.root, &spec.volumes)?;
@@ -1239,7 +1290,23 @@ const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 /// device binds all resolve to a directory we own *inside* the new root - never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
-fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> Result<(), Error> {
+/// Mount options for the box's `/dev/shm` tmpfs: always `mode=1777` (the standard sticky,
+/// world-writable shm mode), plus a `size=` equal to the box's memory cap when it has one. See the
+/// call site for why the size matters even though the cgroup usually charges shmem to the box.
+fn shm_mount_opts(shm_max: Option<u64>) -> String {
+    match shm_max {
+        Some(b) if b > 0 => format!("mode=1777,size={b}"),
+        _ => "mode=1777".to_string(),
+    }
+}
+
+fn setup_dev(
+    root: &str,
+    tun: bool,
+    needs_pts: bool,
+    tty_slave: Option<i32>,
+    shm_max: Option<u64>,
+) -> Result<(), Error> {
     let dev_path = format!("{root}/dev");
     let dp = cstr(&dev_path)?;
     // Neutralize a hostile `/dev` symlink before any path resolves through it.
@@ -1304,14 +1371,23 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
     // this mount they fail "No such file or directory". `mode=1777` (sticky + world-writable) is the
     // standard shm mode so an unprivileged workload creates its OWN segments (which it then owns, so
     // `fs.protected_regular` doesn't bite). `MS_NOSUID|MS_NODEV`: shm never hosts a setuid binary or a
-    // device node. The tmpfs is charged to the box's memory cgroup, so `--memory` bounds it and there is
-    // no separate `--shm-size` footgun (Docker's 64 MB default is what breaks Postgres under load).
+    // device node. There is no separate `--shm-size` footgun: shm may use the box's WHOLE budget, so a
+    // Postgres under load never hits Docker's fixed 64 MB default.
+    //
+    // `size=` is what makes "the box's whole budget" a real ceiling rather than a hoped-for one. Where
+    // the memory cgroup charges shmem to the box, `--memory` already bounds this tmpfs; where it does
+    // NOT (measured on the Jetson's 5.15-tegra kernel: 200 MB written into `/dev/shm` inside a 32 MB
+    // box, and a bare systemd scope on that kernel leaks the same way, so it is the kernel's shmem
+    // accounting and not ours) an unsized tmpfs defaults to HALF OF HOST RAM and a capped box could eat
+    // the board. Sizing it to the cap makes the kernel enforce the same bound directly, on every kernel.
+    // Uncapped boxes keep the tmpfs default, exactly as before.
     // Best-effort: a host/kernel that refuses it just leaves the box without `/dev/shm` (prior behaviour).
     {
         let shmdir = format!("{root}/dev/shm");
+        let shm_opts = shm_mount_opts(shm_max);
         if let Ok(sd) = cstr(&shmdir) {
             unsafe { libc::mkdir(sd.as_ptr(), 0o1777) };
-            if let (Ok(ty), Ok(opts)) = (cstr("tmpfs"), cstr("mode=1777")) {
+            if let (Ok(ty), Ok(opts)) = (cstr("tmpfs"), cstr(&shm_opts)) {
                 unsafe {
                     libc::mount(
                         ty.as_ptr(),
@@ -2372,11 +2448,12 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         // the caller's `/etc/subuid` range) so software that drops to or `chown`s *other* uids works
         // (`apt`/`dpkg`, daemons that drop to `www-data`, …); it needs the setuid `newuidmap`/
         // `newgidmap` helpers and costs two subprocesses at start.
-        let range = if spec.uid_range {
+        let range = if spec.uid_range.is_on() {
             let r = detect_id_range(euid, egid);
-            if r.is_none() {
+            if r.is_none() && spec.uid_range == UidRange::Requested {
                 // Requested but unavailable - don't silently behave as if mapped: tell the user, then
                 // fall through to the safe single-uid map (apt-style workloads just lack extra uids).
+                // A per-image default stays quiet here; see [`UidRange`].
                 eprintln!(
                     "kern: --uid-range requested but unavailable (need newuidmap/newgidmap + an /etc/subuid+/etc/subgid allocation) - using single-uid map"
                 );
@@ -2882,18 +2959,19 @@ fn bring_loopback_up() {
 /// fresh net ns, brings its loopback up, then `pause()`s so the namespaces stay alive until the
 /// holder is killed (`kern pod rm`). Never returns.
 pub fn run_pod_holder() -> ! {
-    // A pod holder maps a RANGED uid map (`KERN_POD_UID_RANGE=1`, set by `pod create --uid-range`)
+    // A pod holder maps a RANGED uid map (`KERN_POD_UID_RANGE`, set by `pod create --uid-range`)
     // when the pod will host OCI images that drop privilege in their entrypoint (postgres/redis/nginx/
     // …). Members `setns` into this shared user ns and inherit the range, so their drop to a service
     // uid works - the 0.6 official-image fix, extended to the pod path. Default (no env) = the single-
     // uid self-map: faster (no newuidmap), more isolated (one uid), for a pod of root-only services.
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    let want_range = std::env::var_os("KERN_POD_UID_RANGE").is_some();
+    let env_range = std::env::var("KERN_POD_UID_RANGE").ok();
+    let want_range = UidRange::from_env(env_range.as_deref());
     let ns = libc::CLONE_NEWUSER | libc::CLONE_NEWNET;
     // The range needs newuidmap + an /etc/subuid allocation; if either is missing, fall back to the
     // single-uid map (honest degrade - official images in this pod will then fail with the F1 warning,
     // not silently). detect_id_range is resolved BEFORE the unshare (it must run in the init userns).
-    let range = if want_range {
+    let range = if want_range.is_on() {
         detect_id_range(euid, egid)
     } else {
         None
@@ -2923,7 +3001,7 @@ pub fn run_pod_holder() -> ! {
                 }
                 unsafe { libc::_exit(1) };
             }
-            if want_range {
+            if want_range == UidRange::Requested {
                 eprintln!("kern: pod: --uid-range requested but unavailable (need newuidmap/newgidmap + /etc/subuid) - single-uid map");
             }
             if write_single_uid_map(euid, egid).is_err() {
@@ -3369,6 +3447,63 @@ mod pdeathsig_cascade_tests {
 /// not the root's mode; (2) `/dev/fd` + `/dev/std{in,out,err}` symlinks into procfs (bash process
 /// substitution / postgres initdb need them). Verified live: redis, nginx, postgres all reach
 /// "ready to accept connections" under `--uid-range`.
+/// A capped box must not be able to exceed its own memory budget through `/dev/shm`. Where the
+/// kernel charges shmem to the box's cgroup that is already true; where it does NOT (measured on
+/// 5.15-tegra) an unsized tmpfs defaults to half of host RAM, so the size has to be stated.
+#[cfg(test)]
+mod shm_is_bounded_by_the_memory_cap {
+    use super::shm_mount_opts;
+
+    #[test]
+    fn a_capped_box_sizes_shm_to_its_cap() {
+        assert_eq!(shm_mount_opts(Some(33_554_432)), "mode=1777,size=33554432");
+        // Byte-exact, not rounded: the tmpfs bound has to be the same number the cgroup enforces,
+        // or the two disagree about what the budget is.
+        assert_eq!(shm_mount_opts(Some(1)), "mode=1777,size=1");
+    }
+
+    #[test]
+    fn an_uncapped_box_keeps_the_tmpfs_default() {
+        // No cap means no stated size (the kernel's half-of-RAM default), exactly as before: a box
+        // with no budget has nothing to be bounded by, and inventing one here would be a new limit
+        // nobody asked for.
+        assert_eq!(shm_mount_opts(None), "mode=1777");
+        // `--memory 0` is not a zero-byte budget, it is the absence of one: sizing shm to 0 would
+        // make every shm write fail instead.
+        assert_eq!(shm_mount_opts(Some(0)), "mode=1777");
+    }
+}
+
+/// The pod holder learns WHY its range was asked for through an env var, because it decides in a
+/// forked child, after the parent is gone. That crossing must survive a kern upgrade in both
+/// directions: a holder started by an older kern wrote a bare `1`, which has to keep warning rather
+/// than fall silent, since back then only an explicit `--uid-range` could set it at all.
+#[cfg(test)]
+mod uid_range_env_roundtrip {
+    use super::UidRange;
+
+    #[test]
+    fn every_variant_survives_the_env_crossing() {
+        for v in [UidRange::Off, UidRange::ImageDefault, UidRange::Requested] {
+            let wire = v.as_env();
+            let back = UidRange::from_env(if wire.is_empty() { None } else { Some(wire) });
+            assert_eq!(back, v, "{v:?} did not survive as {wire:?}");
+        }
+    }
+
+    #[test]
+    fn an_older_holders_bare_1_still_warns() {
+        // Pre-enum kern set `1` only for an explicit `--uid-range`, so it must read as Requested,
+        // never as the silent per-image default.
+        assert_eq!(UidRange::from_env(Some("1")), UidRange::Requested);
+        // An unset or empty variable is simply off.
+        assert_eq!(UidRange::from_env(None), UidRange::Off);
+        assert_eq!(UidRange::from_env(Some("")), UidRange::Off);
+        assert!(!UidRange::Off.is_on());
+        assert!(UidRange::ImageDefault.is_on() && UidRange::Requested.is_on());
+    }
+}
+
 #[cfg(test)]
 mod uid_range_root_traversable {
     use std::os::unix::fs::PermissionsExt;

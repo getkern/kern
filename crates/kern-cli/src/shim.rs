@@ -627,10 +627,9 @@ mod tests {
             })
         ));
         // Missing value is still an error, not a silent drop.
-        assert!(matches!(
-            translate(&v(&["run", "alpine"])).and(translate(&v(&["run", "--entrypoint"]))),
-            Err(_)
-        ));
+        assert!(translate(&v(&["run", "alpine"]))
+            .and(translate(&v(&["run", "--entrypoint"])))
+            .is_err());
     }
 
     #[test]

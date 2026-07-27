@@ -6,7 +6,7 @@ use crate::registry;
 use crate::sandbox::SandboxCtx;
 use kern_common::BoxName;
 use kern_isolation::{
-    exec_in_box, run_in_sandbox_with, MountMode, OverlayDirs, SandboxSpec, Volume,
+    exec_in_box, run_in_sandbox_with, MountMode, OverlayDirs, SandboxSpec, UidRange, Volume,
 };
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -1048,8 +1048,15 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // `--ssh` and a non-root `--user` imply the uid/gid *range* mapping: sshd's privsep needs a
         // working `setgroups` (a single-uid map forbids it via `/proc/self/setgroups=deny`), and a
         // non-zero target uid must be mapped in. With the range (via `newgidmap`/`newuidmap`) both
-        // work; if the helpers are absent the box falls back to single-uid (warned elsewhere).
-        uid_range: args.uid_range || ssh.is_some() || non_root_user || image_default_uid_range,
+        // work; if the helpers are absent the box falls back to single-uid. Those three are the
+        // caller ASKING, so an unavailable range is reported; the per-image default is not.
+        uid_range: if args.uid_range || ssh.is_some() || non_root_user {
+            UidRange::Requested
+        } else if image_default_uid_range {
+            UidRange::ImageDefault
+        } else {
+            UidRange::Off
+        },
         bind_rootfs: args.bind_rootfs,
         privileged: args.privileged,
         overlay_upper: args.overlay_upper.map(str::to_string),
@@ -1850,7 +1857,7 @@ struct BuildSpec<'a> {
     share_net: bool,
     /// `--pod`: the pod holder PID whose user+net ns this box joins (`None` = its own).
     pod_holder: Option<i32>,
-    uid_range: bool,
+    uid_range: UidRange,
     bind_rootfs: bool,
     /// `--privileged`: relax seccomp for a nested `kern box` (rootless-only).
     privileged: bool,
@@ -1961,8 +1968,9 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         // exact EACCES-on-`/` gap this whole block fixes. Harmless for a single-uid pod (no other uid to
         // traverse). Found via a live python+postgres pod stack: the entrypoint's `gosu postgres` drop
         // could not traverse the 0700 `/`, so every PATH lookup failed "not found".
-        let root_traversable =
-            matches!(b.run_as, Some((u, _)) if u != 0) || b.uid_range || b.pod_holder.is_some();
+        let root_traversable = matches!(b.run_as, Some((u, _)) if u != 0)
+            || b.uid_range.is_on()
+            || b.pod_holder.is_some();
         if root_traversable {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o755))
@@ -11035,16 +11043,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `up` is idempotent.
     let use_pod = !no_pod && boxes.len() >= 2 && boxes.iter().any(|b| !b.net);
     if use_pod && crate::pod::holder_pid(&pod).is_none() {
-        // Map a uid RANGE into the pod's shared user ns when ANY member needs it: an OCI-image box
-        // (official images drop privilege in their entrypoint) OR a box that explicitly set
-        // `uid_range = true`. A pod member setns's into the holder's user ns and writes NO map of its
-        // own, so the holder's map is authoritative - `--uid-range` on the member alone is a no-op. This
-        // MUST match `push_box_flags`'s per-box rule exactly (`uid_range || image-and-not-opted-out`),
-        // decided HERE, before the holder is created (it writes its map at unshare). A pod of only
-        // single-uid rootfs services stays single-uid (faster).
-        let pod_needs_range = boxes
-            .iter()
-            .any(|b| b.uid_range || (b.image.is_some() && !b.uid_range_explicit_false));
+        // Map a uid RANGE into the pod's shared user ns when ANY member needs it (`wants_uid_range`,
+        // the single statement of that rule). A pod member setns's into the holder's user ns and writes
+        // NO map of its own, so the holder's map is authoritative - `--uid-range` on the member alone is
+        // a no-op, and the decision must be made HERE, before the holder unshares. A pod of only
+        // single-uid rootfs services stays single-uid (faster). The pod reports an unavailable range
+        // only if a member ASKED for it, matching the per-box rule.
+        let pod_needs_range = if boxes.iter().any(|b| b.uid_range) {
+            UidRange::Requested
+        } else if boxes.iter().any(|b| b.wants_uid_range()) {
+            UidRange::ImageDefault
+        } else {
+            UidRange::Off
+        };
         crate::pod::create_with_range(&pod, true, pod_needs_range)?;
     }
     // Feedback-first: a `--net` (host-network) service in a podded stack is NOT on the pod net, so its
