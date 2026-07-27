@@ -1750,6 +1750,30 @@ fn service_to_box(
 /// skipped here rather than warned per-key, since a single-node `deploy:` block is common and mostly
 /// inert for `kern compose`.
 fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
+    // `deploy.replicas` / `deploy.mode`: kern runs ONE box per service. Docker would start N, so
+    // ignoring this in silence means a stack that looks scaled and is not - the exact "runs but lies"
+    // this parser refuses. Named, so the operator decides.
+    for k in [
+        "replicas",
+        "mode",
+        "placement",
+        "update_config",
+        "rollback_config",
+        "endpoint_mode",
+    ] {
+        if node.child(k).is_some() {
+            warn(&format!(
+                "service '{name}': deploy.{k} ignored - kern runs one box per service (no orchestrator)"
+            ));
+        }
+    }
+    if let Some(rp) = node.child("restart_policy") {
+        if rp.child("condition").is_some() {
+            warn(&format!(
+                "service '{name}': deploy.restart_policy ignored - use `restart:` (kern restarts on failure only)"
+            ));
+        }
+    }
     let Some(limits) = node.child("resources").and_then(|r| r.child("limits")) else {
         return;
     };
@@ -1872,6 +1896,30 @@ fn kv_pairs(node: &Node) -> Vec<String> {
         // bare `- KEY` absent from the host env → omit (Docker semantics).
     }
     for (k, v) in &node.children {
+        // `K:` with no value, or an explicit YAML null (`null` / `~`), means PASS THROUGH from the
+        // host environment - Docker's rule, and the same thing the `- KEY` list form already did.
+        // Emitting `K=null` instead handed the service the literal four-letter string, which is worse
+        // than empty: it looks like a value. The check is on the RAW scalar, so a deliberate
+        // `K: "null"` keeps its quotes and stays a real value.
+        let literal_null = match v.scalar.as_deref() {
+            // A MISSING scalar is left as an empty value, not a passthrough: interpolation runs over
+            // the document first, so `X: ${UNSET}` reaches us indistinguishable from a bare `X:`, and
+            // Docker sets the first to empty. The `- KEY` list form remains the spelling that means
+            // "take it from the host", and it already did.
+            None => false,
+            // NOT the empty string: interpolation runs over the whole document first, so
+            // `X: ${UNSET}` arrives here as an empty scalar and Docker wants X set to EMPTY, not
+            // omitted. Only an explicit YAML null (or no scalar at all) means passthrough.
+            Some(sc) => matches!(sc.trim(), "null" | "Null" | "NULL" | "~"),
+        };
+        if literal_null {
+            // Present in the host env → forward its value; absent → omit the variable entirely
+            // (Docker semantics: an unresolved passthrough is not set, not set-to-empty).
+            if let Ok(val) = std::env::var(k) {
+                out.push(format!("{k}={val}"));
+            }
+            continue;
+        }
         let raw = v.scalar.as_deref().map(scalar_str).unwrap_or_default();
         out.push(format!("{k}={raw}"));
     }

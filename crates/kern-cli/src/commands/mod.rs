@@ -6803,12 +6803,7 @@ fn resolve_relative_binds(
     boxes: &mut [crate::compose::ComposeBox],
     file: &str,
 ) -> Result<(), Error> {
-    let compose_dir = std::path::Path::new(file)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let base = std::fs::canonicalize(&compose_dir)
+    let base = std::fs::canonicalize(compose_dir(file))
         .map_err(|e| Error::Compose(format!("resolving compose dir: {e}")))?;
 
     for b in boxes.iter_mut() {
@@ -6824,7 +6819,12 @@ fn resolve_relative_binds(
             // `foo/../../../etc` is relative but doesn't start with `./`, and the old check let it skip
             // the guard (the box's name-validator caught it as a backstop, but defense-in-depth wants
             // the compose layer to confine every relative path itself). (Hacker-mode audit, MEDIUM.)
-            if src.starts_with('/') || !src.contains('/') {
+            // `.` and `..` are relative PATHS with no slash in them, so the "no slash means named
+            // volume" rule sent the single most common bind in existence (`.:/app`, mount the project
+            // root) to the volume-name validator, which refused it. Docker resolves both against the
+            // project directory. Anything else without a slash really is a named volume.
+            let is_dot = src == "." || src == "..";
+            if !is_dot && (src.starts_with('/') || !src.contains('/')) {
                 continue;
             }
             let abs = std::fs::canonicalize(base.join(src)).map_err(|e| {
@@ -10441,6 +10441,22 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // EADDRINUSE buried in its own log while `up` still reports success (a silent partial failure,
     // empirically confirmed). Caught here from the parsed file: deterministic, before any box starts.
     check_port_collisions(&boxes)?;
+    // A pod shares ONE network namespace, so a `net.*` sysctl written on one service applies to every
+    // service in the stack and the last one to start wins. The file makes it look per-service; say so
+    // rather than let an operator tune one service and silently retune the others.
+    if !no_pod && boxes.len() > 1 {
+        for b in &boxes {
+            for kv in b.sysctls.iter().filter(|s| s.starts_with("net.")) {
+                let key = kv.split('=').next().unwrap_or(kv);
+                eprintln!(
+                    "kern compose: service '{}': sysctl '{key}' applies to the WHOLE pod (services \
+                     share one network namespace) - the last service to start wins; use --no-pod for \
+                     per-service network settings",
+                    b.name
+                );
+            }
+        }
+    }
     let self_exe =
         std::env::current_exe().map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
 
@@ -12577,6 +12593,58 @@ mod image_rm_tests {
             0,
             "child must be dead after kill_box"
         );
+    }
+}
+
+#[cfg(test)]
+mod relative_bind_tests {
+    use super::*;
+
+    fn one(spec: &str, dir: &std::path::Path) -> Result<String, Error> {
+        let mut b = vec![crate::compose::ComposeBox {
+            name: "a".into(),
+            volumes: vec![spec.to_string()],
+            ..Default::default()
+        }];
+        let f = dir.join("docker-compose.yml");
+        resolve_relative_binds(&mut b, &f.to_string_lossy())?;
+        Ok(b.remove(0).volumes.remove(0))
+    }
+
+    #[test]
+    fn bare_dot_is_a_path_not_a_volume_name() {
+        // `.:/app` (mount the project root) is the single most common bind there is. The rule "no
+        // slash means named volume" sent it to the volume-name validator, which refused `.`.
+        let tmp = std::env::temp_dir().join(format!("kern-bind-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let got = one(".:/app", &tmp).expect("`.` resolves");
+        let want = std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone());
+        assert_eq!(got, format!("{}:/app", want.to_string_lossy()));
+        // Options after the target survive the rewrite.
+        assert!(one(".:/app:ro", &tmp).expect("ro").ends_with(":/app:ro"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_real_volume_name_is_still_left_alone() {
+        // Only `.`/`..` change meaning: a bare name is still a named volume, untouched.
+        let tmp = std::env::temp_dir().join(format!("kern-bind2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        assert_eq!(one("dati:/app", &tmp).expect("named"), "dati:/app");
+        assert_eq!(one("/abs:/app", &tmp).expect("abs"), "/abs:/app");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dotdot_still_cannot_escape_the_project_directory() {
+        // The traversal guard is a deliberate divergence from Docker and must survive this change.
+        let tmp = std::env::temp_dir().join(format!("kern-bind3-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        assert!(
+            one("..:/app", &tmp).is_err(),
+            "`..` escapes the compose dir"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
