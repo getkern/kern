@@ -130,6 +130,17 @@ pub struct SandboxSpec {
     /// `--add-host NAME:IP`: extra `/etc/hosts` entries appended inside the box (`host-gateway` is
     /// already resolved to a concrete address by the caller). Empty for none.
     pub extra_hosts: Vec<(String, String)>,
+    /// `--ulimit NAME=SOFT[:HARD]` (repeatable), resolved to `(RLIMIT_*, soft, hard)` by the CLI so
+    /// this layer does no string work. Applied with `setrlimit(2)` before privileges are dropped:
+    /// LOWERING a limit always succeeds, RAISING a hard limit needs `CAP_SYS_RESOURCE` in the INIT
+    /// user namespace, which a rootless box does not have - so a raise fails loudly rather than
+    /// leaving the workload with a silently different limit than it asked for.
+    pub ulimits: Vec<(i32, u64, u64)>,
+    /// `--sysctl KEY=VALUE` (repeatable). Written to `/proc/sys/<key with '.' → '/'>` AFTER the fresh
+    /// procfs is mounted and BEFORE privileges are dropped. Only NAMESPACED knobs are writable (the
+    /// box owns its uts/ipc, and its net ns when it has one); a host-global knob is owned by the init
+    /// user namespace and the kernel refuses the write - reported as a hard error, never ignored.
+    pub sysctls: Vec<(String, String)>,
     /// `--privileged`: relax the always-on seccomp filter to ALLOW the namespace + classic-mount
     /// syscalls (`unshare`/`setns`/`mount`/`umount2`/`pivot_root`) so a *nested* `kern box` (or
     /// docker-in-docker-style workload) can start. Honoured ONLY in rootless mode - when the box's
@@ -672,6 +683,15 @@ fn child_setup_and_exec(
     // user namespace and a rootless box (even as box-root) lacks the CAP_SYS_ADMIN there to write them -
     // so the mask was defense-in-depth for the ROOT-mapped case, which `--privileged` already refuses.
     // The nested box, unless itself `--privileged`, re-applies its own masks normally.
+    // `--sysctl`: written HERE, in the only correct window - after the fresh procfs is mounted and
+    // while `/proc/sys` is still writable, but BEFORE `mask_proc_paths` remounts it read-only. The
+    // ordering is a property, not an accident: the operator's values are applied, and then the knobs
+    // are sealed, so the workload itself can never change what it was pinned to (Docker leaves
+    // namespaced knobs writable from inside the container).
+    apply_sysctls(&spec.sysctls)?;
+    if !spec.sysctls.is_empty() {
+        t.mark("sysctl");
+    }
     if !allow_nesting {
         mask_proc_paths()?;
     }
@@ -736,6 +756,13 @@ fn child_setup_and_exec(
     // box command actually runs pinned even where the cgroup write is skipped. Done before seccomp
     // (a setup syscall).
     set_cpu_affinity(spec.cpuset.as_deref());
+
+    // `--ulimit`: applied while we still hold capabilities (a hard-limit RAISE needs them) and before
+    // seccomp, which would otherwise have to allow `setrlimit`.
+    apply_ulimits(&spec.ulimits)?;
+    if !spec.ulimits.is_empty() {
+        t.mark("ulimit");
+    }
 
     // Least-privilege, in three ordered steps so `--user` + `--cap-drop ALL` (the canonical hardened
     // profile) composes correctly. All run after privileged setup (mount/pivot/loopback), so they
@@ -2654,6 +2681,93 @@ fn drop_cap_bounding(mask: u64) {
     }
 }
 
+/// Apply `--ulimit` resource limits with `setrlimit(2)`.
+///
+/// FAIL-CLOSED by design: a workload that asked for a limit and silently got a different one is a
+/// correctness bug that surfaces later as an inexplicable EMFILE or a fork bomb that was supposed to
+/// be capped. Rootless reality, stated plainly: LOWERING either bound always succeeds; RAISING the
+/// HARD bound requires `CAP_SYS_RESOURCE` in the INIT user namespace, which a rootless box never has,
+/// so that attempt returns EPERM and we refuse to start rather than run under the inherited limit.
+///
+/// No allocation: the spec arrives pre-resolved as `(resource, soft, hard)` from the CLI, and the
+/// error path formats only when it is already failing.
+fn apply_ulimits(limits: &[(i32, u64, u64)]) -> Result<(), Error> {
+    for &(resource, soft, hard) in limits {
+        let rl = libc::rlimit {
+            rlim_cur: soft as libc::rlim_t,
+            rlim_max: hard as libc::rlim_t,
+        };
+        // SAFETY: `resource` is one of the RLIMIT_* constants (the CLI resolves the name against a
+        // fixed table and rejects anything else), and `rl` is a fully initialised `rlimit` we own.
+        if unsafe { libc::setrlimit(resource as _, &rl) } != 0 {
+            let e = std::io::Error::last_os_error();
+            let hint = if e.raw_os_error() == Some(libc::EPERM) {
+                " (raising a HARD limit needs CAP_SYS_RESOURCE in the initial user namespace - a \
+                 rootless box can only LOWER its inherited limits)"
+            } else {
+                ""
+            };
+            return Err(Error::Spec(format!(
+                "--ulimit: setrlimit(resource {resource}, soft {soft}, hard {hard}) failed: {e}{hint}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Apply `--sysctl KEY=VALUE` by writing `/proc/sys/<key with '.' → '/'>`.
+///
+/// FAIL-CLOSED, like Docker: a container that asked for `net.core.somaxconn=1024` and silently ran
+/// with the host default has different behaviour under load than it asked for. Only NAMESPACED knobs
+/// are writable from inside (the box owns its uts/ipc namespaces, and its net namespace when it has
+/// one); a host-global knob belongs to the init user namespace and the kernel returns EPERM/EACCES,
+/// which is reported with that distinction so the operator knows it is a namespace-ownership issue
+/// and not a typo.
+///
+/// The key is validated as a *relative* `a.b.c` path before it is joined: a key containing `/`, `..`
+/// or a leading separator could otherwise be steered outside `/proc/sys` and turn a config field into
+/// an arbitrary-file write.
+fn apply_sysctls(sysctls: &[(String, String)]) -> Result<(), Error> {
+    for (key, value) in sysctls {
+        if key.is_empty()
+            || key.contains('/')
+            || key
+                .split('.')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(Error::Spec(format!(
+                "--sysctl '{key}': invalid key (expected dotted form like net.core.somaxconn, with no \
+                 '/' or empty/'..' segments)"
+            )));
+        }
+        let mut path = String::with_capacity("/proc/sys/".len() + key.len());
+        path.push_str("/proc/sys/");
+        for (i, seg) in key.split('.').enumerate() {
+            if i > 0 {
+                path.push('/');
+            }
+            path.push_str(seg);
+        }
+        if let Err(e) = std::fs::write(&path, value.as_bytes()) {
+            let why = match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    " (no such knob on this kernel, or it is not visible in this namespace)"
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    " (not a namespaced knob, or this namespace is not owned by the box's user \
+                     namespace - a rootless box can only set knobs it owns; `net.*` needs its own \
+                     network namespace, e.g. a pod or --network)"
+                }
+                _ => "",
+            };
+            return Err(Error::Spec(format!(
+                "--sysctl {key}={value}: writing {path} failed: {e}{why}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Clear the masked capabilities from the live effective/permitted/inheritable sets (the workload
 /// won't hold them after exec). For a non-root `--user`, `setuid` has already emptied these; this
 /// still matters for a root box and is a harmless no-op otherwise.
@@ -2894,6 +3008,28 @@ pub fn exec_in_box(
         return Err(Error::Unsupported("no command given to exec in the box"));
     }
     let argv: Vec<CString> = command.iter().map(|s| cstr(s)).collect::<Result<_, _>>()?;
+
+    // INHERIT the box's environment, like `docker exec` does. Read from the host view of PID 1 NOW,
+    // before any `setns`: once we enter the mount namespace `/proc` is the box's and this path no
+    // longer resolves to the same task. Without this, `exec` ran with a bare PATH/HOME and every
+    // `compose exec db psql -U $POSTGRES_USER` style command saw an empty variable.
+    //
+    // Explicit `-e` is applied AFTER these (see the `set_clean_env` call), so a caller can still
+    // override anything the box set. Best-effort: an unreadable `environ` just means no inheritance,
+    // never a failed exec.
+    let inherited: Vec<(String, String)> = std::fs::read(format!("/proc/{pid1}/environ"))
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .filter(|e| !e.is_empty())
+                .filter_map(|e| std::str::from_utf8(e).ok())
+                .filter_map(|e| e.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut env_all: Vec<(String, String)> = inherited;
+    env_all.extend(env.iter().cloned());
+    let env: &[(String, String)] = &env_all;
 
     // Open every namespace fd BEFORE any setns: once we enter the mount namespace, `/proc` points
     // at the box's, so `/proc/<pid1>/ns/*` would no longer resolve. Order of *entry* matters -

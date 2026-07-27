@@ -47,6 +47,11 @@ pub struct Instance {
     pub memory_max: Option<u64>,
     /// The box's requested `pids.max` cap (`--pids-limit`); `None` when uncapped or absent.
     pub pids_max: Option<u64>,
+    /// `--label k=v` metadata (comma-joined `k=v` pairs), the compose `labels:` target. Purely
+    /// descriptive - it changes nothing about how the box runs - but it is what `kern ps --filter
+    /// label=` selects on and what `kern inspect` reports, so tooling can group a stack's boxes.
+    /// Empty when none; absent in older entries (the decoder defaults it).
+    pub labels: String,
 }
 
 impl Instance {
@@ -417,7 +422,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -432,6 +437,7 @@ fn encode(inst: &Instance) -> String {
         one_line(&inst.landlock_rw),
         inst.memory_max.map(|v| v.to_string()).unwrap_or_default(),
         inst.pids_max.map(|v| v.to_string()).unwrap_or_default(),
+        one_line(&inst.labels),
     )
 }
 
@@ -957,6 +963,7 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut volumes, mut pod) = (String::new(), String::new());
     let (mut egress, mut landlock_rw) = (String::new(), String::new());
     let (mut memory_max, mut pids_max) = (None, None);
+    let mut labels = String::new();
     for line in body.lines() {
         // Skip a malformed line (e.g. a half-written record from a crash mid-write) rather than `?`-ing
         // out, which would evaporate the WHOLE entry and silently drop a live box from the registry.
@@ -979,6 +986,7 @@ fn parse(body: &str) -> Option<Instance> {
             // empty string (uncapped) parses to None; a bad value is ignored, not fatal
             "memory_max" => memory_max = v.parse().ok(),
             "pids_max" => pids_max = v.parse().ok(),
+            "labels" => labels = v.to_string(),
             _ => {}
         }
     }
@@ -995,6 +1003,7 @@ fn parse(body: &str) -> Option<Instance> {
         pod,
         egress,
         landlock_rw,
+        labels,
         memory_max,
         pids_max,
     })
@@ -1049,6 +1058,7 @@ mod tests {
             landlock_rw: "/tmp,/data".into(),
             memory_max: Some(134_217_728),
             pids_max: Some(64),
+            labels: String::new(),
         };
         let got = parse(&encode(&inst)).expect("parse a well-formed entry");
         assert_eq!(got.pod, "stack");
@@ -1060,6 +1070,7 @@ mod tests {
         let uncapped = Instance {
             memory_max: None,
             pids_max: None,
+            labels: String::new(),
             ..inst.clone()
         };
         let got2 = parse(&encode(&uncapped)).expect("parse");
@@ -1177,6 +1188,7 @@ mod tests {
                 landlock_rw: String::new(),
                 memory_max: None,
                 pids_max: None,
+                labels: String::new(),
             })
             .unwrap()
         };
@@ -1223,6 +1235,7 @@ mod tests {
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,
+            labels: String::new(),
         })
         .unwrap();
         let got = claim_name(&name).unwrap();

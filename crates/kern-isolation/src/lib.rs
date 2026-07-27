@@ -73,6 +73,10 @@ pub enum Error {
     Syscall(&'static str, std::io::Error),
     /// The environment cannot host a sandbox (e.g. unprivileged user namespaces disabled).
     Unsupported(&'static str),
+    /// A spec value the kernel refused, with a message naming the exact field and reason (e.g. which
+    /// `--sysctl` key and why). Owned because the detail is what makes it actionable; only built on
+    /// the failure path, so it costs nothing when the box starts normally.
+    Spec(String),
 }
 
 impl Error {
@@ -87,6 +91,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Syscall(op, e) => write!(f, "{op} failed: {e}"),
             Error::Unsupported(why) => write!(f, "{why}"),
+            Error::Spec(msg) => write!(f, "{msg}"),
         }
     }
 }

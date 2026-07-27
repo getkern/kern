@@ -234,22 +234,50 @@ pub fn create_with_range(name: &str, want_outbound: bool, uid_range: bool) -> Re
 /// `resolv.conf`. Returns `true` only when outbound AND DNS are actually up (so `create`'s message
 /// is honest). Best-effort: no pasta / any failure → `false` (the pod stays loopback-only). pasta
 /// backgrounds itself and exits automatically when the net ns is freed (at `pod rm`).
+/// pasta's automatic port mapping, OFF in all four directions.
+///
+/// pasta defaults every one of these to `auto`, which is not merely redundant with kern's own
+/// publishing - it breaks it:
+///
+///  * `-t auto` (host → ns) re-scans host-bound ports on a timer and binds the matching port INSIDE
+///    the pod net ns. kern's forwarder binds the HOST side of every `-p`, so ~1-2 s after a box
+///    starts pasta claims that port in the ns and the service trying to listen there gets EADDRINUSE.
+///    Measured on the shipped binary: a service binding within ~1 s won the race, one binding at >=2 s
+///    always lost - i.e. every real app (node, django, postgres) failed to serve its own published
+///    port while `compose up` still reported success. A silent partial failure, at runtime.
+///  * `-T auto` (ns → host) would publish in-pod ports on the host with no `-p` at all, contradicting
+///    kern's explicit-publish, loopback-default model. Off by construction rather than by timing.
+///
+/// Publishing stays entirely kern's job ([`crate::ports`] → `fork_forwarders`: bind the host port,
+/// `setns` into the box per connection). pasta is left doing exactly what it is here for: NAT'd
+/// egress + DNS.
+const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", "-U", "none"];
+
+/// The exact argv passed to `pasta` for a pod, as a pure function of the pod dir + holder PID, so the
+/// invariants above are unit-testable without spawning anything. `--config-net` copies the host's
+/// addresses/routes into the ns tap and NATs outbound; pasta then daemonizes (the spawned process
+/// exits once setup is done). `-q` quiets it, `-P` records its PID for teardown.
+fn pasta_args(dir: &std::path::Path, holder: i32) -> Vec<std::ffi::OsString> {
+    let mut a: Vec<std::ffi::OsString> = Vec::with_capacity(15);
+    a.push("--config-net".into());
+    a.push("-q".into());
+    a.push("-P".into());
+    a.push(dir.join("pasta.pid").into());
+    a.extend(PASTA_NO_PORT_MAP.iter().map(Into::into));
+    a.push("--userns".into());
+    a.push(format!("/proc/{holder}/ns/user").into());
+    a.push("--netns".into());
+    a.push(format!("/proc/{holder}/ns/net").into());
+    a
+}
+
 fn setup_outbound(name: &str, holder: i32) -> bool {
     let Some(pasta) = which_pasta() else {
         return false;
     };
     let dir = pod_dir(name);
-    // `--config-net` copies the host's addresses/routes into the ns tap and NATs outbound; pasta then
-    // daemonizes (the spawned process exits once setup is done). `-q` quiets it, `-P` records its PID.
     let ok = std::process::Command::new(pasta)
-        .arg("--config-net")
-        .arg("-q")
-        .arg("-P")
-        .arg(dir.join("pasta.pid"))
-        .arg("--userns")
-        .arg(format!("/proc/{holder}/ns/user"))
-        .arg("--netns")
-        .arg(format!("/proc/{holder}/ns/net"))
+        .args(pasta_args(&dir, holder))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -495,6 +523,52 @@ mod tests {
         for no in ["bash", "sleep", "kern", "past", "asta", "", "pas"] {
             assert!(!is_pasta_comm(no), "{no} must NOT match");
         }
+    }
+
+    #[test]
+    fn pasta_argv_disables_automatic_port_mapping() {
+        // REGRESSION GUARD for a runtime silent partial failure: pasta defaults `-t/-u/-T/-U` to
+        // `auto`, and `-t auto` periodically binds host-bound ports INSIDE the pod net ns. Since kern's
+        // own forwarder binds the host side of every `-p`, pasta would steal the published port from
+        // the service ~1-2 s after start (measured: bind at >=2 s always got EADDRINUSE) while
+        // `compose up` still reported success. All four MUST stay explicitly `none`.
+        let argv = pasta_args(std::path::Path::new("/run/user/1000/kern/pods/demo"), 4242);
+        let flat: Vec<String> = argv
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        for dir_flag in ["-t", "-u", "-T", "-U"] {
+            let at = flat.iter().position(|a| a == dir_flag);
+            let Some(at) = at else {
+                panic!("pasta argv must pin {dir_flag} explicitly, got {flat:?}");
+            };
+            assert_eq!(
+                flat.get(at + 1).map(String::as_str),
+                Some("none"),
+                "{dir_flag} must be 'none' (pasta's default is 'auto', which steals published ports)"
+            );
+        }
+        // The rest of the contract the teardown and egress depend on.
+        assert!(flat.contains(&"--config-net".to_string()), "NAT'd egress");
+        let pidfile = flat
+            .iter()
+            .position(|a| a == "-P")
+            .and_then(|i| flat.get(i + 1));
+        assert_eq!(
+            pidfile.map(String::as_str),
+            Some("/run/user/1000/kern/pods/demo/pasta.pid"),
+            "teardown reads this exact path to kill pasta"
+        );
+        let ns = flat
+            .iter()
+            .position(|a| a == "--netns")
+            .and_then(|i| flat.get(i + 1));
+        assert_eq!(ns.map(String::as_str), Some("/proc/4242/ns/net"));
+        let us = flat
+            .iter()
+            .position(|a| a == "--userns")
+            .and_then(|i| flat.get(i + 1));
+        assert_eq!(us.map(String::as_str), Some("/proc/4242/ns/user"));
     }
 
     #[test]

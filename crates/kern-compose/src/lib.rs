@@ -78,6 +78,9 @@ pub struct ComposeBox {
     pub health_timeout: Option<String>,
     pub health_action: Option<String>,
     pub read_only: bool,
+    /// Compose `init: true` → `--init`: a minimal reaping PID 1 in the box, so a service that
+    /// forks (nginx, supervisord, any `sh -c` wrapper) doesn't accumulate zombies.
+    pub init: bool,
     pub net: bool,
     pub uid_range: bool,
     /// Set when the compose file wrote `uid_range = false` explicitly, so the per-image default
@@ -92,6 +95,16 @@ pub struct ComposeBox {
     pub ports: Vec<String>,
     pub secrets: Vec<String>,
     pub tmpfs: Vec<String>,
+    /// Compose `extra_hosts:` → one `--add-host` per entry (`name:ip`). Docker also accepts the
+    /// `name=ip` spelling and the long mapping form; both are normalised to `name:ip` by the parser.
+    pub add_host: Vec<String>,
+    /// Compose `ulimits:` → one `--ulimit NAME=SOFT:HARD` per entry. Both Docker forms are accepted:
+    /// the scalar (`nofile: 1024`, soft == hard) and the mapping (`nofile: {soft: N, hard: M}`).
+    pub ulimits: Vec<String>,
+    /// Compose `labels:` → one `--label k=v` per entry (mapping `k: v` or `k=v` list form).
+    pub labels: Vec<String>,
+    /// Compose `sysctls:` → one `--sysctl KEY=VALUE` per entry (mapping or `KEY=VALUE` list form).
+    pub sysctls: Vec<String>,
     pub cap_add: Vec<String>,
     pub cap_drop: Vec<String>,
     /// Compose `profiles: [...]`. A service with a non-empty profile list is INACTIVE unless one of
@@ -204,6 +217,9 @@ impl ComposeBox {
         if self.read_only {
             cmd.arg("--read-only");
         }
+        if self.init {
+            cmd.arg("--init");
+        }
         if self.net {
             cmd.arg("--net");
         }
@@ -223,6 +239,18 @@ impl ComposeBox {
         }
         if self.tun {
             cmd.arg("--tun");
+        }
+        for v in &self.add_host {
+            cmd.arg("--add-host").arg(v);
+        }
+        for v in &self.ulimits {
+            cmd.arg("--ulimit").arg(v);
+        }
+        for v in &self.sysctls {
+            cmd.arg("--sysctl").arg(v);
+        }
+        for v in &self.labels {
+            cmd.arg("--label").arg(v);
         }
         for v in &self.volumes {
             cmd.arg("--volume").arg(v);
@@ -260,14 +288,263 @@ impl ComposeBox {
 /// long tail - see `yaml::parse`). Auto-detect is deliberate: the two grammars are unambiguous at the
 /// first non-comment line (`[` opens a TOML table; a bare `key:` opens a YAML mapping).
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
+    parse_with_env(text, &DotEnv::default())
+}
+
+/// [`parse`], plus a project `.env` consulted for `${VAR}` interpolation when the process environment
+/// does not define the name. Split from `parse` so the pure-text entry point (and the fuzz target)
+/// keeps its one-argument signature.
+pub fn parse_with_env(text: &str, dotenv: &DotEnv) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, true)
+}
+
+/// Parse an OVERRIDE layer (`-f base.yml -f override.yml`, every file after the first).
+///
+/// Docker merges the documents BEFORE validating them, so an override legitimately carries no
+/// `image:` - it only restates the keys it changes. Validating each file standalone rejected exactly
+/// the file an override is supposed to be; the "nothing to run" check is therefore deferred to the
+/// MERGED result, where it still catches a service no layer ever gave something to run.
+pub fn parse_override(text: &str, dotenv: &DotEnv) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, false)
+}
+
+/// Assert every service ended up with something to run. Called on the merged stack (see
+/// [`parse_override`]).
+pub fn validate_runnable(boxes: &[ComposeBox]) -> Result<(), String> {
+    for b in boxes {
+        let has_image = b.image.as_deref().is_some_and(|s| !s.is_empty());
+        let has_rootfs = b.rootfs.as_deref().is_some_and(|s| !s.is_empty());
+        if !has_image && !has_rootfs && b.build.is_none() {
+            return Err(format!(
+                "service '{}' has no `image:`, `rootfs:` or `build:` (nothing to run)",
+                b.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_layer(
+    text: &str,
+    dotenv: &DotEnv,
+    require_runnable: bool,
+) -> Result<Vec<ComposeBox>, String> {
     // Strip a leading UTF-8 BOM (Windows editors add one) so the first key/table header is recognized
     // - Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
     // "has no services".
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if is_yaml(text) {
-        yaml::parse(text)
+        yaml::parse_with_env(text, dotenv, require_runnable)
     } else {
         parse_toml(text)
+    }
+}
+
+/// Merge an OVERRIDE stack into a BASE one, Docker's `-f base.yml -f override.yml` semantics.
+///
+/// Docker merges the files before interpreting them; kern merges the interpreted services, which is
+/// equivalent for everything a compose override actually expresses, and is stated here precisely so
+/// the behaviour is checkable rather than folklore:
+///
+///  * a service only in the override is ADDED;
+///  * for a service in both, a SCALAR the override sets wins (image, command, user, mem_limit, …) and
+///    one it leaves unset keeps the base value - "unset" being the field's `Default`, exactly how the
+///    parser records an absent key;
+///  * SEQUENCES are APPENDED (ports, volumes, environment, labels, …) with the override last, so a
+///    later `environment` entry wins at runtime and an override can add a port without restating the
+///    base ones;
+///  * `command`/`entrypoint` REPLACE rather than append - concatenating two argv would run neither.
+///
+/// Order matters: `merge(a, b)` is "b overrides a". Not commutative, by design.
+pub fn merge_stacks(base: Vec<ComposeBox>, over: Vec<ComposeBox>) -> Vec<ComposeBox> {
+    let mut out = base;
+    for o in over {
+        match out.iter_mut().find(|b| b.name == o.name) {
+            Some(b) => b.merge_from(o),
+            None => out.push(o),
+        }
+    }
+    out
+}
+
+impl ComposeBox {
+    /// Apply `o` over `self` - see [`merge_stacks`] for the rules.
+    fn merge_from(&mut self, o: ComposeBox) {
+        // Scalars: the override wins when it set one.
+        macro_rules! opt {
+            ($($f:ident),* $(,)?) => { $( if o.$f.is_some() { self.$f = o.$f; } )* };
+        }
+        opt!(
+            image,
+            rootfs,
+            build,
+            workdir,
+            memory,
+            cpus,
+            cpuset,
+            swap_max,
+            pids_limit,
+            io_weight,
+            nice,
+            timeout,
+            hostname,
+            user,
+            ssh,
+            ssh_key,
+            health_cmd,
+            health_interval,
+            health_retries,
+            health_start_period,
+            health_timeout,
+            health_action,
+        );
+        // Booleans: an override can only turn one ON (its `false` is indistinguishable from absent).
+        macro_rules! flag {
+            ($($f:ident),* $(,)?) => { $( self.$f |= o.$f; )* };
+        }
+        flag!(read_only, net, uid_range, bind_rootfs, restart, tun, init);
+        if o.uid_range_explicit_false {
+            self.uid_range_explicit_false = true;
+        }
+        // Sequences: append, override last.
+        macro_rules! seq {
+            ($($f:ident),* $(,)?) => { $( self.$f.extend(o.$f); )* };
+        }
+        seq!(
+            volumes,
+            env,
+            env_file,
+            ports,
+            secrets,
+            tmpfs,
+            cap_add,
+            cap_drop,
+            add_host,
+            ulimits,
+            sysctls,
+            labels,
+            net_aliases,
+            profiles,
+            depends_on,
+            depends_healthy,
+            depends_completed,
+        );
+        // argv REPLACES: appending two commands would run neither.
+        if !o.command.is_empty() {
+            self.command = o.command;
+        }
+    }
+}
+
+/// Variables from a project `.env`, consulted ONLY when the process environment does not define the
+/// name - Docker's precedence is shell > `.env`, and inverting it would let a checked-in file silently
+/// override what an operator exported for one run.
+///
+/// A contiguous `Vec` scanned linearly, not a hash map: a real `.env` holds a handful of keys, so the
+/// whole table sits in a couple of cache lines and a linear scan wins on both lookup latency and setup
+/// cost at these sizes. The common case (no `.env` at all) is [`DotEnv::default`], where every lookup
+/// is one length check.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct DotEnv(Vec<(String, String)>);
+
+impl DotEnv {
+    /// The value bound to `key`, or `None`. Last definition wins (like a shell sourcing the file), so
+    /// the scan runs backwards and stops at the first hit.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Number of bindings (0 when there is no `.env`).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Parse `.env` text per Docker's rules. Pure and total: any input yields a table, never an error -
+/// a malformed line is skipped, because refusing to run a stack over one stray line in a file Docker
+/// tolerates would be worse than ignoring it.
+///
+/// Implemented rules (docs.docker.com/compose/how-tos/environment-variables/variable-interpolation):
+///  * blank lines and lines whose first non-space character is `#` are ignored;
+///  * `KEY=VALUE` or `KEY:VALUE` (first delimiter wins), spaces around both sides trimmed;
+///  * a leading `export ` is tolerated (shells write it; Docker ignores it);
+///  * single-quoted values are LITERAL; double-quoted values decode `\n`, `\r`, `\t`, `\\`, `\"`;
+///  * an inline comment is stripped after the closing quote, or - for an unquoted value - at the first
+///    ` #` (a `#` with no preceding space is part of the value, e.g. a colour or a fragment URL);
+///  * a key that is empty or contains whitespace is skipped (it could not be referenced anyway).
+///
+/// `${…}` inside values is NOT expanded here: kern interpolates once, over the whole compose document,
+/// after the environment and this table are merged - expanding twice would substitute a value that
+/// itself looks like a reference.
+pub fn parse_dotenv(text: &str) -> DotEnv {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        // First `=` or `:` delimits; whichever comes first, so `URL=http://x` keeps its colons.
+        let cut = match (line.find('='), line.find(':')) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => continue, // no delimiter: not a binding
+        };
+        let key = line[..cut].trim();
+        if key.is_empty() || key.split_whitespace().count() != 1 {
+            continue;
+        }
+        out.push((key.to_string(), dotenv_value(line[cut + 1..].trim())));
+    }
+    DotEnv(out)
+}
+
+/// Decode one `.env` value: quote handling + inline-comment stripping. See [`parse_dotenv`].
+fn dotenv_value(v: &str) -> String {
+    let mut chars = v.chars();
+    match chars.next() {
+        // Single quotes: literal to the closing quote; anything after it is a comment.
+        Some('\'') => match v[1..].find('\'') {
+            Some(end) => v[1..1 + end].to_string(),
+            None => v[1..].to_string(), // unterminated: take the rest, don't drop the value
+        },
+        // Double quotes: honour backslash escapes, stop at the first UNescaped closing quote.
+        Some('"') => {
+            let mut out = String::with_capacity(v.len());
+            let mut esc = false;
+            for c in v[1..].chars() {
+                if esc {
+                    out.push(match c {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other, // covers \\ and \" ; unknown escapes stay literal
+                    });
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    break;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        // Unquoted: an inline comment must be preceded by a space, so only ` #` ends the value.
+        _ => match v.find(" #") {
+            Some(at) => v[..at].trim_end().to_string(),
+            None => v.to_string(),
+        },
     }
 }
 
@@ -1166,5 +1443,406 @@ mod tests {
         assert!(parse("[box.a/b]\nimage=\"x\"").is_err());
         // An empty source is treated as absent.
         assert!(parse("[box.a]\nimage=\"\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod compat_field_tests {
+    use super::*;
+
+    fn one(yaml: &str) -> ComposeBox {
+        let mut v = parse(yaml).expect("parses");
+        assert_eq!(v.len(), 1, "expected exactly one service");
+        v.remove(0)
+    }
+
+    #[test]
+    fn extra_hosts_all_three_docker_spellings() {
+        // List with ':', list with '=', and the mapping form - all normalised to kern's `name:ip`.
+        let b = one("services:\n  a:\n    image: x\n    extra_hosts:\n      - \"api:10.0.0.5\"\n      - \"db=10.0.0.6\"\n");
+        assert_eq!(b.add_host, ["api:10.0.0.5", "db:10.0.0.6"]);
+        let m = one("services:\n  a:\n    image: x\n    extra_hosts:\n      cache: 10.0.0.7\n");
+        assert_eq!(m.add_host, ["cache:10.0.0.7"]);
+    }
+
+    #[test]
+    fn extra_hosts_keeps_ipv6_intact_and_drops_malformed() {
+        // Splitting on the FIRST separator matters: an IPv6 value is full of colons.
+        let b = one("services:\n  a:\n    image: x\n    extra_hosts:\n      - \"v6=::1\"\n      - \"nonsense\"\n");
+        assert_eq!(
+            b.add_host,
+            ["v6:::1"],
+            "only the well-formed entry survives"
+        );
+    }
+
+    #[test]
+    fn init_maps_to_the_flag() {
+        assert!(one("services:\n  a:\n    image: x\n    init: true\n").init);
+        assert!(!one("services:\n  a:\n    image: x\n    init: false\n").init);
+        assert!(!one("services:\n  a:\n    image: x\n").init);
+    }
+
+    #[test]
+    fn ulimits_scalar_and_mapping_forms() {
+        let b = one("services:\n  a:\n    image: x\n    ulimits:\n      nofile: 1024\n      nproc:\n        soft: 512\n        hard: 1024\n");
+        assert!(
+            b.ulimits.contains(&"nofile=1024".to_string()),
+            "{:?}",
+            b.ulimits
+        );
+        assert!(
+            b.ulimits.contains(&"nproc=512:1024".to_string()),
+            "{:?}",
+            b.ulimits
+        );
+    }
+
+    #[test]
+    fn ulimits_partial_mapping_reuses_the_given_bound() {
+        // Docker tolerates only one of soft/hard; reusing it keeps `soft <= hard` true by construction.
+        let b =
+            one("services:\n  a:\n    image: x\n    ulimits:\n      nofile:\n        soft: 2048\n");
+        assert_eq!(b.ulimits, ["nofile=2048"]);
+    }
+
+    #[test]
+    fn sysctls_mapping_and_list_forms() {
+        let m =
+            one("services:\n  a:\n    image: x\n    sysctls:\n      net.core.somaxconn: 4096\n");
+        assert_eq!(m.sysctls, ["net.core.somaxconn=4096"]);
+        let l =
+            one("services:\n  a:\n    image: x\n    sysctls:\n      - net.core.somaxconn=4096\n");
+        assert_eq!(l.sysctls, ["net.core.somaxconn=4096"]);
+    }
+
+    #[test]
+    fn flow_mappings_resolve_like_block_mappings() {
+        // REGRESSION: `{...}` arrives as one opaque scalar. Before this was handled, an inline
+        // `sysctls: {k: v}` reached the box as a single unparsable argument (hard error) and an inline
+        // `ulimits: {nofile: N}` was dropped SILENTLY - a limit the operator wrote, not in force.
+        let f = one("services:\n  a:\n    image: x\n    sysctls: {net.core.somaxconn: 1500}\n");
+        assert_eq!(f.sysctls, ["net.core.somaxconn=1500"]);
+        let l = one("services:\n  a:\n    image: x\n    labels: {app: web, tier: front}\n");
+        assert_eq!(l.labels, ["app=web", "tier=front"]);
+        let u = one("services:\n  a:\n    image: x\n    ulimits: {nofile: 2048}\n");
+        assert_eq!(u.ulimits, ["nofile=2048"]);
+        let h = one("services:\n  a:\n    image: x\n    extra_hosts: {h.local: 10.1.2.3}\n");
+        assert_eq!(h.add_host, ["h.local:10.1.2.3"]);
+        // Nested value: the comma inside the inner map must NOT split the outer one.
+        let n =
+            one("services:\n  a:\n    image: x\n    ulimits: {nofile: {soft: 256, hard: 512}}\n");
+        assert_eq!(n.ulimits, ["nofile=256:512"]);
+        // Two ulimits, one of them nested - depth tracking on the top-level comma.
+        let m = one(
+            "services:\n  a:\n    image: x\n    ulimits: {nproc: 64, nofile: {soft: 1, hard: 2}}\n",
+        );
+        assert!(
+            m.ulimits.contains(&"nproc=64".to_string()),
+            "{:?}",
+            m.ulimits
+        );
+        assert!(
+            m.ulimits.contains(&"nofile=1:2".to_string()),
+            "{:?}",
+            m.ulimits
+        );
+    }
+
+    #[test]
+    fn bare_dollar_var_is_interpolated_like_docker() {
+        // Docker substitutes a BARE `$NAME` exactly like `${NAME}`; kern left it literal, so
+        // `image: myapp:$TAG` shipped the string "$TAG" as a tag.
+        std::env::set_var("KERN_BARE_T", "3.19");
+        let b = one("services:\n  a:\n    image: \"alpine:$KERN_BARE_T\"\n");
+        assert_eq!(b.image.as_deref(), Some("alpine:3.19"));
+        std::env::remove_var("KERN_BARE_T");
+    }
+
+    #[test]
+    fn dollar_forms_docker_does_not_touch_stay_literal() {
+        // `$(cmd)`, `$1` and `$$` must survive for the in-box shell: interpolating them would rewrite
+        // a command's meaning. `$$` is the documented escape for a literal `$`.
+        let b = one(
+            "services:\n  a:\n    image: alpine\n    command: sh -c \"echo $(date) $1 $$HOME\"\n",
+        );
+        let cmd = b.command.join(" ");
+        assert!(cmd.contains("$(date)"), "{cmd}");
+        assert!(cmd.contains("$1"), "{cmd}");
+        assert!(cmd.contains("$HOME") && !cmd.contains("$$HOME"), "{cmd}");
+    }
+
+    #[test]
+    fn merge_stacks_follows_the_documented_rules() {
+        let base = parse("services:\n  a:\n    image: alpine\n    command: base\n    ports: [\"1:1\"]\n    environment: [X=1]\n").expect("base");
+        let over = parse_override("services:\n  a:\n    command: over\n    ports: [\"2:2\"]\n    environment: [Y=2]\n  b:\n    image: busybox\n", &DotEnv::default()).expect("override");
+        let m = merge_stacks(base, over);
+        assert_eq!(m.len(), 2, "a service only in the override is added");
+        let a = m.iter().find(|b| b.name == "a").expect("a");
+        assert_eq!(
+            a.image.as_deref(),
+            Some("alpine"),
+            "base scalar kept when the override omits it"
+        );
+        // A shell-form `command:` is recorded as `sh -c <string>`, so assert on content: the
+        // override's argv is there and the base's is GONE (a concatenation would keep both).
+        let cmd = a.command.join(" ");
+        assert!(
+            cmd.contains("over") && !cmd.contains("base"),
+            "argv REPLACES, never concatenates: {cmd}"
+        );
+        assert_eq!(a.ports, ["1:1", "2:2"], "sequences append, override last");
+        assert_eq!(a.env, ["X=1", "Y=2"]);
+    }
+
+    #[test]
+    fn an_override_layer_needs_no_image_but_the_result_does() {
+        // The whole point of `-f base -f override`: the override restates only what it changes.
+        let over = parse_override(
+            "services:\n  a:\n    environment: [X=1]\n",
+            &DotEnv::default(),
+        )
+        .expect("override parses without image");
+        assert!(
+            validate_runnable(&over).is_err(),
+            "…but the merged result must still be runnable"
+        );
+        let base = parse("services:\n  a:\n    image: alpine\n").expect("base");
+        assert!(validate_runnable(&merge_stacks(base, over)).is_ok());
+    }
+
+    #[test]
+    fn flow_mapping_values_keep_their_colons() {
+        // The key ends at the FIRST top-level ':'; a value with colons (URL, IPv6) stays whole.
+        let l = one("services:\n  a:\n    image: x\n    labels: {url: http://h:8080/p}\n");
+        assert_eq!(l.labels, ["url=http://h:8080/p"]);
+    }
+
+    #[test]
+    fn labels_mapping_and_list_forms() {
+        let m = one("services:\n  a:\n    image: x\n    labels:\n      app: web\n");
+        assert_eq!(m.labels, ["app=web"]);
+        let l = one("services:\n  a:\n    image: x\n    labels:\n      - app=web\n");
+        assert_eq!(l.labels, ["app=web"]);
+    }
+
+    #[test]
+    fn all_five_reach_the_box_command_line() {
+        // The end that matters: each field must become the kern flag that implements it. A field
+        // parsed but never emitted would be exactly the silent no-op these fixes removed.
+        let b = one(
+            "services:\n  a:\n    image: x\n    init: true\n    extra_hosts: [\"h:1.2.3.4\"]\n             \n    ulimits:\n      nofile: 64\n    sysctls:\n      net.core.somaxconn: 8\n             \n    labels:\n      app: web\n",
+        );
+        let mut cmd = std::process::Command::new("kern");
+        b.push_box_flags(&mut cmd);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "--init",
+            "--add-host",
+            "h:1.2.3.4",
+            "--ulimit",
+            "nofile=64",
+            "--sysctl",
+            "net.core.somaxconn=8",
+            "--label",
+            "app=web",
+        ] {
+            assert!(
+                argv.iter().any(|a| a == expected),
+                "{expected:?} missing from {argv:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod dotenv_tests {
+    use super::*;
+
+    fn v(text: &str, key: &str) -> Option<String> {
+        parse_dotenv(text).get(key).map(str::to_string)
+    }
+
+    #[test]
+    fn plain_bindings_and_both_delimiters() {
+        let e = parse_dotenv("A=1\nB:2\n");
+        assert_eq!(e.get("A"), Some("1"));
+        assert_eq!(
+            e.get("B"),
+            Some("2"),
+            "Docker accepts `:` as a delimiter too"
+        );
+        assert_eq!(e.get("MISSING"), None);
+        assert_eq!(e.len(), 2);
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_ignored() {
+        let e = parse_dotenv("# commento\n\n   \n#A=nascosto\nA=visibile\n");
+        assert_eq!(e.get("A"), Some("visibile"));
+        assert_eq!(e.len(), 1, "only the one real binding: {e:?}");
+    }
+
+    #[test]
+    fn spaces_around_key_and_value_are_trimmed() {
+        assert_eq!(v("  A  =   1   \n", "A").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn export_prefix_is_tolerated() {
+        // Shells write `export K=V` into these files; Docker reads the binding either way.
+        assert_eq!(v("export A=1\n", "A").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn first_delimiter_wins_so_urls_keep_their_colons() {
+        assert_eq!(
+            v("URL=http://host:5432/db\n", "URL").as_deref(),
+            Some("http://host:5432/db")
+        );
+        // …and a `:`-delimited key whose value contains `=` keeps the `=`.
+        assert_eq!(v("Q:a=b\n", "Q").as_deref(), Some("a=b"));
+    }
+
+    #[test]
+    fn single_quotes_are_literal() {
+        // No escape processing, no interpolation - the value is exactly what is between the quotes.
+        assert_eq!(
+            v("A='ciao \\n $NOPE'\n", "A").as_deref(),
+            Some("ciao \\n $NOPE")
+        );
+    }
+
+    #[test]
+    fn double_quotes_decode_escapes() {
+        assert_eq!(
+            v(r#"A="riga1\nriga2""#, "A").as_deref(),
+            Some("riga1\nriga2")
+        );
+        assert_eq!(v(r#"A="tab\there""#, "A").as_deref(), Some("tab\there"));
+        assert_eq!(v(r#"A="back\\slash""#, "A").as_deref(), Some("back\\slash"));
+        assert_eq!(v(r#"A="say \"hi\"""#, "A").as_deref(), Some("say \"hi\""));
+    }
+
+    #[test]
+    fn inline_comments() {
+        // Unquoted: only a SPACE-prefixed `#` starts a comment, so a `#` glued to the value stays.
+        assert_eq!(v("A=valore # nota\n", "A").as_deref(), Some("valore"));
+        assert_eq!(v("A=#ffffff\n", "A").as_deref(), Some("#ffffff"));
+        assert_eq!(v("A=col#ore\n", "A").as_deref(), Some("col#ore"));
+        // Quoted: the comment follows the closing quote and is dropped.
+        assert_eq!(
+            v("A=\"con spazi\"  # nota\n", "A").as_deref(),
+            Some("con spazi")
+        );
+        assert_eq!(
+            v("A='letterale'  # nota\n", "A").as_deref(),
+            Some("letterale")
+        );
+    }
+
+    #[test]
+    fn last_definition_wins() {
+        // A file that binds the same key twice behaves like a shell sourcing it top to bottom.
+        assert_eq!(v("A=primo\nA=secondo\n", "A").as_deref(), Some("secondo"));
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped_never_fatal() {
+        // Total function: a stray line must not take the stack down (Docker tolerates these files).
+        let e =
+            parse_dotenv("questa riga non ha delimitatore\n=senza_chiave\nA B=due parole\nOK=1\n");
+        assert_eq!(e.get("OK"), Some("1"));
+        assert_eq!(e.len(), 1, "only the well-formed binding survives: {e:?}");
+    }
+
+    #[test]
+    fn empty_and_edge_values() {
+        assert_eq!(v("A=\n", "A").as_deref(), Some(""));
+        assert_eq!(v("A=''\n", "A").as_deref(), Some(""));
+        assert_eq!(v("A=\"\"\n", "A").as_deref(), Some(""));
+        // Unterminated quote: keep the rest rather than silently dropping the value.
+        assert_eq!(v("A='non chiusa\n", "A").as_deref(), Some("non chiusa"));
+        // No trailing newline at EOF.
+        assert_eq!(v("A=1", "A").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn dollar_is_left_for_the_document_pass() {
+        // `${…}` inside a value must survive verbatim: kern interpolates ONCE over the whole compose
+        // document after merging env + .env. Expanding here would substitute twice.
+        assert_eq!(v("A=${B}\n", "A").as_deref(), Some("${B}"));
+    }
+
+    #[test]
+    fn shell_environment_wins_over_dotenv() {
+        // Docker precedence: shell > .env. Verified through the real interpolation path.
+        let _g = std::sync::Mutex::new(()); // (no shared state; the var name below is unique)
+        drop(_g);
+        let de = parse_dotenv("KERN_DOTENV_PREC_TEST=da-dotenv\n");
+        let yaml =
+            "services:\n  a:\n    image: alpine\n    command: echo ${KERN_DOTENV_PREC_TEST}\n";
+
+        let only_dotenv = parse_with_env(yaml, &de).expect("parses");
+        assert!(
+            only_dotenv[0].command.join(" ").contains("da-dotenv"),
+            "unset in the shell → the .env value is used: {:?}",
+            only_dotenv[0].command
+        );
+
+        std::env::set_var("KERN_DOTENV_PREC_TEST", "da-shell");
+        let with_shell = parse_with_env(yaml, &de).expect("parses");
+        std::env::remove_var("KERN_DOTENV_PREC_TEST");
+        assert!(
+            with_shell[0].command.join(" ").contains("da-shell"),
+            "the shell must WIN over .env: {:?}",
+            with_shell[0].command
+        );
+    }
+
+    #[test]
+    fn totality_under_random_input() {
+        // `parse_dotenv` is documented as TOTAL: any byte string yields a table, never a panic. The
+        // slicing inside it is index-arithmetic on `find()` results and on quote characters, so a
+        // wrong assumption about char boundaries would panic on multibyte input. Deterministic
+        // xorshift (no `rand` dependency, reproducible on failure) over the bytes most likely to break
+        // it: quotes, backslashes, delimiters, `#`, and multibyte UTF-8.
+        let alphabet: &[&str] = &[
+            "=", ":", "#", "'", "\"", "\\", " ", "\n", "\t", "A", "1", "export ", "$", "{", "}",
+            "à", "€", "🦀", "\u{feff}", "",
+        ];
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..100_000 {
+            let len = (next() % 24) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(alphabet[(next() as usize) % alphabet.len()]);
+            }
+            let e = parse_dotenv(&s);
+            // Whatever comes back must be self-consistent: every key it reports is retrievable.
+            for (k, _) in &e.0 {
+                assert!(e.get(k).is_some(), "key {k:?} not retrievable from {s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_dotenv_behaves_exactly_as_before() {
+        // The default table must change nothing for a project without a `.env`.
+        let yaml =
+            "services:\n  a:\n    image: alpine\n    command: echo ${KERN_NO_DOTENV_XYZ:-def}\n";
+        assert_eq!(
+            parse_with_env(yaml, &DotEnv::default()).map(|b| b[0].command.clone()),
+            parse(yaml).map(|b| b[0].command.clone())
+        );
     }
 }

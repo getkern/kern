@@ -37,7 +37,18 @@ const MAX_ANCHOR_NODES: usize = 10_000;
 /// `pub(crate)`: reached only through the crate's one public door, [`super::parse`] (which sniffs
 /// YAML vs TOML first). The `yaml` module itself is private, so this was never externally reachable -
 /// the narrower marker just says so.
-pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
+/// Test-only shim: the pre-`.env` one-argument entry point, so the existing suite keeps exercising
+/// `parse` exactly as callers without a project `.env` reach it.
+#[cfg(test)]
+fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
+    parse_with_env(text, &crate::DotEnv::default(), true)
+}
+
+pub(crate) fn parse_with_env(
+    text: &str,
+    dotenv: &crate::DotEnv,
+    require_runnable: bool,
+) -> Result<Vec<ComposeBox>, String> {
     // Fold multi-line block scalars (`|`/`>`) and multi-line flow collections onto single logical lines
     // first, so the rest of the pipeline stays line-at-a-time (block-scalar bodies become opaque values).
     let folded = fold_multiline(text)?;
@@ -51,7 +62,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     // per-field pass would miss `ports: ["${PORT}:80"]`; Docker substitutes over the whole file before
     // parsing, and so do we. Unset with no default → empty + warn (Docker semantics), never a literal
     // `${VAR}` left to confuse a downstream tool.
-    let interpolated = interpolate_document(&folded);
+    let interpolated = interpolate_document(&folded, dotenv);
     let text = interpolated.as_str();
 
     let lines = lex(text)?;
@@ -145,7 +156,9 @@ pub(crate) fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     for b in &boxes {
         let has_image = b.image.as_deref().is_some_and(|s| !s.is_empty());
         let has_rootfs = b.rootfs.as_deref().is_some_and(|s| !s.is_empty());
-        if !has_image && !has_rootfs && b.build.is_none() {
+        // Skipped for an OVERRIDE layer: it restates only what it changes, so "nothing to run" is
+        // asserted on the MERGED stack instead (see `parse_override` / `validate_runnable`).
+        if require_runnable && !has_image && !has_rootfs && b.build.is_none() {
             return Err(format!(
                 "service '{}' has no `image:`, `rootfs:` or `build:` (nothing to run)",
                 b.name
@@ -309,6 +322,51 @@ fn fold_multiline(text: &str) -> Result<String, String> {
                         acc.push_str(split_at_comment(lines[j]).0.trim());
                     }
                     out.push(format!("{prefix}{acc}"));
+                    for _ in (i + 1)..=j {
+                        out.push(String::new());
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        // PLAIN multi-line scalar: `command: echo uno` continued by MORE-indented lines. Legal YAML
+        // and the one multi-line form kern used to refuse outright ("expected `key: value`").
+        //
+        // A continuation line must NOT contain a top-level `: ` - in block context YAML forbids that
+        // inside a plain scalar precisely because it is ambiguous with a mapping. Keeping that guard
+        // means an over-indented KEY still fails loudly (an indentation typo cannot be swallowed into
+        // the previous value), while genuine prose/command continuations fold. A `- ` line is a
+        // sequence entry and also stops the fold.
+        if let Some(ci) = colon_index(code) {
+            let value = code[ci + 1..].trim();
+            let is_block = block_intro(code).is_some();
+            let is_flow = value.starts_with('[') || value.starts_with('{');
+            if !value.is_empty() && !is_block && !is_flow {
+                let mut acc = String::new();
+                let mut j = i;
+                while j + 1 < lines.len() {
+                    let nl = lines[j + 1];
+                    if nl.trim().is_empty() {
+                        break;
+                    }
+                    let nc = split_at_comment(nl).0;
+                    let ni = nc.len() - nc.trim_start_matches(' ').len();
+                    let nt = nc.trim();
+                    if ni <= indent
+                        || nt.starts_with('-')
+                        || colon_index(nc).is_some()
+                        || block_intro(nc).is_some()
+                    {
+                        break;
+                    }
+                    acc.push(' ');
+                    acc.push_str(nt);
+                    j += 1;
+                }
+                if j > i {
+                    out.push(format!("{}{acc}", raw.trim_end()));
                     for _ in (i + 1)..=j {
                         out.push(String::new());
                     }
@@ -994,9 +1052,17 @@ fn resolve_extends(root: &mut Node) -> Result<(), String> {
 /// The target service name of an `extends` node: the scalar short form, or the `service:` key of the
 /// map form. A `file:` key (cross-file) is rejected clearly.
 fn extends_target(n: &Node) -> Result<String, String> {
-    if let Some(s) = n.scalar.as_deref().map(str::trim) {
-        if !s.is_empty() {
-            return Ok(s.to_string());
+    // STRUCTURED form first. A flow mapping (`extends: {service: b}`) carries BOTH the expanded
+    // `children` and the raw `{…}` text as a scalar; reading the scalar first took that raw text as a
+    // service NAME and reported "unknown service '{file: base.yml, service: b}'" instead of resolving
+    // it (or giving the honest cross-file message below).
+    if n.children.is_empty() {
+        if let Some(s) = n.scalar.as_deref().map(str::trim) {
+            // The short form is a bare service name; a leftover `{…}` is a mapping we failed to expand,
+            // never a name - fall through to the structured errors rather than inventing a target.
+            if !s.is_empty() && !s.starts_with('{') {
+                return Ok(s.to_string());
+            }
         }
     }
     if n.children.iter().any(|(k, _)| k == "file") {
@@ -1215,6 +1281,248 @@ fn split_top_commas(s: &str) -> Vec<String> {
 /// Collect `networks.<net>.aliases` across every network of a service's `networks:` node (the map
 /// form `networks: {net: {aliases: [db, …]}}`). The list form (`networks: [net]`) has no aliases →
 /// empty. Order-stable and de-duplicated.
+/// Split a YAML **flow mapping** (`{a: 1, b: {c: 2}}`) into its TOP-LEVEL `key → value` pairs.
+///
+/// The block form arrives as parsed `children`; the flow form arrives as one opaque scalar, and
+/// treating it as a plain string is how `sysctls: {net.core.somaxconn: 1500}` reached the box as a
+/// single unparsable argument. Real compose files use both spellings, so both must resolve to the
+/// same thing.
+///
+/// Splitting tracks brace/bracket DEPTH, so a nested value (`nofile: {soft: 1, hard: 2}`) stays whole
+/// and a comma inside it is not a separator. The key ends at the first TOP-LEVEL `:`, which keeps a
+/// value that itself contains colons (a URL label, an IPv6 address) intact. Returns an empty vec for
+/// anything that is not a flow mapping, so callers can fall through to their other forms.
+fn parse_inline_map(s: &str) -> Vec<(String, String)> {
+    let t = s.trim();
+    let Some(body) = t.strip_prefix('{').and_then(|b| b.strip_suffix('}')) else {
+        return Vec::new();
+    };
+    // Top-level comma split.
+    let mut items: Vec<&str> = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(&body[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    items.push(&body[start..]);
+
+    let unquote = |v: &str| -> String {
+        let v = v.trim();
+        v.strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .or_else(|| v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+            .unwrap_or(v)
+            .to_string()
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        // First TOP-LEVEL ':' separates key from value.
+        let mut d = 0usize;
+        let mut cut = None;
+        for (i, c) in item.char_indices() {
+            match c {
+                '{' | '[' => d += 1,
+                '}' | ']' => d = d.saturating_sub(1),
+                ':' if d == 0 => {
+                    cut = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(cut) = cut else { continue }; // no `k: v` shape - skip, never guess
+        let k = unquote(&item[..cut]);
+        if !k.is_empty() {
+            out.push((k, unquote(&item[cut + 1..])));
+        }
+    }
+    out
+}
+
+/// `extra_hosts:` → kern `--add-host` specs, normalised to `name:ip`.
+///
+/// Docker accepts three spellings and all three appear in real files:
+///   `extra_hosts: ["api.local:10.0.0.5"]`   (list, colon)
+///   `extra_hosts: ["api.local=10.0.0.5"]`   (list, equals - the newer spelling)
+///   `extra_hosts: {api.local: 10.0.0.5}`    (mapping)
+/// An entry with no separator cannot name a host AND an address, so it is dropped with a warning
+/// instead of being forwarded: kern would refuse the whole box over one malformed line, and a stack
+/// that fails to start is worse than one host alias missing (which the warning names precisely).
+/// A `key: value` mapping (or an already-joined `key<sep>value` list) flattened to `key<sep>value`
+/// strings. Used for `sysctls:`, which Docker accepts in both shapes.
+fn collect_kv(node: &Node, sep: char) -> Vec<String> {
+    // ONE source wins, in this order - they must never be summed. The lexer already expands a FLOW
+    // mapping (`{a: 1}`) into `children`, while `list_value` still hands back the raw `{a: 1}` text:
+    // consulting both appended that raw text as if it were an entry, and the box received
+    // `--sysctl {net.core.somaxconn: 1500}` (a hard error) or an unusable label.
+    if !node.children.is_empty() {
+        return node
+            .children
+            .iter()
+            .map(|(k, def)| {
+                let v = def.scalar.as_deref().map(scalar_str).unwrap_or_default();
+                format!("{k}{sep}{v}")
+            })
+            .collect();
+    }
+    if let Some(sc) = &node.scalar {
+        let pairs = parse_inline_map(sc);
+        if !pairs.is_empty() {
+            return pairs
+                .into_iter()
+                .map(|(k, v)| format!("{k}{sep}{v}"))
+                .collect();
+        }
+    }
+    // List form: `- KEY=VALUE`.
+    list_value(node)
+        .into_iter()
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .collect()
+}
+
+/// `ulimits:` → `NAME=SOFT:HARD` specs. Docker allows a scalar (`nofile: 1024`, meaning soft == hard)
+/// and a mapping (`nofile: {soft: 20000, hard: 40000}`); a mapping missing one bound reuses the other,
+/// which is what Docker does and keeps `soft <= hard` true by construction. Values are NOT validated
+/// here - the box owns the resource-name table and the bounds check, so there is exactly one authority.
+fn collect_ulimits(node: &Node, svc: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // Flow mapping, flat (`{nofile: 1024}`) or nested (`{nofile: {soft: 1, hard: 2}}`). Silently
+    // dropping it (the pre-fix behaviour) meant a limit the operator wrote was simply not in force.
+    if node.children.is_empty() {
+        if let Some(sc) = &node.scalar {
+            for (name, val) in parse_inline_map(sc) {
+                let inner = parse_inline_map(&val);
+                if inner.is_empty() {
+                    if !val.trim().is_empty() {
+                        out.push(format!("{name}={}", val.trim()));
+                    }
+                    continue;
+                }
+                let get = |k: &str| {
+                    inner
+                        .iter()
+                        .find(|(ik, _)| ik == k)
+                        .map(|(_, v)| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                };
+                match (get("soft"), get("hard")) {
+                    (Some(s), Some(h)) => out.push(format!("{name}={s}:{h}")),
+                    (Some(s), None) => out.push(format!("{name}={s}")),
+                    (None, Some(h)) => out.push(format!("{name}={h}")),
+                    (None, None) => warn(&format!(
+                    "service '{svc}': ulimits '{name}' has neither a value nor soft/hard - ignored"
+                )),
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    for (name, def) in &node.children {
+        // Scalar form: `nofile: 1024`.
+        if let Some(sc) = &def.scalar {
+            let v = scalar_str(sc);
+            if !v.trim().is_empty() {
+                out.push(format!("{name}={}", v.trim()));
+                continue;
+            }
+        }
+        // Mapping form: `nofile: {soft: N, hard: M}`.
+        let get = |k: &str| -> Option<String> {
+            def.child(k)
+                .and_then(|n| n.scalar.as_deref())
+                .map(scalar_str)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        match (get("soft"), get("hard")) {
+            (Some(s), Some(h)) => out.push(format!("{name}={s}:{h}")),
+            (Some(s), None) => out.push(format!("{name}={s}")),
+            (None, Some(h)) => out.push(format!("{name}={h}")),
+            (None, None) => warn(&format!(
+                "service '{svc}': ulimits '{name}' has neither a value nor soft/hard - ignored"
+            )),
+        }
+    }
+    out
+}
+
+fn collect_extra_hosts(node: &Node, svc: &str) -> Vec<String> {
+    // Normalise `name=ip` / `name:ip` to kern's `name:ip`, splitting on the FIRST separator so an
+    // IPv6 value keeps its colons.
+    let norm = |entry: &str, out: &mut Vec<String>| {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return;
+        }
+        let cut = match (entry.find('='), entry.find(':')) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                warn(&format!(
+                    "service '{svc}': extra_hosts entry '{entry}' has no ':' or '=' separator - ignored"
+                ));
+                return;
+            }
+        };
+        let (host, ip) = (entry[..cut].trim(), entry[cut + 1..].trim());
+        if host.is_empty() || ip.is_empty() {
+            warn(&format!(
+                "service '{svc}': extra_hosts entry '{entry}' is incomplete - ignored"
+            ));
+            return;
+        }
+        out.push(format!("{host}:{ip}"));
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    // ONE source, in precedence order - summing them would append the raw `{...}` text of a flow
+    // mapping that the lexer has already expanded into `children`.
+    if !node.children.is_empty() {
+        for (host, def) in &node.children {
+            let ip = def.scalar.as_deref().map(scalar_str).unwrap_or_default();
+            if host.is_empty() || ip.trim().is_empty() {
+                warn(&format!(
+                    "service '{svc}': extra_hosts entry '{host}' has no address - ignored"
+                ));
+                continue;
+            }
+            out.push(format!("{host}:{}", ip.trim()));
+        }
+        return out;
+    }
+    if let Some(sc) = &node.scalar {
+        let pairs = parse_inline_map(sc);
+        if !pairs.is_empty() {
+            for (host, ip) in pairs {
+                if !host.is_empty() && !ip.trim().is_empty() {
+                    out.push(format!("{host}:{}", ip.trim()));
+                }
+            }
+            return out;
+        }
+    }
+    for raw in list_value(node) {
+        norm(&raw, &mut out);
+    }
+    out
+}
+
 fn collect_net_aliases(networks: &Node) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_net, def) in &networks.children {
@@ -1385,8 +1693,23 @@ fn service_to_box(
             "networks" => {
                 b.net_aliases = collect_net_aliases(node);
             }
-            "configs" | "labels" | "logging" | "expose" | "extends" | "init" | "stdin_open"
-            | "tty" | "domainname" => {
+            // `init: true` → `--init`. kern already ships the reaping PID 1; this only wires the
+            // compose spelling to it.
+            "init" => b.init = scalar_is_true(node),
+            // `extra_hosts:` → one `--add-host name:ip` per entry. Docker accepts three spellings:
+            // the list forms `"name:ip"` and `"name=ip"`, and the mapping form `name: ip`. All are
+            // normalised to kern's `name:ip`. An entry without a separator is dropped with a warning
+            // rather than forwarded, because kern would reject the whole box for one malformed line.
+            "extra_hosts" => b.add_host = collect_extra_hosts(node, name),
+            // `ulimits:` → `--ulimit NAME=SOFT:HARD`; `sysctls:` → `--sysctl KEY=VALUE`. Both are
+            // forwarded VERBATIM to the box, which owns the validation (resource-name table, bounds,
+            // key shape): one authority, so a compose file and a `kern box` flag can never disagree.
+            // `labels:` → `--label k=v`. Descriptive metadata, but recorded so `kern ps --filter
+            // label=` can select a stack's boxes - which is what compose users use labels FOR.
+            "labels" => b.labels = collect_kv(node, '='),
+            "ulimits" => b.ulimits = collect_ulimits(node, name),
+            "sysctls" => b.sysctls = collect_kv(node, '='),
+            "configs" | "logging" | "expose" | "extends" | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
             other => warn(&format!(
@@ -1431,16 +1754,37 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
         return;
     };
     let mut mapped = false;
+    // A cap written BOTH ways (`mem_limit:` and `deploy.resources.limits.memory:`) is a real
+    // ambiguity in the file, not in the runtime: the two values are usually different because the
+    // author believed only one of them applied. `deploy` wins (Compose v2's rule), and the conflict
+    // is NAMED - silently applying one of two conflicting numbers is exactly the "runs but lies"
+    // this parser refuses elsewhere.
+    let clash = |field: &str, old: &Option<String>, new: &str| {
+        if let Some(prev) = old {
+            if prev != new {
+                warn(&format!(
+                    "service '{name}': {field} is set twice with different values ('{prev}' and \
+                     '{new}' under deploy.resources.limits) - the deploy value wins"
+                ));
+            }
+        }
+    };
     if let Some(m) = limits.child("memory").and_then(|n| n.scalar.as_deref()) {
-        b.memory = Some(scalar_str(m));
+        let v = scalar_str(m);
+        clash("mem_limit", &b.memory, &v);
+        b.memory = Some(v);
         mapped = true;
     }
     if let Some(c) = limits.child("cpus").and_then(|n| n.scalar.as_deref()) {
-        b.cpus = Some(scalar_str(c));
+        let v = scalar_str(c);
+        clash("cpus", &b.cpus, &v);
+        b.cpus = Some(v);
         mapped = true;
     }
     if let Some(p) = limits.child("pids").and_then(|n| n.scalar.as_deref()) {
-        b.pids_limit = Some(scalar_str(p));
+        let v = scalar_str(p);
+        clash("pids_limit", &b.pids_limit, &v);
+        b.pids_limit = Some(v);
         mapped = true;
     }
     // Honesty: a `limits:` block that maps NOTHING (a mistyped key like `mem:`/`cpu:`) would leave the
@@ -1498,7 +1842,16 @@ fn command_argv(node: &Node) -> (Vec<String>, bool) {
 /// rejected it and the whole service failed to start.
 fn kv_pairs(node: &Node) -> Vec<String> {
     let mut out = Vec::new();
-    for it in &node.items {
+    // A FLOW list (`environment: [A=1, B=2]`) arrives as one scalar, not as `items`: without this it
+    // was dropped entirely, so a service silently ran with none of its environment. The block list
+    // (`- A=1`) and the map form were already handled below.
+    let flow: Vec<String> = node
+        .scalar
+        .as_deref()
+        .filter(|sc| sc.trim_start().starts_with('['))
+        .map(parse_inline_list)
+        .unwrap_or_default();
+    for it in node.items.iter().chain(flow.iter()) {
         let entry = scalar_str(it);
         let trimmed = entry.trim();
         if trimmed.starts_with('{') {
@@ -1534,7 +1887,7 @@ fn kv_pairs(node: &Node) -> Vec<String> {
 /// warning (the comment text is dropped by the lexer anyway; interpolating it only produced spurious
 /// stderr noise - audit finding). We split each line at its first unquoted `#`, interpolate the code
 /// part, and re-attach the comment verbatim.
-fn interpolate_document(text: &str) -> String {
+fn interpolate_document(text: &str, dotenv: &crate::DotEnv) -> String {
     if !text.contains('$') {
         return text.to_string();
     }
@@ -1549,7 +1902,7 @@ fn interpolate_document(text: &str) -> String {
         }
         first = false;
         let (code, comment) = split_at_comment(line);
-        out.push_str(&interpolate_fragment(code));
+        out.push_str(&interpolate_fragment(code, dotenv));
         out.push_str(comment); // verbatim - no interpolation, no warning
     }
     if ends_with_nl {
@@ -1582,8 +1935,8 @@ fn split_at_comment(line: &str) -> (&str, &str) {
 
 /// Interpolate `${VAR}`/`${VAR:-default}`/`$$` in a single comment-free fragment. Slices are at
 /// `${`/`}`/`$$` ASCII offsets, so multibyte values in the document are never sliced mid-char.
-fn interpolate_fragment(text: &str) -> String {
-    interpolate_depth(text, 0)
+fn interpolate_fragment(text: &str, dotenv: &crate::DotEnv) -> String {
+    interpolate_depth(text, 0, dotenv)
 }
 
 /// Max nesting depth for `${A:-${B:-…}}` - a hard cap so an adversarial input can't drive unbounded
@@ -1611,7 +1964,7 @@ fn matching_brace_end(inner: &str) -> Option<usize> {
     None
 }
 
-fn interpolate_depth(text: &str, depth: usize) -> String {
+fn interpolate_depth(text: &str, depth: usize, dotenv: &crate::DotEnv) -> String {
     if !text.contains('$') {
         return text.to_string();
     }
@@ -1631,9 +1984,29 @@ fn interpolate_depth(text: &str, depth: usize) -> String {
             continue;
         }
         let Some(inner) = after.strip_prefix('{') else {
-            // `$` not followed by `{` (or `$`): leave the `$` and continue (bare `$VAR` passthrough).
-            out.push('$');
-            rest = after;
+            // BARE `$NAME`, which Docker interpolates exactly like `${NAME}`. A name is
+            // `[A-Za-z_][A-Za-z0-9_]*`; anything else after `$` (a digit, `(`, punctuation, end of
+            // string) is NOT a reference and stays literal - so `$(date)` and `$1` in a shell command
+            // are untouched, and `$$` above is still the escape for a literal `$`.
+            let name_len = {
+                let mut it = after.chars();
+                match it.next() {
+                    Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                        1 + it
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .map(char::len_utf8)
+                            .sum::<usize>()
+                    }
+                    _ => 0,
+                }
+            };
+            if name_len > 0 {
+                out.push_str(&interpolate_expr(&after[..name_len], dotenv));
+                rest = &after[name_len..];
+            } else {
+                out.push('$');
+                rest = after;
+            }
             continue;
         };
         let Some(end) = matching_brace_end(inner) else {
@@ -1648,11 +2021,11 @@ fn interpolate_depth(text: &str, depth: usize) -> String {
         // expression FIRST (bounded recursion, depth-capped), then evaluate the outer expression on the
         // resolved text. `matching_brace_end` found the BALANCED `}`, so `expr` holds the whole inner.
         let resolved = if expr.contains("${") {
-            interpolate_depth(expr, depth + 1)
+            interpolate_depth(expr, depth + 1, dotenv)
         } else {
             expr.to_string()
         };
-        out.push_str(&interpolate_expr(&resolved));
+        out.push_str(&interpolate_expr(&resolved, dotenv));
         rest = &inner[end + 1..];
     }
     out.push_str(rest);
@@ -1666,7 +2039,7 @@ fn interpolate_depth(text: &str, depth: usize) -> String {
 ///   `${VAR:?message}`   → the value, else warn with message (VAR empty-or-unset); `${VAR?message}` → unset only
 /// The `:` prefix means "treat empty like unset" (Docker semantics). Operators are matched longest-
 /// first (`:-` before `-`) so the colon variant isn't shadowed.
-fn interpolate_expr(expr: &str) -> String {
+fn interpolate_expr(expr: &str, dotenv: &crate::DotEnv) -> String {
     // Find the operator: the first of `:-`, `-`, `:+`, `+`, `:?`, `?` (a `:` binds to the following op).
     let ops: [(&str, char, bool); 6] = [
         (":-", '-', true),
@@ -1699,7 +2072,10 @@ fn interpolate_expr(expr: &str) -> String {
         }
     };
 
-    let val = std::env::var(var).ok();
+    // Docker precedence: the process environment wins; a project `.env` is the fallback.
+    let val = std::env::var(var)
+        .ok()
+        .or_else(|| dotenv.get(var).map(str::to_string));
     // "present" per the colon rule: with `:` an empty value counts as absent.
     let present = match &val {
         Some(v) => !(colon && v.is_empty()),
@@ -1751,12 +2127,21 @@ fn ports_value(node: &Node, svc: &str) -> Vec<String> {
             Some((p, proto)) => (p.to_string(), Some(proto.to_ascii_lowercase())),
             None => (spec.clone(), None),
         };
+        // `/udp` is PUBLISHED, not dropped: `kern box -p host:box/udp` has a real UDP forwarder, and
+        // silently skipping it here made the same mapping work through the CLI and vanish through
+        // compose - two paths disagreeing about the same input. Any OTHER protocol has no forwarder,
+        // so it is still refused, by name.
+        let mut keep_proto = "";
         if let Some(pr) = &proto {
-            if pr != "tcp" {
-                warn(&format!(
-                    "service '{svc}': port '{spec}' uses /{pr} - kern publishes TCP only, entry SKIPPED"
-                ));
-                return;
+            match pr.as_str() {
+                "tcp" => {}
+                "udp" => keep_proto = "/udp",
+                other => {
+                    warn(&format!(
+                        "service '{svc}': port '{spec}' uses /{other} - kern forwards TCP and UDP only, entry SKIPPED"
+                    ));
+                    return;
+                }
             }
         }
         // host:box with no host-IP → kern binds loopback (secure default, unlike Docker's 0.0.0.0).
@@ -1766,7 +2151,7 @@ fn ports_value(node: &Node, svc: &str) -> Vec<String> {
                 "service '{svc}': port '{host_port}' bound to 127.0.0.1 (kern is loopback-default, unlike Docker); use 0.0.0.0:{host_port} to expose on all interfaces"
             ));
         }
-        out.push(host_port);
+        out.push(format!("{host_port}{keep_proto}"));
     };
 
     // Block or inline list of entries.
@@ -2329,17 +2714,26 @@ mod tests {
         std::env::remove_var("KERN_NX_B");
         // Nested default `${A:-${B:-c}}` resolves the inner first, then the outer (Docker parity).
         assert_eq!(
-            interpolate_document("x=${KERN_NX_A:-${KERN_NX_B:-deep}}"),
+            interpolate_document(
+                "x=${KERN_NX_A:-${KERN_NX_B:-deep}}",
+                &crate::DotEnv::default()
+            ),
             "x=deep"
         );
         // `${A${B}}`: the inner `${B}` resolves (unset -> empty), leaving `${A}` -> empty. No stray `}`
         // leaks (the balanced-brace scan closes at the OUTER `}`).
-        assert_eq!(interpolate_document("x=${A${B}}"), "x=");
+        assert_eq!(
+            interpolate_document("x=${A${B}}", &crate::DotEnv::default()),
+            "x="
+        );
         // A normal `${VAR:-def}` still works.
-        assert_eq!(interpolate_document("x=${UNSET_XYZ_KERN:-def}"), "x=def");
+        assert_eq!(
+            interpolate_document("x=${UNSET_XYZ_KERN:-def}", &crate::DotEnv::default()),
+            "x=def"
+        );
         // Adversarial deep nesting terminates (depth cap), never hangs.
         let deep = "${".repeat(100) + "X" + &"}".repeat(100);
-        let _ = interpolate_document(&deep);
+        let _ = interpolate_document(&deep, &crate::DotEnv::default());
     }
 
     #[test]
@@ -2350,7 +2744,7 @@ mod tests {
         std::env::set_var("KERN_T_SET", "val");
         std::env::set_var("KERN_T_EMPTY", "");
         std::env::remove_var("KERN_T_UNSET");
-        let i = interpolate_expr;
+        let i = |e: &str| interpolate_expr(e, &crate::DotEnv::default());
         // default `:-` : applies on unset OR empty
         assert_eq!(i("KERN_T_SET:-def"), "val");
         assert_eq!(i("KERN_T_EMPTY:-def"), "def"); // empty → default (the `:` rule)
@@ -2379,16 +2773,22 @@ mod tests {
         // Audit regression: a `${VAR}` inside a trailing comment must not be interpolated (no spurious
         // unset-var warning, comment text left verbatim). The value part is still interpolated.
         assert_eq!(
-            interpolate_document("image: x  # see ${SOME_UNSET_XYZ}"),
+            interpolate_document(
+                "image: x  # see ${SOME_UNSET_XYZ}",
+                &crate::DotEnv::default()
+            ),
             "image: x  # see ${SOME_UNSET_XYZ}"
         );
         assert_eq!(
-            interpolate_document("cmd: ${UNSET_XYZ_KERN:-run}  # ${ALSO_UNSET}"),
+            interpolate_document(
+                "cmd: ${UNSET_XYZ_KERN:-run}  # ${ALSO_UNSET}",
+                &crate::DotEnv::default()
+            ),
             "cmd: run  # ${ALSO_UNSET}"
         );
         // A `#` inside quotes is NOT a comment - interpolation applies across it.
         assert_eq!(
-            interpolate_document("v: \"${UNSET_XYZ_KERN:-a#b}\""),
+            interpolate_document("v: \"${UNSET_XYZ_KERN:-a#b}\"", &crate::DotEnv::default()),
             "v: \"a#b\""
         );
     }
@@ -2643,11 +3043,17 @@ mod tests {
     }
 
     #[test]
-    fn ports_udp_is_skipped_not_silently_tcp() {
-        let y = "services:\n  a:\n    image: alpine\n    ports:\n      - \"53:53/udp\"\n";
+    fn ports_udp_is_published_not_silently_tcp() {
+        // `kern box -p host:box/udp` has a real UDP forwarder, so compose must PUBLISH udp rather
+        // than drop it: the same mapping working through the CLI and vanishing through compose was
+        // two paths disagreeing about one input. What it must never do is convert it to TCP.
+        let y = "services:\n  a:\n    image: alpine\n    ports:\n      - \"5353:5353/udp\"\n";
+        assert_eq!(boxes(y)[0].ports, ["5353:5353/udp"]);
+        // A protocol with no forwarder is still refused rather than silently treated as TCP.
+        let sctp = "services:\n  a:\n    image: alpine\n    ports:\n      - \"5353:5353/sctp\"\n";
         assert!(
-            boxes(y)[0].ports.is_empty(),
-            "udp must be skipped, not converted to tcp"
+            boxes(sctp)[0].ports.is_empty(),
+            "sctp has no forwarder: skipped, never tcp"
         );
     }
 

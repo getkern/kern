@@ -33,7 +33,7 @@ pub fn help() -> Result<(), Error> {
     {c}box{z} <name> --plan                                              Preview the isolation sequence
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [-- CMD...]           Run CMD in a running box
-    {c}ps{z} [--json] [-q] [--filter k=v] [--format T]                   List running boxes
+    {c}ps{z} [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List running boxes
     {c}logs{z} <name> [--tail N] [-f|--follow]                           Show a box's output
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
 
@@ -71,7 +71,7 @@ pub fn help() -> Result<(), Error> {
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
-    {c}compose{z} <file>                                                 Bring up a stack (kern TOML or docker-compose.yml)
+    {c}compose{z} <file> [up|down|stop|start|restart|ps|logs|build|pull|config] Run a stack (kern TOML or docker-compose.yml)
     {c}up{z} [--no-pod] / {c}down{z}                                          Bring up / tear down the compose file in this dir
     {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls / pod rm <name>     Shared-network pod (boxes reach each other by name)
 
@@ -145,6 +145,9 @@ pub fn help() -> Result<(), Error> {
     -u, --user <u[:g]>  Run the box command as this uid[:gid] (numeric; needs the id mapped)
     --cap-add <CAP>     Keep a capability kern would otherwise drop (e.g. NET_ADMIN, or ALL); repeatable
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
+    --ulimit <n=s[:h]>  Set a resource limit (e.g. nofile=1024:2048); rootless can only LOWER; repeatable
+    --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
+    -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
     --landlock-rw <path> Confine writes to these paths with the Landlock LSM; root stays read+exec (repeatable)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
                         only the caller (faster + more isolated)
@@ -323,6 +326,13 @@ pub struct BoxRunArgs<'a> {
     pub pids_limit: Option<u64>,
     /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
     pub tmpfs: &'a [String],
+    /// `--ulimit` limits, pre-resolved to `(RLIMIT_*, soft, hard)` by the CLI.
+    pub ulimits: &'a [(i32, u64, u64)],
+    /// `--sysctl KEY=VALUE` pairs, applied inside the box's namespaces.
+    pub sysctls: &'a [(String, String)],
+    /// `--label k=v` metadata (repeatable). Descriptive only: it does not change how the box runs,
+    /// but it is recorded in the registry so `kern ps --filter label=` and `kern inspect` can use it.
+    pub labels: &'a [String],
     /// `--user UID[:GID]`: drop to this uid/gid inside the box before the command runs.
     pub run_as: Option<&'a str>,
     /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
@@ -1036,6 +1046,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         io_max: vdisk_io_max,
         io_weight: args.io_weight,
         extra_hosts: resolve_add_hosts(args.add_hosts, args.share_net),
+        ulimits: args.ulimits.to_vec(),
+        sysctls: args.sysctls.to_vec(),
     })?;
 
     if args.tty && args.detached {
@@ -1094,6 +1106,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 action: health_action,
             },
             args.timeout,
+            &args.labels.join(","),
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -1140,6 +1153,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             pod: args.pod.unwrap_or("").to_string(),
             egress: args.egress_allow.join(","),
             landlock_rw: spec.landlock_rw.join(","),
+            labels: args.labels.join(","),
             memory_max: spec.memory_max,
             pids_max: spec.pids_max,
         };
@@ -1829,6 +1843,10 @@ struct BuildSpec<'a> {
     io_weight: Option<u64>,
     /// `--add-host NAME:IP` entries (`host-gateway` already resolved to a concrete address).
     extra_hosts: Vec<(String, String)>,
+    /// `--ulimit`, pre-resolved to `(RLIMIT_*, soft, hard)`.
+    ulimits: Vec<(i32, u64, u64)>,
+    /// `--sysctl KEY=VALUE`, applied inside the box's namespaces.
+    sysctls: Vec<(String, String)>,
 }
 
 /// Build the sandbox spec. **Always an overlay** (the image/rootfs is the read-only lower; a
@@ -1978,6 +1996,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         io_max: b.io_max,
         io_weight: b.io_weight,
         extra_hosts: b.extra_hosts,
+        ulimits: b.ulimits,
+        sysctls: b.sysctls,
         privileged: b.privileged,
     };
     Ok((spec, eph))
@@ -3054,6 +3074,8 @@ fn run_detached(
     restart: bool,
     health: HealthConfig,
     timeout: u64,
+    // `--label k=v` metadata, comma-joined, recorded in the registry entry (see `Instance::labels`).
+    labels: &str,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -3104,6 +3126,7 @@ fn run_detached(
         pod: pod.to_string(),
         egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
         landlock_rw: spec.landlock_rw.join(","),
+        labels: labels.to_string(),
         memory_max: spec.memory_max,
         pids_max: spec.pids_max,
     };
@@ -3530,6 +3553,17 @@ fn detach_stdio(log: Option<&std::path::Path>) {
 fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
     filters.iter().all(|(k, v)| match k.as_str() {
         "name" => b.name.contains(v.as_str()),
+        // Exact pod match - the grouping key `compose ps` scopes on. Exact, not substring: two stacks
+        // whose pod names share a prefix must never be listed as one.
+        "pod" => b.pod == *v,
+        // `label=k=v` matches an exact pair; `label=k` matches the key whatever its value - the two
+        // forms Docker supports. Matching is over the comma-joined field, so a bare key must not be
+        // satisfied by a mere substring of another key (`app` must not match `apple=1`): compare the
+        // key segment up to its `=`.
+        "label" => b.labels.split(',').filter(|l| !l.is_empty()).any(|l| {
+            l == v.as_str()
+                || (!v.contains('=') && l.split_once('=').map(|(k, _)| k) == Some(v.as_str()))
+        }),
         "id" => b.pid.to_string() == *v,
         "status" => match v.as_str() {
             "running" => !registry::is_paused(b.cgroup_pid()),
@@ -3645,7 +3679,7 @@ pub fn ps(
     // Validate every filter once, fail-fast on an unsupported key or status value.
     for (k, v) in filters {
         match k.as_str() {
-            "name" | "id" => {}
+            "name" | "id" | "label" | "pod" => {}
             "status" => {
                 if !matches!(
                     v.as_str(),
@@ -3659,7 +3693,7 @@ pub fn ps(
             }
             _ => {
                 return Err(Error::Usage(
-                    "ps --filter: supported keys are name=, status=, id=",
+                    "ps --filter: supported keys are name=, status=, id=, label=, pod=",
                 ))
             }
         }
@@ -9755,11 +9789,7 @@ fn resolve_builds(
     self_exe: &std::path::Path,
 ) -> Result<(), Error> {
     // The directory that a `build.context` is confined under: the compose file's parent (canonical).
-    let compose_dir = std::path::Path::new(file)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let compose_dir = compose_dir(file);
     let base = std::fs::canonicalize(&compose_dir).map_err(|e| {
         Error::Compose(format!(
             "resolving compose dir '{}': {e}",
@@ -9978,55 +10008,439 @@ fn is_box_alive(name: &str) -> bool {
     registry::name_taken(name)
 }
 
+/// What `kern compose <file> <verb>` should do. One enum instead of a `down: bool` so every verb is
+/// exhaustively handled at the dispatch (a new verb cannot be silently forgotten by the compiler).
+///
+/// kern's model differs from Docker's in one way that shapes these semantics: a kern box is
+/// EPHEMERAL - there is no "created but stopped" state to restart into. So `Stop` ends the boxes and
+/// keeps the pod (the shared network), and `Start` launches whatever is not currently running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeAction {
+    /// Bring the whole stack up (create the pod, build, launch in dependency order).
+    Up,
+    /// Stop every service AND tear the pod down.
+    Down,
+    /// Stop every service, KEEP the pod - so `start` can re-join the same shared network.
+    Stop,
+    /// Launch the services that are not currently running (the rest are left untouched).
+    Start,
+    /// `Stop` followed by a full `Up`.
+    Restart,
+    /// List this stack's boxes.
+    Ps,
+    /// Print this stack's logs (`--tail N`, and `-f` for a single service).
+    Logs,
+    /// Only run the `build:` directives; start nothing.
+    Build,
+    /// Only fetch each service's `image:`; start nothing.
+    Pull,
+    /// Parse, interpolate and validate, then print the resolved services. No side effects.
+    Config,
+}
+
+impl ComposeAction {
+    /// Parse a compose sub-verb. `None` for an unknown word, so the caller can report it with the
+    /// full list rather than guessing.
+    pub fn from_verb(v: &str) -> Option<Self> {
+        Some(match v {
+            "up" => ComposeAction::Up,
+            "down" => ComposeAction::Down,
+            "stop" => ComposeAction::Stop,
+            "start" => ComposeAction::Start,
+            "restart" => ComposeAction::Restart,
+            "ps" => ComposeAction::Ps,
+            "logs" => ComposeAction::Logs,
+            "build" => ComposeAction::Build,
+            "pull" => ComposeAction::Pull,
+            "config" => ComposeAction::Config,
+            _ => return None,
+        })
+    }
+}
+
+/// Stop every service of a stack and reap its exit sidecars. Shared by `down`, `stop` and `restart`
+/// so the (subtle) sidecar-reaping rule below lives in exactly one place. Returns the service names.
+///
+/// Sidecar keys are `<pod>-<token>-<name>`; a teardown does not know the `up`'s token, so it clears
+/// `<pod>-*-<name>` per box it stopped - NOT a blind `<pod>-*`, which would wipe a concurrent
+/// same-stack run's OTHER boxes. Each `remove_file` is atomic and ENOENT-safe, so two concurrent
+/// teardowns just no-op over each other.
+///
+/// One race remains for pure name-scoping: `down A` stops A's `migrate`, a concurrent `up B`
+/// re-creates a `migrate` box, then A's reap would delete B's fresh sidecar. Closed BY CONSTRUCTION:
+/// a box's sidecars are reaped ONLY if that box is no longer alive.
+fn stop_stack(boxes: &[crate::compose::ComposeBox], pod: &str) -> Vec<String> {
+    let names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
+    let _ = stop(&names, false); // best-effort - some may already be gone
+    for n in &names {
+        if !is_box_alive(n) {
+            registry::clear_exit_matching(&exit_key_prefix(pod), &format!("-{n}"));
+        }
+    }
+    names
+}
+
+/// The compose file's own directory - Docker's "project directory", which anchors `.env`, relative
+/// bind sources and `build.context`. A bare filename (`docker-compose.yml`, no parent) means the
+/// current directory, so the empty parent is mapped to `.` rather than to the filesystem root.
+fn compose_dir(file: &str) -> std::path::PathBuf {
+    std::path::Path::new(file)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Every mapping seen so far for ONE `(host port, protocol)` pair - the bucket that makes the
+/// collision check linear instead of pairwise. `wildcard` is the service that bound `0.0.0.0` on this
+/// pair (it subsumes every address, so anything else here conflicts with it); `specific` maps each
+/// concrete bind address to its owner, and `first_specific` remembers one of them so a later wildcard
+/// can name a counterpart in O(1).
+#[derive(Default)]
+struct PortSlot<'a> {
+    wildcard: Option<&'a str>,
+    first_specific: Option<&'a str>,
+    specific: std::collections::HashMap<u32, &'a str>,
+}
+
+/// Pre-flight for `compose up`: reject two published mappings that would fight for the SAME host port.
+///
+/// Reuses the verified spec parser ([`crate::ports::parse`]) so range/`ip:host:box`/`/udp` forms are
+/// interpreted exactly as at box-start. Two mappings conflict when they share protocol and host port
+/// AND their bind addresses overlap - identical, or either bound to `0.0.0.0` (`bind_ip == 0`), which
+/// subsumes any specific address.
+///
+/// LINEAR in the number of published mappings, by bucketing on `(host, udp)` and hashing the bind
+/// address inside each bucket. The obvious pairwise form is quadratic, and that is NOT academic here:
+/// a single `-p` may expand to 1024 ports (`ports::MAX_RANGE`), so a perfectly legal
+/// 40-service stack of ranges reaches ~41k mappings and measured **10.5 s** of pure comparison before
+/// a single box started (10/20/40 services = 0.7/2.7/10.5 s, textbook x4-per-doubling). Bucketing
+/// makes the same file ~40 ms.
+///
+/// Panic-free (`Result` throughout); an unparseable spec is left for the per-box path to report, not
+/// silently treated as a conflict.
+///
+/// On the protocol dimension: the compose parser (`ports_value`) already STRIPS the `/tcp` suffix and
+/// drops non-TCP entries with a warning, so specs arriving here are always TCP today. Bucketing on
+/// `(host, udp)` anyway keeps this faithful to `ports::parse`'s contract - the day kern publishes UDP,
+/// a `udp/8080` and a `tcp/8080` won't be conflated into a bogus conflict.
+fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error> {
+    let mut slots: std::collections::HashMap<(u16, bool), PortSlot> =
+        std::collections::HashMap::new();
+    for b in boxes {
+        let name = b.name.as_str();
+        for spec in &b.ports {
+            let Some(pms) = crate::ports::parse(spec) else {
+                continue;
+            };
+            for pm in pms {
+                let slot = slots.entry((pm.host, pm.udp)).or_default();
+                // Who (if anyone) already holds an address overlapping this one on this port+proto.
+                let prior = match slot.wildcard {
+                    Some(w) => Some(w), // 0.0.0.0 is already taken: everything here conflicts
+                    None if pm.bind_ip == 0 => slot.first_specific, // we ARE the wildcard
+                    None => slot.specific.get(&pm.bind_ip).copied(), // exact same address
+                };
+                if let Some(other) = prior {
+                    let proto = if pm.udp { "udp" } else { "tcp" };
+                    let who = if other == name {
+                        format!(
+                            "service '{name}' publishes host port {}/{proto} more than once",
+                            pm.host
+                        )
+                    } else {
+                        format!(
+                            "services '{other}' and '{name}' both publish host port {}/{proto}",
+                            pm.host
+                        )
+                    };
+                    return Err(Error::Compose(format!(
+                        "{who}. Only one process can bind a host port; give each a distinct one."
+                    )));
+                }
+                if pm.bind_ip == 0 {
+                    slot.wildcard = Some(name);
+                } else {
+                    slot.specific.insert(pm.bind_ip, name);
+                    slot.first_specific.get_or_insert(name);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `kern compose <file>` - bring up a stack of boxes (detached) in `depends_on` order. Each
 /// service is launched via a fresh `kern box -d` subprocess, so it gets its own scope + registry
 /// entry; track the stack with `kern ps`.
-pub fn compose(file: &str, down: bool, no_pod: bool) -> Result<(), Error> {
+pub struct ComposeOpts<'a> {
+    /// One or more compose files, merged left-to-right (`-f base.yml -f override.yml`).
+    pub files: &'a [String],
+    pub action: ComposeAction,
+    pub no_pod: bool,
+    pub tail: Option<usize>,
+    pub follow: bool,
+    pub services: &'a [String],
+    /// `-p/--project-name`: overrides the pod name normally derived from the file's directory.
+    pub project: Option<&'a str>,
+    /// `--env-file`: the interpolation table, instead of the project `.env`.
+    pub env_file: Option<&'a str>,
+    /// `--profile` (repeatable): profiles to activate, like `COMPOSE_PROFILES`.
+    pub profiles: &'a [String],
+}
+
+pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
+    let ComposeOpts {
+        files,
+        action,
+        no_pod,
+        tail,
+        follow,
+        services,
+        project,
+        env_file,
+        profiles,
+    } = o;
+    // `--profile` is DEFINED by Docker as equivalent to `COMPOSE_PROFILES`, so it is applied by
+    // exporting that variable once here, at the CLI boundary, before any parsing. One assignment in a
+    // one-shot process, never from library code - the parser keeps reading a single source of truth.
+    if !profiles.is_empty() {
+        let mut all: Vec<String> = std::env::var("COMPOSE_PROFILES")
+            .ok()
+            .into_iter()
+            .flat_map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
+            .filter(|p| !p.is_empty())
+            .collect();
+        all.extend(profiles.iter().cloned());
+        std::env::set_var("COMPOSE_PROFILES", all.join(","));
+    }
+    // The FIRST file names the project (pod, relative paths, `.env` location), as in Docker.
+    let file = files
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| Error::Compose("compose needs at least one file".to_string()))?;
     let text = std::fs::read_to_string(file)
         .map_err(|e| Error::Compose(format!("reading {file}: {e}")))?;
-    let mut boxes = crate::compose::parse(&text).map_err(Error::Compose)?;
+    // Docker loads a `.env` sitting next to the compose file and uses it for `${VAR}` interpolation.
+    // Without this, every real project (nearly all ship one) silently substituted EMPTY: a
+    // `"${PORT}:80"` became `":80"` and a `${POSTGRES_PASSWORD}` became blank, with only a warning.
+    // Absent/unreadable `.env` → an empty table, i.e. exactly the previous behaviour.
+    // `--env-file` REPLACES the project `.env` (Docker's rule), and is required to exist when named:
+    // a typo'd path must not silently fall back to no interpolation at all.
+    let dotenv = match env_file {
+        Some(p) => crate::compose::parse_dotenv(
+            &std::fs::read_to_string(p)
+                .map_err(|e| Error::Compose(format!("--env-file {p}: {e}")))?,
+        ),
+        None => std::fs::read_to_string(compose_dir(file).join(".env"))
+            .map(|t| crate::compose::parse_dotenv(&t))
+            .unwrap_or_default(),
+    };
+    let mut boxes = crate::compose::parse_with_env(&text, &dotenv).map_err(Error::Compose)?;
+    // Merge every additional `-f`, left to right (see `merge_stacks` for the exact rules).
+    for extra in &files[1..] {
+        let t = std::fs::read_to_string(extra)
+            .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?;
+        let over = crate::compose::parse_override(&t, &dotenv).map_err(Error::Compose)?;
+        boxes = crate::compose::merge_stacks(boxes, over);
+    }
+    // "nothing to run" is asserted HERE, on the merged stack: an override legitimately carries no
+    // `image:`, but the result must still be runnable.
+    if files.len() > 1 {
+        crate::compose::validate_runnable(&boxes).map_err(Error::Compose)?;
+    }
     // The stack's pod is named after the compose file (Docker's project-name idea) - one shared
     // network so services reach each other by name.
-    let pod = compose_pod_name(file);
+    let pod = match project {
+        Some(p) => p.to_string(),
+        None => compose_pod_name(file),
+    };
 
-    // `compose down`: stop every box in the stack, then tear the pod down QUIETLY (we just stopped
-    // the members, so `pod::remove`'s "members keep running" note would contradict this).
-    if down {
-        let names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
-        let _ = stop(&names, false); // best-effort - some may already be gone
-                                     // Reap this stack's exit sidecars. Keys are `<pod>-<token>-<name>`; `down` doesn't know the
-                                     // `up`'s token, so it clears `<pod>-*-<name>` per box it stopped - NOT a blind `<pod>-*` (that
-                                     // would wipe a concurrent same-stack run's OTHER boxes). There's no shared state-file and no
-                                     // read-modify-write, so no lost-update: each `remove_file` is atomic and ENOENT-safe, so two
-                                     // concurrent `down`s just no-op over each other.
-                                     //
-                                     // The one race left by pure name-scoping: `down A` stops A's `migrate`, then a concurrent
-                                     // `up B` re-creates a `migrate` box (allowed once A's is gone), then A's reap fires and would
-                                     // delete B's fresh `<pod>-<tokenB>-migrate`. Close it BY CONSTRUCTION: reap a box's sidecars
-                                     // ONLY if that box is no longer alive. If B brought `migrate` back, it's alive again → we skip
-                                     // it → B's sidecar survives. `down` legitimately reaps only what it actually tore down.
-        for n in &names {
-            if !is_box_alive(n) {
-                registry::clear_exit_matching(&exit_key_prefix(&pod), &format!("-{n}"));
-            }
+    // A `--filter`/service selection narrows the read-only verbs to the named services; empty = all.
+    // Validated up front so a typo names itself instead of silently matching nothing.
+    for want in services {
+        if !boxes.iter().any(|b| &b.name == want) {
+            return Err(Error::Compose(format!(
+                "no service '{want}' in {file} (services: {})",
+                boxes
+                    .iter()
+                    .map(|b| b.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
-        let (pod_existed, _) = crate::pod::teardown(&pod);
-        // Only claim the pod was removed if one actually existed (a `--no-pod` stack has none).
-        if pod_existed {
+    }
+    let selected =
+        |b: &crate::compose::ComposeBox| services.is_empty() || services.contains(&b.name);
+
+    match action {
+        // Read-only / terminal verbs: each returns, so the bring-up below is reached ONLY by the
+        // verbs that actually start something (Up, Start, Restart).
+        ComposeAction::Config => {
+            // Parse + interpolate + validate, then print what kern actually resolved - the answer to
+            // "is my file what I think it is" WITHOUT starting anything. Validation runs first so a
+            // broken graph is reported here rather than at the next `up`.
+            crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
+            validate_conditions(&boxes)?;
+            check_port_collisions(&boxes)?;
+            // Validate every published spec HERE, with the same parser the box uses. `config` is the
+            // verb people run to check a file, so a typo must surface without starting anything (as
+            // `docker compose config` does) instead of failing one box at bring-up. ALL bad specs are
+            // reported together: fixing them one error per run is a poor loop.
+            let bad: Vec<String> = boxes
+                .iter()
+                .flat_map(|b| {
+                    b.ports
+                        .iter()
+                        .filter(|spec| crate::ports::parse(spec).is_none())
+                        .map(move |spec| format!("  {}: invalid port '{spec}'", b.name))
+                })
+                .collect();
+            if !bad.is_empty() {
+                return Err(Error::Compose(format!(
+                    "{} invalid port spec(s) - expected [ip:]host:box[/tcp|/udp], ports 1-65535:\n{}",
+                    bad.len(),
+                    bad.join("\n")
+                )));
+            }
+            println!("compose config: {} service(s) in {file}", boxes.len());
+            for b in boxes.iter().filter(|b| selected(b)) {
+                let src = b
+                    .image
+                    .as_deref()
+                    .or(b.rootfs.as_deref())
+                    .unwrap_or("(build)");
+                println!("  {}  image={src}", b.name);
+                if !b.ports.is_empty() {
+                    println!("    ports: {}", b.ports.join(", "));
+                }
+                let deps = b.all_deps();
+                if !deps.is_empty() {
+                    println!("    depends_on: {}", deps.join(", "));
+                }
+            }
+            return Ok(());
+        }
+        ComposeAction::Ps => {
+            // Reuse `kern ps` itself, scoped to this stack's pod - one renderer, so the compose view
+            // can never drift from `kern ps` (same columns, same status rules, same --json).
+            return ps(false, false, &[("pod".to_string(), pod.clone())], None);
+        }
+        ComposeAction::Logs => {
+            let wanted: Vec<&str> = boxes
+                .iter()
+                .filter(|b| selected(b))
+                .map(|b| b.name.as_str())
+                .collect();
+            // `-f` on several services would need one blocking reader each; rather than interleave
+            // them badly, require a single service and say exactly how to ask for it.
+            if follow && wanted.len() != 1 {
+                return Err(Error::Compose(format!(
+                    "compose logs -f follows ONE service at a time; name it (e.g. `compose {file} logs -f {}`)",
+                    wanted.first().copied().unwrap_or("<service>")
+                )));
+            }
+            for (i, name) in wanted.iter().enumerate() {
+                if wanted.len() > 1 {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("=== {name} ===");
+                }
+                // A service that never started (or already exited) has no log: report it and keep
+                // going, so one missing service can't hide the others' output.
+                if let Err(e) = logs(name, tail, follow) {
+                    eprintln!("compose logs: {name}: {e}");
+                }
+            }
+            return Ok(());
+        }
+        ComposeAction::Pull => {
+            let mut n = 0usize;
+            for b in boxes.iter().filter(|b| selected(b)) {
+                if let Some(img) = b.image.as_deref() {
+                    pull(img, None, None)?;
+                    n += 1;
+                }
+            }
+            println!("compose pull: {n} image(s) up to date");
+            return Ok(());
+        }
+        ComposeAction::Build => {
+            let self_exe = std::env::current_exe()
+                .map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
+            resolve_builds(&mut boxes, file, &self_exe)?;
+            println!("compose build: done");
+            return Ok(());
+        }
+        ComposeAction::Down => {
+            let names = stop_stack(&boxes, &pod);
+            // Tear the pod down QUIETLY (we just stopped the members, so `pod::remove`'s "members keep
+            // running" note would contradict this). Only claim it was removed if one existed - a
+            // `--no-pod` stack has none.
+            let (pod_existed, _) = crate::pod::teardown(&pod);
+            if pod_existed {
+                println!(
+                    "compose down: {} box(es) stopped, pod '{pod}' removed",
+                    names.len()
+                );
+            } else {
+                println!("compose down: {} box(es) stopped", names.len());
+            }
+            return Ok(());
+        }
+        ComposeAction::Stop => {
+            // `stop` touches ONLY this file's services and never tears the pod down itself; `down`
+            // removes the pod unconditionally. The distinction is real when the pod has members that
+            // are NOT in this file (someone ran `kern box --pod <same>`): those keep running and the
+            // pod with them. With no such member the pod still goes, because `kern stop` collapses a
+            // pod once its LAST member exits (a deliberate, documented invariant - see `stop`); a
+            // later `compose start` recreates it and services reach each other by name again.
+            let names = stop_stack(&boxes, &pod);
+            let pod_alive = crate::pod::holder_pid(&pod).is_some();
             println!(
-                "compose down: {} box(es) stopped, pod '{pod}' removed",
+                "compose stop: {} box(es) stopped, pod '{pod}' {}",
+                names.len(),
+                if pod_alive {
+                    "still up (other members remain)"
+                } else {
+                    "gone with its last member (`start` recreates it)"
+                }
+            );
+            return Ok(());
+        }
+        // `restart` = stop everything, then fall through to the full bring-up below.
+        ComposeAction::Restart => {
+            let names = stop_stack(&boxes, &pod);
+            println!(
+                "compose restart: {} box(es) stopped, restarting",
                 names.len()
             );
-        } else {
-            println!("compose down: {} box(es) stopped", names.len());
         }
-        return Ok(());
+        ComposeAction::Up | ComposeAction::Start => {}
     }
 
-    let levels = crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
+    let mut levels = crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
+    // `start` launches only what is NOT already running. Filtering the LEVELS (not `boxes`) keeps the
+    // dependency graph exactly as computed - dropping a service from `boxes` would make its dependents
+    // reference an unknown name - and keeps every level entry backed by a real box.
+    if action == ComposeAction::Start {
+        for level in &mut levels {
+            level.retain(|n| !is_box_alive(n));
+        }
+        if levels.iter().all(|l| l.is_empty()) {
+            println!("compose start: every service is already running");
+            return Ok(());
+        }
+    }
     // Static rejection of conditions that can NEVER be satisfied - caught here, not left to time out
     // at runtime (adversarial-review 2d). `topo_order` above already rejects cycles and unknown deps.
     validate_conditions(&boxes)?;
+    // Static rejection of DUPLICATE published host ports: the bring-up below is CONCURRENT per level,
+    // so two services on the same host port would race for the bind - one wins, the other dies with
+    // EADDRINUSE buried in its own log while `up` still reports success (a silent partial failure,
+    // empirically confirmed). Caught here from the parsed file: deterministic, before any box starts.
+    check_port_collisions(&boxes)?;
     let self_exe =
         std::env::current_exe().map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
 
@@ -10960,6 +11374,7 @@ mod net_resource_tests {
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,
+            labels: String::new(),
         }
     }
 
@@ -12162,5 +12577,451 @@ mod image_rm_tests {
             0,
             "child must be dead after kill_box"
         );
+    }
+}
+
+#[cfg(test)]
+mod compose_action_tests {
+    use super::*;
+
+    #[test]
+    fn every_documented_verb_parses() {
+        // The help text and the parser must not drift: every verb kern advertises has to resolve.
+        for (word, want) in [
+            ("up", ComposeAction::Up),
+            ("down", ComposeAction::Down),
+            ("stop", ComposeAction::Stop),
+            ("start", ComposeAction::Start),
+            ("restart", ComposeAction::Restart),
+            ("ps", ComposeAction::Ps),
+            ("logs", ComposeAction::Logs),
+            ("build", ComposeAction::Build),
+            ("pull", ComposeAction::Pull),
+            ("config", ComposeAction::Config),
+        ] {
+            assert_eq!(ComposeAction::from_verb(word), Some(want), "verb {word}");
+        }
+    }
+
+    #[test]
+    fn unknown_verb_is_none_not_a_guess() {
+        // A typo must NOT silently resolve to something (the caller turns `None` into a message that
+        // lists the real verbs); `stop` must not be reachable from `stopp`.
+        for word in ["", "pippo", "stopp", "UP", "Down", "--up", "up "] {
+            assert_eq!(ComposeAction::from_verb(word), None, "{word:?}");
+        }
+    }
+
+    #[test]
+    fn only_up_start_and_restart_launch_anything() {
+        // The dispatch returns early for every other verb. If a new verb is added and forgotten here,
+        // this test states the intended contract rather than letting it silently start a stack.
+        for a in [
+            ComposeAction::Down,
+            ComposeAction::Stop,
+            ComposeAction::Ps,
+            ComposeAction::Logs,
+            ComposeAction::Build,
+            ComposeAction::Pull,
+            ComposeAction::Config,
+        ] {
+            assert!(
+                !matches!(
+                    a,
+                    ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart
+                ),
+                "{a:?} must not be a launching verb"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod label_filter_tests {
+    use super::*;
+
+    fn inst_with(labels: &str) -> registry::Instance {
+        registry::Instance {
+            name: "b".into(),
+            pid: 1,
+            pid1: 0,
+            rootfs: String::new(),
+            command: String::new(),
+            started: 0,
+            starttime: 0,
+            ports: String::new(),
+            volumes: String::new(),
+            pod: String::new(),
+            egress: String::new(),
+            landlock_rw: String::new(),
+            memory_max: None,
+            pids_max: None,
+            labels: labels.into(),
+        }
+    }
+
+    fn f(k: &str, v: &str) -> Vec<(String, String)> {
+        vec![(k.to_string(), v.to_string())]
+    }
+
+    #[test]
+    fn exact_pair_matches() {
+        let b = inst_with("app=web,tier=front");
+        assert!(ps_matches(&b, &f("label", "app=web")));
+        assert!(ps_matches(&b, &f("label", "tier=front")));
+        assert!(!ps_matches(&b, &f("label", "app=api")));
+    }
+
+    #[test]
+    fn bare_key_matches_any_value() {
+        let b = inst_with("app=web");
+        assert!(ps_matches(&b, &f("label", "app")));
+        assert!(!ps_matches(&b, &f("label", "tier")));
+    }
+
+    #[test]
+    fn bare_key_is_not_a_substring_match() {
+        // `app` must NOT match `apple=1`: a prefix is a different key, and a filter that quietly
+        // over-matches would select boxes the operator did not mean to touch.
+        let b = inst_with("apple=1");
+        assert!(!ps_matches(&b, &f("label", "app")));
+        assert!(ps_matches(&b, &f("label", "apple")));
+    }
+
+    #[test]
+    fn no_labels_matches_nothing() {
+        let b = inst_with("");
+        assert!(!ps_matches(&b, &f("label", "app")));
+        assert!(!ps_matches(&b, &f("label", "app=web")));
+    }
+
+    #[test]
+    fn value_containing_equals_is_matched_whole() {
+        // A value may itself contain '=', e.g. a base64 or a query string. The pair is compared as a
+        // whole, so this must match exactly and not be split at the second '='.
+        let b = inst_with("cfg=a=b");
+        assert!(ps_matches(&b, &f("label", "cfg=a=b")));
+        assert!(ps_matches(&b, &f("label", "cfg")));
+        assert!(!ps_matches(&b, &f("label", "cfg=a")));
+    }
+}
+
+#[cfg(test)]
+mod port_collision_tests {
+    use super::*;
+
+    // A ComposeBox with just a name + published ports - every other field is its Default. Enough to
+    // drive `check_port_collisions`, which only reads `.name` and `.ports`.
+    fn svc(name: &str, ports: &[&str]) -> crate::compose::ComposeBox {
+        crate::compose::ComposeBox {
+            name: name.to_string(),
+            ports: ports.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    // Assert a collision was reported AND that the message names both offenders (a silent or vague
+    // rejection would be a regression - the whole point is a loud, actionable pre-flight error).
+    fn assert_collides(boxes: &[crate::compose::ComposeBox], needles: &[&str]) {
+        match check_port_collisions(boxes) {
+            Err(Error::Compose(msg)) => {
+                for n in needles {
+                    assert!(msg.contains(n), "message {msg:?} should mention {n:?}");
+                }
+            }
+            other => panic!("expected a compose collision error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_host_ports_are_fine() {
+        let boxes = [svc("web", &["8080:80"]), svc("api", &["8081:80"])];
+        assert!(check_port_collisions(&boxes).is_ok());
+    }
+
+    #[test]
+    fn same_host_port_two_services_collides() {
+        let boxes = [svc("a", &["9500:80"]), svc("b", &["9500:81"])];
+        assert_collides(&boxes, &["'a'", "'b'", "9500/tcp"]);
+    }
+
+    #[test]
+    fn different_protocol_same_port_is_fine() {
+        // tcp/9000 and udp/9000 are independent bindings - NOT a collision.
+        //
+        // CONTRACT-level, not compose-reachable today: the compose parser strips `/tcp` and drops
+        // non-TCP entries before they get here, so a `/udp` spec never reaches this function from a
+        // real file (verified e2e - two `/udp` services start with NOTHING published). This covers the
+        // function's own contract so the protocol dimension stays correct if kern gains UDP publish.
+        let boxes = [svc("a", &["9000:80"]), svc("b", &["9000:80/udp"])];
+        assert!(check_port_collisions(&boxes).is_ok());
+    }
+
+    #[test]
+    fn wildcard_bind_subsumes_specific_ip() {
+        // 0.0.0.0:9700 and 127.0.0.1:9700 both want the loopback port - overlap.
+        let boxes = [
+            svc("x", &["0.0.0.0:9700:80"]),
+            svc("y", &["127.0.0.1:9700:81"]),
+        ];
+        assert_collides(&boxes, &["'x'", "'y'", "9700/tcp"]);
+    }
+
+    #[test]
+    fn distinct_specific_ips_same_port_are_fine() {
+        // Two DIFFERENT concrete addresses can both hold port 9800 - no overlap, no error.
+        let boxes = [
+            svc("x", &["127.0.0.1:9800:80"]),
+            svc("y", &["192.168.1.5:9800:81"]),
+        ];
+        assert!(check_port_collisions(&boxes).is_ok());
+    }
+
+    #[test]
+    fn intra_service_duplicate_is_caught() {
+        // One service publishing the same host port twice would also fail at bind time - catch it here.
+        let boxes = [svc("solo", &["9500:80", "9500:81"])];
+        assert_collides(&boxes, &["'solo'", "more than once", "9500/tcp"]);
+    }
+
+    #[test]
+    fn range_publish_overlap_is_caught() {
+        // `8000-8002:8000-8002` expands to host ports 8000,8001,8002; a peer on 8001 collides on the
+        // shared port even though the two specs aren't textually equal.
+        let boxes = [
+            svc("range", &["8000-8002:8000-8002"]),
+            svc("peer", &["8001:81"]),
+        ];
+        assert_collides(&boxes, &["'range'", "'peer'", "8001/tcp"]);
+    }
+
+    #[test]
+    fn unparseable_spec_is_left_for_the_per_box_path() {
+        // A spec `ports::parse` rejects must NOT be treated as a collision here (that would mask the
+        // real "invalid port" error the per-box start reports). No panic, no false positive.
+        let boxes = [svc("bad", &["not-a-port"]), svc("ok", &["8080:80"])];
+        assert!(check_port_collisions(&boxes).is_ok());
+    }
+
+    // ---- extreme / adversarial edge cases ----------------------------------------------------
+
+    #[test]
+    fn nothing_to_check_is_ok() {
+        // No services at all, and services with an empty `ports:` list. Must not panic or false-positive.
+        assert!(check_port_collisions(&[]).is_ok());
+        let boxes = [svc("quiet", &[]), svc("also_quiet", &[])];
+        assert!(check_port_collisions(&boxes).is_ok());
+    }
+
+    #[test]
+    fn partially_overlapping_ranges_collide_on_the_shared_port() {
+        // 8000-8005 and 8003-8008 share 8003..8005. The specs are textually different and neither is a
+        // subset of the other - only real expansion catches this.
+        let boxes = [
+            svc("lo", &["8000-8005:8000-8005"]),
+            svc("hi", &["8003-8008:8003-8008"]),
+        ];
+        assert_collides(&boxes, &["'lo'", "'hi'"]);
+    }
+
+    #[test]
+    fn adjacent_ranges_do_not_collide() {
+        // Off-by-one boundary in the OTHER direction: 8000-8004 then 8005-8009 touch but never overlap.
+        let boxes = [
+            svc("lo", &["8000-8004:8000-8004"]),
+            svc("hi", &["8005-8009:8005-8009"]),
+        ];
+        assert!(check_port_collisions(&boxes).is_ok());
+    }
+
+    #[test]
+    fn max_range_boundary() {
+        // `ports::parse` caps a single spec at MAX_RANGE (1024). At the cap the spec expands and a peer
+        // inside it collides; one PAST the cap is rejected by the parser, so we must stay silent and let
+        // the per-box path report it - NOT invent a collision from a spec that will never bind.
+        let at_cap = [svc("big", &["1-1024:1-1024"]), svc("peer", &["512:80"])];
+        assert_collides(&at_cap, &["'big'", "'peer'", "512/tcp"]);
+        let past_cap = [svc("huge", &["1-1025:1-1025"]), svc("peer", &["512:80"])];
+        assert!(check_port_collisions(&past_cap).is_ok());
+    }
+
+    #[test]
+    fn port_number_boundaries() {
+        // The extremes of the valid range (1 and 65535) are ordinary ports to the checker.
+        assert_collides(
+            &[svc("a", &["1:1"]), svc("b", &["1:2"])],
+            &["1/tcp", "'a'", "'b'"],
+        );
+        assert_collides(
+            &[svc("a", &["65535:1"]), svc("b", &["65535:2"])],
+            &["65535/tcp", "'a'", "'b'"],
+        );
+        // Adjacent extremes don't collide.
+        assert!(check_port_collisions(&[svc("a", &["65534:1"]), svc("b", &["65535:1"])]).is_ok());
+    }
+
+    #[test]
+    fn explicit_tcp_equals_default_tcp() {
+        // `8080:80` and `8080:80/tcp` are the SAME protocol - a spelling difference must not hide the clash.
+        let boxes = [svc("a", &["8080:80"]), svc("b", &["8080:81/tcp"])];
+        assert_collides(&boxes, &["8080/tcp", "'a'", "'b'"]);
+    }
+
+    #[test]
+    fn protocol_suffix_is_case_insensitive() {
+        // `ports::parse` accepts `/UDP`; two udp mappings spelled differently still collide, and a
+        // `/UDP` mapping still does NOT collide with tcp on the same port. CONTRACT-level like
+        // `different_protocol_same_port_is_fine` - compose strips the proto before this point.
+        assert_collides(
+            &[svc("a", &["9000:80/udp"]), svc("b", &["9000:81/UDP"])],
+            &["9000/udp"],
+        );
+        assert!(
+            check_port_collisions(&[svc("a", &["9000:80/UDP"]), svc("b", &["9000:81"])]).is_ok()
+        );
+    }
+
+    #[test]
+    fn wildcard_twice_collides() {
+        // Two services BOTH on 0.0.0.0 for the same port - the wildcard-vs-wildcard branch.
+        let boxes = [
+            svc("a", &["0.0.0.0:9100:80"]),
+            svc("b", &["0.0.0.0:9100:81"]),
+        ];
+        assert_collides(&boxes, &["9100/tcp", "'a'", "'b'"]);
+    }
+
+    #[test]
+    fn wildcard_arriving_second_still_collides() {
+        // Order matters to the implementation (the wildcard may be inserted before OR after the specific
+        // address), so cover both directions: specific-then-wildcard, and wildcard-then-specific.
+        assert_collides(
+            &[
+                svc("spec", &["127.0.0.1:9200:80"]),
+                svc("wild", &["0.0.0.0:9200:81"]),
+            ],
+            &["9200/tcp", "'spec'", "'wild'"],
+        );
+        assert_collides(
+            &[
+                svc("wild", &["0.0.0.0:9300:80"]),
+                svc("spec", &["127.0.0.1:9300:81"]),
+            ],
+            &["9300/tcp", "'wild'", "'spec'"],
+        );
+    }
+
+    #[test]
+    fn wildcard_collides_with_a_far_away_specific_address() {
+        // 0.0.0.0 subsumes EVERY address, not just loopback: a LAN-bound peer conflicts too.
+        let boxes = [
+            svc("lan", &["192.168.1.5:9400:80"]),
+            svc("wild", &["0.0.0.0:9400:81"]),
+        ];
+        assert_collides(&boxes, &["'lan'", "'wild'"]);
+    }
+
+    #[test]
+    fn default_bind_is_loopback_so_bare_and_explicit_loopback_collide() {
+        // A bare `9500:80` defaults to 127.0.0.1 (kern is loopback-default). It MUST clash with an
+        // explicit `127.0.0.1:9500:81` - otherwise the checker would disagree with the real bind.
+        let boxes = [
+            svc("bare", &["9500:80"]),
+            svc("explicit", &["127.0.0.1:9500:81"]),
+        ];
+        assert_collides(&boxes, &["'bare'", "'explicit'", "9500/tcp"]);
+    }
+
+    #[test]
+    fn intra_service_wildcard_duplicate_names_the_service_once() {
+        // Same service, same wildcard port twice: the message must say "more than once" (not name the
+        // service twice as if there were two culprits).
+        let boxes = [svc("solo", &["0.0.0.0:9600:80", "0.0.0.0:9600:81"])];
+        match check_port_collisions(&boxes) {
+            Err(Error::Compose(m)) => {
+                assert!(m.contains("more than once"), "got {m:?}");
+                assert!(
+                    !m.contains("and 'solo'"),
+                    "should not read as two services: {m:?}"
+                );
+            }
+            other => panic!("expected a collision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn many_services_no_collision_is_linear_not_quadratic() {
+        // REGRESSION GUARD. A single `-p` may expand to 1024 ports, so a legal stack of ranges reaches
+        // tens of thousands of mappings. The pairwise version of this check measured 10.5 s on exactly
+        // this shape (40 services) before any box started; bucketing makes it milliseconds. Distinct
+        // bind IPs mean there is NO collision, so the scan cannot exit early - the worst case.
+        let boxes: Vec<_> = (0..40)
+            .map(|i| {
+                svc(
+                    &format!("s{i}"),
+                    &[&format!("10.0.{}.{}:1-1024:1-1024", i / 256, i % 256)],
+                )
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        assert!(
+            check_port_collisions(&boxes).is_ok(),
+            "distinct IPs never collide"
+        );
+        let dt = t0.elapsed();
+        // Generous ceiling (the quadratic form took ~10.5 s here, ~260x this bound) so the test is a
+        // real signal on slow CI rather than a flake.
+        assert!(
+            dt < std::time::Duration::from_secs(2),
+            "41k-mapping check should be milliseconds, took {dt:?} - did the pairwise scan come back?"
+        );
+    }
+
+    #[test]
+    fn collision_is_reported_deterministically() {
+        // HashMap iteration order is randomized per process, but the SCAN walks services and specs in
+        // file order, so the reported pair must be stable - a flaky error message would be a UX bug and
+        // would make the e2e tests non-reproducible. Same input, same message, every time.
+        let boxes = [
+            svc("first", &["7000:80"]),
+            svc("second", &["7000:81"]),
+            svc("third", &["7000:82"]),
+        ];
+        let msg = match check_port_collisions(&boxes) {
+            Err(Error::Compose(m)) => m,
+            other => panic!("expected a collision, got {other:?}"),
+        };
+        for _ in 0..64 {
+            match check_port_collisions(&boxes) {
+                Err(Error::Compose(m)) => assert_eq!(m, msg, "message must be stable"),
+                other => panic!("expected a collision, got {other:?}"),
+            }
+        }
+        // And it names the FIRST conflicting pair in file order, not an arbitrary one.
+        assert!(
+            msg.contains("'first'") && msg.contains("'second'") && !msg.contains("'third'"),
+            "should report the earliest pair: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn every_spec_of_a_service_is_checked_not_just_the_first() {
+        // A service's LAST port must be checked too (an early-exit bug would pass the first spec only).
+        let boxes = [
+            svc("multi", &["7100:80", "7101:81", "7102:82"]),
+            svc("late", &["7102:83"]),
+        ];
+        assert_collides(&boxes, &["'multi'", "'late'", "7102/tcp"]);
+    }
+
+    #[test]
+    fn a_malformed_spec_does_not_stop_the_scan() {
+        // The `continue` on an unparseable spec must skip only THAT spec: a real collision after it is
+        // still caught (a `return` there would silently disable the whole check).
+        let boxes = [
+            svc("a", &["bogus:spec:here:too", "7200:80"]),
+            svc("b", &["7200:81"]),
+        ];
+        assert_collides(&boxes, &["'a'", "'b'", "7200/tcp"]);
     }
 }

@@ -95,6 +95,13 @@ pub enum Command {
         pids_limit: Option<u64>,
         /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
         tmpfs: Vec<String>,
+        /// `--ulimit NAME=SOFT[:HARD]` (repeatable), pre-resolved to `(RLIMIT_*, soft, hard)` so the
+        /// sandbox layer does no parsing. `unlimited`/`-1` map to `RLIM_INFINITY`.
+        ulimits: Vec<(i32, u64, u64)>,
+        /// `--sysctl KEY=VALUE` (repeatable): namespaced kernel knobs set inside the box.
+        sysctls: Vec<(String, String)>,
+        /// `--label k=v` (repeatable): descriptive metadata recorded in the registry.
+        labels: Vec<String>,
         /// `--user UID[:GID]` / `-u`: drop to this uid/gid inside the box before the command runs.
         run_as: Option<String>,
         /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
@@ -367,9 +374,23 @@ pub enum Command {
     /// dependency order. `up` auto-creates a pod so services reach each other by name (`--no-pod`
     /// opts out); `down` stops the boxes and removes the pod.
     Compose {
-        file: String,
-        down: bool,
+        /// One or more compose files, merged left-to-right (`-f base -f override`).
+        files: Vec<String>,
+        /// Which compose verb to run (see [`commands::ComposeAction`]).
+        action: commands::ComposeAction,
         no_pod: bool,
+        /// `--tail N` for `logs`.
+        tail: Option<usize>,
+        /// `-f/--follow` for `logs` (one service only).
+        follow: bool,
+        /// Optional service subset for the read-only verbs; empty = every service.
+        services: Vec<String>,
+        /// `-p/--project-name`: pod name override.
+        project: Option<String>,
+        /// `--env-file`: interpolation table instead of the project `.env`.
+        env_file: Option<String>,
+        /// `--profile` (repeatable).
+        profiles: Vec<String>,
     },
     /// `kern config [edit|setup|probe|clear]`: manage `kern.toml` (default: list its profiles).
     Config {
@@ -870,36 +891,131 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("top") => Command::Top,
         // `compose <file> [up|down] [--no-pod]`: bring up / tear down a stack.
         Some("compose") => {
+            const USAGE: &str =
+                "compose <file>... [up|down|stop|start|restart|ps|logs|build|pull|config] \
+                 [-p NAME] [--env-file F] [--profile P] [--no-pod] [--tail N] [-f] [service...]";
+            let mut files: Vec<String> = Vec::new();
+            let mut project: Option<String> = None;
+            let mut env_file: Option<String> = None;
+            let mut profiles: Vec<String> = Vec::new();
             let mut file: Option<String> = None;
-            let mut down = false;
+            let mut action: Option<commands::ComposeAction> = None;
             let mut no_pod = false;
-            for a in rest.iter().skip(1) {
+            let mut tail: Option<usize> = None;
+            let mut follow = false;
+            let mut services: Vec<String> = Vec::new();
+            let mut it = rest.iter().skip(1).peekable();
+            while let Some(a) = it.next() {
                 match *a {
-                    "up" => {}
-                    "down" | "stop" => down = true,
                     "--no-pod" => no_pod = true,
-                    f if !f.starts_with('-') && file.is_none() => file = Some(f.to_string()),
-                    _ => return Err(Error::Usage("compose <file> [up|down] [--no-pod]")),
+                    "-f" | "--follow" => follow = true,
+                    "-p" | "--project-name" => {
+                        project = Some(
+                            it.next()
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose -p <project-name>"))?,
+                        );
+                    }
+                    "--env-file" => {
+                        env_file = Some(
+                            it.next()
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose --env-file <path>"))?,
+                        );
+                    }
+                    "--profile" => {
+                        profiles.push(
+                            it.next()
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose --profile <name>"))?,
+                        );
+                    }
+                    // Presentation/scheduling knobs with no semantic effect here: accepted so a Docker
+                    // script runs unchanged, and NOTED so nobody believes they did something.
+                    // `--parallel` is not silently honoured - kern has its own concurrency cap.
+                    "--ansi" | "--progress" | "--parallel" => {
+                        let v = it.next().map(|v| (*v).to_string()).unwrap_or_default();
+                        eprintln!("kern compose: '{a} {v}' has no effect on kern - ignored");
+                    }
+                    "--no-ansi" | "--compatibility" | "--dry-run" => {
+                        eprintln!("kern compose: '{a}' has no effect on kern - ignored");
+                    }
+                    "--tail" => {
+                        // A non-numeric `--tail` is a typo, not "show everything": refuse it.
+                        tail = Some(
+                            it.next()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .ok_or(Error::Usage("compose --tail N (a number of lines)"))?,
+                        );
+                    }
+                    f if f.starts_with('-') => return Err(Error::Usage(USAGE)),
+                    // First bare word that names a verb IS the verb; the file is the first bare word
+                    // that is not one (Docker puts the file behind `-f`, kern takes it positionally).
+                    w => {
+                        if action.is_none() {
+                            if let Some(act) = commands::ComposeAction::from_verb(w) {
+                                action = Some(act);
+                                continue;
+                            }
+                        }
+                        if file.is_none() {
+                            file = Some(w.to_string());
+                            files.push(w.to_string());
+                        } else if action.is_none()
+                            && (w.ends_with(".yml") || w.ends_with(".yaml") || w.ends_with(".toml"))
+                        {
+                            // Another compose FILE (kern takes them positionally; the shim turns each
+                            // Docker `-f` into one of these). Anything else selects services.
+                            files.push(w.to_string());
+                        } else {
+                            // Anything after the file and the verb selects services (`logs api web`).
+                            services.push(w.to_string());
+                        }
+                    }
                 }
             }
+            if files.is_empty() {
+                return Err(Error::Usage(USAGE));
+            }
+            let _ = file;
             Command::Compose {
-                file: file.ok_or(Error::Usage("compose <file> [up|down] [--no-pod]"))?,
-                down,
+                files,
+                action: action.unwrap_or(commands::ComposeAction::Up),
                 no_pod,
+                tail,
+                follow,
+                services,
+                project,
+                env_file,
+                profiles,
             }
         }
         // `up [--no-pod]` / `down`: Docker-familiar shorthands that DISCOVER a compose file in the CWD
         // (`docker-compose.yml`/`compose.yml`/…) and bring it up / tear it down. The whole point of the
         // compat surface: land in a dir with a compose file, type `kern up`, it just works.
         Some("up") | Some("down") => {
-            let down = rest.first().copied() == Some("down");
+            let action = if rest.first().copied() == Some("down") {
+                commands::ComposeAction::Down
+            } else {
+                commands::ComposeAction::Up
+            };
             let no_pod = rest.contains(&"--no-pod");
             let file = discover_compose_file().ok_or_else(|| {
                 Error::Compose(
                     "no compose file in this directory (looked for docker-compose.yml, compose.yml, compose.yaml, kern.toml)".to_string(),
                 )
             })?;
-            Command::Compose { file, down, no_pod }
+            Command::Compose {
+                files: vec![file],
+                action,
+                no_pod,
+                tail: None,
+                follow: false,
+                services: Vec::new(),
+                project: None,
+                env_file: None,
+                profiles: Vec::new(),
+            }
         }
         // `config`: list resource profiles from kern.toml.
         Some("config" | "cfg") => {
@@ -947,6 +1063,60 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
 
 /// Parse the `box` subcommand. `--plan` previews the isolation sequence (no privileges);
 /// `--rootfs <dir>` or `--image <ref>` runs the command (after `--`, default `/bin/sh`) in a
+/// Resolve a Docker-style `--ulimit NAME=SOFT[:HARD]` into `(RLIMIT_*, soft, hard)`.
+///
+/// Only POSIX resources with a stable `RLIMIT_*` constant are accepted; an unknown name is REFUSED
+/// rather than ignored, because a limit the workload believes is in force but is not is exactly the
+/// silent-divergence class this codebase refuses. `unlimited`, `infinity` and `-1` mean
+/// `RLIM_INFINITY`; a bare `NAME=N` sets soft and hard alike, as Docker does.
+fn parse_ulimit(spec: &str) -> Result<(i32, u64, u64), Error> {
+    const USAGE: &str =
+        "--ulimit NAME=SOFT[:HARD] where NAME is one of: core cpu data fsize locks \
+                         memlock msgqueue nice nofile nproc rss rtprio rttime sigpending stack";
+    let (name, bounds) = spec.split_once('=').ok_or(Error::Usage(USAGE))?;
+    // Table, not a match on `&str` scattered through the parser: one place to audit, and the CLI is
+    // the ONLY layer that knows these names (the sandbox receives resolved integers).
+    let resource: i32 = match name.trim().to_ascii_lowercase().as_str() {
+        "core" => libc::RLIMIT_CORE as i32,
+        "cpu" => libc::RLIMIT_CPU as i32,
+        "data" => libc::RLIMIT_DATA as i32,
+        "fsize" => libc::RLIMIT_FSIZE as i32,
+        "locks" => libc::RLIMIT_LOCKS as i32,
+        "memlock" => libc::RLIMIT_MEMLOCK as i32,
+        "msgqueue" => libc::RLIMIT_MSGQUEUE as i32,
+        "nice" => libc::RLIMIT_NICE as i32,
+        "nofile" => libc::RLIMIT_NOFILE as i32,
+        "nproc" => libc::RLIMIT_NPROC as i32,
+        "rss" => libc::RLIMIT_RSS as i32,
+        "rtprio" => libc::RLIMIT_RTPRIO as i32,
+        "rttime" => libc::RLIMIT_RTTIME as i32,
+        "sigpending" => libc::RLIMIT_SIGPENDING as i32,
+        "stack" => libc::RLIMIT_STACK as i32,
+        _ => return Err(Error::Usage(USAGE)),
+    };
+    let one = |v: &str| -> Result<u64, Error> {
+        let v = v.trim();
+        match v {
+            "unlimited" | "infinity" | "-1" => Ok(libc::RLIM_INFINITY),
+            _ => v.parse::<u64>().map_err(|_| Error::Usage(USAGE)),
+        }
+    };
+    let (soft, hard) = match bounds.split_once(':') {
+        Some((s, h)) => (one(s)?, one(h)?),
+        None => {
+            let both = one(bounds)?;
+            (both, both)
+        }
+    };
+    // The kernel refuses soft > hard with EINVAL; catching it here names the actual mistake.
+    if soft > hard {
+        return Err(Error::Usage(
+            "--ulimit: the soft limit cannot exceed the hard limit (NAME=SOFT:HARD)",
+        ));
+    }
+    Ok((resource, soft, hard))
+}
+
 /// real sandbox. Without a rootfs/image it still routes to `BoxRun` (which reports the missing
 /// source); `--plan` previews instead of running.
 fn parse_box(rest: &[&str]) -> Result<Command, Error> {
@@ -990,6 +1160,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut init = false;
     let mut pids_limit: Option<u64> = None;
     let mut tmpfs: Vec<String> = Vec::new();
+    let mut ulimits: Vec<(i32, u64, u64)> = Vec::new();
+    let mut sysctls: Vec<(String, String)> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
     let mut run_as: Option<String> = None;
     let mut cap_add: Vec<String> = Vec::new();
     let mut cap_drop: Vec<String> = Vec::new();
@@ -1081,6 +1254,51 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     {
                         Some(n) => pids_limit = Some(n),
                         None => return Err(Error::Usage("--pids-limit <N> (>= 1, e.g. 256)")),
+                    }
+                }
+                // `--ulimit NAME=SOFT[:HARD]`: a POSIX resource limit, Docker's spelling. Resolved
+                // here (name → RLIMIT_*, bounds → u64) so the sandbox layer never parses strings.
+                "--ulimit" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => ulimits.push(parse_ulimit(v)?),
+                        None => {
+                            return Err(Error::Usage(
+                                "--ulimit NAME=SOFT[:HARD] (e.g. --ulimit nofile=1024:2048)",
+                            ))
+                        }
+                    }
+                }
+                // `-l/--label k=v`: descriptive metadata. Requires the `=` (Docker's own rule) so a
+                // typo can't silently register a key with an empty value that no filter will match.
+                "-l" | "--label" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) if v.contains('=') && !v.starts_with('=') => {
+                            labels.push((*v).to_string())
+                        }
+                        _ => return Err(Error::Usage("--label k=v (e.g. --label app=web)")),
+                    }
+                }
+                // `--sysctl KEY=VALUE`: a namespaced kernel knob, Docker's spelling.
+                "--sysctl" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => {
+                            match v.split_once('=') {
+                                Some((k, val)) if !k.trim().is_empty() => {
+                                    sysctls.push((k.trim().to_string(), val.trim().to_string()))
+                                }
+                                _ => return Err(Error::Usage(
+                                    "--sysctl KEY=VALUE (e.g. --sysctl net.core.somaxconn=1024)",
+                                )),
+                            }
+                        }
+                        None => {
+                            return Err(Error::Usage(
+                                "--sysctl KEY=VALUE (e.g. --sysctl net.core.somaxconn=1024)",
+                            ))
+                        }
                     }
                 }
                 // `--tmpfs PATH[:size]`: mount a fresh tmpfs inside the box (repeatable).
@@ -1499,6 +1717,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             init,
             pids_limit,
             tmpfs,
+            ulimits,
+            sysctls,
+            labels,
             run_as,
             cap_add,
             cap_drop,
@@ -1939,6 +2160,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             init,
             pids_limit,
             tmpfs,
+            ulimits,
+            sysctls,
+            labels,
             run_as,
             cap_add,
             cap_drop,
@@ -1992,6 +2216,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             init,
             pids_limit,
             tmpfs: &tmpfs,
+            ulimits: &ulimits,
+            sysctls: &sysctls,
+            labels: &labels,
             run_as: run_as.as_deref(),
             cap_add: &cap_add,
             cap_drop: &cap_drop,
@@ -2121,7 +2348,27 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Logout { registry } => crate::auth::logout(registry.as_deref()),
         Command::Completions { shell } => crate::completions::completions(&shell),
         Command::Top => commands::top(),
-        Command::Compose { file, down, no_pod } => commands::compose(&file, down, no_pod),
+        Command::Compose {
+            files,
+            action,
+            no_pod,
+            tail,
+            follow,
+            services,
+            project,
+            env_file,
+            profiles,
+        } => commands::compose(commands::ComposeOpts {
+            files: &files,
+            action,
+            no_pod,
+            tail,
+            follow,
+            services: &services,
+            project: project.as_deref(),
+            env_file: env_file.as_deref(),
+            profiles: &profiles,
+        }),
         Command::Config { sub, force } => commands::config_cmd(&sub, force),
         Command::ConfigAdd { args } => commands::config_add(&args),
         Command::ConfigRm { args } => commands::config_rm(&args),
