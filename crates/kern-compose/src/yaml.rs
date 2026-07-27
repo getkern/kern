@@ -83,6 +83,8 @@ pub(crate) fn parse_with_env(
     let secret_files = collect_secret_files(&root);
 
     let mut boxes = Vec::new();
+
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut have_services = false;
     for (key, node) in &root.children {
         match key.as_str() {
@@ -93,7 +95,10 @@ pub(crate) fn parse_with_env(
                     // reject it rather than launch two boxes with the same name (which then collide at
                     // start with an opaque "already running", or silently shadow). Docker's YAML parser
                     // rejects duplicate mapping keys too.
-                    if boxes.iter().any(|b: &ComposeBox| b.name == *name) {
+                    // O(1) membership, not a scan of everything parsed so far: the scan made the
+                    // whole parse quadratic in the number of services (measured 3x per doubling in
+                    // the tail, and a 60k-service file never finished).
+                    if !seen_names.insert(name.clone()) {
                         return Err(format!("duplicate service '{name}'"));
                     }
                     let b = service_to_box(name, svc, &secret_files)?;
@@ -1037,6 +1042,17 @@ fn resolve_extends(root: &mut Node) -> Result<(), String> {
     let Some(si) = root.children.iter().position(|(k, _)| k == "services") else {
         return Ok(());
     };
+    // Nothing to resolve if no service uses `extends` - and that is almost every file. Without this
+    // guard the pass still ran once per service, and each run scanned every service to find its index:
+    // O(N^2) paid by files that never asked for the feature.
+    if !root.children[si]
+        .1
+        .children
+        .iter()
+        .any(|(_, svc)| svc.children.iter().any(|(k, _)| k == "extends"))
+    {
+        return Ok(());
+    }
     let names: Vec<String> = root.children[si]
         .1
         .children
