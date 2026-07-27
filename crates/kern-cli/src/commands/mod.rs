@@ -6910,7 +6910,46 @@ fn resolve_relative_binds(
             if !is_dot && (src.starts_with('/') || !src.contains('/')) {
                 continue;
             }
-            let abs = std::fs::canonicalize(base.join(src)).map_err(|e| {
+            // Docker CREATES a missing relative bind source. Refusing broke the most ordinary
+            // workflow there is: clone a repo whose compose file says `./data:/var/lib/mysql`, and
+            // `up` failed because `./data` does not exist yet. We create it too, but SAY SO - Docker
+            // creating directories silently is how a typo'd path becomes an empty mount nobody
+            // notices. Only under the compose directory, and only for a path that is relative, so the
+            // traversal guard below still decides what is allowed.
+            let target = base.join(src);
+            // Containment is checked LEXICALLY first, BEFORE creating anything: `canonicalize` needs
+            // the path to exist, so a `../x` source would otherwise have its directory created and
+            // only then be refused - a filesystem side effect outside the project, caused by the very
+            // input we are about to reject.
+            // Walk the components keeping a depth counter: a `..` at depth 0 would step above the
+            // project, so `try_fold` short-circuits to `None` and that IS the escape.
+            let escapes = src
+                .split('/')
+                .try_fold(0i32, |depth, seg| match seg {
+                    "" | "." => Some(depth),
+                    ".." => (depth > 0).then_some(depth - 1),
+                    _ => Some(depth + 1),
+                })
+                .is_none();
+            if escapes {
+                return Err(Error::Compose(format!(
+                    "service '{}': bind source '{src}' escapes the compose directory (refused)",
+                    b.name
+                )));
+            }
+            if !target.exists() {
+                std::fs::create_dir_all(&target).map_err(|e| {
+                    Error::Compose(format!(
+                        "service '{}': bind source '{src}' does not exist and could not be created: {e}",
+                        b.name
+                    ))
+                })?;
+                eprintln!(
+                    "kern compose: service '{}': created missing bind source '{src}'",
+                    b.name
+                );
+            }
+            let abs = std::fs::canonicalize(&target).map_err(|e| {
                 Error::Compose(format!("service '{}': bind source '{src}': {e}", b.name))
             })?;
             if !abs.starts_with(&base) {
@@ -12761,6 +12800,40 @@ mod relative_bind_tests {
         let _ = std::fs::create_dir_all(&tmp);
         assert_eq!(one("dati:/app", &tmp).expect("named"), "dati:/app");
         assert_eq!(one("/abs:/app", &tmp).expect("abs"), "/abs:/app");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_missing_bind_source_is_created_under_the_project() {
+        // Docker creates it, and refusing broke the most ordinary workflow there is: clone a repo
+        // whose compose file says `./data:/var/lib/mysql` and `up` failed because `./data` is not in
+        // the tree yet.
+        let tmp = std::env::temp_dir().join(format!("kern-bind4-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let got = one("./nuovo:/app", &tmp).expect("missing source is created");
+        assert!(
+            tmp.join("nuovo").is_dir(),
+            "the directory now exists: {got}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_escaping_source_is_refused_without_creating_anything() {
+        // Containment is decided LEXICALLY, before any mkdir: `canonicalize` needs the path to exist,
+        // so checking after creating would let the very input we reject leave a directory behind
+        // OUTSIDE the project.
+        let tmp = std::env::temp_dir().join(format!("kern-bind5-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let outside = tmp.parent().map(|p| p.join("kern-bind5-escape"));
+        for spec in ["../kern-bind5-escape:/m", "./a/../../kern-bind5-escape:/m"] {
+            assert!(one(spec, &tmp).is_err(), "{spec} must be refused");
+        }
+        if let Some(o) = &outside {
+            assert!(!o.exists(), "nothing may be created outside the project");
+        }
+        // A `..` that stays INSIDE is still fine.
+        assert!(one("a/b/../c:/m", &tmp).is_ok());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
