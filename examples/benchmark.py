@@ -67,12 +67,26 @@ def make_oci_bundle(spec_tool, rootfs, workdir):
     return bundle
 
 
-def bench(label, cmd_for, n, repeat, uid, env=None):
+def bench(label, cmd_for, n, repeat, uid, env=None, budget_ms=None):
     """Warm once, then time `repeat` batches of `n` runs each. Returns the per-batch ms/run
     samples (sorted) so the caller can report min / median / max - runtimes vary run-to-run
     (runc especially), and a single batch would hide that. `uid` yields a globally-unique id per
-    run so OCI container names never collide across batches."""
+    run so OCI container names never collide across batches.
+
+    `n` is a CEILING, not a quota. The warm-up run also measures what one call costs, and the
+    batch is then shortened so no runtime takes longer than `budget_ms` per batch. Without that,
+    `--runs 200 --repeat 5` means 1000 calls of every runtime: fine for kern at ~3 ms (3 s), but
+    ~5 minutes for `docker run` at ~300 ms, and another 5 for podman. The whole example took over
+    ten minutes, which is long enough that nobody runs it twice.
+
+    Shortening costs nothing that matters: a runtime at 300 ms is already stable after a couple of
+    dozen samples, while the sub-millisecond ones keep the large batch that their variance needs.
+    The floor of 5 keeps every batch a real average rather than a single timed call."""
+    warm_start = time.perf_counter_ns()
     sh(cmd_for(next(uid)), env=env)  # warm (caches, cgroup tree, image store)
+    one_ms = (time.perf_counter_ns() - warm_start) / 1e6
+    if budget_ms and one_ms > 0:
+        n = max(5, min(n, int(budget_ms / one_ms)))
     samples = []
     for _ in range(repeat):
         start = time.perf_counter_ns()
@@ -80,7 +94,7 @@ def bench(label, cmd_for, n, repeat, uid, env=None):
             sh(cmd_for(next(uid)), env=env)
         samples.append((time.perf_counter_ns() - start) / 1e6 / n)  # ms/run for this batch
     samples.sort()
-    return samples
+    return samples, n
 
 
 def main():
@@ -88,6 +102,9 @@ def main():
     ap.add_argument("--runs", type=int, default=200, help="runs per batch (default 200)")
     ap.add_argument("--repeat", type=int, default=5, help="batches per runtime, for min/median/max (default 5)")
     ap.add_argument("--conc", type=int, default=200, help="parallel starts for the concurrency test (0 = skip; default 200)")
+    ap.add_argument("--budget", type=int, default=4000,
+                    help="max ms per batch: a slow runtime does fewer runs rather than making you "
+                         "wait (default 4000; 0 = no cap, the old fixed-count behaviour)")
     ap.add_argument("--rootfs", help="an existing Alpine rootfs dir (else pulled with kern)")
     args = ap.parse_args()
 
@@ -141,17 +158,21 @@ def main():
 
     n, repeat = args.runs, args.repeat
     uid = itertools.count()  # globally-unique id per run (no OCI name collisions across batches)
-    print(f"\nOne isolated /bin/true - {repeat} batches × {n} runs, time/run = total / {n}.")
+    print(f"\nOne isolated /bin/true - {repeat} batches × up to {n} runs, time/run = total / runs.")
+    print(f"Each batch is capped at ~{args.budget / 1000:.0f}s, so a slow engine shortens its batch")
+    print("instead of making you wait: the actual run count per runtime is printed below.")
     print("(kern here is the bare box, no cgroup cap - like bubblewrap; add a hard cap with the")
     print(" default `kern box` and it is ~5.5 ms, tied with crun.)\n")
 
     results = []
     for label, cmd_for, env in rows:
         print(f"  benchmarking {label} ...", end=" ", flush=True)
-        s = bench(label, cmd_for, n, repeat, uid, env=env)
+        s, used = bench(label, cmd_for, n, repeat, uid, env=env, budget_ms=args.budget)
         lo, med, hi = s[0], s[len(s) // 2], s[-1]
         results.append((label, lo, med, hi))
-        print(f"median {med:.1f} ms/run  (min {lo:.1f}, max {hi:.1f})")
+        # The run count is printed, never assumed: a median over 5 runs and one over 200 deserve
+        # different confidence, and hiding which one you got would be the dishonest shortcut here.
+        print(f"median {med:.1f} ms/run  (min {lo:.1f}, max {hi:.1f}, {used} runs × {repeat})")
 
     results.sort(key=lambda r: r[2])  # by median
     kern_med = next(med for lbl, lo, med, hi in results if lbl.startswith("kern"))
