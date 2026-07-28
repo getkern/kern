@@ -1435,7 +1435,16 @@ pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(),
             }
             ("zstd", ["-dc", &path])
         }
-        Compression::Plain => unreachable!(),
+        // An uncompressed layer has no decompressor to spawn, and every caller reads it directly
+        // instead of coming here. That makes this arm unreachable TODAY, which is exactly why it
+        // must not be `unreachable!()`: the guarantee lives in the callers, so a later one that
+        // forgets would turn a routing mistake into a panic in the middle of a pull. Refusing is
+        // the same fail-closed answer the vetter gives everywhere else.
+        Compression::Plain => return Err(OciError::Tool(
+            "kern",
+            "internal: a plain (uncompressed) layer was routed through the decompressing vetter"
+                .into(),
+        )),
     };
     let mut child = Command::new(bin)
         .args(args)
