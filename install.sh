@@ -25,10 +25,23 @@ case "$(uname -m)" in
 esac
 
 # --- downloader ---
+# The IPv4 retry is not paranoia: inside a WSL2 distro whose curl is built against c-ares (Alpine's
+# is), an AAAA lookup against the WSL NAT resolver can go unanswered while the A record resolves
+# perfectly. curl then reports "Could not resolve host" for a name that `getent hosts` resolves a
+# second later, which reads as a broken installer rather than a broken lookup. Measured on Windows 10
+# 22H2: the same URL fails plain and returns 200 with --ipv4. One retry, and it says why.
 if command -v curl >/dev/null 2>&1; then
-  dl() { curl -fsSL "$1" -o "$2"; }
+  dl() {
+    curl -fsSL "$1" -o "$2" && return 0
+    echo "  download failed, retrying over IPv4 only (some WSL/musl resolvers stall on AAAA)" >&2
+    curl -fsSL --ipv4 "$1" -o "$2"
+  }
 elif command -v wget >/dev/null 2>&1; then
-  dl() { wget -qO "$2" "$1"; }
+  dl() {
+    wget -qO "$2" "$1" && return 0
+    echo "  download failed, retrying over IPv4 only (some WSL/musl resolvers stall on AAAA)" >&2
+    wget -qO "$2" -4 "$1"
+  }
 else
   err "need curl or wget to download."
 fi
