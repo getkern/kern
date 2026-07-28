@@ -19,6 +19,9 @@ pub fn version() -> Result<(), Error> {
 pub fn help() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
+    // The compose sub-verbs come from COMPOSE_VERBS, so help cannot describe a set of verbs the
+    // parser does not accept, nor omit one it does.
+    let cv = compose_verbs_help();
     println!("{}", crate::ui::logo(&p));
     println!(
         "\
@@ -71,7 +74,7 @@ pub fn help() -> Result<(), Error> {
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
-    {c}compose{z} <file> [up|down|stop|start|restart|ps|logs|build|pull|config] Run a stack (kern TOML or docker-compose.yml)
+    {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml)
     {c}up{z} [--no-pod] / {c}down{z}                                          Bring up / tear down the compose file in this dir
     {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls / pod rm <name>     Shared-network pod (boxes reach each other by name)
 
@@ -88,7 +91,7 @@ pub fn help() -> Result<(), Error> {
     {c}doctor{z}                                                         Preflight: will boxes run here?
     {c}probe{z}                                                          Host resources you can put in kern.toml
     {c}info{z}                                                           Runtime + host snapshot
-    {c}bench{z} --rootfs <dir> [-n N]                                    Time box start→exit latency
+    {c}bench{z} (--image <ref>|--rootfs <dir>) [-n N]                    Time box start→exit latency
     {c}completions{z} <bash|zsh|fish>                                    Print a shell-completion script
 
 {b}OPTIONS for box:{z}
@@ -994,14 +997,27 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The same input reaching the two paths and behaving differently is the divergence class this
     // codebase treats as a defect. `--no-uid-range` opts out for anyone who wants the tighter
     // single-uid map; a `--rootfs` box is unaffected, exactly as in compose.
-    let image_default_uid_range = args.image.is_some() && !args.no_uid_range;
+    let image_default_uid_range = image_default_uid_range(&args);
+
+    // A non-root `--user` needs its uid mapped into the box's namespace, which the single-uid map
+    // doesn't provide - so a non-zero `--user` (like `--ssh`) implies the uid/gid-range mapping.
+    // `run_as` already folded in the image's own `USER`, which is why this has to be known BEFORE
+    // the heads-up below: that message speaks about the map the box will get.
+    let non_root_user = matches!(run_as, Some((u, _)) if u != 0);
 
     let declared_user = image_config
         .user
         .as_deref()
         .filter(|u| !u.is_empty() && *u != "0" && *u != "root");
     if let Some(u) = declared_user {
-        if !args.uid_range && !image_default_uid_range {
+        // Warn ONLY when the box really will be single-uid. Checking just the flag and the image
+        // default made this fire on `--image <declares USER 1000> --no-uid-range`, where the image's
+        // own USER has already promoted the box to a range: it announced a single-uid map that did
+        // not exist and advised re-running without a flag, which would have changed nothing. The
+        // remaining true case is an explicit `--user 0` over an image that drops privilege itself.
+        let will_be_single_uid =
+            !args.uid_range && !image_default_uid_range && !non_root_user && ssh.is_none();
+        if will_be_single_uid {
             eprintln!(
                 "kern: heads-up: image runs as non-root user '{u}' - under kern's rootless model a \
                  single-uid box can't map that uid, so the entrypoint may fail (chown/setuid EINVAL). \
@@ -1024,9 +1040,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--cap-add`/`--cap-drop`: resolve names to a CapSpec (unknown name → error) layered on the
     // always-dropped dangerous baseline.
     let caps = crate::caps::resolve(args.cap_add, args.cap_drop)?;
-    // A non-root `--user` needs its uid mapped into the box's namespace, which the single-uid map
-    // doesn't provide - so a non-zero `--user` (like `--ssh`) implies the uid/gid-range mapping.
-    let non_root_user = matches!(run_as, Some((u, _)) if u != 0);
 
     // Always an overlay (image/rootfs = read-only lower, private upper takes writes).
     // `--read-only` then remounts that overlay read-only after pivot.
@@ -1337,6 +1350,14 @@ fn display_source_cmd<'a>(args: &'a BoxRunArgs) -> (&'a str, String) {
     (source, cmd)
 }
 
+/// Does kern turn the subordinate uid range on for this box BY DEFAULT, because it is an OCI image
+/// box? The single statement of that rule on the box side: the real run and the `--show-config` dry
+/// run both call it, so the dry run cannot report a range the box will not get, or miss one it will.
+/// It reported `uid_range: false` for every image box for exactly as long as this was written twice.
+fn image_default_uid_range(args: &BoxRunArgs) -> bool {
+    args.image.is_some() && !args.no_uid_range
+}
+
 /// `--show-config`: print the resolved box configuration (after profiles, clamps and flag merges) to
 /// stdout as plain `key: value` lines, then the caller exits. A dry run - unlike the status panel it
 /// always prints (it's the whole point of the command) and goes to stdout so it can be captured.
@@ -1376,9 +1397,21 @@ fn print_resolved_config(
         .ok()
         .flatten()
         .is_some_and(|(u, _)| u != 0);
+    // Report the range AND where it came from. The bare boolean stays a bare boolean (scripts parse
+    // these lines), so the provenance is its own key: a caller can see that kern, not they, turned it
+    // on, which is the difference between a default one may opt out of and a request one asked for.
+    // The dry run runs before the image is resolved, so an image that declares a non-root USER can
+    // still promote this to `request` at run time; `image-default` is a floor, never a ceiling.
+    let asked = args.uid_range || args.ssh_port.is_some() || non_root_user;
+    let by_image = image_default_uid_range(args);
+    println!("uid_range: {}", asked || by_image);
     println!(
-        "uid_range: {}",
-        args.uid_range || args.ssh_port.is_some() || non_root_user
+        "uid_range_source: {}",
+        match (asked, by_image) {
+            (true, _) => "request",
+            (false, true) => "image-default",
+            (false, false) => "-",
+        }
     );
     println!("tun: {}", args.tun);
     println!("tty: {}", args.tty);
@@ -2777,10 +2810,48 @@ unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
 /// The wait is a bounded poll on the pidfd, so a workload that exits immediately costs one syscall,
 /// not the whole grace. A workload that IGNORES the signal costs exactly `grace_secs` and then dies:
 /// the kernel tears down the pid namespace with its PID 1, so nothing survives the SIGKILL.
+/// Can `sig` actually terminate this box's init, or would the grace period be a guaranteed wait for
+/// nothing?
+///
+/// A PID-namespace init is special: the kernel DISCARDS any signal it has no handler for, so the
+/// default "terminate" action does not apply to it. A box whose command is an ordinary program that
+/// installs no handler (`sleep`, and most binaries) therefore cannot be stopped by SIGTERM at all,
+/// and the graceful phase becomes a full wait for an event that can never happen.
+///
+/// MEASURED: `kern stop` on a `sleep` box took 9013 ms, against 2 ms before the graceful phase
+/// existed, because it always waited the whole 10 s and only then sent SIGKILL. A box whose init
+/// DOES trap the signal (a shell with `trap`, or any real service) is unaffected and still gets its
+/// full grace.
+///
+/// `SigCgt` in `/proc/<pid>/status` is the caught-signal mask, one bit per signal, signal `n` at bit
+/// `n-1`. Unreadable, unparsable, or absent means we do NOT know: assume it IS caught, so an unknown
+/// stays on the patient path rather than being killed early. Guessing wrong in that direction costs
+/// a wait; guessing wrong the other way would cut a real shutdown short.
+fn init_catches_signal(pid1: i32, sig: i32) -> bool {
+    if pid1 <= 0 || !(1..=64).contains(&sig) {
+        return true;
+    }
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid1}/status")) else {
+        return true;
+    };
+    let Some(mask) = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+    else {
+        return true;
+    };
+    mask & (1u64 << (sig - 1)) != 0
+}
+
 fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_secs: u64) -> bool {
     let pidfd = if pid1 > 0 {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
-        if grace_secs > 0 {
+        // Skip the graceful phase entirely when the init provably cannot receive the signal: see
+        // `init_catches_signal`. This is the difference between `kern stop` returning in 2 ms and in
+        // 9 s for the most ordinary box there is.
+        let graceful = grace_secs > 0 && init_catches_signal(pid1, stop_signal);
+        if graceful {
             // Graceful phase: the configured signal to the box init, and to the supervisor's group so
             // a foreground box's helpers hear it too.
             unsafe { signal_box(fd, pid1, stop_signal) };
@@ -3437,7 +3508,8 @@ fn install_persistent_box(
         svc.push_str(&format!("TasksMax={p}\n"));
     }
     let unit = format!(
-        "[Unit]\nDescription=kern box {name}\nAfter=network-online.target\n\n\
+        "[Unit]\nDescription=kern box {name}\n{MANAGED_MARKER}={name}\n\
+         After=network-online.target\n\n\
          [Service]\n{svc}\n[Install]\nWantedBy=default.target\n",
         name = name.as_str(),
     );
@@ -4355,21 +4427,45 @@ fn sweep_orphan_layers() -> (usize, u64) {
 /// boxes (each `/bin/true`, foreground) and timing them, then reporting min/median/avg/max +
 /// boxes/sec. This is the real user-facing number (it spawns `kern box` just like you would), so it's
 /// the honest figure to quote. Needs a `--rootfs` with a `/bin/true` (any busybox/distro rootfs).
-pub fn bench(rootfs: Option<&str>, count: u32) -> Result<(), Error> {
-    let rootfs = rootfs.ok_or(Error::Usage(
-        "bench needs --rootfs <dir> (e.g. kern pull alpine && kern bench --rootfs ./alpine)",
-    ))?;
-    if !std::path::Path::new(rootfs).is_dir() {
-        return Err(Error::Sandbox(format!(
-            "--rootfs '{rootfs}' is not a directory"
-        )));
-    }
+pub fn bench(rootfs: Option<&str>, image: Option<&str>, count: u32) -> Result<(), Error> {
+    // `--image` resolves through the SAME cache path `kern box --image` uses, so benching an image
+    // measures the box a user would actually run, and a second copy of the pull logic never appears
+    // here. Before this, bench was the only verb needing a filesystem that did not accept an image:
+    // the one command the README asks a newcomer to run was the one needing two commands first.
+    // Bench measures the box a user would actually run, so it spawns the SAME command they would:
+    // `--rootfs <dir>` or `--image <ref>`, passed through verbatim. Resolving an image to a directory
+    // here would have been wrong twice: a locally built image resolves to a COLON-JOINED layer chain
+    // that `--rootfs` does not accept, and the timing would stop describing the command being quoted.
+    let (flag, value) = match (rootfs, image) {
+        (Some(_), Some(_)) => {
+            return Err(Error::Usage(
+                "bench takes --rootfs <dir> OR --image <ref>, not both",
+            ))
+        }
+        (Some(r), None) => {
+            if !std::path::Path::new(r).is_dir() {
+                return Err(Error::Sandbox(format!("--rootfs '{r}' is not a directory")));
+            }
+            ("--rootfs", r)
+        }
+        (None, Some(img)) => {
+            // Warm the cache BEFORE timing: a first-run pull is network time, not box-start time,
+            // and folding it into the first sample would inflate max and slander the number.
+            resolve_image(img)?;
+            ("--image", img)
+        }
+        (None, None) => {
+            return Err(Error::Usage(
+                "bench needs --image <ref> (e.g. kern bench --image alpine) or --rootfs <dir>",
+            ))
+        }
+    };
     let self_exe =
         std::env::current_exe().map_err(|e| Error::Sandbox(format!("locating kern: {e}")))?;
     let one = |name: &str| -> Option<std::time::Duration> {
         let t0 = std::time::Instant::now();
         let ok = std::process::Command::new(&self_exe)
-            .args(["box", name, "--rootfs", rootfs, "--", "/bin/true"])
+            .args(["box", name, flag, value, "--", "/bin/true"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -4400,8 +4496,9 @@ pub fn bench(rootfs: Option<&str>, count: u32) -> Result<(), Error> {
     let avg = sum / times.len() as f64;
     let p = crate::ui::Palette::detect();
     println!(
-        "{b}kern bench{z}  {} runs, rootfs {rootfs}",
+        "{b}kern bench{z}  {} runs, {} {value}",
         times.len(),
+        flag,
         b = p.b,
         z = p.z
     );
@@ -9717,13 +9814,16 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                         .to_string(),
                 )
             })
+            // The name only makes a file a CANDIDATE. Ownership is read from the file itself, or
+            // `stop --all` removes units it never wrote - see `is_kern_managed_unit`.
+            .filter(|n| managed_unit_path(n).is_some_and(|p| is_kern_managed_unit(&p)))
             .filter(|n| !targets.iter().any(|b| &b.name == n))
             .collect()
     } else {
         names
             .iter()
             .filter(|n| !targets.iter().any(|b| &b.name == *n))
-            .filter(|n| managed_unit_path(n).is_some_and(|p| p.exists()))
+            .filter(|n| managed_unit_path(n).is_some_and(|p| is_kern_managed_unit(&p)))
             .cloned()
             .collect()
     };
@@ -9883,6 +9983,47 @@ fn unit_file_name(name: &str) -> String {
     format!("kern-{name}.service")
 }
 
+/// The `X-` key kern stamps into every unit IT writes for a persistent box. systemd ignores unknown
+/// `X-` keys and preserves them, which makes this a free, machine-readable claim of ownership.
+const MANAGED_MARKER: &str = "X-KernManagedBox";
+
+/// Is this unit file one kern wrote for a persistent box, and therefore one kern may DELETE?
+///
+/// The name is not evidence. `stop --all` used to treat every `kern-*.service` in the user's unit
+/// directory as its own and remove it, so a unit the user wrote by hand - including the one
+/// `kern compose … systemd` tells them to write, which is named exactly that way - was deleted by an
+/// unrelated `kern stop --all`. Deleting a file kern never created, outside kern's own state
+/// directories, is not a cleanup; it is data loss.
+///
+/// Ownership is therefore asserted POSITIVELY, by two marks, and anything else is left alone:
+///
+/// * [`MANAGED_MARKER`], stamped by every unit kern writes from now on;
+/// * `Description=kern box <name>`, which every unit kern wrote BEFORE the marker existed carries,
+///   so an already-installed persistent box keeps being cleaned up across the upgrade.
+///
+/// Fail-safe by construction: a file that cannot be read, or is too large to be one of ours, is NOT
+/// ours. The read is bounded because this runs over every candidate in a directory kern does not own.
+fn is_kern_managed_unit(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    // A kern unit is a few hundred bytes. 64 KiB is far above any of ours and far below a file worth
+    // paging in; a truncated read can only ever make the answer "not ours", which is the safe one.
+    const MAX: usize = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if f.by_ref().take(MAX as u64).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&buf) else {
+        return false;
+    };
+    text.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with(MANAGED_MARKER) || l.starts_with("Description=kern box ")
+    })
+}
+
 /// Path of the systemd user unit for a persistent box named `name` (if the user's systemd dir is
 /// resolvable). Existence of this file is what marks a box as systemd-managed. Returns `None` for a
 /// name that isn't a valid box name - `kern stop <name>` takes raw, unvalidated names, and a `../`
@@ -9900,7 +10041,9 @@ fn stop_managed_unit(name: &str) -> bool {
     let Some(path) = managed_unit_path(name) else {
         return false;
     };
-    if !path.exists() {
+    // Last line of defence, deliberately duplicated with the callers' filter: this function DELETES,
+    // and a future caller that forgets to filter must not be able to remove a stranger's unit.
+    if !is_kern_managed_unit(&path) {
         return false;
     }
     let unit = unit_file_name(name);
@@ -10268,25 +10411,46 @@ pub enum ComposeAction {
     Pull,
     /// Parse, interpolate and validate, then print the resolved services. No side effects.
     Config,
+    /// Print a systemd unit for this stack on stdout. Installs nothing: kern is daemonless, so the
+    /// one thing it cannot do for itself is come back after a reboot, and where that unit belongs is
+    /// a decision about the user's machine. No side effects.
+    Systemd,
+}
+
+/// Every compose sub-verb, in the order the help prints them. THE list: `from_verb`, the help line
+/// and the usage error all read it, so a verb cannot work while being absent from what the CLI tells
+/// you about itself. `systemd` shipped exactly that way, working but undocumented in both, because
+/// the same list was written out three times by hand.
+pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
+    ("up", ComposeAction::Up),
+    ("down", ComposeAction::Down),
+    ("stop", ComposeAction::Stop),
+    ("start", ComposeAction::Start),
+    ("restart", ComposeAction::Restart),
+    ("ps", ComposeAction::Ps),
+    ("logs", ComposeAction::Logs),
+    ("build", ComposeAction::Build),
+    ("pull", ComposeAction::Pull),
+    ("config", ComposeAction::Config),
+    ("systemd", ComposeAction::Systemd),
+];
+
+/// The `up|down|…` fragment both help sites print, built from [`COMPOSE_VERBS`] so it cannot drift.
+pub fn compose_verbs_help() -> String {
+    COMPOSE_VERBS
+        .iter()
+        .map(|(v, _)| *v)
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 impl ComposeAction {
     /// Parse a compose sub-verb. `None` for an unknown word, so the caller can report it with the
     /// full list rather than guessing.
     pub fn from_verb(v: &str) -> Option<Self> {
-        Some(match v {
-            "up" => ComposeAction::Up,
-            "down" => ComposeAction::Down,
-            "stop" => ComposeAction::Stop,
-            "start" => ComposeAction::Start,
-            "restart" => ComposeAction::Restart,
-            "ps" => ComposeAction::Ps,
-            "logs" => ComposeAction::Logs,
-            "build" => ComposeAction::Build,
-            "pull" => ComposeAction::Pull,
-            "config" => ComposeAction::Config,
-            _ => return None,
-        })
+        COMPOSE_VERBS
+            .iter()
+            .find_map(|(name, a)| (*name == v).then_some(*a))
     }
 }
 
@@ -10377,8 +10541,23 @@ fn reconcile_decision(running: &registry::Instance, want: &str) -> Reconcile {
 /// The generalisation matters more than any single case: the internal-port clash was found only
 /// because a reviewer's premise was tested, and it is one member of a class, not a special case.
 ///
-/// Runs only for a pod (`--no-pod` gives each service its own namespace, so none of this applies).
-fn check_pod_global_conflicts(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error> {
+/// The gate lives HERE, not at the call sites. It used to be written at each of them, and they drifted
+/// exactly as that always ends: `up` gated it, `systemd` ran it ungated, and `config` (the verb whose
+/// whole job is answering "will this come up?") did not run it at all, so a stack that `up` refused
+/// was reported clean by the dry run. One statement of the rule, three callers that cannot restate it
+/// differently.
+///
+/// Not gated on `use_pod`'s third term (`any(!b.net)`) on purpose: services on the HOST network share
+/// the host's namespace, so their internal ports collide just as surely. `use_pod` answers "create a
+/// pod?", this answers "can these ports coexist?" - different questions that happen to share two terms.
+fn check_pod_global_conflicts(
+    boxes: &[crate::compose::ComposeBox],
+    no_pod: bool,
+) -> Result<(), Error> {
+    // `--no-pod` gives each service its own namespace, and a lone service shares with nobody.
+    if no_pod || boxes.len() < 2 {
+        return Ok(());
+    }
     let short = |b: &crate::compose::ComposeBox| b.name.clone();
 
     // 1. INTERNAL ports. Two services listening on the same box port share one namespace: one binds,
@@ -10387,24 +10566,37 @@ fn check_pod_global_conflicts(boxes: &[crate::compose::ComposeBox]) -> Result<()
     //    routinely want the same one even when their PUBLISHED ports differ.
     let mut seen: std::collections::HashMap<(u16, bool), String> = std::collections::HashMap::new();
     for b in boxes {
-        for spec in &b.ports {
-            let Some(maps) = crate::ports::parse(spec) else {
-                continue; // malformed: the per-box path reports it precisely
-            };
-            for m in maps {
-                if let Some(other) = seen.insert((m.box_port, m.udp), short(b)) {
-                    if other != b.name {
-                        let proto = if m.udp { "udp" } else { "tcp" };
-                        return Err(Error::Compose(format!(
-                            "services '{}' and '{}' both listen on container port {}/{proto}. Services \
-                             in a stack share ONE network namespace (like a Kubernetes pod), so only \
-                             one can bind it: give them different container ports (many images read \
-                             one from an env var such as PORT), or run with --no-pod.",
-                            other,
-                            short(b),
-                            m.box_port
-                        )));
-                    }
+        // A declared `port` counts exactly like a published mapping's container port, and is the only
+        // way an INTERNAL-only service (reached by name, publishing nothing) becomes visible here at
+        // all. Derived from `ports:` alone, this check saw only the services that publish, so the
+        // stack it protected was the smaller half of the stack. Declared ports are TCP.
+        // Tre sorgenti, UNO spazio: `port:` (dichiarata, iniettata come PORT), `expose:` (dichiarate,
+        // grafia Compose) e le mappature di `ports:` (pubblicate). Sono tutte la stessa affermazione,
+        // "questo servizio lega questa porta nel namespace del pod", e vanno confrontate insieme o il
+        // controllo protegge solo la sorgente che gli e' capitato di guardare.
+        let declared = b.port.map(|p| (p, false));
+        for (port, udp) in
+            declared
+                .into_iter()
+                .chain(b.expose.iter().copied())
+                .chain(b.ports.iter().flat_map(|spec| {
+                    crate::ports::parse(spec) // malformed: the per-box path reports it precisely
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|m| (m.box_port, m.udp))
+                }))
+        {
+            if let Some(other) = seen.insert((port, udp), short(b)) {
+                if other != b.name {
+                    let proto = if udp { "udp" } else { "tcp" };
+                    return Err(Error::Compose(format!(
+                        "services '{}' and '{}' both listen on container port {port}/{proto}. Services \
+                         in a stack share ONE network namespace (like a Kubernetes pod), so only one \
+                         can bind it: declare a different internal port with `port:` on one of them \
+                         (kern passes it as PORT, which most images read), or run with --no-pod.",
+                        other,
+                        short(b)
+                    )));
                 }
             }
         }
@@ -10459,10 +10651,43 @@ fn check_pod_global_conflicts(boxes: &[crate::compose::ComposeBox]) -> Result<()
 }
 
 /// How long to watch a freshly-launched stack for an IMMEDIATE death. Not "how long a service takes
-/// to start": a service is not required to be READY here, only to still exist. Half a second covers a
-/// failed `execve`, a failed bind, a permission error and a missing file, which is the entire class
-/// `up` can honestly speak about.
-const BRING_UP_SETTLE_MS: u64 = 500;
+/// to start": a service is not required to be READY here, only to still exist. This covers a failed
+/// `execve`, a failed bind, a permission error and a missing file, which is the entire class `up` can
+/// honestly speak about.
+///
+/// MEASURED, not chosen. A service that fails at once (`exit 3`, a missing binary, a failed exec) is
+/// observably gone 0.7 ms after its box returns. This window is two orders of magnitude above that,
+/// which leaves room for a board an order of magnitude slower than the desktop it was measured on.
+///
+/// It was 500 ms, justified by a comment stating the window "adds a fixed 500 ms to a bring-up that
+/// already takes seconds". The bring-up measures ~40 ms: the window WAS the cost of `compose up`,
+/// twelve times the work it was watching over. `compose up` of four services went from 540 ms to
+/// ~190, and a stack with a failing service now reports in milliseconds instead of half a second.
+const BRING_UP_SETTLE_MS: u64 = 150;
+
+/// Watch the freshly-started services and return AS SOON AS one is gone, or when `ms` elapses.
+///
+/// The window used to be a flat sleep, so a stack whose service died instantly still took the whole
+/// window to say so. Watching costs one cheap liveness check per service per tick and turns the
+/// failure path from "always the full window" into "as fast as the failure happened", while a stack
+/// that stays up pays exactly what it paid before.
+fn watch_for_early_death(boxes: &[crate::compose::ComposeBox], ms: u64) {
+    // 10 ms: far below the window, far above the cost of one liveness check per service, so the
+    // watch adds no measurable work to a stack that stays up.
+    const TICK_MS: u64 = 10;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        if boxes.iter().any(|b| !is_box_alive(&b.name)) {
+            return; // one is gone: the caller's registry pass decides whether that was legitimate
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let left = deadline.saturating_duration_since(now);
+        std::thread::sleep(left.min(std::time::Duration::from_millis(TICK_MS)));
+    }
+}
 
 /// Names of the services that are gone after the settle window, in file order.
 ///
@@ -10470,14 +10695,13 @@ const BRING_UP_SETTLE_MS: u64 = 500;
 /// signal `depends_completed` waits on, so a one-shot task that did its job is not reported as a
 /// failure. Anything else that is no longer in the registry died, and `up` must say so.
 ///
-/// One sleep for the whole stack, then one registry read per service: the check adds a fixed 500 ms
-/// to a bring-up that already takes seconds, and no per-service polling.
+/// One watch for the whole stack, then one registry read per service to classify what is gone.
 fn settle_and_collect_dead(
     boxes: &[crate::compose::ComposeBox],
     pod: &str,
     token: &str,
 ) -> Vec<String> {
-    std::thread::sleep(std::time::Duration::from_millis(BRING_UP_SETTLE_MS));
+    watch_for_early_death(boxes, BRING_UP_SETTLE_MS);
     boxes
         .iter()
         .filter(|b| {
@@ -10594,6 +10818,9 @@ struct TerminalOpts<'a> {
     tail: Option<usize>,
     follow: bool,
     services: &'a [String],
+    /// Needed by the read-only verbs too: `config` and `systemd` answer questions ABOUT a bring-up,
+    /// so they have to know whether that bring-up would share a namespace.
+    no_pod: bool,
 }
 
 /// Run the compose verbs that never launch a box, and report whether one ran.
@@ -10607,13 +10834,25 @@ fn run_terminal_verb(
     boxes: &mut [crate::compose::ComposeBox],
     o: &TerminalOpts<'_>,
 ) -> Result<bool, Error> {
-    let (pod, file, tail, follow, services) = (o.pod, o.file, o.tail, o.follow, o.services);
+    let (pod, file, tail, follow, services, no_pod) =
+        (o.pod, o.file, o.tail, o.follow, o.services, o.no_pod);
     let selected =
         |b: &crate::compose::ComposeBox| services.is_empty() || services.contains(&b.name);
 
     match action {
         // Read-only / terminal verbs: each returns, so the bring-up below is reached ONLY by the
         // verbs that actually start something (Up, Start, Restart).
+        ComposeAction::Systemd => {
+            // The SAME validation `config` runs, before emitting anything: a unit generated from a
+            // file that cannot come up would fail at boot, on a machine nobody is watching, which is
+            // the worst possible moment to discover a broken graph. Then the unit, on stdout only.
+            crate::compose::topo_levels(boxes).map_err(Error::Compose)?;
+            validate_conditions(boxes)?;
+            check_port_collisions(boxes)?;
+            check_pod_global_conflicts(boxes, no_pod)?;
+            crate::systemd::print_unit(file, pod)?;
+            return Ok(true);
+        }
         ComposeAction::Config => {
             // Parse + interpolate + validate, then print what kern actually resolved - the answer to
             // "is my file what I think it is" WITHOUT starting anything. Validation runs first so a
@@ -10621,6 +10860,10 @@ fn run_terminal_verb(
             crate::compose::topo_levels(boxes).map_err(Error::Compose)?;
             validate_conditions(boxes)?;
             check_port_collisions(boxes)?;
+            // The pod-global conflicts too: `config` is the verb you run to find out whether the file
+            // will come up, so every rejection `up` performs has to be reachable from here. Reporting
+            // a clean dry run for a stack that `up` then refuses is worse than not having the verb.
+            check_pod_global_conflicts(boxes, no_pod)?;
             // Validate every published spec HERE, with the same parser the box uses. `config` is the
             // verb people run to check a file, so a typo must surface without starting anything (as
             // `docker compose config` does) instead of failing one box at bring-up. ALL bad specs are
@@ -10654,6 +10897,21 @@ fn run_terminal_verb(
                 println!("  {}  image={src}", short(&b.name));
                 if !b.ports.is_empty() {
                     println!("    ports: {}", b.ports.join(", "));
+                }
+                // `config` answers "what did kern understand", so it must show a declared `port:`:
+                // it is what the pod preflight reserves AND what the service receives as `PORT`, so
+                // hiding it would leave the one command that exists to explain the file silent about
+                // a field that changes both. Named as what it does, not just as its number.
+                if let Some(p) = b.port {
+                    println!("    port: {p} (reserved in the pod, passed as PORT={p})");
+                }
+                if !b.expose.is_empty() {
+                    let list: Vec<String> = b
+                        .expose
+                        .iter()
+                        .map(|(n, udp)| format!("{n}/{}", if *udp { "udp" } else { "tcp" }))
+                        .collect();
+                    println!("    expose: {} (reserved in the pod)", list.join(", "));
                 }
                 let deps: Vec<String> = b.all_deps().into_iter().map(short).collect();
                 if !deps.is_empty() {
@@ -10836,11 +11094,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         let over = crate::compose::parse_override(&t, &dotenv).map_err(Error::Compose)?;
         boxes = crate::compose::merge_stacks(boxes, over);
     }
-    // "nothing to run" is asserted HERE, on the merged stack: an override legitimately carries no
-    // `image:`, but the result must still be runnable.
-    if files.len() > 1 {
-        crate::compose::validate_runnable(&boxes).map_err(Error::Compose)?;
-    }
+    // Per-service validation, on the MERGED stack and UNCONDITIONALLY. Merged, because an override
+    // legitimately carries no `image:` and only the result must be runnable. Unconditional, because
+    // these are per-service facts that do not depend on how many files stated them: gated on
+    // `files.len() > 1`, the single-file case skipped them entirely, which left a lone YAML stack
+    // unchecked (the TOML parser refuses "nothing to run" itself, the YAML front end defers it here)
+    // and let a `port:`/`PORT=` contradiction through in the common one-file case.
+    crate::compose::validate_runnable(&boxes).map_err(Error::Compose)?;
     // The stack's pod is named after the compose file (Docker's project-name idea) - one shared
     // network so services reach each other by name.
     let pod = match project {
@@ -10913,6 +11173,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             tail,
             follow,
             services,
+            no_pod,
         },
     )? {
         return Ok(());
@@ -10987,11 +11248,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // EADDRINUSE buried in its own log while `up` still reports success (a silent partial failure,
     // empirically confirmed). Caught here from the parsed file: deterministic, before any box starts.
     check_port_collisions(&boxes)?;
+    // Self-gated (see its doc comment): `config` and `systemd` reach the SAME rejection through the
+    // same call, so the dry run can never disagree with the bring-up about what is startable.
+    check_pod_global_conflicts(&boxes, no_pod)?;
     // A pod shares ONE network namespace, so a `net.*` sysctl written on one service applies to every
     // service in the stack and the last one to start wins. The file makes it look per-service; say so
     // rather than let an operator tune one service and silently retune the others.
     if !no_pod && boxes.len() > 1 {
-        check_pod_global_conflicts(&boxes)?;
         for b in &boxes {
             for kv in b.sysctls.iter().filter(|s| s.starts_with("net.")) {
                 let key = kv.split('=').next().unwrap_or(kv);
@@ -13537,10 +13800,129 @@ mod pod_global_tests {
         }
     }
     fn err(boxes: &[crate::compose::ComposeBox]) -> String {
-        match check_pod_global_conflicts(boxes) {
+        match check_pod_global_conflicts(boxes, false) {
             Err(Error::Compose(m)) => m,
             other => panic!("expected a conflict, got {other:?}"),
         }
+    }
+
+    /// `expose:` entra nello stesso spazio di `port:` e `ports:`. Senza, un `docker-compose.yml`
+    /// reale che usa la grafia Compose restava fuori dal preflight e collideva a runtime.
+    #[test]
+    fn expose_shares_the_port_space_with_port_and_ports() {
+        // expose contro port dichiarata.
+        let mut a = svc("api");
+        a.expose = vec![(3000, false)];
+        let mut b = svc("admin");
+        b.port = Some(3000);
+        assert!(err(&[a, b]).contains("3000/tcp"));
+
+        // expose contro una mappatura pubblicata.
+        let mut c = svc("api");
+        c.expose = vec![(3000, false)];
+        let mut d = svc("admin");
+        d.ports = vec!["9000:3000".into()];
+        assert!(err(&[c, d]).contains("3000/tcp"));
+
+        // expose contro expose.
+        let mut e = svc("api");
+        e.expose = vec![(3000, false)];
+        let mut f = svc("admin");
+        f.expose = vec![(3000, false)];
+        assert!(err(&[e, f]).contains("3000/tcp"));
+
+        // Il protocollo conta: udp e tcp sullo stesso numero sono socket diversi.
+        let mut g = svc("api");
+        g.expose = vec![(53, true)];
+        let mut h = svc("dns");
+        h.expose = vec![(53, false)];
+        assert!(
+            check_pod_global_conflicts(&[g, h], false).is_ok(),
+            "udp e tcp non collidono"
+        );
+
+        // Un servizio che dichiara la stessa porta in due grafie afferma un fatto due volte.
+        let mut solo = svc("api");
+        solo.port = Some(3000);
+        solo.expose = vec![(3000, false)];
+        solo.ports = vec!["8080:3000".into()];
+        assert!(
+            check_pod_global_conflicts(&[solo], false).is_ok(),
+            "un servizio non collide con se stesso"
+        );
+
+        // Piu' porte esposte: collide solo quella davvero condivisa.
+        let mut m = svc("api");
+        m.expose = vec![(3000, false), (9090, false)];
+        let mut n = svc("metrics");
+        n.expose = vec![(9090, false)];
+        let msg = err(&[m, n]);
+        assert!(msg.contains("9090/tcp") && !msg.contains("3000"), "{msg}");
+    }
+
+    /// A DECLARED `port` is what makes an internal-only service visible to this check at all. The
+    /// conflict was derived from `ports:` mappings alone, so two services that publish nothing and
+    /// talk to each other by name could both claim `:3000`: the preflight saw neither, both boxes
+    /// started, one died with EADDRINUSE, and the stack was half up.
+    #[test]
+    fn a_declared_port_makes_an_unpublished_service_visible_to_the_preflight() {
+        let mut a = svc("api");
+        a.port = Some(3000);
+        let mut b = svc("admin");
+        b.port = Some(3000);
+        let m = err(&[a, b]);
+        assert!(m.contains("container port 3000/tcp"), "{m}");
+        assert!(
+            m.contains("api") && m.contains("admin"),
+            "both services named: {m}"
+        );
+        // The message must offer the way out the field exists for.
+        assert!(m.contains("port:"), "the remedy names the field: {m}");
+    }
+
+    /// A declared port and a published mapping are the same claim, so they must collide across
+    /// services and must NOT collide with themselves.
+    #[test]
+    fn declared_and_published_ports_share_one_space_without_self_conflict() {
+        // Same service declaring 3000 and publishing 8080:3000 states one fact twice: not a conflict.
+        let mut solo = svc("api");
+        solo.port = Some(3000);
+        solo.ports = vec!["8080:3000".into()];
+        assert!(
+            check_pod_global_conflicts(&[solo], false).is_ok(),
+            "a service must not conflict with itself"
+        );
+
+        // One declares, the other publishes the same internal port: a real conflict.
+        let mut a = svc("api");
+        a.port = Some(3000);
+        let mut b = svc("admin");
+        b.ports = vec!["3002:3000".into()];
+        assert!(err(&[a, b]).contains("3000/tcp"));
+
+        // Different internal ports are exactly the way out, and must pass.
+        let mut c = svc("api");
+        c.port = Some(3000);
+        let mut d = svc("admin");
+        d.port = Some(3100);
+        assert!(
+            check_pod_global_conflicts(&[c, d], false).is_ok(),
+            "distinct ports must be allowed"
+        );
+    }
+
+    /// A declared TCP port must not be confused with a UDP publication of the same number: they are
+    /// different sockets and both can bind.
+    #[test]
+    fn a_declared_port_is_tcp_and_does_not_collide_with_udp() {
+        let mut a = svc("api");
+        a.port = Some(3000);
+        let mut b = svc("metrics");
+        b.ports = vec!["3000:3000/udp".into()];
+        assert!(
+            check_pod_global_conflicts(&[a, b], false).is_ok(),
+            "tcp/3000 and udp/3000 are different sockets"
+        );
     }
 
     #[test]
@@ -13568,11 +13950,11 @@ mod pod_global_tests {
         a.ports = vec!["3001:3000".into()];
         let mut b = svc("web");
         b.ports = vec!["3002:8080".into()];
-        assert!(check_pod_global_conflicts(&[a, b]).is_ok());
+        assert!(check_pod_global_conflicts(&[a, b], false).is_ok());
         // A single service publishing the same port twice is a HOST-port problem, caught elsewhere.
         let mut solo = svc("solo");
         solo.ports = vec!["1:3000".into(), "2:3000".into()];
-        assert!(check_pod_global_conflicts(&[solo]).is_ok());
+        assert!(check_pod_global_conflicts(&[solo], false).is_ok());
     }
 
     #[test]
@@ -13581,7 +13963,7 @@ mod pod_global_tests {
         a.ports = vec!["1:53".into()];
         let mut b = svc("b");
         b.ports = vec!["2:53/udp".into()];
-        assert!(check_pod_global_conflicts(&[a, b]).is_ok());
+        assert!(check_pod_global_conflicts(&[a, b], false).is_ok());
     }
 
     #[test]
@@ -13598,7 +13980,7 @@ mod pod_global_tests {
         d.sysctls = vec!["net.core.somaxconn=1024".into()];
         let mut e = svc("e");
         e.sysctls = vec!["net.core.somaxconn=1024".into()];
-        assert!(check_pod_global_conflicts(&[d, e]).is_ok());
+        assert!(check_pod_global_conflicts(&[d, e], false).is_ok());
     }
 
     #[test]
@@ -13608,7 +13990,7 @@ mod pod_global_tests {
         a.sysctls = vec!["kernel.msgmax=1".into()];
         let mut b = svc("b");
         b.sysctls = vec!["kernel.msgmax=2".into()];
-        assert!(check_pod_global_conflicts(&[a, b]).is_ok());
+        assert!(check_pod_global_conflicts(&[a, b], false).is_ok());
     }
 
     #[test]
@@ -13622,7 +14004,32 @@ mod pod_global_tests {
         // An unrelated host entry is fine.
         let mut ok_app = svc("app");
         ok_app.add_host = vec!["esterno:9.9.9.9".into()];
-        assert!(check_pod_global_conflicts(&[svc("db"), ok_app]).is_ok());
+        assert!(check_pod_global_conflicts(&[svc("db"), ok_app], false).is_ok());
+    }
+
+    /// Il gate sta DENTRO la funzione, e questo test e' il motivo per cui ci resta.
+    ///
+    /// Prima era riscritto a ogni sito di chiamata e i siti hanno divergiuto: `up` lo applicava,
+    /// `systemd` girava senza gate, e `config` (il verbo che risponde a "questo file parte?") non
+    /// chiamava affatto il controllo, quindi dichiarava sano uno stack che `up` rifiutava. Chi
+    /// riportasse il gate fuori di qui, in uno solo dei tre siti, riaprirebbe quella divergenza.
+    #[test]
+    fn the_gate_is_inside_so_no_caller_can_restate_it_differently() {
+        // `ComposeBox` non e' Clone, quindi la coppia si ricostruisce a ogni asserzione.
+        let pair = || {
+            let (mut a, mut b) = (svc("a"), svc("b"));
+            a.port = Some(3100);
+            b.port = Some(3100);
+            [a, b]
+        };
+        // Controllo positivo: la collisione c'e' davvero, altrimenti sotto non si starebbe misurando
+        // il gate ma l'assenza del conflitto.
+        assert!(err(&pair()).contains("3100"));
+        // `--no-pod`: ogni servizio ha la sua namespace, la collisione non esiste piu'.
+        assert!(check_pod_global_conflicts(&pair(), true).is_ok());
+        // Un servizio solo non condivide con nessuno, a prescindere dal flag.
+        let [solo, _] = pair();
+        assert!(check_pod_global_conflicts(&[solo], false).is_ok());
     }
 }
 
@@ -13943,5 +14350,178 @@ mod port_collision_tests {
             svc("b", &["7200:81"]),
         ];
         assert_collides(&boxes, &["'a'", "'b'", "7200/tcp"]);
+    }
+}
+
+/// `kern stop --all` used to delete EVERY `kern-*.service` in the user's unit directory, because it
+/// identified its own persistent boxes by file name. A unit the user wrote by hand was removed by an
+/// unrelated `stop --all` - including the one `kern compose … systemd` tells them to write, which is
+/// named exactly that way. Ownership is now read from the file, and these tests pin both marks.
+#[cfg(test)]
+mod managed_unit_ownership {
+    use super::*;
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).expect("test fixture");
+        p
+    }
+
+    #[test]
+    fn only_units_kern_wrote_are_claimed() {
+        let dir = std::env::temp_dir().join(format!("kern-unit-own-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test fixture");
+
+        // Written by kern today: carries the explicit marker.
+        let marked = write(
+            &dir,
+            "kern-api.service",
+            "[Unit]\nDescription=kern box api\nX-KernManagedBox=api\n[Service]\nExecStart=/bin/true\n",
+        );
+        assert!(is_kern_managed_unit(&marked));
+
+        // Written by an OLDER kern: no marker, but the description kern has always used. It must stay
+        // claimable, or upgrading would strand every already-installed persistent box.
+        let legacy = write(
+            &dir,
+            "kern-old.service",
+            "[Unit]\nDescription=kern box old\n[Service]\nExecStart=/bin/true\n",
+        );
+        assert!(is_kern_managed_unit(&legacy));
+
+        // The unit `kern compose … systemd` emits: same NAME shape, not kern's to delete.
+        let stack = write(
+            &dir,
+            "kern-web.service",
+            "[Unit]\nDescription=kern compose stack web\n[Service]\nExecStart=/usr/bin/kern compose /srv/x.yml up\n",
+        );
+        assert!(
+            !is_kern_managed_unit(&stack),
+            "a stack unit is the user's file"
+        );
+
+        // Someone else's unit that happens to start with `kern-`.
+        let stranger = write(
+            &dir,
+            "kern-backup.service",
+            "[Unit]\nDescription=nightly backup\n[Service]\nExecStart=/usr/local/bin/backup\n",
+        );
+        assert!(!is_kern_managed_unit(&stranger));
+
+        // Unreadable or absent: not ours. Never delete what cannot be verified.
+        assert!(!is_kern_managed_unit(&dir.join("does-not-exist.service")));
+
+        // Binary rubbish under a kern-ish name: not ours, and no panic.
+        let binary = dir.join("kern-bin.service");
+        std::fs::write(&binary, [0xff_u8, 0xfe, 0x00, 0x01]).expect("test fixture");
+        assert!(!is_kern_managed_unit(&binary));
+
+        // A marker buried in a huge file is still found up to the read cap, and beyond it the answer
+        // is the safe one rather than a long read.
+        let big = dir.join("kern-big.service");
+        let mut body = String::from("[Unit]\nX-KernManagedBox=big\n");
+        body.push_str(&"# padding\n".repeat(200));
+        std::fs::write(&big, &body).expect("test fixture");
+        assert!(is_kern_managed_unit(&big));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Un verbo che il parser accetta ma che ne' l'help ne' il messaggio d'uso nominano e' un verbo che
+/// non esiste per chi legge. `systemd` e' stato esattamente questo, perche' la lista era scritta a
+/// mano in tre posti. Ora ce n'e' una sola, e questi test la ancorano da entrambi i lati.
+#[cfg(test)]
+mod compose_verbs_are_one_list {
+    use super::*;
+
+    #[test]
+    fn every_listed_verb_parses_and_every_parsed_verb_is_listed() {
+        let help = compose_verbs_help();
+        for (name, action) in COMPOSE_VERBS {
+            assert_eq!(
+                ComposeAction::from_verb(name),
+                Some(*action),
+                "'{name}' e' in elenco ma il parser non lo accetta"
+            );
+            assert!(
+                help.split('|').any(|v| v == *name),
+                "'{name}' e' accettato ma non compare nel testo d'aiuto: {help}"
+            );
+        }
+        // Il testo non deve annunciare nulla che il parser rifiuti.
+        for v in help.split('|') {
+            assert!(
+                ComposeAction::from_verb(v).is_some(),
+                "il testo d'aiuto annuncia '{v}', che il parser non accetta"
+            );
+        }
+        // Nessun duplicato: due voci con lo stesso nome renderebbero la seconda irraggiungibile.
+        let mut names: Vec<&str> = COMPOSE_VERBS.iter().map(|(n, _)| *n).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "un verbo compare due volte in COMPOSE_VERBS"
+        );
+    }
+
+    #[test]
+    fn an_unknown_verb_is_refused_rather_than_guessed() {
+        for bad in ["", "UP", "upp", "systemctl", "--up", "up "] {
+            assert!(
+                ComposeAction::from_verb(bad).is_none(),
+                "'{bad}' non deve essere interpretato come un verbo"
+            );
+        }
+    }
+}
+
+/// L'arresto grazioso aspettava l'intero periodo di grazia anche quando l'init del box non poteva
+/// riceverne il segnale: un PID 1 di namespace scarta i segnali di cui non ha un gestore, quindi un
+/// `sleep` non muore mai di SIGTERM. `kern stop` ci metteva 9013 ms invece di 2, e un `compose down`
+/// di quattro servizi sarebbe stato 36 secondi.
+#[cfg(test)]
+mod stop_does_not_wait_for_the_impossible {
+    use super::*;
+
+    #[test]
+    fn a_signal_the_init_cannot_catch_is_not_waited_for() {
+        // Questo processo di test ha una maschera SigCgt reale: qualunque cosa contenga, la funzione
+        // deve leggerla senza panicare e rispondere in modo coerente con /proc.
+        let me = std::process::id() as i32;
+        let status = std::fs::read_to_string(format!("/proc/{me}/status")).unwrap_or_default();
+        let mask = status
+            .lines()
+            .find_map(|l| l.strip_prefix("SigCgt:"))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            .unwrap_or(0);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGUSR1] {
+            let expected = mask & (1u64 << (sig - 1)) != 0;
+            assert_eq!(
+                init_catches_signal(me, sig),
+                expected,
+                "il verdetto per il segnale {sig} non corrisponde a SigCgt di /proc"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_process_stays_on_the_patient_path() {
+        // Non sapere deve significare ASPETTARE, non uccidere presto: sbagliare in quella direzione
+        // costa un'attesa, sbagliare nell'altra troncherebbe uno spegnimento reale a meta'.
+        assert!(init_catches_signal(0, libc::SIGTERM), "pid non valido");
+        assert!(init_catches_signal(-1, libc::SIGTERM), "pid negativo");
+        assert!(
+            init_catches_signal(i32::MAX, libc::SIGTERM),
+            "pid inesistente: /proc non leggibile, quindi si aspetta"
+        );
+        // Un numero di segnale fuori intervallo non deve far scorrere il bit oltre la maschera.
+        let me = std::process::id() as i32;
+        assert!(init_catches_signal(me, 0));
+        assert!(init_catches_signal(me, 65));
+        assert!(init_catches_signal(me, -5));
     }
 }

@@ -335,6 +335,10 @@ pub enum Command {
     /// `kern bench [--rootfs R] [-n N]`: time N box start→exit cycles.
     Bench {
         rootfs: Option<String>,
+        /// `--image <ref>`: bench an OCI image instead of a prepared directory. Every other verb
+        /// that needs a filesystem takes `--image`; bench took only `--rootfs`, so the one command
+        /// the README tells a newcomer to run was the one command that needed two others first.
+        image: Option<String>,
         count: u32,
     },
     /// `kern recover`: clean up stale registry entries / orphaned scratch of dead boxes.
@@ -791,6 +795,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `bench [--rootfs R] [-n N]`: measure box start→exit latency.
         Some("bench") => Command::Bench {
             rootfs: flag_value(&rest, "--rootfs"),
+            image: flag_value(&rest, "--image"),
             count: flag_value(&rest, "-n")
                 .or_else(|| flag_value(&rest, "--count"))
                 .and_then(|v| v.parse().ok())
@@ -901,9 +906,20 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("top") => Command::Top,
         // `compose <file> [up|down] [--no-pod]`: bring up / tear down a stack.
         Some("compose") => {
-            const USAGE: &str =
-                "compose <file>... [up|down|stop|start|restart|ps|logs|build|pull|config] \
-                 [-p NAME] [--env-file F] [--profile P] [--no-pod] [--tail N] [-f] [service...]";
+            // Verbs from COMPOSE_VERBS, so this message cannot list a set the parser does not
+            // accept. It listed ten while the parser took eleven, so `systemd` was invisible here.
+            // `Error::Usage` wants a `'static`: a `OnceLock` gives one without leaking, and the
+            // string is built at most once per process, on an error path that ends it anyway.
+            static COMPOSE_USAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            let usage: &'static str = COMPOSE_USAGE
+                .get_or_init(|| {
+                    format!(
+                        "compose <file>... [{}] [-p NAME] [--env-file F] [--profile P] [--no-pod] \
+                         [--tail N] [-f] [service...]",
+                        crate::commands::compose_verbs_help()
+                    )
+                })
+                .as_str();
             let mut files: Vec<String> = Vec::new();
             let mut project: Option<String> = None;
             let mut env_file: Option<String> = None;
@@ -958,7 +974,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                                 .ok_or(Error::Usage("compose --tail N (a number of lines)"))?,
                         );
                     }
-                    f if f.starts_with('-') => return Err(Error::Usage(USAGE)),
+                    f if f.starts_with('-') => return Err(Error::Usage(usage)),
                     // First bare word that names a verb IS the verb; the file is the first bare word
                     // that is not one (Docker puts the file behind `-f`, kern takes it positionally).
                     w => {
@@ -985,7 +1001,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 }
             }
             if files.is_empty() {
-                return Err(Error::Usage(USAGE));
+                return Err(Error::Usage(usage));
             }
             let _ = file;
             Command::Compose {
@@ -2439,7 +2455,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Gc { images } => commands::gc(images),
         Command::Doctor => crate::doctor::doctor(),
         Command::Info => crate::doctor::info(),
-        Command::Bench { rootfs, count } => commands::bench(rootfs.as_deref(), count),
+        Command::Bench {
+            rootfs,
+            image,
+            count,
+        } => commands::bench(rootfs.as_deref(), image.as_deref(), count),
         Command::Recover => commands::recover(),
         Command::Rename { old, new } => commands::rename(&old, &new),
         Command::Update {

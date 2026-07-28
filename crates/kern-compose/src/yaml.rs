@@ -1702,6 +1702,47 @@ fn service_to_box(
             "environment" => b.env = kv_pairs(node),
             "env_file" => b.env_file = list_value(node),
             "ports" => b.ports = ports_value(node, name),
+            // `port:` is kern's own key, not a Compose Specification one: it declares the port this
+            // service LISTENS on inside the shared namespace, so the preflight can see a service that
+            // publishes nothing. Parsed here rather than passed through as text, so a malformed value
+            // fails at the file that wrote it. An out-of-range or non-numeric value is warned and
+            // ignored rather than fatal: this key is an addition to a Docker file that is otherwise
+            // valid, and refusing to run a working stack over it would be the wrong trade.
+            // `expose:` e' la grafia Compose di "ascolto qui": stesso spazio delle porte del pod di
+            // `ports:` e `port:`, quindi entra nello stesso preflight. Non inietta nulla (in Docker
+            // documenta e basta). Una voce malformata avvisa e viene saltata: e' un'aggiunta a un file
+            // per il resto valido, e rifiutare l'intero stack per una riga sarebbe il compromesso
+            // sbagliato. Gli INTERVALLI (`3000-3005`) sono dichiarati non supportati invece di essere
+            // espansi in silenzio: espanderli renderebbe il messaggio di collisione impossibile da
+            // leggere, e nessuno li usa per un servizio che ne ascolta una sola.
+            // `expose:` e' la grafia Compose di "ascolto qui": stesso spazio delle porte del pod di
+            // `ports:` e `port:`, quindi entra nello stesso preflight. Non inietta nulla (in Docker
+            // documenta e basta). La sintassi la legge `parse_expose_entry`, condivisa col profilo
+            // kern: la stessa stringa significa la stessa cosa in entrambe le grafie.
+            //
+            // La DISPOSIZIONE di una voce malformata invece differisce, ed e' voluto: qui si avvisa e
+            // si salta, nel TOML di kern si rifiuta con il numero di riga. Un `docker-compose.yml` e'
+            // il file di qualcun altro e rifiutare l'intero stack per una riga di documentazione
+            // sarebbe il compromesso sbagliato; un profilo kern e' il formato di kern, dove un refuso
+            // va detto subito. Stesso parser, disposizione diversa, ed e' fissata da un test che
+            // asserisce ENTRAMBE le grafie insieme, cosi' nessuna delle due puo' cambiare in silenzio.
+            "expose" => {
+                for raw in list_value(node) {
+                    match crate::parse_expose_entry(&raw) {
+                        Ok(e) => b.expose.push(e),
+                        Err(m) => warn(&format!("service '{name}': expose: {m} - ignored")),
+                    }
+                }
+            }
+            "port" => match node.scalar.as_deref().map(scalar_str) {
+                Some(v) => match v.trim().parse::<u16>() {
+                    Ok(n) if n > 0 => b.port = Some(n),
+                    _ => warn(&format!(
+                        "service '{name}': port: '{v}' is not a port in 1..=65535 - ignored"
+                    )),
+                },
+                None => warn(&format!("service '{name}': port: needs a number - ignored")),
+            },
             "volumes" => b.volumes = volumes_value(node),
             "depends_on" => apply_depends(&mut b, node),
             "healthcheck" => apply_healthcheck(&mut b, node, name),
@@ -1788,7 +1829,7 @@ fn service_to_box(
             }
             "ulimits" => b.ulimits = collect_ulimits(node, name),
             "sysctls" => b.sysctls = collect_kv(node, '='),
-            "configs" | "logging" | "expose" | "extends" | "stdin_open" | "tty" | "domainname" => {
+            "configs" | "logging" | "extends" | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
             // Service-level extension field: defined by the spec, ignored on purpose, silently.

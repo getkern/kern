@@ -106,3 +106,46 @@ fn box_plan_rejects_a_traversing_name() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("invalid box name"));
 }
+
+/// `--show-config` is a DRY RUN of the real decision, so it must not disagree with the box it
+/// describes. It reported `uid_range: false` for every `--image` box while the box itself mapped a
+/// range, because the per-image rule was written once in the run path and not at all in the dry run.
+/// The provenance is asserted too: a default kern chose is not the same thing as a request, and a
+/// caller deciding whether to opt out needs to tell them apart from the output alone.
+#[test]
+fn show_config_reports_the_uid_range_the_box_will_actually_get() {
+    let field = |args: &[&str], key: &str| -> String {
+        let out = kern()
+            .args(args)
+            .arg("--show-config")
+            .output()
+            .expect("run kern");
+        assert!(out.status.success(), "--show-config should succeed");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+            .unwrap_or_else(|| panic!("no `{key}` line for {args:?}"))
+            .trim()
+            .to_string()
+    };
+
+    // An image box gets the range even though nothing on the command line asked for one.
+    let img = ["box", "t", "--image", "alpine"];
+    assert_eq!(field(&img, "uid_range"), "true");
+    assert_eq!(field(&img, "uid_range_source"), "image-default");
+
+    // Asking explicitly is reported as a request, so it is distinguishable from the default.
+    let asked = ["box", "t", "--image", "alpine", "--uid-range"];
+    assert_eq!(field(&asked, "uid_range"), "true");
+    assert_eq!(field(&asked, "uid_range_source"), "request");
+
+    // The opt-out is reachable from the hot path and is reported honestly.
+    let off = ["box", "t", "--image", "alpine", "--no-uid-range"];
+    assert_eq!(field(&off, "uid_range"), "false");
+    assert_eq!(field(&off, "uid_range_source"), "-");
+
+    // A rootfs box is untouched by the image default: it keeps the tighter single-uid map.
+    let rootfs = ["box", "t", "--rootfs", "/tmp"];
+    assert_eq!(field(&rootfs, "uid_range"), "false");
+    assert_eq!(field(&rootfs, "uid_range_source"), "-");
+}

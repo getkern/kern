@@ -93,6 +93,26 @@ pub struct ComposeBox {
     pub env: Vec<String>,
     pub env_file: Vec<String>,
     pub ports: Vec<String>,
+    /// `port: 3000` - the port this service LISTENS on inside the pod, declared rather than inferred.
+    ///
+    /// The stack shares one network namespace, so two services cannot both bind the same container
+    /// port. kern already refuses that, but only for services that PUBLISH: the conflict was derived
+    /// from `ports:` mappings, so an internal-only service (reached by name, publishing nothing) was
+    /// invisible to the check and collided at run time with `EADDRINUSE` instead. Declaring it makes
+    /// the whole stack visible to the preflight, and gives the user the way out that Docker solves
+    /// with separate networks: give each service a different internal port.
+    ///
+    /// TCP by construction: every framework port this exists for is a TCP listener.
+    pub port: Option<u16>,
+    /// Docker's `expose:` - the ports a service listens on, DOCUMENTED rather than published. It is
+    /// the Compose-native spelling of what `port:` declares, so kern honours it for the same reason:
+    /// it is a claim on the pod's single network namespace and belongs in the collision preflight.
+    ///
+    /// It differs from `port:` in two ways that are Docker's, not ours. It is a LIST (a service may
+    /// listen on several), and it sets no environment variable: `expose` documents, `port` also
+    /// hands the number to the service as `PORT`. `(number, is_udp)` because Docker's `"53/udp"` form
+    /// is a different socket from `"53/tcp"` and the two do not collide.
+    pub expose: Vec<(u16, bool)>,
     pub secrets: Vec<String>,
     pub tmpfs: Vec<String>,
     /// Compose `extra_hosts:` → one `--add-host` per entry (`name:ip`). Docker also accepts the
@@ -126,6 +146,30 @@ pub struct ComposeBox {
 }
 
 impl ComposeBox {
+    /// The `PORT=<n>` pair kern adds for a declared `port`, or `None` when there is nothing to add.
+    ///
+    /// `PORT` is the only variable injected, and deliberately so. It is the one convention shared
+    /// across the ecosystem (Node, Rails, Heroku-style buildpacks, Cloud Run) rather than one
+    /// framework's private spelling, so injecting it is a single well-understood act instead of a
+    /// growing table of guesses. Two entries proposed for such a table did not survive checking:
+    /// `GUNICORN_CMD_ARGS` is not a port at all but a CLI argument string (`--bind 0.0.0.0:3000`),
+    /// and `RAILS_PORT` is not a documented Rails variable (Rails reads `PORT`). A per-framework
+    /// table therefore needs each entry MEASURED against its real image before it can be believed.
+    ///
+    /// kern's responsibility ends at delivering the variable: whether an image reads it is the
+    /// image's business, and an image that ignores it keeps its own default port. That is why an
+    /// explicit `PORT` in `environment:` always wins - it is also the opt-out for anyone who passes
+    /// the port some other way (a flag in `command`, a config file).
+    pub fn port_env(&self) -> Option<String> {
+        let n = self.port?;
+        // The user's own value is authoritative. Comparing on the `PORT=` prefix (not equality)
+        // catches `PORT=8080` as well as an empty `PORT=`, which is still a deliberate statement.
+        if stated_port(&self.env).is_some() {
+            return None;
+        }
+        Some(format!("{PORT_VAR}={n}"))
+    }
+
     /// Whether this box ends up with a subordinate uid RANGE: because it asked, or because it is an
     /// OCI IMAGE box, since official images (postgres/redis/nginx/mariadb/grafana) drop privilege in
     /// their entrypoint to a service uid and need the range to do it (the 0.6 official-image fix). A
@@ -289,6 +333,9 @@ impl ComposeBox {
         for v in &self.env {
             cmd.arg("--env").arg(v);
         }
+        if let Some(kv) = self.port_env() {
+            cmd.arg("--env").arg(kv);
+        }
         for v in &self.env_file {
             cmd.arg("--env-file").arg(v);
         }
@@ -341,6 +388,51 @@ pub fn parse_override(text: &str, dotenv: &DotEnv) -> Result<Vec<ComposeBox>, St
 
 /// Assert every service ended up with something to run. Called on the merged stack (see
 /// [`parse_override`]).
+/// The environment variable kern uses to hand a declared `port:` to the service. One name, one
+/// spelling, read and written through [`stated_port`] and [`ComposeBox::port_env`] only: written out
+/// three times by hand, the injection site and the contradiction check could disagree about which
+/// variable they are even talking about.
+const PORT_VAR: &str = "PORT";
+
+/// Parse ONE `expose:` entry (`"3000"`, `"53/udp"`, `"8080/tcp"`) into `(port, is_udp)`.
+///
+/// The single reader of that syntax: the YAML front end and the kern profile both call it, so the two
+/// spellings of the same file cannot come to different conclusions about what `"53/udp"` means. Ranges
+/// (`3000-3005`) are refused by name rather than expanded, because an expanded range makes a collision
+/// message unreadable and a service that listens on one port has no use for one.
+pub fn parse_expose_entry(raw: &str) -> Result<(u16, bool), String> {
+    let raw = raw.trim();
+    if raw.contains('-') {
+        return Err(format!(
+            "'{raw}' is a range - not supported, list the ports one by one"
+        ));
+    }
+    let (num, proto) = raw.split_once('/').unwrap_or((raw, "tcp"));
+    // Confronto senza distinzione di maiuscole: non ho dati che confermino che Docker accetti
+    // `/TCP`, ma accettarlo non puo' rompere nulla, mentre rifiutare un file altrove valido si'.
+    let proto = proto.trim();
+    let udp = if proto.eq_ignore_ascii_case("tcp") {
+        false
+    } else if proto.eq_ignore_ascii_case("udp") {
+        true
+    } else {
+        return Err(format!(
+            "'{raw}' has an unknown protocol '{proto}' (tcp or udp)"
+        ));
+    };
+    match num.trim().parse::<u16>() {
+        Ok(n) if n > 0 => Ok((n, udp)),
+        _ => Err(format!("'{raw}' is not a port in 1..=65535")),
+    }
+}
+
+/// The value of an explicit `PORT=` in a service's inline environment, if it states one. Borrows from
+/// `env`, so asking the question costs no allocation.
+fn stated_port(env: &[String]) -> Option<&str> {
+    env.iter()
+        .find_map(|e| e.strip_prefix(PORT_VAR)?.strip_prefix('='))
+}
+
 pub fn validate_runnable(boxes: &[ComposeBox]) -> Result<(), String> {
     for b in boxes {
         let has_image = b.image.as_deref().is_some_and(|s| !s.is_empty());
@@ -350,6 +442,22 @@ pub fn validate_runnable(boxes: &[ComposeBox]) -> Result<(), String> {
                 "service '{}' has no `image:`, `rootfs:` or `build:` (nothing to run)",
                 b.name
             ));
+        }
+        // `port:` and an explicit `PORT=` that DISAGREE are a contradiction, and silently picking a
+        // winner is the worst answer available: `port:` is what the pod preflight reserves, so if the
+        // service actually listens on the other number the preflight is protecting a port nobody
+        // binds while the real one collides unnoticed. Refuse and name both, rather than let the
+        // declaration and the runtime drift apart. Agreeing values are simply redundant, not an error.
+        if let Some(declared) = b.port {
+            if let Some(stated) = stated_port(&b.env).filter(|v| v.trim() != declared.to_string()) {
+                return Err(format!(
+                    "service '{}' declares `port: {declared}` but also sets `PORT={stated}`: the \
+                     preflight reserves {declared} while the service would listen on {stated}. Keep \
+                     one of the two (dropping `port:` leaves kern with nothing to reserve, so prefer \
+                     dropping the `PORT=` and letting `port:` set it).",
+                    b.name
+                ));
+            }
         }
     }
     Ok(())
@@ -428,6 +536,13 @@ impl ComposeBox {
             health_start_period,
             health_timeout,
             health_action,
+            // Added late and forgotten once each: a field that reaches the struct but not this list
+            // is dropped in SILENCE by an override file, which is the worst shape a bug can take in a
+            // merge. `every_optional_field_survives_a_merge` now fails when the next one is missed.
+            port,
+            restart_max,
+            stop_signal,
+            stop_grace_period,
         );
         // Booleans: an override can only turn one ON (its `false` is indistinguishable from absent).
         macro_rules! flag {
@@ -442,6 +557,7 @@ impl ComposeBox {
             ($($f:ident),* $(,)?) => { $( self.$f.extend(o.$f); )* };
         }
         seq!(
+            expose,
             volumes,
             env,
             env_file,
@@ -634,6 +750,13 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "cpus" => b.cpus = Some(s(val)?),
             "cpuset" => b.cpuset = Some(s(val)?),
             "swap_max" => b.swap_max = Some(s(val)?),
+            // Questi tre esistevano come flag CLI e come chiavi Docker, ma NON come chiavi del
+            // profilo kern: uno stack kern-nativo non poteva esprimerli, contro la regola "campo del
+            // profilo == flag CLI 1:1". La validazione resta a valle, dove gia' vive per il percorso
+            // YAML, cosi' le due strade non possono divergere sul valore accettato.
+            "restart_max" => b.restart_max = Some(s(val)?),
+            "stop_signal" => b.stop_signal = Some(s(val)?),
+            "stop_grace_period" => b.stop_grace_period = Some(s(val)?),
             "pids_limit" => b.pids_limit = Some(s(val)?),
             "io_weight" => b.io_weight = Some(s(val)?),
             "nice" => b.nice = Some(s(val)?),
@@ -660,6 +783,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "bind_rootfs" => b.bind_rootfs = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "restart" => b.restart = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "tun" => b.tun = parse_bool(val).map_err(|e| line_err(i, &e))?,
+            "init" => b.init = parse_bool(val).map_err(|e| line_err(i, &e))?,
             // Repeatable flags - arrays of the same CLI strings.
             "command" => b.command = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             // `depends_on` accepts BOTH the array form (`["db"]` - start-order only, like Docker's
@@ -678,10 +802,46 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "env" => b.env = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "env_file" => b.env_file = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "ports" => b.ports = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            // Malformata = RIFIUTATA, con il numero di riga, mentre lo stesso valore in un
+            // `docker-compose.yml` avvisa e viene saltato. Voluto, non incoerente: questo e' il
+            // formato di kern, dove un refuso e' un refuso da correggere; quello e' il file di
+            // qualcun altro, dove rifiutare l'intero stack per una riga di sola documentazione
+            // sarebbe il compromesso sbagliato. Il PARSER e' lo stesso, quindi la stringa significa
+            // la stessa cosa in entrambe; cambia solo che cosa se ne fa chi la legge.
+            "expose" => {
+                b.expose.clear();
+                for raw in parse_string_array(val).map_err(|e| line_err(i, &e))? {
+                    b.expose.push(
+                        parse_expose_entry(&raw)
+                            .map_err(|e| line_err(i, &format!("expose: {e}")))?,
+                    );
+                }
+            }
+            "port" => {
+                // Narrowed to `u16` HERE, at the one place the text is read, so nothing downstream
+                // ever holds a port that might not be one. `parse_positive_int` already refuses `0`
+                // and negatives: to `bind()` a `0` means "any free port", which is the opposite of a
+                // DECLARED port and would have the preflight compare a number nobody listens on.
+                // Both `port = 3000` and a quoted `port = "3000"` are accepted, because the YAML
+                // front end passes a quoted scalar through as written.
+                let raw = val.trim().trim_matches('"');
+                let n = parse_positive_int(raw).map_err(|e| line_err(i, &format!("port: {e}")))?;
+                let n = u16::try_from(n).map_err(|_| {
+                    line_err(i, &format!("port: {n} is outside the 1..=65535 port range"))
+                })?;
+                b.port = Some(n);
+            }
             "secrets" => b.secrets = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "tmpfs" => b.tmpfs = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "cap_add" => b.cap_add = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "cap_drop" => b.cap_drop = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            // Cinque campi avevano il flag CLI e la chiave Docker ma non quella del profilo kern:
+            // uno stack kern-nativo non poteva esprimerli. La legge del progetto e' "campo del
+            // profilo == flag CLI 1:1", e questa era l'unica meta' mancante.
+            "add_host" => b.add_host = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            "ulimits" => b.ulimits = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            "labels" => b.labels = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            "sysctls" => b.sysctls = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             other => return Err(format!("line {}: unknown key '{other}'", i + 1)),
         }
     }
@@ -1958,5 +2118,253 @@ mod dotenv_tests {
         assert!(one("[box.a]\nrootfs = \"/tmp/r\"\nuid_range = true\n").wants_uid_range());
         assert!(!one("[box.a]\nimage = \"redis\"\nuid_range = false\n").wants_uid_range());
         assert!(!one("[box.a]\nrootfs = \"/tmp/r\"\n").wants_uid_range());
+    }
+    /// `port:` exists so an INTERNAL-only service is visible to the pod preflight, and so a user has
+    /// the way out that Docker solves with separate networks. Every branch of the declaration is
+    /// pinned here, including the two that would silently do the wrong thing: a `0` (which means
+    /// "any free port" to `bind()`, so it could never be compared against anything) and an explicit
+    /// `PORT` in `environment:`, which must always beat kern's injection.
+    #[test]
+    fn declared_port_parses_injects_and_refuses_a_contradiction() {
+        let one = |src: &str| parse(src).expect("parses").remove(0);
+
+        let b = one("[box.api]\nimage = \"node\"\nport = 3000\n");
+        assert_eq!(b.port, Some(3000));
+        assert_eq!(b.port_env().as_deref(), Some("PORT=3000"));
+
+        // The user's own PORT wins: `port:` is then only a declaration for the preflight.
+        let owned = one("[box.api]\nimage = \"node\"\nport = 3000\nenv = [\"PORT=9999\"]\n");
+        assert_eq!(owned.port, Some(3000));
+        assert_eq!(
+            owned.port_env(),
+            None,
+            "kern must not overwrite a stated PORT"
+        );
+
+        // Even an empty `PORT=` is a deliberate statement and must not be overwritten.
+        let empty = one("[box.api]\nimage = \"node\"\nport = 3000\nenv = [\"PORT=\"]\n");
+        assert_eq!(empty.port_env(), None);
+
+        // No declaration, nothing injected: a stack that never mentions ports is untouched.
+        let none = one("[box.api]\nimage = \"node\"\n");
+        assert_eq!(none.port, None);
+        assert_eq!(none.port_env(), None);
+
+        // Boundaries and refusals.
+        assert_eq!(
+            one("[box.a]\nimage = \"x\"\nport = 65535\n").port,
+            Some(65535)
+        );
+        assert_eq!(one("[box.a]\nimage = \"x\"\nport = 1\n").port, Some(1));
+        assert!(
+            parse("[box.a]\nimage = \"x\"\nport = 0\n").is_err(),
+            "0 is not a declared port"
+        );
+        assert!(
+            parse("[box.a]\nimage = \"x\"\nport = 65536\n").is_err(),
+            "out of u16 range"
+        );
+        assert!(
+            parse("[box.a]\nimage = \"x\"\nport = -1\n").is_err(),
+            "negative"
+        );
+        assert!(
+            parse("[box.a]\nimage = \"x\"\nport = \"http\"\n").is_err(),
+            "not a number"
+        );
+    }
+
+    /// The injected pair must travel in the argv, and must not appear when there is nothing to inject.
+    #[test]
+    fn push_box_flags_carries_the_injected_port() {
+        let argv = |src: &str| -> Vec<String> {
+            let s = parse(src).expect("parses");
+            let mut cmd = std::process::Command::new("kern");
+            s[0].push_box_flags(&mut cmd);
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let with = argv("[box.a]\nimage = \"node\"\nport = 3000\n");
+        assert!(
+            with.windows(2).any(|w| w == ["--env", "PORT=3000"]),
+            "got {with:?}"
+        );
+
+        let without = argv("[box.a]\nimage = \"node\"\n");
+        assert!(
+            !without.iter().any(|a| a.starts_with("PORT=")),
+            "got {without:?}"
+        );
+
+        // A stated PORT travels once, from the user, never twice.
+        let stated = argv("[box.a]\nimage = \"node\"\nport = 3000\nenv = [\"PORT=3000\"]\n");
+        assert_eq!(
+            stated.iter().filter(|a| a.starts_with("PORT=")).count(),
+            1,
+            "got {stated:?}"
+        );
+        assert!(stated.contains(&"PORT=3000".to_string()));
+    }
+    /// GUARDIA STRUTTURALE. Un campo che raggiunge la struct ma non `merge_from` viene scartato in
+    /// SILENZIO da un file override, che e' la forma peggiore che un difetto possa prendere in una
+    /// fusione: il file dice una cosa, lo stack ne fa un'altra, e nessuno lo segnala. Quattro campi
+    /// erano gia' in questo stato (`port`, `restart_max`, `stop_signal`, `stop_grace_period`).
+    ///
+    /// Il test NON elenca i campi a mano, altrimenti ripeterebbe l'errore che deve intercettare:
+    /// fonde una scatola COMPLETA sopra una vuota e confronta la rappresentazione `Debug` con quella
+    /// della stessa scatola non fusa. Qualunque campo che `merge_from` dimentica appare come una
+    /// differenza. Il prossimo campo aggiunto e' coperto senza toccare questo test.
+    #[test]
+    fn every_optional_field_survives_a_merge() {
+        // Ogni chiave che il parser conosce, con un valore non-default.
+        const FULL: &str = concat!(
+            "[box.a]\n",
+            "image = \"img\"\n",
+            "workdir = \"/w\"\n",
+            "memory = \"64m\"\n",
+            "cpus = \"1.5\"\n",
+            "cpuset = \"0-1\"\n",
+            "swap_max = \"1g\"\n",
+            "pids_limit = \"128\"\n",
+            "io_weight = \"200\"\n",
+            "nice = \"5\"\n",
+            "timeout = \"30\"\n",
+            "hostname = \"h\"\n",
+            "user = \"1000:1000\"\n",
+            "ssh = \"2222\"\n",
+            "ssh_key = \"/k.pub\"\n",
+            "health_cmd = \"true\"\n",
+            "health_interval = 15\n",
+            "health_retries = \"3\"\n",
+            "health_start_period = \"10\"\n",
+            "health_timeout = \"2\"\n",
+            "health_action = \"restart\"\n",
+            "port = 3000\n",
+            "expose = [\"3000\", \"53/udp\"]\n",
+            "restart = true\n",
+            "restart_max = \"3\"\n",
+            "stop_signal = \"SIGINT\"\n",
+            "stop_grace_period = \"30\"\n",
+            "read_only = true\n",
+            "net = true\n",
+            "uid_range = true\n",
+            "bind_rootfs = true\n",
+            "tun = true\n",
+            "init = true\n",
+            "add_host = [\"h:1.2.3.4\"]\n",
+            "volumes = [\"/a:/a\"]\n",
+            "env = [\"K=V\"]\n",
+            "env_file = [\"/e\"]\n",
+            "ports = [\"1:2\"]\n",
+            "secrets = [\"s:/s\"]\n",
+            "tmpfs = [\"/t:1m\"]\n",
+            "cap_add = [\"NET_ADMIN\"]\n",
+            "cap_drop = [\"ALL\"]\n",
+            "labels = [\"l=1\"]\n",
+            "ulimits = [\"nofile=1024\"]\n",
+            "sysctls = [\"net.core.somaxconn=1024\"]\n",
+            "command = [\"true\"]\n",
+        );
+
+        // Due istanze identiche: una resta il riferimento, l'altra viene fusa sopra una vuota.
+        let reference = parse(FULL).expect("parses").remove(0);
+        let overriding = parse(FULL).expect("parses").remove(0);
+        let mut base = ComposeBox::new("a".to_string());
+        base.merge_from(overriding);
+
+        assert_eq!(
+            format!("{base:?}"),
+            format!("{reference:?}"),
+            "un campo non sopravvive a merge_from: confronta le due righe e cerca il campo che \
+             differisce, poi aggiungilo alla macro giusta (opt!/flag!/seq!)"
+        );
+
+        // Controllo positivo: se la fusione non facesse NULLA, il test sopra dovrebbe fallire.
+        // Senza questo, una `merge_from` svuotata passerebbe solo quando anche il riferimento e' vuoto.
+        let empty = ComposeBox::new("a".to_string());
+        assert_ne!(
+            format!("{empty:?}"),
+            format!("{reference:?}"),
+            "il riferimento deve essere diverso da una scatola vuota, altrimenti non prova nulla"
+        );
+    }
+    /// `expose:` e' la grafia Compose di cio' che `port:` dichiara, quindi finisce nello stesso spazio
+    /// di porte del pod. La sintassi ha tre forme e due modi di essere sbagliata, e un solo lettore le
+    /// deve interpretare tutte allo stesso modo per entrambe le grafie del file.
+    #[test]
+    fn expose_entries_parse_every_docker_form_and_refuse_the_rest() {
+        assert_eq!(parse_expose_entry("3000"), Ok((3000, false)));
+        assert_eq!(parse_expose_entry("3000/tcp"), Ok((3000, false)));
+        assert_eq!(parse_expose_entry("53/udp"), Ok((53, true)));
+        // Maiuscole accettate: rifiutare un file altrove valido costa piu' che tollerarle.
+        assert_eq!(parse_expose_entry("3000/TCP"), Ok((3000, false)));
+        assert_eq!(parse_expose_entry("53/UDP"), Ok((53, true)));
+        assert_eq!(parse_expose_entry("  8080  "), Ok((8080, false)));
+        assert_eq!(parse_expose_entry("65535"), Ok((65535, false)));
+        assert_eq!(parse_expose_entry("1"), Ok((1, false)));
+
+        // Un intervallo e' rifiutato PER NOME, non espanso in silenzio.
+        let r = parse_expose_entry("3000-3005").expect_err("range");
+        assert!(r.contains("range") && r.contains("3000-3005"), "{r}");
+
+        // Zero, fuori intervallo, protocollo ignoto, testo: tutti rifiutati.
+        for bad in ["0", "65536", "-1", "3000/sctp", "http", "", "3000/", "/udp"] {
+            assert!(
+                parse_expose_entry(bad).is_err(),
+                "'{bad}' doveva essere rifiutato"
+            );
+        }
+    }
+
+    /// Le due grafie condividono il PARSER ma non la DISPOSIZIONE di una voce malformata, e la
+    /// differenza e' una scelta, non un'incoerenza: il TOML e' il formato di kern (un refuso si dice
+    /// subito, con la riga), lo YAML e' il file di qualcun altro (rifiutare l'intero stack per una
+    /// riga di sola documentazione sarebbe il compromesso sbagliato).
+    ///
+    /// Il test tiene ferme ENTRAMBE nello stesso posto. Erano gia' divergenti mentre un commento
+    /// affermava che non potevano esserlo: nessuno le aveva mai asserite insieme.
+    #[test]
+    fn range_disposition_differs_by_spelling_on_purpose() {
+        let yaml = "services:\n  a:\n    image: alpine\n    expose: [\"3000-3005\"]\n";
+        let toml = "[box.a]\nimage = \"alpine\"\nexpose = [\"3000-3005\"]\n";
+
+        // YAML: accettato, l'intervallo saltato, il resto del servizio intatto.
+        let parsed = parse(yaml).expect("un intervallo non deve far fallire un compose YAML");
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            parsed[0].expose.is_empty(),
+            "l'intervallo va saltato, non espanso"
+        );
+        assert_eq!(parsed[0].image.as_deref(), Some("alpine"));
+
+        // TOML: rifiutato, e il messaggio nomina la riga e il valore.
+        let e = parse(toml).expect_err("un intervallo deve far fallire un profilo kern");
+        assert!(e.contains("3000-3005") && e.contains("range"), "{e}");
+
+        // Controllo positivo: una voce VALIDA arriva alla stessa conclusione in entrambe le grafie,
+        // che e' cio' che condividere il parser deve garantire.
+        for src in [
+            "services:\n  a:\n    image: alpine\n    expose: [\"53/udp\"]\n",
+            "[box.a]\nimage = \"alpine\"\nexpose = [\"53/udp\"]\n",
+        ] {
+            let p = parse(src).expect("voce valida");
+            assert_eq!(p[0].expose, vec![(53, true)], "grafie in disaccordo: {src}");
+        }
+    }
+
+    /// Le tre sorgenti di porta (`port:`, `expose:`, `ports:`) sono la stessa affermazione e devono
+    /// finire nello stesso spazio, altrimenti il preflight protegge solo quella che gli capita di
+    /// guardare. Qui si verifica che il parser le porti tutte fino alla struct.
+    #[test]
+    fn expose_reaches_the_box_from_both_spellings() {
+        let b = parse("[box.a]\nimage = \"x\"\nexpose = [\"3000\", \"53/udp\"]\n")
+            .expect("parses")
+            .remove(0);
+        assert_eq!(b.expose, vec![(3000, false), (53, true)]);
+
+        // Una voce malformata nel profilo kern e' un errore di file, non un avviso: il profilo e'
+        // scritto per kern, quindi non c'e' un "file per il resto valido" da salvare.
+        assert!(parse("[box.a]\nimage = \"x\"\nexpose = [\"3000-3005\"]\n").is_err());
     }
 }

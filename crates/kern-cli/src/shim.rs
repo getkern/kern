@@ -477,6 +477,17 @@ fn translate_compose(rest: &[String]) -> Result<Vec<String>, ShimError> {
             i += 1;
             continue;
         }
+        // `up -d` is THE canonical compose invocation, and it asks for what kern already does: a
+        // compose service is detached by construction, there is no attached mode to opt out of. It
+        // belongs in the DROP bucket, like the no-op flags on the `docker run` side. Forwarding it
+        // verbatim (the previous behaviour, since compose had no buckets at all) handed `-d` to a
+        // parser that does not know it, so the single most common command in the ecosystem died on
+        // kern's generic usage text. Only AFTER the verb: before it, `-d` is docker's own global
+        // debug flag and none of our business.
+        if seen_verb && (flag == "-d" || flag == "--detach") && inline.is_none() {
+            i += 1;
+            continue;
+        }
         if !seen_verb && (flag == "-f" || flag == "--file") {
             let f = value_of(flag, inline, rest, &mut i)?;
             // The file is forwarded as a positional to `kern compose <file>`; a leading `-` would be
@@ -727,6 +738,40 @@ mod tests {
         }
         // A bare `docker volume` keeps its (empty) argument list - kern prints its own usage.
         assert_eq!(translate(&v(&["volume"])).unwrap(), v(&["volume"]));
+    }
+
+    /// `docker compose up -d` is the most typed command in the ecosystem, and it used to die on
+    /// kern's generic usage text: compose had no DROP bucket at all, so `-d` was forwarded to a
+    /// parser that does not accept it. kern's compose services are detached by construction, so the
+    /// flag asks for what already happens and is dropped, not refused.
+    #[test]
+    fn compose_up_detach_is_dropped_not_forwarded() {
+        let out = translate(&v(&["compose", "up", "-d"])).expect("translates");
+        assert!(!out.contains(&"-d".to_string()), "got {out:?}");
+        assert_eq!(out[0], "compose");
+        assert!(out.contains(&"up".to_string()));
+
+        let long = translate(&v(&["compose", "up", "--detach"])).expect("translates");
+        assert!(!long.contains(&"--detach".to_string()), "got {long:?}");
+
+        // With an explicit file, the file still travels and `-d` still does not.
+        let withf = translate(&v(&["compose", "-f", "stack.yml", "up", "-d"])).expect("translates");
+        assert!(withf.contains(&"stack.yml".to_string()), "got {withf:?}");
+        assert!(!withf.contains(&"-d".to_string()), "got {withf:?}");
+    }
+
+    /// The drop must not eat a `-f` that means "follow", nor anything that merely looks like `-d`.
+    #[test]
+    fn compose_drop_does_not_touch_neighbouring_flags() {
+        let logs =
+            translate(&v(&["compose", "-f", "stack.yml", "logs", "-f"])).expect("translates");
+        assert!(
+            logs.contains(&"-f".to_string()),
+            "follow swallowed: {logs:?}"
+        );
+        // A `-d=…` form is not docker's detach flag; leave it alone rather than guess at it.
+        let odd = translate(&v(&["compose", "up", "-d=1"])).expect("translates");
+        assert!(odd.contains(&"-d=1".to_string()), "got {odd:?}");
     }
 
     #[test]
