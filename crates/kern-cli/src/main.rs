@@ -38,6 +38,7 @@ mod runstats;
 mod sandbox;
 mod secret;
 mod shim;
+mod systemd;
 mod toml_surgery;
 mod tui;
 mod ui;
