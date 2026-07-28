@@ -599,6 +599,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             name.as_str()
         )));
     }
+    pt.mark("parent:name-check");
     // FLEET LIMITS (env-configured, deployment-level). Checked only in the OUTER process (KERN_SCOPE
     // unset), like the name check: the scoped inner re-run is the SAME box, already counted.
     if std::env::var_os("KERN_SCOPE").is_none() {
@@ -791,6 +792,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // registry UNDER its lock, so `Ok(None)` covers both a concurrent starter and an already-
     // running box. Two concurrent same-name starts now serialize: one wins, the other fails fast
     // here instead of both passing `name_taken` and both coming up as ambiguous twins.
+    pt.mark("parent:config+volumes");
     let name_claim = match registry::claim_name(name.as_str()) {
         Ok(Some(c)) => Some(c),
         Ok(None) => {
@@ -803,7 +805,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // (fail-open, exactly like `name_taken`).
         Err(_) => None,
     };
-    pt.mark("parent:name+fleet+claim");
+    pt.mark("parent:claim");
 
     // `--bind-rootfs` only makes sense for a real `--rootfs` directory: an `--image` must stay an
     // immutable, shareable overlay (the cache is read-only and shared across boxes), and a bind
