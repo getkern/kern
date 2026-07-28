@@ -28,7 +28,18 @@ image = "alpine"
 depends_healthy = ["cache"]
 memory = "64m"
 ports = ["8088:8080"]
+# `port` declares the port this service LISTENS on inside the shared pod network. kern reserves it
+# (a second service claiming 8080 is refused before anything starts) and passes it as `PORT`, which
+# is why the command below reads `$PORT` instead of repeating the number. Docker's `expose:` says
+# the same thing and is honoured the same way.
+port = 8080
 command = [
   "/bin/sh", "-c",
-  "while true; do printf 'HTTP/1.1 200 OK\\r\\nConnection: close\\r\\n\\r\\nweb is up and the cache was healthy first\\n' | nc -lp 8080; done",
+  # TOML basic strings take escapes: `\r\n` here IS a CRLF. Written `\\r\\n` it was a literal
+  # backslash-r, so the reply was not valid HTTP and `curl` printed nothing while the box looked
+  # perfectly healthy. That is the failure this example existed to demonstrate NOT happening.
+  # No double quotes in here: kern's TOML reader passes a backslash through as written, so a `\"`
+  # would reach the shell as a literal quote character and `nc` would be handed `"8080"` instead of
+  # 8080. `$PORT` holds a number, so it needs no quoting anyway.
+  "while true; do printf 'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nweb is up on port %s and the cache was healthy first\n' $PORT | nc -lp $PORT; done",
 ]

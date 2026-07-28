@@ -19,6 +19,10 @@ config_version = 1
 #   nice   = scheduling priority (-20 high .. 19 low) - the CLI flag is --nice
 [[vcpu]]
 name = "slim"
+# `backend` names the host resource this profile slices, and is REQUIRED since 0.6.10: a profile
+# that does not say what it carves up is refused rather than guessed. "host" means the whole host;
+# otherwise name a declared [[cpu]] id.
+backend = "host"
 cpus = 0.5           # half a core of quota
 cpuset = "0"         # pin to CPU 0
 memory = "256 MB"    # RAM ceiling (cgroup memory.max)
@@ -28,6 +32,7 @@ nice = 10            # low-ish scheduling priority
 [[vcpu]]
 name = "burst"
 extends = "slim"     # start from slim...
+backend = "host"     # ...but `extends` does NOT inherit `backend`: each profile states its own.
 cpus = 2.0           # ...but allow up to 2 cores
 memory = "512 MB"
 
@@ -37,10 +42,10 @@ memory = "512 MB"
 # upgrades it to an ext4-on-loop image (disk-backed, honouring persistent/iops/bandwidth).
 [[vdisk]]
 name = "scratch"
+backend = "ram"        # REQUIRED since 0.6.10. "ram" = a size-capped tmpfs, no [[disk]] block needed.
+                       # Use `disk:<id>` to place the image on a declared [[disk]] pool instead.
 size = "32m"
 # persistent = false   # (default) don't survive box removal
-# backend = "disk:pool"  # optional: place the image on a declared [[disk]] named "pool"
-#                         # (add a matching `[[disk]]\nname = "pool"\npath = "/var/lib/kern/disks"`)
 
 # ── virtual GPIO / peripherals ([[vgpio]]) ────────────────────────────────────────────────────
 # Device exposure is host-dependent (real gpiochips / /dev nodes / sysfs). This profile is inert
@@ -48,7 +53,7 @@ size = "32m"
 # isolation is chip-granular, not per-line - see SECURITY.md.
 [[vgpio]]
 name = "leds"
-backend = "gpio:0"
+backend = "host"     # "gpio:<id>" requires a matching [[gpio]] block; "host" needs none.
 leds = ["led0"]
 # pins = [17, 27]      # requesting any pin binds every /dev/gpiochipN present (chip-granular)
 # i2c  = ["/dev/i2c-1"]

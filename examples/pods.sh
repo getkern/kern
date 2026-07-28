@@ -47,6 +47,7 @@ echo "==> join 'client' to the same pod and reach the peer BY NAME over the shar
          grep -E "server|localhost" /etc/hosts; \
          echo "--- fetch http://server:8080/ (peer by name) ---"; \
          wget -qO- http://server:8080/ ; \
+         sleep 1 ; \
          echo "--- same service via localhost:8080 (one shared netns) ---"; \
          wget -qO- http://localhost:8080/'
 
