@@ -20,8 +20,6 @@ mod real;
 mod sandbox;
 mod seccomp;
 mod ssh;
-/// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
-/// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 pub use cgroup::apply_limits as apply_cgroup_limits;
 /// Resolve a box's exact direct-path cgroup dir from `/proc/<pid1>/cgroup` - the immediate, targeted
 /// counterpart to [`gc_orphan_box_cgroups`]: `kern stop`/`compose down` capture the dir while the box is
@@ -53,6 +51,12 @@ pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
 pub use cgroup::{fleet_status, FleetStatus};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::{preflight as preflight_ports, PortMap};
+/// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
+/// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
+/// Il cronometro per fase, esportato perche' il PADRE non era strumentato affatto: `KERN_TIMING`
+/// copriva solo il setup nel figlio, quindi il tempo speso prima della fork era invisibile e nessuno
+/// poteva vederlo nemmeno volendo.
+pub use real::PhaseTimer;
 pub use real::{
     default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
     set_cpu_affinity, shed_inherited_fds, sub_range, trusted_helper, username, CapSpec,

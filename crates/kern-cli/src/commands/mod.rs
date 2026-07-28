@@ -578,6 +578,10 @@ fn fleet_gate_and_budget() -> Result<(), Error> {
 }
 
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
+    // Il PADRE non era strumentato: `KERN_TIMING` copriva solo il setup nel figlio, quindi il tempo
+    // speso qui era invisibile e non poteva essere ottimizzato da nessuno, perche' nessuno poteva
+    // vederlo. Le marche sotto costano un `getenv` quando la variabile non c'e'.
+    let mut pt = kern_isolation::PhaseTimer::new();
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
     // start chose the direct path) is meaningless here and would arm the fail-closed refusal on a
@@ -799,6 +803,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // (fail-open, exactly like `name_taken`).
         Err(_) => None,
     };
+    pt.mark("parent:name+fleet+claim");
 
     // `--bind-rootfs` only makes sense for a real `--rootfs` directory: an `--image` must stay an
     // immutable, shareable overlay (the cache is read-only and shared across boxes), and a bind
@@ -848,6 +853,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // command, else the image's Cmd; a shell if nothing is set). `--ssh` with no command keeps the
     // box alive instead. Explicit `-- CMD` always wins over the image's Cmd.
     let cmd = resolve_image_command(args.command, args.ssh_port.is_some(), &image_config);
+    pt.mark("parent:image+command");
     // The image's Env are DEFAULTS: put them first, then the user's `--env`/`--env-file` on top so an
     // explicit variable overrides the image's.
     if !image_config.env.is_empty() {

@@ -570,13 +570,13 @@ fn exec(argv: &[CString]) -> Error {
 /// Per-phase wall-clock for box setup, gated on the `KERN_TIMING` env var (off → zero cost beyond
 /// one `getenv`). Set `KERN_TIMING=1` to print `kern-timing: <phase>: <µs>` to stderr - a cheap
 /// profiler for where startup goes on a given kernel/SoC (overlay vs dev binds vs seccomp).
-struct PhaseTimer {
+pub struct PhaseTimer {
     on: bool,
     last: libc::timespec,
 }
 
 impl PhaseTimer {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let on = std::env::var_os("KERN_TIMING").is_some();
         let mut last = libc::timespec {
             tv_sec: 0,
@@ -588,7 +588,7 @@ impl PhaseTimer {
         Self { on, last }
     }
 
-    fn mark(&mut self, label: &str) {
+    pub fn mark(&mut self, label: &str) {
         if !self.on {
             return;
         }
