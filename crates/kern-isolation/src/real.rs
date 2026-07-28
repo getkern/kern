@@ -2396,6 +2396,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     }
     let _cg = cg; // held for RAII: its Drop removes the box's cgroup dir after waitpid (see CgroupGuard)
 
+    let mut pt_spawn = PhaseTimer::new();
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
 
@@ -2479,6 +2480,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                     return Err(Error::Syscall("unshare(namespaces)", e));
                 }
                 write_single_uid_map(euid, egid)?;
+                pt_spawn.mark("parent:unshare(ns)+idmap");
             }
         }
     }

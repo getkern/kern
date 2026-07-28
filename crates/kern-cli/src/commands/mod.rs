@@ -1253,6 +1253,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }
     }
     let mut egress_guard: Option<crate::egress::EgressFilter> = None;
+    pt.mark("parent:setup->spawn");
     let result = run_in_sandbox_with(
         &spec,
         None,
@@ -1275,6 +1276,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // its supervisor (KillMode=mixed tears it down); a PDEATHSIG relative to systemd is pointless.
         !managed,
     );
+    pt.mark("box lifetime (spawn->exit)");
     cancel_foreground_timeout(timeout_wd);
     // The box has exited: SIGKILL the egress helpers NOW (this foreground path leaves via
     // `process::exit`, which skips Drop, so an implicit drop would leak the proxy + pump).
@@ -1293,6 +1295,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if let Some((_, Some(path))) = &reg_state {
         registry::unregister(path);
     }
+    pt.mark("parent:teardown");
     match result {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
         // one place a non-0/1 exit code is produced - a deliberate terminal action.
