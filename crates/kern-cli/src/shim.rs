@@ -17,6 +17,49 @@
 
 use std::fmt;
 
+/// The argv kern actually decided to run, after any shim translation.
+///
+/// Exists because kern RE-EXECS itself when it caps a box through a `systemd-run --scope`, and that
+/// re-exec used to replay `std::env::args()`, which is what the USER typed rather than what kern
+/// resolved. Invoked through a symlink named `docker`, the second pass lost twice over:
+/// `current_exe()` resolves the symlink, so `argv[0]` came back as `kern` and the shim no longer
+/// recognised itself, and the args replayed were the untranslated `run --rm IMAGE cmd`, which kern's
+/// own `run` verb then rejected as an unknown flag. The command simply failed, on exactly the setup
+/// the README documents (`ln -s "$(command -v kern)" ~/.local/bin/docker`) and exactly on the hosts
+/// that take the scope path: a normal non-root Linux user. It worked as root, which is why it had
+/// gone unnoticed.
+///
+/// Replaying the DECIDED command instead of the typed one also means the second pass never needs to
+/// re-derive anything: translation happens once, at the edge, and everything downstream sees kern's
+/// own dialect.
+static EFFECTIVE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set on the scope re-exec to say "the argv you received is already kern's dialect".
+///
+/// The re-exec names the binary by its RESOLVED path, which is usually `kern` and then translation
+/// never triggers. But a shim installed as a COPY named `docker` (rather than a symlink) re-enters
+/// `main` still called `docker`, and without this marker it would translate the already-translated
+/// argv and refuse `box …` as a command Docker does not have.
+pub const DIALECT_ENV: &str = "KERN_ARGV_IS_KERN_DIALECT";
+
+/// Is this process the far side of a re-exec that already carries kern's own dialect?
+pub fn argv_already_translated() -> bool {
+    std::env::var_os(DIALECT_ENV).is_some()
+}
+
+/// Record the post-translation argv (without `argv[0]`). Called once, from `main`.
+pub fn set_effective(args: &[String]) {
+    let _ = EFFECTIVE.set(args.to_vec());
+}
+
+/// The post-translation argv, or the raw one if `main` never recorded it (tests, direct library use).
+pub fn effective_args() -> Vec<String> {
+    EFFECTIVE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::args().skip(1).collect())
+}
+
 /// Why a `docker` argv could not be translated. Carries enough context for a precise message.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShimError {
@@ -1015,5 +1058,36 @@ mod fuzz_robustness {
             oks > 0 && errs > 0,
             "fuzz corpus too one-sided: ok={oks} err={errs}"
         );
+    }
+
+    /// Il re-exec sotto `systemd-run --scope` deve ripetere il comando DECISO, non quello digitato.
+    ///
+    /// Trovato sul Pi 5, non a tavolino: `docker run --rm alpine echo hi` attraverso il symlink che
+    /// il README documenta falliva con "kern run: unknown flag". kern si ri-esegue per applicare il
+    /// tetto via scope, e la seconda passata riceveva `argv[0]` gia' risolto dal symlink (quindi lo
+    /// shim non si riconosceva) insieme agli argomenti NON tradotti. Da root non succedeva, perche'
+    /// il percorso diretto non si ri-esegue: per questo era passato inosservato su ogni macchina di
+    /// sviluppo.
+    #[test]
+    fn the_reexec_replays_the_translated_argv_not_the_typed_one() {
+        let typed: Vec<String> = ["run", "--rm", "alpine:3.19", "echo", "hi"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let translated = translate(&typed).expect("docker run e' traducibile");
+        // Controllo positivo: la traduzione cambia davvero la forma, altrimenti sotto non si
+        // starebbe distinguendo nulla.
+        assert_ne!(translated, typed, "la traduzione deve cambiare l'argv");
+        assert_eq!(translated.first().map(String::as_str), Some("box"));
+        assert!(
+            !translated.iter().any(|a| a == "--rm"),
+            "`--rm` sta nel secchio DROP e non deve sopravvivere: {translated:?}"
+        );
+
+        set_effective(&translated);
+        // Cio' che il re-exec e la unit persistente rigiocano e' la forma tradotta, che kern sa
+        // parlare, e non `run --rm …`, che il verbo `run` di kern rifiuta.
+        assert_eq!(effective_args(), translated);
+        assert_eq!(effective_args().first().map(String::as_str), Some("box"));
     }
 }

@@ -3445,8 +3445,12 @@ fn install_persistent_box(
     let self_exe = std::env::current_exe()
         .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
     // Rebuild the argv for the managed foreground run so systemd re-runs exactly this each start.
+    // The DECIDED argv, for the same reason the scope re-exec uses it, and here the stakes are
+    // higher: the typed form gets FROZEN into a unit file. A `docker run --restart …` would bake
+    // docker syntax into a unit whose `ExecStart` names the resolved `kern` binary, so it would fail
+    // at every boot, on a machine nobody is watching.
     let mut exec = vec![systemd_quote(&self_exe.to_string_lossy())];
-    let mut it = std::env::args().skip(1).peekable();
+    let mut it = crate::shim::effective_args().into_iter().peekable();
     let mut past_sep = false;
     while let Some(a) = it.next() {
         // Strip kern's own `-d`/`--restart` only among the flags BEFORE the `--` command separator.
@@ -3640,7 +3644,11 @@ fn reexec_in_scope_if_possible(
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The DECIDED argv, not the typed one: a `docker …` invocation has already been translated into
+    // kern's dialect here, and replaying the original would hand the second pass docker syntax that
+    // kern's own parser rejects. `current_exe()` above resolves a symlink, so the shim cannot
+    // re-identify itself on the far side and cannot translate again.
+    let args: Vec<String> = crate::shim::effective_args();
 
     // The scope's memory cap tracks `--memory` (so the outer scope never caps a box below what it
     // asked for); `--cpus` maps to a CPUQuota, `--cpuset-cpus` to AllowedCPUs. Swap tracks
@@ -3690,7 +3698,13 @@ fn reexec_in_scope_if_possible(
         .arg("--")
         .arg(self_exe)
         .args(&args)
-        .env("KERN_SCOPE", "1");
+        .env("KERN_SCOPE", "1")
+        // `args` is already kern's dialect (see `shim::effective_args`), so the child must NOT
+        // translate again. It would otherwise re-enter the shim whenever the binary it re-execs is
+        // itself named `docker` (a COPY rather than a symlink) and reject `box …` as "no kern
+        // equivalent". Not folded into KERN_SCOPE: a user can set that one by hand to opt out of the
+        // scope path, and it would then be claiming something about the argv that isn't true.
+        .env(crate::shim::DIALECT_ENV, "1");
     // A FOREGROUND box must die with its launcher (the SDK's per-request pattern). systemd-run
     // interposes itself as the box supervisor's parent, so the supervisor's own launcher-PDEATHSIG
     // would fire on systemd-run's death, not the launcher's - leaving the box orphaned until the

@@ -69,7 +69,7 @@ fn main() -> ExitCode {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    if invoked == "docker" || invoked == "docker-compose" {
+    if (invoked == "docker" || invoked == "docker-compose") && !shim::argv_already_translated() {
         if invoked == "docker-compose" {
             args.insert(0, "compose".to_string());
         }
@@ -81,6 +81,11 @@ fn main() -> ExitCode {
             }
         }
     }
+    // Record what kern DECIDED to run. The scope re-exec replays this, not `env::args()`: through a
+    // symlink named `docker` the raw argv would arrive at the second pass untranslated, with an
+    // `argv[0]` that `current_exe()` has already resolved back to `kern`. See `shim::EFFECTIVE`.
+    shim::set_effective(&args);
+
     // Map the result to an exit code in exactly ONE place (the lib/command layer returns
     // `Result`, never calls `process::exit` itself).
     match cli::run(&args) {
