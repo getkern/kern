@@ -42,7 +42,7 @@ then `kern box dev --image alpine -- sh`
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~308 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.8 MB static binary, no daemon.">
 </p>
 
-<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2 ms</b>; a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. The comparison table under <a href="#performance">Performance</a> is a separate Linux 6.17 desktop; your hardware and cgroup delegation differ, so measure your own. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology and on-device board numbers.</sub>
+<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2.4 ms</b> here (<code>kern bench --rootfs</code> median; the 1.9 ms in the table below is a Linux 6.17 desktop, and the kernel version moves this number); a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. The comparison table under <a href="#performance">Performance</a> is a separate Linux 6.17 desktop; your hardware and cgroup delegation differ, so measure your own. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology and on-device board numbers.</sub>
 
 [Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Storage](docs/STORAGE.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
@@ -703,7 +703,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.21.** Everything in [Features](#features) works today and is tested (637 Rust, 61 Python and 50
+**0.6.21.** Everything in [Features](#features) works today and is tested (638 Rust, 61 Python and 50
 Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
 real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
 starts in **~2 ms** from one **~1.8 MB** binary. Versioned under semver: each release is the official

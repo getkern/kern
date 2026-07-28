@@ -7,6 +7,12 @@ installed there: **Docker 29.1.3** (daemon up), **Podman 4.9.3** (rootless), **c
 same Alpine rootfs (Docker/Podman via their image store; kern/bwrap/crun/runc via the same exported
 rootfs directory). This is a 0.x project, treat these as "fast class", not a guarantee.
 
+> **The kernel moves this number, and by more than a release of kern does.** The same machine on
+> **Linux 7.0** starts a bare box in **2.4 ms** (`kern bench --rootfs` median), against the 1.9 ms
+> below on 6.17. That is not a regression in kern: measured side by side on 7.0, **v0.6.14 and
+> v0.6.21 both report 2.40 ms, a delta of 0.00**. If your own number is higher than the table, check
+> your kernel before you check kern, and please do measure your own: `kern bench --rootfs <dir>`.
+
 **Reproduce it yourself.** The three performance tables below, cold start, throughput, and
 concurrency, are all produced by one script, [`examples/benchmark.py`](examples/benchmark.py)
 (stdlib only, no dependencies). It auto-detects whatever runtimes are installed, pulls the Alpine
