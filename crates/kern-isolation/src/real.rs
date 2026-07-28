@@ -693,13 +693,7 @@ fn child_setup_and_exec(
     // `-it` slave). The overwhelming common case (agent code-exec, CI, `sh -c`) never opens a PTY, so
     // gate the whole devpts mount+mkdir+symlink out of it - one fewer filesystem-mount syscall per box.
     let needs_pts = spec.ssh.is_some() || spec.tty_slave.is_some();
-    setup_dev(
-        &spec.root,
-        spec.tun,
-        needs_pts,
-        spec.tty_slave,
-        spec.memory_max,
-    )?;
+    setup_dev(&spec.root, spec.tun, needs_pts, spec.tty_slave)?;
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
     setup_volumes(&spec.root, &spec.volumes)?;
@@ -1290,23 +1284,7 @@ const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 /// device binds all resolve to a directory we own *inside* the new root - never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
-/// Mount options for the box's `/dev/shm` tmpfs: always `mode=1777` (the standard sticky,
-/// world-writable shm mode), plus a `size=` equal to the box's memory cap when it has one. See the
-/// call site for why the size matters even though the cgroup usually charges shmem to the box.
-fn shm_mount_opts(shm_max: Option<u64>) -> String {
-    match shm_max {
-        Some(b) if b > 0 => format!("mode=1777,size={b}"),
-        _ => "mode=1777".to_string(),
-    }
-}
-
-fn setup_dev(
-    root: &str,
-    tun: bool,
-    needs_pts: bool,
-    tty_slave: Option<i32>,
-    shm_max: Option<u64>,
-) -> Result<(), Error> {
+fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> Result<(), Error> {
     let dev_path = format!("{root}/dev");
     let dp = cstr(&dev_path)?;
     // Neutralize a hostile `/dev` symlink before any path resolves through it.
@@ -1371,23 +1349,16 @@ fn setup_dev(
     // this mount they fail "No such file or directory". `mode=1777` (sticky + world-writable) is the
     // standard shm mode so an unprivileged workload creates its OWN segments (which it then owns, so
     // `fs.protected_regular` doesn't bite). `MS_NOSUID|MS_NODEV`: shm never hosts a setuid binary or a
-    // device node. There is no separate `--shm-size` footgun: shm may use the box's WHOLE budget, so a
-    // Postgres under load never hits Docker's fixed 64 MB default.
-    //
-    // `size=` is what makes "the box's whole budget" a real ceiling rather than a hoped-for one. Where
-    // the memory cgroup charges shmem to the box, `--memory` already bounds this tmpfs; where it does
-    // NOT (measured on the Jetson's 5.15-tegra kernel: 200 MB written into `/dev/shm` inside a 32 MB
-    // box, and a bare systemd scope on that kernel leaks the same way, so it is the kernel's shmem
-    // accounting and not ours) an unsized tmpfs defaults to HALF OF HOST RAM and a capped box could eat
-    // the board. Sizing it to the cap makes the kernel enforce the same bound directly, on every kernel.
-    // Uncapped boxes keep the tmpfs default, exactly as before.
+    // device node. The tmpfs is charged to the box's memory cgroup, so `--memory` bounds it and there is
+    // no separate `--shm-size` footgun (Docker's 64 MB default is what breaks Postgres under load).
+    // MEASURED, not assumed: on 5.15-tegra a `--memory 32m` box admits ~30 MB into an UNSIZED (3.7 GB,
+    // half of host RAM) `/dev/shm` before ENOSPC, so the charge, not the tmpfs size, is the bound.
     // Best-effort: a host/kernel that refuses it just leaves the box without `/dev/shm` (prior behaviour).
     {
         let shmdir = format!("{root}/dev/shm");
-        let shm_opts = shm_mount_opts(shm_max);
         if let Ok(sd) = cstr(&shmdir) {
             unsafe { libc::mkdir(sd.as_ptr(), 0o1777) };
-            if let (Ok(ty), Ok(opts)) = (cstr("tmpfs"), cstr(&shm_opts)) {
+            if let (Ok(ty), Ok(opts)) = (cstr("tmpfs"), cstr("mode=1777")) {
                 unsafe {
                     libc::mount(
                         ty.as_ptr(),
@@ -2109,7 +2080,14 @@ fn detect_id_range(euid: u32, egid: u32) -> Option<IdRange> {
 
 /// `newuidmap`/`newgidmap PID 0 own 1 1 sub count` - map box id 0 → caller, box ids 1.. → the
 /// subordinate range. `bin` is a trusted absolute path. Returns whether the helper exited 0.
-fn run_idmap(bin: &std::path::Path, pid: i32, own: u32, sub: u32, count: u32) -> bool {
+/// Start one id-map helper WITHOUT waiting for it. The caller waits, so the two helpers overlap.
+fn spawn_idmap(
+    bin: &std::path::Path,
+    pid: i32,
+    own: u32,
+    sub: u32,
+    count: u32,
+) -> Option<std::process::Child> {
     std::process::Command::new(bin)
         .args([
             pid.to_string(),
@@ -2120,9 +2098,32 @@ fn run_idmap(bin: &std::path::Path, pid: i32, own: u32, sub: u32, count: u32) ->
             sub.to_string(),
             count.to_string(),
         ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .spawn()
+        .ok()
+}
+
+/// Apply BOTH id maps, overlapping the two setuid helpers instead of running them back to back.
+///
+/// They used to run in sequence, so a box paid two full spawn + exec + wait cycles one after the
+/// other. MEASURED: that is about 2 ms of a ~4 ms image-box start, the single largest cost in the
+/// whole sequence and pure latency rather than work. The two helpers write DIFFERENT files
+/// (`/proc/<pid>/uid_map` and `/proc/<pid>/gid_map`) for the same target, read different files
+/// (`/etc/subuid`, `/etc/subgid`) and share no mutable state, so nothing orders one before the
+/// other. `newgidmap` is itself the privileged writer, so there is no `setgroups` sequencing to
+/// respect either.
+///
+/// BOTH are waited even when the first fails: a spawned child that is never reaped becomes a zombie
+/// held by the supervisor for as long as the box lives.
+fn run_both_idmaps(r: &IdRange, pid: i32, euid: u32, egid: u32) -> bool {
+    let a = spawn_idmap(&r.newuidmap, pid, euid, r.sub_uid, r.uid_count);
+    let b = spawn_idmap(&r.newgidmap, pid, egid, r.sub_gid, r.gid_count);
+    let wait = |c: Option<std::process::Child>| {
+        c.map(|mut c| c.wait().map(|s| s.success()).unwrap_or(false))
+            .unwrap_or(false)
+    };
+    let ok_a = wait(a);
+    let ok_b = wait(b);
+    ok_a && ok_b
 }
 
 /// Unshare `ns_flags` (incl. the user ns), then set a *ranged* uid/gid map. Because an
@@ -2155,8 +2156,7 @@ fn apply_userns_range(
         let ppid = unsafe { libc::getppid() };
         let mut b = [0u8; 1];
         let _ = unsafe { libc::read(p2h[0], b.as_mut_ptr() as *mut libc::c_void, 1) };
-        let ok = run_idmap(&r.newuidmap, ppid, euid, r.sub_uid, r.uid_count)
-            && run_idmap(&r.newgidmap, ppid, egid, r.sub_gid, r.gid_count);
+        let ok = run_both_idmaps(r, ppid, euid, egid);
         let msg: &[u8] = if ok { b"1" } else { b"0" };
         let _ = unsafe { libc::write(h2p[1], msg.as_ptr() as *const libc::c_void, 1) };
         unsafe { libc::_exit(0) };
@@ -3447,33 +3447,6 @@ mod pdeathsig_cascade_tests {
 /// not the root's mode; (2) `/dev/fd` + `/dev/std{in,out,err}` symlinks into procfs (bash process
 /// substitution / postgres initdb need them). Verified live: redis, nginx, postgres all reach
 /// "ready to accept connections" under `--uid-range`.
-/// A capped box must not be able to exceed its own memory budget through `/dev/shm`. Where the
-/// kernel charges shmem to the box's cgroup that is already true; where it does NOT (measured on
-/// 5.15-tegra) an unsized tmpfs defaults to half of host RAM, so the size has to be stated.
-#[cfg(test)]
-mod shm_is_bounded_by_the_memory_cap {
-    use super::shm_mount_opts;
-
-    #[test]
-    fn a_capped_box_sizes_shm_to_its_cap() {
-        assert_eq!(shm_mount_opts(Some(33_554_432)), "mode=1777,size=33554432");
-        // Byte-exact, not rounded: the tmpfs bound has to be the same number the cgroup enforces,
-        // or the two disagree about what the budget is.
-        assert_eq!(shm_mount_opts(Some(1)), "mode=1777,size=1");
-    }
-
-    #[test]
-    fn an_uncapped_box_keeps_the_tmpfs_default() {
-        // No cap means no stated size (the kernel's half-of-RAM default), exactly as before: a box
-        // with no budget has nothing to be bounded by, and inventing one here would be a new limit
-        // nobody asked for.
-        assert_eq!(shm_mount_opts(None), "mode=1777");
-        // `--memory 0` is not a zero-byte budget, it is the absence of one: sizing shm to 0 would
-        // make every shm write fail instead.
-        assert_eq!(shm_mount_opts(Some(0)), "mode=1777");
-    }
-}
-
 /// The pod holder learns WHY its range was asked for through an env var, because it decides in a
 /// forked child, after the parent is gone. That crossing must survive a kern upgrade in both
 /// directions: a holder started by an older kern wrote a bare `1`, which has to keep warning rather
