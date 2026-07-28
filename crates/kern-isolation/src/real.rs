@@ -575,6 +575,12 @@ pub struct PhaseTimer {
     last: libc::timespec,
 }
 
+impl Default for PhaseTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PhaseTimer {
     pub fn new() -> Self {
         let on = std::env::var_os("KERN_TIMING").is_some();
