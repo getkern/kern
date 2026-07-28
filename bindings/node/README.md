@@ -1,7 +1,7 @@
 # kern-sandbox (Node.js / TypeScript)
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless, daemonless Linux sandbox runtime: a real,
-kernel-enforced box that starts in **~2 ms**, from one **~1.6 MB** binary, with no daemon. **kern-sandbox**
+kernel-enforced box that starts in **~2 ms**, from one **~1.8 MB** binary, with no daemon. **kern-sandbox**
 is its Node / TypeScript binding: run untrusted or agent-generated code in a fresh, isolated box, from Node.
 
 On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). For Python, the same
@@ -9,7 +9,7 @@ package is on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/).
 
 It is a thin, dependency-free wrapper around the [`kern`](https://github.com/getkern/kern) binary:
 a fresh, isolated box per call, network off by default, hard resource caps, and a timeout the binding
-itself enforces. Kernel-enforced isolation (namespaces, cgroups v2, seccomp), local, about 1.6 MB, with no cloud, no account, no VM.
+itself enforces. Kernel-enforced isolation (namespaces, cgroups v2, seccomp), local, about 1.8 MB, with no cloud, no account, no VM.
 
 ```js
 const kern = require("kern-sandbox");
@@ -136,7 +136,7 @@ new Sandbox({
   profiles,        // reusable kern.toml profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]
   env,             // { KEY: "value" }
   maxOutputBytes,  // default 64 MiB
-  enforceLimits,   // default true (systemd scope, ~6 ms); false = best-effort, ~3 ms
+  enforceLimits,   // default true; false is best-effort and NO faster (see the Python README)
   depsReadonly,    // default false
   trackFiles,      // default true: diff the workspace each call for result.files (O(files)); false = [], O(1)
   onStdout,        // (chunk: Buffer) => void, live stdout streaming (result.stdout still captured)

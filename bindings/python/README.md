@@ -1,7 +1,7 @@
 # kern-sandbox
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless, daemonless Linux sandbox runtime: a real,
-kernel-enforced box that starts in **~2 ms**, from one **~1.6 MB** binary, with no daemon. **kern-sandbox**
+kernel-enforced box that starts in **~2 ms**, from one **~1.8 MB** binary, with no daemon. **kern-sandbox**
 is its Python binding: run untrusted or agent-generated code in a fresh, isolated box, straight from Python.
 
 On PyPI: [`pip install kern-sandbox`](https://pypi.org/project/kern-sandbox/). For Node / TypeScript, the
@@ -60,15 +60,21 @@ aspirational. Your hardware will differ, measure and claim your own number.
 
 | call (p50) | `enforce_limits=False` | default (`enforce_limits=True`) |
 | --- | --- | --- |
-| `run(["true"])` (bare box) | ~3.5 ms | ~7.5 ms |
+| `run(["true"])` (bare box) | ~7.5 ms | ~7.5 ms |
 | `run_code("print(1)")` (+ Python interpreter start) | ~16 ms | ~32 ms |
 | `docker run python:3.12-slim python3 -c` | n/a | ~344 ms |
 
-For reference, `kern box` **natively** (no Python wrapper) is ~2 ms, the ~3.5 ms bare-box row is that
-plus the wrapper's subprocess + reader-thread overhead.
+For reference, `kern box` **natively** (no Python wrapper) is ~2 ms from a prepared rootfs and ~3.7 ms
+from an OCI image; the ~7.5 ms bare-box row is that plus the wrapper's subprocess + reader-thread
+overhead.
+
+**`enforce_limits=False` no longer buys speed.** It used to skip a per-box `systemd-run` scope, which
+cost about 4 ms; kern now caps directly in its own delegated slice, so both columns measure the same
+and the flag only matters where cgroups cannot be delegated at all. Leave it at the default: you would
+be giving up hard cap enforcement for nothing.
 
 `run_code` runs *Python code*, so it pays the **CPython interpreter start** (~12 ms) on top of the box,
-that's a Python cost, not kern's, and it's why `run_code` is ~16 ms, not the bare box's ~3.5 ms. Even so:
+that's a Python cost, not kern's, and it's why `run_code` is ~16 ms, not the bare box's ~7.5 ms. Even so:
 **~16 ms vs Docker's ~344 ms is about 20× faster** for the same task, and we quote the number you get from
 `run_code`, never the bare-box best case dressed up as the code-execution number.
 

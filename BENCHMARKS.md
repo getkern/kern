@@ -23,7 +23,7 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 > **TL;DR.** kern is in the **fastest tier**: it leads the no-cgroup-cap sandboxes (ahead of
 > `bubblewrap`), and with a hard cgroup cap it **ties `crun`** (the fastest OCI runtime) and is
 > **~2× `runc`**: while being the only one of them that ships a complete daemonless container UX
-> (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~1.6 MB** binary. Against the real
+> (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~1.8 MB** binary. Against the real
 > engines it's **~80-160× faster to start** (`podman` ~155 ms, Docker ~308 ms) and carries no
 > resident daemon. It is *not* "the fastest in the world", the top tier is within a couple ms,
 > i.e. noise; the honest claim is **top-tier speed + a full runtime in a tiny daemonless binary**.
@@ -35,6 +35,7 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 | Runtime | Cold start | What it does at that price |
 |---|---:|---|
 | **kern** `box --rootfs` | **1.9 ms** | overlay + self-pivot + seccomp |
+| **kern** `box --image` | **3.7 ms** | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
 | bubblewrap | 2.6 ms | a sandbox *primitive*, no images, caps, or lifecycle |
 | crun | 5.2 ms | OCI runtime (C): bundle + cgroup setup |
 | runc (rootless) | 12.2 ms | OCI runtime (Go): bundle + cgroup (high run-to-run variance) |
@@ -55,7 +56,7 @@ tier sits within a couple ms of each other and of each other's run-to-run noise,
 single-shot latency outright. The real gap is to the **engines**: `podman` (~155 ms) and Docker
 (~308 ms) fork `conmon` / round-trip a daemon every run, so kern is **~80-160× faster** than the
 tools people actually compare it to, while shipping the same UX (OCI pull, overlay,
-`ps`/`exec`/`logs`, compose) in ~1.6 MB with no resident daemon.
+`ps`/`exec`/`logs`, compose) in ~1.8 MB with no resident daemon.
 
 ### Real image, not `/bin/true`
 
@@ -124,7 +125,7 @@ per run = total ÷ N):
 
 ✗ = **not installed (nor readily installable) on that board.** The standout row is the **Raspberry
 Pi 5: `kern` is the ONLY runtime that runs at all**: bubblewrap, crun, runc, podman and Docker are
-*none of them present*, while one ~1.6 MB static binary just works. That reach, not a single-shot
+*none of them present*, while one ~1.8 MB static binary just works. That reach, not a single-shot
 latency crown, is the differentiator. (Jetson/Arduino had bubblewrap, runc and Docker; crun and
 podman weren't installed there either.)
 
@@ -141,7 +142,7 @@ the rootfs/image stays immutable and shareable, which is sub-millisecond on ever
 the reason kern wins outright on the other three boards. For exactly this case, **`--bind-rootfs`**
 swaps the overlay for a direct bind, kern then starts in **9.9 ms, beating bubblewrap (14.9 ms)**
 while still doing more than it (seccomp, a real `/dev`, lifecycle); the trade-off is a mutable,
-shared source, so it's opt-in. Net: one ~1.6 MB binary (one Rust dep, `libc`; system `curl`/`tar` for
+shared source, so it's opt-in. Net: one ~1.8 MB binary (one Rust dep, `libc`; system `curl`/`tar` for
 OCI pull), no daemon, no per-distro
 packaging, **fastest on all four kernels**: and the only runtime present at all on the Pi and the
 only one that ships OCI images + caps + `ps`/`exec`/`logs`/compose. That reach is the differentiator.
@@ -150,14 +151,14 @@ only one that ships OCI images + caps + `ps`/`exec`/`logs`/compose. That reach i
 
 | | |
 |---|---:|
-| **kern** binary (the whole thing) | **~1.6 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 ~1.6 MB, aarch64 ~1.3 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
+| **kern** binary (the whole thing) | **~1.8 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 ~1.8 MB, aarch64 ~1.3 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
 | kern resident memory at rest | **0**: no daemon |
 | kern RSS per box (setup) | ~7 MB |
 | bubblewrap binary | 70 KB (launcher only) |
 | runc binary | ~10 MB |
 | **Docker** resident | **~186 MB RSS** always on (`dockerd` ~121 MB + `containerd` ~65 MB) |
 
-kern is **~6× smaller than runc** (1.6 MB vs ~10 MB) and needs no bundle scaffolding; bwrap is
+kern is **~6× smaller than runc** (1.8 MB vs ~10 MB) and needs no bundle scaffolding; bwrap is
 smaller still but is only a launcher (no images/caps/lifecycle). Docker keeps ~186 MB resident
 before you run anything.
 

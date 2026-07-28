@@ -19,6 +19,77 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.19], 2026-07-28
+
+Docker compose parity for web stacks, plus three defects found by running the work on real hardware.
+
+### Added
+
+- **`docker` / `docker-compose` shim.** Invoked under either name (a symlink is enough), kern
+  translates the argv and runs an existing script unchanged. Every flag lands in one of three
+  buckets: forwarded, dropped as a no-op, or refused by name. There is no fourth bucket where a
+  flag is silently ignored.
+- **`kern compose`, ten verbs**: `up`, `down`, `stop`, `start`, `restart`, `ps`, `logs`, `build`,
+  `pull`, `config`, reading a `docker-compose.yml` or a kern profile.
+- **`kern compose <file> systemd`.** Prints a systemd unit on stdout and installs nothing. kern is
+  daemonless, so coming back after a reboot is the one thing it cannot do for itself. The unit
+  states in a comment that it does not supervise, rather than letting the reader assume it does.
+- **`port:` and Docker's `expose:`.** Declare the port a service listens on inside the pod. kern
+  reserves it (a second service claiming it is refused before anything starts) and passes `port:`
+  to the service as `PORT`. This is the way out of the one constraint the pod model imposes.
+- **Profile keys that had a CLI flag but no config key**: `init`, `add_host`, `ulimits`, `labels`,
+  `sysctls`, `restart_max`, `stop_signal`, `stop_grace_period`.
+
+- **`kern bench` accepts `--image`.** It took only `--rootfs <dir>`, so the one command the README
+  points a newcomer to needed two others first. With `--image` it spawns the same `kern box --image`
+  a user would run, and warms the cache before timing so a first-run pull is not counted.
+- **The two id-map helpers run concurrently.** `newuidmap` and `newgidmap` ran back to back, two full
+  spawn/exec/wait cycles. They write different files for the same target and share no state, so
+  nothing ordered them: overlapping them takes an image box from ~4.0 to ~3.4 ms. Both are waited
+  even when the first fails, or the unreaped child would linger as a zombie for the box's lifetime.
+
+### Fixed
+
+- **`kern stop` waited the full grace period for a signal the box could not receive.** A PID-namespace
+  init discards any signal it has no handler for, so an ordinary command (`sleep`, most binaries)
+  never dies from SIGTERM and the graceful phase became a 10-second wait for an event that could not
+  happen: 9013 ms to stop one box, and a `compose down` of four services would have taken 36 s. kern
+  now reads `SigCgt` and skips the graceful phase when the init provably cannot catch the signal, so
+  that box stops in 4 ms while a service that DOES trap it still gets its full grace.
+
+- **`kern stop --all` deleted systemd unit files it had never written.** It identified its own
+  persistent boxes by file name, so any `kern-*.service` in the user's unit directory was removed,
+  including one written by hand. Ownership is now asserted positively, from a marker inside the
+  file; anything unmarked is left alone.
+- **An `--image` box announced a single-uid map it did not have.** The heads-up about an image
+  running as a non-root user checked two of the four conditions that turn the uid range on, so it
+  reported a missing map that was in fact present and advised a flag change that would have done
+  nothing.
+- **`--show-config` reported `uid_range: false` for every image box**, while the box itself mapped
+  a range. The dry run now reports the same decision the box makes, and names its source.
+- **`docker compose up -d` failed** with kern's usage text. The compose path had no bucket for
+  `-d`, which asks for what kern already does.
+- **Override files silently dropped four fields** (`port`, `restart_max`, `stop_signal`,
+  `stop_grace_period`): they reached the struct but not the merge.
+- **`compose config` reported a stack that `up` refused as clean.** The pod-global check (two
+  services on one internal port, a shadowed host entry) was gated at each call site instead of
+  inside itself, and the three sites drifted: `up` ran it, `systemd` ran it ungated, and `config`,
+  the verb whose whole job is answering "will this come up?", never called it. A dry run that
+  disagrees with the bring-up is worse than no dry run. The gate now lives in the function, so no
+  caller can restate it differently.
+
+### Changed
+
+- The compose sub-verb list, the help line and the usage message are one list. `systemd` shipped
+  working but absent from both, because the list was written out three times by hand.
+- **A malformed `expose:` entry is treated differently by design, and now says so.** In a kern
+  profile it is refused with its line number; in a `docker-compose.yml` it is warned about and
+  skipped, because failing someone else's whole stack over one line of pure documentation is the
+  wrong trade. Both spellings share the one parser, so a valid entry always means the same thing.
+  The two dispositions had drifted apart under a comment asserting they could not, which is what
+  happens when nothing asserts them together: a test now does.
+
+
 ## [0.6.18], 2026-07-26
 
 OCI compatibility with fail-closed security: an image that ships an inert device node in a layer
