@@ -20,7 +20,7 @@ was installed at all).
 A throwaway box in **3.7 ms** (vs 299 for `docker run`) · `exec` **1.4 ms** (vs 42) · `ps` **0.8 ms** (vs 8.2) · `logs` **0.8 ms** (vs 8.3) · **~1.8 MB** static binary · **0 RAM at rest** · **rootless**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern bench --rootfs ./alpine' reports median 1.4 ms, min 1.3 ms, 670 boxes/sec on a P-core; 'time docker run --rm alpine true' reports real 300 ms. The same isolated box, no daemon, from a 1.8 MB static binary, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.7 ms against docker run's ~308 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 **🐧 Linux & ARM boards**
