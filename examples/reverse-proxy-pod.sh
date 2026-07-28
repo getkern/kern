@@ -54,7 +54,9 @@ echo
 echo "==> 2. the APP: a detached box in the pod, serving HTTP on :8080 (NOT published):"
 "$kern" box app --pod "$pod" --image alpine -d -- \
   sh -c 'while true; do printf "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello from the APP behind nginx\n" | nc -lp 8080; done'
-sleep 1
+# Condizione, non orologio: appena i box compaiono si prosegue. Un `sleep 1` fisso costava un
+# secondo qui e poteva non bastare su una board lenta.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 
 echo
 echo "==> 3. NGINX in front: same pod, published to the host on 127.0.0.1:$port -> nginx :80:"

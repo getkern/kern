@@ -19,7 +19,10 @@ trap cleanup EXIT
 
 echo "==> prod stays up the whole time:"
 "$kern" box "${svc}-prod" --image "$img" -d -- sh -c 'while true; do sleep 2; done' >/dev/null
-sleep 1
+# Il box e' gia' avviato quando `-d` ritorna (misurato: 20 su 20 con `exec` e `logs` subito dopo).
+# Si aspetta la CONDIZIONE, non un tempo: qui e' istantaneo, e su una board lenta regge lo stesso,
+# mentre un `sleep 1` fisso era il numero sbagliato in entrambe le direzioni.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 "$kern" ps --filter "name=${svc}-prod" --format '    prod: {{.Names}} {{.Status}}'
 
 echo

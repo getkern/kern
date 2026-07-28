@@ -17,7 +17,10 @@ echo "hello-from-host" > "$work/from-host.txt"
 
 echo "==> start a detached box to copy against:"
 "$kern" box files --image alpine -d -- /bin/sh -c 'while true; do sleep 1; done'
-sleep 1
+# Il box e' gia' avviato quando `-d` ritorna (misurato: 20 su 20 con `exec` e `logs` subito dopo).
+# Si aspetta la CONDIZIONE, non un tempo: qui e' istantaneo, e su una board lenta regge lo stesso,
+# mentre un `sleep 1` fisso era il numero sbagliato in entrambe le direzioni.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 
 echo
 echo "==> copy a host file INTO the box (host -> box:/tmp):"

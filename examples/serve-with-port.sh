@@ -17,7 +17,15 @@ echo "==> starting a detached HTTP service: host 8080 -> box 80, with restart + 
 
 echo
 echo "==> waiting for the health check to go green..."
-sleep 4
+# Poll the state, do not guess the duration. A fixed `sleep 4` was both slower than necessary here
+# and too short on a loaded ARM board: the wrong number in both directions, which is what a fixed
+# wait always is. Ten tries at 200 ms, then give up loudly rather than pretend.
+i=0
+while [ $i -lt 10 ]; do
+  "$kern" ps 2>/dev/null | grep -q "healthy" && break
+  sleep 0.2; i=$((i + 1))
+done
+[ $i -lt 10 ] || echo "    (still not healthy after 2s - continuing so you can see what ps reports)"
 echo "==> kern ps - note the PORTS (127.0.0.1:8080->80) and HEALTH (healthy) columns:"
 "$kern" ps
 

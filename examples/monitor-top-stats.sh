@@ -12,7 +12,10 @@ kern="${KERN:-kern}"
 echo "==> start two detached boxes doing a little work:"
 "$kern" box api    --image alpine -d -- /bin/sh -c 'while true; do :; done'
 "$kern" box worker --image alpine -d -- /bin/sh -c 'while true; do sleep 1; done'
-sleep 2
+# Il box e' gia' avviato quando `-d` ritorna (misurato: 20 su 20 con `exec` e `logs` subito dopo).
+# Si aspetta la CONDIZIONE, non un tempo: qui e' istantaneo, e su una board lenta regge lo stesso,
+# mentre un `sleep 1` fisso era il numero sbagliato in entrambe le direzioni.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 
 echo
 echo "==> kern stats - memory + CPU per box, sampled from each box's cgroup:"

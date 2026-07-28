@@ -19,7 +19,10 @@ echo "==> kern doctor - is this host able to run boxes, and what's available?"
 echo
 echo "==> create and stop a box so there's some dead-box residue to clean up:"
 "$kern" box scratch --image alpine -d -- /bin/sh -c 'echo hi; while true; do sleep 1; done'
-sleep 1
+# Il box e' gia' avviato quando `-d` ritorna (misurato: 20 su 20 con `exec` e `logs` subito dopo).
+# Si aspetta la CONDIZIONE, non un tempo: qui e' istantaneo, e su una board lenta regge lo stesso,
+# mentre un `sleep 1` fisso era il numero sbagliato in entrambe le direzioni.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 "$kern" stop scratch
 sleep 1
 

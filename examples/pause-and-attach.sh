@@ -11,28 +11,32 @@
 set -eu
 kern="${KERN:-kern}"
 
-echo "==> start a detached box that ticks once a second and records each tick:"
+# Ticks five times a second, not once. The demonstration needs a HANDFUL of ticks, not a handful
+# of seconds: at 1 Hz this example spent 8 of its 10 seconds asleep, which is a long time to ask of
+# someone reading it for the first time.
+echo "==> start a detached box that ticks 5x a second and records each tick:"
 "$kern" box ticker --image alpine -d -- \
-  /bin/sh -c 'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 1; done'
-sleep 3
+  /bin/sh -c 'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 0.2; done'
+sleep 1
 
 echo
-echo "==> it has been running ~3s, so a few ticks are in the log:"
+echo "==> it has been running ~1s, so a few ticks are in the log:"
 "$kern" logs ticker | tail -2
 before="$("$kern" logs ticker | wc -l)"
 
 echo
 echo "==> freeze it with kern pause - every process in the box stops dead:"
 "$kern" pause ticker
-sleep 3   # 3 real seconds pass, but the frozen box produces no new ticks
+# A full second is FIVE ticks' worth at this rate: if the freeze leaked even one, the count moves.
+sleep 1
 
 after_pause="$("$kern" logs ticker | wc -l)"
-echo "    log lines before pause: $before   after 3s frozen: $after_pause  (unchanged = truly frozen)"
+echo "    log lines before pause: $before   after 1s frozen (5 ticks' worth): $after_pause  (unchanged = truly frozen)"
 
 echo
 echo "==> thaw it with kern unpause - it resumes exactly where it left off:"
 "$kern" unpause ticker
-sleep 2
+sleep 1
 echo "    ticks resume:"
 "$kern" logs ticker | tail -2
 

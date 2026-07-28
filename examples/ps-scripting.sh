@@ -24,7 +24,9 @@ echo "==> launch a small fleet of detached boxes (${pfx}a/b/c):"
 for n in a b c; do
   "$kern" box "${pfx}${n}" --image "$img" -d -- sh -c 'sleep 120' >/dev/null
 done
-sleep 1
+# Condizione, non orologio: appena i box compaiono si prosegue. Un `sleep 1` fisso costava un
+# secondo qui e poteva non bastare su una board lenta.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 
 echo
 echo "==> ps --format: one TSV line per box, custom columns (\\t becomes a real tab for awk):"

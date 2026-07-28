@@ -11,7 +11,9 @@ here="$(dirname "$0")"
 echo "composing the stack (db -> api -> web):"
 "$kern" compose "$here/stack.toml"
 
-sleep 1
+# Condizione, non orologio: appena i box compaiono si prosegue. Un `sleep 1` fisso costava un
+# secondo qui e poteva non bastare su una board lenta.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 echo
 echo "running boxes:"
 "$kern" ps

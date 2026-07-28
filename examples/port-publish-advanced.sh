@@ -26,7 +26,9 @@ echo "==> publish a RANGE of TCP ports (host 8000-8002 -> box 8000-8002), detach
   sh -c 'for p in 8000 8001 8002; do
            ( while true; do printf "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nport %s\n" "$p" | nc -lp "$p"; done ) &
          done; wait'
-sleep 1
+# Condizione, non orologio: appena i box compaiono si prosegue. Un `sleep 1` fisso costava un
+# secondo qui e poteva non bastare su una board lenta.
+i=0; while [ $i -lt 25 ] && [ -z "$("$kern" ps -q 2>/dev/null)" ]; do sleep 0.04; i=$((i+1)); done
 
 echo
 echo "==> kern ps - the PORTS column lists every mapping in the expanded range:"
