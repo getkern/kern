@@ -19,6 +19,31 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.20], 2026-07-28
+
+One fix, found on a Raspberry Pi 5 two hours after 0.6.19 shipped.
+
+### Fixed
+
+- **The `docker` shim was broken through a symlink, for every non-root user.** Installed the way
+  the README documents (`ln -s "$(command -v kern)" ~/.local/bin/docker`), `docker run --rm alpine
+  echo hi` failed with `usage: kern run: unknown flag`.
+
+  kern re-execs itself under `systemd-run --scope` to apply cgroup caps, and that path is taken by
+  an ordinary user, not by root. The re-exec replayed the argv the user TYPED and located the binary
+  with `current_exe()`, which resolves the symlink: the second pass got `argv[0] = kern`, no longer
+  recognised itself as the shim, and handed untranslated docker syntax to kern's own `run` verb.
+
+  Two independent losses that combine only through a symlink. Installed as a copy named `docker` it
+  worked, which is how it passed every check that had been run before a board ran it as a real user.
+
+  The re-exec now replays the argv kern decided rather than the one it was given. `kern box
+  --restart`, which freezes the argv into a systemd unit, had the same defect and worse consequences:
+  it would have written docker syntax into a file that fails at every boot.
+
+  Verified on the Pi 5, the Jetson Orin Nano and the Arduino UNO Q: 17/17 each, symlink and copy,
+  with `--device` still refused by name.
+
 ## [0.6.19], 2026-07-28
 
 Docker compose parity for web stacks, plus three defects found by running the work on real hardware.
