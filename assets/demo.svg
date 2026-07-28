@@ -38,7 +38,7 @@
 
     <!-- attach a resource slice to an isolated box -->
     <text x="22" y="181" class="l" style="animation-delay:1.4s"><tspan class="prompt">$</tspan> <tspan class="cmd">kern box train </tspan><tspan class="flag">--image</tspan><tspan class="cmd"> alpine </tspan><tspan class="prof">vcpu:heavy vdisk:scratch</tspan><tspan class="cmd"> -- ./train.sh</tspan></text>
-    <text x="22" y="204" class="l" style="animation-delay:2.0s"><tspan class="ok">  ✓</tspan> <tspan class="cmd">box "train" ready in </tspan><tspan class="ok">~2.7 ms capped</tspan>   <tspan class="dim">docker run: ~308 ms</tspan></text>
+    <text x="22" y="204" class="l" style="animation-delay:2.0s"><tspan class="ok">  ✓</tspan> <tspan class="cmd">box "train" ready in </tspan><tspan class="ok">~2.7 ms capped</tspan>   <tspan class="dim">docker run: ~289 ms</tspan></text>
     <text x="22" y="227" class="l" style="animation-delay:2.4s"><tspan class="cyan">    4 vCPU · 8 GB RAM · /vdisk/scratch (2 GB, in RAM) · rootless</tspan></text>
 
     <!-- govern a transcode · expose one device · a fresh box per request · a stack · a live UI -->

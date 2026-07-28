@@ -19,6 +19,35 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.22], 2026-07-28
+
+### Fixed
+
+- **`kern top` showed a pod's members by their project prefix, not their service name.** The name
+  was truncated to sixteen characters and the project scope alone is longer, so every member of a
+  stack rendered as the same string and the one column that tells them apart told you nothing.
+  `kern ps` had stripped the prefix all along: two views of one registry disagreeing about what a box
+  is called. The rule now lives in `ui::display_box_name`, which both call.
+
+### Changed
+
+- **Every timing in the README and BENCHMARKS.md was re-measured on one machine, on one night.** The
+  table was from June on Linux 6.17 and had drifted: podman was quoted at 155 ms and measures 288,
+  Docker at 308 and measures 289, a bare box at ~2 ms and measures 2.3. The demo GIF and SVG carried
+  the old figures in their pixels and were regenerated from the generator that now ships beside them.
+- **`KERN_TIMING` instruments the parent**, which had none: half of a box start was invisible.
+  `parent:name-check`, `parent:config+volumes`, `parent:claim`, `parent:unshare(ns)+idmap`,
+  `parent:setup->spawn`, `box lifetime (spawn->exit)`, `parent:teardown`.
+
+  What it found: `unshare(CLONE_NEWNET)` costs 430 us on this kernel, 17% of a box start, and is the
+  largest single item. It is the kernel's price for network isolation; `--net` skips it.
+
+  It also settled a question that a summary had answered wrongly. Against 0.3.0 on the same machine:
+  an UNCAPPED box went from 1.7 to 2.2 ms (thirteen mounts that mask `/proc` and close an escape
+  through `core_pattern`, plus a seccomp filter grown from 79 to 170 us), while the box a user
+  actually runs went from **4.92 ms to 2.45**, because 0.3.0 re-execed through `systemd-run` eleven
+  times per start and this does not.
+
 ## [0.6.21], 2026-07-28
 
 Compose compatibility, measured against 109 real `docker-compose.yml` files (all of
