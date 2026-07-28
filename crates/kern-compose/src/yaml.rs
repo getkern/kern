@@ -144,6 +144,19 @@ pub(crate) fn parse_with_env(
         return Err("no `services:` block found".to_string());
     }
     if boxes.is_empty() {
+        // Distinguish "the block has nothing in it" from "everything in it is behind an inactive
+        // profile". Hoppscotch puts EVERY service behind one, so a plain run legitimately starts
+        // nothing (Docker behaves identically) and kern answered "`services:` is empty" about a file
+        // that defines ten of them. Correct outcome, wrong noun: the reader goes looking for a
+        // missing block instead of setting COMPOSE_PROFILES.
+        if !skipped_by_profile.is_empty() {
+            let mut names: Vec<&str> = skipped_by_profile.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            return Err(format!(
+                "every service is behind an inactive profile ({}): nothing would run. Set COMPOSE_PROFILES to pick one",
+                names.join(", ")
+            ));
+        }
         return Err("`services:` is empty".to_string());
     }
     // A `depends_on` toward a service that was dropped as profile-inactive must not fail the topo sort
