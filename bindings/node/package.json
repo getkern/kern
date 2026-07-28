@@ -18,7 +18,7 @@
   "homepage": "https://github.com/getkern/kern/tree/main/bindings/node",
   "repository": {
     "type": "git",
-    "url": "https://github.com/getkern/kern.git",
+    "url": "git+https://github.com/getkern/kern.git",
     "directory": "bindings/node"
   },
   "bugs": {
