@@ -19,6 +19,51 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.21], 2026-07-28
+
+Compose compatibility, measured against 109 real `docker-compose.yml` files (all of
+`docker/awesome-compose`, plus Airflow, Sentry, Supabase, Appwrite, Kafka, Temporal, Immich,
+Mastodon, GitLab, Nextcloud, Grafana, MinIO, Keycloak, Odoo, Drupal, Moodle, Saleor, Vendure,
+Windmill, Dify, Directus and the rest: 12,111 lines) and against `docker compose config` itself
+rather than against an assumption.
+
+95 of the 109 now parse as they are, up from 90. Of the 14 that do not, 5 are refused by Docker
+too, 7 are pod port collisions that `--no-pod` accepts, and 2 diverge on purpose.
+
+### Added
+
+- **A container-only port is accepted, as a DECLARED port.** `ports: ["8000"]` and
+  `ports: ["${UNSET}:8000"]` were refused; Docker normalises both to `target: 8000` with no
+  published port and assigns an ephemeral one at `up`. kern has no ephemeral allocator, and
+  inventing one would publish a port the file never named on a number nobody can predict, so the
+  entry joins the pod-wide space `expose:` and `port:` already feed, with a warning saying no host
+  port was published and how to ask for one. The preflight still sees it, so a collision against it
+  is still refused. Supabase, Budibase, Jitsi and OpenCTI reach this form through an unset variable.
+
+### Fixed
+
+- **A `depends_on` typo was silently dropped.** The pruning loop removed every absent name, so the
+  topological sort never saw it and the ordering the file asked for vanished behind one vague line
+  that pointed at profiles. A name skipped by an inactive profile is still pruned; a name that was
+  never defined is now refused and quoted, as Docker refuses it. Cross-file dependencies
+  (`-f base.yml -f db.yml`) are unaffected.
+- **An `image:` beginning with `-` was accepted by compose** while the docker shim refused the
+  identical string as flag injection. Not exploitable (kern passes it as a value; it failed at the
+  registry with a message about the wrong thing) but one rule had two answers again.
+- **A per-service `networks:` with no top-level block passed in silence.** Docker refuses that file;
+  kern dropped the segmentation and said nothing. Stated once per run, not once per service: eight
+  identical lines on a seven-service file is how a reader learns to skim past warnings.
+- **`services:` is empty** was the answer for a file with ten services, all behind inactive profiles.
+  Right outcome, wrong noun. It now names them and says to set `COMPOSE_PROFILES`.
+- **An empty file was answered with a TOML noun** (`no [box.NAME] tables found`) for a document
+  saved as `.yml`. An empty file has no format to guess.
+- **The installer gave up on a WSL2 distro** whose curl is built against c-ares: an AAAA lookup
+  against the WSL NAT resolver goes unanswered while the A record resolves. One IPv4 retry, saying
+  why. `kern pull` was never affected.
+- **`examples/benchmark.py` took over ten minutes**, because a fixed 1000 runs per runtime is three
+  seconds for kern and five minutes for docker. Each batch now fits a time budget and prints the
+  run count it actually used: 118 s, same numbers.
+
 ## [0.6.20], 2026-07-28
 
 One fix, found on a Raspberry Pi 5 two hours after 0.6.19 shipped.
