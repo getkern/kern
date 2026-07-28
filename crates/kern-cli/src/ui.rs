@@ -550,3 +550,34 @@ mod tests {
         assert!(!out.contains('\x07'));
     }
 }
+
+/// The name to SHOW for a box: a pod member drops the project prefix, a standalone box is whole.
+///
+/// One statement, two readers. `kern ps` stripped the prefix and `kern top` did not, so every member
+/// of a pod rendered in `top` as the same truncated project scope (`toptest-ac3b7`, three times) and
+/// the only column that distinguishes them distinguished nothing. The registry keeps the full,
+/// project-scoped name; this is display only.
+pub fn display_box_name<'a>(name: &'a str, pod: &str) -> &'a str {
+    if pod.is_empty() {
+        return name;
+    }
+    name.strip_prefix(pod)
+        .and_then(|r| r.strip_prefix('-'))
+        .unwrap_or(name)
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::display_box_name;
+
+    #[test]
+    fn a_pod_member_shows_its_service_name_and_a_lone_box_is_untouched() {
+        assert_eq!(display_box_name("proj-9f6e-web", "proj-9f6e"), "web");
+        // Nessun pod: intatto.
+        assert_eq!(display_box_name("solitario", ""), "solitario");
+        // Prefisso che NON corrisponde: intatto, non tagliato a caso.
+        assert_eq!(display_box_name("altro-web", "proj-9f6e"), "altro-web");
+        // Il nome del pod senza il trattino non deve mordere il nome del servizio.
+        assert_eq!(display_box_name("projweb", "proj"), "projweb");
+    }
+}

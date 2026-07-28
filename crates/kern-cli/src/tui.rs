@@ -3019,9 +3019,15 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         } else {
             "├─ ".to_string()
         };
+        // Strip the pod prefix, exactly as `kern ps` does: the registry keeps the full
+        // project-scoped name, but a member shows the SERVICE name its compose file uses. Without
+        // this, every member of a pod rendered as the same truncated project prefix
+        // (`toptest-ac3b7` three times over) and the one column that tells them apart told you
+        // nothing. Display only; a standalone box is printed whole.
+        let shown = crate::ui::display_box_name(&r.name, &r.pod);
         let name_cell = format!(
             "{connector}{}",
-            trunc(&r.name, 16usize.saturating_sub(connector.chars().count()))
+            trunc(shown, 16usize.saturating_sub(connector.chars().count()))
         );
 
         let mem = r.mem.map_or("-".into(), human_bytes);

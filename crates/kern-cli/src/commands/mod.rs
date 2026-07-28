@@ -4006,10 +4006,7 @@ pub fn ps(
                 // so the member shows the SERVICE name the compose file uses. The registry keeps the
                 // full, project-scoped name; this is display only, and a standalone box (no pod) is
                 // printed whole.
-                let shown = Some(b.pod.as_str())
-                    .filter(|pod| !pod.is_empty())
-                    .and_then(|pod| b.name.strip_prefix(&format!("{pod}-")))
-                    .unwrap_or(b.name.as_str());
+                let shown = crate::ui::display_box_name(&b.name, &b.pod);
                 // dim connector, then reset, then the standard bold-cyan NAME padded to fill the cell.
                 let name = format!(
                     "{d}{connector}{z}{b}{c}{:<nw$}{z}",
