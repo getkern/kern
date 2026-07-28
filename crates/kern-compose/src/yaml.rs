@@ -84,6 +84,8 @@ pub(crate) fn parse_with_env(
 
     let mut boxes = Vec::new();
 
+    let mut skipped_by_profile: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut have_services = false;
     for (key, node) in &root.children {
@@ -112,6 +114,9 @@ pub(crate) fn parse_with_env(
                             "service '{name}': skipped - profile(s) [{}] not active (set COMPOSE_PROFILES to enable)",
                             b.profiles.join(", ")
                         ));
+                        // Remembered, so a `depends_on` pointing here can be told apart from one
+                        // pointing at a name that was never defined at all. See the pruning below.
+                        skipped_by_profile.insert(name.clone());
                         continue;
                     }
                     boxes.push(b);
@@ -121,7 +126,11 @@ pub(crate) fn parse_with_env(
                 // `volumes:`/`secrets:` top-level are consumed elsewhere (volumes auto-created on `-v`
                 // use; secrets pre-collected above). `networks:` is the one we actively warn about.
                 if key == "networks" {
-                    warn("'networks:' ignored - kern connects pod members by name (shared netns)");
+                    // `warn_once`: the same fact is also reachable from a per-service `networks:`,
+                    // and a file with both would otherwise say it twice (plus once per service).
+                    warn_once(
+                        "'networks:' ignored - kern connects pod members by name (shared netns)",
+                    );
                 }
             }
             // `x-…` is the Compose Specification's EXTENSION mechanism, not an unknown key: it is
@@ -142,19 +151,32 @@ pub(crate) fn parse_with_env(
     // when the dependent is itself active; here we DROP the dangling edge with a warning (the depended
     // service simply isn't part of this run). Only prune names that vanished - a truly unknown name
     // still errors later in `topo_order`.
+    // The comment above said a truly unknown name "still errors later in topo_order". It did not:
+    // this loop pruned EVERY absent name, so `topo_order` never saw the typo and the ordering the
+    // file asked for vanished with one vague line that even suggested looking at profiles. A
+    // dependency on a name that was never defined is a mistake in the file (Docker refuses it); a
+    // dependency on a service this run skipped for a profile is not. Only the second gets pruned.
     let present: std::collections::HashSet<String> = boxes.iter().map(|b| b.name.clone()).collect();
     for b in boxes.iter_mut() {
-        let mut dropped = false;
-        let n0 = b.depends_on.len() + b.depends_healthy.len() + b.depends_completed.len();
-        b.depends_on.retain(|d| present.contains(d));
-        b.depends_healthy.retain(|d| present.contains(d));
-        b.depends_completed.retain(|d| present.contains(d));
-        if b.depends_on.len() + b.depends_healthy.len() + b.depends_completed.len() != n0 {
-            dropped = true;
-        }
-        if dropped {
+        let mut dropped = 0usize;
+        let mut prune = |list: &mut Vec<String>| {
+            list.retain(|d| {
+                if present.contains(d) {
+                    return true;
+                }
+                if skipped_by_profile.contains(d) {
+                    dropped += 1;
+                    return false;
+                }
+                true // unknown: kept, so `topo_order` reports it by name
+            });
+        };
+        prune(&mut b.depends_on);
+        prune(&mut b.depends_healthy);
+        prune(&mut b.depends_completed);
+        if dropped > 0 {
             warn(&format!(
-                "service '{}': a dependency was dropped (target not active in this run - e.g. a profiled service)",
+                "service '{}': {dropped} dependency/ies dropped - the target is skipped by an inactive profile in this run",
                 b.name
             ));
         }
@@ -1802,6 +1824,19 @@ fn service_to_box(
             // list form (`networks: [net]`) has none.
             "networks" => {
                 b.net_aliases = collect_net_aliases(node);
+                // Only RECORDED here, announced once for the whole document. A per-service
+                // `networks:` used to pass in total silence when the file declared no top-level
+                // block (Docker rejects such a file; kern accepted it and said nothing about the
+                // segmentation it was dropping). Warning per service instead put eight identical
+                // lines on a seven-service file, and stating the same fact in two places is the
+                // exact defect class this codebase keeps paying for. One fact, one statement.
+                // Not flagged when aliases came out of it: something WAS honoured, and "ignored"
+                // would then be the lie.
+                if b.net_aliases.is_empty() {
+                    warn_once(
+                        "'networks:' ignored - kern connects pod members by name (shared netns)",
+                    );
+                }
             }
             // `init: true` → `--init`. kern already ships the reaping PID 1; this only wires the
             // compose spelling to it.
@@ -2763,6 +2798,25 @@ fn build_value(node: &Node) -> BuildDirective {
 /// user sees exactly which part of their compose didn't map 1:1.
 fn warn(msg: &str) {
     eprintln!("kern compose: {}", sanitize_for_terminal(msg));
+}
+
+/// `warn`, but the same text is printed once per run.
+///
+/// For facts that belong to the FILE rather than to a service: `networks:` is dropped for the whole
+/// stack, so a seven-service file was getting eight lines saying it. Repeating one fact per service
+/// trains the reader to skim past warnings, which is how the one that mattered gets missed.
+fn warn_once(msg: &str) {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static SEEN: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    }
+    // Thread-local rather than global: kern is one process per invocation, and a test that parses
+    // several documents on its own thread still sees each first occurrence.
+    let fresh = SEEN.with(|s| s.borrow_mut().insert(msg.to_string()));
+    if fresh {
+        warn(msg);
+    }
 }
 
 /// Neutralize control characters in a string bound for the user's terminal. `warn` interpolates

@@ -443,6 +443,23 @@ pub fn validate_runnable(boxes: &[ComposeBox]) -> Result<(), String> {
                 b.name
             ));
         }
+        // The same flag-injection rule the docker shim applies to a positional, applied here too.
+        // The shim refused `docker run -- --rootfs=/etc`; compose accepted the identical string as an
+        // `image:` and only failed much later, at the registry, with "no layers in manifest" - a
+        // message about the wrong thing entirely. Docker refuses such a reference outright, and one
+        // rule stated in one place beats two paths that disagree about the same string.
+        for (role, value) in [
+            ("image", b.image.as_deref()),
+            ("rootfs", b.rootfs.as_deref()),
+            ("service name", Some(b.name.as_str())),
+        ] {
+            if let Some(v) = value.filter(|v| v.starts_with('-')) {
+                return Err(format!(
+                    "service '{}': {role} '{v}' begins with '-' and would be read as a flag (injection). {role}s cannot start with '-' (same rule as Docker)",
+                    b.name
+                ));
+            }
+        }
         // `port:` and an explicit `PORT=` that DISAGREE are a contradiction, and silently picking a
         // winner is the worst answer available: `port:` is what the pod preflight reserves, so if the
         // service actually listens on the other number the preflight is protecting a port nobody
@@ -472,6 +489,13 @@ fn parse_layer(
     // - Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
     // "has no services".
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // An empty file matches NEITHER format, so `is_yaml` says no and it fell through to the TOML
+    // parser, which answered "no [box.NAME] tables found" - a TOML noun, for a file the user almost
+    // certainly saved as `.yml`. Name the actual problem instead of guessing a format for a document
+    // that has none.
+    if text.trim().is_empty() {
+        return Err("the file is empty: a compose file needs a `services:` block".into());
+    }
     if is_yaml(text) {
         yaml::parse_with_env(text, dotenv, require_runnable)
     } else {
