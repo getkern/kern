@@ -1736,7 +1736,13 @@ fn service_to_box(
             }
             "environment" => b.env = kv_pairs(node),
             "env_file" => b.env_file = list_value(node),
-            "ports" => b.ports = ports_value(node, name),
+            "ports" => {
+                // A container-only entry joins the DECLARED space (what `expose:`/`port:` feed)
+                // instead of being refused: same statement, one space, as everywhere else here.
+                let mut declared = Vec::new();
+                b.ports = ports_value(node, name, &mut declared);
+                b.expose.extend(declared);
+            }
             // `port:` is kern's own key, not a Compose Specification one: it declares the port this
             // service LISTENS on inside the shared namespace, so the preflight can see a service that
             // publishes nothing. Parsed here rather than passed through as text, so a malformed value
@@ -2338,7 +2344,9 @@ fn interpolate_expr(expr: &str, dotenv: &crate::DotEnv) -> String {
 /// dropping the proto would mislead. A plain `host:box` (no host-IP) publishes on kern's loopback
 /// default, which differs from Docker's all-interfaces default → warn so a Docker user isn't surprised
 /// their service "doesn't answer from outside".
-fn ports_value(node: &Node, svc: &str) -> Vec<String> {
+/// Published port specs, plus (out-param) the container-only ones, which are DECLARED rather than
+/// published: see the comment at the detection site.
+fn ports_value(node: &Node, svc: &str, declared: &mut Vec<(u16, bool)>) -> Vec<String> {
     let mut out = Vec::new();
     let mut push_spec = |spec: String| {
         let (host_port, proto) = match spec.rsplit_once('/') {
@@ -2364,6 +2372,31 @@ fn ports_value(node: &Node, svc: &str) -> Vec<String> {
         }
         // host:box with no host-IP → kern binds loopback (secure default, unlike Docker's 0.0.0.0).
         let colons = host_port.matches(':').count();
+        // CONTAINER-ONLY forms: `"8000"` and `":8000"`. Docker treats them identically (`config`
+        // normalises both to `target: 8000` with no `published:`) and picks an EPHEMERAL host port at
+        // `up`. kern has no ephemeral allocator, and inventing one would be worse than saying so: it
+        // would publish a port the file never named, on a number nobody could predict.
+        //
+        // So the entry becomes a DECLARED port instead of a published one - the same space `expose:`
+        // and `port:` feed - which is exactly what it means inside the pod: the service listens here.
+        // Refusing it was the alternative, and it cost four real files (Supabase, Budibase, Jitsi,
+        // OpenCTI) that reach this form through an unset `${VAR}` and that Docker accepts. Measured
+        // against `docker compose config`, not assumed.
+        let bare = host_port.strip_prefix(':').unwrap_or(&host_port);
+        if colons == 0 || (colons == 1 && host_port.starts_with(':')) {
+            match bare.parse::<u16>() {
+                Ok(n) if n > 0 => {
+                    declared.push((n, keep_proto == "/udp"));
+                    warn_once(
+                        "a container-only port (`8000` / `:8000`) is DECLARED, not published: kern assigns no random host port. Write `HOST:8000` to publish one",
+                    );
+                }
+                _ => warn(&format!(
+                    "service '{svc}': port '{spec}' is not a port in 1..=65535, entry SKIPPED"
+                )),
+            }
+            return;
+        }
         if colons == 1 {
             warn(&format!(
                 "service '{svc}': port '{host_port}' bound to 127.0.0.1 (kern is loopback-default, unlike Docker); use 0.0.0.0:{host_port} to expose on all interfaces"
