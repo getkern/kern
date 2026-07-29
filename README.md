@@ -170,7 +170,7 @@ deny-by-default. GPU slices are on the [Roadmap](#roadmap).
 | **Block I/O** | `--io-weight` | I/O bandwidth weight | cgroup `io` |
 | **GPU** | *(roadmap)* | A *slice* of a GPU (VRAM cap, then time-slice) | 🚧 cooperative governor, first-party / noisy-neighbour, **not** a hard boundary |
 
-¹ On the default WSL2 kernel the `memory` controller isn't delegated: kern warns and shows the one-line
+¹ Where the `memory` controller is not delegated to a non-root user's scope, kern warns and shows the one-line
 `.wslconfig` fix; enforced natively on Linux. Profiles (`vcpu:`/`vdisk:`/`vgpio:`) are reusable presets in
 `~/.config/kern/kern.toml`, see [docs/CONFIG.md](docs/CONFIG.md). Author them with `kern probe` (list the
 host resources you can slice), `kern examples` (print a sample `kern.toml`), and `kern validate` (check one).
@@ -274,9 +274,10 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
 kern runs inside **WSL2**, a real Linux kernel, so the isolation (namespaces + seccomp) and `--cpus`
-cap work for real. **One honest exception:** `--memory` needs a one-line WSL kernel tweak the default
-omits (kern **warns** and shows it; the fix and the same note for Raspberry Pi OS live under
-[Requirements & limitations](#requirements--limitations)). On a native Linux host `--memory` is enforced
+cap work for real, `--memory` included: measured on a stock WSL2 kernel (6.18), a 128m box reads back
+`memory.max = 134217728`. Where a host does not delegate the `memory` controller (a stock Raspberry Pi
+OS, and older WSL2 kernels), kern **warns** and shows the one-line fix rather than pretending, see
+[Requirements & limitations](#requirements--limitations). On a native Linux host `--memory` is enforced
 out of the box. The installer ensures the WSL2 engine (self-elevating for the one reboot it may need, then
 resuming on its own), imports kern's **own** pre-baked distro (a tiny Alpine + kern, no Ubuntu, no
 manual steps), drops the `kern.exe` shim on your PATH, and verifies end-to-end. Every download is
@@ -437,9 +438,9 @@ Pure standard library on both sides, no transitive dependencies: the bindings sh
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux
 userland (the Arduino UNO Q). **On Windows, WSL2 *is* that Linux kernel**, and the one-line PowerShell
-installer sets up WSL2 and drops in a pre-baked kern distro, so isolation and `--cpus` are enforced
-for real (`--memory` needs a one-line WSL kernel tweak the default omits, see
-[Requirements & limitations](#requirements--limitations); enforced natively on real Linux). Honest
+installer sets up WSL2 and drops in a pre-baked kern distro, so isolation, `--cpus` and `--memory` are
+all enforced for real (measured on a stock 6.18 WSL2 kernel: a 128m box reads back `memory.max =
+134217728`). Honest
 caveat: you're inside the WSL2 VM, so it's "no Docker Desktop", not "no VM". kern does **not** run on stock Android-the-OS (Bionic, SELinux, userns off). Daemonless is a big
 win on RAM-constrained boards (0 resident vs ~186 MB), see **[EDGE.md](EDGE.md)**. ARM CI is tracked
 in the issues.
@@ -693,8 +694,9 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
   WSL2; there is no native macOS/Windows port ([Roadmap](#roadmap)).
 - Hard `--memory`/`--cpus`/`--pids` caps need a **delegated cgroup** (a systemd user manager, or root);
   without one they degrade to best-effort and kern says so. Microsoft's default WSL2 kernel and a stock
-  Raspberry Pi OS don't delegate the `memory` controller, so `--memory` is accepted-but-unenforced there
-  (same as Docker/Podman) until you enable it: on **WSL**, add `cgroup_enable=memory cgroup_memory=1` to
+  Raspberry Pi OS, and WSL2 kernels older than the current one) don't delegate the `memory` controller,
+  so `--memory` is accepted-but-unenforced there (same as Docker/Podman) until you enable it. A current
+  WSL2 kernel does enforce it, measured. To enable it where it is missing: on **WSL**, add `cgroup_enable=memory cgroup_memory=1` to
   `kernelCommandLine` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`; on **Raspberry
   Pi OS**, add `cgroup_enable=memory cgroup_memory=1` to `/boot/firmware/cmdline.txt`, then reboot.
 - `newuidmap` + `/etc/subuid` for a full uid range (`--uid-range`, `--ssh`); a single-uid box works
