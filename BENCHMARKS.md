@@ -9,21 +9,21 @@ rootfs directory). This is a 0.x project, treat these as "fast class", not a gua
 
 > **Two numbers, and which one you get depends on whether the box is capped.**
 >
-> This table measures a box with **no cgroup cap**, which is what makes it comparable to bubblewrap.
-> In that configuration 0.3.0 (2026-06-06) reports **1.7 ms** and v0.6.21 reports **2.2 ms** on the
-> same machine today, each with the benchmark script of its own era, bubblewrap steady at 2.8 and 2.7
-> as the control. kern got 0.5 ms slower there, and the reason is visible in `KERN_TIMING` and
-> `strace`: v0.6.21 issues **thirteen more `mount` calls**, putting `/dev/null` over `/proc/kcore`,
-> `kallsyms`, `kmsg`, `keys`, `latency_stats`, `timer_list`, `sched_debug` and `scsi`, remounting
-> `sysrq-trigger`, `irq`, `bus`, `fs` and `asound` read-only, and mounting a cgroup2 view. That set
-> closes a container escape through `core_pattern`. The seccomp filter grew from 79 to 170 us for the
-> same reason.
+> **The box you actually run is capped, and it is twice as fast as it was**: plain `kern box`, no
+> environment set, **0.3.0 takes 4.92 ms and v0.6.21 takes 2.45 ms** on this machine today. 0.3.0
+> re-execs itself through `systemd-run` for every box (11 `execve` of it per start); v0.6.21 caps
+> directly in its own delegated slice and calls it zero times, while the cap still bites (200 MiB
+> under `--memory 32m` still exits 137).
 >
-> **What a user actually runs is capped, and there v0.6.21 is twice as fast**: plain `kern box`, no
-> environment set, **0.3.0 takes 4.92 ms and v0.6.21 takes 2.45 ms**. 0.3.0 re-execs itself through
-> `systemd-run` for every box (11 `execve` of it per start); v0.6.21 caps directly in its own
-> delegated slice and calls it zero times, while the cap still bites (200 MiB under `--memory 32m`
-> still exits 137).
+> **The table below measures an UNCAPPED box**, which is what makes it comparable to bubblewrap, and
+> there kern went the other way: 0.3.0 reports **1.7 ms** against v0.6.21's **2.2 ms**, each with the
+> benchmark script of its own era, bubblewrap steady at 2.8 and 2.7 as the control. Part of that 0.5
+> ms is visible in `KERN_TIMING` and `strace`: v0.6.21 issues **thirteen more `mount` calls**, putting
+> `/dev/null` over `/proc/kcore`, `kallsyms`, `kmsg`, `keys`, `latency_stats`, `timer_list`,
+> `sched_debug` and `scsi`, remounting `sysrq-trigger`, `irq`, `bus`, `fs` and `asound` read-only, and
+> mounting a cgroup2 view, which together close a container escape through `core_pattern`; the seccomp
+> filter grew from 79 to 170 us for the same reason. That accounts for about 185 us of it. The rest is
+> not attributed, and is recorded as such in [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than explained away.
 >
 > The single most expensive thing left is not kern's: `unshare(CLONE_NEWNET)` costs **430 us** here
 > (503 us for the namespace step with it, 74 us with `--net`), which is 17% of a box start and is the

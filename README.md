@@ -17,7 +17,7 @@ one case of a smaller idea.
 Jetson, Arduino UNO Q), where a 186 MB Docker daemon is a poor fit (on the Pi 5 tested here, no engine
 was installed at all).
 
-A throwaway box in **3.3 ms** (vs 289 for `docker run`) · `exec` **1.4 ms** (vs 42) · `ps` **0.8 ms** (vs 8.2) · `logs` **0.8 ms** (vs 8.3) · **~1.8 MB** static binary · **0 RAM at rest** · **rootless**
+A throwaway box in **3.3 ms** (vs 289 for `docker run`) · `exec` **0.9 ms** (vs 42) · `ps` **0.5 ms** (vs 8.2) · `logs` **0.5 ms** (vs 8.3) · **~1.8 MB** static binary · **0 RAM at rest** · **rootless**
 
 <p align="center">
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.3 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
@@ -42,7 +42,7 @@ then `kern box dev --image alpine -- sh`
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.8 MB static binary, no daemon.">
 </p>
 
-<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice), a bare box is <b>~2.4 ms</b> here (<code>kern bench --rootfs</code> median; the table below measures an UNCAPPED box (comparable to bubblewrap) and is from 0.3.0; a capped `kern box`, which is what you actually run, takes 2.45 ms today against 4.92 ms on 0.3.0, because 0.3.0 re-execed through systemd-run for every box); a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not just kern's ~1.24 ms of setup. The comparison table under <a href="#performance">Performance</a> is a separate Linux 6.17 desktop; your hardware and cgroup delegation differ, so measure your own. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology and on-device board numbers.</sub>
+<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice) and a bare one is <b>~2.4 ms</b>, both a full <code>kern box</code> lifecycle (fork, isolate, run, tear down) rather than kern's ~1.24 ms of setup. The <a href="#performance">Performance</a> table was measured on the same machine on the same night. Your hardware and cgroup delegation differ, so measure your own: <code>kern bench --rootfs &lt;dir&gt;</code>. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology, the capped-vs-uncapped split, and on-device board numbers.</sub>
 
 [Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Storage](docs/STORAGE.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
@@ -598,12 +598,12 @@ where each boundary is real, cooperative, or opt-in.
 
 ## Performance
 
-One isolated `/bin/true`, warm image cache, one box per run. The x86_64 table below was measured on a
-**20-core / 28-thread, Linux 6.17, NVMe, systemd-user** desktop (exact per-runtime commands in
-**[BENCHMARKS.md](BENCHMARKS.md)**). kern's figure is informally reproduced on the machine the hero and
-demo numbers come from, an **Intel i7-14700KF, Linux 7.0**, same class, where a P-core-pinned
-`/bin/true` box lands in the low-single-digit-ms range (an E-core is slightly higher). Your
-numbers vary with hardware and load; board rows are from on-device runs.
+One isolated `/bin/true`, warm image cache, one box per run. The x86_64 row below was measured on an
+**Intel i7-14700KF (20-core / 28-thread), Linux 7.0, NVMe, systemd-user** desktop, which is the same
+machine the hero and demo numbers come from, in one sitting against the runtimes installed there
+(exact per-runtime commands in **[BENCHMARKS.md](BENCHMARKS.md)**). Your numbers vary with hardware,
+kernel and load, so measure your own with `kern bench --rootfs <dir>`; board rows are from on-device
+runs.
 
 ### A working day, not a cold start
 
@@ -709,6 +709,11 @@ real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a 
 starts in **~2.3 ms** from one **~1.8 MB** binary. Versioned under semver: each release is the official
 build of that version, and pre-1.0 means only that the CLI and config *surface* can still change between
 minor versions, always called out in [CHANGELOG.md](CHANGELOG.md).
+
+What kern knows it does not know, or does not do yet, is written down in
+[OPEN_ITEMS.md](OPEN_ITEMS.md) rather than left for you to discover: a gap in a startup measurement
+we have not attributed, why the seccomp filter is still a denylist, which fleet limit is a guard rail
+instead of a boundary. Declared debt is cheaper than silent debt.
 
 **Recently:** an explicit-`backend` resource-profile schema; `kern exec` joins the box's cgroup so an
 exec'd command inherits its `--memory`/`--pids` caps (with an honest warning where a rootless per-box
