@@ -17,7 +17,7 @@ one case of a smaller idea.
 Jetson, Arduino UNO Q), where a 186 MB Docker daemon is a poor fit (on the Pi 5 tested here, no engine
 was installed at all).
 
-A throwaway box in **3.3 ms** (vs 289 for `docker run`) · `exec` **0.9 ms** (vs 42) · `ps` **0.5 ms** (vs 8.2) · `logs` **0.5 ms** (vs 8.3) · **~1.8 MB** static binary · **0 RAM at rest** · **rootless**
+Milliseconds: a throwaway box **3.3** · `exec` **0.9** · `ps` **0.5** · `logs` **0.5** (289 · 42 · 8.2 · 8.3 on a daemon runtime) · **~1.8 MB** static binary · **0 RAM at rest** · **rootless**
 
 <p align="center">
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.3 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
@@ -797,6 +797,6 @@ tree is deliberately tiny (`libc` only on the Rust side; standard-library-only o
 copyleft-free; `cargo deny check licenses` is clean.
 
 **Trademark.** The *code* is free under [Apache-2.0](LICENSE): fork it, embed it, run it, no strings.
-But **"kern" is a trademark** of the project: please don't use the name for a fork, a
-modified build, or a competing product/service without permission, see [TRADEMARK.md](TRADEMARK.md).
-Open code, protected name, the same split Rust and Firefox use.
+The licence itself grants no rights to the project's names or logo (§6), so please don't use "kern"
+for a fork, a modified build, or a competing product or service without permission, see
+[TRADEMARK.md](TRADEMARK.md). Open code, protected name, the same split Rust and Firefox use.

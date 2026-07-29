@@ -40,7 +40,7 @@ never as an unqualified claim about what another tool cannot do.
 ## Why this exists
 
 The code is yours to build on freely. The **name** stays a reliable signal of the upstream project, so
-that "kern" always means *this* project. Same split used by Rust, Firefox, Linux, and CNCF projects:
+that "kern" always means *this* project. Same split used by Rust, Firefox, and CNCF projects:
 **open code, protected name.**
 
 Questions or permission requests: open an issue on the repository or email hello@getkern.dev.

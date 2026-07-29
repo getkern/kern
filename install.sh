@@ -86,7 +86,16 @@ install -m755 "${tmp}/kern" "${bindir}/kern"
 
 info "installed $("${bindir}/kern" --version)"
 case ":${PATH}:" in
-  *":${bindir}:"*) ;;
+  *":${bindir}:"*)
+    # On PATH is not the same as FIRST on PATH. An older kern in /usr/local/bin keeps winning, so
+    # `kern --version` reports the old one and the install looks like it did nothing. Say which file
+    # actually answers, and only when it is not the one just written.
+    winner=$(command -v kern 2>/dev/null || true)
+    if [ -n "$winner" ] && [ "$winner" != "${bindir}/kern" ]; then
+      printf "${DIM}    note: \`kern\` still resolves to ${winner} ($("$winner" --version 2>/dev/null || echo 'unknown version')) - it comes earlier on your PATH${ZZ}\n"
+      printf "${DIM}    to use the one just installed: export PATH=\"${bindir}:\$PATH\"  (or remove ${winner})${ZZ}\n"
+    fi
+    ;;
   *) printf "${DIM}    ${bindir} is not on your PATH - add:  export PATH=\"${bindir}:\$PATH\"${ZZ}\n" ;;
 esac
 # Optional Docker drop-in: invoked as `docker` / `docker-compose`, kern rewrites the argv (no daemon,
