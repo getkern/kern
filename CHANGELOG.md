@@ -228,6 +228,20 @@ three ARM boards. Every one of them is the same shape: two places deciding the s
   `REQUIRED`; the "copy-paste this starter" block in [docs/CONFIG.md](docs/CONFIG.md) validates, and
   so does the output of `kern examples`.
 
+- **Two of the three SDK examples in the README did not run.** The Node one built a `Sandbox` and
+  called `runCode` without opening it, so it threw on the first useful line; the Python one passed
+  `memory="512m"` where the constructor takes `memory_mb`, so it raised a `TypeError`. Both are in
+  the section that shows what embedding kern looks like. Found by extracting every `python`/`js`
+  block from the shipped docs and executing it against the PUBLISHED packages, which is now a
+  harness: 6 runnable examples, all passing, 12 fragments (excerpts with no import) reported as
+  skipped rather than counted as passing.
+
+- **The README quoted the same timings sixteen times too often.** Every repeated number is a place
+  that must be updated when it is re-measured, and this release already had a count drift. Prose
+  restatements of figures that live in the comparison tables are gone (66 mentions to 60 overall,
+  27 to 21 in prose, `~2.3 ms` from ten to five); the opening pitch, the at-a-glance line and every
+  table keep theirs, because that is where a number belongs.
+
 - **`KERN_CONFIG` was called "documented" and was not.** It appears in no README, no `docs/`, and no
   `--help`, while now governing which file every read AND write touches.
   [docs/CONFIG.md](docs/CONFIG.md) gains a "Which file is in effect" table covering `--config`,

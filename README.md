@@ -77,11 +77,11 @@ print(r.stdout, r.success)                     # → a fresh, discarded-after bo
 
 ## What you'd use it for
 
-One move under all of these: a fresh, isolated, resource-capped box in **~2.3 ms**, wherever you would
+One move under all of these: a fresh, isolated, resource-capped box in single-digit milliseconds, wherever you would
 otherwise reach for a container, a cloud sandbox, or root.
 
 - **Development:** one command, in a real box, in milliseconds, then gone. A service, a database or a
-  clean per-language build box starts in **~2.3 ms**, runs, and is thrown away with your host untouched
+  clean per-language build box starts, runs, and is thrown away with your host untouched
   and nothing left resident ([docker-shim.sh](examples/docker-shim.sh) · [compose-declared-ports.sh](examples/compose-declared-ports.sh) · [familiar-commands.sh](examples/familiar-commands.sh) · [database-box.sh](examples/database-box.sh)).
 - **AI agents:** run each model-generated tool call in a fresh, network-off box, sandbox faults come back
   as data, not crashes ([warm-kernel.py](examples/warm-kernel.py) · [kern-mcp for Claude Desktop / Cursor](examples/mcp-code-interpreter.md) · [agent-tool-runner.py](examples/agent-tool-runner.py)).
@@ -129,7 +129,7 @@ translates what maps, **refuses** what would change behaviour, and never silentl
 
 - ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.8 MB static binary, **one Rust dependency**
   (`libc`); it shells out to the system's `curl`/`tar` only to *pull* images (running a box needs
-  neither). Cold start **~2.3 ms** vs ~289 ms for `docker run`; **~7 MB** RSS per box vs an always-on
+  neither). A cold start faster than a daemon round-trip; **~7 MB** RSS per box vs an always-on
   ~186 MB daemon (`dockerd` + `containerd`). `kern ps` reads state straight from the kernel.
 - 👤 **Rootless by default.** Unprivileged user namespaces: your uid maps to root *inside* the box,
   and only there. Single-uid is the default and is `libc`-pure (no helper, smallest id surface);
@@ -399,14 +399,15 @@ agent tools, per-request workers), and a structured result back, including rich 
 
 ```python
 from kern_sandbox import Sandbox              # pip install kern-sandbox
-with Sandbox(memory="512m", network=False) as s:
+with Sandbox(memory_mb=512, network=False) as s:
     print(s.run_code("print(6 * 7)").stdout)  # 42
 ```
 
 ```js
-import { Sandbox } from "kern-sandbox";       // npm install kern-sandbox
-const s = new Sandbox({ memory: "512m", network: false });
-console.log((await s.runCode("print(6*7)")).stdout);
+import { withSandbox } from "kern-sandbox";   // npm install kern-sandbox
+await withSandbox({ memory: "512m", network: false }, async (s) => {
+  console.log((await s.runCode("print(6*7)")).stdout);   // 42
+});
 ```
 
 ```rust
@@ -716,7 +717,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 **0.6.23.** Everything in [Features](#features) works today and is tested (649 Rust, 61 Python and 50
 Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
 real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
-starts in **~2.3 ms** from one **~1.8 MB** binary. Versioned under semver: each release is the official
+starts in single-digit milliseconds from one **~1.8 MB** binary. Versioned under semver: each release is the official
 build of that version, and pre-1.0 means only that the CLI and config *surface* can still change between
 minor versions, always called out in [CHANGELOG.md](CHANGELOG.md).
 
@@ -777,7 +778,7 @@ locks the whole root), a kernel-level boundary, deny-by-default on devices, with
 masked, and an opt-in **Landlock** (LSM) layer on top (plus an experimental egress allowlist). That's
 strong for first-party and noisy-neighbour workloads. For **adversarial, multi-tenant untrusted code** where you want a
 hardware-virtualization boundary, a microVM/VM adds a layer kern doesn't: a deliberate trade for
-~2.3 ms starts and a ~1.8 MB footprint.
+single-digit-millisecond starts and a ~1.8 MB footprint.
 
 The full threat model, per-feature notes, and the honest *"kern vs a microVM, when to use what"*
 guidance live in [SECURITY.md](SECURITY.md). Found a vulnerability? Report it **privately** via GitHub
