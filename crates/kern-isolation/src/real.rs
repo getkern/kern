@@ -2364,6 +2364,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         spec.io_weight,
     );
 
+    // Under a systemd scope the caps were handed to `systemd-run` as `MemoryMax=`/`CPUQuota=`/
+    // `TasksMax=` and nothing re-checked them: systemd accepts a property the kernel cannot honour
+    // and reports nothing. Verify the EFFECTIVE chain from inside the scope, where /proc/self/cgroup
+    // is the box's own. Found on an Arduino UNO Q's Android kernel, whose `cpu` controller exposes
+    // only `cpu.weight` and no `cpu.max`, turning `--cpus` into a share with no message at all.
+    if std::env::var_os("KERN_SCOPE").is_some() {
+        crate::cgroup::warn_unenforced_caps(spec.memory_max, spec.cpus, spec.pids_max);
+    }
+
     // FAIL-CLOSED on the direct fast path. When we DELIBERATELY skipped the per-box systemd scope
     // (`took_direct_cap_path()` - the SAME canonical predicate `reexec` used, so they can't diverge), the
     // box's OWN cgroup is the sole enforcer. `apply_limits` returns `None` iff a MANDATORY cap didn't bite

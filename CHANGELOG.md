@@ -19,6 +19,28 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.24], 2026-07-29
+
+### Fixed
+
+- **`--cpus` could be accepted and silently not enforced, and `doctor` called it enforced.** On a
+  host whose `cpu` controller exposes only the *weight* interface and no `cpu.max` (no
+  `CONFIG_CFS_BANDWIDTH`), a CPU quota becomes a share. kern said nothing, and `kern doctor` printed
+  a green "resource caps enforced" because it checked whether the **memory** controller was delegated
+  and generalised the verdict to all three knobs. Measured on an Arduino UNO Q's Android kernel
+  (6.16): `cgroup.controllers` lists `cpu`, and `cpu.max` exists nowhere in the chain.
+
+  Two causes, both now closed. The **scope** path handed the caps to `systemd-run` as
+  `MemoryMax=`/`CPUQuota=`/`TasksMax=` and never re-checked; systemd accepts a property the kernel
+  cannot honour and reports nothing. The direct path had verified its own writes since 0.6.x, so the
+  rule existed and only one of the two callers used it: `warn_unenforced_caps` now reads the
+  EFFECTIVE chain from inside the scope, for `kern box` and `kern run` alike. And `doctor` now probes
+  for `cpu.max` itself instead of inferring it from a delegated controller name, because "this cgroup
+  can distribute CPU" and "this cgroup can cap CPU" are different questions.
+
+  Unchanged where the interface exists: on x86_64 a capped box still prints nothing and the doctor row
+  stays green. The warning only speaks when it has something true to say.
+
 ## [0.6.23], 2026-07-29
 
 ### Changed

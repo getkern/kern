@@ -127,6 +127,36 @@ pub fn info() -> Result<(), Error> {
     Ok(())
 }
 
+/// Does this kernel expose the cgroup-v2 CPU **bandwidth** interface (`cpu.max`), as opposed to only
+/// the weight one (`cpu.weight`)? A `cpu` entry in `cgroup.controllers` answers "can this cgroup
+/// distribute CPU", not "can it cap it": without `CONFIG_CFS_BANDWIDTH` the controller is present and
+/// `cpu.max` is not, so a quota silently becomes a share.
+///
+/// Walks this process's own chain, since the file appears on a cgroup only once its parent enables the
+/// controller. Best-effort and read-only: an unreadable `/proc/self/cgroup` returns `true`, because a
+/// warning we cannot substantiate is worse than none.
+fn cpu_bandwidth_interface_present() -> bool {
+    let Ok(raw) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return true;
+    };
+    let Some(rel) = raw
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)
+    else {
+        return true;
+    };
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    loop {
+        if dir.join("cpu.max").exists() {
+            return true;
+        }
+        if !dir.pop() || !dir.starts_with("/sys/fs/cgroup") {
+            return false;
+        }
+    }
+}
+
 /// Actually try to create an unprivileged user namespace in a throwaway child (so a failure can't
 /// affect us) - more truthful than reading any single sysctl, which varies by distro (Debian's
 /// `unprivileged_userns_clone`, Ubuntu's AppArmor gate, …). Returns whether it succeeded.
@@ -201,7 +231,22 @@ fn check_cgroup() -> R {
         // Couldn't read the delegated set - don't over- or under-claim.
         R::Ok("cgroup v2 + systemd --user scope: memory/pids/cpu caps where delegated".into())
     } else if ctrls.iter().any(|c| c == "memory") {
-        R::Ok("cgroup v2 + systemd --user scope: resource caps enforced (memory delegated)".into())
+        // A DELEGATED controller is not the same as an ENFORCEABLE knob, and this row used to
+        // generalise from one to all three. On an Arduino UNO Q's Android kernel `cgroup.controllers`
+        // lists `cpu`, yet no `cpu.max` exists anywhere in the chain: the controller is there with only
+        // its *weight* interface, so `--cpus` is a share and not a ceiling. Reporting "resource caps
+        // enforced" there is the tool telling a comfortable lie about a knob it never looked at.
+        if cpu_bandwidth_interface_present() {
+            R::Ok(
+                "cgroup v2 + systemd --user scope: resource caps enforced (memory delegated)"
+                    .into(),
+            )
+        } else {
+            R::Warn(
+                "memory/pids caps are enforced, but this kernel's `cpu` controller has no bandwidth interface (`cpu.max`) - `--cpus` is a SHARE here, not a ceiling".into(),
+                "needs CONFIG_CFS_BANDWIDTH=y; memory and pids caps are unaffected".into(),
+            )
+        }
     } else {
         R::Warn(
             format!(

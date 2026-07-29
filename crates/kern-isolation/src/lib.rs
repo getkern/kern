@@ -53,6 +53,7 @@ pub use cgroup::systemd_scope_mode;
 /// Is the systemd manager kern would use present? (root → the system manager `/run/systemd/system`,
 /// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;
+pub use cgroup::warn_unenforced_caps;
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
 /// records itself in an in-process marker) and the scrub of an INHERITED marker (a nested kern must
 /// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,

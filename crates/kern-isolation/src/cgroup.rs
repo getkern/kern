@@ -840,6 +840,59 @@ fn is_real_limit(raw: &str) -> bool {
     !v.is_empty() && !v.starts_with("max")
 }
 
+/// Warn for every cap the caller ASKED for that nothing in this process's cgroup chain enforces.
+///
+/// The direct path already does this at the inner cgroup (see the `capped_in_tree` warnings above),
+/// but the **scope** path hands the knobs to `systemd-run` as `MemoryMax=`/`CPUQuota=`/`TasksMax=`
+/// and never re-checked. systemd accepts a property the kernel cannot honour and says nothing: on an
+/// Arduino UNO Q's Android kernel the `cpu` controller exposes only the *weight* interface
+/// (`cpu.weight`) and no `cpu.max` anywhere in the chain, so `--cpus 0.5` became a share rather than
+/// a ceiling, in silence, while `kern doctor` reported caps as enforced. Measured there, not assumed.
+///
+/// Runs INSIDE the scope, so `/proc/self/cgroup` is the box's own chain and the answer is the
+/// effective one. Read-only and best-effort: an unreadable `/proc/self/cgroup` means we cannot tell,
+/// and a warning we cannot justify is worse than none, so it stays quiet.
+pub fn warn_unenforced_caps(memory: Option<u64>, cpus: Option<f64>, pids: Option<u64>) {
+    let Ok(raw) = fs::read_to_string("/proc/self/cgroup") else {
+        return;
+    };
+    // cgroup v2 line: `0::/user.slice/.../foo.scope`. Anything else is v1/hybrid, which this check
+    // does not model - staying quiet beats warning about a layout we did not inspect.
+    let Some(rel) = raw
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)
+        .filter(|p| p.starts_with('/'))
+    else {
+        return;
+    };
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    for (asked, file, flag, why) in [
+        (
+            memory.is_some(),
+            "memory.max",
+            "--memory",
+            "the `memory` controller is not delegated to this cgroup",
+        ),
+        (
+            cpus.is_some(),
+            "cpu.max",
+            "--cpus",
+            "this kernel's `cpu` controller exposes no bandwidth interface (`cpu.max`), only weights",
+        ),
+        (
+            pids.is_some(),
+            "pids.max",
+            "--pids",
+            "the `pids` controller is not delegated to this cgroup",
+        ),
+    ] {
+        if asked && !capped_in_tree(&dir, file) {
+            eprintln!("kern: {flag} accepted but NOT enforced here - {why}; the box can exceed it");
+        }
+    }
+}
+
 /// Is a `memory.max`/`cpu.max`-style cap actually in force for the box - at THIS cgroup OR any
 /// ancestor up to the cgroup root? Accounts for the two-layer model (inner cgroup + outer systemd
 /// scope): the inner write may fail while an ancestor still enforces the cap. The "no cap" sentinel

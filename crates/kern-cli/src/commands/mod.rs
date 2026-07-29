@@ -1636,6 +1636,11 @@ pub fn run(
             "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
              delegation unavailable) - the command runs UNCAPPED."
         );
+    } else if std::env::var_os("KERN_SCOPE").is_some() {
+        // The branch above stays quiet under a scope because the scope is ASSUMED to enforce the
+        // caps it was given. systemd accepts `MemoryMax=`/`CPUQuota=` that the kernel cannot honour
+        // and reports nothing, so verify the effective chain rather than trusting the assumption.
+        kern_isolation::warn_unenforced_caps(memory, cpus, None);
     }
     // `kern run` exec()s the workload IN PLACE - there is no supervisor left to reap it and drop the
     // guard afterwards. The guard's Drop would `rmdir` the cgroup we're about to exec into, which is
