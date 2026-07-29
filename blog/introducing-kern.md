@@ -1,12 +1,12 @@
 # Introducing kern: a container runtime that does less than Docker, on purpose
 
 *A fast, daemonless, rootless Linux sandbox & virtual-resource runtime, one ~1.8 MB static binary,
-one Rust dependency (`libc`). It starts a real, kernel-enforced box in ~1.9 ms, embeds from Python or
+one Rust dependency (`libc`). It starts a real, kernel-enforced box in ~2.3 ms, embeds from Python or
 Rust, and runs the same on a laptop, in CI, or on a Raspberry Pi.*
 
 Most container tooling is built around a daemon. You install a service that stays resident, holds the
 image store and the network, and every `run` is a round-trip to it. That buys a lot of features, and
-it costs a resident process, a socket to secure, ~308 ms of start latency, and a footprint that keeps
+it costs a resident process, a socket to secure, ~289 ms of start latency, and a footprint that keeps
 kern off a lot of small machines entirely.
 
 kern is the other trade. There is no daemon. `kern box` forks one short-lived process, sets up Linux
@@ -57,12 +57,12 @@ One isolated `/bin/true`, warm image cache, on an x86_64 desktop (Linux 6.17, me
 
 | runtime | cold start | |
 |---|---|---|
-| **kern** `box --rootfs` | **1.9 ms** | overlay + self-pivot + seccomp |
-| bubblewrap | 2.6 ms | a sandbox *primitive*, no images, caps, or lifecycle |
-| crun | 5.2 ms | OCI runtime (C) |
-| runc (rootless) | 12.2 ms | OCI runtime (Go) |
-| podman (rootless) | 155 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
-| docker run | 308 ms | client → daemon round-trip |
+| **kern** `box --rootfs` | **2.2 ms** | overlay + self-pivot + seccomp |
+| bubblewrap | 2.9 ms | a sandbox *primitive*, no images, caps, or lifecycle |
+| crun | 5.2 ms (not installed on the machine re-measured) | OCI runtime (C) |
+| runc (rootless) | 13.8 ms | OCI runtime (Go) |
+| podman (rootless) | 288 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
+| docker run | 289 ms | client → daemon round-trip |
 
 The honest version: **nobody wins single-shot latency outright**: the top tier is all within a couple
 of milliseconds, i.e. noise. kern leads that tier while being the only one of them that ships a full
@@ -96,7 +96,7 @@ test you hope exists, [that's a separate post](what-the-type-system-buys-you.md)
 
 That's strong for first-party and semi-trusted workloads, CI, dev, edge, your own agents' code. It is
 **not** a hardware-virtualization boundary. For actively hostile, multi-tenant, untrusted code where
-you want a VM boundary, reach for a microVM, a deliberate trade for ~2 ms starts and a ~1.8 MB
+you want a VM boundary, reach for a microVM, a deliberate trade for ~2.3 ms starts and a ~1.8 MB
 footprint. [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md) marks every guarantee
 that's cooperative or opt-in, and says exactly when to use kern versus a microVM.
 

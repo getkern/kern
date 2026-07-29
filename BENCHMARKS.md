@@ -45,10 +45,9 @@ KERN=./target/release/kern python3 examples/benchmark.py --runs 500 --conc 100
 commands shown inline; only those depend on a specific image or a systemd-user manager.)
 
 > **TL;DR.** kern is in the **fastest tier**: it leads the no-cgroup-cap sandboxes (ahead of
-> `bubblewrap`), and with a hard cgroup cap it **ties `crun`** (the fastest OCI runtime) and is
-> **~2× `runc`**: while being the only one of them that ships a complete daemonless container UX
+> `bubblewrap`), and a hard cgroup cap now costs 0.25 ms rather than a `systemd-run` round trip: while being the only one of them that ships a complete daemonless container UX
 > (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~1.8 MB** binary. Against the real
-> engines it's **~80-160× faster to start** (`podman` ~155 ms, Docker ~308 ms) and carries no
+> engines it's **~125× faster to start** (`podman` ~288 ms, Docker ~289 ms) and carries no
 > resident daemon. It is *not* "the fastest in the world", the top tier is within a couple ms,
 > i.e. noise; the honest claim is **top-tier speed + a full runtime in a tiny daemonless binary**.
 
@@ -58,29 +57,29 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 
 | Runtime | Cold start | What it does at that price |
 |---|---:|---|
-| **kern** `box --rootfs` | **1.9 ms** | overlay + self-pivot + seccomp |
-| **kern** `box --image` | **3.7 ms** | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
-| bubblewrap | 2.6 ms | a sandbox *primitive*, no images, caps, or lifecycle |
-| crun | 5.2 ms | OCI runtime (C): bundle + cgroup setup |
-| runc (rootless) | 12.2 ms | OCI runtime (Go): bundle + cgroup (high run-to-run variance) |
-| podman (rootless) | 155 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
-| **docker run --rm** | 308 ms | client → daemon round-trip |
+| **kern** `box --rootfs` | **2.2 ms** | overlay + self-pivot + seccomp |
+| **kern** `box --image` | **3.3 ms** | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
+| bubblewrap | 2.9 ms | a sandbox *primitive*, no images, caps, or lifecycle |
+| crun | 5.2 ms (June; not installed on the machine re-measured here) | OCI runtime (C): bundle + cgroup setup |
+| runc (rootless) | 13.8 ms | OCI runtime (Go): bundle + cgroup (high run-to-run variance) |
+| podman (rootless) | 287.5 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
+| **docker run --rm** | 289.2 ms | client → daemon round-trip |
 
-kern's bare box adds **no** cgroup cap (like bubblewrap); when it *does* add a hard cap the full
-path is **~5.5 ms**: see the two-tier note below.
+kern's bare box adds **no** cgroup cap (like bubblewrap). Adding one used to cost a `systemd-run`
+round trip and put the capped path at ~5.5 ms; since 0.6.15 kern caps directly in its own delegated
+slice and **the cap costs 0.25 ms**: 2.20 ms uncapped, **2.45 ms with caps on**, 2.49 ms with an
+explicit `--memory 512m`. The cap still bites (200 MiB under `--memory 32m` exits 137).
 
-(Measured as total ÷ N over 200 runs, not a per-call timer, at sub-ms scale the timer's own
+(Measured as total / N over 200 runs, not a per-call timer, at sub-ms scale the timer's own
 fork/exec would otherwise dominate. Latency and the throughput numbers below are the same data.)
 
-Two honest tiers. **No cgroup cap** (lightest): kern's bare box leads at **1.9 ms**, ahead of
-bubblewrap (2.6 ms), both skip the cgroup. **With a cgroup cap** (what a real container wants):
-kern at **5.5 ms ties `crun`** (5.2 ms, the fastest OCI runtime) and is **~2× faster than
-`runc`** (12.2 ms). The physical floor for `unshare`+`exec` is ~1-2 ms, so everyone in the top
-tier sits within a couple ms of each other and of each other's run-to-run noise, nobody "wins"
-single-shot latency outright. The real gap is to the **engines**: `podman` (~155 ms) and Docker
-(~308 ms) fork `conmon` / round-trip a daemon every run, so kern is **~80-160× faster** than the
-tools people actually compare it to, while shipping the same UX (OCI pull, overlay,
-`ps`/`exec`/`logs`, compose) in ~1.8 MB with no resident daemon.
+The two-tier split this section used to describe is gone, and that is the point: you no longer
+choose between a fast box and a capped one. kern capped (2.45 ms) is faster than the fastest OCI
+runtime measured here uncapped, and the physical floor for `unshare`+`exec` is ~1-2 ms, so the top
+tier sits within a couple ms of itself and of its own run-to-run noise. Nobody "wins"
+single-shot latency outright. The real gap is to the **engines**: `podman` (~288 ms) and Docker
+(~289 ms) fork `conmon` / round-trip a daemon every run, so kern is **~125x faster** than the
+engines while shipping the container UX they ship.
 
 ### Real image, not `/bin/true`
 
@@ -142,7 +141,7 @@ per run = total ÷ N):
 
 | host | kernel | **kern** | bubblewrap | crun | runc | podman | docker |
 |---|---|---:|---:|---:|---:|---:|---:|
-| x86_64 desktop | v6.17 | **1.9 ms** | 2.6 ms | 5.2 ms | 12.2 ms | 155 ms | 308 ms |
+| x86_64 desktop | v7.0 | **2.2 ms** | 2.9 ms | not installed | 13.8 ms | 287.5 ms | 289.2 ms |
 | Jetson Orin Nano | v5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
 | Raspberry Pi 5 | v6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Arduino UNO Q | **v6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |

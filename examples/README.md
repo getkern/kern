@@ -120,7 +120,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [edge-many-services.sh](edge-many-services.sh) | Many isolated services on a small board, few-MB footprint vs a ~186 MB daemon |
 | [rolling-redeploy.sh](rolling-redeploy.sh) | Zero-downtime rolling redeploy: `--pull always` swaps the image atomically (live boxes survive), bring up new instances then retire old ones, fleet never drops below target. Daemonless, no k8s |
 | [canary-deploy.sh](canary-deploy.sh) | Canary with keep-old-on-failure: `--pull always` refresh, run one canary, gate on its verdict read back via `logs --tail`; prod is never touched if the canary is unhealthy |
-| [scale-test.sh](scale-test.sh) | Burst N isolated boxes (~2 ms each, no dockerd), drive the whole set from `ps -q`: count, `--filter` sample, then reap with one `kern stop $(kern ps -q)` |
+| [scale-test.sh](scale-test.sh) | Burst N isolated boxes (~2.3 ms each, no dockerd), drive the whole set from `ps -q`: count, `--filter` sample, then reap with one `kern stop $(kern ps -q)` |
 | [device-isolation.sh](device-isolation.sh) | Give a box exactly one hardware device (i2c / serial / spi) and nothing else |
 
 ### Per-language dev & build boxes (your host stays clean)

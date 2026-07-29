@@ -1,7 +1,7 @@
 # kern-sandbox
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless, daemonless Linux sandbox runtime: a real,
-kernel-enforced box that starts in **~2 ms**, from one **~1.8 MB** binary, with no daemon. **kern-sandbox**
+kernel-enforced box that starts in **~2.3 ms**, from one **~1.8 MB** binary, with no daemon. **kern-sandbox**
 is its Python binding: run untrusted or agent-generated code in a fresh, isolated box, straight from Python.
 
 On PyPI: [`pip install kern-sandbox`](https://pypi.org/project/kern-sandbox/). For Node / TypeScript, the
@@ -64,7 +64,7 @@ aspirational. Your hardware will differ, measure and claim your own number.
 | `run_code("print(1)")` (+ Python interpreter start) | ~16 ms | ~32 ms |
 | `docker run python:3.12-slim python3 -c` | n/a | ~344 ms |
 
-For reference, `kern box` **natively** (no Python wrapper) is ~2 ms from a prepared rootfs and ~3.7 ms
+For reference, `kern box` **natively** (no Python wrapper) is ~2.3 ms from a prepared rootfs and ~3.3 ms
 from an OCI image; the ~3.5 ms bare-box row is that plus the wrapper's subprocess + reader-thread
 overhead.
 
