@@ -4,7 +4,7 @@
 
 **A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
 
-It's a daemonless container for your inner loop: a real, kernel-enforced box that starts in **~2.3 ms**
+It's a daemonless container for your inner loop: a real, kernel-enforced box that starts in **~2.2 ms**
 from a prepared rootfs, or **~3.3 ms** from an OCI image, out of one **~1.8 MB** rootless binary with
 no `dockerd` sitting in the background. The same box also runs
 untrusted or agent-generated code, isolated. Embed it from Python, Node or Rust, or run it from the CLI.
@@ -42,7 +42,7 @@ then `kern box dev --image alpine -- sh`
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.8 MB static binary, no daemon.">
 </p>
 
-<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice) and a bare one is <b>~2.4 ms</b>, both a full <code>kern box</code> lifecycle (fork, isolate, run, tear down) rather than kern's ~1.24 ms of setup. The <a href="#performance">Performance</a> table was measured on the same machine on the same night. Your hardware and cgroup delegation differ, so measure your own: <code>kern bench --rootfs &lt;dir&gt;</code>. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology, the capped-vs-uncapped split, and on-device board numbers.</sub>
+<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice) and a bare one is <b>~2.4 ms</b>, both a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not kern's own setup phase in isolation. The <a href="#performance">Performance</a> table was measured on the same machine on the same night. Your hardware and cgroup delegation differ, so measure your own: <code>kern bench --rootfs &lt;dir&gt;</code>. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology, the capped-vs-uncapped split, and on-device board numbers.</sub>
 
 [Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Storage](docs/STORAGE.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
 
@@ -99,7 +99,7 @@ otherwise reach for a container, a cloud sandbox, or root.
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes** | opt-in (rootless mode) | yes |
-| Cold start (a bare box) | **~2.3 ms** | ~289 ms | ~288 ms |
+| Cold start (a bare box) | **~2.2 ms** | ~289 ms | ~288 ms |
 | Cold start (from an OCI image) | **~3.3 ms** | ~289 ms | ~288 ms |
 | Footprint | **one 1.8 MB static binary** | ~186 MB daemon stack | multi-binary install |
 | OCI images (pull / build) | **yes** | yes | yes |
@@ -306,7 +306,7 @@ A sandboxed shell from any OCI image. The image stays read-only; your writes go 
 kern box dev --image alpine -it -- sh
 ```
 
-That box starts in **~3.3 ms**, not the ~2.3 ms of a bare rootfs box: an OCI image gets a rootless
+That box starts in **~3.3 ms**, not the ~2.2 ms of a bare rootfs box: an OCI image gets a rootless
 uid-range mapping so an official image can drop privilege in its entrypoint, and that costs two
 setuid helpers (~1.1 ms, run concurrently, unavoidable without `CAP_SETUID`). Measure it yourself
 with `kern bench --image alpine`, or drop it with `--no-uid-range` if your workload stays root.
@@ -644,7 +644,7 @@ other row is fast, not because of a container that ignores signals.
 
 | host | kernel | **kern** | bubblewrap | crun | runc | podman | docker |
 |---|---|---:|---:|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.3 ms** | 2.9 ms | not installed | 13.8 ms | 287.5 ms | 289.2 ms |
+| x86_64 desktop | v7.0 | **2.2 ms** | 2.9 ms | not installed | 13.8 ms | 287.5 ms | 289.2 ms |
 | Jetson Orin Nano | v5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
 | Raspberry Pi 5 | v6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Arduino UNO Q | **v6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
@@ -653,7 +653,7 @@ other row is fast, not because of a container that ignores signals.
 present at all**: one ~1.8 MB static binary just works where the others are each a setup step (Docker
 alone is a ~186 MB daemon stack).
 
-kern is the fastest sandbox here at **~2.3 ms**, ahead of bubblewrap at 2.9, and the top tier is all
+kern is the fastest sandbox here at **~2.2 ms**, ahead of bubblewrap at 2.9, and the top tier is all
 within a few ms: nobody wins single-shot latency outright. The real gap is to the **engines**,
 **~125x faster** than podman (~288 ms) and Docker (~289 ms), which round-trip a daemon every
 run. Beyond one start: **~500 boxes/s**, **~7 MB** RSS per box, **0 resident** where Docker keeps

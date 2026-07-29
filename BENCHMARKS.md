@@ -210,6 +210,13 @@ delegated, else caps are skipped (documented in [SECURITY.md](SECURITY.md)).
 
 ## Method
 
+Not every figure quoted in the README lives here, on purpose. The day-to-day operations table
+(`exec`, `ps`, `logs`, bringing a stack up) is measured differently, by typing the commands and
+timing them with the shell, so it lives next to that claim in
+[README.md § A working day, not a cold start](README.md#a-working-day-not-a-cold-start) with its own
+reproduction line. Copying those numbers into this file would give each of them two homes, and two
+homes is how a number drifts.
+
 The cold-start, throughput and concurrency tables all come from one self-contained script,
 run it and you get the same three tables for whatever runtimes you have installed:
 
