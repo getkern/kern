@@ -24,6 +24,9 @@ pub enum Command {
     /// `kern box <name> --plan`: print the ordered isolation step sequence (no privileges).
     BoxPlan {
         name: String,
+        /// The `vcpu:`/`vgpio:`/`vdisk:` tokens on the command line. A preview that omits the
+        /// hardware a profile hands over is not a preview of what will be created.
+        profiles: Vec<String>,
     },
     /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-- cmd...]`: run in a sandbox.
     BoxRun {
@@ -1051,12 +1054,26 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .map(|s| (*s).to_string())
                 .unwrap_or_else(|| "list".into());
             match sub.as_str() {
-                "list" | "edit" | "setup" | "probe" | "clear" => Command::Config {
-                    force: rest
-                        .iter()
-                        .any(|a| *a == "--force" || *a == "--yes" || *a == "-y"),
-                    sub,
-                },
+                "list" | "edit" | "setup" | "probe" | "clear" => {
+                    // A flag these verbs do not take is REFUSED, never ignored. `kern config list
+                    // --json` used to print the human listing and exit 0, so a script that asked for
+                    // JSON silently got prose and could not tell; the same held for any typo. Only
+                    // the destructive verbs (setup/clear) take a flag at all, and it is the confirm.
+                    for a in rest.iter().skip(1) {
+                        let s: &str = a;
+                        if s.starts_with('-') && !matches!(s, "--force" | "--yes" | "-y") {
+                            return Err(Error::Config(format!(
+                                "config {sub}: unknown flag {s:?} - this verb takes no flags (only `config setup`/`clear` accept --force/--yes/-y)"
+                            )));
+                        }
+                    }
+                    Command::Config {
+                        force: rest
+                            .iter()
+                            .any(|a| *a == "--force" || *a == "--yes" || *a == "-y"),
+                        sub,
+                    }
+                }
                 "add" => Command::ConfigAdd {
                     args: rest.iter().skip(2).map(|s| (*s).to_string()).collect(),
                 },
@@ -1778,6 +1795,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let cmd = if plan {
         Command::BoxPlan {
             name: name.unwrap_or_default().to_string(),
+            profiles: profiles.clone(),
         }
     } else {
         Command::BoxRun {
@@ -2231,7 +2249,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Version => commands::version(),
         Command::Banner => commands::banner(),
         Command::Help => commands::help(),
-        Command::BoxPlan { name } => commands::box_plan(&name),
+        Command::BoxPlan { name, profiles } => commands::box_plan(&name, &profiles),
         Command::BoxRun {
             name,
             rootfs,
@@ -2512,6 +2530,34 @@ pub fn run(args: &[String]) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    /// A flag the read-only config verbs do not take must be REFUSED. `kern config list --json`
+    /// printed the human listing and exited 0, so a script that asked for JSON got prose and had no
+    /// way to tell; the same held for any typo. `--force`/`--yes`/`-y` stay accepted (setup/clear
+    /// need a confirm), and `config add`/`rm` are untouched: their flags are the profile fields.
+    #[test]
+    fn a_flag_the_config_verbs_do_not_take_is_refused_not_ignored() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        for bad in [
+            vec!["config", "list", "--json"],
+            vec!["config", "list", "--zzzz"],
+            vec!["config", "--json"],
+            vec!["config", "probe", "-x"],
+        ] {
+            assert!(p(&bad).is_err(), "{bad:?} should be refused");
+        }
+        for good in [
+            vec!["config"],
+            vec!["config", "list"],
+            vec!["config", "setup", "--force"],
+            vec!["config", "clear", "-y"],
+            // `add`/`rm` parse their own flags - the guard must not reach them.
+            vec!["config", "add", "vcpu:x", "--cpus", "1"],
+            vec!["config", "rm", "vcpu:x"],
+        ] {
+            assert!(p(&good).is_ok(), "{good:?} should parse");
+        }
+    }
+
     #[test]
     fn version_help_and_banner_resolve() {
         assert_eq!(parse(&["--version".into()]).unwrap().1, Command::Version);
@@ -2554,7 +2600,29 @@ mod tests {
         let plan = parse(&["box".into(), "web".into(), "--plan".into()])
             .unwrap()
             .1;
-        assert_eq!(plan, Command::BoxPlan { name: "web".into() });
+        assert_eq!(
+            plan,
+            Command::BoxPlan {
+                name: "web".into(),
+                profiles: vec![]
+            }
+        );
+        // A `--plan` that carries profiles keeps them: the preview resolves the device grants, so
+        // dropping them here would show three mounts and stay silent about `/dev/i2c-5`.
+        assert_eq!(
+            parse(&[
+                "box".into(),
+                "web".into(),
+                "vgpio:sensor".into(),
+                "--plan".into()
+            ])
+            .unwrap()
+            .1,
+            Command::BoxPlan {
+                name: "web".into(),
+                profiles: vec!["vgpio:sensor".into()]
+            }
+        );
         // `box <name>` with no rootfs/image still routes to BoxRun (box_run reports the missing
         // source) - NOT a misleading "not implemented".
         assert!(matches!(

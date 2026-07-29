@@ -24,6 +24,19 @@ is separate from, and does not restrict, your rights to the code.
   service**, or in a **domain name**, especially for a competing offering.
 - Using the logo in a way that implies **official endorsement** or affiliation.
 
+## Other people's marks
+
+kern is an independent project with no affiliation with, sponsorship by, or endorsement from any
+other vendor. Where third-party names appear in this repository they are used **nominatively**: to
+name a file format kern reads, a registry it talks to, a command whose syntax it accepts, or a tool
+it is compared against in a stated, reproducible measurement. Those names belong to their respective
+owners. In particular, **Docker and Docker Compose are trademarks of Docker, Inc.**, which is not
+connected to this project in any way.
+
+The same restraint applies inward: kern describes what kern does. A comparison belongs here only
+when it comes with the measurement that supports it, in [BENCHMARKS.md](BENCHMARKS.md) or the README,
+never as an unqualified claim about what another tool cannot do.
+
 ## Why this exists
 
 The code is yours to build on freely. The **name** stays a reliable signal of the upstream project, so

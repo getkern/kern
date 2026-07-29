@@ -50,3 +50,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "image_ref"
+path = "fuzz_targets/image_ref.rs"
+test = false
+doc = false
+bench = false

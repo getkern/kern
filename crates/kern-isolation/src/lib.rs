@@ -14,6 +14,16 @@ use std::marker::PhantomData;
 
 mod cgroup;
 mod landlock;
+
+/// The kernel's Landlock ABI version, or `None` when Landlock is unavailable (not compiled in, or
+/// disabled at boot). Exposed so `kern doctor` can SAY SO up front: `--landlock-rw` degrades to
+/// namespaces + seccomp with a warning at box start, which is honest but arrives late. A preflight
+/// that answers "will boxes run here?" should also answer "and will the confinement I plan to rely
+/// on exist?", especially on the ARM boards, where measured on three of them (Raspberry Pi OS,
+/// Jetson tegra, Arduino UNO Q) NONE ships Landlock.
+pub fn landlock_abi() -> Option<i32> {
+    landlock::abi_version()
+}
 mod outcome;
 mod ports;
 mod real;

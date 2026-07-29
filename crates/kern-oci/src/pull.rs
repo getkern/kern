@@ -315,16 +315,45 @@ fn parse_image_config(blob: &str) -> ImageConfig {
     }
 }
 
+/// The tag an untagged reference means. `alpine` is `alpine:latest`, everywhere.
+pub const DEFAULT_TAG: &str = "latest";
+
+/// Split `image` into `(name, tag)` when it carries an EXPLICIT tag, else `None`.
+///
+/// **The single definition of "does this reference name a tag".** A trailing `:tag` only counts if
+/// the part after `:` has no `/`, otherwise `localhost:5000/img` would read its port as a tag. A
+/// digest (`img@sha256:<hex>`) splits at that same `:` and so counts as explicit, which is what we
+/// want: a digest pins harder than a tag and must never have `:latest` bolted onto it.
+pub fn split_tag(image: &str) -> Option<(&str, &str)> {
+    match image.rsplit_once(':') {
+        Some((n, t)) if !t.contains('/') && !n.is_empty() => Some((n, t)),
+        _ => None,
+    }
+}
+
+/// Give a reference its implied tag: `alpine` → `alpine:latest`. Already-tagged, digest-pinned and
+/// empty references are returned unchanged.
+///
+/// Callers that key a cache, a file name or a lookup on the reference MUST go through this first.
+/// Without it `alpine` and `alpine:latest` are two different keys for one image, which is how the
+/// same 8.7 MB got stored twice, `rmi alpine` left `alpine:latest` behind, and a `save`+`load` round
+/// trip renamed an image so the reference that worked before stopped resolving.
+pub fn normalize_ref(image: &str) -> String {
+    if image.is_empty() || split_tag(image).is_some() {
+        return image.to_string();
+    }
+    format!("{image}:{DEFAULT_TAG}")
+}
+
 /// `[registry/]repo[:tag]` → `(registry, repo, reference)`. Bare names get `library/` +
 /// `registry-1.docker.io`; the first path segment is a registry only if it looks like a host.
 pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciError> {
     if image.is_empty() {
         return Err(OciError::Ref("empty".into()));
     }
-    // A trailing `:tag` only counts if the part after `:` has no `/` (else it's a host:port).
-    let (name, reference) = match image.rsplit_once(':') {
-        Some((n, t)) if !t.contains('/') && !n.is_empty() => (n.to_string(), t.to_string()),
-        _ => (image.to_string(), "latest".to_string()),
+    let (name, reference) = match split_tag(image) {
+        Some((n, t)) => (n.to_string(), t.to_string()),
+        None => (image.to_string(), DEFAULT_TAG.to_string()),
     };
     let (registry, repo) = match name.split_once('/') {
         Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => {
@@ -2310,6 +2339,47 @@ mod tests {
         assert_eq!(reg_base("localhost:5000"), "http://localhost:5000");
         assert_eq!(reg_base("ghcr.io"), "https://ghcr.io");
         assert_eq!(reg_base("127.0.0.1.evil.com"), "https://127.0.0.1.evil.com");
+    }
+
+    /// `alpine` and `alpine:latest` name ONE image, and everything that keys a cache, a file or a
+    /// lookup on a reference has to agree on that. When they did not, the same 8.7 MB was stored
+    /// twice, `rmi alpine` left `alpine:latest` behind, and `save` + `load` renamed an image so the
+    /// reference that worked before stopped resolving after.
+    ///
+    /// The three rows that matter are the ones where a naive "does it contain a colon" would be
+    /// wrong: a registry PORT is not a tag, a DIGEST must never be given one, and an already-tagged
+    /// reference must come back byte-identical.
+    #[test]
+    fn an_untagged_reference_gets_latest_and_a_port_or_digest_does_not() {
+        for (input, want) in [
+            ("alpine", "alpine:latest"),
+            ("ghcr.io/org/x", "ghcr.io/org/x:latest"),
+            // A port is not a tag: the part after `:` contains a `/`.
+            ("localhost:5000/img", "localhost:5000/img:latest"),
+            // Already explicit: returned untouched, whatever the shape.
+            ("alpine:3.19", "alpine:3.19"),
+            ("localhost:5000/img:2", "localhost:5000/img:2"),
+            // A digest pins harder than a tag and must not be given one.
+            ("img@sha256:abc123", "img@sha256:abc123"),
+            // Nothing to normalize.
+            ("", ""),
+        ] {
+            assert_eq!(normalize_ref(input), want, "normalize_ref({input:?})");
+            // Normalizing is idempotent: applying it twice must not append a second tag.
+            assert_eq!(
+                normalize_ref(&normalize_ref(input)),
+                want,
+                "normalize_ref is not idempotent for {input:?}"
+            );
+            // And it must never change what the reference RESOLVES to at the registry.
+            if !input.is_empty() {
+                assert_eq!(
+                    parse_ref(input).ok(),
+                    parse_ref(want).ok(),
+                    "normalizing {input:?} changed how it resolves"
+                );
+            }
+        }
     }
 
     #[test]

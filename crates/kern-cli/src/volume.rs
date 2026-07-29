@@ -22,9 +22,49 @@ pub fn volumes_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/kern-volumes-{}", unsafe { libc::getuid() }))
 }
 
+/// What a `-v` source names.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SourceKind {
+    /// A bare name: persistent storage under the volumes dir, auto-created on first use.
+    Named,
+    /// A host path, absolute (`/srv/x`) or relative to the current directory (`.`, `./src`, `../x`).
+    Path,
+    /// Neither: empty, or a `scheme://` URL, which a different code path handles.
+    Neither,
+}
+
+/// Classify a `-v` source. **The single place this decision is made**, so no two call sites can
+/// derive it differently and drift apart.
+///
+/// The conventional rule, verified against a reference implementation rather than assumed: a source
+/// is a PATH when it is absolute or starts with `./` / `../` (or is exactly `.` / `..`), and a NAME
+/// otherwise. So `sub:/app` stays a named volume and `foo/bar:/app` stays a (doomed) name whose
+/// error still points at the real problem. Those two negatives are as load-bearing as the positive
+/// and are pinned by test: if `sub` ever started reading as a path, an existing named volume would
+/// silently become a new empty directory.
+///
+/// Before this existed, `-v .:/app` (mount the project you are standing in) reached the volume-name
+/// validator and came back as "invalid volume name '.'". The compose layer already resolved its own
+/// `./` binds (`resolve_relative_binds`, against the compose file's dir); this is the same rule for
+/// the CLI flag, where the base is the current directory instead.
+pub fn classify(source: &str) -> SourceKind {
+    if source.is_empty() || source.contains("://") {
+        return SourceKind::Neither;
+    }
+    if source.starts_with('/') || is_relative_path(source) {
+        return SourceKind::Path;
+    }
+    SourceKind::Named
+}
+
+/// Is this `-v` source a path written relative to the current directory (`.`, `..`, `./…`, `../…`)?
+fn is_relative_path(source: &str) -> bool {
+    source == "." || source == ".." || source.starts_with("./") || source.starts_with("../")
+}
+
 /// Is this `-v` source a *named* volume (a bare name) rather than a host path or a `scheme://` URL?
 pub fn is_named(source: &str) -> bool {
-    !source.is_empty() && !source.starts_with('/') && !source.contains("://")
+    classify(source) == SourceKind::Named
 }
 
 /// A valid volume name: non-empty, `[A-Za-z0-9_.-]` only, no leading `-`/`.`, not `.`/`..`, ≤ 64.
@@ -1045,5 +1085,44 @@ mod tests {
         assert_eq!(size_limit("plainvol"), None);
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    /// The line that sent us here: `-v .:/app` (mount the project you are standing in) answered
+    /// "invalid volume name '.'", because every source without a leading `/` was treated as a name.
+    /// Each case below was checked against a reference implementation first, so this pins the
+    /// conventional behaviour rather than a preference. The negative half matters as much as the
+    /// positive one: if `sub` ever started being read as a path, an existing named volume would
+    /// silently become a new empty directory, which is the kind of change nobody notices until the
+    /// data is gone.
+    #[test]
+    fn a_dot_source_is_a_path_and_a_bare_word_is_still_a_volume_name() {
+        use SourceKind::*;
+        for (source, want) in [
+            // Relative paths: the whole point of the change.
+            (".", Path),
+            ("..", Path),
+            ("./", Path),
+            ("./src", Path),
+            ("../shared", Path),
+            ("../../x", Path),
+            ("./a/b", Path),
+            // Absolute paths and bare names are untouched by it.
+            ("/tmp/x", Path),
+            ("data", Named),
+            ("sub", Named),
+            ("my-vol", Named),
+            ("v1.2", Named),
+            ("_cache", Named),
+            // `foo/bar` stays a (doomed) NAME, so the error keeps naming the real problem instead
+            // of quietly inventing a directory tree.
+            ("foo/bar", Named),
+            // Handled by another path, or nothing at all.
+            ("nfs://h/e", Neither),
+            ("", Neither),
+        ] {
+            assert_eq!(classify(source), want, "classify({source:?})");
+            assert_eq!(is_named(source), want == Named, "is_named({source:?})");
+        }
+        assert!(validate("foo/bar").is_err(), "a name with a '/' is invalid");
     }
 }

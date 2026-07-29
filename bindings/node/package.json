@@ -1,6 +1,6 @@
 {
   "name": "kern-sandbox",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "kern is a fast, rootless, daemonless Linux sandbox runtime; kern-sandbox is its Node/TypeScript binding. Run untrusted or agent-generated code (Python/JS/Bash) in a real, kernel-enforced box, ~2 ms, no cloud, no account, no VM.",
   "keywords": [
     "sandbox",

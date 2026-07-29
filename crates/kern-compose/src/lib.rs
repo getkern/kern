@@ -455,7 +455,7 @@ pub fn validate_runnable(boxes: &[ComposeBox]) -> Result<(), String> {
         ] {
             if let Some(v) = value.filter(|v| v.starts_with('-')) {
                 return Err(format!(
-                    "service '{}': {role} '{v}' begins with '-' and would be read as a flag (injection). {role}s cannot start with '-' (same rule as Docker)",
+                    "service '{}': {role} '{v}' begins with '-' and would be read as a flag (injection). A {role} cannot start with '-'",
                     b.name
                 ));
             }

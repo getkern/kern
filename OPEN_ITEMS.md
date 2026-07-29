@@ -68,3 +68,24 @@ the memory controller is not delegated gets no warning. The correct predicate
 (`memory_cap_enforceable()`) already exists; wiring the warning to it needs a host with
 `cgroup_enable=memory` removed to verify against, which is a physical board rather than a code
 change.
+
+## The Python and Node SDK test suites leave two boxes each behind
+
+Measured 2026-07-29 against this build, from a clean slate (zero `kern` processes): `pytest` in
+`bindings/python` ends 61/61 green and leaves **2** `pysbx-*` boxes running; `node --test` in
+`bindings/node` ends 50/50 green and leaves **2** `jssbx-*`. They carry the SDK's 24 h `--timeout`
+backstop, so they do expire on their own, but until then `kern ps` does not list them and
+`kern stop --all` answers "no running boxes to stop" while four of them are alive.
+
+What it is NOT, each ruled out by measurement rather than by reading: a registry defect (a plain
+detached box is listed and stopped correctly), the orphan-on-launcher-death bug (a box whose
+launcher is SIGKILLed stays registered and `stop --all` ends it), and `KERN_NO_SCOPE=1`, which the
+SDK sets on every sandbox and which on its own leaves a box perfectly visible and stoppable. The
+`Kernel.__exit__` path closes stdin, waits 3 s and calls `_kill()` on timeout, and `_kill()` runs
+`kern stop <name>` before SIGKILLing the group, so on paper it should clean up.
+
+The mechanism is therefore somewhere in the binding's own lifecycle and is NOT isolated yet. It
+lives in `bindings/`, which ships as the separately versioned `kern-sandbox` package rather than in
+the kern binary, so it is written down here instead of being fixed in a hurry the afternoon of a
+release: a change to a lifecycle whose failure mode is not understood is how a leak becomes a kill
+of something that should have lived.

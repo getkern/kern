@@ -119,7 +119,7 @@ pub fn info() -> Result<(), Error> {
     }
     row(
         "config",
-        crate::config::default_path()
+        crate::config::active_path()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "-".into())
             .as_str(),
@@ -279,7 +279,30 @@ fn check_tools() -> Vec<R> {
             "-v sshfs:// network volumes",
             "install sshfs, or use nfs/smb",
         ),
+        landlock(),
     ]
+}
+
+/// Does this kernel have Landlock, the LSM behind `--landlock-rw`?
+///
+/// A box already warns at start when it is missing, and then runs with namespaces + seccomp only.
+/// That is honest, but it arrives after you have decided to rely on the confinement. `doctor` is the
+/// preflight that answers "will boxes run here?", so it has to answer this too. It matters most
+/// exactly where kern is aimed: measured on three ARM boards (Raspberry Pi OS 6.6, Jetson 5.15-tegra,
+/// Arduino UNO Q 6.16), NONE of them ships Landlock, and Raspberry Pi OS says so outright with
+/// `# CONFIG_SECURITY_LANDLOCK is not set`.
+fn landlock() -> R {
+    match kern_isolation::landlock_abi() {
+        Some(v) => R::Ok(format!(
+            "Landlock: ABI v{v} (--landlock-rw enforces a write allowlist)"
+        )),
+        None => R::Warn(
+            "Landlock: absent - --landlock-rw is accepted but CANNOT confine writes here".into(),
+            "the box still gets namespaces + seccomp; a kernel with CONFIG_SECURITY_LANDLOCK=y \
+             (and `lsm=...,landlock` if your distro gates it) is needed for the path allowlist"
+                .into(),
+        ),
+    }
 }
 
 fn tool_req(bin: &str, what: &str, hint: &str) -> R {

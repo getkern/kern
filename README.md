@@ -115,6 +115,16 @@ right tool, and [SECURITY.md](SECURITY.md) says exactly where the line is.
 pod: no network segmentation between services, no `deploy.replicas`, nothing on `docker.sock`.
 See [when NOT to use kern](#when-to-use-kern-and-when-not).
 
+**"So it's a reimplementation of Docker?"** No, and the dependency list is the shortest proof: kern is
+~58,000 lines of Rust with **one** external crate (`libc`), no vendored code and no Docker source. What
+it shares with other runtimes are *published standards*, the [OCI image spec](https://github.com/opencontainers/image-spec)
+and the [Compose Specification](https://compose-spec.io), the same way two browsers share HTML. Reading
+a format is interoperability, not lineage. The architecture goes the other way on purpose: Docker runs a
+container through a daemon and several binaries, kern runs one through a single static binary with
+nothing resident between calls. And the `docker`-syntax shim is deliberately partial and says so: it
+translates what maps, **refuses** what would change behaviour, and never silently ignores a flag
+([Docker compatibility](#docker-compatibility)).
+
 ## Why kern
 
 - ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.8 MB static binary, **one Rust dependency**
@@ -703,7 +713,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.22.** Everything in [Features](#features) works today and is tested (638 Rust, 61 Python and 50
+**0.6.23.** Everything in [Features](#features) works today and is tested (649 Rust, 61 Python and 50
 Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
 real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
 starts in **~2.3 ms** from one **~1.8 MB** binary. Versioned under semver: each release is the official

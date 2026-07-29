@@ -86,6 +86,10 @@ pub(crate) fn parse_with_env(
 
     let mut skipped_by_profile: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // The PROFILE names that gated those services, kept apart from the service names. The two are
+    // not interchangeable and the error below has to quote this set: a reader who copies the other
+    // one gets a `COMPOSE_PROFILES` that activates nothing.
+    let mut inactive_profiles: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut have_services = false;
     for (key, node) in &root.children {
@@ -117,6 +121,7 @@ pub(crate) fn parse_with_env(
                         // Remembered, so a `depends_on` pointing here can be told apart from one
                         // pointing at a name that was never defined at all. See the pruning below.
                         skipped_by_profile.insert(name.clone());
+                        inactive_profiles.extend(b.profiles.iter().cloned());
                         continue;
                     }
                     boxes.push(b);
@@ -150,11 +155,20 @@ pub(crate) fn parse_with_env(
         // that defines ten of them. Correct outcome, wrong noun: the reader goes looking for a
         // missing block instead of setting COMPOSE_PROFILES.
         if !skipped_by_profile.is_empty() {
-            let mut names: Vec<&str> = skipped_by_profile.iter().map(String::as_str).collect();
-            names.sort_unstable();
+            // The names quoted here are the PROFILES to activate, not the services that were
+            // skipped. It listed the services before, and told the reader to put them in
+            // COMPOSE_PROFILES: following the message exactly activated nothing, because a service
+            // name is not a profile name. Measured on a real file: the message suggested
+            // `hoppscotch-backend`, which does nothing, where `backend` is what works.
+            let mut profiles: Vec<&str> = inactive_profiles.iter().map(String::as_str).collect();
+            profiles.sort_unstable();
+            let mut services: Vec<&str> = skipped_by_profile.iter().map(String::as_str).collect();
+            services.sort_unstable();
             return Err(format!(
-                "every service is behind an inactive profile ({}): nothing would run. Set COMPOSE_PROFILES to pick one",
-                names.join(", ")
+                "every service is behind an inactive profile: {} would run under COMPOSE_PROFILES={} \
+                 (or `--profile <name>`), and nothing runs without one",
+                services.join(", "),
+                profiles.join(",")
             ));
         }
         return Err("`services:` is empty".to_string());

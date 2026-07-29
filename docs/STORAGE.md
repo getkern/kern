@@ -85,7 +85,7 @@ you name once in `kern.toml` and attach with the `vdisk:` prefix.
 name = "scratch"
 size = "2g"            # hard cap
 persistent = false     # true = survives box removal
-# backend = "disk:0"   # advanced: pin to a specific physical disk (see below); default is automatic
+backend = "ram"        # REQUIRED: "ram" = a RAM-backed tmpfs, or a [[disk]] id (see below)
 # iops = 500           # advanced: optional I/O limit (ext4-loop backend only)
 ```
 

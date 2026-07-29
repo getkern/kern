@@ -25,7 +25,7 @@ pub fn help() -> Result<(), Error> {
     println!("{}", crate::ui::logo(&p));
     println!(
         "\
-  {b}kern {ver}{z}{d}: a fast, lightweight sandbox & virtual resource manager{z}
+  {b}kern {ver}{z}{d}: a fast, rootless sandbox & virtual resource runtime{z}
 
 {b}USAGE:{z}
     kern <COMMAND> [ARGS]
@@ -33,7 +33,7 @@ pub fn help() -> Result<(), Error> {
 {b}COMMANDS:{z}
   {d}Essentials{z}
     {c}box{z} <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
-    {c}box{z} <name> --plan                                              Preview the isolation sequence
+    {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [-- CMD...]           Run CMD in a running box
     {c}ps{z} [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List running boxes
@@ -117,7 +117,9 @@ pub fn help() -> Result<(), Error> {
     --add-host N:IP     Add an /etc/hosts entry N → IP in the box; IP may be `host-gateway`
                         (the host's address, to reach a service on the host); repeatable
     --secret SPEC       Deliver a secret as /run/secrets/NAME (mode 0400): SRC[:NAME] (file),
-                        NAME=value (inline), or NAME=- (from stdin); repeatable
+                        NAME=- (from stdin), or NAME=value (inline - the value lands in argv, so
+                        it is readable by any user via `ps`: use a file or stdin for a real one);
+                        repeatable
     --ssh PORT          Run an in-box sshd, published on host PORT (→ box :22); prints the ssh
                         command (auto-generates a keypair). Needs openssh in the image
     --ssh-key FILE      Authorize this public key instead of generating a throwaway keypair
@@ -162,7 +164,7 @@ pub fn help() -> Result<(), Error> {
                         slow overlayfs, but the source is mutable & shared (no per-box isolation)
     --privileged        Relax seccomp so a NESTED `kern box` (docker-in-docker style) can start,
                         rootless-only; still blocks kexec/modules/bpf/io_uring (unlike Docker)
-    --plan              Preview the isolation sequence instead of running
+    --plan              Preview the isolation sequence and any device grants, without running
 
 {b}OPTIONS:{z}
     -V, --version  Print version
@@ -182,7 +184,7 @@ pub fn banner() -> Result<(), Error> {
     println!("{}", crate::ui::logo(&p));
     println!(
         "\
-  {b}kern {ver}{z}{d}: a fast, lightweight sandbox & virtual resource manager{z}
+  {b}kern {ver}{z}{d}: a fast, rootless sandbox & virtual resource runtime{z}
 
     {b}kern box{z} <name> --image alpine -- sh   {d}run a command in a sandbox{z}
     {b}kern box{z} app --image alpine vcpu:big -- sh  {d}attach a resource profile (make one: {z}{b}kern config{z}{d}){z}
@@ -202,12 +204,49 @@ pub fn banner() -> Result<(), Error> {
 /// would perform. Privilege-free: it records the sequence via the isolation seam rather than
 /// executing it, so it works anywhere and exercises the 0.2 step-sequence + mount-ordering
 /// typestate end to end.
-pub fn box_plan(name: &str) -> Result<(), Error> {
+pub fn box_plan(name: &str, profiles: &[String]) -> Result<(), Error> {
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let ctx = SandboxCtx::new(name);
     println!("isolation plan for box '{}':", ctx.name.as_str());
     for (i, step) in ctx.plan().iter().enumerate() {
         println!("  {}. {step}", i + 1);
+    }
+    // The mount sequence is only half of what a box gets. A `vgpio:` profile hands over real device
+    // nodes, and a preview that lists three mounts while saying nothing about `/dev/i2c-5` is not a
+    // preview of what will be created. Resolved against THIS host (the same call the launch makes),
+    // so the preview and the launch cannot disagree, and a profile that cannot attach says so here
+    // instead of at launch.
+    let vgpio: Vec<&str> = profiles
+        .iter()
+        .filter_map(|p| p.strip_prefix("vgpio:"))
+        .filter(|n| !n.is_empty())
+        .collect();
+    if vgpio.is_empty() {
+        return Ok(());
+    }
+    let cfg = crate::config::load(None).map_err(Error::Config)?;
+    for n in vgpio {
+        match crate::config::resolve_vgpio(&cfg, n) {
+            Ok(r) if r.devs.is_empty() && r.sysfs.is_empty() && r.pins.is_empty() => {
+                println!("  device grants from vgpio:{n}: none on this host");
+            }
+            Ok(r) => {
+                println!("  device grants from vgpio:{n}:");
+                for d in &r.devs {
+                    println!("    bind {d}");
+                }
+                for s in &r.sysfs {
+                    println!("    bind {s} (sysfs)");
+                }
+                if !r.pins.is_empty() {
+                    println!(
+                        "    pins {:?} (chip-granular: the chardev exposes every line)",
+                        r.pins
+                    );
+                }
+            }
+            Err(e) => println!("  vgpio:{n}: cannot attach: {e}"),
+        }
     }
     Ok(())
 }
@@ -2088,7 +2127,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
     Ok((spec, eph))
 }
 
-/// Parse `-v src:dst[:ro]` specs into [`Volume`]s. Both paths must be absolute; the source must
+/// Parse `-v src:dst[:ro]` specs into [`Volume`]s. The target must be absolute; the source is a
+/// volume name, an absolute path, or a `./`-style path relative to the current directory, and must
 /// exist on the host. A trailing `:ro` (or `:rw`) sets the mode.
 fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
     let mut out = Vec::with_capacity(specs.len());
@@ -2133,20 +2173,25 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
                 "-v '{s}': cannot mount over {shown} (a box essential mount)"
             )));
         }
-        // The source is either a NAMED volume (a bare name - resolved to its data dir, auto-created
-        // like Docker) or an absolute host path (canonicalized symlink-free; a missing one is
-        // rejected early rather than as an opaque post-fork mount failure).
-        let source = if crate::volume::is_named(source) {
-            crate::volume::resolve_named(source)?
-        } else if source.starts_with('/') {
-            std::fs::canonicalize(source)
+        // A NAMED volume resolves to its data dir (auto-created on first use); a PATH is
+        // canonicalized symlink-free, so a missing source is rejected here rather than as an opaque
+        // post-fork mount failure. `canonicalize` resolves a relative path (`.`, `./src`,
+        // `../shared`) against the current directory, which is what makes `-v .:/app` work. No
+        // containment guard on purpose: unlike compose, which confines binds under the project dir,
+        // a direct CLI invocation can already name any absolute path, so resolving a relative one
+        // grants nothing new and refusing `../shared:/x` would only break a legitimate call.
+        // `volume::classify` owns the name-or-path decision so this site cannot disagree with it.
+        let source = match crate::volume::classify(source) {
+            crate::volume::SourceKind::Named => crate::volume::resolve_named(source)?,
+            crate::volume::SourceKind::Path => std::fs::canonicalize(source)
                 .map_err(|e| Error::Sandbox(format!("-v '{s}': source {source}: {e}")))?
                 .to_string_lossy()
-                .into_owned()
-        } else {
-            return Err(Error::Sandbox(format!(
-                "-v '{s}': source must be an absolute path or a volume name"
-            )));
+                .into_owned(),
+            crate::volume::SourceKind::Neither => {
+                return Err(Error::Sandbox(format!(
+                    "-v '{s}': source must be a volume name or a path (absolute, or ./ or ../)"
+                )))
+            }
         };
         out.push(Volume {
             source,
@@ -2398,6 +2443,17 @@ pub fn exec(
     let cmd = default_if_empty(command);
     let inst = registry::find_ref(name.as_str())
         .ok_or_else(|| Error::NotRunning(format!("no running box named '{}'", name.as_str())))?;
+    // A PAUSED box runs no task, so the exec'd process is placed in a frozen cgroup and never
+    // scheduled: the command hung forever with no output and no way to tell why. `ps` has always
+    // reported the box as `paused`, so the state was known - it just wasn't consulted here. An
+    // operation that CANNOT succeed has to say so immediately, and name the way out.
+    if registry::is_paused(inst.cgroup_pid()) {
+        return Err(Error::Sandbox(format!(
+            "box '{}' is paused, so an exec would never be scheduled - `kern unpause {}` first",
+            name.as_str(),
+            name.as_str()
+        )));
+    }
     // PID 1 of the box. Older entries (or a race before the supervisor recorded it) → fall back
     // to the supervisor's sole child.
     let pid1 = if inst.pid1 > 0 {
@@ -5043,10 +5099,15 @@ pub(crate) fn image_entries() -> Vec<ImageEntry> {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
                 continue;
             };
+            // Shown with its implied tag, so every row is a reference you can paste straight back
+            // into `--image` or `rmi`. The sentinel records the ref as first written (`alpine` from
+            // a pull, `alpine:latest` from a load), and listing the two spellings side by side made
+            // one image look like two.
             let name = std::fs::read_to_string(&path)
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
+                .map(|s| kern_oci::normalize_ref(&s))
                 .unwrap_or_else(|| stem.clone());
             let (size, dangling) = image_stat(&cache, &stem);
             let pulled = std::fs::metadata(&path)
@@ -5138,11 +5199,57 @@ fn is_safe_stem(s: &str) -> bool {
 /// otherwise linger and misclassify a later same-name pull. Best-effort; a missing artifact is fine.
 /// `stem` MUST already be a [`sanitize_ref`] token (see [`is_safe_stem`]) - never raw user input.
 fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
-    let _ = std::fs::remove_dir_all(cache.join(stem));
-    let _ = std::fs::remove_dir_all(cache.join(format!("{stem}.diff")));
+    force_remove_dir_all(&cache.join(stem));
+    force_remove_dir_all(&cache.join(format!("{stem}.diff")));
     for suffix in [".layers", ".base", ".image", ".ok", ".lock", ".flatkey"] {
         let _ = std::fs::remove_file(cache.join(format!("{stem}{suffix}")));
     }
+}
+
+/// `remove_dir_all`, retried after restoring owner write+search on the tree.
+///
+/// An image layer can carry a directory with no owner write bit (`dr-xr-xr-x` is ordinary in
+/// Fedora-based images: `quay.io/podman/stable` has hundreds). Unlinking a file needs write on its
+/// PARENT, so `remove_dir_all` stops at the first such directory and leaves the rest on disk.
+/// `rmi` then reported the size it had measured BEFORE deleting: measured on that image, it said
+/// "freed 600.5M" and left **456 MB** behind. Saying a thing happened when it did not is the
+/// costliest kind of defect here, and on an SD-card board it is the difference between a full disk
+/// and an empty one.
+///
+/// We own the cache (0700, created by us), so restoring `u+rwX` on our own copy changes nothing an
+/// image can observe: the extracted modes are a property of the layer, not of a running box, and
+/// this path runs only when that copy is being destroyed.
+fn force_remove_dir_all(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::remove_dir_all(path).is_ok() || !path.exists() {
+        return;
+    }
+    fn chmod_writable(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            // `symlink_metadata`: never follow a link out of the cache to chmod something else.
+            let Ok(m) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if m.file_type().is_dir() {
+                let mut perm = m.permissions();
+                perm.set_mode(perm.mode() | 0o700);
+                let _ = std::fs::set_permissions(&p, perm);
+                chmod_writable(&p);
+            }
+        }
+    }
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        let mut perm = m.permissions();
+        perm.set_mode(perm.mode() | 0o700);
+        let _ = std::fs::set_permissions(path, perm);
+    }
+    chmod_writable(path);
+    let _ = std::fs::remove_dir_all(path);
 }
 
 /// Delete one cached image, resolved by its ref (as shown in `kern images`) OR its sanitized stem, then
@@ -5155,7 +5262,14 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     if want.is_empty() {
         return None;
     }
-    let (mut by_ref, mut by_stem) = (None, None);
+    let want_norm = kern_oci::normalize_ref(want);
+    // ALL ref matches, not the first. One reference can map to more than one cache entry: an image
+    // pulled as `alpine` by a kern older than 0.6.23 sits under a different key than the same image
+    // pulled as `alpine:latest`, and both normalize to one reference. They are the same image, so
+    // `rmi alpine` removes both and reports the total. Removing one and leaving the other listed
+    // under an identical name would look like the delete had failed.
+    let mut by_ref: Vec<String> = Vec::new();
+    let mut by_stem = None;
     if let Ok(rd) = std::fs::read_dir(cache) {
         for e in rd.flatten() {
             let path = e.path();
@@ -5172,27 +5286,39 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
                 by_stem = Some(st.to_string());
             }
             // Only a READABLE sentinel counts as a ref match - never default to matching "".
+            // BOTH sides get their implied tag first: the sentinel records the reference as it was
+            // first written, which is `alpine` for a `--image alpine` pull and `provalocale:latest`
+            // for a `load`. Comparing the raw strings meant `rmi provalocale` could not delete an
+            // image that `kern images` was listing right in front of you.
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if content.trim() == want {
-                    by_ref = Some(st.to_string());
-                    break; // an exact ref match wins outright
+                if kern_oci::normalize_ref(content.trim()) == want_norm {
+                    by_ref.push(st.to_string());
                 }
             }
         }
     }
-    let stem = by_ref.or(by_stem)?;
-    // The image's OWN on-disk payload (flat + single-diff), measured before removal. A multi-layer image
-    // owns no dir here - its bytes live in the shared `L/` cache, accounted by the orphan sweep below.
+    // A ref match still wins over a stem match, so an image whose ref equals another's stem cannot be
+    // deleted by accident.
+    let stems: Vec<String> = if by_ref.is_empty() {
+        vec![by_stem?]
+    } else {
+        by_ref
+    };
+    // Each image's OWN on-disk payload (flat + single-diff), measured before removal. A multi-layer
+    // image owns no dir here - its bytes live in the shared `L/` cache, accounted by the orphan sweep
+    // below.
     let mut freed = 0u64;
-    let flat = cache.join(&stem);
-    let diff = cache.join(format!("{stem}.diff"));
-    if flat.is_dir() {
-        freed += dir_size(&flat);
+    for stem in &stems {
+        let flat = cache.join(stem);
+        let diff = cache.join(format!("{stem}.diff"));
+        if flat.is_dir() {
+            freed += dir_size(&flat);
+        }
+        if diff.is_dir() {
+            freed += dir_size(&diff);
+        }
+        drop_image_artifacts(cache, stem);
     }
-    if diff.is_dir() {
-        freed += dir_size(&diff);
-    }
-    drop_image_artifacts(cache, &stem);
     // Reclaim layers this image was the last to reference (the sweep fails closed, so a shared layer is
     // never dropped while another image's manifest still names it).
     let (_, layer_freed) = sweep_orphan_layers();
@@ -6000,6 +6126,23 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
             "no such image '{src}' - `kern images` lists cached images"
         )));
     }
+    // Clear any PRIOR image at `dst` FIRST (all forms) - otherwise re-tagging over an existing image
+    // would leave stale files from the old one (a hybrid rootfs) or a mismatched sidecar. Like Docker,
+    // a tag REPLACES the destination. The `.ok` marker is written LAST (below), so an interrupted
+    // re-tag can't leave a half-image that `images`/`push` treats as valid.
+    //
+    // This ran AFTER the `.image` copy and deleted the sidecar that copy had just written, so every
+    // tagged image lost its entrypoint/cmd/env/workdir/user: `kern tag app app2` produced an `app2`
+    // that refused to run with "this image declares no entrypoint or command". The clear has to come
+    // before anything is written to `dst`, not after.
+    if src_safe != dst_safe {
+        let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.ok")));
+        for suffix in ["", ".diff", ".layers", ".base", ".image"] {
+            let p = cache.join(format!("{dst_safe}{suffix}"));
+            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
     // Copy the config sidecar (best-effort: an old image may predate it).
     let cp_file = |suffix: &str| -> Result<(), Error> {
         let from = cache.join(format!("{src_safe}{suffix}"));
@@ -6018,18 +6161,6 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     let flat = cache.join(&src_safe);
     let diff = cache.join(format!("{src_safe}.diff"));
     let layers = cache.join(format!("{src_safe}.layers"));
-    // Clear any PRIOR image at `dst` first (all forms) - otherwise re-tagging over an existing image
-    // would leave stale files from the old one (a hybrid rootfs) or a mismatched sidecar. Like Docker,
-    // a tag REPLACES the destination. The `.ok` marker is written LAST (below), so an interrupted
-    // re-tag can't leave a half-image that `images`/`push` treats as valid.
-    if src_safe != dst_safe {
-        let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.ok")));
-        for suffix in ["", ".diff", ".layers", ".base", ".image"] {
-            let p = cache.join(format!("{dst_safe}{suffix}"));
-            let _ = std::fs::remove_dir_all(&p);
-            let _ = std::fs::remove_file(&p);
-        }
-    }
     if flat.is_dir() {
         copy_tree(&flat, &cache.join(&dst_safe))?;
     } else if layers.exists() {
@@ -7654,6 +7785,14 @@ fn own_only_dir(dir: &std::path::Path) -> std::io::Result<()> {
 
 /// A filesystem-safe directory name for an image reference.
 fn sanitize_ref(image: &str) -> String {
+    // The reference gets its implied tag FIRST, so `alpine` and `alpine:latest` are one key and not
+    // two. They used to be two, and it cost: the same 8.7 MB cached twice, `rmi alpine` leaving
+    // `alpine:latest` behind, `gc` blind to the pair, and a `save`+`load` round trip renaming an
+    // image so the reference that worked before it stopped resolving after. Every caller of this
+    // function keys a cache dir, a sidecar or a lookup on the result, so normalizing here fixes all
+    // of them at once instead of at each site (which is how they drifted apart to begin with).
+    // A digest ref is left alone by `normalize_ref`: it pins harder than a tag.
+    let image = &kern_oci::normalize_ref(image);
     // A filesystem-safe, COLLISION-FREE cache key. Map anything outside `[A-Za-z0-9_-]` to `_` - so
     // `/`, `:`, and crucially any `.`/`..` can't build a traversal like `cache/..` (which a later
     // `remove_dir_all` would then wipe) - then append a short hash of the FULL ref so distinct images
@@ -9387,6 +9526,25 @@ fn expand_copy_srcs(ctx: &std::path::Path, srcs: &[String]) -> Result<Vec<String
 /// Copy `src_rel` (relative to the build context) into the build `rootfs` at `dst`, refusing to
 /// escape the context (source) or traverse a symlinked component of the image (destination). A
 /// relative `dst` (e.g. `COPY x .`) resolves against the current `workdir` (Docker semantics).
+/// Drop the `.` and empty segments a path join creates, leaving `..` ALONE.
+///
+/// `..` is deliberately kept: `sanitize_rootfs_rel` refuses it, and resolving it here would quietly
+/// turn a rejected escape into an accepted write.
+fn collapse_dot_segments(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        out.push('/');
+        out.push_str(seg);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
 fn copy_into_rootfs(
     ctx: &std::path::Path,
     src_rel: &str,
@@ -9410,6 +9568,12 @@ fn copy_into_rootfs(
     } else {
         format!("{}/{}", workdir.unwrap_or("/").trim_end_matches('/'), dst)
     };
+    // Then the `.` segments that join just created are dropped. `WORKDIR /app` + `COPY . .` builds
+    // `/app/.`, and `cp` fails trying to create a directory literally named `.` - which broke the
+    // single most common shape an application Dockerfile has. `COPY . /app` and `COPY main.py .`
+    // both worked, which is why it survived: only a DIRECTORY source with a relative dot
+    // destination under a non-root WORKDIR hits it.
+    let dst_abs = collapse_dot_segments(&dst_abs);
     // Destination resolution (Docker semantics, verified against `docker build`):
     //   - a FILE into a directory dest keeps its basename → `dst/<file>`.
     //   - a DIRECTORY source has its CONTENTS copied into dest (`COPY dir /d/` → `/d/<contents>`,
@@ -11641,6 +11805,24 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
         set_pair(field, value);
     }
 
+    // `backend` is mandatory on every profile (it names the host resource being sliced) and each kind
+    // has exactly one sentinel meaning "the whole host". Making a person type the only value they
+    // could type turned creating a profile into an error message. The writer picks the sentinel and
+    // writes it EXPLICITLY into the block, so the file still carries no ambiguous default, a
+    // hand-edited block with no backend still fails loudly, and the choice is printed rather than
+    // silent. Never on `--update`: injecting it there would rewrite a `backend = "cpu:0"` the caller
+    // never mentioned.
+    let mut defaulted: Option<&str> = None;
+    if !update && !pairs.iter().any(|(k, _)| k == "backend") {
+        let sentinel = if kind == "vdisk" {
+            crate::config::BACKEND_RAM
+        } else {
+            crate::config::BACKEND_HOST
+        };
+        pairs.push(("backend".to_string(), sentinel.to_string()));
+        defaulted = Some(sentinel);
+    }
+
     let refs: Vec<(&str, &str)> = pairs
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -11660,6 +11842,20 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
         z = p.z,
         d = p.d
     );
+    if let Some(sentinel) = defaulted {
+        // Name what the sentinel actually means for THIS kind - `ram` is a RAM-backed tmpfs, not
+        // "the whole host", and a vdisk sized past RAM is exactly where that distinction bites.
+        let meaning = match kind.as_str() {
+            "vdisk" => "a RAM-backed tmpfs, ephemeral",
+            "vgpio" => "the host's own device nodes",
+            _ => "the whole host CPU",
+        };
+        println!(
+            "{d}backend = \"{sentinel}\" ({meaning}) - pass --backend to slice a declared resource instead{z}",
+            d = p.d,
+            z = p.z
+        );
+    }
     Ok(())
 }
 
@@ -11675,7 +11871,7 @@ pub fn config_rm(args: &[String]) -> Result<(), Error> {
 
 /// The default `kern.toml` path, or an error if `$HOME`/`$XDG_CONFIG_HOME` is unset.
 fn config_path() -> Result<PathBuf, Error> {
-    crate::config::default_path()
+    crate::config::active_path()
         .ok_or_else(|| Error::Config("no config path (set $HOME or $XDG_CONFIG_HOME)".into()))
 }
 
@@ -11868,6 +12064,19 @@ fn config_setup(force: bool) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Config(format!("config dir: {e}")))?;
     }
+    // `--force` overwrites a config a person may have hand-written over months. Keep the previous
+    // file next to it and SAY where it went: a destructive verb that leaves no way back is how the
+    // one irreplaceable file in this tool gets lost, and `--force` is typed far more casually than
+    // its consequence deserves. Best-effort by design - a failed copy must not block the write, so
+    // the outcome is reported rather than assumed.
+    let existed = path.exists();
+    let mut saved: Option<std::path::PathBuf> = None;
+    if existed {
+        let bak = path.with_extension("toml.bak");
+        if std::fs::copy(&path, &bak).is_ok() {
+            saved = Some(bak);
+        }
+    }
     let toml = tailored_kern_toml(&detect_host());
     std::fs::write(&path, &toml)
         .map_err(|e| Error::Config(format!("writing {}: {e}", path.display())))?;
@@ -11875,6 +12084,11 @@ fn config_setup(force: bool) -> Result<(), Error> {
         "wrote a starter config to {} (tailored to this host - `kern config edit` to tweak)",
         path.display()
     );
+    match saved {
+        Some(bak) => println!("the previous config is at {}", bak.display()),
+        None if existed => println!("note: the previous config could not be backed up"),
+        None => {}
+    }
     Ok(())
 }
 
@@ -11974,7 +12188,7 @@ fn config_probe() -> Result<(), Error> {
 
 pub fn config_show() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
-    let Some(path) = crate::config::default_path().filter(|p| p.exists()) else {
+    let Some(path) = crate::config::active_path().filter(|p| p.exists()) else {
         println!(
             "{d}no kern.toml - run `kern examples` to see the format{z}",
             d = p.d,
@@ -11984,6 +12198,27 @@ pub fn config_show() -> Result<(), Error> {
     };
     let cfg = crate::config::load(None).map_err(Error::Config)?;
     println!("{d}{}{z}", path.display(), d = p.d, z = p.z);
+    // A listed profile that cannot be attached is the trap this guards: `kern validate` reports it
+    // (naming file, profile and fix) while the listing used to show it as healthy, so two read verbs
+    // over the same file gave two verdicts because one of them never asked. Same rule, one call.
+    let mut unattachable = 0usize;
+    let mut line = |section: &str, name: &str, detail: String| {
+        let bad = crate::config::validate_profile_refs(&cfg, section, name).err();
+        if bad.is_some() {
+            unattachable += 1;
+        }
+        println!(
+            "  {b}{c}{section}:{name}{z}  {d}{detail}{z}{}",
+            match &bad {
+                Some(why) => format!("  {r}cannot attach: {why}{z}", r = p.r, z = p.z),
+                None => String::new(),
+            },
+            b = p.b,
+            c = p.c,
+            d = p.d,
+            z = p.z
+        );
+    };
     for e in &cfg.vcpu {
         let mut parts = Vec::new();
         if let Some(q) = e.cpus {
@@ -11995,41 +12230,41 @@ pub fn config_show() -> Result<(), Error> {
         if let Some(m) = &e.memory {
             parts.push(m.clone());
         }
-        println!(
-            "  {b}{c}vcpu:{}{z}  {d}{}{z}",
-            e.name,
-            parts.join(", "),
-            b = p.b,
-            c = p.c,
-            d = p.d,
-            z = p.z
-        );
+        line("vcpu", &e.name, parts.join(", "));
     }
     for e in &cfg.vgpio {
-        println!(
-            "  {b}{c}vgpio:{}{z}  {d}backend {}, {} pin(s){z}",
-            e.name,
-            e.backend,
-            e.pins.len(),
-            b = p.b,
-            c = p.c,
-            d = p.d,
-            z = p.z
+        // DECLARED devices, not just pins: a profile carrying `i2c = ["/dev/i2c-5"]` reported
+        // "0 pin(s)", identical to one that grants nothing, in the one command that answers
+        // "what do my profiles hand out?".
+        let (devs, lines) = e.declared_grants();
+        line(
+            "vgpio",
+            &e.name,
+            format!(
+                "backend {}, {devs} device(s), {lines} line(s)",
+                if e.backend.is_empty() {
+                    "(unset)"
+                } else {
+                    &e.backend
+                }
+            ),
         );
     }
     for e in &cfg.vdisk {
-        println!(
-            "  {b}{c}vdisk:{}{z}  {d}{}{z}",
-            e.name,
-            e.size.as_deref().unwrap_or("-"),
-            b = p.b,
-            c = p.c,
-            d = p.d,
-            z = p.z
+        line(
+            "vdisk",
+            &e.name,
+            e.size.as_deref().unwrap_or("-").to_string(),
         );
     }
     if cfg.vcpu.is_empty() && cfg.vgpio.is_empty() && cfg.vdisk.is_empty() {
         println!("{d}(no vcpu/vgpio/vdisk profiles){z}", d = p.d, z = p.z);
+    } else if unattachable > 0 {
+        println!(
+            "{d}{unattachable} profile(s) cannot attach - run `kern validate` for the full report{z}",
+            d = p.d,
+            z = p.z
+        );
     }
     Ok(())
 }
@@ -12056,8 +12291,9 @@ fn brackets_outside_quotes(line: &str) -> (usize, usize) {
 pub fn validate(path: Option<&str>) -> Result<(), Error> {
     let target = match path {
         Some(p) => std::path::PathBuf::from(p),
-        None => crate::config::default_path()
-            .ok_or_else(|| Error::Config("no default config path (set $HOME)".to_string()))?,
+        None => crate::config::active_path().ok_or_else(|| {
+            Error::Config("no config path in effect (set $HOME or KERN_CONFIG)".to_string())
+        })?,
     };
     let text = std::fs::read_to_string(&target)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
@@ -12502,6 +12738,29 @@ mod net_resource_tests {
         assert_eq!(systemd_quote("echo $(date +%s)"), "\"echo $$(date +%%s)\"");
         // Embedded quotes/backslashes are C-escaped so the ExecStart line stays parseable.
         assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    /// `WORKDIR /app` + `COPY . .` is the shape most application Dockerfiles have, and joining the
+    /// relative dot destination onto the workdir built `/app/.`, which `cp` cannot create. The
+    /// neighbours that DID work are pinned too, because they are why the bug survived: `COPY . /app`
+    /// and `COPY main.py .` both went down other paths.
+    ///
+    /// `..` must come out UNTOUCHED. Resolving it here would silently convert an escape that
+    /// `sanitize_rootfs_rel` rejects into one it never sees.
+    #[test]
+    fn a_dot_destination_collapses_but_dotdot_survives_for_the_guard() {
+        assert_eq!(collapse_dot_segments("/app/."), "/app");
+        assert_eq!(collapse_dot_segments("/a/b/c/."), "/a/b/c");
+        assert_eq!(collapse_dot_segments("/app/./sub"), "/app/sub");
+        assert_eq!(collapse_dot_segments("//app//sub//"), "/app/sub");
+        assert_eq!(collapse_dot_segments("/app"), "/app");
+        // A destination that reduces to nothing is the rootfs itself, not the empty string.
+        assert_eq!(collapse_dot_segments("/."), "/");
+        assert_eq!(collapse_dot_segments("/"), "/");
+        // Left for the guard to refuse, never resolved here.
+        assert_eq!(collapse_dot_segments("/app/.."), "/app/..");
+        assert_eq!(collapse_dot_segments("/../../etc"), "/../../etc");
+        assert!(sanitize_rootfs_rel("..", &collapse_dot_segments("/app/..")[1..]).is_err());
     }
 
     #[test]
@@ -13171,6 +13430,36 @@ mod image_rm_tests {
         let dir = cache.join(stem);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("blob"), vec![0u8; bytes]).unwrap();
+    }
+
+    /// A layer can carry a directory with no owner write bit (`dr-xr-xr-x` is ordinary in
+    /// Fedora-based images). Unlinking a file needs write on its PARENT, so a plain `remove_dir_all`
+    /// stops at the first one and leaves the rest on disk while `rmi` reports the size it measured
+    /// beforehand. Measured on `quay.io/podman/stable`: "freed 600.5M", **456 MB still there**.
+    /// On an SD-card board that is the difference between a full disk and an empty one.
+    #[test]
+    fn a_read_only_directory_does_not_survive_the_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kern-ro-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let deep = base.join("a/bloccata/dentro");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("file"), b"x").unwrap();
+        // Take the write bit off the directory that HOLDS the file, which is what blocks the unlink.
+        let ro = base.join("a/bloccata");
+        let mut p = std::fs::metadata(&ro).unwrap().permissions();
+        p.set_mode(0o555);
+        std::fs::set_permissions(&ro, p).unwrap();
+        // The plain call is expected to fail here - that is the bug being pinned.
+        assert!(
+            std::fs::remove_dir_all(&base).is_err(),
+            "fixture is wrong: the plain remove succeeded, so it proves nothing"
+        );
+        force_remove_dir_all(&base);
+        assert!(
+            !base.exists(),
+            "the tree survived the delete: rmi would report bytes it never freed"
+        );
     }
 
     #[test]

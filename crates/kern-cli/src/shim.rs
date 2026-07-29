@@ -101,7 +101,7 @@ impl fmt::Display for ShimError {
             }
             ShimError::InjectedFlag { role, value } => write!(
                 f,
-                "docker compat: refusing {role} '{value}' - it begins with '-' and would be read as a flag (injection). {role}s cannot start with '-' (same rule as Docker)."
+                "docker compat: refusing {role} '{value}' - it begins with '-' and would be read as a flag (injection). A {role} cannot start with '-'."
             ),
             ShimError::EmptyImage => {
                 write!(f, "docker compat: empty image reference is invalid")

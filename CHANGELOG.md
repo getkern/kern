@@ -19,6 +19,237 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.23], 2026-07-29
+
+### Changed
+
+- **The binary now describes itself the way everything else does.** Running `kern` with no
+  arguments, and `kern --help`, called it *"a fast, lightweight sandbox & virtual resource manager"*,
+  while the README, the site and the package all say *"a fast, **rootless** sandbox and virtual
+  resource **runtime**"*. The first line a user reads after installing dropped the one word that
+  distinguishes kern from every other runtime, and called it a manager where everything else calls
+  it a runtime. Aligned in all four places it appeared, including the crate description.
+
+- **`kern top` no longer states what another runtime cannot do.** Three lines of help text in the
+  Runs tab carried absolute claims about a competing tool ("what X can't do at scale", "X has no
+  analogue this fast"). Nothing measured supports an absolute claim of that shape, and a product's
+  own UI is the worst place to make one. The lines now describe what a run *is* (a CPU/mem-capped
+  process with cgroup caps and no namespaces, counted as aggregate throughput rather than listed
+  row by row), which is the useful part and is true on its own. Comparisons stay where the numbers
+  are: [BENCHMARKS.md](BENCHMARKS.md).
+- **Third-party marks are now named as such.** [TRADEMARK.md](TRADEMARK.md) gains an "Other people's
+  marks" section: kern is independent and unaffiliated, third-party names appear nominatively (a
+  file format it reads, a registry it talks to, a syntax it accepts), and they belong to their
+  owners. Two error messages that justified a rule by citing another tool now simply state the rule.
+
+### Fixed
+
+- **`kern rmi` reported freeing space it had not freed.** An image layer can carry a directory with
+  no owner write bit (`dr-xr-xr-x` is ordinary in Fedora-based images: `quay.io/podman/stable` has
+  hundreds of them). Unlinking a file needs write on its PARENT, so `remove_dir_all` stopped at the
+  first such directory and left the rest of the tree on disk, while the command printed the size it
+  had measured *before* deleting. Measured on that image: **"removed image, freed 600.5M" with
+  456 MB still on disk**. The delete now restores owner `u+rwX` on its own copy and retries, so the
+  same case goes from 624 MB to 4 KB. Saying a thing happened when it did not is the costliest
+  defect shape here, and on an SD-card board it is the difference between a full disk and an empty
+  one.
+
+- **The "every service is behind an inactive profile" error told you to set the wrong names.** It
+  listed the SERVICES that were skipped and then said to put them in `COMPOSE_PROFILES`, which
+  activates nothing, because a service name is not a profile name. Measured on a real file: the
+  message suggested `hoppscotch-backend`, which does nothing, where `backend` is what works. It now
+  names the services that WOULD run and, separately, the profiles that would enable them, checked
+  against the same file: five of the eight it lists bring the stack up, and the other three surface
+  a different, real conflict inside those services rather than the profile being wrong.
+
+- **`kern exec` into a paused box hung forever.** A paused box sits in a frozen cgroup, so the
+  exec'd process is placed there and never scheduled: the command produced no output, no error and
+  no exit, and the only way out was Ctrl-C. `ps` had reported the box as `paused` all along, so the
+  state was known, it just was not consulted before the exec. It now fails in **2 ms** with the
+  reason and the way out (`kern unpause <box>` first). `kern cp` from a paused box is untouched and
+  still works, because it reads `/proc/<pid>/root` and needs nothing scheduled.
+
+- **`kern top` scrolled its own screen on any tab with a full list.** The row budget reserved 9 lines
+  for chrome, but the frame chrome is 7 and every list pane adds 5 of its own (a blank, its caption,
+  a blank, the column header, the trailing `… N more`), so 12 lines were spoken for before the first
+  row of data. While a list was short nothing showed; as soon as one filled the budget the frame ran
+  over by exactly 3. Measured: Images and Builds rendered **33 lines into a 30-row terminal**, and
+  the same +3 at 20, 24, 40 and 50 rows. Three lines past the last row scroll the alternate screen,
+  which carries the **tab bar off the top** and makes every repaint start one line lower: the
+  flicker, and the missing header.
+
+  The budget is corrected, and `render` now caps its own output at the terminal height, so the
+  invariant lives in one place and a test holds it across seven tabs and seven window sizes. The cap
+  also covers what the budget cannot: a pane with fixed content (the Overview) has a minimum height,
+  and in a 10-row window it loses its bottom rows instead of corrupting the screen.
+
+- **`kern top` dropped every key of a burst except the first.** The loop read up to eight bytes and
+  dispatched `buf[0]`, discarding the rest. A terminal hands over several bytes in one read whenever
+  keys outrun one loop turn: a held key repeating, a paste, or any laggy link, which over ssh to a
+  board is the normal case rather than the exception. Measured: eight keys typed as one burst left
+  the TUI unresponsive until it was killed 12 s later, because the `q` at the end was never seen;
+  the same keys one at a time answered in 274 ms. A read is now split into individual key events and
+  queued, one dispatched per turn, and a queued key skips the poll entirely instead of waiting on
+  it. After the fix the same burst quits in **274 ms**, and a thirty-key burst in 275 ms.
+
+  Escape sequences stay whole, which is why this is not a plain per-byte loop: an arrow key is three
+  bytes that mean one event, and splitting it would type a stray `[` into a form. A bare `Esc` is
+  still delivered on its own, so it still closes a modal.
+
+- **`kern tag` produced an image that would not run.** The destination's config sidecar was copied
+  first and the "clear any prior image at the destination" sweep ran second, deleting the file that
+  had just been written. A tagged image therefore lost its entrypoint, cmd, env, workdir and user,
+  and `kern box --image <newtag>` answered `this image declares no entrypoint or command in kern's
+  cache`. The sweep now runs before anything is written to the destination, which is where a
+  "replace what is there" step belongs. Re-tagging over an existing image is pinned by test too,
+  since that is the case the sweep exists for.
+
+- **`WORKDIR /app` + `COPY . .` failed to build.** The relative destination was joined onto the
+  workdir as a literal `/app/.`, and `cp` cannot create a directory named `.`, so the build died with
+  `COPY '.' → '.' failed`. That is the shape most application Dockerfiles have. It survived because
+  every neighbour worked: `COPY . /app` (absolute destination), `COPY main.py .` (file source), and
+  `COPY . .` with no `WORKDIR` all took other paths, so only a DIRECTORY source with a relative dot
+  destination under a non-root workdir hit it. The destination now has its `.` and empty segments
+  collapsed before use. `..` is deliberately left in place: `sanitize_rootfs_rel` refuses it, and
+  resolving it here would turn a rejected escape into an accepted write (checked: a
+  `COPY f /../../../tmp/x` is still refused with `escapes the image rootfs`).
+
+- **`alpine` and `alpine:latest` were two different images.** The registry request was always right
+  (`parse_ref` defaults a missing tag to `latest`), but the **cache key** was derived from the
+  reference as typed, so one image pulled both ways was stored twice. Four things followed, all
+  measured before the fix: two rows in `kern images` holding **8.7 MB each of identical content**;
+  `kern rmi alpine` freeing 8.0 MB and leaving `alpine:latest` behind; `kern gc` blind to the pair
+  (it freed 261 B); and, the half you actually hit, a `save` + `load` round trip **renaming** an
+  image, so a build tagged `myapp` came back as `myapp:latest` and `--image myapp` stopped
+  resolving.
+
+  A reference now gets its implied tag once, in `kern_oci::normalize_ref`, before anything keys a
+  cache dir, a sidecar or a lookup on it. The rule that decides whether a reference is already
+  tagged lives in exactly one function (`split_tag`) used by both the normalizer and the registry
+  parser, so the two cannot drift: a registry **port** is not a tag (`localhost:5000/img` becomes
+  `localhost:5000/img:latest`, not a tag of `5000/img`), and a **digest** is never given one
+  (`img@sha256:…` is returned untouched, because it pins harder than a tag). `rmi` normalizes both
+  sides of its comparison, so either spelling deletes the image you are looking at, and `kern
+  images` prints the canonical form so every row is a reference you can paste straight back.
+
+  **One-time cost, stated exactly.** The cache key changes, so an image cached by an earlier version
+  is not found under the new key and is pulled once more. Nothing is deleted, and the old entry stays
+  on disk: `kern gc` does **not** reclaim it (measured: 0 B freed), because it is a complete, valid
+  cache entry and not garbage. Until you remove it, `kern images` lists it as a second row with the
+  same name, since both spellings now print canonically. `kern rmi <ref>` therefore removes **every**
+  entry that reference resolves to and reports the total, so one `kern rmi alpine` reclaims the pair
+  (measured: 16.0 MB from two 8.0 MB entries) while `alpine:3.19` and every unrelated image are left
+  untouched.
+
+- **`-v .:/app` was refused as an invalid volume name.** Every `-v` source without a leading `/` was
+  classified as a *named volume*, so the most ordinary bind there is (mount the project you are
+  standing in) reached the volume-name validator and came back as `invalid volume name '.'`. The
+  same line through the compatibility shim failed the same way, which is what that shim exists to
+  prevent. `-v` now applies the conventional rule: a source is a **path** when it is absolute or
+  starts with `./` / `../` (or is exactly `.` / `..`), and a **name** otherwise. The two negatives
+  are unchanged and pinned by test, because they are how a fix like this breaks: `-v sub:/app` is
+  still a named volume (not the `./sub` directory), and `-v foo/bar:/app` is still an error.
+
+  The compose layer already resolved its own `./` binds against the compose file's directory, and
+  still does: relative sources from a `.yml` continue to resolve there, not against the current
+  directory. Only the CLI flag changed, where the base is the current directory. No containment
+  guard is applied to the CLI form on purpose: a direct invocation can already name any absolute
+  path, so resolving a relative one grants nothing new, while refusing `../shared:/x` would break a
+  legitimate call. Other path-taking flags (`--env-file`, `--secret`) never had the ambiguity and
+  were already correct.
+
+### Profiles and `kern.toml`
+
+Nine defects found by exercising the profile surface end to end on five machines, including the
+three ARM boards. Every one of them is the same shape: two places deciding the same thing.
+
+- **The writer and the reader used a different file.** `KERN_CONFIG` was honoured when *reading*
+  (`kern config list`) and ignored when *writing*: `config add`/`rm`/`setup`/`edit`, and also
+  `kern validate` and `kern info`, went straight to `~/.config/kern/kern.toml`. Point `KERN_CONFIG`
+  at a project config and the listing showed that file while the edit silently landed in the global
+  one, with no message on either side. One `config::active_path()` now answers "which file is in
+  effect" for every caller. Verified on all three boards: an add against a `KERN_CONFIG` fixture
+  lands there, and `list`, `validate` and `info` all report the same path.
+
+- **`kern config list` showed unusable profiles as healthy.** A profile with no `backend` cannot
+  attach - `kern validate` says so, naming file, profile and fix - but the listing printed it like
+  any other. Two read verbs over one file gave two verdicts because one never asked. The listing now
+  runs the same check and marks the entry, with a trailing count pointing at `kern validate`.
+
+- **The summary could not tell a real device grant from nothing.** `vgpio` entries reported only
+  `N pin(s)`, so a profile carrying `i2c = ["/dev/i2c-5"]` printed `0 pin(s)`, the same line as one
+  that grants nothing, in the one command that answers "what do my profiles hand out?". It now
+  counts declared devices and lines across every field (never `net`, which vgpio parses but does not
+  attach).
+
+- **A device path that escapes `/dev` was stored and then refused at every launch.**
+  `--i2c /dev/../etc/shadow` passed the writer's prefix test; the resolver then skipped it on every
+  box start ("outside /dev/"). `is_dev_path` now walks `.`/`..` and refuses anything that does not
+  land under `/dev/`, which is the rule the resolver already applied. The lexical check is not a
+  substitute for the resolver's `canonicalize`: a *symlink* out of `/dev` is still the resolver's
+  job, and the comment says so.
+
+- **The only mandatory field was the hardest one to reach.** `backend` is required on every profile
+  and lives inside the TUI's "Advanced" fold, below every detected-device row - so the more hardware
+  a host has, the further down it sits. Measured: a Pi 5 (no i2c nodes) puts it six rows down, a
+  Jetson (seven i2c buses, four spi ports, four uarts) far below that, on exactly the boards where a
+  vgpio profile is the point. Filling the visible form and pressing Enter answered with a message
+  written in TOML rather than in the form's language. Both writers now pre-pick the kind's sentinel
+  (`host`, or `ram` for vdisk) and write it EXPLICITLY: creating a vgpio profile in `kern top` went
+  from 28 keystrokes to 9. The file still never carries an implicit default, a hand-edited profile
+  with no backend still fails loudly, and `--update` never rewrites a backend the caller did not
+  mention.
+
+- **`kern box --plan` previewed the mounts and not the hardware.** A `vgpio:` profile hands over real
+  device nodes; the preview listed three mount steps and said nothing about `/dev/i2c-5`. It now
+  resolves the attached profiles against this host - the same call the launch makes, so preview and
+  launch cannot disagree - and reports the binds, the sysfs paths, the pins (naming the
+  chip-granular limit), or the reason a profile cannot attach.
+
+- **A granted device you cannot open looked like a kern bug.** kern deliberately does not elevate: a
+  rootless box inherits the caller's access, so a node at `root:root 0600` is visible inside the box
+  and refuses to open. Nothing said so. A box start now names the device, its uid/gid/mode, and the
+  two ways out. One-directional by construction: the box runs as this user or a mapped subuid with no
+  more access, so "the caller cannot open it" implies the box cannot either.
+
+- **`kern config setup --force` overwrote a config with no way back.** It now copies the previous
+  file to `kern.toml.bak` first and prints where it went, or says plainly that the backup failed.
+
+- **A flag the read-only config verbs do not take was ignored.** `kern config list --json` printed
+  the human listing and exited 0, so a script that asked for JSON got prose and could not tell. Any
+  unrecognised flag on `list`/`edit`/`setup`/`probe`/`clear` is now refused by name.
+
+- **A shipped config example did not work, and said the opposite.** [docs/STORAGE.md](docs/STORAGE.md)
+  presented a complete `~/.config/kern/kern.toml` with `backend` commented out and annotated
+  "default is automatic" - false since 0.6.11, and copying that file gets it refused. Found by
+  extracting every TOML snippet from the shipped docs and running it through `kern validate` rather
+  than by reading them. The remaining snippets that do not validate standalone are the per-field
+  reference excerpts, which show a profile without its physical block on purpose and are annotated
+  `REQUIRED`; the "copy-paste this starter" block in [docs/CONFIG.md](docs/CONFIG.md) validates, and
+  so does the output of `kern examples`.
+
+- **`KERN_CONFIG` was called "documented" and was not.** It appears in no README, no `docs/`, and no
+  `--help`, while now governing which file every read AND write touches.
+  [docs/CONFIG.md](docs/CONFIG.md) gains a "Which file is in effect" table covering `--config`,
+  `KERN_CONFIG` and the default location, and says that `kern info` prints the path in effect.
+  `--plan`'s help line now mentions the device grants it prints.
+
+Two things that looked like defects and are not, checked before changing them: `--cpus 99999` is
+accepted at write time on purpose (a config is portable) and the runtime clamps it to the host's
+CPUs with a warning; an oversized RAM-backed `vdisk` mounts, and the runtime already states that it
+is tmpfs, ephemeral, and charged to RAM, and points at `--memory`.
+
+### Bindings (`kern-sandbox` 0.1.11, on PyPI + npm)
+
+- **The bindings reported the wrong version of themselves.** `kern_sandbox.__version__` and the Node
+  `version` export both read `0.1.8` while `pyproject.toml` and `package.json` declared `0.1.10`, so
+  the published 0.1.10 package identified itself as 0.1.8. The visible consequence was in the MCP
+  server: the `serverInfo.version` returned at `initialize`, which is what an MCP client logs and
+  displays, named a release two versions old. The version was stated in two places per binding and
+  they drifted, the same duplicated-derived-value defect as `-v .:/app` and the tag default in this
+  release. Both literals now match their manifest, verified through a real stdio handshake rather
+  than by reading the source.
+
 ## [0.6.22], 2026-07-28
 
 ### Fixed

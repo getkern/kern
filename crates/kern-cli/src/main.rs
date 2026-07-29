@@ -1,4 +1,4 @@
-//! kern - a fast, lightweight sandbox & virtual resource manager.
+//! kern - a fast, rootless sandbox & virtual resource runtime.
 //!
 //! This binary is intentionally THIN: it parses argv into a [`cli::Command`] and dispatches.
 //! Real subcommand logic lives in `commands/`, and the sandbox in `sandbox/`. There is NO

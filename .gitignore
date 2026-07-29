@@ -58,3 +58,11 @@ credentials
 win-key*
 *.ots.bak
 *.bak
+
+# Debris the examples leave in their own directory when you run them: `try-any-distro.sh` extracts a
+# rootfs beside itself and `media-transcode.sh` writes its output clip. Both are build products of a
+# demo, not sources, and the rootfs is 8.7 MB - big enough that an accidental `git add -A` is worth
+# preventing rather than noticing in review.
+examples/*/
+!examples/*.sh
+examples/clip.mp4

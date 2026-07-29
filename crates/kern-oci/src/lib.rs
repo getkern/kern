@@ -7,7 +7,9 @@ mod pull;
 mod push;
 mod search;
 pub use archive::{load, save, Loaded};
-pub use pull::{pull, valid_reference, ImageConfig, OciError, Platform};
+pub use pull::{
+    normalize_ref, pull, split_tag, valid_reference, ImageConfig, OciError, Platform, DEFAULT_TAG,
+};
 pub use push::{push, ImageConfigOut};
 pub use search::{search, SearchResult};
 
@@ -16,6 +18,13 @@ pub use search::{search, SearchResult};
 /// them. See `fuzz/README.md`.
 #[doc(hidden)]
 pub mod __fuzz {
+    /// `parse_ref` for the reference fuzzer: normalizing a reference must never change the
+    /// `(registry, repo, tag)` it resolves to, or kern would cache under one identity and download
+    /// another.
+    pub fn parse_ref_pub(image: &str) -> Result<(String, String, String), crate::OciError> {
+        crate::pull::parse_ref(image)
+    }
+
     /// Drive the registry-JSON string scanner over arbitrary input - it must never panic (e.g. on a
     /// non-UTF-8-boundary slice) no matter how malformed the bytes are.
     pub fn json_walk(s: &str) {

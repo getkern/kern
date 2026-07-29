@@ -150,6 +150,37 @@ pub struct VGpioEntry {
     pub extra: Vec<String>,
 }
 
+impl VGpioEntry {
+    /// What this profile DECLARES it hands to a box, as `(device nodes, hardware lines)`.
+    ///
+    /// Declared, not resolved: a pure read of the entry with no filesystem access, so
+    /// `kern config list` stays a file operation, costs nothing, and gives the same answer on every
+    /// host. What is actually bound at launch is `resolve_vgpio`'s job and can only be SMALLER (it
+    /// drops what this host does not have). Counting `pins` alone - as the summary line used to -
+    /// reports `0` for a profile that hands over a real `/dev` node, which is the one question the
+    /// listing exists to answer.
+    ///
+    /// `net` is deliberately excluded: a vgpio profile does not attach network interfaces (the
+    /// resolver says so out loud), so counting it would inflate the grant with something inert.
+    pub(crate) fn declared_grants(&self) -> (usize, usize) {
+        let devs = self.i2c.len()
+            + self.spi.len()
+            + self.uart.len()
+            + self.can.len()
+            + self.camera.len()
+            + self.audio.len()
+            + self.leds.len()
+            + self.bluetooth.len()
+            + self.usb.len()
+            + self.input.len()
+            + self.midi.len()
+            + self.display.len()
+            + self.extra.len();
+        let lines = self.pins.len() + self.pwm.len() + self.adc.len() + self.onewire.len();
+        (devs, lines)
+    }
+}
+
 // ─────────────────────────────── Disk (implemented) ───────────────────────────────
 
 /// `[[disk]]` - a physical disk pool volumes are placed on.
@@ -589,6 +620,34 @@ pub fn default_path() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".config/kern/kern.toml"))
 }
 
+/// The config file **in effect** for this invocation: `KERN_CONFIG` when set and non-empty, else
+/// [`default_path`]. One answer for every caller.
+///
+/// This exists because the readers and the writers used to resolve it differently: `kern config
+/// list` read through [`load`], which honours `KERN_CONFIG`, while `config add`/`rm`/`setup`/`edit`
+/// went straight to [`default_path`]. With `KERN_CONFIG` pointing at a project file, the listing
+/// showed that file and the edit silently went into `~/.config/kern/kern.toml` - a write landing in
+/// a file the user is not looking at, with no message either way. An explicit `--config` on a `box`
+/// or `run` command still wins for THAT command's read (it is passed to `load`); it is not a global
+/// flag and never reaches the config-editing verbs, which is why it is absent here.
+pub fn active_path() -> Option<std::path::PathBuf> {
+    active_path_impl(std::env::var_os("KERN_CONFIG"), default_path())
+}
+
+/// Testable core of [`active_path`] (same split as [`load_impl`], for the same reason: the rule is
+/// worth asserting without touching the process environment). An empty `KERN_CONFIG` counts as
+/// unset - exported-but-blank is how a shell script passes "no override", and treating it as a path
+/// would write `kern.toml` into the current directory.
+fn active_path_impl(
+    env_cfg: Option<std::ffi::OsString>,
+    default: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    env_cfg
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or(default)
+}
+
 /// Load `kern.toml` from `path` (or the default location). A missing file is not an error - it
 /// yields an empty config, so profiles are simply "not found". A present-but-malformed file IS an
 /// error (with its line).
@@ -817,6 +876,22 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
                         real.display()
                     );
                 }
+                // Binding a node the caller cannot OPEN produces a box where the device is visible
+                // and unusable, which reads as "kern is broken" rather than "the host permissions say
+                // no". kern deliberately does not elevate: a rootless box inherits the caller's
+                // access, so `/dev/i2c-5` at root:root 0600 stays shut. Say it here, once, with the
+                // fix - this is where all three ways of writing a profile converge.
+                //
+                // One-directional by construction: the box runs as this user or as a mapped subuid
+                // with no MORE access, so "the caller cannot open it" implies the box cannot either.
+                // The converse is not claimed (the check is skipped, never inverted, on error).
+                if !can_open(&real) {
+                    eprintln!(
+                        "kern: vgpio device {} is not readable/writable by this user ({}) - the box will see the node and fail to open it; add yourself to its group or relax its mode on the host",
+                        real.display(),
+                        dev_owner_hint(&real)
+                    );
+                }
                 devs.push(real.to_string_lossy().into_owned());
             }
             Ok(real) => {
@@ -861,16 +936,76 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("/dev/i2c-{n}"))
 }
 
+/// Can the CURRENT user open `path` for read+write? A pure permission probe via `access(2)`: it does
+/// NOT open the node, so it cannot disturb a peripheral that reacts to being opened (a modem that
+/// resets on open, a UART that asserts DTR).
+///
+/// Returns `true` on any error building the probe. This drives a *warning*, and a warning that fires
+/// because a `CString` could not be built would be noise attached to the wrong cause.
+fn can_open(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: `c` is a NUL-terminated C string that outlives the call, and `access` only reads it.
+    unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) == 0 }
+}
+
+/// `uid/gid/mode` of a device node, for the "you cannot open it" warning: the three facts a person
+/// needs to choose between joining a group and relaxing the mode. Numeric on purpose - resolving
+/// names means NSS lookups that can block on a network directory service, in a warning path.
+fn dev_owner_hint(path: &std::path::Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(m) => format!(
+            "uid {} gid {} mode {:04o}",
+            m.uid(),
+            m.gid(),
+            m.mode() & 0o7777
+        ),
+        Err(_) => "permissions unknown".to_string(),
+    }
+}
+
 /// Is `s` a well-formed `/dev/…` path (SHAPE only - not existence)? `/dev/` then a non-empty run of
-/// path chars (alnum `/ . _ -`), no spaces/junk. The single rule shared by the `extra` field's save
-/// validation and its live filter, so the CLI, a hand-edited file and the TUI all agree.
+/// path chars (alnum `/ . _ -`), no spaces/junk, **and it must still name something under `/dev/`
+/// once `.`/`..` are resolved**. The single rule shared by the `extra` field's save validation and
+/// its live filter, so the CLI, a hand-edited file and the TUI all agree.
+///
+/// The `..` walk is what makes this more than a prefix test: `/dev/../etc/shadow` starts with
+/// `/dev/` and is made only of path chars, so a prefix test stores it happily - and then the
+/// resolver refuses it at every launch ("resolves to /etc/shadow (outside /dev/) - skipped"). The
+/// writer must apply the rule the reader applies, or the file holds a device grant that can never
+/// take effect. Lexical by design: a *symlink* out of `/dev` is not visible here and stays the
+/// resolver's job (it canonicalizes, this cannot).
 pub(crate) fn is_dev_path(s: &str) -> bool {
-    s.strip_prefix("/dev/").is_some_and(|rest| {
-        !rest.is_empty()
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
-    })
+    let Some(rest) = s.strip_prefix("/dev/") else {
+        return false;
+    };
+    if rest.is_empty()
+        || !rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    // Depth below `/dev`, walked segment by segment: `..` at depth 0 escapes, and ending at depth 0
+    // (`/dev/foo/..` = `/dev` itself) names no device. Saturating by construction - the `== 0` guard
+    // precedes every decrement, so this cannot underflow.
+    let mut depth: usize = 0;
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            _ => depth += 1,
+        }
+    }
+    depth > 0
 }
 
 /// A `/dev` node that must never be bound into a deny-by-default *peripheral* sandbox. The rule is a
@@ -1608,7 +1743,7 @@ pub(crate) fn profile_pairs(cfg: &KernConfig, kind: &str, name: &str) -> Vec<(St
 fn config_lock() -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::io::AsRawFd as _;
-    let path = default_path()?;
+    let path = active_path()?;
     let parent = path.parent()?;
     let _ = std::fs::create_dir_all(parent);
     let f = std::fs::OpenOptions::new()
@@ -1625,7 +1760,7 @@ fn config_lock() -> Option<std::fs::File> {
 /// The default `kern.toml` path + its current contents (empty when absent), ensuring the parent dir
 /// exists so a later write succeeds.
 pub(crate) fn read_kern_toml() -> Result<(std::path::PathBuf, String), String> {
-    let path = default_path().ok_or("no config path (is HOME set?)")?;
+    let path = active_path().ok_or("no config path (is HOME set?)")?;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1807,6 +1942,100 @@ pub(crate) fn delete_named_block(section: &str, name: &str) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The writers and the readers must resolve the SAME file. `load` honoured `KERN_CONFIG` while
+    /// `config add`/`rm`/`setup`/`edit`, `validate` and `doctor` went straight to the default
+    /// location: with `KERN_CONFIG` pointing at a project file, `config list` showed that file and
+    /// `config add` silently edited `~/.config/kern/kern.toml` instead, with no message on either
+    /// side. Measured, not read: an add against a `KERN_CONFIG` fixture left the fixture untouched.
+    #[test]
+    fn the_active_config_is_kern_config_when_set_and_the_default_otherwise() {
+        use std::ffi::OsString;
+        let default = Some(std::path::PathBuf::from("/home/u/.config/kern/kern.toml"));
+
+        // Set and non-empty: it wins over the default.
+        assert_eq!(
+            active_path_impl(Some(OsString::from("/proj/kern.toml")), default.clone()),
+            Some(std::path::PathBuf::from("/proj/kern.toml"))
+        );
+        // Unset: the default.
+        assert_eq!(active_path_impl(None, default.clone()), default);
+        // Exported but BLANK counts as unset - taking it as a path would write `kern.toml` into the
+        // current directory, which is how a config silently appears in a repo.
+        assert_eq!(
+            active_path_impl(Some(OsString::new()), default.clone()),
+            default
+        );
+        // No env and no default (no HOME): no path at all, rather than a relative one.
+        assert_eq!(active_path_impl(None, None), None);
+        // The override still applies when there is no default to fall back to.
+        assert_eq!(
+            active_path_impl(Some(OsString::from("/proj/kern.toml")), None),
+            Some(std::path::PathBuf::from("/proj/kern.toml"))
+        );
+    }
+
+    /// `kern config list` reported "0 pin(s)" for a profile carrying `i2c = ["/dev/i2c-5"]`, the
+    /// same line it printed for a profile that grants nothing - in the one command that answers
+    /// "what do my profiles hand out?". The count must see every device field, and must NOT count
+    /// `net`, which a vgpio profile parses but does not attach.
+    #[test]
+    fn declared_grants_counts_devices_and_lines_but_never_net() {
+        let e = VGpioEntry {
+            name: "t".into(),
+            backend: "host".into(),
+            i2c: vec!["/dev/i2c-5".into()],
+            uart: vec!["/dev/ttyACM0".into()],
+            display: vec!["/dev/dri/renderD128".into()],
+            extra: vec!["/dev/rtc0".into()],
+            pins: vec![17, 27],
+            pwm: vec![12],
+            net: vec!["eth0".into(), "wlan0".into()], // parsed, never attached: must not count
+            ..Default::default()
+        };
+        assert_eq!(e.declared_grants(), (4, 3));
+
+        let empty = VGpioEntry {
+            name: "e".into(),
+            backend: "host".into(),
+            ..Default::default()
+        };
+        assert_eq!(empty.declared_grants(), (0, 0));
+
+        // The regression itself: a device-only profile must not report the same as an empty one.
+        assert_ne!(e.declared_grants(), empty.declared_grants());
+    }
+
+    /// SECURITY/COHERENCE regression: the writer must refuse exactly what the resolver refuses.
+    /// `/dev/../etc/shadow` passed the old prefix test, so `kern config add --i2c /dev/../etc/shadow`
+    /// stored a device grant that the resolver then skipped at EVERY launch ("outside /dev/"). A
+    /// stored grant that can never take effect is a lie in the config file, and the same string was
+    /// accepted by the TUI's live filter, which shares this function.
+    #[test]
+    fn a_dev_path_that_walks_out_of_dev_is_not_a_dev_path() {
+        for good in [
+            "/dev/i2c-1",
+            "/dev/snd/seq",
+            "/dev/bus/usb/001/002",
+            "/dev/snd/../snd/seq", // walks up but lands back inside
+            "/dev/./i2c-1",
+        ] {
+            assert!(is_dev_path(good), "{good} should be accepted");
+        }
+        for bad in [
+            "/dev/../etc/shadow", // the reported case
+            "/dev/../../etc/passwd",
+            "/dev/snd/../../etc/shadow",
+            "/dev/i2c-1/..", // resolves to /dev itself: names no device
+            "/dev/..",
+            "/dev/",
+            "/etc/shadow",
+            "dev/i2c-1",
+            "/dev/i2c 1", // space: not a path char
+        ] {
+            assert!(!is_dev_path(bad), "{bad} should be refused");
+        }
+    }
 
     const DOC: &str = r#"
         [kern]

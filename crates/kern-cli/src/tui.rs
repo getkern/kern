@@ -396,6 +396,31 @@ fn setup_registry_watch() -> i32 {
     -1
 }
 
+/// Split one `read` of the terminal into individual key events, keeping an escape sequence (the
+/// arrows, Home/End, PgUp/PgDn) whole.
+///
+/// A sequence is `ESC` then `[` or `O`, then parameter bytes, then a final byte in `0x40..=0x7e`.
+/// Anything else is one byte, one key. A lone `ESC`, or a sequence that arrived truncated, stays a
+/// single event: that is exactly what a bare Escape keypress looks like, and treating it as the
+/// start of something longer would swallow the key that closes a modal.
+fn split_keys(buf: &[u8], out: &mut std::collections::VecDeque<Vec<u8>>) {
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b && i + 1 < buf.len() && (buf[i + 1] == b'[' || buf[i + 1] == b'O') {
+            let mut j = i + 2;
+            while j < buf.len() && !(0x40..=0x7e).contains(&buf[j]) {
+                j += 1;
+            }
+            let end = (j + 1).min(buf.len());
+            out.push_back(buf[i..end].to_vec());
+            i = end;
+        } else {
+            out.push_back(vec![buf[i]]);
+            i += 1;
+        }
+    }
+}
+
 /// Run the interactive TUI. Returns when the user quits (`q`, `Esc`, or `Ctrl-C`).
 pub fn run() -> Result<(), crate::error::Error> {
     let fd = 0; // stdin
@@ -437,6 +462,13 @@ pub fn run() -> Result<(), crate::error::Error> {
     // unavailable, the 1 s timer below still keeps the view fresh (just not sub-second on changes).
     let ino_fd = setup_registry_watch();
 
+    // Key events already split off a read but not yet dispatched. A terminal hands us SEVERAL bytes
+    // in one `read` whenever keys arrive faster than one loop turn: a held key repeating, a paste,
+    // or any laggy link, which over ssh to a board is the normal case rather than the exception.
+    // Acting on `buf[0]` and discarding the rest lost every key but the first, so a burst ending in
+    // `q` never quit. They are queued here and dispatched one per turn instead.
+    let mut keyq: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+
     let mut snap = refresh_full(
         &mut prev,
         &mut prev_cpu,
@@ -473,6 +505,8 @@ pub fn run() -> Result<(), crate::error::Error> {
             sel,
             &mode,
         );
+        // The frame is already capped to `term_rows` by `render` itself - one place decides the
+        // height, so this loop cannot disagree with it.
         // Clear each line to end-of-line (`\x1b[K`) so a shorter/blank line in the new frame wipes
         // any leftover text from the previous one (no residue, no flicker), then erase everything
         // below the frame (`\x1b[J`) in case the new frame has fewer lines.
@@ -484,53 +518,63 @@ pub fn run() -> Result<(), crate::error::Error> {
 
         // Wait for a key, a registry change (inotify), or ~1 s (the CPU%/stats window). A registry
         // change wakes us instantly (no poll lag); the timer keeps stats fresh even when idle.
-        let mut pfds = [
-            libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: ino_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let nfds = if ino_fd >= 0 { 2 } else { 1 };
-        if unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 1000) } <= 0 {
-            snap = refresh_full(
-                &mut prev,
-                &mut prev_cpu,
-                &mut prev_runs,
-                &mut runs_hist,
-                &mut prev_box,
-                &mut box_hist,
-            ); // timeout → periodic refresh (CPU% window)
-            continue;
-        }
-        // A registry change woke us: drain the inotify queue and refresh NOW. If no key is also
-        // pending, re-render and wait again - no 1 s lag on box appear/disappear.
-        if ino_fd >= 0 && pfds[1].revents & libc::POLLIN != 0 {
-            let mut ibuf = [0u8; 4096];
-            while unsafe { libc::read(ino_fd, ibuf.as_mut_ptr().cast(), ibuf.len()) } > 0 {}
-            snap = refresh_full(
-                &mut prev,
-                &mut prev_cpu,
-                &mut prev_runs,
-                &mut runs_hist,
-                &mut prev_box,
-                &mut box_hist,
-            );
-            if pfds[0].revents & libc::POLLIN == 0 {
+        // Queued keys are dispatched WITHOUT polling: they already arrived, and making the user's
+        // second keystroke wait on a poll is what turned a burst into a frozen-looking TUI.
+        if keyq.is_empty() {
+            let mut pfds = [
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: ino_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let nfds = if ino_fd >= 0 { 2 } else { 1 };
+            if unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 1000) } <= 0 {
+                snap = refresh_full(
+                    &mut prev,
+                    &mut prev_cpu,
+                    &mut prev_runs,
+                    &mut runs_hist,
+                    &mut prev_box,
+                    &mut box_hist,
+                ); // timeout → periodic refresh (CPU% window)
                 continue;
             }
+            // A registry change woke us: drain the inotify queue and refresh NOW. If no key is also
+            // pending, re-render and wait again - no 1 s lag on box appear/disappear.
+            if ino_fd >= 0 && pfds[1].revents & libc::POLLIN != 0 {
+                let mut ibuf = [0u8; 4096];
+                while unsafe { libc::read(ino_fd, ibuf.as_mut_ptr().cast(), ibuf.len()) } > 0 {}
+                snap = refresh_full(
+                    &mut prev,
+                    &mut prev_cpu,
+                    &mut prev_runs,
+                    &mut runs_hist,
+                    &mut prev_box,
+                    &mut box_hist,
+                );
+                if pfds[0].revents & libc::POLLIN == 0 {
+                    continue;
+                }
+            }
+            // 64, not 8: a paste or a fast repeat delivers more than eight bytes at once, and a
+            // buffer that truncates them just moves the loss one layer down.
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                continue;
+            }
+            split_keys(&buf[..n as usize], &mut keyq);
         }
-        let mut buf = [0u8; 8];
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
+        let Some(key_owned) = keyq.pop_front() else {
             continue;
-        }
-        let key = &buf[..n.max(0) as usize];
+        };
+        let key = &key_owned[..];
 
         // Dispatch by mode. `mem::replace` takes ownership so a modal can transition cleanly back to
         // Nav; an edit that stays in the modal puts it back. `dirty` = the action changed on-disk
@@ -1273,7 +1317,24 @@ fn validated_field(label: &str) -> bool {
 /// configured GPIO ids (or a "run kern config setup" note), and it's optional - the resolver binds the
 /// gpiochips from `pins` regardless - so a beginner leaves it alone.
 fn new_profile_form(section: &'static str) -> Form {
-    let fields = section_fields(section);
+    let mut fields = section_fields(section);
+    // `backend` is the only MANDATORY field besides the name, and it sits inside the Advanced fold,
+    // BELOW every detected-device row - so the more hardware a host has, the further it is from the
+    // top. Measured on the three ARM boards: a Pi 5 (no i2c nodes) puts it six rows down, a Jetson
+    // (seven i2c buses, four spi ports, four uarts) far below that, on exactly the boards where a
+    // vgpio profile is the point. Filling the visible form and pressing Enter answered with a
+    // message written in TOML rather than in the form's own language.
+    //
+    // Pre-select the sentinel, as `kern config add` does: the value is still written EXPLICITLY into
+    // the file (so the 0.6.11 rule that a profile never binds to an implicit default is intact), it
+    // is still visible in the form, and it is still one keystroke to change. NEW forms only - an
+    // EDIT must keep showing the profile's real state, including a backend that is missing.
+    if let Some(f) = fields.iter_mut().find(|f| f.label == "backend") {
+        if let Some(first) = f.sel.first_mut() {
+            *first = true;
+            f.sync_pick_value();
+        }
+    }
     Form {
         title: format!("new {section} profile"),
         fields,
@@ -1831,7 +1892,7 @@ struct HostStats {
     cores: usize,
     load1: f64,
     /// Cumulative `kern run` invocations (from the daemonless runstats mmap counter) + the derived
-    /// rate/sec - kern's fire-and-forget capped-process throughput, which Docker can't show at scale.
+    /// rate/sec: fire-and-forget capped processes are too many to list, so they are counted instead.
     runs_total: u64,
     runs_per_sec: f64,
     /// Average per-run setup latency in microseconds (entry→exec, the honest "~1 ms"); 0 with no runs.
@@ -2058,9 +2119,15 @@ fn render(
 ) -> String {
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let width = cols.clamp(40, 120);
-    // Chrome around the content is ~8 lines (title 2 + tabs 1 + rule 1 + footer 3 + header 1); cap
-    // the table so the frame never exceeds the screen and scrolls (which corrupts the alt-screen).
-    let body_rows = term_rows.saturating_sub(9).max(1);
+    // Rows left for DATA once everything else has taken its share. Counted, not estimated, because
+    // estimating it wrong is what produced the flicker: the frame chrome is 7 lines (title 2 + tab
+    // bar 1 + footer 4) and every list pane adds 5 of its own (a blank, its caption, a blank, the
+    // column header, and the trailing "… N more"), so 12 lines are spoken for before the first row
+    // of data. The old budget subtracted 9, which fit while a list was short and overflowed by
+    // exactly 3 as soon as one filled the screen: measured, Images and Builds rendered 33 lines
+    // into a 30-row terminal. Those 3 extra lines scroll the alternate screen, which carries the tab
+    // bar off the top and makes every repaint start from a shifted origin. That is the flicker.
+    let body_rows = term_rows.saturating_sub(12).max(1);
     let mut s = String::new();
 
     // Title bar - a live host header, always visible on every tab (CPU · RAM · Disk · Boxes),
@@ -2156,7 +2223,17 @@ fn render(
         }
     };
     s.push_str(&format!("\n{d}{}{z}\n  {keys}\n", "─".repeat(width)));
-    s
+    // HARD CAP, at the boundary where the invariant belongs: `render` never returns more lines than
+    // the screen has. The row budget above keeps every pane inside it at normal sizes, but a pane
+    // with FIXED content (the Overview) cannot shrink below its own height, so a very small window
+    // would still overflow. A frame past the last row scrolls the alternate screen: the tab bar
+    // leaves through the top and each repaint lands a line lower, which is what the flicker was.
+    // Losing the bottom of a pane in a 10-row window is a small, local, visible loss; a screen that
+    // scrolls itself is a broken TUI. Capping here rather than at the paint site keeps ONE place
+    // that decides the frame height, and lets a test hold it.
+    let mut lines: Vec<&str> = s.lines().collect();
+    lines.truncate(term_rows.max(1));
+    lines.join("\n")
 }
 
 /// The `?` help overlay: the complete keymap + what each tab is for, in plain language. Rendered in the
@@ -2785,7 +2862,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
         "  {d}A run is {z}{b}NOT a container{z}{d}: for an isolated box, use the {z}{c}Boxes{z}{d} tab. Runs are too fast/many to{z}\n"
     ));
     s.push_str(&format!(
-        "  {d}list one-by-one, so this tab {z}{b}counts{z}{d} them as live throughput (what Docker can't do at scale).{z}\n\n"
+        "  {d}list one-by-one, so this tab {z}{b}counts{z}{d} them as live throughput instead.{z}\n\n"
     ));
 
     if host.runs_total == 0 {
@@ -2796,7 +2873,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
             "  {d}e.g.  {z}{c}for i in $(seq 1000); do kern run -- true; done{z}\n\n"
         ));
         s.push_str(&format!(
-            "  {d}a run is a CPU/mem-capped process with no sandbox - Docker has no analogue this fast.{z}\n"
+            "  {d}a run is a CPU/mem-capped process with no sandbox: cgroup caps only, no namespaces.{z}\n"
         ));
         return s;
     }
@@ -2858,7 +2935,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
         "\n  {d}runs = capped processes (CPU/mem cgroup, no sandbox), fire-and-forget - shown as{z}\n"
     ));
     s.push_str(&format!(
-        "  {d}aggregate throughput, not a per-row list. This is what Docker can't do at scale.{z}\n"
+        "  {d}aggregate throughput, not a per-row list: at scale, the list is the wrong shape.{z}\n"
     ));
     s
 }
@@ -3130,6 +3207,92 @@ mod tests {
             pod: String::new(),
             iso: String::new(),
             sec: String::new(),
+        }
+    }
+
+    /// A terminal delivers several bytes in ONE read whenever keys outrun the loop: a held key, a
+    /// paste, or a laggy link (ssh to a board is the normal case, not the exception). Dispatching
+    /// `buf[0]` and dropping the rest meant a burst ending in `q` never quit: measured, a batch of
+    /// eight keys hung the TUI until it was killed 12 s later, one at a time it answered in 274 ms.
+    ///
+    /// The escape sequences are the reason this cannot be a plain per-byte loop: an arrow key is
+    /// three bytes that mean ONE event, and splitting it would type a stray `[` into a form.
+    #[test]
+    fn a_burst_becomes_one_event_per_key_and_an_arrow_stays_whole() {
+        let split = |b: &[u8]| {
+            let mut q = std::collections::VecDeque::new();
+            split_keys(b, &mut q);
+            q.into_iter().collect::<Vec<_>>()
+        };
+        // The measured failure: eight keys in one read are eight events, and the last is `q`.
+        let got = split(b"1234567q");
+        assert_eq!(got.len(), 8, "a burst must not collapse to one event");
+        assert_eq!(got[7], b"q".to_vec(), "the quit key must survive the burst");
+        // An arrow is one event of three bytes, not three events.
+        assert_eq!(split(b"\x1b[C"), vec![b"\x1b[C".to_vec()]);
+        assert_eq!(
+            split(b"\x1b[C\x1b[Dq"),
+            vec![b"\x1b[C".to_vec(), b"\x1b[D".to_vec(), b"q".to_vec()]
+        );
+        // `ESC O P` (an F-key on some terminals) is the other sequence introducer.
+        assert_eq!(split(b"\x1bOP"), vec![b"\x1bOP".to_vec()]);
+        // A bare Escape is a key in its own right: it closes a modal, so it must NOT be held back
+        // waiting for bytes that are never coming.
+        assert_eq!(split(b"\x1b"), vec![b"\x1b".to_vec()]);
+        assert_eq!(split(b"\x1bq"), vec![b"\x1b".to_vec(), b"q".to_vec()]);
+        // A truncated sequence still yields one event rather than vanishing.
+        assert_eq!(split(b"\x1b["), vec![b"\x1b[".to_vec()]);
+        assert!(split(b"").is_empty());
+    }
+
+    /// A frame taller than the screen scrolls the alternate buffer: the tab bar leaves through the
+    /// top and every repaint starts one line lower, which is seen as flicker. It was real, and the
+    /// arithmetic that caused it is the kind that drifts silently, so the invariant is pinned here
+    /// rather than in a comment.
+    ///
+    /// Measured before the fix, with a list long enough to fill the budget: Images and Builds
+    /// rendered **33** lines into a **30**-row terminal, at every size, always over by exactly 3.
+    #[test]
+    fn no_tab_ever_renders_a_frame_taller_than_the_terminal() {
+        // Far more rows than any budget: whichever pane is on screen, its list is the long case.
+        let rows: Vec<Row> = (0..200).map(|i| row(&format!("box{i}"), false)).collect();
+        let builds: Vec<crate::builds::Record> = (0..200)
+            .map(|i| crate::builds::Record {
+                id: format!("{i}"),
+                tag: format!("t{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let images: Vec<crate::commands::ImageEntry> = (0..200)
+            .map(|i| crate::commands::ImageEntry {
+                name: format!("img{i}"),
+                size: 1024,
+                pulled: 0,
+                dangling: false,
+            })
+            .collect();
+        for term_rows in [10usize, 20, 24, 30, 40, 50, 80] {
+            for tab in 0..TABS.len() {
+                let frame = render(
+                    &plain(),
+                    tab,
+                    &rows,
+                    &HostStats::default(),
+                    &[],
+                    &[],
+                    &builds,
+                    &images,
+                    100,
+                    term_rows,
+                    0,
+                    &Mode::Nav,
+                );
+                let h = frame.lines().count();
+                assert!(
+                    h <= term_rows,
+                    "tab {tab} rendered {h} lines into {term_rows} rows: the alt screen will scroll"
+                );
+            }
         }
     }
 
@@ -3971,6 +4134,36 @@ leds = [\"led0\"]
         let form = feed(mk("cpus"), b"0.5");
         let pane = form_pane(&plain(), &form, 80, 24);
         assert!(pane.contains('✓'), "valid shows a tick:\n{pane}");
+    }
+
+    /// A NEW profile form arrives with the sentinel already picked, so filling the visible fields
+    /// and pressing Enter SAVES instead of answering with an error about a field the form never
+    /// showed. `backend` lives inside the Advanced fold, below every detected-device row, so on a
+    /// board with real hardware it is further down the more hardware the host has - measured on a
+    /// Jetson (seven i2c buses, four spi ports, four uarts) against a Pi 5 (no i2c nodes at all).
+    ///
+    /// The value is still written EXPLICITLY into the file: the 0.6.11 rule (no profile ever binds
+    /// to an implicit default) is about what the FILE says, and it still says it.
+    #[test]
+    fn a_new_profile_form_arrives_with_the_backend_sentinel_already_picked() {
+        for (kind, sentinel) in [("vcpu", "host"), ("vgpio", "host"), ("vdisk", "ram")] {
+            let form = new_profile_form(kind);
+            let f = form
+                .fields
+                .iter()
+                .find(|f| f.label == "backend")
+                .unwrap_or_else(|| panic!("{kind}: no backend field"));
+            assert_eq!(f.value, sentinel, "{kind}: sentinel must be pre-picked");
+            assert_eq!(
+                f.sel.iter().filter(|s| **s).count(),
+                1,
+                "{kind}: exactly one backend, never two"
+            );
+            assert!(
+                f.sel.first().copied().unwrap_or(false),
+                "{kind}: the pre-picked one must be the sentinel, which is listed first"
+            );
+        }
     }
 
     #[test]

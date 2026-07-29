@@ -13,6 +13,20 @@ The parser is hand-rolled (no `serde`/`toml`) and **tolerant**: an unrecognized 
 line of TOML it doesn't model, is **ignored, not rejected**, so a `kern.toml` shared with another kern
 edition still loads. A *malformed value* of a key it DOES implement is always an error, with its line.
 
+### Which file is in effect
+
+| source | applies to |
+|---|---|
+| `--config <path>` | that one `kern box` / `kern run` invocation, for its `vcpu:`/`vgpio:`/`vdisk:` tokens |
+| **`KERN_CONFIG=<path>`** | **everything**: reads *and* writes. `config list`/`add`/`rm`/`setup`/`edit`, `validate`, `info`, and every profile token |
+| `$XDG_CONFIG_HOME/kern/kern.toml`, else `~/.config/kern/kern.toml` | the default when neither is set |
+
+`KERN_CONFIG` is the way to keep a per-project config: export it and every kern command, including
+the ones that *edit* the file, uses it. `kern info` prints the path in effect, which is the quickest
+way to confirm which file you are about to change. An exported-but-empty `KERN_CONFIG` counts as
+unset (it would otherwise resolve to a relative path and drop a `kern.toml` in the current
+directory).
+
 ---
 
 ## Resource profiles
