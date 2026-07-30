@@ -67,3 +67,7 @@ win-key*
 examples/*/
 !examples/*.sh
 examples/clip.mp4
+
+# Output of examples/media-transcode.sh: the example regenerates it, so a committed copy is
+# a build artefact that went in by accident (it did, in 0.6.20).
+clip.mp4
