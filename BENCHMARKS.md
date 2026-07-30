@@ -9,14 +9,19 @@ rootfs directory). This is a 0.x project, treat these as "fast class", not a gua
 
 > **Two numbers, and which one you get depends on whether the box is capped.**
 >
-> **The box you actually run is capped, and it is twice as fast as it was**: plain `kern box`, no
-> environment set, **0.3.0 takes 4.92 ms and v0.6.21 takes 2.45 ms** on this machine today. 0.3.0
-> re-execs itself through `systemd-run` for every box (11 `execve` of it per start); v0.6.21 caps
-> directly in its own delegated slice and calls it zero times, while the cap still bites (200 MiB
-> under `--memory 32m` still exits 137).
+> Recorded when **v0.6.21** was current, and kept as the record it is rather than restated as though it
+> were today's measurement.
+>
+> **The box you actually run is capped, and it was twice as fast as it had been**: plain `kern box`, no
+> environment set, **0.3.0 took 4.92 ms and v0.6.21 took 2.45 ms** on this machine. 0.3.0 re-execs itself
+> through `systemd-run` for every box (11 `execve` of it per start); v0.6.21 caps directly in its own
+> delegated slice **where that slice is reachable** and calls it zero times, while the cap still bites
+> (200 MiB under `--memory 32m` still exits 137). Where it is not reachable, notably from an SSH session
+> or on the ARM boards, the `systemd-run` path is still what runs and still costs what it costs, which is
+> the subject of [Why a headless board pays it](#why-a-headless-board-pays-it-and-what-to-do-about-it).
 >
 > **The table below measures an UNCAPPED box**, which is what makes it comparable to bubblewrap, and
-> there kern went the other way: 0.3.0 reports **1.7 ms** against v0.6.21's **2.2 ms**, each with the
+> there kern went the other way: 0.3.0 reported **1.7 ms** against v0.6.21's **2.2 ms**, each with the
 > benchmark script of its own era, bubblewrap steady at 2.8 and 2.7 as the control. Part of that 0.5
 > ms is visible in `KERN_TIMING` and `strace`: v0.6.21 issues **thirteen more `mount` calls**, putting
 > `/dev/null` over `/proc/kcore`, `kallsyms`, `kmsg`, `keys`, `latency_stats`, `timer_list`,
@@ -66,9 +71,18 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 | **docker run --rm** | 289.2 ms | client → daemon round-trip |
 
 kern's bare box adds **no** cgroup cap (like bubblewrap). Adding one used to cost a `systemd-run`
-round trip and put the capped path at ~5.5 ms; since 0.6.15 kern caps directly in its own delegated
-slice and **the cap costs 0.25 ms**: 2.20 ms uncapped, **2.45 ms with caps on**, 2.49 ms with an
+round trip and put the capped path at ~5.5 ms; since 0.6.15 kern can cap directly in its own delegated
+slice, and **there the cap costs 0.25 ms**: 2.20 ms uncapped, **2.45 ms with caps on**, 2.49 ms with an
 explicit `--memory 512m`. The cap still bites (200 MiB under `--memory 32m` exits 137).
+
+⚠️ **"There" is doing work in that sentence.** The direct slice is reachable only when kern runs inside
+the systemd user manager's tree, which a desktop session gives you and an **SSH session does not**: a
+login session is placed under the SYSTEM manager, in a different delegation domain. Where the direct path
+is out of reach kern falls back to a per-box transient scope, and that costs **13.7 ms** rather than
+0.25 on a Raspberry Pi 5. Same binary, same caps enforced either way. This paragraph used to state the
+0.25 ms as though it held everywhere; it holds where the path is reachable.
+[Why a headless board pays it](#why-a-headless-board-pays-it-and-what-to-do-about-it) has the numbers and
+the one-line way to get the fast path back.
 
 (Measured as total / N over 200 runs, not a per-call timer, at sub-ms scale the timer's own
 fork/exec would otherwise dominate. Latency and the throughput numbers below are the same data.)
