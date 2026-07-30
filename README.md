@@ -12,16 +12,18 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.3 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-~2.2 ms from a prepared rootfs · `exec` **0.9** · `ps` **0.5** · `logs` **0.5** (289 · 42 · 8.2 · 8.3 on a daemon runtime) · **0 RAM at rest** · no daemon, no socket, nothing to start
+<sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` the only dependency</sub>
 
 **Runs everywhere Linux does: bare Linux, Windows (via WSL2), and ARM boards** (Raspberry Pi, NVIDIA
 Jetson, Arduino UNO Q), where a 186 MB Docker daemon is a poor fit (on the Pi 5 tested here, no engine
 was installed at all).
 
-Isolation is the first resource kern manages this way, not the only one: the same model also slices CPU
-(`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`) per process, with or without a full box. The
-container is one case of a smaller idea, and it is why there are two verbs. Embed it from Python, Node or
-Rust, or run it from the CLI.
+[![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](#platforms)
+[![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
+
+[Quickstart](#quickstart) · [When to use it, and when not](#when-to-use-kern-and-when-not) · [Embed it](#embed-it) · [How it works](#how-it-works) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md) · [Config](docs/CONFIG.md)
 
 **🐧 Linux & ARM boards**
 ```sh
@@ -33,18 +35,15 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 then `kern box dev --image alpine -- sh`
 
-[![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](#platforms)
-[![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
+Isolation is the first resource kern manages this way, not the only one: the same model also slices CPU
+(`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`) per process, with or without a full box. The
+container is one case of a smaller idea, and it is why there are two verbs. Embed it from Python, Node or
 
 <p align="center">
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.8 MB static binary, no daemon.">
 </p>
 
-<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): the <b>~2.7 ms</b> is a <i>capped</i> box start (the `vcpu:heavy vdisk:scratch` slice) and a bare one is <b>~2.4 ms</b>, both a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not kern's own setup phase in isolation. The <a href="#performance">Performance</a> table was measured on the same machine on the same night. Your hardware and cgroup delegation differ, so measure your own: <code>kern bench --rootfs &lt;dir&gt;</code>. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology, the capped-vs-uncapped split, and on-device board numbers.</sub>
-
-[Install](#install) · [Quickstart](#quickstart) · [Docker compat](#docker-compatibility) · [When to use](#when-to-use-kern-and-when-not) · [Embed (Rust / Python / Node)](#embed-it) · [How it works](#how-it-works) · [Config &amp; profiles](docs/CONFIG.md) · [Storage](docs/STORAGE.md) · [Benchmarks](BENCHMARKS.md) · [Security](SECURITY.md)
+<sub>Demo timings on an Intel i7-14700KF (20-core / 28-thread x86_64, Linux 7.0, systemd-user, cgroup delegated): every timing in it is a full <code>kern box</code> lifecycle (fork, isolate, run, tear down), not kern's own setup phase in isolation, and the <a href="#performance">Performance</a> table was measured on the same machine on the same night. Your hardware and cgroup delegation differ, so measure your own: <code>kern bench --rootfs &lt;dir&gt;</code>. See <a href="BENCHMARKS.md">Benchmarks</a> for methodology, the capped-vs-uncapped split, and on-device board numbers.</sub>
 
 </div>
 
