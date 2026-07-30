@@ -94,7 +94,7 @@ fn resolve_target() -> Result<Target, ResolveErr> {
         });
     }
     // First run only. WSL can take several seconds to boot its utility VM - say so, never hang mute.
-    eprintln!("kern: first run - locating your WSL distro (WSL itself can take a few seconds to start)…");
+    eprintln!("kern: first run - locating your WSL distro (WSL itself can take a few seconds to start)...");
     let names = list_distros();
     if names.is_empty() {
         return Err(ResolveErr::NoDistro);
@@ -308,7 +308,7 @@ fn main() {
             Ok(s) if s.code() == Some(-1) && target.from_cache && attempt == 0 => {
                 clear_cache();
                 eprintln!(
-                    "kern: WSL distro '{}' didn't start (removed or renamed?) - re-detecting…",
+                    "kern: WSL distro '{}' didn't start (removed or renamed?) - re-detecting...",
                     target.distro
                 );
                 continue;

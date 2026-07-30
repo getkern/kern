@@ -33,6 +33,13 @@ pub enum Error {
     /// A `kern.toml` profile could not be parsed, found, or applied.
     Config(String),
     /// A recognised command was invoked with missing/invalid arguments.
+    /// A flag or verb the CLI does not take. Displays BARE, with no kind prefix: routed through
+    /// `Config` it read `error: config: config list: unknown flag …` with "config" doubled, and through
+    /// `Sandbox` it read `error: sandbox: uninstall: unknown flag …`, announcing a parse error as a
+    /// sandbox failure. The message already names the verb, so a prefix can only get in the way. Its
+    /// hint points at `--help`, unlike `Config`'s, which sent someone who mistyped a flag to read about
+    /// where profiles live.
+    Cli(String),
     Usage(&'static str),
 }
 
@@ -75,7 +82,7 @@ impl Error {
             Error::Config(_) => {
                 Some("profiles live in ~/.config/kern/kern.toml - see docs/CONFIG.md".into())
             }
-            Error::Usage(_) => Some("run `kern --help` for full usage".into()),
+            Error::Cli(_) | Error::Usage(_) => Some("run `kern --help` for full usage".into()),
         }
     }
 }
@@ -116,6 +123,7 @@ impl std::fmt::Display for Error {
             Error::Compose(why) => write!(f, "compose: {why}"),
             Error::Build(why) => write!(f, "build: {why}"),
             Error::Config(why) => write!(f, "config: {why}"),
+            Error::Cli(why) => write!(f, "{why}"),
             Error::Usage(u) => write!(f, "usage: kern {u}"),
         }
     }

@@ -1,27 +1,27 @@
 <div align="center">
 
+<img src="assets/brand/kern-logo.png" width="260" alt="kern">
+
 # kern: a rootless container sandbox and virtual-resource runtime
 
 **A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
 
-It's a daemonless container for your inner loop: a real, kernel-enforced box that starts in **~2.2 ms**
-from a prepared rootfs, or **~3.3 ms** from an OCI image, out of one **~1.8 MB** rootless binary with
-no `dockerd` sitting in the background. The same box also runs
-untrusted or agent-generated code, isolated. Embed it from Python, Node or Rust, or run it from the CLI.
+**A real, kernel-enforced container in ~3.3 ms, out of one ~1.8 MB binary with no daemon.**
 
-Isolation is just the first resource kern manages this way: the same model also slices CPU (`vcpu:`),
-memory, disk (`vdisk:`) and devices (`vgpio:`) per process, with or without a full box. The container is
-one case of a smaller idea.
+<p align="center">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.3 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+</p>
+
+~2.2 ms from a prepared rootfs · `exec` **0.9** · `ps` **0.5** · `logs` **0.5** (289 · 42 · 8.2 · 8.3 on a daemon runtime) · **0 RAM at rest** · no daemon, no socket, nothing to start
 
 **Runs everywhere Linux does: bare Linux, Windows (via WSL2), and ARM boards** (Raspberry Pi, NVIDIA
 Jetson, Arduino UNO Q), where a 186 MB Docker daemon is a poor fit (on the Pi 5 tested here, no engine
 was installed at all).
 
-Milliseconds: a throwaway box **3.3** · `exec` **0.9** · `ps` **0.5** · `logs` **0.5** (289 · 42 · 8.2 · 8.3 on a daemon runtime) · **~1.8 MB** static binary · **0 RAM at rest** · **rootless**
-
-<p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.3 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
-</p>
+Isolation is the first resource kern manages this way, not the only one: the same model also slices CPU
+(`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`) per process, with or without a full box. The
+container is one case of a smaller idea, and it is why there are two verbs. Embed it from Python, Node or
+Rust, or run it from the CLI.
 
 **🐧 Linux & ARM boards**
 ```sh
@@ -171,7 +171,29 @@ deny-by-default. GPU slices are on the [Roadmap](#roadmap).
 | **GPU** | *(roadmap)* | Not shipped | see [Roadmap](#roadmap) |
 
 ¹ Where the `memory` controller is not delegated to a non-root user's scope, kern warns and shows the one-line
-`.wslconfig` fix; enforced natively on Linux. Profiles (`vcpu:`/`vdisk:`/`vgpio:`) are reusable presets in
+`.wslconfig` fix; enforced natively on Linux.
+
+**How to check a cap, and how not to.** `free`, `top` and `htop` inside a box report the **host's** memory,
+not the box's, because the kernel does not namespace `/proc/meminfo`. That is true of every container
+runtime without a `/proc` shim, and it makes a cap that *is* enforced look absent. The distinction that
+matters in practice: a runtime that sizes itself from the **cgroup** (a modern JVM, Go's memory limit, most
+container-aware tooling) gets the right number; one that reads `/proc/meminfo` gets the host's. Read the
+cgroup, or hit the ceiling and watch the kernel do it:
+
+```sh
+kern box check --image alpine --memory 256m -- cat /sys/fs/cgroup/memory.max   # 268435456
+kern box oom   --image alpine --memory 256m -- \
+  sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=512' ; echo "exit=$?"       # exit=137, OOM-killed
+```
+
+`cpu.max` reads the same way: `50000 100000` is half a core, `200000 100000` is two.
+
+`--pids-limit` counts **every task in the box**, not just the ones your workload forks, so the forks
+available to you are the limit minus whatever is already there. That baseline is not a fixed number: it
+depends on whether the command is a shell or an exec'd binary, and on whether the box is detached. On the
+box measured here it was 2, so `--pids-limit 30` allowed 28 forks before the kernel returned `EAGAIN`
+(`can't fork: Resource temporarily unavailable`). It is a fork-bomb ceiling, not an exact budget for your
+own processes. Profiles (`vcpu:`/`vdisk:`/`vgpio:`) are reusable presets in
 `~/.config/kern/kern.toml`, see [docs/CONFIG.md](docs/CONFIG.md). Author them with `kern probe` (list the
 host resources you can slice), `kern examples` (print a sample `kern.toml`), and `kern validate` (check one).
 
@@ -297,6 +319,28 @@ sha256-checked. After it finishes: `kern box dev --image alpine -it -- sh`. Hone
 *inside* the WSL2 kernel, so it doesn't shed the VM weight native Linux does; the win is "no Docker
 Desktop", not "no VM".
 
+**Where the milliseconds go on Windows.** The figures at the top of this page are Linux hosts. A command
+typed on the Windows side spawns `wsl.exe` to cross into the distro, once per command, and that crossing
+is not kern's work but it dwarfs kern's work. Measured on two Windows 11 hosts: **6.5 and 7.0 ms per box**
+typed inside the distro, against **70.5 ms** per command through `kern.exe`. So run kern
+inside the distro; use the bridge for the occasional command from a PowerShell you are already in, not for
+a loop that starts hundreds of boxes. Your project can live on `C:` either way, that made no measurable
+difference to box startup.
+[Benchmarks](BENCHMARKS.md#windows-where-the-milliseconds-go) has the table, the variance, and what was
+not measured.
+
+**If your antivirus deletes `kern.exe`.** Some products remove an unsigned executable from
+`%LOCALAPPDATA%` on sight; kern is not signed. The Linux side is untouched and still works, and the
+installer also writes a `kern.cmd` companion that takes over automatically (`PATHEXT` resolves `.EXE`
+before `.CMD`, so it is inert until the exe is gone), which keeps `kern` working in a new terminal.
+
+It is a safety net, not a replacement, because `cmd.exe` is now in the path the exe was not: it does not
+translate Windows paths (write `-v /mnt/c/data:/data`), it re-parses arguments so `%VAR%`, `!`, `^`, `&`
+and `|` are consumed before kern sees them, Ctrl-C on an interactive box asks "Terminate batch job (Y/N)?"
+first, and it is not an executable, so the Python and Node SDKs run **from Windows** cannot spawn it. To
+get the exe back, allow the folder the installer names in your antivirus and re-run the installer.
+Throughout, `wsl -d kern -- kern ...` and the SDKs run inside the distro are unaffected.
+
 **📦 Offline / air-gapped** (a board or locked-down server with no internet). kern is a single
 ~1.8 MB static binary, so copying that one file *is* the install:
 
@@ -306,6 +350,32 @@ scp kern pi@raspberrypi:~/          # then:  ssh pi@raspberrypi kern box dev --i
 
 No daemon, no package, nothing to install on the target, which is why it runs where Docker can't
 (see [EDGE.md](EDGE.md)).
+
+### Uninstall
+
+`kern uninstall` is a **dry run by default**: it lists every path kern created, with sizes, and marks
+which of them are data you made rather than a cache it can refetch. Nothing is removed until you add
+`--yes`.
+
+```sh
+kern uninstall                 # show what would go, remove nothing
+kern uninstall --yes           # do it
+kern uninstall --keep-images   # keep the image cache, remove the rest
+```
+
+It refuses while boxes are running, and it only touches paths kern owns: the image cache, named
+volumes, your `kern.toml`, the runtime state, units written by `--restart`, and the binary itself when
+it sits where an installer put it. A `[[disk]]` you pointed somewhere is your data in your location and
+is left alone.
+
+On **Windows** the state lives in kern's WSL2 distro, so removal happens from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/getkern/kern/main/uninstall.ps1 | iex   # dry run
+```
+
+That prints what it found; the command it echoes performs it. It unregisters the `kern` distro, removes
+the `kern.exe` shim, and takes its entry back out of your PATH. Your other WSL distros are not touched.
 
 
 ## Quickstart

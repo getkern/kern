@@ -19,6 +19,96 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.25], 2026-07-30
+
+### Added
+
+- **`kern uninstall`, and `uninstall.ps1` on Windows.** There was no uninstall at all, on any platform.
+  Removing kern meant knowing that its state is spread over four XDG locations plus the systemd units
+  `--restart` writes, and on Windows over a registered WSL distro, a shim folder and a PATH entry. On
+  the machine where this was noticed those paths held **5.2 GB** and 14 named volumes, none of which any
+  documented command could find, let alone remove.
+
+  It is a **dry run by default**. It prints each path, its size, and whether it is data you made (a
+  named volume, your `kern.toml`) or a cache a `pull` restores, then stops; `--yes` performs it. A verb
+  that erases named volumes on the strength of its name alone is one nobody tries in order to find out
+  what it does. `--keep-images` spares the cache, for starting the config over without refetching
+  gigabytes.
+
+  It only removes paths kern **owns**, each taken from the function that creates it rather than written
+  out again here, so moving a location cannot leave this deleting the wrong tree. The binary goes only
+  when it is the running one **and** sits where an installer puts it, so a build in a source tree
+  survives `uninstall` run from that tree. `/var/lib/kern` is never touched, and the output says so:
+  kern-public does not create it, and a `[[disk]]` a user pointed there is their data in their location.
+  It refuses outright while boxes are running rather than deleting the state of a live sandbox.
+
+- **A `kern.cmd` fallback next to `kern.exe` on Windows.** An antivirus deleted a freshly downloaded,
+  checksum-verified `kern.exe` four times on one machine (Malwarebytes, with Defender in passive mode),
+  leaving an install whose Linux side was perfect and whose `kern` command did nothing. The installer now
+  writes a batch companion every time, not only after a failure: `PATHEXT` resolves `.EXE` before `.CMD`,
+  so it is inert while the exe exists and takes over by itself if the exe disappears a week later, with no
+  installer re-run. Its two limits are printed in the file and by the installer: no Windows-path
+  translation (`-v /mnt/c/data:/data` rather than `-v C:\data:/data`), and it is not an executable, so the
+  Python and Node SDKs still need the exe.
+
+  The installer's antivirus advice is now derived from the machine instead of assuming Defender. It reads
+  `root/SecurityCenter2` and the `WinDefend` service, names the product actually guarding the host, and
+  only suggests `Add-MpPreference` when that service is running: on the machine above the command failed
+  with `0x800106ba` because Windows had stopped Defender in favour of the third-party product, so the one
+  remedy the installer offered could not work.
+
+- **The Windows installer no longer reports a working install as unverified.** `install.ps1` runs with
+  `$ErrorActionPreference = 'Stop'`, and Windows PowerShell 5.1 promotes a native command's stderr to a
+  TERMINATING error. The shim writes one line to stderr on every first run ("locating your WSL distro"),
+  so verification landed in its `catch` and printed "kern.exe is present but could not be run" for a
+  bridge that worked - on every clean install, twice observed end to end. It now captures stdout and
+  stderr to separate files and reads the verdict from stdout, which also yields a real exit code: a
+  program that prints a version but exits non-zero is no longer accepted.
+
+  The two shim messages that reach a Windows console are ASCII now. `…` arrived as `ÔÇª`.
+
+  The Windows script is a dry run on the same terms. Two details are load-bearing: it contains no `exit`
+  statement, because it is meant to be run as `irm … | iex` and an `exit` there closes the user's
+  PowerShell window along with the output; and it re-broadcasts `WM_SETTINGCHANGE` after editing the
+  PATH, exactly as the installer does when it adds the entry, otherwise new terminals keep receiving the
+  stale block until a logoff and the removal looks like it never happened.
+
+### Changed
+
+- **`kern pull <image>` now fills the image cache instead of dropping a rootfs in the current
+  directory.** The two verbs were writing to different stores: `pull` extracted to `$PWD/<ref>-<hash>`
+  while `box --image` filled `~/.cache/kern/images`, so `pull X` followed by `box --image X`
+  **re-downloaded the whole image**, `kern images` did not list what had just been pulled, and
+  `tag`/`push`/`save` could not see it. Anyone pulling before going offline arrived offline without
+  the image.
+
+  It also littered. Every pull left an extracted rootfs wherever it ran, and two such directories
+  (`alpine_3_19-…`, `linuxserver_openssh-server_latest-…`) were sitting untracked in a working tree
+  when this was found. The previous release fixed the same class for the examples; this is the root.
+
+  And it broke a shipped example. [tag-and-push-local.sh](examples/tag-and-push-local.sh) says "make
+  sure we have a source image cached" directly above its `kern pull alpine`, then calls `kern tag`,
+  which reads the cache. On a clean cache that failed with "no such image 'alpine'". It passed only
+  when an earlier command happened to have cached the ref. It now runs end to end: pull, tag, push,
+  and pull back from the registry.
+
+  `--dest <dir>` is unchanged and still extracts a plain rootfs, for `--rootfs` and for copying to an
+  air-gapped host. The cache fill goes through the same function `box --image` uses, so there is one
+  definition of the lock, the staging swap, the `.ok` completeness sentinel and the `.image` config
+  sidecar rather than two that can drift.
+
+  Policy is *missing*, not *always*: there is no blob cache, so re-fetching would transfer every byte
+  again on every invocation (measured: 4.1 s then 3.3 s for the same alpine, both full downloads). A
+  deliberate refresh is `kern box --image <ref> --pull always`, which the output names.
+
+- **`--platform` without `--dest` is now refused, with the reason.** The cache key is the reference
+  alone and carries no platform component, and the cache path fetches the host architecture, so
+  storing a foreign-arch rootfs there would poison it - the same class as the platform cache-poisoning
+  fixed earlier. Refusing names `--dest` as the way to do it; silently writing a directory would have
+  given one verb a third behaviour. `--platform` **with** `--dest` is untouched, which is how every
+  example already used it.
+
+
 ## [0.6.24], 2026-07-29
 
 ### Fixed

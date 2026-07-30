@@ -42,7 +42,8 @@ pub fn help() -> Result<(), Error> {
 
   {d}Images{z}
     {c}search{z} <query> [--json]                                        Search Docker Hub for images
-    {c}pull{z} <image> [--dest <dir>] [--platform os/arch]              Download an OCI image
+    {c}pull{z} <image>                                                   Fetch an image into the cache (`--image` uses it)
+    {c}pull{z} <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
@@ -83,6 +84,7 @@ pub fn help() -> Result<(), Error> {
     {c}config add{z} <kind:name> [--flags]                              Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     {c}config rm{z} <kind:name>                                         Delete a profile
     {c}validate{z} [path]                                                Check a kern.toml
+    {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     {c}examples{z}                                                       Print an example kern.toml
     {c}volume{z} <create|ls|rm|inspect|edit|prune>                       Manage named volumes
     {c}login{z} [registry] [--username U] / {c}logout{z} [registry]         Registry credentials (private pulls)
@@ -5959,14 +5961,43 @@ pub(crate) fn fmt_uptime(s: u64) -> String {
     }
 }
 
-/// `kern pull <image> [--dest <dir>]` - download an OCI image into a rootfs directory.
+/// `kern pull <image>` - fetch an OCI image into the **image cache**, the store `--image`, `tag`,
+/// `push`, `save` and `images` all read. `--dest <dir>` instead extracts a plain rootfs directory,
+/// for `--rootfs` and for copying to an air-gapped host.
+///
+/// The default used to be the rootfs directory, in the CURRENT directory, which left three problems
+/// that were measured rather than argued:
+///
+/// * `pull X` then `box --image X` **re-downloaded**, because the two verbs wrote to different
+///   stores. Anyone pulling before going offline arrived offline without the image.
+/// * every pull dropped an extracted rootfs wherever it ran. Two such directories were sitting
+///   untracked in a working tree when this was found.
+/// * `kern images` did not list what had just been pulled, and `tag`/`push`/`save` could not see it.
+///   `examples/tag-and-push-local.sh` says "make sure we have a source image cached" above its
+///   `kern pull`, and then failed with "no such image" on a clean cache. It passed only when some
+///   earlier command happened to have cached the ref.
+///
+/// The cache fill goes through [`resolve_image_depth`], the same function `box --image` uses, so
+/// there is ONE definition of the cache path, the lock, the staging swap, the `.ok` completeness
+/// sentinel and the `.image` config sidecar. A second implementation here would be free to drift.
 pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(), Error> {
-    let dest = match dest {
-        Some(d) => PathBuf::from(d),
-        None => std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(sanitize_ref(image)),
+    // `--platform` cannot go to the cache: the cache key is `sanitize_ref(image)`, derived from the
+    // REFERENCE alone with no platform component, and the cache path fetches the host arch. Storing a
+    // foreign-arch rootfs under a host-arch key is cache poisoning, a class already fixed once in this
+    // codebase. Refuse and name the flag that does work, rather than quietly writing the wrong bytes
+    // or quietly falling back to a directory now that a bare pull no longer produces one.
+    if platform.is_some() && dest.is_none() {
+        return Err(Error::Oci(
+            "--platform needs --dest <dir>: the image cache holds this host's architecture only \
+             (its key carries no platform), so a foreign-arch image cannot live in it. Extract it to \
+             a directory and run it with --rootfs, or on a matching host pull without --platform."
+                .into(),
+        ));
+    }
+    let Some(d) = dest else {
+        return pull_into_cache(image);
     };
+    let dest = PathBuf::from(d);
     // `--platform os/arch`: fetch a specific arch from a multi-arch index (default = this host). A
     // foreign arch pulls fine (for inspection/export); a heads-up if it can't run natively here.
     let plat = match platform {
@@ -5987,6 +6018,404 @@ pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(
     println!(
         "done. run it: kern box <name> --rootfs {} -- /bin/sh",
         dest.display()
+    );
+    Ok(())
+}
+
+/// Fill the image cache for `image`, then say what happened. The whole body of work (lock, staging,
+/// atomic swap, the `.ok` sentinel, the `.image` sidecar, the concurrent re-check) belongs to
+/// [`resolve_image_depth`]; this only decides the POLICY and reports the outcome.
+///
+/// [`PullPolicy::Missing`], not `Always`: there is no blob cache, so `Always` re-downloads every byte
+/// on every invocation (measured on this machine: 4.1 s then 3.3 s for the same alpine, both full
+/// transfers). Re-fetching bytes already on disk is the wrong default for a tool whose argument is
+/// that it does not waste anything, and "make sure it is cached" is what a pull is for. A deliberate
+/// refresh is `kern box --image <ref> --pull always`, which the message points at.
+fn pull_into_cache(image: &str) -> Result<(), Error> {
+    let p = crate::ui::Palette::detect();
+    // Was it already there? Asked BEFORE the fetch, so the message can distinguish "downloaded" from
+    // "already had it" rather than guessing from a timing or a side effect.
+    // The completeness sentinel is `<sanitized>.ok` NEXT TO the `<sanitized>/` directory, not inside
+    // it: an entry mid-extraction has the directory and no sentinel, which is what makes a partial
+    // pull read as absent.
+    let key = sanitize_ref(image);
+    let had = cache_dir().join(format!("{key}.ok")).exists();
+    let (path, _cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
+    println!(
+        "{g}{}{z} {image}",
+        if had { "already cached" } else { "pulled" },
+        g = p.g,
+        z = p.z
+    );
+    println!(
+        "{d}  run it:  kern box <name> --image {image} -- /bin/sh{z}",
+        d = p.d,
+        z = p.z
+    );
+    println!(
+        "{d}  cached at {path}  ·  `kern images` lists it  ·  refresh with `--pull always`{z}",
+        d = p.d,
+        z = p.z
+    );
+    Ok(())
+}
+
+/// One thing `kern uninstall` would remove: where it is, how big, and whether it is user DATA.
+struct Removable {
+    path: PathBuf,
+    what: &'static str,
+    /// Data the user made (named volumes, a hand-written config) as opposed to a cache kern can
+    /// refetch. The plan lists these separately because losing them is not the same as losing bytes
+    /// that a `pull` restores.
+    is_user_data: bool,
+    bytes: u64,
+    /// The path itself is a symlink. `dir_bytes` deliberately does not follow one, so the size reads 0 and
+    /// the plan claimed there was nothing there while a real tree sat on the other side. Removing the link
+    /// is still the right act (following it would delete outside what kern owns), but reporting 0 B is not:
+    /// it tells the reader the cache is empty when it is merely elsewhere.
+    is_symlink: bool,
+}
+
+/// Recursive DISK USAGE of a tree, following no symlinks. Best-effort: an unreadable subtree
+/// contributes 0 rather than aborting the plan, because this number exists to inform a decision.
+///
+/// Two details, both measured on a real cache of 85302 files:
+///
+/// - **Each inode counts once.** 4434 of those files were hardlinks, which the layer store creates for
+///   blobs shared between images. Summing `len()` per directory entry reported **5.22 GiB** where
+///   removing the tree actually freed **3.38 GiB**: a 55% overstatement on the one figure a reader uses
+///   to decide whether this is worth doing.
+/// - **Allocated blocks, not apparent length.** `du` agrees with allocation, and on 85k mostly-small
+///   files the rounding is not noise (it added 0.26 GiB here). It also makes a sparse file count as what
+///   it occupies rather than what it claims.
+///
+/// Two limits it has by construction, and does not hide:
+///
+/// - **Copy-on-write.** On btrfs or ZFS, blocks whose extents are shared with a snapshot are not freed by
+///   removing the file, so on those filesystems this is an upper bound rather than a measurement.
+/// - **Per item, not per plan.** Each row's size stands on its own, which is what a reader comparing rows
+///   wants; the consequence is that an inode hardlinked ACROSS two rows is counted in both, so the total
+///   can overstate. Within a row (the layer store, where sharing actually happens) it cannot.
+fn dir_bytes(p: &std::path::Path) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    disk_usage(p, &mut seen)
+}
+
+fn disk_usage(p: &std::path::Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if md.file_type().is_symlink() {
+        return 0;
+    }
+    // A hardlink already counted contributes nothing more: the blocks are the same blocks.
+    if md.nlink() > 1 && !seen.insert((md.dev(), md.ino())) {
+        return 0;
+    }
+    let own = md.blocks() * 512;
+    if !md.is_dir() {
+        return own;
+    }
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return own;
+    };
+    own + rd
+        .flatten()
+        .map(|e| disk_usage(&e.path(), seen))
+        .sum::<u64>()
+}
+
+/// Are we the kern inside a WSL2 distro? `WSL_DISTRO_NAME` is set by WSL for every process it starts;
+/// the osrelease check catches a process that inherited a stripped environment.
+///
+/// It matters to `uninstall` alone: on Windows the pieces a user sees (`kern.exe`, the PATH entry) live
+/// OUTSIDE this filesystem, so removing the Linux binary from in here leaves a shim pointing at a distro
+/// with no kern. Recoverable - the shim says how - but not something to discover afterwards.
+fn in_wsl() -> bool {
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        return true;
+    }
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| {
+            let s = s.to_ascii_lowercase();
+            s.contains("microsoft") || s.contains("wsl")
+        })
+        .unwrap_or(false)
+}
+
+/// Is `exe` a kern that an installer put where an installer puts it? Only then is deleting it this
+/// verb's business: a kern built in a source tree, or one somebody dropped in `/opt`, is not.
+///
+/// Compares FILE IDENTITY, `(st_dev, st_ino)`, not path strings. `current_exe()` resolves symlinks, so a
+/// packaged install where `/usr/bin/kern` is a symlink into `/usr/lib/kern/` reports the resolved target,
+/// which matches none of the candidate paths as text: string comparison refused to remove a perfectly
+/// legitimate install. Measured, with `~/.local/bin/kern` symlinked at a copy elsewhere. Identity also
+/// absorbs the harmless spellings that broke the string form: a trailing slash, `bin/../bin`, `~`.
+///
+/// A build output in a source tree still answers false, because no candidate path points at it.
+fn is_installed_binary(exe: &std::path::Path, home: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(me) = std::fs::metadata(exe) else {
+        return false;
+    };
+    [
+        home.join(".local/bin/kern"),
+        PathBuf::from("/usr/local/bin/kern"),
+        PathBuf::from("/usr/bin/kern"),
+    ]
+    .iter()
+    .any(|cand| {
+        std::fs::metadata(cand)
+            .map(|c| c.dev() == me.dev() && c.ino() == me.ino())
+            .unwrap_or(false)
+    })
+}
+
+/// `kern uninstall [--yes] [--keep-images]` - remove everything kern created on this host.
+///
+/// A **dry run by default**: it prints the exact paths, their sizes, and which of them are data the
+/// user made, then stops. `--yes` performs it. There was no uninstall at all before this, on any
+/// platform, and the paths involved held 5.5 GB on the machine where that was noticed - so the verb
+/// that removes them has to say what it is about to do before it does it.
+///
+/// It only touches paths kern OWNS, each taken from the function that creates it rather than written
+/// out here, so a future change to a location cannot leave this deleting the wrong tree. Notably it
+/// does **not** touch `/var/lib/kern`: kern-public never creates it (the only mentions in the source
+/// are a synthetic path in `--plan` output and an example inside the generated starter config), and a
+/// `[[disk]]` a user pointed there is their data in their location.
+pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
+    let p = crate::ui::Palette::detect();
+
+    // A running box means live processes, mounts and cgroups. Removing the tree under them would leave
+    // a box whose rootfs is gone: refuse and name the fix rather than half-succeeding.
+    let live = registry::list();
+    if !live.is_empty() {
+        let names: Vec<&str> = live.iter().map(|i| i.name.as_str()).collect();
+        return Err(Error::Sandbox(format!(
+            "{} box(es) still running ({}) - stop them first: kern stop --all",
+            live.len(),
+            names.join(", ")
+        )));
+    }
+
+    let mut items: Vec<Removable> = Vec::new();
+    let mut push = |path: PathBuf, what: &'static str, is_user_data: bool| {
+        if path.exists() {
+            let bytes = dir_bytes(&path);
+            let is_symlink = std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            items.push(Removable {
+                path,
+                what,
+                is_user_data,
+                is_symlink,
+                bytes,
+            });
+        }
+    };
+
+    // The image cache, and the build layer cache inside it. Refetchable, so `--keep-images` can spare
+    // it: reinstalling with a warm cache is the common case and re-downloading gigabytes is not.
+    if !keep_images {
+        if let Some(dir) = cache_dir().parent() {
+            push(dir.to_path_buf(), "image + layer cache", false);
+        }
+    }
+    // Named volumes are user DATA: whatever a `-v name:/dst` wrote lives here.
+    let vols = crate::volume::volumes_dir();
+    let vol_count = std::fs::read_dir(&vols)
+        .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).count())
+        .unwrap_or(0);
+    push(vols, "named volumes (YOUR DATA)", true);
+    // The config, and the backup `config setup --force` leaves next to it - but ONLY the one at kern's
+    // OWN default location.
+    //
+    // `active_path()` returns the `KERN_CONFIG` override when set, and that path is a file the USER chose,
+    // in a directory kern does not own: uninstall listed `/some/shared/dir/my-own-kern.toml` as
+    // "kern.toml (YOUR DATA)" and would have deleted it. Owning a path because its name matches is the
+    // inference this verb exists to avoid, and here it reached outside kern entirely. Measured with
+    // KERN_CONFIG pointing at a hand-written file.
+    let owned_cfg = crate::config::default_path();
+    let active_cfg = crate::config::active_path();
+    let overridden = match (&owned_cfg, &active_cfg) {
+        (Some(o), Some(a)) => o != a,
+        _ => active_cfg.is_some(),
+    };
+    if let Some(cfg) = owned_cfg {
+        push(cfg.with_extension("toml.bak"), "config backup", true);
+        push(cfg, "kern.toml (YOUR DATA)", true);
+    }
+    // Runtime state: the registry, logs, claims. Skipped when EMPTY, because any kern invocation
+    // recreates the tree - including this one, which reads the registry to check for running boxes.
+    // Listing a 0 B directory made "nothing to remove" unreachable on a clean host, which is the one
+    // case where that sentence is the whole answer.
+    if let Ok(rt) = registry::dir() {
+        if let Some(parent) = rt.parent() {
+            if dir_bytes(parent) > 0 {
+                push(
+                    parent.to_path_buf(),
+                    "runtime state (registry, logs)",
+                    false,
+                );
+            }
+        }
+    }
+    // Units generated by `--restart always`. Left behind, they would try to start a box whose binary
+    // is gone at the next login.
+    if let Some(h) = std::env::var_os("HOME") {
+        let unitdir = PathBuf::from(&h).join(".config/systemd/user");
+        if let Ok(rd) = std::fs::read_dir(&unitdir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("kern-") && n.ends_with(".service") {
+                    push(e.path(), "systemd unit from --restart", false);
+                }
+            }
+        }
+    }
+    // The binary itself, only when it is the one running AND sits in a known install location.
+    if let (Some(exe), Some(h)) = (std::env::current_exe().ok(), std::env::var_os("HOME")) {
+        if is_installed_binary(&exe, std::path::Path::new(&h)) {
+            push(exe, "the kern binary", false);
+        }
+    }
+
+    if items.is_empty() {
+        println!("nothing to remove - kern has created no state on this host.");
+        return Ok(());
+    }
+
+    let total: u64 = items.iter().map(|i| i.bytes).sum();
+    let data: u64 = items
+        .iter()
+        .filter(|i| i.is_user_data)
+        .map(|i| i.bytes)
+        .sum();
+    println!(
+        "{b}{}{z} would be removed:",
+        if yes { "removing" } else { "this" },
+        b = p.b,
+        z = p.z
+    );
+    for i in &items {
+        let mark = if i.is_user_data { p.y } else { p.d };
+        // A symlink prints "symlink" where the size goes. Printing 0 B was worse than printing nothing:
+        // it answered the reader's question ("is there anything there?") with a confident no.
+        let size = if i.is_symlink {
+            "symlink".to_string()
+        } else {
+            human_bytes(i.bytes)
+        };
+        println!(
+            "  {mark}{:>9}{z}  {}  {d}{}{z}",
+            size,
+            i.path.display(),
+            i.what,
+            z = p.z,
+            d = p.d
+        );
+        if i.is_symlink {
+            println!(
+                "  {d}           the link is removed; whatever it points at is left alone{z}",
+                d = p.d,
+                z = p.z
+            );
+        }
+    }
+    println!(
+        "  {d}{:>9}   total, of which {} is data you made{z}",
+        human_bytes(total),
+        human_bytes(data),
+        d = p.d,
+        z = p.z
+    );
+    if vol_count > 0 {
+        println!(
+            "  {y}{vol_count} named volume(s) will be destroyed - `kern volume ls` lists them{z}",
+            y = p.y,
+            z = p.z
+        );
+    }
+    if keep_images {
+        println!(
+            "  {d}the image cache is kept (--keep-images){z}",
+            d = p.d,
+            z = p.z
+        );
+    }
+
+    if !yes {
+        println!();
+        println!(
+            "{d}nothing was removed. pass --yes to do it{z}",
+            d = p.d,
+            z = p.z
+        );
+        if in_wsl() && items.iter().any(|i| i.what == "the kern binary") {
+            println!(
+                "{d}inside WSL: this removes kern from the distro only. kern.exe and your PATH entry are on the Windows side - uninstall.ps1 removes those.{z}",
+                d = p.d,
+                z = p.z
+            );
+        }
+        if overridden {
+            if let Some(a) = &active_cfg {
+                println!(
+                    "{d}KERN_CONFIG points at {} - that is your file in your location, so it is NOT removed{z}",
+                    a.display(),
+                    d = p.d,
+                    z = p.z
+                );
+            }
+        }
+        println!(
+            "{d}not touched: /var/lib/kern and any [[disk]] path in your config - kern never created those{z}",
+            d = p.d,
+            z = p.z
+        );
+        return Ok(());
+    }
+
+    // Remove the binary LAST: on Linux an unlinked running executable keeps working, but doing it
+    // first would leave the rest behind if anything after it failed.
+    items.sort_by_key(|i| i.what == "the kern binary");
+    let (mut done, mut failed) = (0usize, Vec::new());
+    for i in &items {
+        let r = if i.path.is_dir() {
+            std::fs::remove_dir_all(&i.path)
+        } else {
+            std::fs::remove_file(&i.path)
+        };
+        match r {
+            Ok(()) => done += 1,
+            Err(e) => failed.push(format!("{}: {e}", i.path.display())),
+        }
+    }
+    println!();
+    if failed.is_empty() {
+        println!(
+            "{g}removed {done} item(s), {}{z}",
+            human_bytes(total),
+            g = p.g,
+            z = p.z
+        );
+    } else {
+        println!(
+            "{y}removed {done} item(s); {} could not be removed:{z}",
+            failed.len(),
+            y = p.y,
+            z = p.z
+        );
+        for f in &failed {
+            println!("  {f}");
+        }
+    }
+    println!(
+        "{d}the transient kern.slice cgroup disappears on its own; nothing else is left.{z}",
+        d = p.d,
+        z = p.z
     );
     Ok(())
 }
@@ -11708,19 +12137,28 @@ fn compose_pod_name(file: &str) -> String {
     format!("{base}-{:08x}", fnv1a(&canon.to_string_lossy()) as u32)
 }
 
-/// `kern config` - list the resource profiles defined in `kern.toml`. Read-only; a missing config
-/// is not an error.
-/// `kern config [edit|setup|probe|clear]` - dispatch the config-management subcommands (default:
-/// list the profiles).
+/// `kern config [list|edit|setup|probe|clear]` - dispatch the config-management subcommands. Bare
+/// `kern config` is `list`, which the parser resolves; listing is read-only and a missing config is
+/// not an error.
 pub fn config_cmd(sub: &str, force: bool) -> Result<(), Error> {
     match sub {
+        "list" => config_list(),
         "edit" => config_edit(),
         "setup" => config_setup(force),
         "probe" => config_probe(),
         "clear" => config_clear(force),
-        _ => config_show(),
+        // Not `_ => config_list()`. A catch-all here made this function's idea of the verb set
+        // implicit, so a verb the parser started accepting without a case here would have listed the
+        // profiles and exited 0 instead of saying it does not exist. Bare `kern config` reaches this
+        // as "list" because the parser defaults it, not because anything unrecognised falls through.
+        _ => Err(Error::Usage(CONFIG_USAGE)),
     }
 }
+
+/// The verbs `kern config` takes. ONE definition, referenced by the parser that refuses an unknown one
+/// and by the dispatch below, because they were two lists and a verb added to one and not the other
+/// would have been accepted and then silently treated as `list`.
+pub(crate) const CONFIG_USAGE: &str = "config [list|add|rm|edit|setup|probe|clear]";
 
 const CONFIG_ADD_USAGE: &str = "config add <vcpu|vgpio|vdisk>:<name> [--field value …] [--update]";
 const CONFIG_RM_USAGE: &str = "config rm <vcpu|vgpio|vdisk>:<name>";
@@ -12198,7 +12636,7 @@ fn config_probe() -> Result<(), Error> {
     Ok(())
 }
 
-pub fn config_show() -> Result<(), Error> {
+pub fn config_list() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     let Some(path) = crate::config::active_path().filter(|p| p.exists()) else {
         println!(
@@ -14849,5 +15287,133 @@ mod stop_does_not_wait_for_the_impossible {
         assert!(init_catches_signal(me, 0));
         assert!(init_catches_signal(me, 65));
         assert!(init_catches_signal(me, -5));
+    }
+}
+
+#[cfg(test)]
+mod uninstall_only_removes_what_kern_installed {
+    use super::*;
+
+    #[test]
+    fn only_the_file_an_installer_placed_is_this_verbs_to_delete() {
+        // Identity, not path text: these need to be REAL files, which is the point. The previous version
+        // of this test passed paths that did not exist and passed against string comparison, which is
+        // exactly what let a symlinked install go unremoved.
+        let base = std::env::temp_dir().join(format!("kern-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(base.join("pkg")).unwrap();
+        std::fs::create_dir_all(base.join("src/target/release")).unwrap();
+
+        // 1. What an installer produces: a real binary at the install path.
+        let installed = home.join(".local/bin/kern");
+        std::fs::write(&installed, b"#!/bin/sh\n").unwrap();
+        assert!(
+            is_installed_binary(&installed, &home),
+            "a binary at the install path must be removable"
+        );
+
+        // 2. A PACKAGED install: the install path is a symlink into a library directory, and
+        // `current_exe()` hands us the resolved target. String comparison answered false here and
+        // refused to remove a legitimate install; identity answers true.
+        let real = base.join("pkg/kern");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        std::fs::remove_file(&installed).unwrap();
+        std::os::unix::fs::symlink(&real, &installed).unwrap();
+        assert!(
+            is_installed_binary(&real, &home),
+            "a symlinked install must still be recognised through its target"
+        );
+
+        // 3. What nobody asked us to touch: a build in a source tree, and a copy somebody placed by hand.
+        let build = base.join("src/target/release/kern");
+        std::fs::write(&build, b"#!/bin/sh\n").unwrap();
+        assert!(
+            !is_installed_binary(&build, &home),
+            "a source-tree build must survive uninstall run from that tree"
+        );
+        let opt = base.join("pkg/kern-copy");
+        std::fs::write(&opt, b"#!/bin/sh\n").unwrap();
+        assert!(
+            !is_installed_binary(&opt, &home),
+            "a hand-placed copy is not an installation"
+        );
+
+        // 4. Another user's home is not this home.
+        let other = base.join("other-home");
+        std::fs::create_dir_all(other.join(".local/bin")).unwrap();
+        let theirs = other.join(".local/bin/kern");
+        std::fs::write(&theirs, b"#!/bin/sh\n").unwrap();
+        assert!(
+            !is_installed_binary(&theirs, &home),
+            "another user's install is not ours to delete"
+        );
+
+        // 5. A path that does not exist cannot be identified, so it is not removable.
+        assert!(!is_installed_binary(&base.join("gone"), &home));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_hardlinked_blob_is_counted_once_and_a_symlink_is_never_followed_out_of_the_tree() {
+        let base = std::env::temp_dir().join(format!("kern-uninst-sz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("blob"), vec![0u8; 65536]).unwrap();
+        let one = dir_bytes(&base);
+        assert!(
+            one >= 65536,
+            "a 64 KiB file must account for at least its bytes, got {one}"
+        );
+
+        // The layer store hardlinks a blob shared between two images. Removing the tree frees those
+        // blocks ONCE, so counting them twice would overstate what the user gets back - which is
+        // exactly what this reported on a real cache before the fix (5.22 GiB claimed, 3.38 freed).
+        std::fs::hard_link(base.join("blob"), base.join("sub/same-blob")).unwrap();
+        assert_eq!(
+            dir_bytes(&base),
+            one,
+            "a second link to the same inode must add nothing"
+        );
+
+        // A symlink pointing anywhere contributes 0: removal does not follow it either.
+        std::os::unix::fs::symlink("/usr", base.join("link")).unwrap();
+        assert_eq!(dir_bytes(&base), one, "a symlink must not be counted");
+
+        // An unreadable or absent subtree contributes 0 rather than aborting the whole plan.
+        assert_eq!(dir_bytes(&base.join("does-not-exist")), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod config_verbs_are_defined_in_one_place {
+    use super::*;
+
+    #[test]
+    fn a_verb_the_dispatch_does_not_know_is_an_error_not_a_silent_listing() {
+        // The parser refuses an unknown verb first, so this is defence in depth against the two lists
+        // drifting: a verb added there without a case here must fail loudly, because listing the
+        // profiles and exiting 0 is indistinguishable from success.
+        for stranger in ["show", "inspect", "ls", "", "LIST"] {
+            let e = config_cmd(stranger, false);
+            assert!(
+                matches!(e, Err(Error::Usage(u)) if u == CONFIG_USAGE),
+                "config_cmd({stranger:?}) must be a usage error, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_usage_string_names_every_verb_the_parser_accepts() {
+        // The one place the verb set is written must actually list what works, or the error message
+        // sends the reader to a verb that does not exist (or hides one that does).
+        for verb in ["list", "add", "rm", "edit", "setup", "probe", "clear"] {
+            assert!(
+                CONFIG_USAGE.contains(verb),
+                "the usage string does not mention `{verb}`: {CONFIG_USAGE}"
+            );
+        }
     }
 }

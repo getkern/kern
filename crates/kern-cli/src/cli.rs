@@ -196,7 +196,8 @@ pub enum Command {
         src: String,
         dst: String,
     },
-    /// `kern pull <image> [--dest <dir>]`: download an OCI image into a rootfs.
+    /// `kern pull <image>`: fetch an OCI image into the cache. `--dest <dir>` extracts a rootfs
+    /// instead.
     Pull {
         image: String,
         dest: Option<String>,
@@ -427,6 +428,12 @@ pub enum Command {
     Validate {
         path: Option<String>,
     },
+    /// `kern uninstall [--yes] [--keep-images]`: remove everything kern created on this host. A dry
+    /// run by default, because the paths it owns hold the image cache and named volumes.
+    Uninstall {
+        yes: bool,
+        keep_images: bool,
+    },
     /// `kern examples`: print an example `kern.toml` to stdout.
     Examples,
     /// `kern volume <create|ls|rm|inspect|prune> …`: manage named volumes.
@@ -446,6 +453,47 @@ const REJECT_MEMORY_SWAP: &str =
      use --memory-swap-max <size> = the swap allowance (memory.swap.max)";
 
 /// Split argv into global options and a subcommand.
+/// Refuse a flag the verb does not take, instead of ignoring it.
+///
+/// ONE definition, because the rule was being written out per verb and thirteen verbs had simply never
+/// had it written: measured with a sweep of every verb in `--help`, `kern ps --zzzz`, `kern images
+/// --zzzz`, `kern stats --zzzz`, `doctor`, `examples`, `gc`, `history`, `info`, `probe`, `prune`,
+/// `recover`, `top` and `validate` all printed their normal output and exited **0**. The dangerous shape
+/// is the format flag: `kern ps --jsn` printed the human table and exited 0, so a script that asked for
+/// JSON got prose and had no way to tell.
+///
+/// The message lists `allowed` rather than restating it, so the text cannot drift from the check. A bare
+/// `-` and everything after `--` are left alone: the former is a conventional stdin marker, the latter is
+/// a workload's own argv and not ours to judge.
+fn reject_unknown_flags(verb: &str, args: &[&str], allowed: &[&str]) -> Result<(), Error> {
+    for a in args.iter().skip(1) {
+        let s: &str = a;
+        if s == "--" {
+            break;
+        }
+        if !s.starts_with('-') || s == "-" {
+            continue;
+        }
+        // `--filter=x` is the same flag as `--filter x`, and `-n5` the same as `-n 5`.
+        let name = s.split('=').next().unwrap_or(s);
+        if allowed
+            .iter()
+            .any(|f| *f == name || (f.len() == 2 && f.starts_with('-') && s.starts_with(f)))
+        {
+            continue;
+        }
+        let takes = if allowed.is_empty() {
+            "no flags".to_string()
+        } else {
+            allowed.join(" ")
+        };
+        return Err(Error::Cli(format!(
+            "{verb}: unknown flag {s:?} - it takes {takes}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
     let opts = GlobalOpts;
     let rest: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -501,7 +549,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         },
         // `build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image.
         Some("build") => parse_build(&rest)?,
-        // `pull <image> [--dest <dir>]`: download an OCI image.
+        // `pull <image>`: fetch into the image cache; `--dest <dir>` extracts a rootfs instead.
         Some("pull") => parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?,
         // `push <local-ref> [as <remote-ref>]` - publish a cached image. `as` lets you retag on push
         // (e.g. `kern push myapp as ghcr.io/me/myapp:1.0`).
@@ -561,9 +609,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             Command::Commit { box_ref, image }
         }
         // `images`: list pulled (cached) images.
-        Some("images") => Command::Images {
-            json: rest.contains(&"--json"),
-        },
+        Some("images") => {
+            reject_unknown_flags("images", &rest, &["--json"])?;
+            Command::Images {
+                json: rest.contains(&"--json"),
+            }
+        }
         // `rmi <image>...`: delete cached images (the counterpart to `pull`).
         Some("rmi") => Command::Rmi {
             images: rest.iter().skip(1).map(|s| s.to_string()).collect(),
@@ -702,6 +753,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `ps [--json] [-q|--quiet] [--filter key=value]...`: list running boxes.
         Some("ps") => {
+            reject_unknown_flags(
+                "ps",
+                &rest,
+                &["--json", "-q", "--quiet", "--filter", "--format"],
+            )?;
             let json = rest.contains(&"--json");
             let quiet = rest.iter().any(|a| *a == "-q" || *a == "--quiet");
             let mut filters = Vec::new();
@@ -734,14 +790,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
         }
         // `stats`: per-box memory + CPU.
-        Some("stats") => Command::Stats {
-            json: rest.contains(&"--json"),
-            names: rest[1..]
-                .iter()
-                .filter(|a| !a.starts_with('-'))
-                .map(|s| (*s).to_string())
-                .collect(),
-        },
+        Some("stats") => {
+            reject_unknown_flags("stats", &rest, &["--json"])?;
+            Command::Stats {
+                json: rest.contains(&"--json"),
+                names: rest[1..]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            }
+        }
         // `logs <name> [--tail N] [-f|--follow]`: a box's captured output.
         Some("logs") => {
             let (mut lname, mut tail, mut follow) = (None, None, false);
@@ -782,19 +841,34 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             None => return Err(Error::Usage("inspect <name> [--json]")),
         },
         // `prune`: GC leftover logs/health/registry files of boxes no longer running.
-        Some("prune") => Command::Prune,
+        Some("prune") => {
+            reject_unknown_flags("prune", &rest, &[])?;
+            Command::Prune
+        }
         // `gc [--images]`: prune dead-box leftovers (+ the image cache with `--images`).
-        Some("gc") => Command::Gc {
-            images: rest.contains(&"--images"),
-        },
+        Some("gc") => {
+            reject_unknown_flags("gc", &rest, &["--images"])?;
+            Command::Gc {
+                images: rest.contains(&"--images"),
+            }
+        }
         // `doctor`: environment preflight. `info`: runtime snapshot.
-        Some("doctor") => Command::Doctor,
-        Some("info") => Command::Info,
+        Some("doctor") => {
+            reject_unknown_flags("doctor", &rest, &[])?;
+            Command::Doctor
+        }
+        Some("info") => {
+            reject_unknown_flags("info", &rest, &[])?;
+            Command::Info
+        }
         // `probe`: a top-level alias for `config probe` - the short form a newcomer reaches for first.
-        Some("probe") => Command::Config {
-            sub: "probe".into(),
-            force: false,
-        },
+        Some("probe") => {
+            reject_unknown_flags("probe", &rest, &[])?;
+            Command::Config {
+                sub: "probe".into(),
+                force: false,
+            }
+        }
         // `bench [--rootfs R] [-n N]`: measure box start→exit latency.
         Some("bench") => Command::Bench {
             rootfs: flag_value(&rest, "--rootfs"),
@@ -805,7 +879,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .filter(|n| *n >= 1)
                 .unwrap_or(20),
         },
-        Some("recover") => Command::Recover,
+        Some("recover") => {
+            reject_unknown_flags("recover", &rest, &[])?;
+            Command::Recover
+        }
         // `update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
         Some("update") => {
             let name = rest
@@ -882,12 +959,15 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 _ => return Err(Error::Usage("rename <old> <new>")),
             }
         }
-        Some("history") => Command::History {
-            count: flag_value(&rest, "-n")
-                .and_then(|v| v.parse().ok())
-                .filter(|n| *n >= 1)
-                .unwrap_or(20),
-        },
+        Some("history") => {
+            reject_unknown_flags("history", &rest, &["-n"])?;
+            Command::History {
+                count: flag_value(&rest, "-n")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n >= 1)
+                    .unwrap_or(20),
+            }
+        }
         // `login [registry] [--username U]` / `logout [registry]`: registry credentials.
         Some("login") => {
             let username = flag_value(&rest, "--username").or_else(|| flag_value(&rest, "-u"));
@@ -906,7 +986,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             _ => return Err(Error::Usage("completions <bash|zsh|fish>")),
         },
         // `top`: live box monitor.
-        Some("top") => Command::Top,
+        Some("top") => {
+            reject_unknown_flags("top", &rest, &[])?;
+            Command::Top
+        }
         // `compose <file> [up|down] [--no-pod]`: bring up / tear down a stack.
         Some("compose") => {
             // Verbs from COMPOSE_VERBS, so this message cannot list a set the parser does not
@@ -1062,7 +1145,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     for a in rest.iter().skip(1) {
                         let s: &str = a;
                         if s.starts_with('-') && !matches!(s, "--force" | "--yes" | "-y") {
-                            return Err(Error::Config(format!(
+                            return Err(Error::Cli(format!(
                                 "config {sub}: unknown flag {s:?} - this verb takes no flags (only `config setup`/`clear` accept --force/--yes/-y)"
                             )));
                         }
@@ -1080,19 +1163,45 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 "rm" | "remove" | "delete" => Command::ConfigRm {
                     args: rest.iter().skip(2).map(|s| (*s).to_string()).collect(),
                 },
-                _ => return Err(Error::Usage("config [list|add|rm|edit|setup|probe|clear]")),
+                _ => return Err(Error::Usage(crate::commands::CONFIG_USAGE)),
             }
         }
         // `validate [path]`: parse a kern.toml and report OK or the offending line.
-        Some("validate") => Command::Validate {
-            path: rest
-                .iter()
-                .skip(1)
-                .find(|a| !a.starts_with('-'))
-                .map(|s| (*s).to_string()),
-        },
+        // `uninstall`: the confirm flag is spelled as the other destructive verbs spell it
+        // (`config clear`), and an unknown flag is refused rather than ignored, so `--dry-run` (which
+        // does not exist, because a dry run IS the default) cannot be mistaken for a no-op switch.
+        Some("uninstall") => {
+            for a in rest.iter().skip(1) {
+                let s: &str = a;
+                if s.starts_with('-') && !matches!(s, "--yes" | "-y" | "--force" | "--keep-images")
+                {
+                    return Err(Error::Cli(format!(
+                        "uninstall: unknown flag {s:?} - it takes --yes (or --force) and --keep-images"
+                    )));
+                }
+            }
+            Command::Uninstall {
+                yes: rest
+                    .iter()
+                    .any(|a| *a == "--yes" || *a == "-y" || *a == "--force"),
+                keep_images: rest.contains(&"--keep-images"),
+            }
+        }
+        Some("validate") => {
+            reject_unknown_flags("validate", &rest, &[])?;
+            Command::Validate {
+                path: rest
+                    .iter()
+                    .skip(1)
+                    .find(|a| !a.starts_with('-'))
+                    .map(|s| (*s).to_string()),
+            }
+        }
         // `examples`: print an example kern.toml.
-        Some("examples" | "example") => Command::Examples,
+        Some("examples" | "example") => {
+            reject_unknown_flags("examples", &rest, &[])?;
+            Command::Examples
+        }
         // `volume <sub> …`: manage named volumes.
         Some("volume" | "vol") => Command::Volume {
             args: rest.iter().skip(1).map(|s| (*s).to_string()).collect(),
@@ -2033,7 +2142,7 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
     }
 }
 
-/// Parse `pull <image> [--dest <dir>]`. `None` if no image was given.
+/// Parse `pull <image> [--dest <dir>] [--platform os/arch]`. `None` if no image was given.
 /// Value following a `--flag` token in `rest` (e.g. `--username alice`), or `None`.
 fn flag_value(rest: &[&str], flag: &str) -> Option<String> {
     rest.iter()
@@ -2521,6 +2630,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::ConfigAdd { args } => commands::config_add(&args),
         Command::ConfigRm { args } => commands::config_rm(&args),
         Command::Validate { path } => commands::validate(path.as_deref()),
+        Command::Uninstall { yes, keep_images } => commands::uninstall(yes, keep_images),
         Command::Examples => commands::examples(),
         Command::Volume { args } => crate::volume::run(&args),
     }
@@ -2534,6 +2644,49 @@ mod tests {
     /// printed the human listing and exited 0, so a script that asked for JSON got prose and had no
     /// way to tell; the same held for any typo. `--force`/`--yes`/`-y` stay accepted (setup/clear
     /// need a confirm), and `config add`/`rm` are untouched: their flags are the profile fields.
+    /// `--platform` cannot reach the image cache: the cache key is the reference alone, with no
+    /// platform component, and the cache path fetches the host architecture. Writing a foreign-arch
+    /// rootfs under a host-arch key is cache poisoning, a class already fixed once here. Since a bare
+    /// `pull` now fills the cache, the combination must be REFUSED rather than silently falling back
+    /// to a directory, which would be a third behaviour for one verb.
+    #[test]
+    fn platform_without_dest_is_refused_because_the_cache_is_host_arch() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        // The parse itself accepts it; the refusal is the command's, so assert the SHAPE reaches it.
+        let cmd = p(&["pull", "alpine", "--platform", "linux/arm64"])
+            .expect("parses")
+            .1;
+        assert!(
+            matches!(&cmd, Command::Pull { image, dest: None, platform: Some(pl) }
+                     if image == "alpine" && pl == "linux/arm64"),
+            "platform without dest must reach the command layer intact: {cmd:?}"
+        );
+        // With --dest it is the long-standing, supported combination.
+        let cmd = p(&[
+            "pull",
+            "alpine",
+            "--platform",
+            "linux/arm64",
+            "--dest",
+            "/tmp/x",
+        ])
+        .expect("parses")
+        .1;
+        assert!(
+            matches!(&cmd, Command::Pull { dest: Some(d), platform: Some(_), .. } if d == "/tmp/x"),
+            "platform WITH dest stays supported: {cmd:?}"
+        );
+        // And a bare pull carries neither, which is the case that now fills the cache.
+        assert!(matches!(
+            p(&["pull", "alpine"]).expect("parses").1,
+            Command::Pull {
+                dest: None,
+                platform: None,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_flag_the_config_verbs_do_not_take_is_refused_not_ignored() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
@@ -3036,5 +3189,81 @@ mod tests {
             Command::Stats { json: true, names } => assert_eq!(names, vec!["web"]),
             other => panic!("expected Stats, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod no_verb_swallows_a_flag_it_does_not_take {
+    use super::*;
+
+    fn parse_v(argv: &[&str]) -> Result<(GlobalOpts, Command), Error> {
+        parse(&argv.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_typo_in_a_format_flag_is_refused_not_ignored() {
+        // The shape that made this worth fixing: `--jsn` printed the human table and exited 0, so a
+        // script that asked for JSON got prose with no way to notice.
+        for argv in [
+            vec!["ps", "--jsn"],
+            vec!["images", "--jsonn"],
+            vec!["stats", "--jso"],
+            vec!["gc", "--image"],
+            vec!["history", "--count", "5"],
+            vec!["doctor", "--json"],
+            vec!["info", "--verbose"],
+            vec!["probe", "--all"],
+            vec!["prune", "-f"],
+            vec!["recover", "--dry-run"],
+            vec!["top", "--json"],
+            vec!["validate", "--strict"],
+            vec!["examples", "--toml"],
+        ] {
+            let r = parse_v(&argv);
+            assert!(
+                matches!(r, Err(Error::Cli(_))),
+                "{argv:?} must be refused, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_flag_the_help_advertises_still_parses() {
+        // The other half: a refusal that also refuses the real flags would be worse than the defect.
+        for argv in [
+            vec!["ps", "--json"],
+            vec!["ps", "-q"],
+            vec!["ps", "--quiet"],
+            vec!["ps", "--filter", "name=x"],
+            vec!["ps", "--format", "{{.Name}}"],
+            vec!["images", "--json"],
+            vec!["stats", "--json"],
+            vec!["stats", "mybox"],
+            vec!["history", "-n", "5"],
+            vec!["history", "-n5"],
+            vec!["gc", "--images"],
+            vec!["validate", "/tmp/kern.toml"],
+            vec!["doctor"],
+            vec!["examples"],
+        ] {
+            let r = parse_v(&argv);
+            assert!(r.is_ok(), "{argv:?} must still parse, got {r:?}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_verb_and_lists_the_real_flags() {
+        // The message is built FROM the allowed list, so it cannot advertise a flag the check rejects.
+        let Err(Error::Cli(msg)) = parse_v(&["ps", "--nope"]) else {
+            panic!("ps --nope was not refused");
+        };
+        assert!(msg.starts_with("ps:"), "does not name the verb: {msg}");
+        for f in ["--json", "-q", "--filter", "--format"] {
+            assert!(msg.contains(f), "does not list {f}: {msg}");
+        }
+        let Err(Error::Cli(msg)) = parse_v(&["examples", "--nope"]) else {
+            panic!("examples --nope was not refused");
+        };
+        assert!(msg.contains("no flags"), "should say it takes none: {msg}");
     }
 }
