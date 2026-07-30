@@ -155,7 +155,7 @@ command the README tells you to run:
 | x86_64 desktop | v7.0 | **2.2 ms** | 2.9 ms | 13.8 ms | 289.2 ms |
 | Raspberry Pi 5 | v6.6-rpi | **11.8 ms** | ✗ | ✗ | ✗ |
 | Jetson Orin Nano | v5.15-tegra | **13.1 ms** | 5.5 ms | 32 ms † | 472 ms † |
-| Arduino UNO Q | **v6.16 Android** | **91.2 ms** | 14.6 ms | 76 ms † | 858 ms † |
+| Arduino UNO Q | **v6.16 Android** | **93.2 ms** | 14.4 ms | 76 ms † | 858 ms † |
 
 ✗ = **not installed (nor readily installable) on that board.** † carried over from the earlier session:
 only kern and bubblewrap were re-measured on 2026-07-30.
@@ -186,8 +186,26 @@ all, so the scope is not even possible, and a box there costs **4.2 ms with the 
 |---|---:|---|---|
 | x86_64 desktop | **2.6** | yes | direct |
 | WSL2 | **4.2** | yes | direct, no systemd present at all |
-| Raspberry Pi 5 | **15.5** | yes | systemd transient scope |
-| Raspberry Pi 5, cgroup off | 4.1 | **no** | none |
+| Raspberry Pi 5 | **17.1** | yes | systemd transient scope |
+| Raspberry Pi 5, cgroup off | 3.7 | **no** | none |
+| Jetson Orin Nano, cgroup off | 5.5 | **no** | none |
+| Arduino UNO Q, cgroup off, `--bind-rootfs` | 12.4 | **no** | none |
+
+And against bubblewrap at the same level of work, which is the only comparison that means anything since
+bubblewrap has no caps to enforce:
+
+| board | kern, cgroup off | bubblewrap | |
+|---|---:|---:|---|
+| Jetson Orin Nano | **5.5 ms** | 6.0 ms | kern |
+| Arduino UNO Q, `--bind-rootfs` | **12.4 ms** | 14.4 ms | kern |
+| x86_64 desktop, kern's caps ON | **2.6 ms** | 3.1 ms | kern, while doing more |
+
+`--bind-rootfs` matters on the Arduino and nowhere else: `KERN_TIMING=1` puts **22.4 ms** in the overlay
+mount alone on that Android kernel, against ~0.1 ms on x86. It takes that board from 93.2 ms to **65.4**
+with caps enforced, and to 12.4 with the cgroup off. Every board row above is the DEFAULT path, so the
+boards are compared with each other rather than each with its own best flag. bubblewrap binds rather than overlays, so
+comparing kern's default overlay to it there compares two different mount strategies, not two runtimes.
+With the same strategy kern is ahead.
 
 So: **wherever kern can take the direct cgroup path, a box costs 2.6 to 4.2 ms with limits enforced.** The
 boards' 12 to 15 ms is the `systemd-run` round trip in full, which kern falls back to because it obtains
