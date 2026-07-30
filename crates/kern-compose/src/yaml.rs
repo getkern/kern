@@ -1233,10 +1233,100 @@ fn strip_quotes(s: &str) -> &str {
     }
 }
 
-/// A scalar value as an owned, unquoted string.
+/// A scalar value as an owned, unquoted string, with the quoting style's escapes decoded.
+///
+/// YAML 1.2 gives the two quote styles different rules and the difference is not cosmetic: in a
+/// DOUBLE-quoted scalar `\n` is a line feed, in a SINGLE-quoted one it is a backslash and an `n`.
+/// This used to strip the quotes and stop, so `command: ["sh","-c","a\nb"]` handed the process a
+/// literal `a\nb` where Docker Compose hands it two lines. The program then failed for a reason
+/// nothing in the file explained.
+///
+/// Deliberate deviation, stated rather than hidden: an UNKNOWN escape (`\q`) is kept verbatim,
+/// where a strict parser errors. Keeping it cannot change the meaning of any file that works
+/// today, and this landed close to a release; erroring is the more correct behaviour and is the
+/// thing to revisit, not a decision to leave undocumented.
 fn scalar_str(s: &str) -> String {
+    let t = s.trim();
+    let b = t.as_bytes();
+    let dq = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
+    let sq = b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'';
     // Decode a folded block scalar's U+0001 line-break sentinel back to a real newline.
-    strip_quotes(s.trim()).replace(BLOCK_NL, "\n")
+    if dq {
+        decode_double_quoted(&t[1..t.len() - 1]).replace(BLOCK_NL, "\n")
+    } else if sq {
+        // Single quotes take no backslash escapes at all; `''` is the only one, and it means `'`.
+        t[1..t.len() - 1].replace("''", "'").replace(BLOCK_NL, "\n")
+    } else {
+        t.replace(BLOCK_NL, "\n")
+    }
+}
+
+/// Decode the escapes YAML 1.2 defines for a double-quoted scalar (§5.7), over the body with the
+/// quotes already removed.
+fn decode_double_quoted(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut it = body.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(e) = it.next() else {
+            // A trailing lone backslash: keep it rather than swallow a character that is there.
+            out.push('\\');
+            break;
+        };
+        match e {
+            '0' => out.push('\0'),
+            'a' => out.push('\u{7}'),
+            'b' => out.push('\u{8}'),
+            't' | '\t' => out.push('\t'),
+            'n' => out.push('\n'),
+            'v' => out.push('\u{b}'),
+            'f' => out.push('\u{c}'),
+            'r' => out.push('\r'),
+            'e' => out.push('\u{1b}'),
+            ' ' => out.push(' '),
+            '"' => out.push('"'),
+            '/' => out.push('/'),
+            '\\' => out.push('\\'),
+            'N' => out.push('\u{85}'),
+            '_' => out.push('\u{a0}'),
+            'L' => out.push('\u{2028}'),
+            'P' => out.push('\u{2029}'),
+            'x' | 'u' | 'U' => {
+                let want = match e {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
+                // Peek exactly `want` hex digits WITHOUT consuming on failure: a malformed `\uZZ`
+                // stays verbatim instead of eating the characters after it.
+                let rest: String = it.clone().take(want).collect();
+                match u32::from_str_radix(&rest, 16)
+                    .ok()
+                    .filter(|_| rest.chars().count() == want)
+                    .and_then(char::from_u32)
+                {
+                    Some(ch) => {
+                        for _ in 0..want {
+                            it.next();
+                        }
+                        out.push(ch);
+                    }
+                    None => {
+                        out.push('\\');
+                        out.push(e);
+                    }
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 /// Parse a YAML inline table `{k: v, k2: {…}, k3: [a, b]}` into a [`Node`] with `children`. Values that
@@ -3765,6 +3855,32 @@ services:
             parse(ok).is_ok(),
             "a bare apostrophe in an unquoted scalar must parse"
         );
+    }
+
+    /// YAML 1.2 gives the two quote styles different escape rules, and a compose file relies on it:
+    /// `"a\\nb"` is two lines, `'a\\nb'` is five characters. kern used to strip the quotes and hand
+    /// the program the backslash, so a command written the way Docker's docs write it ran as one
+    /// line and failed for a reason nothing in the file explained. Asserted on the DECODED scalar,
+    /// because the file parses either way: only the value distinguishes the two behaviours.
+    #[test]
+    fn double_quoted_scalars_decode_escapes_and_single_quoted_do_not() {
+        assert_eq!(scalar_str(r#""a\nb""#), "a\nb");
+        assert_eq!(scalar_str(r#""a\tb""#), "a\tb");
+        assert_eq!(scalar_str(r#""a\\b""#), "a\\b");
+        assert_eq!(scalar_str(r#""say \"hi\"""#), "say \"hi\"");
+        assert_eq!(scalar_str(r#""\u00e9""#), "\u{e9}");
+        assert_eq!(scalar_str(r#""\x41""#), "A");
+
+        // Single quotes take NO backslash escapes; `''` is the only one and it means `'`.
+        assert_eq!(scalar_str("'a\\nb'"), "a\\nb");
+        assert_eq!(scalar_str("'it''s'"), "it's");
+
+        // Unquoted is untouched.
+        assert_eq!(scalar_str("a\\nb"), "a\\nb");
+
+        // An unknown or malformed escape is kept verbatim and consumes nothing after it.
+        assert_eq!(scalar_str(r#""a\qb""#), "a\\qb");
+        assert_eq!(scalar_str(r#""\uZZ12""#), "\\uZZ12");
     }
 
     #[test]
