@@ -213,6 +213,56 @@ WSL2 is the third kernel that settles it: there is no `systemd-run` at all, so t
 possible, and a box costs **4.2 ms with the cap enforced**. That figure is from the previous round and
 could not be re-taken (the Windows host was powered off), so it is quoted as such rather than folded in.
 
+### The toll is avoidable, and that is the headline
+
+The scope is paid because an SSH login sits under the SYSTEM systemd manager while kern's delegated
+`kern.slice` lives under the USER manager, and cgroup v2 refuses to migrate a process across that
+boundary. Verified on the UNO Q rather than assumed: creating a cgroup under `kern.slice` succeeds,
+writing `memory.max` into it succeeds, writing the pid into `cgroup.procs` is **refused**, because the
+common ancestor `user-<uid>.slice` is not the user's to write. So kern's per-box fallback is correct.
+
+What it is not is unavoidable. Enter the user manager's tree ONCE and every box after it takes the
+direct path, with the caps still enforced (`memory.max` read back as 268435456 in every cell below):
+
+```sh
+systemd-run --user --scope bash     # pay it once, then run kern inside that shell
+```
+
+| board | as an SSH login | inside one scope | + `--bind-rootfs` |
+|---|---:|---:|---:|
+| Raspberry Pi 5 | 11.7 ms | **3.0** | **2.8** |
+| Jetson Orin Nano | 12.8 ms | **4.6** | **4.2** |
+| Arduino UNO Q | 91.9 ms | **35.5** | **11.3** |
+
+All four columns come from ONE sitting per board, so they compare with each other; the small drift
+against the table above (11.7 vs 11.9 on the Pi) is two rounds an hour apart, not a change.
+
+Eight times faster on the Arduino, four on the Pi, all with caps live. `kern doctor` now measures the
+toll on the host in front of you and prints that command, rather than leaving it to be discovered.
+
+**And it settles the bubblewrap comparison on the boards, not just on x86.** kern *enforcing a memory
+limit* against bubblewrap enforcing nothing: **4.2 ms vs 5.6** on the Jetson, **11.3 vs 15.0** on the
+Arduino. kern is ahead on every host where both are installed, while doing strictly more.
+
+### Why the Arduino is still the slowest, chased to the bottom
+
+Its remaining cost is one thing: **`mount -t overlay` takes 22 ms on that Android kernel**, against
+~0.1 ms on x86. Everything else in a box there sums to about 7 ms. The 22 ms is a FIXED cost, which is
+what makes it interesting:
+
+- identical with a 517-file lowerdir and with an **empty** one, so it is not the image;
+- identical with everything on ext4 and with everything on tmpfs, so it is not the storage;
+- five consecutive mounts inside one namespace landed within **0.4 ms** of each other;
+- `overlay` is already in `/proc/modules`, so it is not an autoload;
+- a **tmpfs** mount in the same namespace costs 6.1 ms against overlay's 28.2, so it is not `mount()`
+  in general.
+
+A cost that ignores both the content and the backing store is not work being done. kern cannot make
+that kernel faster. `--bind-rootfs` skips the mount entirely and is why the Arduino column above drops
+from 35.5 to 11.3, but it binds the source directly: mutable and shared between boxes, where the
+overlay root is per-box and leaves the source untouched. That is a trade to make deliberately, so
+`kern doctor` states it instead of choosing for you.
+
 ### At the same level of work
 
 bubblewrap binds rather than overlays, so `--bind-rootfs` is the like-for-like flag: comparing kern's

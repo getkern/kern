@@ -749,6 +749,29 @@ costs 9.4 ms on the Pi, 9.0 on the Jetson and 59.9 on the Arduino, against gaps 
 between kern's capped and uncapped runs on those same boards. The arithmetic closes to within 1.7 ms
 everywhere, which is why the boards' figures are a fallback path rather than the engine.
 
+**The toll is avoidable, and that is the point.** An SSH login sits under the SYSTEM systemd manager
+while kern's delegated `kern.slice` lives under the USER manager, and cgroup v2 will not migrate a
+process across that boundary. Enter the user manager's tree once and every box after it takes the
+direct path, caps still enforced:
+
+```sh
+systemd-run --user --scope bash     # pay it once, then run kern inside that shell
+```
+
+| board | as an SSH login | inside one scope | + `--bind-rootfs` |
+|---|---:|---:|---:|
+| Raspberry Pi 5 | 11.7 ms | **3.0** | **2.8** |
+| Jetson Orin Nano | 12.8 ms | **4.6** | **4.2** |
+| Arduino UNO Q | 91.9 ms | **35.5** | **11.3** |
+
+All four columns come from ONE sitting per board, so they compare with each other; the small drift
+against the table above (11.7 vs 11.9 on the Pi) is two rounds an hour apart, not a change.
+
+Eight times faster on the Arduino, four on the Pi. `kern doctor` measures the toll on your host and
+prints that command. It also settles the bubblewrap comparison on the boards: kern *enforcing a memory
+limit* is **4.2 ms against bubblewrap's 5.6** on the Jetson and **11.3 against 15.0** on the Arduino,
+while bubblewrap enforces nothing.
+
 At the same level of work, from the same round:
 
 | board | kern, cgroup off | bubblewrap | |

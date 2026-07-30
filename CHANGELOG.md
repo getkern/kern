@@ -44,6 +44,32 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   the parser had no field for it, so the pod came up with nothing published. A port belongs to the box
   that serves it; the error now says exactly that and gives the command.
 
+### Added
+
+- **`kern doctor` now measures two costs it used to leave invisible, and names the way out of each.**
+
+  The per-box systemd toll: an SSH login sits under the SYSTEM systemd manager while kern's delegated
+  `kern.slice` lives under the USER manager, and cgroup v2 refuses to migrate a process across that
+  boundary. Verified on an Arduino UNO Q rather than assumed: creating a cgroup under `kern.slice`
+  succeeds, writing `memory.max` succeeds, writing the pid into `cgroup.procs` is REFUSED. So the
+  fallback is correct, and it is also avoidable. Enter the tree once with `systemd-run --user --scope
+  bash` and every box takes the direct path with caps still enforced: **11.7 to 3.0 ms** on a Pi 5,
+  12.8 to 4.6 on a Jetson, **91.9 to 35.5** on the Arduino, and 11.3 there with `--bind-rootfs`. That
+  also settles the bubblewrap comparison on the boards: kern enforcing a memory limit is 4.2 ms
+  against bubblewrap's 5.6 on the Jetson and 11.3 against 15.0 on the Arduino.
+
+  The overlay mount: `mount -t overlay` costs **22 ms** on the Arduino's Android kernel against ~0.1 ms
+  on x86, which is most of a box's start time there, and "overlayfs: available" said nothing about it.
+  The cost is fixed, which is what makes it diagnosable: identical with a 517-file lowerdir and with an
+  empty one, identical on ext4 and on tmpfs, five consecutive mounts within 0.4 ms of each other, the
+  module already loaded, and a tmpfs mount in the same namespace costing 6.1 ms against overlay's 28.2.
+  Not the disk, not the image, not an autoload, not `mount()` in general.
+
+  Both figures are measured on the host in front of you, and both measurements were wrong twice before
+  they were worth shipping (a cold first sample overstating the systemd toll by 3.6x; a missing
+  `uid_map` write making the overlay probe measure nothing at all, then a version that timed the
+  `uid_map` write itself and flickered between 20 and 5 ms). The record is in the code.
+
 ### Changed
 
 - **Third measurement round on the boards, and it is the one that ships.** With the bench defect fixed,
