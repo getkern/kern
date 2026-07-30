@@ -32,9 +32,9 @@
   <g>
     <!-- reusable profiles: CPU, disk AND devices, in one config file -->
     <text x="22" y="70"  class="l" style="animation-delay:.2s"><tspan class="dim"># ~/.config/kern/kern.toml - CPU, disk &amp; device profiles, reusable</tspan></text>
-    <text x="22" y="93"  class="l" style="animation-delay:.4s"><tspan class="key">  [[vcpu]]</tspan>  <tspan class="cmd">name =</tspan> <tspan class="str">"heavy"</tspan>    <tspan class="cmd">cpus =</tspan> <tspan class="str">4</tspan>   <tspan class="cmd">memory =</tspan> <tspan class="str">"8G"</tspan></text>
-    <text x="22" y="116" class="l" style="animation-delay:.6s"><tspan class="key">  [[vdisk]]</tspan> <tspan class="cmd">name =</tspan> <tspan class="str">"scratch"</tspan>  <tspan class="cmd">size =</tspan> <tspan class="str">"2G"</tspan></text>
-    <text x="22" y="139" class="l" style="animation-delay:.8s"><tspan class="key">  [[vgpio]]</tspan> <tspan class="cmd">name =</tspan> <tspan class="str">"sensor"</tspan>   <tspan class="cmd">i2c =</tspan> <tspan class="str">["/dev/i2c-1"]</tspan></text>
+    <text x="22" y="93"  class="l" style="animation-delay:.4s"><tspan class="key">  [[vcpu]]</tspan>  <tspan class="cmd">name =</tspan> <tspan class="str">"heavy"</tspan>  <tspan class="cmd">backend =</tspan> <tspan class="str">"host"</tspan>  <tspan class="cmd">cpus =</tspan> <tspan class="str">4</tspan>  <tspan class="cmd">memory =</tspan> <tspan class="str">"8G"</tspan></text>
+    <text x="22" y="116" class="l" style="animation-delay:.6s"><tspan class="key">  [[vdisk]]</tspan> <tspan class="cmd">name =</tspan> <tspan class="str">"scratch"</tspan>  <tspan class="cmd">backend =</tspan> <tspan class="str">"ram"</tspan>  <tspan class="cmd">size =</tspan> <tspan class="str">"2G"</tspan></text>
+    <text x="22" y="139" class="l" style="animation-delay:.8s"><tspan class="key">  [[vgpio]]</tspan> <tspan class="cmd">name =</tspan> <tspan class="str">"sensor"</tspan>   <tspan class="cmd">backend =</tspan> <tspan class="str">"host"</tspan>  <tspan class="cmd">i2c =</tspan> <tspan class="str">["/dev/i2c-1"]</tspan></text>
 
     <!-- attach a resource slice to an isolated box -->
     <text x="22" y="181" class="l" style="animation-delay:1.4s"><tspan class="prompt">$</tspan> <tspan class="cmd">kern box train </tspan><tspan class="flag">--image</tspan><tspan class="cmd"> alpine </tspan><tspan class="prof">vcpu:heavy vdisk:scratch</tspan><tspan class="cmd"> -- ./train.sh</tspan></text>
