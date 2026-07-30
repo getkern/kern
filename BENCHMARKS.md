@@ -154,7 +154,10 @@ reproduce is not a benchmark.
 
 It is **not a regression in kern**, which was the first thing checked: v0.6.9, v0.6.20, v0.6.24 and
 v0.6.25 were each benched on the Pi 5 that evening and produced 13.9, 12.0, 11.9 and 11.7 ms. Every
-version measures the same today, and the newest is the fastest of the four.
+version measures the same today, and the newest is the fastest of the four. Those four are comparable
+with EACH OTHER and not with the table below: they were taken in one sitting before the boards were
+reset, and the table was re-measured after. What they establish is the ordering across versions, which
+is the only thing a regression check needs.
 
 What changed is the boards. All three now have the **memory controller delegated** to the user slice,
 which they did not before: on the Pi 5 it had to be turned on with `cgroup_enable=memory` and a reboot,
