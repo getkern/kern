@@ -729,33 +729,47 @@ other row is fast, not because of a container that ignores signals.
 
 | host | kernel | **kern** | bubblewrap | runc | docker |
 |---|---|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.2 ms** | 3.0 ms | 13.8 ms | 289.2 ms |
-| Raspberry Pi 5 | v6.6-rpi | **17.1 ms** † | ✗ | ✗ | ✗ |
-| Jetson Orin Nano | v5.15-tegra | **14.3 ms** † | 6.0 ms | 32 ms | 472 ms |
-| Arduino UNO Q | **v6.16 Android** | **93.2 ms** † | 14.4 ms | 76 ms | 858 ms |
+| x86_64 desktop | v7.0 | **2.6 ms** | 3.0 ms | 13.8 ms | 289.2 ms |
+| Raspberry Pi 5 | v6.6-rpi | **11.9 ms** † | not installed | not installed | not installed |
+| Jetson Orin Nano | v5.15-tegra | **13.4 ms** † | 5.6 ms | 32 ms ‡ | 472 ms ‡ |
+| Arduino UNO Q | **v6.16 Android** | **91.7 ms** † | 15.0 ms | 76 ms ‡ | 858 ms ‡ |
 
-✗ = not installed on the boards tested. On the **Pi 5, kern is the only runtime present at all**: one
-~1.8 MB static binary just works where the others are each a setup step (Docker alone is a ~186 MB daemon
-stack). That reach, not a latency crown, is what the boards are here to show.
+kern and bubblewrap were measured together on 2026-07-30, three repeats each, median of medians, on an
+idle host. ‡ = runc and docker are carried over from the earlier round and were **not** re-measured that
+night. On the **Pi 5, kern is the only runtime present at all**: docker, podman, runc, crun, bwrap,
+nerdctl, lxc and systemd-nspawn are all absent, checked one by one. One ~1.8 MB static binary just works
+where the others are each a setup step (Docker alone is a ~186 MB daemon stack). That reach, not a
+latency crown, is what the boards are here to show.
 
-† **The board figures include enforcing resource caps, and bubblewrap's do not, because bubblewrap has no
-caps to enforce.** These boards give kern no delegated cgroup slice, so the only way to make a limit bite
-there is a systemd transient scope, and `systemd-run --user --scope /bin/true` alone costs 13.7 ms on the
-Pi. At the same level of work, measured the same night:
+† **The kern column enforces resource caps and the bubblewrap column does not, because bubblewrap has no
+caps to enforce.** `memory.max` was read back as 268435456 inside the box on every host in the table. The
+boards give kern no delegated cgroup slice, so the only way to make a limit bite there is a systemd
+transient scope, and that scope is the entire difference: `systemd-run --user --scope /bin/true` alone
+costs 9.4 ms on the Pi, 9.0 on the Jetson and 59.9 on the Arduino, against gaps of 9.2, 9.3 and 58.2 ms
+between kern's capped and uncapped runs on those same boards. The arithmetic closes to within 1.7 ms
+everywhere, which is why the boards' figures are a fallback path rather than the engine.
+
+At the same level of work, from the same round:
 
 | board | kern, cgroup off | bubblewrap | |
 |---|---:|---:|---|
-| Jetson Orin Nano | **5.5 ms** | 6.0 ms | kern |
-| Arduino UNO Q, `--bind-rootfs` | **12.4 ms** | 14.4 ms | kern |
-| Raspberry Pi 5 | **3.7 ms** | not installed | |
+| x86_64 desktop | **2.3 ms** | 3.0 ms | kern |
+| Jetson Orin Nano, `--bind-rootfs` | **3.5 ms** | 5.6 ms | kern |
+| Arduino UNO Q, `--bind-rootfs` | **9.6 ms** | 15.0 ms | kern |
+| Raspberry Pi 5, `--bind-rootfs` | **2.3 ms** | not installed | |
 
-Wherever kern can take its **direct** cgroup path it does not pay that toll at all: **2.6 ms on x86 with a
-memory cap enforced** (against bubblewrap's 3.1 enforcing nothing, both from the same series) and **4.2 ms inside WSL2**, where
-`systemd-run` does not exist and the cap is enforced anyway. The boards' figures are a fallback path, not
-the engine. `--bind-rootfs` is worth it only on the Arduino, whose Android kernel spends **22.4 ms** in the overlay
-mount alone against ~0.1 ms on x86: it takes that board from 93.2 ms to 65.4 with caps enforced, and to
-12.4 with the cgroup off. Every row in the table above is the default path, so the boards are compared
-with each other rather than each with its own best flag.
+`--bind-rootfs` is the like-for-like flag because bubblewrap binds rather than overlays; comparing kern's
+default overlay against it compares two mount strategies, not two runtimes. It is worth reaching for only
+on the Arduino, whose Android kernel spends **22.4 ms** in the overlay mount alone against ~0.1 ms on
+x86: it takes that board from 91.7 ms to 69.2 with caps enforced, and from 33.5 to 9.6 with the cgroup
+off. Elsewhere it is worth a few tenths. Every row in the first table is the default path, so the boards
+are compared with each other rather than each with its own best flag.
+
+Wherever kern can take its **direct** cgroup path it does not pay the scope toll at all: 2.6 ms on x86
+with the cap enforced, against 4.2 ms for `systemd-run --user --scope /bin/true` on that same machine,
+which is the round trip kern is avoiding. **4.2 ms inside WSL2** with the cap enforced comes from the
+previous round and could not be re-measured (the Windows host was off); `systemd-run` does not exist
+there at all, so the direct path was already the only one.
 
 kern is the fastest sandbox on the desktop at **~2.2 ms**, ahead of bubblewrap at 3.0, and the top tier is
 all within a few ms: nobody wins single-shot latency outright. The real gap is to the **engines**,
@@ -815,7 +829,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.24.** Everything in [Features](#features) works today and is tested (649 Rust, 61 Python and 50
+**0.6.27.** Everything in [Features](#features) works today and is tested (664 Rust, 61 Python and 50
 Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
 real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
 starts in single-digit milliseconds from one **~1.8 MB** binary. Versioned under semver: each release is the official

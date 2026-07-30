@@ -19,6 +19,52 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.27], 2026-07-30
+
+### Fixed
+
+- **`kern bench --bind-rootfs` accepted the flag and dropped it.** Every "bind" figure ever quoted
+  from `kern bench` was therefore an overlay figure under a bind label. It mattered on exactly one
+  board: the Arduino UNO Q's Android kernel spends 22.4 ms in the overlay mount alone against ~0.1 ms
+  on x86, so the mislabelled number was 33.5 ms where the real bind path is 9.6. bench now passes the
+  flag through and names it in its own header, since two very different numbers otherwise print
+  identically. The test asserts the PARSED command rather than the exit code, because the old code
+  also exited 0 for that invocation: only the parsed value separates "accepted and honoured" from
+  "accepted and discarded".
+
+- **A flag kern does not understand is now refused on every verb, not on 14 of 38.** Four exited 0
+  with an invented flag, the worst shape of all: `volume ls --json` printed the human table and
+  reported success, so a script parsing it got prose with no way to tell. `search`, `completions` and
+  `pod ls` did the same. Ten more dropped the flag and failed later for an unrelated reason, which
+  reads as a kern bug until you find the flag was never applied: stop, kill, killall, pause, unpause,
+  attach, cp, inspect, diff, wait, rename, update, tag, commit, rmi, events. One shared
+  `reject_unknown_flags` reaches all of them rather than a second copy of the rule.
+
+- **`kern pod create -p 8080:80` was advertised and not implemented.** The usage line offered `-p` and
+  the parser had no field for it, so the pod came up with nothing published. A port belongs to the box
+  that serves it; the error now says exactly that and gives the command.
+
+### Changed
+
+- **Third measurement round on the boards, and it is the one that ships.** With the bench defect fixed,
+  every cell was re-taken in a single sitting, three repeats each, on idle hosts, with `memory.max`
+  read back from inside a box to prove the caps were live: Pi 5 **11.9 ms**, Jetson **13.4**, Arduino
+  **91.7**, x86 **2.6**, all with caps enforced.
+
+  **The scope accounts for the whole board gap, and the arithmetic closes.** `systemd-run --user
+  --scope /bin/true` timed on its own costs 9.4 / 9.0 / 59.9 ms on the three boards, against capped-
+  minus-uncapped gaps of 9.2 / 9.3 / 58.2 on those same boards: agreement within 1.7 ms everywhere.
+  On x86 the same scope costs 4.2 ms and kern does not pay it, capping directly in its own delegated
+  slice for 0.3 ms instead.
+
+  At the same level of work kern is ahead of bubblewrap on every host where both are installed: 2.2
+  vs 3.0 on x86, 3.5 vs 5.6 on the Jetson, 9.6 vs 15.0 on the Arduino.
+
+  **What is not explained:** the Pi 5 and Jetson read 17.1 and 14.3 ms in the previous round and 11.9
+  and 13.4 in this one, on the same hardware with the same binary and the caps verified enforced in
+  both. The bench defect does not account for it, since it only ever affected `--bind-rootfs`. No
+  cause is offered here because none was established.
+
 ## [0.6.26], 2026-07-30
 
 ### Fixed
@@ -43,9 +89,11 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 ### Changed
 
 - **The ARM board figures in BENCHMARKS.md were re-measured and they moved upward**, from 2.1/3.6/9.9 ms
-  to 11.8/13.1/91.2 on the Pi 5, Jetson and Arduino UNO Q. Not a regression: v0.6.9, v0.6.20, v0.6.24 and
-  v0.6.25 were each benched on the same Pi that evening and read 13.9, 12.0, 11.9 and 11.7, so the newest
-  is the fastest of the four. What changed is the boards, which now have the memory controller delegated
+  to 17.1/14.3/93.2 on the Pi 5, Jetson and Arduino UNO Q. Not a regression: v0.6.9, v0.6.20, v0.6.24 and
+  v0.6.25 were each benched on the same Pi in one sitting and read 13.9, 12.0, 11.9 and 11.7, so the
+  newest is the fastest of the four. Those four compare with each other and not with the table above,
+  which was re-measured later, after the boards were reset.
+  What changed is the boards, which now have the memory controller delegated
   and therefore pay for enforcement they previously could not perform. Chased to its cause:
   `systemd-run --user --scope /bin/true` alone costs 13.7 ms there, against 14.3 for a whole `kern box`,
   and removing it removes the caps with it. bubblewrap is now faster than kern on the two boards where

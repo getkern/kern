@@ -78,7 +78,7 @@ explicit `--memory 512m`. The cap still bites (200 MiB under `--memory 32m` exit
 ⚠️ **"There" is doing work in that sentence.** The direct slice is reachable only when kern runs inside
 the systemd user manager's tree, which a desktop session gives you and an **SSH session does not**: a
 login session is placed under the SYSTEM manager, in a different delegation domain. Where the direct path
-is out of reach kern falls back to a per-box transient scope, and that costs **13.7 ms** rather than
+is out of reach kern falls back to a per-box transient scope, and that costs **9.4 ms** rather than
 0.25 on a Raspberry Pi 5. Same binary, same caps enforced either way. This paragraph used to state the
 0.25 ms as though it held everywhere; it holds where the path is reachable.
 [Why a headless board pays it](#why-a-headless-board-pays-it-and-what-to-do-about-it) has the numbers and
@@ -147,82 +147,92 @@ many-sharing-one-rootfs at 12/12, see the test suite.)
 
 ## Runs everywhere, the same static binary, on boards where the engines can't
 
-**These numbers were re-measured on 2026-07-30 and they moved, upward, on every board.** The earlier
-table read 2.1 ms on the Pi 5, 3.6 on the Jetson and 9.9 on the Arduino. Re-running it found 11.8, 13.1
-and 91.2 on the same hardware. The figures below are the new ones, because a number that does not
-reproduce is not a benchmark.
+**Re-measured twice on 2026-07-30.** The table shipped before that day read 2.1 ms on the Pi 5, 3.6 on
+the Jetson and 9.9 on the Arduino. A first re-run found 11.8, 13.1 and 91.2. A second round late the same
+night, after a defect was found in the benchmark command itself (below), produced the figures here. A
+number that does not reproduce is not a benchmark, so what follows is one round, taken end to end in a
+single sitting, with nothing carried in from the others except where a row says so.
+
+**The benchmark command had a defect, and it mattered on exactly one board.** `kern bench --bind-rootfs`
+accepted the flag and dropped it, so every "bind" figure ever quoted from `kern bench` was an overlay
+figure under a bind label. On the Arduino UNO Q, whose Android kernel spends 22.4 ms in the overlay mount
+alone against ~0.1 ms on x86, that is the difference between 33.5 ms and 9.6. Fixed, with a test that
+asserts the parsed command rather than the exit code, since the old code also exited 0.
 
 It is **not a regression in kern**, which was the first thing checked: v0.6.9, v0.6.20, v0.6.24 and
-v0.6.25 were each benched on the Pi 5 that evening and produced 13.9, 12.0, 11.9 and 11.7 ms. Every
-version measures the same today, and the newest is the fastest of the four. Those four are comparable
-with EACH OTHER and not with the table below: they were taken in one sitting before the boards were
-reset, and the table was re-measured after. What they establish is the ordering across versions, which
-is the only thing a regression check needs.
+v0.6.25 were each benched on the Pi 5 that evening and produced 13.9, 12.0, 11.9 and 11.7 ms. The newest
+is the fastest of the four. Those four are comparable with EACH OTHER and not with the tables below: they
+were taken in one sitting before the boards were reset. What they establish is the ordering across
+versions, which is the only thing a regression check needs.
 
 What changed is the boards. All three now have the **memory controller delegated** to the user slice,
 which they did not before: on the Pi 5 it had to be turned on with `cgroup_enable=memory` and a reboot,
 precisely because `--memory` was accepted and not enforced. Enforcing a cap costs what enforcing a cap
 costs. The old figures were taken on hardware that could not enforce one.
 
-Measured with `kern bench --rootfs <dir>` against a warm page cache and after 20 warm-up boxes, the
-command the README tells you to run:
+Measured with `kern bench --rootfs <dir>`, the command the README tells you to run, three repeats per
+cell against a warm page cache on an idle host, median of medians. Every kern row had `memory.max` read
+back as 268435456 from inside a box in the same session:
 
 | host | kernel | **kern** | bubblewrap | runc | docker |
 |---|---|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.2 ms** | 3.0 ms | 13.8 ms | 289.2 ms |
-| Raspberry Pi 5 | v6.6-rpi | **11.8 ms** | ✗ | ✗ | ✗ |
-| Jetson Orin Nano | v5.15-tegra | **13.1 ms** | 5.5 ms | 32 ms † | 472 ms † |
-| Arduino UNO Q | **v6.16 Android** | **93.2 ms** | 14.4 ms | 76 ms † | 858 ms † |
+| x86_64 desktop | v7.0 | **2.6 ms** | 3.0 ms | 13.8 ms † | 289.2 ms † |
+| Raspberry Pi 5 | v6.6-rpi | **11.9 ms** | ✗ | ✗ | ✗ |
+| Jetson Orin Nano | v5.15-tegra | **13.4 ms** | 5.6 ms | 32 ms † | 472 ms † |
+| Arduino UNO Q | **v6.16 Android** | **91.7 ms** | 15.0 ms | 76 ms † | 858 ms † |
 
-✗ = **not installed (nor readily installable) on that board.** † carried over from the earlier session:
-only kern and bubblewrap were re-measured on 2026-07-30.
+✗ = **not installed on that board**, checked one binary at a time: on the Pi 5, docker, podman, runc,
+crun, bwrap, nerdctl, lxc-start and systemd-nspawn are all absent. † carried over from an earlier
+session: only kern and bubblewrap were measured in this round.
 
-**On the two boards where both are installed, bubblewrap's number is now lower than kern's**, which the
-earlier table had the other way round. Said plainly, because it is the kind of thing a reader finds in a
-minute. But the two columns are not the same work, and the like-for-like measurement says the opposite.
+**On the two boards where both are installed, bubblewrap's number is lower than kern's.** Said plainly,
+because it is the kind of thing a reader finds in a minute. The two columns are not the same work, and
+the like-for-like measurement says the opposite.
 
 bubblewrap is a sandbox primitive: no images, no lifecycle, and **no resource caps at all**, so it never
 does cgroup work. kern's board figures include enforcing caps through a systemd transient scope, which is
-what those boards started charging for. Measured on the x86 desktop where every tool is installed and kern
-can use its direct cgroup path, 40 runs each after a warm-up:
+what those boards started charging for.
 
-| | ms per box | what it does at that price |
-|---|---:|---|
-| **kern**, memory cap ENFORCED | **2.6** | `memory.max` reads 268435456, verified in the same run |
-| kern, cgroup off | 2.8 | same isolation, no cap |
-| bubblewrap | 3.1 | no cap, and no way to ask for one (same series as the two rows above) |
+### The scope is the whole gap, and the arithmetic closes
 
-**kern enforcing a memory limit is faster than bubblewrap enforcing nothing.**
+Not an explanation offered, one measured. `systemd-run --user --scope /bin/true` was timed on its own,
+20 runs, beside kern's capped and uncapped box on the same host in the same session:
 
-The board gap is not the engine, and a third kernel settles it. Inside WSL2 there is no `systemd-run` at
-all, so the scope is not even possible, and a box there costs **4.2 ms with the cap enforced**
-(`memory.max` read back as 268435456 in the same run). Setting `KERN_NO_SCOPE=1` changes nothing there,
-5.1 ms, because the direct path was already the one in use.
+| host | kern, caps ON | kern, cgroup off | difference | `systemd-run --scope` alone |
+|---|---:|---:|---:|---:|
+| x86_64 desktop | 2.6 | 2.3 | 0.3 | 4.2 (**not paid**: direct path) |
+| Raspberry Pi 5 | 11.9 | 2.7 | 9.2 | 9.4 |
+| Jetson Orin Nano | 13.4 | 4.1 | 9.3 | 9.0 |
+| Arduino UNO Q | 91.7 | 33.5 | 58.2 | 59.9 |
 
-| where | ms per box | caps enforced | path |
-|---|---:|---|---|
-| x86_64 desktop | **2.6** | yes | direct |
-| WSL2 | **4.2** | yes | direct, no systemd present at all |
-| Raspberry Pi 5 | **17.1** | yes | systemd transient scope |
-| Raspberry Pi 5, cgroup off | 3.7 | **no** | none |
-| Jetson Orin Nano, cgroup off | 5.5 | **no** | none |
-| Arduino UNO Q, cgroup off, `--bind-rootfs` | 12.4 | **no** | none |
+On all three boards the difference and the standalone scope agree to within 1.7 ms. The x86 row is the
+control and it is the interesting one: the scope costs 4.2 ms there too, and kern does not pay it,
+because it caps directly in its own delegated slice for 0.3 ms instead.
 
-And against bubblewrap at the same level of work, which is the only comparison that means anything since
-bubblewrap has no caps to enforce:
+WSL2 is the third kernel that settles it: there is no `systemd-run` at all, so the scope is not even
+possible, and a box costs **4.2 ms with the cap enforced**. That figure is from the previous round and
+could not be re-taken (the Windows host was powered off), so it is quoted as such rather than folded in.
 
-| board | kern, cgroup off | bubblewrap | |
+### At the same level of work
+
+bubblewrap binds rather than overlays, so `--bind-rootfs` is the like-for-like flag: comparing kern's
+default overlay against it compares two mount strategies, not two runtimes.
+
+| board | kern, cgroup off, `--bind-rootfs` | bubblewrap | |
 |---|---:|---:|---|
-| Jetson Orin Nano | **5.5 ms** | 6.0 ms | kern |
-| Arduino UNO Q, `--bind-rootfs` | **12.4 ms** | 14.4 ms | kern |
-| x86_64 desktop, kern's caps ON | **2.6 ms** | 3.1 ms | kern, while doing more |
+| x86_64 desktop | **2.2 ms** | 3.0 ms | kern |
+| Raspberry Pi 5 | **2.3 ms** | not installed | |
+| Jetson Orin Nano | **3.5 ms** | 5.6 ms | kern |
+| Arduino UNO Q | **9.6 ms** | 15.0 ms | kern |
 
-`--bind-rootfs` matters on the Arduino and nowhere else: `KERN_TIMING=1` puts **22.4 ms** in the overlay
-mount alone on that Android kernel, against ~0.1 ms on x86. It takes that board from 93.2 ms to **65.4**
-with caps enforced, and to 12.4 with the cgroup off. Every board row above is the DEFAULT path, so the
-boards are compared with each other rather than each with its own best flag. bubblewrap binds rather than overlays, so
-comparing kern's default overlay to it there compares two different mount strategies, not two runtimes.
-With the same strategy kern is ahead.
+**kern is ahead of bubblewrap on every host where both are installed, at the same level of work.** And on
+x86, where kern reaches its direct cgroup path, kern *enforcing a memory limit* is 2.6 ms against
+bubblewrap's 3.0 enforcing nothing.
+
+`--bind-rootfs` is worth reaching for only on the Arduino: it takes that board from 91.7 ms to 69.2 with
+caps enforced and from 33.5 to 9.6 with the cgroup off, against a few tenths of a millisecond everywhere
+else. Every row in the first table is the DEFAULT path, so the boards are compared with each other rather
+than each with its own best flag.
 
 ### Why a headless board pays it, and what to do about it
 
@@ -275,13 +285,13 @@ kern's own instrumented phases sum to about **2 ms** (unshare + idmap 579 us, se
 problem either: `kern --version` takes **481 us** there, faster than `/bin/true` at 519.
 
 The rest is one thing. On that board a box goes through a **systemd transient scope**, and
-`systemd-run --user --scope /bin/true` on its own costs **13.7 ms**, against a full `kern box` at 14.3 ms.
+`systemd-run --user --scope /bin/true` on its own costs **9.4 ms**, against a full `kern box` at 11.9 ms.
 The scope is essentially the whole measurement.
 
-It is not overhead that can be dropped. Setting `KERN_NO_SCOPE=1` takes the box from 15.5 ms to 4.1 ms,
+It is not overhead that can be dropped. Setting `KERN_NO_SCOPE=1` takes the box from 11.9 ms to 2.7 ms,
 and in the same breath `--memory 256m` leaves `memory.max` at `max`, `--pids-limit 30` leaves `pids.max`
 at `max`, and a workload 3x over its RAM cap exits 0 instead of 137. On a host with no delegated slice to
-write to, **the scope is the enforcement**. The 13.7 ms buys a cap that actually bites, and trading a
+write to, **the scope is the enforcement**. The 9.4 ms buys a cap that actually bites, and trading a
 kernel boundary for milliseconds is the one trade this project will not make.
 
 That is also why these figures moved: the boards now have the memory controller delegated, so they now
