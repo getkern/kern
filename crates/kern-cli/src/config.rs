@@ -1,24 +1,22 @@
 //! `kern.toml` - the resource-centric config schema.
 //!
-//! The implemented sections mirror the private runtime's `kern.toml` model (same sections, same
-//! resource-centric shape). The CPU **field names are spelled to match the CLI flags 1:1** here
-//! (`cpus` = `--cpus` quota, `cpuset` = `--cpuset-cpus` pin, `cores` = host capacity, `nice`), a
-//! deliberate divergence from the private runtime's older `vcpus`/`priority` spelling; those legacy
-//! keys are REJECTED with a migration hint (not silently ignored) so a stale config can't apply a
-//! silently-wrong limit. It is parsed by kern's own dependency-free TOML reader (no `serde`/`toml`
+//! The CPU **field names are spelled to match the CLI flags 1:1** (`cpus` = `--cpus` quota,
+//! `cpuset` = `--cpuset-cpus` pin, `cores` = host capacity, `nice`): one spelling per concept, and it
+//! is the flag's. The older `vcpus`/`priority` spelling is REJECTED with a migration hint rather than
+//! silently ignored, so a stale config cannot apply a silently-wrong limit. It is parsed by kern's own dependency-free TOML reader (no `serde`/`toml`
 //! crates) - see [`parse`].
 //!
 //! The model is **resource-centric**, not box-centric: you *declare* the host resources you want
 //! kern to consider (`[[cpu]]`, `[[gpio]]`, `[[disk]]`) and *define* named virtual profiles that
 //! carve them up (`[[vcpu]]`, `[[vgpio]]`, `[[vdisk]]`). A profile is then attached to a command by
-//! its prefix - `kern run vcpu:heavy vgpio:leds -- cmd` - exactly as in the private runtime.
+//! its prefix: `kern run vcpu:heavy vgpio:leds -- cmd`.
 //!
 //! kern-public models **CPU, GPIO and disk** resources only; there is no GPU concept here. The
 //! parser is deliberately **tolerant**: a `kern.toml` shared with another kern edition may carry
 //! sections or keys this build doesn't implement (or TOML syntax this hand-rolled reader doesn't
 //! model), and those are ignored rather than rejected, so the config still loads.
 
-/// Top-level `kern.toml`. Section names are identical to the private runtime.
+/// Top-level `kern.toml`.
 #[derive(Debug, Clone, Default)]
 pub struct KernConfig {
     /// `[kern]` - global settings.
@@ -124,7 +122,7 @@ pub struct UsbPortEntry {
     pub reserved: Option<String>,
 }
 
-/// `[[vgpio]]` - a virtual GPIO / I/O peripheral profile. Field names identical to the private.
+/// `[[vgpio]]` - a virtual GPIO / I/O peripheral profile.
 #[derive(Debug, Clone, Default)]
 pub struct VGpioEntry {
     pub name: String,
@@ -197,7 +195,7 @@ pub struct DiskEntry {
     pub model: Option<String>,
 }
 
-/// `[[vdisk]]` - a virtual disk profile: size quota + optional I/O limits. Identical to the private.
+/// `[[vdisk]]` - a virtual disk profile: size quota + optional I/O limits.
 #[derive(Debug, Clone, Default)]
 pub struct VDiskEntry {
     pub name: String,
@@ -233,7 +231,7 @@ enum Ctx {
     Disk,
     Vdisk,
     /// A section kern-public recognizes in the schema but does not implement - its keys are ignored
-    /// so an existing `kern.toml` (e.g. one that also targets the private runtime) still loads. No
+    /// so an existing `kern.toml` (e.g. one shared with another kern edition) still loads. No
     /// output mentions it.
     Skip,
 }
@@ -608,7 +606,7 @@ fn value_u32_array(v: &str) -> Result<Vec<u32>, String> {
 // ─────────────────────────────── load + resolve ───────────────────────────────
 
 /// Default config location: `$XDG_CONFIG_HOME/kern/kern.toml`, else `~/.config/kern/kern.toml`.
-/// Mirrors the private runtime's path.
+/// The conventional XDG location.
 pub fn default_path() -> Option<std::path::PathBuf> {
     // An empty `XDG_CONFIG_HOME` (exported but blank) must be treated as unset - otherwise it forms a
     // *relative* `kern/kern.toml` and the config lands in the current directory.
@@ -777,7 +775,7 @@ fn resolve_vcpu_seen(
 }
 
 /// A resolved `[[vgpio]]` profile: the concrete host device nodes and sysfs directories the box
-/// should expose. Faithful to the private runtime's `discover_iot_devices`.
+/// should expose.
 #[derive(Debug, Default, PartialEq)]
 pub struct ResolvedVgpio {
     pub name: String,
@@ -789,7 +787,7 @@ pub struct ResolvedVgpio {
     pub pins: Vec<u32>,
 }
 
-/// Resolve a `[[vgpio]]` entry to the concrete host paths that exist right now. Mirrors the private:
+/// Resolve a `[[vgpio]]` entry to the concrete host paths that exist right now. The rule:
 /// `pins` → every `/dev/gpiochipN` (the chip exposes all its lines; per-pin isolation is metadata);
 /// `pwm`/`adc`/`onewire`/`leds` → their sysfs dirs; the string fields (`i2c`/`spi`/`uart`/`can`/
 /// `camera`/`audio`/…) are `/dev/*` paths, **canonicalized and re-checked to stay under `/dev/`** so
@@ -809,7 +807,7 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
     let mut devs = Vec::new();
     let mut sysfs = Vec::new();
 
-    // pins → every gpiochip node (single readdir). HONEST LIMITATION (matches the private runtime):
+    // pins → every gpiochip node (single readdir). HONEST LIMITATION:
     // GPIO isolation is *chip-granular*, not per-line - a `/dev/gpiochipN` chardev exposes ALL lines
     // of that controller via ioctl, and requesting any pin binds every gpiochip present. The per-pin
     // list is cooperative metadata (surfaced as `KERN_VGPIO_PINS`), not a kernel boundary. Documented
@@ -1157,7 +1155,7 @@ fn is_recognized_dev(real: &std::path::Path) -> bool {
 }
 
 /// The `/dev/*`-path fields of a vGPIO profile (everything except pins/pwm/adc/onewire/leds/net,
-/// which map to gpiochips or sysfs). Matches the private's `device_paths()`. An `i2c` entry may be a
+/// which map to gpiochips or sysfs). An `i2c` entry may be a
 /// bare bus number (`"1"`) or `"i2c-1"` - both normalise to `/dev/i2c-1` - or a full `/dev/…` path;
 /// the other buses are taken as `/dev/*` paths verbatim.
 fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
@@ -1197,7 +1195,7 @@ fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
 /// A resolved `[[vdisk]]` profile: a size-capped volume the box mounts at `/vdisk/<name>`. The
 /// `size` cap is enforced rootless by a `tmpfs size=` mount (RAM-backed, ephemeral); when kern runs
 /// privileged with loop devices available it is upgraded to an ext4-on-loop image (disk-backed,
-/// `persistent`, `iops`/`bandwidth`-limited) - mirroring the private runtime.
+/// `persistent`, `iops`/`bandwidth`-limited).
 #[derive(Debug, Default, PartialEq)]
 pub struct ResolvedVdisk {
     pub name: String,
@@ -2101,7 +2099,7 @@ mod tests {
 
     #[test]
     fn unimplemented_sections_load_leniently() {
-        // A shared kern.toml that also targets the private runtime (with a [[vgpu]] section) still
+        // A shared kern.toml carrying sections this edition does not model (a [[vgpu]] section) still
         // parses - the unimplemented section and its keys are ignored, not errored, so the file's
         // implemented profiles (e.g. [[vcpu]]) load normally. Nothing about it is surfaced.
         let c = parse(
@@ -2119,7 +2117,7 @@ mod tests {
         assert!(parse("[[vcpu]]\nname = \"x\"\nbogus = 1").is_ok());
         assert!(parse("[nope]\nx = 1").is_ok());
         assert!(parse("x = 1").is_ok());
-        // A multi-line array of inline tables (how the private writes usb_ports) - skipped, not fatal.
+        // A multi-line array of inline tables (as `kern config setup` writes usb_ports) - skipped, not fatal.
         assert!(
             parse("[[gpio]]\nusb_ports = [\n  {bus=1, port=9},\n]\n[[vcpu]]\nname=\"y\"").is_ok()
         );

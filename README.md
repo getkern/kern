@@ -168,7 +168,7 @@ deny-by-default. GPU slices are on the [Roadmap](#roadmap).
 | **Devices** | `vgpio:` | *Only* the named GPIO/I²C/SPI/LED nodes, nothing else | fresh `/dev` + fd-pinned bind + capability deny-list (raw-mem/disk/kvm refused) |
 | **PIDs** | `--pids-limit` | Fork-bomb ceiling | cgroup `pids.max`, hard |
 | **Block I/O** | `--io-weight` | I/O bandwidth weight | cgroup `io` |
-| **GPU** | *(roadmap)* | A *slice* of a GPU (VRAM cap, then time-slice) | 🚧 cooperative governor, first-party / noisy-neighbour, **not** a hard boundary |
+| **GPU** | *(roadmap)* | Not shipped | see [Roadmap](#roadmap) |
 
 ¹ Where the `memory` controller is not delegated to a non-root user's scope, kern warns and shows the one-line
 `.wslconfig` fix; enforced natively on Linux. Profiles (`vcpu:`/`vdisk:`/`vgpio:`) are reusable presets in
@@ -177,23 +177,35 @@ host resources you can slice), `kern examples` (print a sample `kern.toml`), and
 
 ### Profiles
 
-Declare a slice once in a `kern.toml` and attach it by name, instead of repeating flags:
+Name a slice once, attach it by name, and stop repeating flags. Profiles live in
+`~/.config/kern/kern.toml`, so nothing has to be passed on the command line:
+
+```sh
+kern config add vcpu:slim --cpus 0.5 --memory 256m       # or edit the file by hand
+kern box app --image alpine vcpu:slim -- ./app           # no flag: the profile is just there
+kern run vcpu:slim -- ./train.sh                         # the same slice, no sandbox
+```
+
+What that wrote, and what a hand-written one looks like:
 
 ```toml
 [[vcpu]]
 name    = "slim"
-backend = "host"     # the host resource this profile slices (required)
+backend = "host"     # the host resource being sliced: "host" is the whole CPU, so no [[cpu]] block
 cpus    = 0.5
 memory  = "256 MB"
+
+[[vgpio]]
+name    = "sensor"   # the interesting one: exactly one device node, everything else denied
+backend = "host"
+i2c     = ["/dev/i2c-1"]
 ```
 
-```sh
-kern box app --config kern.toml vcpu:slim -- ./app
-```
-
-Profile tokens go BEFORE the `--`: `vcpu:` · `vdisk:` · `vgpio:`. The full schema, every field, the
-7-layer precedence and `extends` are in **[docs/CONFIG.md](docs/CONFIG.md)**; a runnable walk-through
-is [resource-profiles.sh](examples/resource-profiles.sh).
+Profile tokens go BEFORE the `--`: `vcpu:` · `vdisk:` · `vgpio:`. Use `--config ./kern.toml` only to
+point at a per-project file instead of the default, or export `KERN_CONFIG` to make that the file every
+command reads and writes. The full schema, every field, the 7-layer precedence and `extends` are in
+**[docs/CONFIG.md](docs/CONFIG.md)**; a runnable walk-through is
+[resource-profiles.sh](examples/resource-profiles.sh).
 
 ## What you can do in one line
 
@@ -745,8 +757,8 @@ driven by what proves useful. These are directions under consideration, **not co
 and some may never ship if they would change what kern is. Recently shipped work is under
 [Project status](#project-status), not here.
 
-- **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped: when it
-  lands it will be a separate, free, closed-source component, and `--no-gpu` stays the default.
+- **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped, and this
+  README will describe it when it is, not before. `--no-gpu` is and stays the default.
 - **More governed resources.** The same profile model could extend to other cgroup or kernel-real
   resources (I/O bandwidth, network shaping) as they prove useful.
 - **Snapshot / warm-start (CRIU).** Same-host checkpoint and restore of a *warm* box for subsecond

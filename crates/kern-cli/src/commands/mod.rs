@@ -1248,6 +1248,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             ports: ports_summary(ports),
             volumes: mounted_vols.clone(),
             pod: args.pod.unwrap_or("").to_string(),
+            workdir: spec.workdir.clone().unwrap_or_default(),
             egress: args.egress_allow.join(","),
             landlock_rw: spec.landlock_rw.join(","),
             labels: args.labels.join(","),
@@ -1579,7 +1580,7 @@ pub fn run(
         ));
     }
     // `run` has no sandbox, so a `vgpio:` profile can't confine devices - instead export it as env
-    // (`KERN_VGPIO_NAME`/`_PINS`), like the private, so a cooperative workload can find its pins. To
+    // (`KERN_VGPIO_NAME`/`_PINS`), so a cooperative workload can find its pins. To
     // actually *isolate* the peripherals, use `kern box vgpio:NAME …`.
     if !vgpio.is_empty() {
         let names: Vec<&str> = vgpio.iter().map(|v| v.name.as_str()).collect();
@@ -2484,11 +2485,16 @@ pub fn exec(
     // scope-path host the exec can't join the box's cgroup, and a default box would otherwise warn
     // on every `kern exec`. `None` caps → the user asked for nothing to enforce → stay quiet.
     let box_has_explicit_caps = inst.memory_max.is_some() || inst.pids_max.is_some();
+    // With no `-w`, start where the WORKLOAD starts, not at `/`. Docker's `exec` inherits the
+    // container's WorkingDir and people lean on it: a compose service with `working_dir: /app` should
+    // not need `-w /app` retyped on every exec. An explicit `-w` still wins, and a box with no workdir
+    // (or an older registry entry, which carries no such field) keeps landing at `/`.
+    let effective_workdir = workdir.or(Some(inst.workdir.as_str()).filter(|w| !w.is_empty()));
     let result = exec_in_box(
         pid1,
         &cmd,
         &env,
-        workdir,
+        effective_workdir,
         pty.as_ref().map(|p| p.slave),
         pty.as_ref().map(|p| p.master),
         None, // `kern exec` has no timeout
@@ -3384,6 +3390,7 @@ fn run_detached(
         ports: ports_summary(ports),
         volumes: volumes.to_string(),
         pod: pod.to_string(),
+        workdir: spec.workdir.clone().unwrap_or_default(),
         egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
         landlock_rw: spec.landlock_rw.join(","),
         labels: labels.to_string(),
@@ -12490,6 +12497,7 @@ mod net_resource_tests {
             ports: String::new(),
             volumes: String::new(),
             pod: pod.to_string(),
+            workdir: String::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
@@ -13914,6 +13922,7 @@ mod label_filter_tests {
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),
+            workdir: String::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
@@ -14025,6 +14034,7 @@ mod drift_tests {
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),
+            workdir: String::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,

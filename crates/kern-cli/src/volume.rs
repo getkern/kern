@@ -185,7 +185,7 @@ fn parse_network_url(url: &str) -> Option<(NetScheme, &str, &str)> {
 
 /// Reject control chars, whitespace and shell metacharacters in the host/path - these strings become
 /// subprocess arguments (`sshfs`/`mount.nfs` via argv, no shell, but stay strict as defense-in-depth
-/// and to keep a hostile URL out of a GVFS scan). Mirrors the private runtime.
+/// and to keep a hostile URL out of a GVFS scan).
 fn validate_net(host: &str, path: &str) -> Result<(), Error> {
     for (label, val) in [("host", host), ("path", path)] {
         if val.is_empty() {

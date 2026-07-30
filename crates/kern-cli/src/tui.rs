@@ -1881,7 +1881,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
     (rows, seen)
 }
 
-/// A snapshot of host-wide resource use, shown in the Overview tab (like the private's `kern top`).
+/// A snapshot of host-wide resource use, shown in the Overview tab.
 #[derive(Default)]
 struct HostStats {
     mem_used: u64,
@@ -2757,7 +2757,7 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     let mut s = String::from("\n");
     let row = |k: &str, v: String| format!("  {b}{:<16}{z}{v}\n", k);
 
-    // Host - the machine kern is running on (like the private's top).
+    // Host - the machine kern is running on.
     let mem_pct = host.mem_pct();
     s.push_str(&format!("  {b}HOST{z}\n"));
     s.push_str(&row(

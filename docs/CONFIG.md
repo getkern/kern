@@ -32,9 +32,9 @@ directory).
 ## Resource profiles
 
 Profiles are **resource-centric**: you declare a named slice once, then attach it to as many boxes as
-you like by its prefix. This mirrors the private runtime's model (declare-then-carve, attach-by-prefix);
-the CPU field names are spelled to match the CLI flags here, see the divergence note at the end. The
-GPU family stays private, see [Roadmap](../README.md#roadmap).
+you like by its prefix (declare-then-carve, attach-by-prefix). The CPU field names are spelled to match
+the CLI flags, see the divergence note at the end. A GPU family is on the
+[Roadmap](../README.md#roadmap), not in this schema.
 
 > **Editing by hand? Three rules cover everything:**
 >
@@ -302,19 +302,19 @@ Every key maps to a flag one-to-one, nothing to learn twice. If you know the fla
   edition still loads, so config is portable across editions. The trade-off is deliberate: a typo in a
   key name is silently skipped, so lean on `kern config` / `kern top` (which validate live) when authoring.
 
-## Deliberate divergences from the private runtime
+## Deliberate choices in this schema
 
-- **Profiles are resource-centric and identical in shape** to the private (`[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]`
-  attached by prefix), a profile file is portable between the two. Compose is the box-centric surface
-  (`[box.NAME]`), a public addition.
-- **CPU field names match the CLI everywhere**: `cpus` = quota, `cpuset` = pinning in both the flat
-  compose keys AND the `[[vcpu]]` profile. This aligns the public schema with the flags 1:1, diverging
-  from the private runtime's older `vcpus` = quota / `cpus` = pinning spelling. Chosen on purpose.
+- **Two surfaces, one philosophy.** Profiles are resource-centric (`[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]`,
+  attached by prefix) and compose is box-centric (`[box.NAME]`). They read differently because they
+  answer different questions: "what slice" and "what stack".
+- **CPU field names match the CLI everywhere**: `cpus` = quota, `cpuset` = pinning, in the flat compose
+  keys AND the `[[vcpu]]` profile. One spelling per concept, and it is the flag's. Know the flag, know
+  the field, in both files.
 - **No `seccomp = "off"` / `no_seccomp` / `no_cgroup` key**: the seccomp filter and the cgroup caps
   are always on and cannot be disabled from config (hardening over blind parity, by design).
-- **Not public:** the `[[vgpu]]` / `[[gpu]]` family (VRAM/compute/GPU slices), and the `intelligence`
-  / `pool` sections, are on the [roadmap](../README.md#roadmap), not in the schema yet. A config that
-  declares them still loads (the keys are ignored) so it stays portable.
+- **Keys this edition does not model** (a `[[vgpu]]` / `[[gpu]]` family among them) are **ignored,
+  not rejected**, so a `kern.toml` shared with another kern edition still loads here. What is on the
+  roadmap is listed in the [README](../README.md#roadmap); what is in the schema is this document.
 
 ## Fleet limits (environment)
 

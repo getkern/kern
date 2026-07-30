@@ -55,5 +55,5 @@ Do **not** open a public issue, see `SECURITY.md`.
 
 ## Scope reminder
 
-The GPU VRAM cap is cooperative by design; don't file "the cap is bypassable" as a security
-bug (it's documented, out of scope). See `SECURITY.md`.
+GPU limits are not shipped, so a report about their strength has nothing to land on yet. See
+`SECURITY.md` for what is and is not a boundary today.

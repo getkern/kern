@@ -226,6 +226,37 @@ pub struct Volume {
 /// A [`MountOps`] that performs the real Linux mount syscalls.
 pub struct RealMounts;
 
+/// `mkdir -p` for a path INSIDE the box: walk the separators and `mkdir` each prefix, ignoring an
+/// already-exists. libc and a stack buffer, no heap and no panic, because this runs in the child
+/// between `fork` and `exec` where an allocation is a hazard.
+///
+/// Best-effort ON PURPOSE. It reports nothing: the caller's `chdir` is the check that decides, and it
+/// names the real reason (a read-only root, a permission denial, a component that is a file). Bounded
+/// by `PATH_MAX`; a longer path is left untouched so the `chdir` fails and says so, rather than a
+/// truncated `mkdir` silently creating a directory nobody asked for.
+fn mkdir_p(path: &str) {
+    const MAX: usize = 4096;
+    let b = path.as_bytes();
+    if b.is_empty() || b.len() >= MAX {
+        return;
+    }
+    let mut buf = [0u8; MAX];
+    buf[..b.len()].copy_from_slice(b);
+    // Each separator terminates a parent that has to exist first; index 0 is skipped so a leading
+    // `/` is not mistaken for an empty path.
+    for i in 1..b.len() {
+        if b[i] == b'/' {
+            buf[i] = 0;
+            // SAFETY: `buf` is NUL-terminated at `i` and outlives the call; `mkdir` only reads it.
+            unsafe { libc::mkdir(buf.as_ptr().cast(), 0o755) };
+            buf[i] = b'/';
+        }
+    }
+    buf[b.len()] = 0;
+    // SAFETY: same as above, terminated at `b.len()`, which the length guard keeps in bounds.
+    unsafe { libc::mkdir(buf.as_ptr().cast(), 0o755) };
+}
+
 fn cstr(s: &str) -> Result<CString, Error> {
     CString::new(s).map_err(|_| {
         Error::Syscall(
@@ -772,9 +803,26 @@ fn child_setup_and_exec(
     // then layer the user's `--env` on top.
     set_clean_env(&spec.hostname, &spec.env);
 
-    // Honor `--workdir`: chdir into it (must exist inside the box). Fatal if it can't be entered.
+    // Honor `--workdir`: chdir into it, CREATING it first if the image does not have it.
+    //
+    // Docker does the same, and the compose idiom depends on it: `working_dir: /app` with the code
+    // bind-mounted there is the standard shape, and plenty of images (python:alpine among them) ship
+    // no `/app`. Refusing was a real compatibility gap, found by bringing up a three-service stack
+    // where the second service died on `chdir(workdir) failed: No such file or directory`.
+    //
+    // Created inside the box's own rootfs, after the pivot, so this cannot touch a host path. Mode
+    // 0755 matches Docker's. A creation failure is NOT fatal on its own: a read-only root legitimately
+    // refuses it, and the chdir below is the check that decides - it reports the real reason either way.
     if let Some(wd) = &spec.workdir {
         let c = cstr(wd)?;
+        // Create it only for an ABSOLUTE path, as Docker requires ("it needs to be an absolute
+        // path"). Without this guard the creation above turns a typo into a silent success: `-w app`
+        // instead of `-w /app` used to fail, and would now quietly mkdir `app` relative to the box's
+        // root and run there. A relative workdir still reaches `chdir` and fails there if it does not
+        // exist, so the behaviour for an existing relative path is unchanged.
+        if wd.starts_with('/') && unsafe { libc::access(c.as_ptr(), libc::F_OK) } != 0 {
+            mkdir_p(wd);
+        }
         if unsafe { libc::chdir(c.as_ptr()) } != 0 {
             return Err(Error::last("chdir(workdir)"));
         }

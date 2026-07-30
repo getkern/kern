@@ -1,5 +1,5 @@
 //! Host-side ext4-on-loop backend for `vdisk:` profiles (the privileged upgrade over the rootless
-//! `tmpfs` fallback). Faithful to the private runtime: a sparse ext4 image on a loop device gives a
+//! `tmpfs` fallback). A sparse ext4 image on a loop device gives a
 //! real **disk-backed** size quota, `persistent` storage, and (best-effort) I/O limits - none of
 //! which a RAM-backed tmpfs can do.
 //!
@@ -203,7 +203,7 @@ pub fn prepare(
     // Needs CAP_SYS_ADMIN - the step that fails on a non-root host → tmpfs fallback.
     let _ = std::fs::create_dir_all(&mount);
     // `nosuid`+`nodev`: a persistent/writable disk must not honour a device node or setuid binary
-    // planted on it (parity with the private runtime). `noatime` for a small perf edge.
+    // planted on it. `noatime` for a small perf edge.
     let flags = (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME) as libc::c_ulong;
     let mounted = match (
         cstr(&loop_dev),

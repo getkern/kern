@@ -36,6 +36,11 @@ pub struct Instance {
     /// The **pod** (`--pod <name>`, e.g. a compose stack) this box belongs to - the grouping key for
     /// `kern ps`'s tree view and `kern stop <pod>`. Empty for a standalone box; absent in older entries.
     pub pod: String,
+    /// The box's `--workdir`, so `kern exec` can start where the workload started instead of at `/`.
+    /// Docker's `exec` inherits the container's WorkingDir and people rely on it: a compose service
+    /// with `working_dir: /app` should not need `-w /app` typed again on every exec. Empty when the
+    /// box has none; absent in older entries.
+    pub workdir: String,
     /// The `--egress-allow` domain allowlist (comma-joined) governing this box's outbound traffic;
     /// empty when the box is fully isolated or shares the host network. Absent in older entries.
     pub egress: String,
@@ -432,7 +437,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -451,6 +456,7 @@ fn encode(inst: &Instance) -> String {
         inst.stop_signal,
         inst.stop_grace,
         one_line(&inst.def_hash),
+        one_line(&inst.workdir),
     )
 }
 
@@ -697,6 +703,9 @@ pub fn find_ref(x: &str) -> Option<Instance> {
     if let Some(inst) = find(x) {
         return Some(inst); // a live box named `x` - name wins
     }
+    if let Some(inst) = find_service(x) {
+        return Some(inst); // the SERVICE name `kern ps` prints inside a pod
+    }
     let pid: i32 = x.parse().ok().filter(|&p| p > 0)?; // else it can't be a pid
     let d = dir().ok()?;
     for e in fs::read_dir(&d).ok()?.flatten() {
@@ -709,6 +718,56 @@ pub fn find_ref(x: &str) -> Option<Instance> {
         }
     }
     None
+}
+
+/// Resolve the SHORT service name a pod box is displayed under. A compose box is named
+/// `<pod>-<token>-<service>`, and `kern ps` renders it in the pod's tree as just `<service>` - so the
+/// name a person reads was not a name any verb accepted: `kern exec api` answered "no running box
+/// named 'api'" while the box was right there on screen. `docker compose exec api` works, and the
+/// display had already promised the short form.
+///
+/// Matched on the compose naming SHAPE, `<stack>-<token>-<service>` with a hex token, not on a bare
+/// trailing `-<service>`: a standalone box called `my-api` must not answer to `api`, which is exactly
+/// the guess this is meant to avoid. The `pod` field cannot be the test, because a single-service
+/// stack creates no pod (nothing to share a netns with) yet still carries the prefixed name.
+///
+/// Only when the match is UNAMBIGUOUS: two stacks each running an `api` resolve to neither, because
+/// picking one is worse than saying so. The exact-name and pid branches in [`find_ref`] run first, so
+/// a box literally named `api` still wins over this.
+fn find_service(service: &str) -> Option<Instance> {
+    if service.is_empty() {
+        return None;
+    }
+    let suffix = format!("-{service}");
+    let d = dir().ok()?;
+    let mut hit: Option<Instance> = None;
+    for e in fs::read_dir(&d).ok()?.flatten() {
+        if entry_name(&e.file_name()).is_none() {
+            continue;
+        }
+        match load_live(&e.path()) {
+            Some(inst) if is_compose_service(&inst.name, &suffix) => {
+                if hit.is_some() {
+                    return None; // ambiguous across stacks: refuse rather than pick
+                }
+                hit = Some(inst);
+            }
+            _ => {}
+        }
+    }
+    hit
+}
+
+/// Does `name` have the compose shape `<stack>-<token>-<service>`, for this `-<service>` suffix, with
+/// `<token>` a hex hash? The token is what separates a generated stack box from a hand-named one.
+fn is_compose_service(name: &str, suffix: &str) -> bool {
+    let Some(prefix) = name.strip_suffix(suffix) else {
+        return false;
+    };
+    let Some((stack, token)) = prefix.rsplit_once('-') else {
+        return false;
+    };
+    !stack.is_empty() && token.len() >= 8 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The claims directory - one `<name>` file per IN-FLIGHT box start (see [`claim_name`]).
@@ -979,6 +1038,7 @@ fn parse(body: &str) -> Option<Instance> {
     let mut labels = String::new();
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
     let mut def_hash = String::new();
+    let mut workdir = String::new();
     for line in body.lines() {
         // Skip a malformed line (e.g. a half-written record from a crash mid-write) rather than `?`-ing
         // out, which would evaporate the WHOLE entry and silently drop a live box from the registry.
@@ -1005,6 +1065,7 @@ fn parse(body: &str) -> Option<Instance> {
             "stopsig" => stop_signal = v.parse().unwrap_or(0),
             "stopgrace" => stop_grace = v.parse().unwrap_or(0),
             "defhash" => def_hash = v.to_string(),
+            "workdir" => workdir = v.to_string(),
             _ => {}
         }
     }
@@ -1019,6 +1080,7 @@ fn parse(body: &str) -> Option<Instance> {
         ports,
         volumes,
         pod,
+        workdir,
         egress,
         landlock_rw,
         labels,
@@ -1062,6 +1124,79 @@ mod tests {
         assert_eq!(rewrite_caps(body, None, None), body);
     }
 
+    /// The short-name rule must recognise the compose SHAPE and nothing else. A hand-named box that
+    /// merely ends the same way (`my-api`) must not answer to `api`, or `kern exec api` would act on a
+    /// box the user never referred to. The `pod` field cannot be the test: a single-service stack
+    /// creates no pod yet still carries the generated `<stack>-<token>-<service>` name.
+    #[test]
+    fn only_the_compose_name_shape_answers_to_a_short_service_name() {
+        for good in [
+            "dbg-d019a3a0-api",
+            "kern-webstack2-c3598f51-api",
+            "a-0123456789abcdef-api",
+        ] {
+            assert!(is_compose_service(good, "-api"), "{good} should match");
+        }
+        for bad in [
+            "my-api",             // hand-named, no token
+            "api",                // the bare name; the exact-name branch owns this
+            "stack-zzzzzzzz-api", // token is not hex
+            "stack-abc-api",      // token too short to be a hash
+            "-d019a3a0-api",      // empty stack
+            "dbg-d019a3a0-apix",  // different service
+            "dbg-d019a3a0-web",   // different service
+        ] {
+            assert!(!is_compose_service(bad, "-api"), "{bad} should NOT match");
+        }
+    }
+
+    /// The `workdir` field is what lets `kern exec` start where the workload started instead of at
+    /// `/`. Two things must hold: it survives a round trip, and an entry written by an OLDER kern -
+    /// which has no `workdir=` line at all - still loads, with an empty workdir rather than vanishing
+    /// from the registry. A schema addition that drops live boxes on upgrade is worse than the gap it
+    /// closes.
+    #[test]
+    fn workdir_roundtrips_and_an_entry_written_without_it_still_loads() {
+        let inst = Instance {
+            name: "wd".into(),
+            pid: 11,
+            pid1: 12,
+            rootfs: "/r".into(),
+            command: "sleep 1".into(),
+            started: 1,
+            starttime: 2,
+            ports: String::new(),
+            volumes: String::new(),
+            pod: "stack".into(),
+            workdir: "/app".into(),
+            egress: String::new(),
+            landlock_rw: String::new(),
+            memory_max: None,
+            pids_max: None,
+            labels: String::new(),
+            stop_signal: 0,
+            stop_grace: 0,
+            def_hash: String::new(),
+        };
+        let wire = encode(&inst);
+        assert!(wire.contains("workdir=/app\n"), "encoded: {wire}");
+        assert_eq!(parse(&wire).expect("round trip").workdir, "/app");
+
+        // A pre-0.6.25 entry: every other key present, no `workdir=` line.
+        let older: String = wire
+            .lines()
+            .filter(|l| !l.starts_with("workdir="))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let got = parse(&older).expect("an older entry must still load");
+        assert_eq!(got.name, "wd", "the entry survived");
+        assert_eq!(got.pod, "stack", "its other fields survived");
+        assert_eq!(
+            got.workdir, "",
+            "a missing workdir reads as none, not as garbage"
+        );
+    }
+
     #[test]
     fn encode_parse_roundtrips_0_6_7_fields() {
         let inst = Instance {
@@ -1075,6 +1210,7 @@ mod tests {
             ports: String::new(),
             volumes: String::new(),
             pod: "stack".into(),
+            workdir: String::new(),
             egress: "pypi.org,files.pythonhosted.org".into(),
             landlock_rw: "/tmp,/data".into(),
             memory_max: Some(134_217_728),
@@ -1211,6 +1347,7 @@ mod tests {
                 ports: String::new(),
                 volumes: String::new(),
                 pod: String::new(),
+                workdir: String::new(),
                 egress: String::new(),
                 landlock_rw: String::new(),
                 memory_max: None,
@@ -1261,6 +1398,7 @@ mod tests {
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),
+            workdir: String::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,

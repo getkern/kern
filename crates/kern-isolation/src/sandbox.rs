@@ -165,7 +165,7 @@ pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
 /// # Advisory on the public runtime
 /// The public `kern box` installs its hardened **denylist** filter
 /// unconditionally (it cannot be turned off from the SDK). This enum is kept so
-/// embeddings share one API shape with the private runtime and so the intent is
+/// an embedding's intent stays explicit in caller code, and so the shape is
 /// explicit in caller code, but on the public runtime:
 /// - [`Self::DenylistHardened`] is what actually runs (the default).
 /// - [`Self::DenylistHardenedStrict`] and [`Self::Disabled`] are **not honored**

@@ -1,6 +1,6 @@
 //! Surgical, line-based edits to a `kern.toml` - used by the `kern top` **Profiles** tab so editing a
 //! single profile can't destroy the rest of the file. kern's parser is deliberately *tolerant* (it
-//! ignores sections/keys it doesn't model, so a config shared with the private runtime still loads);
+//! ignores sections/keys it doesn't model, so a config shared with another kern edition still loads);
 //! that means a naive "parse → re-serialize" would silently drop every unknown section on save. These
 //! helpers instead splice *only the one array-of-tables block* being edited and leave every other
 //! byte - comments, blank lines, unknown `[gpu]`/`[intelligence]` sections - exactly as it was.

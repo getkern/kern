@@ -19,11 +19,10 @@ acknowledgement and a coordinated-disclosure timeline.
 - seccomp must block the dangerous syscall set unconditionally.
 
 **Explicitly OUT of scope (cooperative, by design, not a boundary):**
-- **The GPU VRAM cap (0.9+) is cooperative.** It governs honest workloads via the public
-  driver API; an adversarial app bypasses it (absolute-path `dlopen`, static link, raw
-  ioctls). On consumer NVIDIA there is no userspace hard cap; a kernel-enforced cap exists
-  only on AMD/Intel via the `dmem` cgroup controller. Do not treat the GPU cap as a security
-  boundary or a multi-tenant billing mechanism on consumer NVIDIA.
+- **GPU limits are not shipped**, so there is nothing here to trust or to attack yet. When they
+  land, expect them to be a cooperative governor for honest workloads rather than a boundary, and
+  expect this file to say so precisely, with the bypasses named. Until then `--no-gpu` is the
+  default and the answer to "how strong is the GPU cap" is "there isn't one".
 
 **A caveat we state plainly, an unprivileged user namespace is itself kernel attack surface.**
 kern's isolation is *built on* an unprivileged user namespace, and userns has historically been a
