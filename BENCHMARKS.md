@@ -59,7 +59,7 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 |---|---:|---|
 | **kern** `box --rootfs` | **2.2 ms** | overlay + self-pivot + seccomp |
 | **kern** `box --image` | **3.3 ms** | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
-| bubblewrap | 2.9 ms | a sandbox *primitive*, no images, caps, or lifecycle |
+| bubblewrap | 3.0 ms | a sandbox *primitive*, no images, caps, or lifecycle |
 | crun | 5.2 ms (June; not installed on the machine re-measured here) | OCI runtime (C): bundle + cgroup setup |
 | runc (rootless) | 13.8 ms | OCI runtime (Go): bundle + cgroup (high run-to-run variance) |
 | podman (rootless) | 287.5 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
@@ -152,7 +152,7 @@ command the README tells you to run:
 
 | host | kernel | **kern** | bubblewrap | runc | docker |
 |---|---|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.2 ms** | 2.9 ms | 13.8 ms | 289.2 ms |
+| x86_64 desktop | v7.0 | **2.2 ms** | 3.0 ms | 13.8 ms | 289.2 ms |
 | Raspberry Pi 5 | v6.6-rpi | **11.8 ms** | ✗ | ✗ | ✗ |
 | Jetson Orin Nano | v5.15-tegra | **13.1 ms** | 5.5 ms | 32 ms † | 472 ms † |
 | Arduino UNO Q | **v6.16 Android** | **93.2 ms** | 14.4 ms | 76 ms † | 858 ms † |
@@ -173,7 +173,7 @@ can use its direct cgroup path, 40 runs each after a warm-up:
 |---|---:|---|
 | **kern**, memory cap ENFORCED | **2.6** | `memory.max` reads 268435456, verified in the same run |
 | kern, cgroup off | 2.8 | same isolation, no cap |
-| bubblewrap | 3.1 | no cap, and no way to ask for one |
+| bubblewrap | 3.1 | no cap, and no way to ask for one (same series as the two rows above) |
 
 **kern enforcing a memory limit is faster than bubblewrap enforcing nothing.**
 
@@ -272,6 +272,60 @@ pay for enforcement they previously could not perform.
 
 `KERN_NO_SCOPE=1` remains available for callers that want the speed and accept best-effort caps, and
 since this release it **says so** rather than accepting a cap it will not enforce.
+
+## Windows: where the milliseconds go
+
+Every figure above is a Linux host. On Windows kern runs inside its own WSL2 distro, and a command
+typed on the Windows side crosses the VM boundary by spawning `wsl.exe` **once per command**. That
+crossing is not kern's work and it dwarfs kern's work, so the honest reading is that Windows has two
+different performance stories depending on where you type.
+
+Two Windows 11 hosts, because one of them cannot measure the row that matters most. 20 boxes of the same
+cached image per sample, `kern box --image alpine` against a warm cache:
+
+| where you type | ms per box | processes added per command | host |
+|---|---:|---|---|
+| inside the distro (`wsl -d kern`, then `kern ...`) | **6.5** and **7.0** | none | both |
+| Windows, via `kern.exe` | **70.5** | 1 (`wsl.exe`) | B |
+| Windows, via the `kern.cmd` fallback | **~330-500** | 2 (`cmd.exe`, then `wsl.exe`) | A |
+
+**Host A** runs Malwarebytes with real-time scanning, which deletes or blocks the unsigned `kern.exe`
+within seconds of every download: the exe row cannot be measured there at all, which is precisely why the
+fallback exists. **Host B** runs only Defender, the exe survives, and it supplies that row. The inside-WSL
+figure is the one both hosts produce, and they agree: **6.5** and **7.0** ms.
+
+So the Windows-side crossing costs about **63 ms per command** with the exe, on the host where it could be
+measured. The fallback row is several times that, but it is a different host as well as a second process,
+so the gap is not the price of the batch wrapper alone.
+
+The comparable Linux figure is the **3.3 ms** OCI-image row above, not the 2.2 ms prepared-rootfs one. The
+inside-WSL numbers are 20 boxes in 0.13 s, one series each, timed in the distro with `time` around the
+whole loop so the shell's 10 ms resolution lands on the total rather than on each box: single samples, not
+distributions.
+
+The fallback row read 507 ms then 330 ms on two runs, so read it as "a few hundred", not as a figure. It
+is timed from PowerShell, where each box is a separate Windows command and an antivirus scans every
+process creation, both of which are in the number.
+
+Two things this table does *not* say. It is silent on the normal `kern.exe` bridge, which adds one
+process instead of two: on the machine above the antivirus deleted the unsigned exe within seconds of
+every download, five times, so the row could not be measured there and is not guessed here.
+
+And the WSL2 9p bridge did not show up in box startup, which was worth checking rather than assuming.
+The same 20-box loop run with the working directory on `/mnt/c` took the same 0.13 s as from `~` inside the
+distro: kern reads its image cache inside the distro's own filesystem, so where the shell happens to be
+standing costs nothing.
+
+Read that narrowly, because it is one comparison and the mechanism is specific. What was measured is the
+**working directory** on 9p. A `-v` mount whose source is under `/mnt/c`, or an image cache relocated
+there, crosses 9p on every read and would not behave the same: that case was not measured and nothing here
+says it is free. An earlier draft of this section asserted the opposite of the measurement, which is why
+the scope is spelled out.
+
+So: on Windows, run kern inside the distro, where a box costs 6.5 ms. The bridge is for the occasional
+command from a PowerShell you are already in, not for a loop that starts hundreds of boxes. The
+`kern.cmd` row exists because an antivirus removing the exe should not leave you with nothing; it
+preserves the *function*, not the speed.
 
 ## Footprint
 

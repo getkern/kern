@@ -725,7 +725,7 @@ other row is fast, not because of a container that ignores signals.
 
 | host | kernel | **kern** | bubblewrap | runc | docker |
 |---|---|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.2 ms** | 2.9 ms | 13.8 ms | 289.2 ms |
+| x86_64 desktop | v7.0 | **2.2 ms** | 3.0 ms | 13.8 ms | 289.2 ms |
 | Raspberry Pi 5 | v6.6-rpi | **17.1 ms** † | ✗ | ✗ | ✗ |
 | Jetson Orin Nano | v5.15-tegra | **14.3 ms** † | 6.0 ms | 32 ms | 472 ms |
 | Arduino UNO Q | **v6.16 Android** | **93.2 ms** † | 14.4 ms | 76 ms | 858 ms |
@@ -746,14 +746,14 @@ Pi. At the same level of work, measured the same night:
 | Raspberry Pi 5 | **3.7 ms** | not installed | |
 
 Wherever kern can take its **direct** cgroup path it does not pay that toll at all: **2.6 ms on x86 with a
-memory cap enforced** (against bubblewrap's 3.1 enforcing nothing) and **4.2 ms inside WSL2**, where
+memory cap enforced** (against bubblewrap's 3.1 enforcing nothing, both from the same series) and **4.2 ms inside WSL2**, where
 `systemd-run` does not exist and the cap is enforced anyway. The boards' figures are a fallback path, not
 the engine. `--bind-rootfs` is worth it only on the Arduino, whose Android kernel spends **22.4 ms** in the overlay
 mount alone against ~0.1 ms on x86: it takes that board from 93.2 ms to 65.4 with caps enforced, and to
 12.4 with the cgroup off. Every row in the table above is the default path, so the boards are compared
 with each other rather than each with its own best flag.
 
-kern is the fastest sandbox on the desktop at **~2.2 ms**, ahead of bubblewrap at 2.9, and the top tier is
+kern is the fastest sandbox on the desktop at **~2.2 ms**, ahead of bubblewrap at 3.0, and the top tier is
 all within a few ms: nobody wins single-shot latency outright. The real gap is to the **engines**,
 **~125x faster** than podman (~288 ms) and Docker (~289 ms), which round-trip a daemon every run. Beyond
 one start: **~500 boxes/s**, **~7 MB** RSS per box, **0 resident** where Docker keeps ~186 MB before you
