@@ -160,10 +160,40 @@ command the README tells you to run:
 ✗ = **not installed (nor readily installable) on that board.** † carried over from the earlier session:
 only kern and bubblewrap were re-measured on 2026-07-30.
 
-**bubblewrap is now faster than kern on the two boards where both are installed**, which the earlier
-table had the other way round. Said plainly because it is the kind of thing a reader finds in a minute:
-bubblewrap does less. It is a sandbox primitive with no images, no caps, no lifecycle and no cgroup work,
-and cgroup work is exactly what those boards started charging for.
+**On the two boards where both are installed, bubblewrap's number is now lower than kern's**, which the
+earlier table had the other way round. Said plainly, because it is the kind of thing a reader finds in a
+minute. But the two columns are not the same work, and the like-for-like measurement says the opposite.
+
+bubblewrap is a sandbox primitive: no images, no lifecycle, and **no resource caps at all**, so it never
+does cgroup work. kern's board figures include enforcing caps through a systemd transient scope, which is
+what those boards started charging for. Measured on the x86 desktop where every tool is installed and kern
+can use its direct cgroup path, 40 runs each after a warm-up:
+
+| | ms per box | what it does at that price |
+|---|---:|---|
+| **kern**, memory cap ENFORCED | **2.6** | `memory.max` reads 268435456, verified in the same run |
+| kern, cgroup off | 2.8 | same isolation, no cap |
+| bubblewrap | 3.1 | no cap, and no way to ask for one |
+
+**kern enforcing a memory limit is faster than bubblewrap enforcing nothing.**
+
+The board gap is not the engine, and a third kernel settles it. Inside WSL2 there is no `systemd-run` at
+all, so the scope is not even possible, and a box there costs **4.2 ms with the cap enforced**
+(`memory.max` read back as 268435456 in the same run). Setting `KERN_NO_SCOPE=1` changes nothing there,
+5.1 ms, because the direct path was already the one in use.
+
+| where | ms per box | caps enforced | path |
+|---|---:|---|---|
+| x86_64 desktop | **2.6** | yes | direct |
+| WSL2 | **4.2** | yes | direct, no systemd present at all |
+| Raspberry Pi 5 | **15.5** | yes | systemd transient scope |
+| Raspberry Pi 5, cgroup off | 4.1 | **no** | none |
+
+So: **wherever kern can take the direct cgroup path, a box costs 2.6 to 4.2 ms with limits enforced.** The
+boards' 12 to 15 ms is the `systemd-run` round trip in full, which kern falls back to because it obtains
+no delegated slice there. That is a fallback, not the engine, and making the direct path reachable on such
+a host is the obvious next thing to try: it would put those boards back near 4 ms without giving up a
+single cap.
 
 The claim that survives is the one that was always the point, and it is a reach claim rather than a
 latency one: on the **Raspberry Pi 5** kern is the ONLY runtime that runs at all. bubblewrap, crun, runc,

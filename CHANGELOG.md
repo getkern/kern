@@ -19,6 +19,8 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.26], 2026-07-30
+
 ### Fixed
 
 - **An exported-but-empty `KERN_*` flag silently turned enforcement off.** `KERN_NO_SCOPE=` with no
