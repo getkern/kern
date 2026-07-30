@@ -21,8 +21,8 @@ acknowledgement and a coordinated-disclosure timeline.
 **Explicitly OUT of scope (cooperative, by design, not a boundary):**
 - **GPU limits are not shipped**, so there is nothing here to trust or to attack yet. When they
   land, expect them to be a cooperative governor for honest workloads rather than a boundary, and
-  expect this file to say so precisely, with the bypasses named. Until then `--no-gpu` is the
-  default and the answer to "how strong is the GPU cap" is "there isn't one".
+  expect this file to say so precisely, with the bypasses named. Until then the answer to "how
+  strong is the GPU cap" is "there is no GPU cap, and no GPU code".
 
 **A caveat we state plainly, an unprivileged user namespace is itself kernel attack surface.**
 kern's isolation is *built on* an unprivileged user namespace, and userns has historically been a
@@ -437,8 +437,8 @@ box access, not a hardened bastion, grant it only to workloads you'd trust with 
 
 ## Hardening posture
 
-- Zero vendor-binary modification; the GPU shim uses only the public driver API and is
-  disable-able with `--no-gpu`.
+- **No vendor binary is modified, and no GPU code ships here at all**: this edition has no GPU
+  path to harden, so the strongest statement is the absence itself.
 - Layer contents are vetted **in-process from the raw tar headers** before extraction (no `..`/
   absolute paths, no device nodes, no escaping hardlink targets, size + entry-count caps), the
   security decision reads fixed-offset header fields, never the host `tar`'s locale-dependent text

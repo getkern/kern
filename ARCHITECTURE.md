@@ -14,7 +14,7 @@ crates/
 ```
 
 A GPU layer is **deferred to 0.9** and is additive: nothing in the core changes to accommodate
-it, and `--no-gpu` is the default until it exists. This document will describe it when there is
+it: no GPU is touched today, because there is no GPU code here. This document will describe it when there is
 something to describe.
 
 ## Design choices (and why)

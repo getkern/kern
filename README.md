@@ -758,7 +758,7 @@ and some may never ship if they would change what kern is. Recently shipped work
 [Project status](#project-status), not here.
 
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped, and this
-  README will describe it when it is, not before. `--no-gpu` is and stays the default.
+  README will describe it when it is, not before. Nothing here touches a GPU today.
 - **More governed resources.** The same profile model could extend to other cgroup or kernel-real
   resources (I/O bandwidth, network shaping) as they prove useful.
 - **Snapshot / warm-start (CRIU).** Same-host checkpoint and restore of a *warm* box for subsecond
