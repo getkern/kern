@@ -227,6 +227,118 @@ fn cpu_bandwidth_interface_present() -> bool {
 /// Actually try to create an unprivileged user namespace in a throwaway child (so a failure can't
 /// affect us) - more truthful than reading any single sysctl, which varies by distro (Debian's
 /// `unprivileged_userns_clone`, Ubuntu's AppArmor gate, …). Returns whether it succeeded.
+/// The cost of ONE overlay mount on this kernel, in milliseconds, or `None` if it could not be
+/// measured.
+///
+/// Worth a doctor row because "overlayfs: available" hid an order of magnitude. On an Arduino UNO Q's
+/// Android kernel one `mount -t overlay` costs ~28 ms against ~0.1 ms on x86, and it is a FIXED cost:
+/// measured identical with a 517-file lowerdir and with an empty one, on ext4 and on tmpfs, and five
+/// consecutive mounts in the same namespace all landed within 0.4 ms of each other. A cost that ignores
+/// both the content and the backing store is not work being done, and the module is already loaded, so
+/// it is not an autoload either. kern cannot make that kernel faster; it can stop the user guessing.
+///
+/// Timed INSIDE the child, after the namespace exists. Timing the whole `fork` + `unshare` + `uid_map`
+/// round trip from the parent was the first attempt and it was useless: writing `uid_map` alone cost
+/// 20 ms on one run and 5 on the next, so the warning appeared and vanished between two invocations on
+/// a machine whose real overlay mount is 0.1 ms. A number that unstable must not gate a warning.
+fn overlay_mount_cost_ms() -> Option<f64> {
+    const N: usize = 3;
+    let dir = std::env::temp_dir().join(format!("kern-ovl-{}", std::process::id()));
+    for k in 0..N {
+        for sub in ["lower", "upper", "work", "merged"] {
+            std::fs::create_dir_all(dir.join(k.to_string()).join(sub)).ok()?;
+        }
+    }
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    let (rd, wr) = (fds[0], fds[1]);
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe { libc::close(rd) };
+        let fail = || unsafe { libc::_exit(1) };
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+            fail();
+        }
+        // Map ourselves to root inside the namespace, as `unshare -r` does: without it the process is
+        // the overflow uid, owns nothing, and every mount fails with EPERM - which is how this check
+        // first measured nothing at all on the one board it exists for.
+        let put = |path: &std::ffi::CStr, val: &str| -> bool {
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
+            if fd < 0 {
+                return false;
+            }
+            let n = unsafe { libc::write(fd, val.as_ptr() as *const libc::c_void, val.len()) };
+            unsafe { libc::close(fd) };
+            n == val.len() as isize
+        };
+        let _ = put(c"/proc/self/setgroups", "deny");
+        if !put(c"/proc/self/uid_map", &format!("0 {uid} 1\n"))
+            || !put(c"/proc/self/gid_map", &format!("0 {gid} 1\n"))
+        {
+            fail();
+        }
+        let mut us: Vec<u64> = Vec::with_capacity(N);
+        for k in 0..N {
+            let base = dir.join(k.to_string());
+            let opts = format!(
+                "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work",
+                base.display()
+            );
+            let Ok(target) =
+                std::ffi::CString::new(base.join("merged").as_os_str().as_encoded_bytes())
+            else {
+                fail();
+                unreachable!()
+            };
+            let Ok(opts_c) = std::ffi::CString::new(opts) else {
+                fail();
+                unreachable!()
+            };
+            let t0 = std::time::Instant::now();
+            let rc = unsafe {
+                libc::mount(
+                    c"overlay".as_ptr(),
+                    target.as_ptr(),
+                    c"overlay".as_ptr(),
+                    0,
+                    opts_c.as_ptr() as *const libc::c_void,
+                )
+            };
+            if rc != 0 {
+                fail();
+            }
+            us.push(t0.elapsed().as_micros() as u64);
+        }
+        us.sort_unstable();
+        let med = us[us.len() / 2];
+        let bytes = med.to_le_bytes();
+        unsafe {
+            libc::write(wr, bytes.as_ptr() as *const libc::c_void, bytes.len());
+            libc::_exit(0)
+        };
+    }
+    unsafe { libc::close(wr) };
+    if pid < 0 {
+        unsafe { libc::close(rd) };
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    let n = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    unsafe { libc::close(rd) };
+    let mut st = 0i32;
+    unsafe { libc::waitpid(pid, &mut st, 0) };
+    let _ = std::fs::remove_dir_all(&dir);
+    if n != buf.len() as isize || !libc::WIFEXITED(st) || libc::WEXITSTATUS(st) != 0 {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf) as f64 / 1000.0)
+}
+
 fn can_create_userns() -> bool {
     let pid = unsafe { libc::fork() };
     if pid == 0 {
@@ -344,7 +456,16 @@ fn check_overlay() -> R {
         })
         .unwrap_or(false);
     if supported {
-        R::Ok("overlayfs: available (default box rootfs strategy)".into())
+        // Available is not the same as cheap, and on one board the difference is the whole benchmark.
+        match overlay_mount_cost_ms() {
+            Some(ms) if ms >= 5.0 => R::Warn(
+                format!(
+                    "overlayfs works but costs {ms:.0} ms per mount on this kernel, which is most of a box's start time"
+                ),
+                "measured constant here: same cost with an EMPTY lowerdir and with everything on tmpfs, so it is not your disk or your image. `--bind-rootfs` skips it (91.9 -> 11.3 ms per box on an Arduino UNO Q) but binds the source directly: mutable and shared between boxes, where the overlay root is per-box and leaves the source untouched".into(),
+            ),
+            _ => R::Ok("overlayfs: available (default box rootfs strategy)".into()),
+        }
     } else {
         R::Warn(
             "overlayfs not listed in /proc/filesystems".into(),
