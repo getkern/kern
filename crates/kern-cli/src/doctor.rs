@@ -288,15 +288,17 @@ fn overlay_mount_cost_ms() -> Option<f64> {
                 "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work",
                 base.display()
             );
-            let Ok(target) =
-                std::ffi::CString::new(base.join("merged").as_os_str().as_encoded_bytes())
-            else {
-                fail();
-                unreachable!()
-            };
-            let Ok(opts_c) = std::ffi::CString::new(opts) else {
-                fail();
-                unreachable!()
+            // `_exit` in the error arm rather than `fail(); unreachable!()`: the panic macro would be
+            // a panic path in a forked child, which this codebase does not ship, and the compiler does
+            // not need it once the arm diverges on its own.
+            let target =
+                match std::ffi::CString::new(base.join("merged").as_os_str().as_encoded_bytes()) {
+                    Ok(c) => c,
+                    Err(_) => unsafe { libc::_exit(4) },
+                };
+            let opts_c = match std::ffi::CString::new(opts) {
+                Ok(c) => c,
+                Err(_) => unsafe { libc::_exit(4) },
             };
             let t0 = std::time::Instant::now();
             let rc = unsafe {

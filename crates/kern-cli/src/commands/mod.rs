@@ -4462,8 +4462,12 @@ pub fn gc(images: bool) -> Result<(), Error> {
         let freed = dir_size(&cache);
         if freed == 0 {
             println!("{}no cached images{}", p.d, p.z);
-        } else if let Err(e) = std::fs::remove_dir_all(&cache) {
-            eprintln!("kern: could not clear the image cache: {e}");
+        } else if let Err(e) = remove_tree_forced(&cache) {
+            // A FAILURE, not a note. This printed to stderr and returned Ok, so `kern gc --images &&
+            // echo cleaned` printed "cleaned" over an untouched cache: the caller had no way to tell.
+            return Err(Error::Sandbox(format!(
+                "could not clear the image cache: {e}"
+            )));
         } else {
             println!(
                 "{}reclaimed{} the image cache, freed {}",
@@ -4474,6 +4478,63 @@ pub fn gc(images: bool) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// `remove_dir_all` that can also delete an extracted OCI image.
+///
+/// An image ships directories with their original modes, and real images ship read-only ones: alpine's
+/// `/proc` is `r-xr-xr-x`, amazonlinux adds `/root`, `/boot` and `/sbin`. Unlinking a child needs WRITE
+/// on its parent directory, so `std::fs::remove_dir_all` stops at the first of them with EACCES, and so
+/// does `rm -rf` (verified: it leaves the tree and still exits 0). 62 such directories sat in this
+/// machine's cache, which is why `kern gc --images` had never actually cleared it.
+///
+/// We own these directories, so the fix is to restore write permission on the way down and then remove.
+/// Only ever applied to a path kern created inside its own cache, and only to DIRECTORIES: file modes
+/// are irrelevant to unlinking and are left alone. Symlinks are unlinked, never followed, so a link
+/// pointing out of the tree cannot lead the chmod anywhere.
+fn remove_tree_forced(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    // Every failure names the path AND why. "Permission denied" on its own sent me hunting through 3 GB
+    // of cache for the one directory that blocked it: it was owned by uid 100999, a subuid left by a
+    // layer built with `--uid-range`. An unprivileged user cannot chmod what it does not own, so that
+    // case is genuinely unremovable from here, and the message says so rather than leaving it to be
+    // discovered.
+    let annotate = |e: std::io::Error, at: &std::path::Path| -> std::io::Error {
+        let me = unsafe { libc::getuid() };
+        let owner = std::fs::symlink_metadata(at).map(|m| m.uid()).ok();
+        let why = match owner {
+            Some(u) if u != me => format!(
+                "{} is owned by uid {u}, not you - a layer built with --uid-range leaves subuid-owned files that an unprivileged user cannot remove",
+                at.display()
+            ),
+            _ => at.display().to_string(),
+        };
+        std::io::Error::new(e.kind(), format!("{e} at {why}"))
+    };
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(annotate(e, path)),
+    };
+    if !md.is_dir() {
+        return std::fs::remove_file(path).map_err(|e| annotate(e, path));
+    }
+    // u+rwx on this directory first, or its own entries cannot be listed or unlinked. An extracted OCI
+    // image ships read-only directories with their original modes (alpine's `/proc` is r-xr-xr-x;
+    // amazonlinux adds `/root`, `/boot`, `/sbin`), and unlinking a child needs WRITE on its parent, so
+    // `std::fs::remove_dir_all` stops at the first one with EACCES. So does `rm -rf`, which leaves the
+    // tree and still exits 0. 62 such directories sat in this machine's cache, which is why
+    // `kern gc --images` had never actually cleared it.
+    let mode = md.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700));
+    }
+    for entry in std::fs::read_dir(path).map_err(|e| annotate(e, path))? {
+        let entry = entry.map_err(|e| annotate(e, path))?;
+        remove_tree_forced(&entry.path())?;
+    }
+    std::fs::remove_dir(path).map_err(|e| annotate(e, path))
 }
 
 /// Delete build-layer dirs in `L/` not referenced by any `<tag>.layers` manifest. Returns
@@ -5831,6 +5892,36 @@ fn follow_log(mut f: std::fs::File, name: &str, pid: i32) -> Result<(), Error> {
             return Ok(());
         }
         unsafe { libc::usleep(200_000) }; // 200 ms - cheap follow poll
+    }
+}
+
+#[cfg(test)]
+mod gc_clears_read_only_image_dirs {
+    use super::remove_tree_forced;
+
+    /// An extracted OCI image ships read-only directories with their original modes, and unlinking a
+    /// child needs WRITE on its parent, so `std::fs::remove_dir_all` stops at the first one with
+    /// EACCES. `rm -rf` does too, and still exits 0. That is why `kern gc --images` had never cleared
+    /// a cache containing alpine (whose `/proc` is `r-xr-xr-x`): 62 such directories sat in the one on
+    /// this machine. Asserted BOTH ways, so the test cannot pass for the wrong reason if the fix is
+    /// reverted: the standard call must FAIL on this fixture first.
+    #[test]
+    fn forced_removal_deletes_what_remove_dir_all_cannot() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("kern-rtf-{}", std::process::id()));
+        let _ = super::remove_tree_forced(&root);
+        let ro = root.join("img/proc");
+        std::fs::create_dir_all(&ro).expect("mkdir");
+        std::fs::write(ro.join("kmsg"), b"x").expect("write");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        assert!(
+            std::fs::remove_dir_all(root.join("img")).is_err(),
+            "remove_dir_all unexpectedly succeeded - the fixture no longer reproduces the bug"
+        );
+
+        remove_tree_forced(&root).expect("forced removal");
+        assert!(!root.exists(), "the tree must be gone");
     }
 }
 
@@ -8008,7 +8099,21 @@ fn pull_to_cache(
         std::fs::create_dir_all(&dir).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
         // The `box --image` cache path pulls the host arch; `box --platform` (foreign-arch box) is
         // Slice B, deferred with the multi-stage work - so no platform override here yet.
-        let config = kern_oci::pull(image, &dir, None).map_err(|e| Error::Oci(e.to_string()))?;
+        //
+        // Remove the directory we just created if the pull fails, the way the `--pull always` branch
+        // above already does for its staging dir. A `?` here left one empty directory per failed pull:
+        // a bad tag, an image that does not exist, and a Ctrl-C mid-download each produced one, and 24
+        // had accumulated in this cache. They are invisible to `kern images` (which keys off the
+        // sentinel) and only `kern gc --images` reaps them, so nothing ever told the user they were
+        // there. Deleting only what this branch created: the `--dest <dir>` path deliberately does NOT
+        // do this, because that directory is the caller's.
+        let config = match kern_oci::pull(image, &dir, None) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(Error::Oci(e.to_string()));
+            }
+        };
         write_image_config(&cfgfile, &config);
         let _ = std::fs::write(&sentinel, image.as_bytes());
     }
