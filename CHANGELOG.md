@@ -19,6 +19,37 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+### Fixed
+
+- **An exported-but-empty `KERN_*` flag silently turned enforcement off.** `KERN_NO_SCOPE=` with no
+  value, and the `export FOO=${FOO:-}` idiom every CI script uses, both leave the name present with an
+  empty value. Every boolean flag read it with a bare `is_some()`, which meant "on".
+
+  On a host where the systemd transient scope IS the enforcement, that is not cosmetic. Measured on a
+  Raspberry Pi 5: with an empty `KERN_NO_SCOPE`, `--memory 256m` left `memory.max` at `max`,
+  `--pids-limit 30` left `pids.max` at `max`, and a workload three times over its RAM cap exited 0
+  instead of 137. kern printed nothing. The same box with the variable absent enforced all of them.
+
+  Empty now counts as unset, through one `env_flag` used by every site, which is the rule the project
+  already applied to `KERN_CONFIG` and `XDG_CONFIG_HOME` and had never given the boolean flags.
+
+- **`KERN_NO_SCOPE=1` no longer accepts a cap it will not enforce.** The opt-out is legitimate and
+  stays: it takes a box from 15.5 ms to 4.1 ms on that Pi. What was wrong is that it said nothing while
+  `--memory` and `--pids-limit` stopped working, which is the defect class this release exists to close.
+  It now warns through the same `warn_unenforced_caps` the other unenforceable-cap paths use.
+
+### Changed
+
+- **The ARM board figures in BENCHMARKS.md were re-measured and they moved upward**, from 2.1/3.6/9.9 ms
+  to 11.8/13.1/91.2 on the Pi 5, Jetson and Arduino UNO Q. Not a regression: v0.6.9, v0.6.20, v0.6.24 and
+  v0.6.25 were each benched on the same Pi that evening and read 13.9, 12.0, 11.9 and 11.7, so the newest
+  is the fastest of the four. What changed is the boards, which now have the memory controller delegated
+  and therefore pay for enforcement they previously could not perform. Chased to its cause:
+  `systemd-run --user --scope /bin/true` alone costs 13.7 ms there, against 14.3 for a whole `kern box`,
+  and removing it removes the caps with it. bubblewrap is now faster than kern on the two boards where
+  both are installed, and that is stated rather than left to be discovered.
+
+
 ## [0.6.25], 2026-07-30
 
 ### Added

@@ -36,6 +36,7 @@ pub use cgroup::apply_limits as apply_cgroup_limits;
 /// alive and `rmdir` it after the SIGKILL, so the empty dir is gone at once instead of waiting for `gc`
 /// or the next box start. See [`cgroup::box_cgroup_dir`].
 pub use cgroup::box_cgroup_dir;
+pub use cgroup::env_flag;
 /// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
 pub use cgroup::gc_orphan_box_cgroups;

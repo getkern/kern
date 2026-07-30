@@ -123,6 +123,18 @@ pub fn pad_visible(text: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(pad), text)
 }
 
+/// Is this boolean env flag SET? A variable exported but EMPTY counts as unset.
+///
+/// `KERN_NO_SCOPE= kern box …`, and the `export FOO=${FOO:-}` idiom every CI script uses, both leave the
+/// name present with an empty value. Read with a bare `is_some()`, which meant "the flag is on", so on a
+/// host where the systemd scope IS the enforcement (a Raspberry Pi 5, measured 2026-07-30) an empty
+/// `KERN_NO_SCOPE` left `--memory` at `max` and a workload 3x over its cap exited 0, with nothing
+/// printed. The project already treats an exported-but-blank `KERN_CONFIG` and `XDG_CONFIG_HOME` as
+/// unset for exactly this reason; the boolean flags had never been given the rule.
+pub fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +217,29 @@ mod tests {
     fn box_name_enforces_length_cap() {
         assert!(BoxName::parse(&"a".repeat(BoxName::MAX_LEN)).is_ok());
         assert!(BoxName::parse(&"a".repeat(BoxName::MAX_LEN + 1)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod an_exported_but_empty_flag_is_not_set {
+    use super::*;
+
+    #[test]
+    fn empty_counts_as_unset_because_that_is_what_a_shell_means_by_it() {
+        // The shape that silently disabled cap enforcement: `KERN_NO_SCOPE= kern box …`, and the
+        // `export FOO=${FOO:-}` idiom, both leave the name present with an empty value.
+        let name = "KERN_TEST_FLAG_EMPTY_IS_UNSET";
+        std::env::remove_var(name);
+        assert!(!env_flag(name), "absent must be off");
+        std::env::set_var(name, "");
+        assert!(!env_flag(name), "exported but EMPTY must be off");
+        std::env::set_var(name, "1");
+        assert!(env_flag(name), "a value must be on");
+        std::env::set_var(name, "0");
+        assert!(
+            env_flag(name),
+            "any non-empty value is on: this is a presence flag, not a boolean"
+        );
+        std::env::remove_var(name);
     }
 }

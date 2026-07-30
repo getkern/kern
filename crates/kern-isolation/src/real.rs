@@ -614,7 +614,7 @@ impl Default for PhaseTimer {
 
 impl PhaseTimer {
     pub fn new() -> Self {
-        let on = std::env::var_os("KERN_TIMING").is_some();
+        let on = crate::cgroup::env_flag("KERN_TIMING");
         let mut last = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -2417,7 +2417,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // and reports nothing. Verify the EFFECTIVE chain from inside the scope, where /proc/self/cgroup
     // is the box's own. Found on an Arduino UNO Q's Android kernel, whose `cpu` controller exposes
     // only `cpu.weight` and no `cpu.max`, turning `--cpus` into a share with no message at all.
-    if std::env::var_os("KERN_SCOPE").is_some() {
+    if crate::cgroup::env_flag("KERN_SCOPE") {
         crate::cgroup::warn_unenforced_caps(spec.memory_max, spec.cpus, spec.pids_max);
     }
 

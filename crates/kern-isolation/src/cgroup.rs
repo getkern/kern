@@ -111,14 +111,26 @@ pub fn user_systemd_present() -> bool {
 /// (`KERN_BUILD_STEP`). Taking the direct path for these would move the box OUT of the enforcing ancestor
 /// (breaking `stop`/kill for managed units) and could fail-closed-refuse a build/restart into a crash-loop.
 fn outer_enforcer_present() -> bool {
-    std::env::var_os("KERN_SCOPE").is_some()
-        || std::env::var_os("KERN_MANAGED").is_some()
-        || std::env::var_os("KERN_BUILD_STEP").is_some()
+    crate::cgroup::env_flag("KERN_SCOPE")
+        || crate::cgroup::env_flag("KERN_MANAGED")
+        || crate::cgroup::env_flag("KERN_BUILD_STEP")
 }
 
 /// In-process marker recording that `choose_direct_cap_path` DECIDED to skip the per-box scope.
 /// An env var (not a static) because the decision must survive the detached supervisor's forks -
 /// a `--restart` runner re-applies limits in a forked child and must still know the path it's on.
+/// Is this boolean env flag SET? A variable exported but EMPTY counts as unset.
+///
+/// `KERN_NO_SCOPE= kern box …`, and the `export FOO=${FOO:-}` idiom every CI script uses, both leave
+/// the name present with an empty value. Read with a bare `is_some()` that meant "the flag is on", so
+/// on a host where the systemd scope IS the enforcement (a Raspberry Pi 5, measured 2026-07-30) an
+/// empty `KERN_NO_SCOPE` left `--memory` at `max` and a workload 3x over its cap exited 0. Nothing was
+/// printed. The project already treats an exported-but-blank `KERN_CONFIG` and `XDG_CONFIG_HOME` as
+/// unset for exactly this reason; the boolean flags were the ones that had never been given the rule.
+pub fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
 const DIRECT_MARKER: &str = "KERN_DIRECT_CAPS";
 
 /// Decide - at the ONE decision site, `reexec_in_scope_if_possible` - whether this box takes the
@@ -133,7 +145,7 @@ const DIRECT_MARKER: &str = "KERN_DIRECT_CAPS";
 /// poisoned by its parent's decision.
 pub fn choose_direct_cap_path() -> bool {
     if outer_enforcer_present()
-        || std::env::var_os("KERN_NO_SCOPE").is_some()
+        || crate::cgroup::env_flag("KERN_NO_SCOPE")
         || !user_systemd_present()
         || !direct_caps_available()
     {
@@ -189,8 +201,7 @@ pub fn memory_cap_enforceable() -> bool {
 ///   so our own legit scope re-exec would otherwise trip the warning on EVERY box and pollute each
 ///   detached box's log; the dedicated "--memory not enforced" message already tells that truth.
 pub fn env_claims_enforcer_but_none_real() -> bool {
-    let claims =
-        std::env::var_os("KERN_SCOPE").is_some() || std::env::var_os("KERN_MANAGED").is_some();
+    let claims = crate::cgroup::env_flag("KERN_SCOPE") || crate::cgroup::env_flag("KERN_MANAGED");
     claims
         && current_v2_cgroup().is_some_and(|c| {
             controller_available_in_tree(&c, "memory") && !capped_in_tree(&c, "memory.max")

@@ -799,11 +799,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // When systemd (re-)starts a persistent box, it runs THIS binary in the foreground with
     // `KERN_MANAGED=1`: skip the transient-scope re-exec (the box already lives in the unit's own
     // service cgroup) and register the foreground run so `kern ps`/`logs`/`stop` still see it.
-    let managed = std::env::var_os("KERN_MANAGED").is_some();
+    let managed = kern_common::env_flag("KERN_MANAGED");
     // A `kern build` RUN step (`KERN_BUILD_STEP=1`) is a transient, first-party box run many times in
     // a row - the ~7ms transient-scope re-exec would dominate the build. Skip it (the best-effort
     // in-process cgroup in run_in_sandbox still applies caps; isolation is unchanged).
-    let build_step = std::env::var_os("KERN_BUILD_STEP").is_some();
+    let build_step = kern_common::env_flag("KERN_BUILD_STEP");
     // Robust resource caps: re-exec this whole invocation inside a transient systemd user scope
     // with memory + task limits (proper cgroup delegation). The scope's caps track the effective
     // memory/cpu so the outer scope never strangles a box that asked for more. No-op if already
@@ -1639,7 +1639,7 @@ pub fn run(
             "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
              delegation unavailable) - the command runs UNCAPPED."
         );
-    } else if std::env::var_os("KERN_SCOPE").is_some() {
+    } else if kern_common::env_flag("KERN_SCOPE") {
         // The branch above stays quiet under a scope because the scope is ASSUMED to enforce the
         // caps it was given. systemd accepts `MemoryMax=`/`CPUQuota=` that the kernel cannot honour
         // and reports nothing, so verify the effective chain rather than trusting the assumption.
@@ -3671,7 +3671,7 @@ fn reexec_in_scope_if_possible(
 ) {
     use std::os::unix::process::CommandExt;
 
-    if std::env::var_os("KERN_SCOPE").is_some() {
+    if kern_common::env_flag("KERN_SCOPE") {
         return; // already inside our scope
     }
     // Honest heads-up (a warning, NOT a refusal): the user asked for `--memory` but this kernel
@@ -3697,12 +3697,23 @@ fn reexec_in_scope_if_possible(
             );
         });
     }
-    if std::env::var_os("KERN_NO_SCOPE").is_some() {
+    if kern_common::env_flag("KERN_NO_SCOPE") {
         // Opt-out fast path: skip the systemd transient scope (which costs a `systemd-run` spawn +
-        // a D-Bus round-trip + a second kern re-exec - several ms). Resource caps then fall through
-        // to the best-effort cgroup path (same as when no user systemd is present). For latency-
-        // critical callers (e.g. an agent dev loop firing many short boxes) that accept best-effort
-        // instead of hard-delegated caps. Safe: it's the already-exercised no-user-systemd branch.
+        // a D-Bus round-trip + a second kern re-exec). Resource caps then fall through to the
+        // best-effort cgroup path (same as when no user systemd is present). For latency-critical
+        // callers (e.g. an agent dev loop firing many short boxes) that accept best-effort instead of
+        // hard-delegated caps.
+        //
+        // "Best-effort" can mean NONE, and it says so now. Measured on a Raspberry Pi 5 (2026-07-30):
+        // the scope costs 13.7 ms of a 15.5 ms box there, so the opt-out looks like free speed, and it
+        // is not. With it set, `--memory 256m` left `memory.max` at `max`, `--pids-limit 30` left
+        // `pids.max` at `max`, and a workload 3x over its RAM cap exited 0 instead of 137: on that
+        // board the scope IS the enforcement, because no delegated slice is available to write to.
+        // kern printed nothing at all. Accepting a cap and not enforcing it is the one thing this
+        // codebase refuses to do quietly, and this was the last place it still did.
+        //
+        // Same function the other unenforceable-cap paths use, so the rule has one definition.
+        kern_isolation::warn_unenforced_caps(memory, cpus, pids_max);
         return;
     }
     // Gate on a running user manager (so the exec can't strand us in a broken systemd-run).

@@ -133,96 +133,67 @@ many-sharing-one-rootfs at 12/12, see the test suite.)
 
 ## Runs everywhere, the same static binary, on boards where the engines can't
 
-The point isn't a single-shot latency crown, the top tier is noise. It's that **one small
-static binary (~1.3 MB on aarch64)** runs the *same* `kern box` on a desktop, an NVIDIA Jetson, a Raspberry Pi 5,
-and an **Android-kernel** board, including hardware where Docker/Podman aren't installed (or
-installable) at all. Measured with [`examples/benchmark.py`](examples/benchmark.py) (bare box, time
-per run = total ÷ N):
+**These numbers were re-measured on 2026-07-30 and they moved, upward, on every board.** The earlier
+table read 2.1 ms on the Pi 5, 3.6 on the Jetson and 9.9 on the Arduino. Re-running it found 11.8, 13.1
+and 91.2 on the same hardware. The figures below are the new ones, because a number that does not
+reproduce is not a benchmark.
 
-| host | kernel | **kern** | bubblewrap | crun | runc | podman | docker |
-|---|---|---:|---:|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.2 ms** | 2.9 ms | not installed | 13.8 ms | 287.5 ms | 289.2 ms |
-| Jetson Orin Nano | v5.15-tegra | **3.6 ms** | 5.6 ms | ✗ | 32 ms | ✗ | 472 ms |
-| Raspberry Pi 5 | v6.6-rpi | **2.1 ms** | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Arduino UNO Q | **v6.16 Android** | **9.9 ms** † | 14.9 ms | ✗ | 76 ms | ✗ | 858 ms |
+It is **not a regression in kern**, which was the first thing checked: v0.6.9, v0.6.20, v0.6.24 and
+v0.6.25 were each benched on the Pi 5 that evening and produced 13.9, 12.0, 11.9 and 11.7 ms. Every
+version measures the same today, and the newest is the fastest of the four.
 
-✗ = **not installed (nor readily installable) on that board.** The standout row is the **Raspberry
-Pi 5: `kern` is the ONLY runtime that runs at all**: bubblewrap, crun, runc, podman and Docker are
-*none of them present*, while one ~1.8 MB static binary just works. That reach, not a single-shot
-latency crown, is the differentiator. (Jetson/Arduino had bubblewrap, runc and Docker; crun and
-podman weren't installed there either.)
+What changed is the boards. All three now have the **memory controller delegated** to the user slice,
+which they did not before: on the Pi 5 it had to be turned on with `cgroup_enable=memory` and a reboot,
+precisely because `--memory` was accepted and not enforced. Enforcing a cap costs what enforcing a cap
+costs. The old figures were taken on hardware that could not enforce one.
 
-† `--bind-rootfs` on the Arduino; its default overlay path is ~33 ms there (the Android-kernel
-overlayfs pathology, see below).
+Measured with `kern bench --rootfs <dir>` against a warm page cache and after 20 warm-up boxes, the
+command the README tells you to run:
 
-kern is **first on every board**: and the one place it took work is itself the most interesting.
-Profiled with `KERN_TIMING=1`, kern's *default* (overlay) startup on the Arduino breaks down as:
-overlay mount **~31 ms** (highly variable on this kernel, ~25-95 ms across runs), everything else
-(unshare, /dev, pivot, proc, seccomp) **~1.9 ms** combined. The overlay *mount syscall itself* is the whole gap: on this Android-derived 6.16 kernel
-an overlayfs mount takes ~31 ms (vs ~8 ms for a plain bind), yet only **104 µs on x86** and ~1 ms
-on the Pi/Jetson. It's a property of that kernel's overlayfs, not of kern; kern uses an overlay so
-the rootfs/image stays immutable and shareable, which is sub-millisecond on every normal kernel and
-the reason kern wins outright on the other three boards. For exactly this case, **`--bind-rootfs`**
-swaps the overlay for a direct bind, kern then starts in **9.9 ms, beating bubblewrap (14.9 ms)**
-while still doing more than it (seccomp, a real `/dev`, lifecycle); the trade-off is a mutable,
-shared source, so it's opt-in. Net: one ~1.8 MB binary (one Rust dep, `libc`; system `curl`/`tar` for
-OCI pull), no daemon, no per-distro
-packaging, **fastest on all four kernels**: and the only runtime present at all on the Pi and the
-only one that ships OCI images + caps + `ps`/`exec`/`logs`/compose. That reach is the differentiator.
+| host | kernel | **kern** | bubblewrap | runc | docker |
+|---|---|---:|---:|---:|---:|
+| x86_64 desktop | v7.0 | **2.2 ms** | 2.9 ms | 13.8 ms | 289.2 ms |
+| Raspberry Pi 5 | v6.6-rpi | **11.8 ms** | ✗ | ✗ | ✗ |
+| Jetson Orin Nano | v5.15-tegra | **13.1 ms** | 5.5 ms | 32 ms † | 472 ms † |
+| Arduino UNO Q | **v6.16 Android** | **91.2 ms** | 14.6 ms | 76 ms † | 858 ms † |
 
-## Windows: where the milliseconds go
+✗ = **not installed (nor readily installable) on that board.** † carried over from the earlier session:
+only kern and bubblewrap were re-measured on 2026-07-30.
 
-Every figure above is a Linux host. On Windows kern runs inside its own WSL2 distro, and a command
-typed on the Windows side crosses the VM boundary by spawning `wsl.exe` **once per command**. That
-crossing is not kern's work and it dwarfs kern's work, so the honest reading is that Windows has two
-different performance stories depending on where you type.
+**bubblewrap is now faster than kern on the two boards where both are installed**, which the earlier
+table had the other way round. Said plainly because it is the kind of thing a reader finds in a minute:
+bubblewrap does less. It is a sandbox primitive with no images, no caps, no lifecycle and no cgroup work,
+and cgroup work is exactly what those boards started charging for.
 
-Two Windows 11 hosts, because one of them cannot measure the row that matters most. 20 boxes of the same
-cached image per sample, `kern box --image alpine` against a warm cache:
+The claim that survives is the one that was always the point, and it is a reach claim rather than a
+latency one: on the **Raspberry Pi 5** kern is the ONLY runtime that runs at all. bubblewrap, crun, runc,
+podman and Docker are none of them present, and one static binary copied over just works. On a desktop
+kern is in the top tier; on these boards it is the thing that is there.
 
-| where you type | ms per box | processes added per command | host |
-|---|---:|---|---|
-| inside the distro (`wsl -d kern`, then `kern ...`) | **6.5** and **7.0** | none | both |
-| Windows, via `kern.exe` | **70.5** | 1 (`wsl.exe`) | B |
-| Windows, via the `kern.cmd` fallback | **~330-500** | 2 (`cmd.exe`, then `wsl.exe`) | A |
+### Where the milliseconds go, and why they are not waste
 
-**Host A** runs Malwarebytes with real-time scanning, which deletes or blocks the unsigned `kern.exe`
-within seconds of every download: the exe row cannot be measured there at all, which is precisely why the
-fallback exists. **Host B** runs only Defender, the exe survives, and it supplies that row. The inside-WSL
-figure is the one both hosts produce, and they agree: **6.5** and **7.0** ms.
+Chased down on the Pi 5 the same evening, because a number you cannot explain is a number you cannot
+defend.
 
-So the Windows-side crossing costs about **63 ms per command** with the exe, on the host where it could be
-measured. The fallback row is several times that, but it is a different host as well as a second process,
-so the gap is not the price of the batch wrapper alone.
+kern's own instrumented phases sum to about **2 ms** (unshare + idmap 579 us, seccomp 233, overlay 185,
+`/dev` 137, pivot 128, the rest smaller) and the box itself lives 2.5 ms. Starting the binary is not the
+problem either: `kern --version` takes **481 us** there, faster than `/bin/true` at 519.
 
-The comparable Linux figure is the **3.3 ms** OCI-image row above, not the 2.2 ms prepared-rootfs one. The
-inside-WSL numbers are 20 boxes in 0.13 s, one series each, timed in the distro with `time` around the
-whole loop so the shell's 10 ms resolution lands on the total rather than on each box: single samples, not
-distributions.
+The rest is one thing. On that board a box goes through a **systemd transient scope**, and
+`systemd-run --user --scope /bin/true` on its own costs **13.7 ms**, against a full `kern box` at 14.3 ms.
+The scope is essentially the whole measurement.
 
-The fallback row read 507 ms then 330 ms on two runs, so read it as "a few hundred", not as a figure. It
-is timed from PowerShell, where each box is a separate Windows command and an antivirus scans every
-process creation, both of which are in the number.
+It is not overhead that can be dropped. Setting `KERN_NO_SCOPE=1` takes the box from 15.5 ms to 4.1 ms,
+and in the same breath `--memory 256m` leaves `memory.max` at `max`, `--pids-limit 30` leaves `pids.max`
+at `max`, and a workload 3x over its RAM cap exits 0 instead of 137. On a host with no delegated slice to
+write to, **the scope is the enforcement**. The 13.7 ms buys a cap that actually bites, and trading a
+kernel boundary for milliseconds is the one trade this project will not make.
 
-Two things this table does *not* say. It is silent on the normal `kern.exe` bridge, which adds one
-process instead of two: on the machine above the antivirus deleted the unsigned exe within seconds of
-every download, five times, so the row could not be measured there and is not guessed here.
+That is also why these figures moved: the boards now have the memory controller delegated, so they now
+pay for enforcement they previously could not perform.
 
-And the WSL2 9p bridge did not show up in box startup, which was worth checking rather than assuming.
-The same 20-box loop run with the working directory on `/mnt/c` took the same 0.13 s as from `~` inside the
-distro: kern reads its image cache inside the distro's own filesystem, so where the shell happens to be
-standing costs nothing.
-
-Read that narrowly, because it is one comparison and the mechanism is specific. What was measured is the
-**working directory** on 9p. A `-v` mount whose source is under `/mnt/c`, or an image cache relocated
-there, crosses 9p on every read and would not behave the same: that case was not measured and nothing here
-says it is free. An earlier draft of this section asserted the opposite of the measurement, which is why
-the scope is spelled out.
-
-So: on Windows, run kern inside the distro, where a box costs 6.5 ms. The bridge is for the occasional
-command from a PowerShell you are already in, not for a loop that starts hundreds of boxes. The
-`kern.cmd` row exists because an antivirus removing the exe should not leave you with nothing; it
-preserves the *function*, not the speed.
+`KERN_NO_SCOPE=1` remains available for callers that want the speed and accept best-effort caps, and
+since this release it **says so** rather than accepting a cap it will not enforce.
 
 ## Footprint
 

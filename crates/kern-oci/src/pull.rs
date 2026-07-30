@@ -655,7 +655,7 @@ fn download_blobs_oneconn(
 ) {
     // Escape hatch (like KERN_NO_PREFETCH): opt out of the one-connection batch and let the per-blob
     // path run. For A/B measuring, or if a registry mishandles `--next` connection reuse.
-    if std::env::var_os("KERN_NO_BLOB_BATCH").is_some() {
+    if kern_common::env_flag("KERN_NO_BLOB_BATCH") {
         return;
     }
     // Basic creds go off-argv via `-K` stdin; do NOT reshape that into a `--next` chain - fall back.
