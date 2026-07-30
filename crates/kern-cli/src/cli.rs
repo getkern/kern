@@ -336,13 +336,19 @@ pub enum Command {
     Doctor,
     /// `kern info`: compact runtime + host snapshot.
     Info,
-    /// `kern bench [--rootfs R] [-n N]`: time N box start→exit cycles.
+    /// `kern bench [--rootfs R] [--bind-rootfs] [-n N]`: time N box start→exit cycles.
     Bench {
         rootfs: Option<String>,
         /// `--image <ref>`: bench an OCI image instead of a prepared directory. Every other verb
         /// that needs a filesystem takes `--image`; bench took only `--rootfs`, so the one command
         /// the README tells a newcomer to run was the one command that needed two others first.
         image: Option<String>,
+        /// `--bind-rootfs`: bench the bind path instead of the overlay, the same choice `kern box`
+        /// offers. bench accepted this flag and dropped it, so on a host where the overlay mount is
+        /// the cost (22 ms on the Arduino UNO Q's Android kernel, 0.1 ms on x86) it reported the
+        /// overlay number for a run the user believed was measuring the bind. A benchmark that
+        /// silently measures something other than what was asked is worse than one that refuses.
+        bind_rootfs: bool,
         count: u32,
     },
     /// `kern recover`: clean up stale registry entries / orphaned scratch of dead boxes.
@@ -465,7 +471,15 @@ const REJECT_MEMORY_SWAP: &str =
 /// The message lists `allowed` rather than restating it, so the text cannot drift from the check. A bare
 /// `-` and everything after `--` are left alone: the former is a conventional stdin marker, the latter is
 /// a workload's own argv and not ours to judge.
-fn reject_unknown_flags(verb: &str, args: &[&str], allowed: &[&str]) -> Result<(), Error> {
+/// `args[0]` is the verb (or subcommand) itself and is skipped; callers with a nested subcommand
+/// pass the slice starting AT that subcommand, so `pod ls --x` and `volume ls --x` reach the same
+/// rule as `ps --x`. Shared rather than restated: a refusal expressed twice drifts, and the drift is
+/// invisible precisely because both spellings look right.
+pub(crate) fn reject_unknown_flags(
+    verb: &str,
+    args: &[&str],
+    allowed: &[&str],
+) -> Result<(), Error> {
     for a in args.iter().skip(1) {
         let s: &str = a;
         if s == "--" {
@@ -527,13 +541,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `exec <name> [opts] [-- cmd]`: run a command in an existing box.
         Some("exec") => parse_exec(&rest)?,
         // `search <query> [--json]`: search Docker Hub for images.
-        Some("search") => match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
-            Some(q) => Command::Search {
-                query: (*q).to_string(),
-                json: rest.contains(&"--json"),
-            },
-            None => return Err(Error::Usage("search <query> [--json]")),
-        },
+        Some("search") => {
+            reject_unknown_flags("search", &rest, &["--json"])?;
+            match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
+                Some(q) => Command::Search {
+                    query: (*q).to_string(),
+                    json: rest.contains(&"--json"),
+                },
+                None => return Err(Error::Usage("search <query> [--json]")),
+            }
+        }
         // `pod create <name> [-p …]` / `pod ls` / `pod rm <name>…`: shared-network pods.
         Some("pod") => parse_pod(&rest)?,
         // Hidden: the pod namespace holder (spawned by `pod create`).
@@ -577,6 +594,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `tag <src> <dst>`: give a cached image a second name.
         Some("tag") => {
+            reject_unknown_flags("tag", &rest, &[])?;
             let args: Vec<&&str> = rest
                 .iter()
                 .skip(1)
@@ -593,6 +611,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             Command::Tag { src, dst }
         }
         Some("commit") => {
+            reject_unknown_flags("commit", &rest, &[])?;
             let args: Vec<&&str> = rest
                 .iter()
                 .skip(1)
@@ -616,9 +635,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
         }
         // `rmi <image>...`: delete cached images (the counterpart to `pull`).
-        Some("rmi") => Command::Rmi {
-            images: rest.iter().skip(1).map(|s| s.to_string()).collect(),
-        },
+        Some("rmi") => {
+            reject_unknown_flags("rmi", &rest, &[])?;
+            Command::Rmi {
+                images: rest.iter().skip(1).map(|s| s.to_string()).collect(),
+            }
+        }
         Some("save") => {
             let (mut image, mut out) = (None, None);
             let mut it = rest.iter().skip(1);
@@ -690,7 +712,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `stop <name>` / `kill <name>`: stop running box(es). kern's `stop` already SIGKILLs the
         // box's process group, so `kill` is a Docker-parity alias. `killall` = `stop --all`.
-        Some("stop" | "kill") => {
+        Some(v @ ("stop" | "kill")) => {
+            reject_unknown_flags(v, &rest, &["--all", "-a"])?;
             let all = rest.iter().any(|a| *a == "--all" || *a == "-a");
             let names: Vec<String> = rest
                 .iter()
@@ -703,13 +726,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
             Command::Stop { names, all }
         }
-        Some("killall") => Command::Stop {
-            names: Vec::new(),
-            all: true,
-        },
+        Some("killall") => {
+            reject_unknown_flags("killall", &rest, &[])?;
+            Command::Stop {
+                names: Vec::new(),
+                all: true,
+            }
+        }
         // `pause`/`unpause` (aka `freeze`/`unfreeze`): freeze/thaw box(es) via the cgroup freezer.
         Some(v @ ("pause" | "freeze" | "unpause" | "unfreeze" | "resume")) => {
             let freeze = matches!(v, "pause" | "freeze");
+            reject_unknown_flags(v, &rest, &["--all", "-a"])?;
             let all = rest.iter().any(|a| *a == "--all" || *a == "-a");
             let names: Vec<String> = rest
                 .iter()
@@ -725,14 +752,18 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             Command::Pause { names, all, freeze }
         }
         // `attach <name>`: follow a detached box's output live.
-        Some("attach") => match rest.get(1) {
-            Some(n) if !n.starts_with('-') => Command::Attach {
-                name: (*n).to_string(),
-            },
-            _ => return Err(Error::Usage("attach <name>")),
-        },
+        Some("attach") => {
+            reject_unknown_flags("attach", &rest, &[])?;
+            match rest.get(1) {
+                Some(n) if !n.starts_with('-') => Command::Attach {
+                    name: (*n).to_string(),
+                },
+                _ => return Err(Error::Usage("attach <name>")),
+            }
+        }
         // `cp <src> <dst>`: copy a file host<->box (one side is `<box>:<path>`).
         Some("cp") => {
+            reject_unknown_flags("cp", &rest, &[])?;
             let pos: Vec<&str> = rest
                 .iter()
                 .skip(1)
@@ -833,13 +864,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
         }
         // `inspect <name> [--json]`: full detail for one box.
-        Some("inspect") => match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
-            Some(n) => Command::Inspect {
-                name: (*n).to_string(),
-                json: rest.contains(&"--json"),
-            },
-            None => return Err(Error::Usage("inspect <name> [--json]")),
-        },
+        Some("inspect") => {
+            reject_unknown_flags("inspect", &rest, &["--json"])?;
+            match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
+                Some(n) => Command::Inspect {
+                    name: (*n).to_string(),
+                    json: rest.contains(&"--json"),
+                },
+                None => return Err(Error::Usage("inspect <name> [--json]")),
+            }
+        }
         // `prune`: GC leftover logs/health/registry files of boxes no longer running.
         Some("prune") => {
             reject_unknown_flags("prune", &rest, &[])?;
@@ -869,22 +903,35 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 force: false,
             }
         }
-        // `bench [--rootfs R] [-n N]`: measure box start→exit latency.
-        Some("bench") => Command::Bench {
-            rootfs: flag_value(&rest, "--rootfs"),
-            image: flag_value(&rest, "--image"),
-            count: flag_value(&rest, "-n")
-                .or_else(|| flag_value(&rest, "--count"))
-                .and_then(|v| v.parse().ok())
-                .filter(|n| *n >= 1)
-                .unwrap_or(20),
-        },
+        // `bench [--rootfs R] [--bind-rootfs] [-n N]`: measure box start→exit latency.
+        Some("bench") => {
+            reject_unknown_flags(
+                "bench",
+                &rest,
+                &["--rootfs", "--image", "--bind-rootfs", "-n", "--count"],
+            )?;
+            Command::Bench {
+                rootfs: flag_value(&rest, "--rootfs"),
+                image: flag_value(&rest, "--image"),
+                bind_rootfs: rest.contains(&"--bind-rootfs"),
+                count: flag_value(&rest, "-n")
+                    .or_else(|| flag_value(&rest, "--count"))
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n >= 1)
+                    .unwrap_or(20),
+            }
+        }
         Some("recover") => {
             reject_unknown_flags("recover", &rest, &[])?;
             Command::Recover
         }
         // `update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
         Some("update") => {
+            reject_unknown_flags(
+                "update",
+                &rest,
+                &["-m", "--memory", "--cpus", "--pids-limit"],
+            )?;
             let name = rest
                 .iter()
                 .skip(1)
@@ -927,16 +974,23 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
         }
         // `events`: stream box lifecycle events until Ctrl-C (Docker parity, best-effort/daemonless).
-        Some("events") => Command::Events,
+        Some("events") => {
+            reject_unknown_flags("events", &rest, &[])?;
+            Command::Events
+        }
         // `diff <box>`: list filesystem changes vs the box's image (Docker parity).
-        Some("diff") => match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
-            Some(n) => Command::Diff {
-                name: (*n).to_string(),
-            },
-            None => return Err(Error::Usage("diff <box>")),
-        },
+        Some("diff") => {
+            reject_unknown_flags("diff", &rest, &[])?;
+            match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
+                Some(n) => Command::Diff {
+                    name: (*n).to_string(),
+                },
+                None => return Err(Error::Usage("diff <box>")),
+            }
+        }
         // `wait <box>...`: block until each box exits, print its exit code (Docker parity).
         Some("wait") => {
+            reject_unknown_flags("wait", &rest, &[])?;
             let names: Vec<String> = rest
                 .iter()
                 .skip(1)
@@ -950,6 +1004,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `rename <old> <new>`: give a running box a new name (Docker parity).
         Some("rename") => {
+            reject_unknown_flags("rename", &rest, &[])?;
             let mut pos = rest.iter().skip(1).filter(|a| !a.starts_with('-'));
             match (pos.next(), pos.next()) {
                 (Some(old), Some(new)) => Command::Rename {
@@ -979,12 +1034,15 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             registry: positional_after_flags(&rest, &[]),
         },
         // `completions <bash|zsh|fish>`: print a shell-completion script.
-        Some("completions") => match rest.get(1) {
-            Some(s) if !s.starts_with('-') => Command::Completions {
-                shell: (*s).to_string(),
-            },
-            _ => return Err(Error::Usage("completions <bash|zsh|fish>")),
-        },
+        Some("completions") => {
+            reject_unknown_flags("completions", &rest, &[])?;
+            match rest.get(1) {
+                Some(s) if !s.starts_with('-') => Command::Completions {
+                    shell: (*s).to_string(),
+                },
+                _ => return Err(Error::Usage("completions <bash|zsh|fish>")),
+            }
+        }
         // `top`: live box monitor.
         Some("top") => {
             reject_unknown_flags("top", &rest, &[])?;
@@ -2200,8 +2258,21 @@ fn parse_pull(rest: &[&str]) -> Option<Command> {
 
 /// `kern pod create <name> [-p [ip:]host:pod]…` | `pod ls` | `pod rm <name>…`.
 fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
+    // A port is published on the BOX that serves it, never on the pod: the pod owns the network
+    // namespace, the box owns the listener. `pod create -p 8080:80` used to exit 0 with the flag
+    // dropped, so the pod came up and nothing was published, which reads exactly like a kern bug
+    // until you find the port was never asked for. The usage line advertised `-p` as well, so the
+    // CLI documented a flag it did not implement.
+    if let Some(p) = rest.iter().skip(2).find(|a| {
+        **a == "-p" || **a == "--publish" || a.starts_with("-p=") || a.starts_with("--publish=")
+    }) {
+        return Err(Error::Cli(format!(
+            "pod: {p:?} belongs on the box, not the pod - publish with `kern box <name> --pod <pod> -p 8080:80`"
+        )));
+    }
     match rest.get(1).copied() {
         Some("create" | "new" | "up") => {
+            reject_unknown_flags("pod create", &rest[1..], &["--no-outbound", "--uid-range"])?;
             let name = rest
                 .iter()
                 .skip(2)
@@ -2218,8 +2289,12 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
                 uid_range: rest.contains(&"--uid-range"),
             })
         }
-        Some("ls" | "list" | "ps") => Ok(Command::PodList),
+        Some("ls" | "list" | "ps") => {
+            reject_unknown_flags("pod ls", &rest[1..], &[])?;
+            Ok(Command::PodList)
+        }
         Some("rm" | "remove" | "down") => {
+            reject_unknown_flags("pod rm", &rest[1..], &[])?;
             let names: Vec<String> = rest
                 .iter()
                 .skip(2)
@@ -2232,7 +2307,7 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
             Ok(Command::PodRemove { names })
         }
         _ => Err(Error::Usage(
-            "pod create <name> [-p …] | pod ls | pod rm <name>",
+            "pod create <name> [--no-outbound] [--uid-range] | pod ls | pod rm <name>",
         )),
     }
 }
@@ -2585,8 +2660,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Bench {
             rootfs,
             image,
+            bind_rootfs,
             count,
-        } => commands::bench(rootfs.as_deref(), image.as_deref(), count),
+        } => commands::bench(rootfs.as_deref(), image.as_deref(), bind_rootfs, count),
         Command::Recover => commands::recover(),
         Command::Rename { old, new } => commands::rename(&old, &new),
         Command::Update {
@@ -3094,6 +3170,57 @@ mod tests {
         ));
         // `prune` takes no args.
         assert_eq!(parse(&["prune".into()]).unwrap().1, Command::Prune);
+    }
+
+    /// `bench` was the one verb that neither refused an unknown flag nor carried `--bind-rootfs`
+    /// through: it took the flag, dropped it, and printed an overlay number under a header naming
+    /// the run the user asked for. On the Arduino UNO Q the overlay mount alone is 22 ms against
+    /// 0.1 ms on x86, so the two paths are not close and the silence was worth ~20 ms of wrong
+    /// answer. Asserted on the PARSED command rather than on the process output, because the old
+    /// code also exited 0 for this invocation: only the parsed value distinguishes "accepted and
+    /// honoured" from "accepted and discarded", which is the whole defect.
+    #[test]
+    fn bench_carries_bind_rootfs_and_refuses_unknown_flags() {
+        let cmd = parse(&[
+            "bench".into(),
+            "--rootfs".into(),
+            "/x".into(),
+            "--bind-rootfs".into(),
+        ])
+        .unwrap()
+        .1;
+        assert_eq!(
+            cmd,
+            Command::Bench {
+                rootfs: Some("/x".into()),
+                image: None,
+                bind_rootfs: true,
+                count: 20,
+            }
+        );
+
+        // Absent means absent: the default must not quietly become the bind path either.
+        let cmd = parse(&["bench".into(), "--rootfs".into(), "/x".into()])
+            .unwrap()
+            .1;
+        assert!(matches!(
+            cmd,
+            Command::Bench {
+                bind_rootfs: false,
+                ..
+            }
+        ));
+
+        // And a typo is refused rather than ignored, the rule the other verbs already follow.
+        assert!(matches!(
+            parse(&[
+                "bench".into(),
+                "--rootfs".into(),
+                "/x".into(),
+                "--bnid-rootfs".into()
+            ]),
+            Err(Error::Usage(_)) | Err(Error::Cli(_))
+        ));
     }
 
     #[test]

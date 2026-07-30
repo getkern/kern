@@ -435,13 +435,28 @@ impl NetVolume {
 
 /// `kern volume <create|ls|rm|inspect|prune> …`.
 pub fn run(args: &[String]) -> Result<(), Error> {
+    // `ls`, `prune` and `inspect` take no flags, and used to exit 0 with any flag silently dropped:
+    // `volume ls --json` printed the human table and reported success, so a script parsing it got
+    // prose and no way to tell. Routed through the SAME rule the top-level verbs use rather than a
+    // second copy of it, and applied here (not in the parser) because `volume` hands its arguments
+    // through verbatim, so this is the first place the subcommand is known.
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.first().map(String::as_str) {
         Some("create" | "c") => create(&args[1..]),
-        Some("ls" | "list") => list(),
+        Some("ls" | "list") => {
+            crate::cli::reject_unknown_flags("volume ls", &refs, &[])?;
+            list()
+        }
         Some("rm" | "remove" | "delete") => remove(&args[1..]),
-        Some("inspect" | "show") => inspect(args.get(1)),
+        Some("inspect" | "show") => {
+            crate::cli::reject_unknown_flags("volume inspect", &refs, &[])?;
+            inspect(args.get(1))
+        }
         Some("edit") => edit_cmd(&args[1..]),
-        Some("prune") => prune(),
+        Some("prune") => {
+            crate::cli::reject_unknown_flags("volume prune", &refs, &[])?;
+            prune()
+        }
         None | Some("-h" | "--help" | "help") => {
             usage();
             Ok(())

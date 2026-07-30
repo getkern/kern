@@ -93,7 +93,7 @@ pub fn help() -> Result<(), Error> {
     {c}doctor{z}                                                         Preflight: will boxes run here?
     {c}probe{z}                                                          Host resources you can put in kern.toml
     {c}info{z}                                                           Runtime + host snapshot
-    {c}bench{z} (--image <ref>|--rootfs <dir>) [-n N]                    Time box start→exit latency
+    {c}bench{z} (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]     Time box start→exit latency
     {c}completions{z} <bash|zsh|fish>                                    Print a shell-completion script
 
 {b}OPTIONS for box:{z}
@@ -4530,7 +4530,12 @@ fn sweep_orphan_layers() -> (usize, u64) {
 /// boxes (each `/bin/true`, foreground) and timing them, then reporting min/median/avg/max +
 /// boxes/sec. This is the real user-facing number (it spawns `kern box` just like you would), so it's
 /// the honest figure to quote. Needs a `--rootfs` with a `/bin/true` (any busybox/distro rootfs).
-pub fn bench(rootfs: Option<&str>, image: Option<&str>, count: u32) -> Result<(), Error> {
+pub fn bench(
+    rootfs: Option<&str>,
+    image: Option<&str>,
+    bind_rootfs: bool,
+    count: u32,
+) -> Result<(), Error> {
     // `--image` resolves through the SAME cache path `kern box --image` uses, so benching an image
     // measures the box a user would actually run, and a second copy of the pull logic never appears
     // here. Before this, bench was the only verb needing a filesystem that did not accept an image:
@@ -4567,8 +4572,15 @@ pub fn bench(rootfs: Option<&str>, image: Option<&str>, count: u32) -> Result<()
         std::env::current_exe().map_err(|e| Error::Sandbox(format!("locating kern: {e}")))?;
     let one = |name: &str| -> Option<std::time::Duration> {
         let t0 = std::time::Instant::now();
-        let ok = std::process::Command::new(&self_exe)
-            .args(["box", name, flag, value, "--", "/bin/true"])
+        let mut cmd = std::process::Command::new(&self_exe);
+        cmd.args(["box", name, flag, value]);
+        // Passed through to the box rather than resolved here, for the same reason `--rootfs` and
+        // `--image` are: bench must spawn the command it quotes, or it stops describing it.
+        if bind_rootfs {
+            cmd.arg("--bind-rootfs");
+        }
+        let ok = cmd
+            .args(["--", "/bin/true"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -4598,10 +4610,14 @@ pub fn bench(rootfs: Option<&str>, image: Option<&str>, count: u32) -> Result<()
     let sum: f64 = times.iter().map(|d| ms(*d)).sum();
     let avg = sum / times.len() as f64;
     let p = crate::ui::Palette::detect();
+    // The header names the exact box that was timed, `--bind-rootfs` included: on a host where the
+    // overlay mount IS the cost, the two paths differ by more than the rest of box start put
+    // together, so a header that omits it leaves two very different numbers looking identical.
     println!(
-        "{b}kern bench{z}  {} runs, {} {value}",
+        "{b}kern bench{z}  {} runs, {} {value}{}",
         times.len(),
         flag,
+        if bind_rootfs { " --bind-rootfs" } else { "" },
         b = p.b,
         z = p.z
     );
