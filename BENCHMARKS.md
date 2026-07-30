@@ -207,6 +207,36 @@ boards are compared with each other rather than each with its own best flag. bub
 comparing kern's default overlay to it there compares two different mount strategies, not two runtimes.
 With the same strategy kern is ahead.
 
+### Why a headless board pays it, and what to do about it
+
+Chased to the bottom the same night, because "the boards are slower" is not an explanation.
+
+kern reaches its fast path by finding the systemd user manager's delegated slice. Rootless, that lives
+under `/user.slice/user-<uid>.slice/user@<uid>.service/`. **An SSH session does not live there**: it is
+placed in `/user.slice/user-<uid>.slice/session-N.scope` by the SYSTEM manager, a different delegation
+domain, and a process there cannot write into the user manager's tree. So every box from an SSH shell
+falls back to a per-box transient scope.
+
+The size of that, measured on a Pi 5 with one binary at one moment:
+
+| how kern was launched | ms per box | caps enforced |
+|---|---:|---|
+| from an SSH session | **13.8** | yes |
+| from inside the systemd user manager | **3.5** | yes |
+
+Same binary, same board, same image, `memory.max` reading 268435456 in both. **A 4x difference decided
+purely by where the calling shell sits.**
+
+It is not a bug kern can route around, and trying was instructive: making it locate the slice by
+constructed path instead of by walking its own ancestors does let it *find* one, and then the box refuses
+to start, because finding a delegated cgroup you are not inside is not the same as being able to use it.
+kern's fail-closed check catches that and refuses rather than running an uncapped box, which is the
+behaviour you want and the reason the attempt was caught in minutes rather than shipped.
+
+**So if you run boxes on a headless board and care about the milliseconds, launch kern from a systemd
+user service rather than straight from an SSH shell.** `systemd-run --user`, or a small unit, is enough,
+and it is 4x. If you are on a desktop session the fast path is already what you get.
+
 So: **wherever kern can take the direct cgroup path, a box costs 2.6 to 4.2 ms with limits enforced.** The
 boards' 12 to 15 ms is the `systemd-run` round trip in full, which kern falls back to because it obtains
 no delegated slice there. That is a fallback, not the engine, and making the direct path reachable on such
