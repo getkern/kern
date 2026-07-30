@@ -15,6 +15,72 @@ enum R {
     Fail(String, String),
 }
 
+/// What the per-box `systemd-run --user --scope` actually costs on THIS host, and how to stop paying
+/// it once per box.
+///
+/// kern caps directly in its own delegated `kern.slice` when it is ALREADY inside the systemd USER
+/// manager's tree. A desktop session puts it there; an **SSH login does not** - sshd places the session
+/// under the SYSTEM manager in a different delegation domain, and cgroup v2 will not migrate a process
+/// across that boundary (the common ancestor, `user-<uid>.slice`, is not the user's to write; verified
+/// on an Arduino UNO Q: creating the child cgroup and writing `memory.max` both succeed, writing the
+/// pid into `cgroup.procs` is refused). So on a headless board kern falls back to one transient scope
+/// PER BOX, and that is the whole board-vs-desktop gap.
+///
+/// The toll is MEASURED, not described, because a guess would be wrong by an order of magnitude: one
+/// `systemd-run --user --scope /bin/true` costs ~4 ms on an x86 desktop, ~9 ms on a Raspberry Pi 5 and
+/// ~39 ms on the UNO Q's Android kernel. Costs one process, and only on a host already paying far more
+/// than that per box.
+///
+/// Reported as a FLOOR ("at least"), which is what it is. A box does not merely create the scope, it
+/// re-execs kern inside it, so the real per-box difference is larger than the bare `systemd-run`:
+/// on the UNO Q this measures 38.6 ms while the capped-minus-uncapped box gap is 58.2. Quoting the
+/// bare number as though it were the whole cost would understate it by a third, in the same way the
+/// cold first sample used to overstate it by 3.6x.
+///
+/// Read-only, as this module promises: the branch is decided from `/proc/self/cgroup`, not by calling
+/// `direct_caps_available()`, which would CREATE the slice as a side effect.
+fn check_scope_toll() -> R {
+    let uid = unsafe { libc::getuid() };
+    let mine = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    // Inside `user@<uid>.service` = inside the user manager's tree = kern caps directly, no toll.
+    if mine.contains(&format!("/user@{uid}.service/")) {
+        return R::Ok("caps go direct into kern.slice: no per-box systemd round trip".into());
+    }
+    if !kern_isolation::user_systemd_present() {
+        return R::Ok("no user systemd manager: caps take the best-effort path".into());
+    }
+    // THREE runs, report the median, and throw the first away. A single cold sample read 34.0 ms on a
+    // Raspberry Pi 5 where the warm median is 9.4: the first `systemd-run` in a session pays for the
+    // user manager's own wake-up, not for the scope. Quoting the cold number would overstate the toll
+    // by 3.6x, and a benchmark this row exists to justify cannot be the sloppiest number on screen.
+    let once = || -> Option<f64> {
+        let t0 = std::time::Instant::now();
+        let ok = std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "/bin/true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then(|| t0.elapsed().as_secs_f64() * 1000.0)
+    };
+    if once().is_none() {
+        return R::Ok("caps take the best-effort path (no usable systemd --user scope)".into());
+    }
+    let mut s: Vec<f64> = (0..3).filter_map(|_| once()).collect();
+    if s.is_empty() {
+        return R::Ok("caps take the best-effort path (no usable systemd --user scope)".into());
+    }
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ms = s[s.len() / 2];
+    R::Warn(
+        format!(
+            "this session is outside the systemd user manager, so every box pays a transient scope to enforce its caps: at least {ms:.1} ms here, on top of the box itself"
+        ),
+        "pay it ONCE: `systemd-run --user --scope bash`, then run kern inside that shell. Caps stay enforced and boxes take the direct kern.slice path (measured: 91.9 -> 35.5 ms per box on an Arduino UNO Q, 11.7 -> 3.0 on a Raspberry Pi 5)".into(),
+    )
+}
+
 pub fn doctor() -> Result<(), Error> {
     let p = Palette::detect();
     let mut results: Vec<R> = vec![
@@ -24,6 +90,7 @@ pub fn doctor() -> Result<(), Error> {
         check_max_userns(),
         // Resource enforcement (cgroup v2 + delegation).
         check_cgroup(),
+        check_scope_toll(),
         // Root filesystem strategy.
         check_overlay(),
         // Optional feature: multi-uid mapping.
