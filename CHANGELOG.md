@@ -70,6 +70,23 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   `uid_map` write making the overlay probe measure nothing at all, then a version that timed the
   `uid_map` write itself and flickered between 20 and 5 ms). The record is in the code.
 
+- **`kern gc --images` never cleared a real image cache, and reported success.** An extracted OCI
+  image ships read-only directories with their original modes (alpine's `/proc` is `r-xr-xr-x`;
+  amazonlinux adds `/root`, `/boot`, `/sbin`), and unlinking a child needs WRITE on its parent, so
+  `remove_dir_all` stopped at the first one. So does `rm -rf`, which leaves the tree and still exits 0.
+  One cache held 62 such directories and 3.0 GB the documented command could not reclaim, and the
+  failure printed to stderr while returning success, so `kern gc --images && echo cleaned` printed
+  "cleaned" over an untouched cache. Removal now restores `u+rwx` on directories as it descends and a
+  failure is a non-zero exit. Every failure names its path and its cause, including the one case that
+  is genuinely unremovable: a file owned by a subuid from a `--uid-range` build, which an unprivileged
+  user cannot chmod.
+
+- **Every failed pull leaked one empty cache directory.** A bad tag, an image that does not exist, and
+  a Ctrl-C mid-download each produced one; 24 had accumulated. The `--pull always` branch already
+  cleaned up its staging directory on error and the `missing` branch did not, so the same rule was
+  written once and forgotten once. `--dest <dir>` deliberately still does not: that directory is the
+  caller's.
+
 ### Changed
 
 - **Third measurement round on the boards, and it is the one that ships.** With the bench defect fixed,
