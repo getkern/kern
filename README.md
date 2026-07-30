@@ -74,6 +74,10 @@ r = kern.run_code("print(sum(range(100)))")   # network OFF, hard caps, a timeou
 print(r.stdout, r.success)                     # → a fresh, discarded-after box
 ```
 
+That call measures **16 ms** end to end on the x86_64 desktop (median of 60, after warm-up). Most of it
+is CPython starting up *inside* the box, not the box: the same machine runs `kern box --image alpine --
+/bin/true` in 3.4 ms, and a bare `python3 -c "print(1)"` on the host already costs 7.8 ms.
+
 ## What you'd use it for
 
 One move under all of these: a fresh, isolated, resource-capped box in single-digit milliseconds, wherever you would
