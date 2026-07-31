@@ -37,6 +37,14 @@ pub(crate) fn waitpid(
 /// Separate from [`waitpid`] because the callers that discard the status passed a null pointer, and
 /// a `&mut` that is documented as "may be null" is a worse interface than two functions.
 pub(crate) fn reap(pid: libc::pid_t) {
+    // `waitpid(-1, ..)` does NOT mean "this child", it means "any child". A caller that passed a
+    // failed `fork()`'s -1 through would reap whatever exits first, which on the foreground box path
+    // is plausibly the box's own PID 1 that another wait is about to collect: an exit code lost or
+    // attributed to the wrong process, the exact class this module exists to close.
+    debug_assert!(pid > 0, "reap() takes a specific child, never a wait-any");
+    if pid <= 0 {
+        return;
+    }
     let mut ignored = 0;
     let _ = waitpid(pid, &mut ignored, 0);
 }
@@ -59,9 +67,28 @@ pub(crate) fn poll(fds: &mut [libc::pollfd], timeout_ms: libc::c_int) -> libc::c
             return r;
         }
     }
-    let deadline = monotonic_ms().saturating_add(timeout_ms as u64);
+    // No usable clock: fall back to the plain restart with the original timeout. That can stretch
+    // the bound under a signal storm, but it is a HONEST degradation, where trusting a bogus
+    // deadline would return an instant phantom timeout the caller reads as "nothing to read" - a
+    // wrong value returned silently, in the module whose whole point is to stop doing that.
+    let Some(start) = monotonic_ms() else {
+        loop {
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
+            if r == -1 && errno() == libc::EINTR {
+                continue;
+            }
+            return r;
+        }
+    };
+    let deadline = start.saturating_add(timeout_ms as u64);
     loop {
-        let now = monotonic_ms();
+        let Some(now) = monotonic_ms() else {
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
+            if r == -1 && errno() == libc::EINTR {
+                continue;
+            }
+            return r;
+        };
         // Deadline already passed while handling a signal: report the timeout the caller asked
         // for rather than issuing a `poll` that would block for a fresh full interval.
         if now >= deadline {
@@ -83,7 +110,7 @@ fn errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
 }
 
-fn monotonic_ms() -> u64 {
+fn monotonic_ms() -> Option<u64> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -91,18 +118,123 @@ fn monotonic_ms() -> u64 {
     // CLOCK_MONOTONIC cannot step backwards or be adjusted by NTP, so a deadline built from it
     // survives a clock change mid-wait. CLOCK_REALTIME would not.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
-        return 0;
+        return None;
     }
-    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+    Some((ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn now_ms() -> u64 {
+        monotonic_ms().expect("CLOCK_MONOTONIC")
+    }
+
+    extern "C" fn noop(_: libc::c_int) {}
+
+    /// Install a SIGUSR1 handler with `SA_RESTART` explicitly OFF, and hammer the CALLING thread
+    /// with it from a helper thread. Both halves are load-bearing: a signal whose default action is
+    /// "ignore" (SIGWINCH, SIGCHLD, SIGURG) never interrupts a syscall at all, because the kernel
+    /// only unblocks one when it has a handler to run, and `SA_RESTART` would make the kernel
+    /// restart the syscall itself so EINTR never reaches userspace. Getting either wrong yields a
+    /// test that passes against completely unwrapped code, which is what the first attempt did.
+    fn under_signal_storm<T>(body: impl FnOnce() -> T) -> T {
+        // Serialised, and the handler is never restored. Rust runs tests in parallel threads of ONE
+        // process, so a concurrent storm test that reset SIGUSR1 to SIG_DFL made this one's next
+        // signal kill the whole test binary (signal 10). The disposition is process-wide state:
+        // two tests cannot own it at once, and handing it back is what breaks the other.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            sa.sa_flags = 0; // NOT SA_RESTART: this is what makes EINTR observable
+            libc::sigemptyset(&mut sa.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()), 0);
+        }
+        // pthread_kill, not kill(getpid()): a process-directed signal may be taken by ANY thread
+        // that has it unblocked, including the sender, and would then never interrupt our poll.
+        let target = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stop.clone();
+        let t = std::thread::spawn(move || {
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe { libc::pthread_kill(target, libc::SIGUSR1) };
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let out = body();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = t.join();
+        out
+    }
+
+    /// THE test of this module: the only one that fails against either wrong implementation.
+    ///
+    /// No retry at all -> `poll` returns -1 on the first signal and the `assert_eq!(.., 0)` fails.
+    /// Retry with the ORIGINAL timeout -> the clock restarts on every signal, so with one signal
+    /// every 10 ms against a 300 ms budget the call never returns and the upper bound fails.
+    /// Only the monotonic deadline lands inside the window.
+    #[test]
+    fn poll_deadline_survives_a_signal_storm() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let mut pfd = [libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let (rc, dt) = under_signal_storm(|| {
+            let t0 = now_ms();
+            let rc = poll(&mut pfd, 300);
+            (rc, now_ms() - t0)
+        });
+        assert_eq!(rc, 0, "poll returned {rc}: EINTR leaked to the caller");
+        assert!(
+            dt >= 280,
+            "returned after {dt} ms, short of the 300 ms budget"
+        );
+        assert!(
+            dt < 900,
+            "took {dt} ms for a 300 ms budget: the timeout is being restarted per signal"
+        );
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// Same storm against `waitpid`. Unwrapped, this returns -1 with `status` untouched and the
+    /// caller decodes the initialiser as the child's exit code.
+    #[test]
+    fn waitpid_survives_a_signal_storm() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Nothing may be added between fork() and _exit(): this process is multi-threaded, so
+            // anything that allocates or takes a lock another thread held at fork time can deadlock.
+            unsafe {
+                libc::usleep(250_000);
+                libc::_exit(9)
+            };
+        }
+        let mut st = -1;
+        let r = under_signal_storm(|| {
+            let mut st2 = -1;
+            let r = waitpid(pid, &mut st2, 0);
+            st = st2;
+            r
+        });
+        assert_eq!(r, pid, "waitpid returned {r}: EINTR leaked to the caller");
+        assert!(libc::WIFEXITED(st), "status {st} was never written");
+        assert_eq!(libc::WEXITSTATUS(st), 9);
+    }
+
     #[test]
     fn waitpid_reaps_a_real_child() {
-        // The control: the wrapper must still behave like `waitpid` when no signal interferes.
+        // The control: unchanged behaviour when no signal interferes. See the note above about the
+        // fork/_exit window - nothing may be inserted there.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -116,9 +248,7 @@ mod tests {
 
     #[test]
     fn poll_honours_its_deadline() {
-        // A pipe nobody writes to: `poll` can only come back by timing out. The assertion is on the
-        // ELAPSED time, not on the return value, because the return value was already right before
-        // this module existed - it is the restarted clock that this has to rule out.
+        // A control, not a proof: with no signals this passes against unwrapped code too.
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let mut pfd = [libc::pollfd {
@@ -126,9 +256,9 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         }];
-        let t0 = monotonic_ms();
+        let t0 = now_ms();
         assert_eq!(poll(&mut pfd, 120), 0, "expected a timeout, not readiness");
-        let dt = monotonic_ms() - t0;
+        let dt = now_ms() - t0;
         assert!(
             dt >= 110,
             "returned after {dt} ms, before the 120 ms asked for"
@@ -167,9 +297,9 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         }];
-        let t0 = monotonic_ms();
+        let t0 = now_ms();
         assert_eq!(poll(&mut pfd, 0), 0);
-        assert!(monotonic_ms() - t0 < 1000, "a 0 ms poll blocked");
+        assert!(now_ms() - t0 < 1000, "a 0 ms poll blocked");
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);

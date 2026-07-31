@@ -38,8 +38,14 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   from a `CLOCK_MONOTONIC` deadline, which is what a bounded wait was always supposed to mean.
 - **`kern top` polled a descriptor it did not own.** The event loop builds a two-slot `pollfd`
   array but only the first slot is valid when the inotify watch could not be opened, and the
-  count guarding that was computed and then not used. Found while routing the call through the
-  new wrapper.
+  count guarding that was computed and then not used, and it is now clamped to the array length so
+  the slice cannot panic inside the event loop. Found while routing the call through the wrapper.
+- **`reap()` refuses a non-positive pid.** `waitpid(-1, ..)` means "any child", not "this child": a
+  failed `fork()`'s -1 passed through would have reaped whatever exited first, which on the
+  foreground box path is plausibly the box's own PID 1 that another wait is about to collect.
+- **`poll` degrades honestly when `CLOCK_MONOTONIC` is unavailable.** The deadline helper returned
+  0 on error, which yielded an instant phantom timeout the caller reads as "nothing to read". It
+  now returns `None` and the wait falls back to a plain restart.
 
 ## [0.6.27], 2026-07-30
 
