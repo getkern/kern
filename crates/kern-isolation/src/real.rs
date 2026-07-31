@@ -2997,6 +2997,27 @@ pub fn shed_inherited_fds(keep: i32) {
     }
 }
 
+/// Does `pid1` share OUR `kind` namespace? Compared by the `(dev, ino)` identity of
+/// `/proc/<pid>/ns/<kind>`: `stat` follows the ns link to the nsfs inode, which IS the kernel's
+/// namespace identity (the number `readlink` renders as `net:[…]`).
+///
+/// Fails CLOSED, and the closed direction is `false` = "treat it as separate and try to join". A
+/// wrong `true` would SKIP a namespace and run the command outside part of the box's isolation, so
+/// anything unreadable is left for `setns` to refuse; a wrong `false` only costs the `EPERM` that
+/// this predicate exists to avoid.
+fn shares_our_namespace(pid1: i32, kind: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id =
+        |p: &str| -> Option<(u64, u64)> { std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino())) };
+    match (
+        id(&format!("/proc/self/ns/{kind}")),
+        id(&format!("/proc/{pid1}/ns/{kind}")),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Bring the loopback interface (`lo`) up in the current network namespace via `SIOCSIFFLAGS`, so
 /// `127.0.0.1` works inside an otherwise-isolated box. Best-effort (a fresh net ns owned by our
 /// user namespace grants CAP_NET_ADMIN, so this normally succeeds; failures leave `lo` down).
@@ -3178,8 +3199,16 @@ pub fn exec_in_box(
     // Open every namespace fd BEFORE any setns: once we enter the mount namespace, `/proc` points
     // at the box's, so `/proc/<pid1>/ns/*` would no longer resolve. Order of *entry* matters -
     // user first (so we hold CAP_SYS_ADMIN in the box's userns for the rest); pid before the fork.
-    let ns_order: [(&str, libc::c_int); 6] = [
+    // `cgroup` comes straight after `user`, whose capabilities it needs. Without it an exec'd command
+    // read the HOST's cgroup path out of `/proc/self/cgroup`
+    // (`0::/user.slice/user-1000.slice/user@1000.service/kern.slice/kern-box-<name>-<pid>`) while the
+    // box's own workload correctly reads `0::/`: the same box, two different answers, with the host's
+    // slice layout and the caller's uid disclosed to whatever ran under `kern exec`. A box without a
+    // cgroup namespace (an older kernel, no `CONFIG_CGROUP_NS`) has no `ns/cgroup` file, so it is
+    // skipped exactly as before.
+    let ns_order: [(&str, libc::c_int); 7] = [
         ("user", libc::CLONE_NEWUSER),
+        ("cgroup", libc::CLONE_NEWCGROUP),
         ("ipc", libc::CLONE_NEWIPC),
         ("uts", libc::CLONE_NEWUTS),
         ("net", libc::CLONE_NEWNET),
@@ -3188,13 +3217,23 @@ pub fn exec_in_box(
     ];
     let mut fds: Vec<(libc::c_int, libc::c_int)> = Vec::with_capacity(ns_order.len());
     for (name, flag) in ns_order {
+        // A namespace the box SHARES with us is not one to join, and joining it fails. `--net` is the
+        // case that made this visible: `/proc/<pid1>/ns/net` is not missing there, it EXISTS and
+        // resolves to OUR net ns. Entering the box's user ns first drops the `CAP_SYS_ADMIN` that the
+        // host net ns's owning (initial) user ns requires, so the following `setns(CLONE_NEWNET)` is
+        // refused `EPERM` and every `kern exec` into a `--net` box died with "must be the same user
+        // that started it" - which was also the wrong reason. Measured on x86_64 and a Raspberry Pi 5
+        // on 2026-07-31: 100% of execs into a `--net` box. Compared BEFORE any `setns`, while
+        // `/proc/self/ns/*` still describes where we started.
+        if shares_our_namespace(pid1, name) {
+            continue;
+        }
         let p = cstr(&format!("/proc/{pid1}/ns/{name}"))?;
         let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd >= 0 {
             fds.push((fd, flag));
         }
-        // A missing ns file means it isn't separate (e.g. `--net` shares the host net ns) -
-        // there's nothing to join, so skipping is correct.
+        // A missing ns file means the box is gone; the required-namespace check below catches that.
     }
     // Refuse if the box's core namespaces aren't there to join: if PID 1 has exited (a race), its
     // `/proc/<pid1>/ns/*` vanish, and without this we'd fork+exec in the HOST namespaces - running
