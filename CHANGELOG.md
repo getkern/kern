@@ -19,6 +19,126 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.29], 2026-08-01
+
+### Security
+
+- **`-p` and `--ssh` are now REFUSED with `--net`: a shared network gives the box no port of its own,
+  and publishing one meant publishing a host service under the box's name.** With `--net` the box has
+  no network namespace, so the forwarder's `127.0.0.1:<box_port>` is the host's, and nothing in the
+  kernel distinguishes the box's listener from any other process on the machine. If the box's service
+  is not up (it crashed, it is still starting, it was never in the image) the mapping serves whatever
+  host process owns that number, while `kern ps` shows it as the box's.
+
+  `--ssh` is the case that made this concrete. Measured on 2026-07-31 with an image containing **no
+  sshd at all**: the banner on the published port was byte-identical to the host's own
+  (`SSH-2.0-OpenSSH_9.6p1`), while kern printed `ssh -p <port> … root@127.0.0.1` as the way into the
+  box. On a host with no sshd it is no better, the box's own sshd binds the host's `:22` and is exposed
+  to the whole network on the standard port.
+
+  Both are refused with an error naming the way forward, and `--pod` really is one: verified that a
+  pod box has outbound (`wget http://example.com` succeeds) **and** working `-p` at the same time, so
+  nothing that worked before is lost. The forwarder carries the same rule independently, refusing to
+  forward if it is ever handed a box in its own network namespace, so the guarantee does not rest on
+  one CLI check. Same principle as `--egress-allow`, which already refuses `--net` because it filters
+  the box's OWN network.
+- **`kern exec` into a `--net` box always failed, with the wrong reason.** It joined the box's user
+  namespace and then tried to `setns` into the box's *network* namespace, which under `--net` is the
+  HOST's, owned by the initial user namespace where the process no longer holds `CAP_SYS_ADMIN`. The
+  refusal surfaced as "cannot join the box's namespaces (must be the same user that started it)" when
+  it was in fact the same user. `kern exec` now skips any namespace the box already shares with the
+  caller, decided by namespace identity before the first `setns` and failing closed (an unreadable
+  namespace is treated as separate and left for `setns` to refuse). Verified on x86_64, a Raspberry
+  Pi 5, an Arduino UNO Q and a Jetson Orin Nano: exec into a `--net` box now works and still sees only
+  the box's pid namespace (4 processes against the host's 176 to 588).
+- **A `vgpio` device grant could be dropped in silence.** Only `i2c` normalized the shorthand
+  CONFIG.md documents; every other bus was taken verbatim, so the documented
+  `spi = ["0.0"]  # /dev/spidev0.0` reached the `/dev/`-confinement gate as a bare string, failed it,
+  and vanished. The box started, said nothing, and had no SPI device. Found on a Raspberry Pi 5 with a
+  real `/dev/spidev10.0`. `spi` now resolves `BUS.CS` (validated all-digits before the path is built,
+  so `"0.0/../../etc/shadow"` cannot concatenate its way out of `/dev`), and **every** unresolvable
+  entry in every field now prints why it was skipped instead of disappearing. Verified against a
+  negative-control box on all three ARM boards: the granted node is present, and an ungranted
+  `/dev/gpiochip0` that exists on the host is still refused.
+
+### Fixed
+
+- **A published port is now bound before the box is declared started.** The forwarder used to bind
+  only after the box existed, so a host port taken in the window between the `-p` preflight (which
+  runs early, before the image, mounts and cgroup work) and the bind left `kern box` printing
+  "✔ started", `kern ps` printing the mapping, and nothing listening. The only trace was a message on
+  a stderr that a detached box swallows. Each forwarder now binds the moment it is forked and reports
+  the outcome, and a failure refuses the box, naming the port and the OS reason. The same change
+  removes two silent `continue`s that dropped a mapping entirely when `pipe` or `fork` failed. No
+  measurable cost: 4.6 ms/box with `-p` against 5.1 ms without, 20 runs each.
+- **A SIGKILLed supervisor no longer orphans its port forwarder.** The forwarder is torn down by an
+  RAII Drop, and a Drop does not run on SIGKILL. That is not an exotic case: the supervisor sits in
+  the BOX's cgroup, so an OOM inside the box kills it outright. The forwarder then survived, blocked
+  in `accept()` on a host port that `kern ps` could no longer name and `kern stop` had no box to
+  stop. Found by looking at `ps` rather than at kern: **six** of them alive on a development machine
+  on 2026-08-01, each holding a host port for over an hour, produced by a test that deliberately OOMs
+  a 64 MB box. Each forwarder now arms `PR_SET_PDEATHSIG(SIGKILL)` against the supervisor, with the
+  `getppid()` re-check that closes the fork-to-prctl window. Verified by `kill -9` on the supervisor:
+  before, the port stayed bound indefinitely; after, it is released. This hole predates the RAII
+  change (the hand-written `stop()` calls did not run on SIGKILL either).
+- **A `-p` box that fails to start no longer leaves host ports held.** The forwarders are forked
+  before the `unshare`, with about a dozen fallible steps between that and a running box, and each was
+  an early return that left the bound ports to be released whenever the process happened to exit. They
+  are now owned as one RAII set whose drop stops them, which covers every one of those paths instead
+  of the two success sites that were stopped by hand.
+
+- **`kern exec` now joins the box's cgroup namespace.** An exec'd command read the HOST's cgroup path
+  out of `/proc/self/cgroup` (`0::/user.slice/user-1000.slice/user@1000.service/kern.slice/kern-box-…`)
+  while the box's own workload correctly read `0::/`: the same box, two answers, with the host's slice
+  layout and the caller's uid disclosed to whatever ran under `kern exec`. On a host that runs boxes
+  in per-box systemd scopes the new reading also makes the existing "this exec runs outside the box's
+  caps" warning verifiable rather than merely stated: `/proc/self/cgroup` renders as
+  `0::/../../../session-N.scope`, which says outright that the process sits outside the box's cgroup.
+
+- **A `vdisk:` profile that names a disk pool could be RAM-backed without saying so.** The
+  ext4-on-loop backend is only used for a FOREGROUND box (its teardown is bounded to the box's run),
+  so `-d` and `-it` take the tmpfs path even as root with loop devices and `mkfs.ext4` present. The
+  fallback only printed anything when the profile ALSO set `iops`/`bandwidth`/`persistent`, or asked
+  for at least 1 GiB, so the ordinary case (a disk pool, a modest size) was told nothing at all. Found
+  on a root VPS on 2026-08-01: `backend = "disk:pool"`, `size = "64m"`, `df` inside the box said
+  `tmpfs`. An explicit disk backend that ends up RAM-backed now says which of the two reasons applies
+  (foreground-only, or missing privilege) and CONFIG.md states the condition. The disk path itself is
+  verified working on that host: `/dev/loop0 ext4`, a 256 MB write into a 64 MB vdisk refused at
+  60080 KB, and the workload still running afterwards, which is what a quota is supposed to do.
+- **`kern doctor` told every root host to enable systemd lingering, which fixes nothing there.** As
+  real root kern drives the SYSTEM manager, so boxes are not under `user@<uid>.service` and no login
+  session can stop them. The check now branches on the same predicate that picks the manager
+  (`systemd_scope_mode`) rather than re-deriving it. Measured on a Contabo VPS: a detached box as root
+  was still running with its port bound 30 s after every session closed, lingering off throughout.
+
+### Added
+
+- **`kern doctor` now answers "will a detached box survive my logout?"** It usually will not, and that
+  is the one question a headless board makes urgent. Each box lives in a transient systemd scope under
+  `user@<uid>.service`; without **lingering**, systemd stops that service when the user's last session
+  ends, killing every box under it and removing the `/run/user/<uid>` registry with them. Measured on a
+  Raspberry Pi 5 on 2026-08-01: a detached box publishing `0.0.0.0:8099` was gone 20 s after the last
+  ssh session closed, with no process left and `kern ps`, the port and `kern logs` all empty. After
+  `loginctl enable-linger`, the same box kept serving the page to another machine over the LAN with no
+  session open at all. The check reads `/var/lib/systemd/linger/<user>` (a file test, no subprocess),
+  stays quiet where there is no user manager to stop anything (WSL2), and names the exact command.
+  Both branches verified on the board.
+- `examples/edge-webserver-ssh.sh`: a web server on a headless board, published to the LAN, with
+  `--ssh` into the box. It shows the shape that works, which is build with `--net` and **serve
+  without** it, and checks lingering before it starts. Every claim in it was measured on a Raspberry
+  Pi 5: fetched from another machine over the LAN with no session open, and an ssh session that saw
+  hostname `edgeweb`, 8 processes where the host had 154, `memory.max` at the 128m cap, and no host
+  disk.
+
+### Changed
+
+- **The reported symptom that started all of this** was `kern box --net -p …` on a Raspberry Pi 5
+  showing the mapping in `kern ps` with nothing reachable. Reproduced on x86_64 and on the Pi: the
+  host port DID listen, and every connection was accepted and instantly reset (`curl: (56)`), UDP
+  silently dropped. The cause was the `setns(CLONE_NEWNET)` `EPERM` described above. It is not fixed
+  by making the combination work, because a working version publishes the wrong thing; it is fixed by
+  refusing it and pointing at `--pod`.
+
 ## [0.6.28], 2026-07-31
 
 ### Fixed

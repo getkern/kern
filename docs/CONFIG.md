@@ -140,6 +140,12 @@ let `kern top` / `kern config setup` pre-fill it from what it detects on the hos
 | `usb` | USB devices | by bus / port | no |
 | `extra` | explicit `/dev/*` paths | any (validated) | no |
 
+**How to write an entry.** `i2c` takes a bus number (`"1"`, `"i2c-1"`) or a full path; `spi` takes
+`BUS.CS` (`"0.0"`, `"spidev0.0"`) or a full path. **Every other field takes the full `/dev/…` path**
+(`uart = ["/dev/ttyUSB0"]`, not `["ttyUSB0"]`). An entry kern cannot resolve to a path is skipped with
+a line on stderr saying which field and which entry: a device grant that vanished quietly used to be
+indistinguishable from one that was honoured, right up until the workload failed.
+
 `pins`/`pwm`/`adc`/`onewire` are lines of a controller, so they need a `backend` naming a `[[gpio]]`
 id. The rest are standalone host device nodes: use `backend = "host"`, or any declared `[[gpio]]` id as
 the anchor. Whatever you list, kern binds only the paths that **exist** on this host (absent ones are
@@ -160,7 +166,10 @@ persistent = true          # survive box removal (default: false → scratch, di
 ```
 
 A `vdisk:` appears in the box at `/vdisk/<name>`: a RAM tmpfs when rootless, or an ext4-on-loop image
-with a real quota when privileged.
+with a real quota when privileged **and the box runs in the foreground**. The ext4 backend's teardown
+is bounded to the box's run, so `-d` and `-it` take the tmpfs path even as root; kern says so when a
+`backend = "disk:…"` profile ends up RAM-backed, and the size cap is enforced either way. `iops`,
+`bandwidth` and `persistent` need the ext4 backend and are reported as unapplied without it.
 
 ### Physical declarations, what a profile's `backend` points at
 

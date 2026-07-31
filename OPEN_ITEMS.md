@@ -89,3 +89,83 @@ lives in `bindings/`, which ships as the separately versioned `kern-sandbox` pac
 the kern binary, so it is written down here instead of being fixed in a hurry the afternoon of a
 release: a change to a lifecycle whose failure mode is not understood is how a leak becomes a kill
 of something that should have lived.
+
+## Binary size: measured 2026-07-31, deliberately NOT applied
+
+Published: **1893344 B x86_64 (1.81 MB)**, **1577448 B aarch64 (1.50 MB)**. Growth since v0.6.22 is
+**+2.9%** over six releases, which is not a problem and was the thing worth checking first.
+
+The release profile is already at its limit (`opt-level="z"`, `lto="fat"`, `codegen-units=1`,
+`panic="abort"`, `strip=true`). Two negative results, recorded so nobody spends an evening on them again:
+
+- **`-C force-unwind-tables=no` alone changes nothing.** Byte-identical output, identical `.text`,
+  identical `.eh_frame` (186980 B). The tables come from the precompiled std for the musl target;
+  no flag on our own code reaches them. This is why `build-std` is the only real lever.
+- **`opt-level="s"` is 11.5% WORSE than `"z"`** (2110432 vs 1893344, `.text` 1.72 vs 1.43 MB).
+  The existing choice was right; now there is a number instead of a comment.
+
+What does work, rebuilding the standard library on nightly:
+
+| variant | x86_64 | aarch64 | panic messages |
+|---|---|---|---|
+| published | 1.81 MB | 1.50 MB | intact |
+| `-Z build-std` | 1.40 MB (-22.8%) | not measured | **intact** |
+| `+ -Cpanic=immediate-abort -Cforce-unwind-tables=no` | 1.22 MB (-32.6%) | 1.00 MB (-33.4%) | **gone** |
+
+`.eh_frame` drops from 186980 B to **144 B**; `.text` falls 23%. The smallest x86_64 build passes
+**13/13** of `kern-verify.sh` and is marginally faster (2.3 ms median against 2.5).
+
+**Decision: `immediate-abort` never, `build-std` only after launch, and only if the cost is accepted.**
+
+- A panic then prints nothing at all: no file, no line. The 34 production `unwrap`s are safe *by
+  construction*, and "by construction" is exactly the class of claim that turned out false five times
+  in one day (`-n5`, `--json=1`, the `rm -rf` comment, flags "verified by reading"). The day the 35th
+  is wrong, "file and line" versus "it died" is ten minutes versus a week.
+- `cargo test` cannot run under that profile: its harness catches panics to report failures, so the
+  shipped binary would stop being the tested one where panics are concerned.
+- nightly in CI is a new way to break that does not exist today, across 8 assets on 4 targets. And a
+  contributor on stable could no longer build the published binary, which on an Apache-2.0 project
+  soliciting contributions costs more than 400 KB.
+- aarch64 was cross-compiled only, never executed on the Pi 5, Jetson or UNO Q.
+
+## `kern ps` prints the mapping recorded at start, not a live probe
+
+A published port is now a fact at box **start**: the forwarder binds its host socket before `kern box`
+prints "started", and a bind that fails refuses the box instead of leaving a mapping nothing serves.
+What `kern ps` prints afterwards is still the mapping stored in the registry, not an answer to "is
+anything listening on that port right now".
+
+In practice the two now agree. A forwarder is a child of the box's supervisor and is torn down with it,
+so a live box implies live forwarders. The gap that remains is a forwarder that dies on its own, killed
+by hand or by the OOM killer, while its box keeps running: `kern ps` would still show the mapping.
+
+How to settle it: record the forwarder PIDs in the registry entry and have `ps` check them, one
+`kill(pid, 0)` per published port. It was not done with the rest because the honest check is "does the
+forwarder still exist", not "does something listen": probing the port would report the mapping as
+healthy when an unrelated process grabbed it after the forwarder died, which is a worse answer than no
+answer at all.
+
+## `--ssh` needs `newuidmap`, and three of our four boards do not have it
+
+`--ssh` forks an sshd inside the box, and sshd's privilege separation needs more than one uid in the
+box's user namespace. kern's default single-uid map does not provide that, so `--ssh` requires the
+`--uid-range` path: the setuid `newuidmap`/`newgidmap` helpers plus an `/etc/subuid` + `/etc/subgid`
+allocation for the caller.
+
+Measured 2026-07-31: present on an Ubuntu x86_64 desktop, **absent on a stock Raspberry Pi OS, on the
+Arduino UNO Q and on the Jetson Orin Nano**. kern detects it and warns before the box starts ("--ssh
+needs a uid range … so sshd will refuse the login"), which is the honest behaviour and not a defect,
+but it means the flag most likely to be reached for on a headless board is the one least likely to
+work there. The failure a user then sees from the client is
+`kex_exchange_identification: Connection closed by remote host`, which says nothing about uid maps.
+
+`kern doctor` already reports the ingredient (`--uid-range / --user / --ssh: newuidmap + /etc/subuid
+present`), so the environment fact is covered. What is not: the warning kern prints at box start does
+not name the fix, and the failure the client then sees is
+`kex_exchange_identification: Connection closed by remote host`, which says nothing about uid maps.
+
+How to settle it: (1) put the fix in the warning itself (`apt install uidmap`, and the `/etc/subuid`
+line if that is what is missing), so the message is actionable on the board where it fires; (2) look at
+whether a two-uid map is enough for sshd's privilege separation, which would drop the `newuidmap`
+dependency entirely. Neither is started. Installing `uidmap` on a Raspberry Pi 5 on 2026-08-01 was
+enough to make `--ssh` work there with no other change.
