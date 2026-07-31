@@ -1045,7 +1045,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             "cannot publish host port {hp}: {e} - already in use (another box, or a non-kern process)"
         )));
     }
-
     // `--hostname`: validate before it reaches `sethostname`. `--tmpfs`: parse the Docker-style
     // specs (blocking a tmpfs over the hardened mounts). `--user`: parse UID[:GID].
     let hostname = validate_hostname(args.hostname)?;
@@ -1933,6 +1932,26 @@ fn prepare_vdisk(
                 };
             }
         }
+    }
+    // `backend = "disk:<pool>"` is an explicit request for a DISK, and this is the path where it did
+    // not happen. Until now it only got a message if the profile ALSO set `iops`/`bandwidth`/
+    // `persistent`, or asked for >= 1 GiB - so the ordinary case (a disk pool, a modest size) was told
+    // nothing at all and got RAM. Found on a root VPS on 2026-08-01: `backend = "disk:pool"`,
+    // `size = "64m"`, `mkfs.ext4` present, `/dev/loop-control` writable, and `df` inside the box said
+    // `tmpfs`, because the box was `--detach`ed. Name the reason, since the two are fixed differently.
+    if vd.backend_dir.is_some() {
+        let why = if !ext4_ok {
+            "the ext4-loop backend is only used for a FOREGROUND box (its teardown is bounded to the \
+             box's run); drop -d / -it to get the disk-backed quota"
+        } else {
+            "the ext4-loop backend needs privilege: root (or the `disk` group) for /dev/loop-control, \
+             plus mkfs.ext4 - see `kern doctor`"
+        };
+        eprintln!(
+            "kern: vdisk:{} asked for a disk backend but is RAM-backed (tmpfs) here: {}. The size cap \
+             is still enforced; the data is EPHEMERAL and counts against the box's memory.",
+            vd.name, why
+        );
     }
     // Rootless fallback: a size-capped tmpfs. Be honest about what it can't do.
     if vd.iops.is_some() || vd.bandwidth.is_some() || vd.persistent {
