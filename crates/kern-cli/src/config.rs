@@ -934,6 +934,27 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("/dev/i2c-{n}"))
 }
 
+/// The canonical `/dev` path of an SPI device reference. `"0.0"` or `"spidev0.0"` →
+/// `Some("/dev/spidev0.0")`; a full `/dev/…` path or anything that is not `BUS.CS` → `None`.
+///
+/// This exists because CONFIG.md has always documented `spi = ["0.0"]  # /dev/spidev0.0` while only
+/// `i2c` normalized its shorthand: every other bus was taken verbatim, so `"0.0"` reached the
+/// `starts_with("/dev/")` confinement gate as a bare string, failed it, and was dropped WITHOUT a
+/// word. A box asking for an SPI device then started, said nothing, and had no SPI device. Found on a
+/// Raspberry Pi 5 on 2026-07-31 with `spi = ["10.0"]` and a real `/dev/spidev10.0` on the host.
+///
+/// Same defence as [`canon_i2c_bus`]: both halves are validated as all-digits BEFORE the path is
+/// built, so a crafted `"0/../../etc/shadow"` can never concatenate its way out of `/dev`.
+pub(crate) fn canon_spi_dev(s: &str) -> Option<String> {
+    if s.starts_with('/') {
+        return None;
+    }
+    let n = s.strip_prefix("spidev").unwrap_or(s);
+    let (bus, cs) = n.split_once('.')?;
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    (digits(bus) && digits(cs)).then(|| format!("/dev/spidev{bus}.{cs}"))
+}
+
 /// Can the CURRENT user open `path` for read+write? A pure permission probe via `access(2)`: it does
 /// NOT open the node, so it cannot disturb a peripheral that reacts to being opened (a modem that
 /// resets on open, a UART that asserts DTR).
@@ -1173,23 +1194,46 @@ fn vgpio_device_paths(e: &VGpioEntry) -> Vec<String> {
             None
         })
     });
+    // `spi` gets the same shorthand treatment as `i2c`, because CONFIG.md documents one.
+    let spi = e.spi.iter().filter_map(|s| {
+        if s.starts_with('/') {
+            return Some(s.clone());
+        }
+        canon_spi_dev(s).or_else(|| {
+            eprintln!(
+                "kern: vgpio spi entry {s:?} is not a BUS.CS device (e.g. \"0.0\", \"spidev0.0\") or a /dev/ path - skipped"
+            );
+            None
+        })
+    });
+    // The remaining buses are `/dev/…` paths verbatim. A NON-path entry cannot be normalized here
+    // (there is no one shape for a uart, a camera and a USB device), but it must not VANISH either:
+    // the whole point of a device grant is that the box gets what was asked for, and a grant that is
+    // silently dropped is indistinguishable from one that was honoured until the workload fails.
     let rest = [
-        &e.spi,
-        &e.uart,
-        &e.can,
-        &e.camera,
-        &e.audio,
-        &e.bluetooth,
-        &e.usb,
-        &e.input,
-        &e.midi,
-        &e.display,
-        &e.extra,
+        ("uart", &e.uart),
+        ("can", &e.can),
+        ("camera", &e.camera),
+        ("audio", &e.audio),
+        ("bluetooth", &e.bluetooth),
+        ("usb", &e.usb),
+        ("input", &e.input),
+        ("midi", &e.midi),
+        ("display", &e.display),
+        ("extra", &e.extra),
     ]
     .into_iter()
-    .flatten()
-    .cloned();
-    i2c.chain(rest).collect()
+    .flat_map(|(field, list)| list.iter().map(move |s| (field, s)))
+    .filter_map(|(field, s)| {
+        if s.starts_with('/') {
+            return Some(s.clone());
+        }
+        eprintln!(
+            "kern: vgpio {field} entry {s:?} is not a /dev/ path - skipped (write the full path, e.g. \"/dev/ttyUSB0\")"
+        );
+        None
+    });
+    i2c.chain(spi).chain(rest).collect()
 }
 
 /// A resolved `[[vdisk]]` profile: a size-capped volume the box mounts at `/vdisk/<name>`. The
@@ -2289,6 +2333,48 @@ mod tests {
         assert_eq!(size_to_bytes("g"), None); // unit with no number
         assert_eq!(size_to_bytes("0"), None); // zero rejected
         assert_eq!(size_to_bytes("99999999999g"), None); // overflows u64 → rejected
+    }
+
+    /// The shorthand CONFIG.md documents for `spi` must actually resolve, and must not be a way out
+    /// of `/dev`. Before this, `spi = ["0.0"]` was passed through verbatim, failed the
+    /// `starts_with("/dev/")` gate downstream, and the grant disappeared with no message: the box
+    /// started and simply had no SPI device. Found on a Raspberry Pi 5 with a real `/dev/spidev10.0`.
+    #[test]
+    fn spi_shorthand_resolves_and_cannot_escape_dev() {
+        assert_eq!(canon_spi_dev("0.0"), Some("/dev/spidev0.0".into()));
+        assert_eq!(canon_spi_dev("10.0"), Some("/dev/spidev10.0".into())); // two-digit bus (Pi 5)
+        assert_eq!(canon_spi_dev("spidev1.2"), Some("/dev/spidev1.2".into()));
+        // A full path is the caller's job to keep (the confinement gate handles it), not ours.
+        assert_eq!(canon_spi_dev("/dev/spidev0.0"), None);
+        // Anything that is not BUS.CS is refused rather than concatenated into a path.
+        assert_eq!(canon_spi_dev("0"), None); // no chip-select
+        assert_eq!(canon_spi_dev("0."), None);
+        assert_eq!(canon_spi_dev(".0"), None);
+        assert_eq!(canon_spi_dev("a.b"), None);
+        assert_eq!(canon_spi_dev("0.0/../../etc/shadow"), None); // traversal
+        assert_eq!(canon_spi_dev("../mem.0"), None);
+        assert_eq!(canon_spi_dev(""), None);
+    }
+
+    /// End to end through the resolver: the documented shorthand reaches `devs` as a real path.
+    #[test]
+    fn a_vgpio_spi_shorthand_reaches_the_device_list() {
+        let mut cfg = KernConfig::default();
+        cfg.vgpio.push(VGpioEntry {
+            name: "sensor".into(),
+            backend: "host".into(),
+            spi: vec!["0.0".into()],
+            ..Default::default()
+        });
+        let r = resolve_vgpio(&cfg, "sensor").unwrap();
+        // The path is only kept if the host really has that node, so assert on the RESOLUTION rather
+        // than on this machine's hardware: an unresolved entry would not even be a candidate.
+        assert_eq!(
+            vgpio_device_paths(&cfg.vgpio[0]),
+            vec!["/dev/spidev0.0".to_string()],
+            "the documented `spi = [\"0.0\"]` shorthand must expand to a /dev path"
+        );
+        let _ = r;
     }
 
     #[test]
