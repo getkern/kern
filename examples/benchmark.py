@@ -162,7 +162,7 @@ def main():
     print(f"Each batch is capped at ~{args.budget / 1000:.0f}s, so a slow engine shortens its batch")
     print("instead of making you wait: the actual run count per runtime is printed below.")
     print("(kern here is the bare box, no cgroup cap - like bubblewrap; add a hard cap with the")
-    print(" default `kern box` and it is ~5.5 ms, tied with crun.)\n")
+    print(" default `kern box` and it is ~2.4 ms where the direct cgroup path is reachable.)\n")
 
     results = []
     for label, cmd_for, env in rows:

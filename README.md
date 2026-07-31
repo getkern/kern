@@ -6,10 +6,10 @@
 
 **A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
 
-**A real, kernel-enforced container in ~3.3 ms, out of one ~1.8 MB binary with no daemon.**
+**A real, kernel-enforced container in ~3.6 ms, out of one ~1.8 MB binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.3 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.6 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` the only dependency</sub>
@@ -74,9 +74,11 @@ r = kern.run_code("print(sum(range(100)))")   # network OFF, hard caps, a timeou
 print(r.stdout, r.success)                     # → a fresh, discarded-after box
 ```
 
-That call measures **16 ms** end to end on the x86_64 desktop (median of 60, after warm-up). Most of it
-is CPython starting up *inside* the box, not the box: the same machine runs `kern box --image alpine --
-/bin/true` in 3.4 ms, and a bare `python3 -c "print(1)"` on the host already costs 7.8 ms.
+That call measures **16 ms** end to end on the x86_64 desktop (median of 60, after warm-up), and the
+subtraction is worth publishing rather than a summary of it: **~8.4 ms** is CPython starting at all
+(`python3 -c pass` on the host, same machine), **~3.6 ms** is the box, and the remaining **~4.3 ms** is
+the binding's own work, which is not attributed further. So the interpreter is about half of it, not
+"nearly all" - the shape this figure used to be described with.
 
 ## What you'd use it for
 
@@ -103,7 +105,7 @@ otherwise reach for a container, a cloud sandbox, or root.
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes** | opt-in (rootless mode) | yes |
 | Cold start (a bare box) | **~2.2 ms** | ~289 ms | ~288 ms |
-| Cold start (from an OCI image) | **~3.3 ms** | ~289 ms | ~288 ms |
+| Cold start (from an OCI image) | **~3.6 ms** | ~289 ms | ~288 ms |
 | Footprint | **one 1.8 MB static binary** | ~186 MB daemon stack | multi-binary install |
 | OCI images (pull / build) | **yes** | yes | yes |
 | Resource caps without a full box | **yes (`kern run`)** | no | no |
@@ -132,7 +134,7 @@ translates what maps, **refuses** what would change behaviour, and never silentl
 
 - ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.8 MB static binary, **one Rust dependency**
   (`libc`); it shells out to the system's `curl`/`tar` only to *pull* images (running a box needs
-  neither). A cold start faster than a daemon round-trip; **~7 MB** RSS per box vs an always-on
+  neither). A cold start faster than a daemon round-trip; **~2 MB** RSS per box vs an always-on
   ~186 MB daemon (`dockerd` + `containerd`). `kern ps` reads state straight from the kernel.
 - 👤 **Rootless by default.** Unprivileged user namespaces: your uid maps to root *inside* the box,
   and only there. Single-uid is the default and is `libc`-pure (no helper, smallest id surface);
@@ -188,6 +190,13 @@ kern box check --image alpine --memory 256m -- cat /sys/fs/cgroup/memory.max   #
 kern box oom   --image alpine --memory 256m -- \
   sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=512' ; echo "exit=$?"       # exit=137, OOM-killed
 ```
+
+The cap binds on every host tested. On the Arduino UNO Q the BOX exits 143 rather than 137, and the
+reason is measurable rather than a platform quirk: the workload itself is SIGKILLed by the cgroup
+(`dd` exits **137** there, captured to a file before the shell dies), and the box's own init is
+terminated afterwards, which is the 143. Android's `lmkd` is **not running** on that board, so it is
+the cgroup doing the killing, not a host-level low-memory killer. `memory.max` reads back 33554432
+throughout.
 
 `cpu.max` reads the same way: `50000 100000` is half a core, `200000 100000` is two.
 
@@ -391,7 +400,7 @@ A sandboxed shell from any OCI image. The image stays read-only; your writes go 
 kern box dev --image alpine -it -- sh
 ```
 
-That box starts in **~3.3 ms**, not the ~2.2 ms of a bare rootfs box: an OCI image gets a rootless
+That box starts in **~3.6 ms**, not the ~2.2 ms of a bare rootfs box: an OCI image gets a rootless
 uid-range mapping so an official image can drop privilege in its entrypoint, and that costs two
 setuid helpers (~1.1 ms, run concurrently, unavoidable without `CAP_SETUID`). Measure it yourself
 with `kern bench --image alpine`, or drop it with `--no-uid-range` if your workload stays root.
@@ -539,7 +548,7 @@ reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd** |
 | **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
-| **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), **COPY globs** (`*.txt`, `src/*`, `[ab].conf`), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, layer cache, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box |
+| **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), **COPY globs** (`*.txt`, `src/*`, `[ab].conf`), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first, including steps before the edit |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context: keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: export/import an image tar, `docker load`-compatible |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
@@ -710,29 +719,29 @@ timed with the shell:
 
 | what you actually type | kern | docker | podman |
 |---|---:|---:|---:|
-| a throwaway box (`run … true`) | **3.3 ms** | 289.2 ms | 287.5 ms |
-| `exec` into a running service | **0.9 ms** | 42.2 ms | 150.6 ms |
-| list what is running (`ps`) | **0.5 ms** | 8.2 ms | 15.3 ms |
-| read logs | **0.5 ms** | 8.3 ms | 39.9 ms |
-| stop a service (init handles SIGTERM) | **4 ms** | ~300 ms | |
+| a throwaway box (`run … true`) | **3.6 ms** | 292.9 ms | 287.5 ms |
+| `exec` into a running service | **1.2 ms** | 42.2 ms | 150.6 ms |
+| list what is running (`ps`) | **0.7 ms** | 8.2 ms | 15.3 ms |
+| read logs | **0.7 ms** | 8.3 ms | 39.9 ms |
+| stop a service (init handles SIGTERM) | **4.7 ms** | ~300 ms | |
 | bring a 2-service stack up | **185 ms** | 301 ms | |
 
 > Reproduce any row with `time`, on both sides. No script of ours is involved.
 
 **One row needs a caveat we would rather state than be caught on.** Stopping a service whose init does
-*not* handle SIGTERM takes 10 s on Docker and Podman, and 4 ms on kern. That is **not** Docker being
+*not* handle SIGTERM takes 10 s on Docker and Podman, and 4.7 ms on kern. That is **not** Docker being
 slow: a PID-namespace init discards signals it has no handler for, so the container genuinely cannot
 die of SIGTERM, and waiting the full grace before `SIGKILL` is the correct, documented behaviour. kern
 reads `/proc/<pid>/status` first and skips a wait that provably cannot end. The honest comparison is
-the row above, with an init that *does* handle the signal: 4 ms against ~300, for the same reason every
+the row above, with an init that *does* handle the signal: 4.7 ms against ~300, for the same reason every
 other row is fast, not because of a container that ignores signals.
 
 | host | kernel | **kern** | bubblewrap | runc | docker |
 |---|---|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.6 ms** | 3.0 ms | 13.8 ms | 289.2 ms |
-| Raspberry Pi 5 | v6.6-rpi | **11.9 ms** † | not installed | not installed | not installed |
-| Jetson Orin Nano | v5.15-tegra | **13.4 ms** † | 5.6 ms | 32 ms ‡ | 472 ms ‡ |
-| Arduino UNO Q | **v6.16 Android** | **91.7 ms** † | 15.0 ms | 76 ms ‡ | 858 ms ‡ |
+| x86_64 desktop | v7.0 | **2.6 ms** | 2.9 ms | 13.8 ms | 292.9 ms |
+| Raspberry Pi 5 | v6.6-rpi | **11.8 ms** † | not installed | not installed | not installed |
+| Jetson Orin Nano | v5.15-tegra | **12.5 ms** † | 5.6 ms | 32 ms ‡ | 472 ms ‡ |
+| Arduino UNO Q | **v6.16 Android** | **91.5 ms** † | 15.0 ms | 76 ms ‡ | 858 ms ‡ |
 
 kern and bubblewrap were measured together on 2026-07-30, three repeats each, median of medians, on an
 idle host. ‡ = runc and docker are carried over from the earlier round and were **not** re-measured that
@@ -760,9 +769,9 @@ systemd-run --user --scope bash     # pay it once, then run kern inside that she
 
 | board | as an SSH login | inside one scope | + `--bind-rootfs` |
 |---|---:|---:|---:|
-| Raspberry Pi 5 | 11.7 ms | **3.0** | **2.8** |
-| Jetson Orin Nano | 12.8 ms | **4.6** | **4.2** |
-| Arduino UNO Q | 91.9 ms | **35.5** | **11.3** |
+| Raspberry Pi 5 | 11.8 ms | **3.0** | **2.8** |
+| Jetson Orin Nano | 12.5 ms | **4.6** | **4.2** |
+| Arduino UNO Q | 91.5 ms | **35.5** | **11.3** |
 
 All four columns come from ONE sitting per board, so they compare with each other; the small drift
 against the table above (11.7 vs 11.9 on the Pi) is two rounds an hour apart, not a change.
@@ -776,7 +785,7 @@ At the same level of work, from the same round:
 
 | board | kern, cgroup off | bubblewrap | |
 |---|---:|---:|---|
-| x86_64 desktop | **2.3 ms** | 3.0 ms | kern |
+| x86_64 desktop | **2.2 ms** | 2.9 ms | kern |
 | Jetson Orin Nano, `--bind-rootfs` | **3.5 ms** | 5.6 ms | kern |
 | Arduino UNO Q, `--bind-rootfs` | **9.6 ms** | 15.0 ms | kern |
 | Raspberry Pi 5, `--bind-rootfs` | **2.3 ms** | not installed | |
@@ -790,14 +799,13 @@ are compared with each other rather than each with its own best flag.
 
 Wherever kern can take its **direct** cgroup path it does not pay the scope toll at all: 2.6 ms on x86
 with the cap enforced, against 4.2 ms for `systemd-run --user --scope /bin/true` on that same machine,
-which is the round trip kern is avoiding. **4.2 ms inside WSL2** with the cap enforced comes from the
-previous round and could not be re-measured (the Windows host was off); `systemd-run` does not exist
-there at all, so the direct path was already the only one.
+which is the round trip kern is avoiding. **3.4 ms inside WSL2** with the cap enforced, re-measured on
+2026-07-31; `systemd-run` does not exist there at all, so the direct path was already the only one.
 
-kern is the fastest sandbox on the desktop at **~2.2 ms**, ahead of bubblewrap at 3.0, and the top tier is
+kern is the fastest sandbox on the desktop at **~2.2 ms**, ahead of bubblewrap at 2.9 by 0.7 ms, and the top tier is
 all within a few ms: nobody wins single-shot latency outright. The real gap is to the **engines**,
 **~125x faster** than podman (~288 ms) and Docker (~289 ms), which round-trip a daemon every run. Beyond
-one start: **~500 boxes/s**, **~7 MB** RSS per box, **0 resident** where Docker keeps ~186 MB before you
+one start: **~457 boxes/s**, **~2 MB** RSS per box, **0 resident** where Docker keeps ~186 MB before you
 run anything. Where the time goes, phase by phase: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 Reproduce with **[`examples/benchmark.py`](examples/benchmark.py)** (auto-detects the runtimes you
@@ -852,7 +860,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.27.** Everything in [Features](#features) works today and is tested (666 Rust, 61 Python and 50
+**0.6.27.** Everything in [Features](#features) works today and is tested (667 Rust, 61 Python and 50
 Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
 real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
 starts in single-digit milliseconds from one **~1.8 MB** binary. Versioned under semver: each release is the official

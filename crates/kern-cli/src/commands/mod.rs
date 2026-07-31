@@ -4485,14 +4485,23 @@ pub fn gc(images: bool) -> Result<(), Error> {
 /// An image ships directories with their original modes, and real images ship read-only ones: alpine's
 /// `/proc` is `r-xr-xr-x`, amazonlinux adds `/root`, `/boot` and `/sbin`. Unlinking a child needs WRITE
 /// on its parent directory, so `std::fs::remove_dir_all` stops at the first of them with EACCES, and so
-/// does `rm -rf` (verified: it leaves the tree and still exits 0). 62 such directories sat in this
-/// machine's cache, which is why `kern gc --images` had never actually cleared it.
+/// does `rm -rf`, which leaves the tree too - but `rm` REPORTS it and exits 1. kern's defect was the
+/// other half: it printed to stderr and returned Ok, so `kern gc --images && echo cleaned` printed
+/// "cleaned" over an untouched cache while `rm -rf ... && echo cleaned` prints nothing. An earlier
+/// version of this comment claimed `rm` exits 0, measured by reading `$?` after a pipe - which reads
+/// the exit of `head`, not of `rm`. The rule against that is written down in this project, and it was
+/// broken in the act of producing the false claim. 62 such directories sat in this machine's cache,
+/// which is why `kern gc --images` had never actually cleared it.
+///
+/// Also called by `doctor` on overlayfs workdirs, a different shape of tree entirely: their
+/// `work/work` is mode 000, created by uid 0 inside a user namespace that maps to the caller's
+/// real uid, so the chmod reaches it. The paragraph above describes only the OCI-image caller.
 ///
 /// We own these directories, so the fix is to restore write permission on the way down and then remove.
 /// Only ever applied to a path kern created inside its own cache, and only to DIRECTORIES: file modes
 /// are irrelevant to unlinking and are left alone. Symlinks are unlinked, never followed, so a link
 /// pointing out of the tree cannot lead the chmod anywhere.
-fn remove_tree_forced(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn remove_tree_forced(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     // Every failure names the path AND why. "Permission denied" on its own sent me hunting through 3 GB
@@ -4524,7 +4533,8 @@ fn remove_tree_forced(path: &std::path::Path) -> std::io::Result<()> {
     // image ships read-only directories with their original modes (alpine's `/proc` is r-xr-xr-x;
     // amazonlinux adds `/root`, `/boot`, `/sbin`), and unlinking a child needs WRITE on its parent, so
     // `std::fs::remove_dir_all` stops at the first one with EACCES. So does `rm -rf`, which leaves the
-    // tree and still exits 0. 62 such directories sat in this machine's cache, which is why
+    // tree, but `rm` reports it and exits 1; kern's defect was printing to stderr and returning Ok.
+    // 62 such directories sat in this machine's cache, which is why
     // `kern gc --images` had never actually cleared it.
     let mode = md.permissions().mode();
     if mode & 0o700 != 0o700 {
@@ -5659,23 +5669,41 @@ fn image_size(cache: &std::path::Path, stem: &str) -> u64 {
 /// 76 ms. It is the same work, done again each time, for a number that CANNOT have changed: an
 /// extracted image is immutable once its `.ok` sentinel is written.
 ///
+/// INVARIANT, stated because everything here rests on it and nothing enforced it: **nothing writes
+/// into an image directory after its `.ok` sentinel exists.** Extraction completes, then the sentinel
+/// is written; a re-pull rewrites both. A caller that added to a cached directory WITHOUT rewriting
+/// the sentinel would be served a stale total forever - verified by adding 3 MB to an extracted
+/// alpine and watching `kern images` keep reporting 8.0M. No such caller exists today; if one is
+/// added, it must touch the sentinel, and this comment is the only thing that says so.
+///
 /// So the total is cached in `<dir>.size` as `<stamp> <bytes>`, where `stamp` is the mtime of the
 /// thing that changes when the content does. A re-pull rewrites the sentinel, the stamp no longer
 /// matches, and the size is recomputed. Anything unreadable, malformed or stale simply recomputes:
 /// the cache can only ever save work, never change an answer.
 fn dir_size_cached(dir: &std::path::Path, stamp_of: &std::path::Path) -> u64 {
-    let stamp = std::fs::metadata(stamp_of)
-        .and_then(|m| m.modified())
-        .ok()
+    // mtime in WHOLE SECONDS plus the sentinel's SIZE. The mtime alone left a second, unwritten
+    // precondition: that every rewrite of `.ok` lands in a different second from the last. Two
+    // commands in a row can break that - `kern rmi alpine && kern pull alpine` inside one second
+    // rewrites the sentinel with the same mtime, and the sidecar from the OLD image stays valid. The
+    // size closes it: a rewritten sentinel almost always differs in length, and when it does not, it
+    // is the same reference for the same image.
+    let md = std::fs::metadata(stamp_of).ok();
+    let stamp = md
+        .as_ref()
+        .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let slen = md.as_ref().map(|m| m.len()).unwrap_or(0);
     let side = std::path::PathBuf::from(format!("{}.size", dir.display()));
     if stamp != 0 {
         if let Ok(body) = std::fs::read_to_string(&side) {
+            // THREE fields now: `<mtime> <sentinel-size> <bytes>`. Reading two left `b` holding the
+            // size instead of the total - a shape the old two-field file would also have parsed, which
+            // is why the format check is positional and strict rather than lenient.
             let mut it = body.split_whitespace();
-            if let (Some(s), Some(b)) = (it.next(), it.next()) {
-                if s.parse::<u64>() == Ok(stamp) {
+            if let (Some(s), Some(sl), Some(b)) = (it.next(), it.next(), it.next()) {
+                if s.parse::<u64>() == Ok(stamp) && sl.parse::<u64>() == Ok(slen) {
                     if let Ok(bytes) = b.parse::<u64>() {
                         return bytes;
                     }
@@ -5685,7 +5713,7 @@ fn dir_size_cached(dir: &std::path::Path, stamp_of: &std::path::Path) -> u64 {
     }
     let bytes = dir_size(dir);
     if stamp != 0 {
-        let _ = std::fs::write(&side, format!("{stamp} {bytes}\n"));
+        let _ = std::fs::write(&side, format!("{stamp} {slen} {bytes}\n"));
     }
     bytes
 }
@@ -5959,13 +5987,24 @@ mod image_size_is_memoised {
             "warm read matches too"
         );
 
-        // Grow the tree WITHOUT touching the stamp: the cache is entitled to keep serving the old
-        // total, which is exactly why the stamp has to be the thing that changes with the content.
+        // Grow the tree WITHOUT touching the stamp file: the cache is entitled to keep serving the old
+        // total. This is the INVARIANT the function documents - nothing writes into an image
+        // directory after its sentinel exists - and the test pins it rather than pretending the cache
+        // can detect a change it is not keyed on.
         std::fs::write(dir.join("c"), vec![0u8; 500]).expect("write");
         assert_eq!(
             dir_size_cached(&dir, &stamp),
             walked,
             "same stamp, same answer: the cache is keyed on the stamp, not on a guess"
+        );
+
+        // A sentinel rewritten to a DIFFERENT LENGTH inside the same second must still invalidate:
+        // mtime alone left `kern rmi x && kern pull x` able to serve the old image's size.
+        std::fs::write(&stamp, b"a-longer-reference").expect("restamp same second");
+        assert_eq!(
+            dir_size_cached(&dir, &stamp),
+            3500,
+            "a sentinel of a different size must force a recompute even within one second"
         );
 
         // Rewrite the stamp, as a re-pull does, and the size must be recomputed.
@@ -5987,7 +6026,7 @@ mod gc_clears_read_only_image_dirs {
 
     /// An extracted OCI image ships read-only directories with their original modes, and unlinking a
     /// child needs WRITE on its parent, so `std::fs::remove_dir_all` stops at the first one with
-    /// EACCES. `rm -rf` does too, and still exits 0. That is why `kern gc --images` had never cleared
+    /// EACCES. `rm -rf` leaves the tree too, but reports it and exits 1. That is why `kern gc --images` had never cleared
     /// a cache containing alpine (whose `/proc` is `r-xr-xr-x`): 62 such directories sat in the one on
     /// this machine. Asserted BOTH ways, so the test cannot pass for the wrong reason if the fix is
     /// reverted: the standard call must FAIL on this fixture first.

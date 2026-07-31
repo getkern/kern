@@ -468,7 +468,10 @@ const REJECT_MEMORY_SWAP: &str =
 /// is the format flag: `kern ps --jsn` printed the human table and exited 0, so a script that asked for
 /// JSON got prose and had no way to tell.
 ///
-/// The message lists `allowed` rather than restating it, so the text cannot drift from the check. A bare
+/// The message POINTS AT `--help` rather than enumerating `allowed`: that list is a hand-kept
+/// duplicate of what the parser accepts, and stating it to a user who is already confused asserts,
+/// as fact, what the verb takes. This line used to say the opposite and call it an advantage -
+/// left stale by the fix twenty lines below, which is the same way three earlier defects were born. A bare
 /// `-` and everything after `--` are left alone: the former is a conventional stdin marker, the latter is
 /// a workload's own argv and not ours to judge.
 /// `args[0]` is the verb (or subcommand) itself and is skipped; callers with a nested subcommand
@@ -488,21 +491,31 @@ pub(crate) fn reject_unknown_flags(
         if !s.starts_with('-') || s == "-" {
             continue;
         }
-        // `--filter=x` is the same flag as `--filter x`, and `-n5` the same as `-n 5`.
-        let name = s.split('=').next().unwrap_or(s);
-        if allowed
-            .iter()
-            .any(|f| *f == name || (f.len() == 2 && f.starts_with('-') && s.starts_with(f)))
-        {
+        // EXACT match, on the argument as written. The `--flag=value` form used to be normalised to
+        // `--flag` before the lookup, on the same unmeasured assumption that cost this function three
+        // rewrites for `-n5`: that the parsers honour the attached form. They do not. `kern images
+        // --json=1` was accepted here, ignored there, and printed the HUMAN TABLE with exit 0 - a
+        // script asking for JSON got prose, which is the opening case of this whole change committed
+        // by the function that closes it. `kern gc --images=no` was accepted and did not touch the
+        // image cache. Both are refused now; `--json` and `--images` are the documented forms.
+        let name = s;
+        // Two attempts at an attached SHORT form (`-n5`) failed the same way:
+        // the first let any argument beginning with an allowed short flag through, so `ps -quiet`
+        // printed the table and exited 0; the second restricted the tail to digits, which refused that
+        // but ACCEPTED `-n5` while no parser honours it - `history -n 3` prints 3 rows and `history -n3`
+        // prints all of them, `builds -n 2` prints 2 and `-n2` prints none. Permitting a form the
+        // parsers ignore is the silent acceptance this function exists to refuse, committed by the
+        // function itself. `-n 5` is the documented form and it works.
+        if allowed.contains(&name) {
             continue;
         }
-        let takes = if allowed.is_empty() {
-            "no flags".to_string()
-        } else {
-            allowed.join(" ")
-        };
+        // Point at `--help`, do NOT enumerate `allowed`. That list is a hand-kept duplicate of what the
+        // parser accepts, and printing it tells the user, as a fact, what the verb takes - at the exact
+        // moment they are already confused. If the list ever omits a spelling the parser honours, the
+        // message does not merely refuse it, it asserts the verb has no such flag. `--help` is generated
+        // from the parser and cannot drift, which is what the README already promises about it.
         return Err(Error::Cli(format!(
-            "{verb}: unknown flag {s:?} - it takes {takes}"
+            "{verb}: unknown flag {s:?} - run `kern {verb} --help` for what it accepts"
         )));
     }
     Ok(())
@@ -3367,7 +3380,10 @@ mod no_verb_swallows_a_flag_it_does_not_take {
             vec!["stats", "--json"],
             vec!["stats", "mybox"],
             vec!["history", "-n", "5"],
-            vec!["history", "-n5"],
+            // NOT `-n5`: the attached form was accepted by the flag check and then ignored by the
+            // parser (`history -n 3` prints 3 rows, `history -n3` printed all of them). Asserting it
+            // "must parse" was asserting that a silently-ignored flag is fine, which is the defect
+            // this module exists to refuse. `-n 5` is the documented form and the one that works.
             vec!["gc", "--images"],
             vec!["validate", "/tmp/kern.toml"],
             vec!["doctor"],
@@ -3380,17 +3396,37 @@ mod no_verb_swallows_a_flag_it_does_not_take {
 
     #[test]
     fn the_refusal_names_the_verb_and_lists_the_real_flags() {
-        // The message is built FROM the allowed list, so it cannot advertise a flag the check rejects.
+        // The message must NAME the verb and the offending flag, and must NOT enumerate the allowed
+        // list. That list is a hand-kept duplicate of what the parser accepts; printing it states, to
+        // the user, as a fact, what the verb takes - and if it ever omits a spelling the parser
+        // honours, the message does not merely refuse it, it asserts the verb has no such flag.
+        // `--help` is generated from the parser and cannot drift. This test used to assert the
+        // OPPOSITE (that the message listed --json, -q, --filter, --format), which enshrined the
+        // defect: it would have passed against a message that lied.
         let Err(Error::Cli(msg)) = parse_v(&["ps", "--nope"]) else {
             panic!("ps --nope was not refused");
         };
         assert!(msg.starts_with("ps:"), "does not name the verb: {msg}");
+        assert!(
+            msg.contains("--nope"),
+            "does not name the offending flag: {msg}"
+        );
+        assert!(
+            msg.contains("--help"),
+            "does not point at the one source that cannot drift: {msg}"
+        );
         for f in ["--json", "-q", "--filter", "--format"] {
-            assert!(msg.contains(f), "does not list {f}: {msg}");
+            assert!(
+                !msg.contains(f),
+                "the message enumerates {f} from the hand-kept list: {msg}"
+            );
         }
         let Err(Error::Cli(msg)) = parse_v(&["examples", "--nope"]) else {
             panic!("examples --nope was not refused");
         };
-        assert!(msg.contains("no flags"), "should say it takes none: {msg}");
+        assert!(
+            msg.contains("--help"),
+            "the no-flag verb must point at --help too: {msg}"
+        );
     }
 }

@@ -47,7 +47,9 @@ fn check_scope_toll() -> R {
         return R::Ok("caps go direct into kern.slice: no per-box systemd round trip".into());
     }
     if !kern_isolation::user_systemd_present() {
-        return R::Ok("no user systemd manager: caps take the best-effort path".into());
+        // No user manager means no transient scope to pay for, which on WSL2 is why a box costs 4.2 ms
+        // there WITH its cap enforced: the direct path was never optional, it was the only one.
+        return R::Ok("no systemd user manager here: no per-box scope is paid at all".into());
     }
     // THREE runs, report the median, and throw the first away. A single cold sample read 34.0 ms on a
     // Raspberry Pi 5 where the warm median is 9.4: the first `systemd-run` in a session pays for the
@@ -64,12 +66,15 @@ fn check_scope_toll() -> R {
             .unwrap_or(false);
         ok.then(|| t0.elapsed().as_secs_f64() * 1000.0)
     };
+    // One message, one place. It was written twice for the two ways the timing can come back empty,
+    // which is the duplicated-derived-condition rule broken in the function that measures it.
+    const NO_SCOPE: &str = "caps take the best-effort path (no usable systemd --user scope)";
     if once().is_none() {
-        return R::Ok("caps take the best-effort path (no usable systemd --user scope)".into());
+        return R::Ok(NO_SCOPE.into());
     }
     let mut s: Vec<f64> = (0..3).filter_map(|_| once()).collect();
     if s.is_empty() {
-        return R::Ok("caps take the best-effort path (no usable systemd --user scope)".into());
+        return R::Ok(NO_SCOPE.into());
     }
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let ms = s[s.len() / 2];
@@ -242,26 +247,55 @@ fn cpu_bandwidth_interface_present() -> bool {
 /// 20 ms on one run and 5 on the next, so the warning appeared and vanished between two invocations on
 /// a machine whose real overlay mount is 0.1 ms. A number that unstable must not gate a warning.
 fn overlay_mount_cost_ms() -> Option<f64> {
+    use std::os::unix::ffi::OsStrExt;
     const N: usize = 3;
+
+    // EVERYTHING the child touches is built HERE, before the fork. After `fork()` in a process that
+    // has threads, only async-signal-safe calls are legal: an allocation whose lock was held by
+    // another thread at the instant of the fork deadlocks the child, and the parent then blocks in
+    // `read()` on a pipe that will never be written. `kern doctor` would hang forever, and doctor is
+    // the first command someone runs when something is already wrong. The child below does only
+    // unshare / open / write / mount / write / _exit, plus `clock_gettime` via `Instant::now`, which
+    // is on the POSIX async-signal-safe list. The median is computed in the parent.
     let dir = std::env::temp_dir().join(format!("kern-ovl-{}", std::process::id()));
+    let _ = crate::commands::remove_tree_forced(&dir);
     for k in 0..N {
         for sub in ["lower", "upper", "work", "merged"] {
-            std::fs::create_dir_all(dir.join(k.to_string()).join(sub)).ok()?;
+            if std::fs::create_dir_all(dir.join(k.to_string()).join(sub)).is_err() {
+                let _ = crate::commands::remove_tree_forced(&dir); // never leave the tree we started
+                return None;
+            }
         }
     }
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let uid_map = format!("0 {uid} 1\n");
+    let gid_map = format!("0 {gid} 1\n");
+    let mut targets: Vec<std::ffi::CString> = Vec::with_capacity(N);
+    let mut optses: Vec<std::ffi::CString> = Vec::with_capacity(N);
+    for k in 0..N {
+        let base = dir.join(k.to_string());
+        let t = std::ffi::CString::new(base.join("merged").as_os_str().as_bytes()).ok()?;
+        let o = std::ffi::CString::new(format!(
+            "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work",
+            base.display()
+        ))
+        .ok()?;
+        targets.push(t);
+        optses.push(o);
+    }
+
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::commands::remove_tree_forced(&dir);
         return None;
     }
     let (rd, wr) = (fds[0], fds[1]);
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let pid = unsafe { libc::fork() };
     if pid == 0 {
+        // ---- CHILD: no allocation past this line. ----
         unsafe { libc::close(rd) };
-        let fail = || unsafe { libc::_exit(1) };
         if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-            fail();
+            unsafe { libc::_exit(1) };
         }
         // Map ourselves to root inside the namespace, as `unshare -r` does: without it the process is
         // the overflow uid, owns nothing, and every mount fails with EPERM - which is how this check
@@ -276,48 +310,30 @@ fn overlay_mount_cost_ms() -> Option<f64> {
             n == val.len() as isize
         };
         let _ = put(c"/proc/self/setgroups", "deny");
-        if !put(c"/proc/self/uid_map", &format!("0 {uid} 1\n"))
-            || !put(c"/proc/self/gid_map", &format!("0 {gid} 1\n"))
-        {
-            fail();
+        if !put(c"/proc/self/uid_map", &uid_map) || !put(c"/proc/self/gid_map", &gid_map) {
+            unsafe { libc::_exit(2) };
         }
-        let mut us: Vec<u64> = Vec::with_capacity(N);
+        // A fixed-size array, not a Vec: no allocation, and the parent does the sorting.
+        let mut us = [0u64; N];
         for k in 0..N {
-            let base = dir.join(k.to_string());
-            let opts = format!(
-                "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work",
-                base.display()
-            );
-            // `_exit` in the error arm rather than `fail(); unreachable!()`: the panic macro would be
-            // a panic path in a forked child, which this codebase does not ship, and the compiler does
-            // not need it once the arm diverges on its own.
-            let target =
-                match std::ffi::CString::new(base.join("merged").as_os_str().as_encoded_bytes()) {
-                    Ok(c) => c,
-                    Err(_) => unsafe { libc::_exit(4) },
-                };
-            let opts_c = match std::ffi::CString::new(opts) {
-                Ok(c) => c,
-                Err(_) => unsafe { libc::_exit(4) },
-            };
             let t0 = std::time::Instant::now();
             let rc = unsafe {
                 libc::mount(
                     c"overlay".as_ptr(),
-                    target.as_ptr(),
+                    targets[k].as_ptr(),
                     c"overlay".as_ptr(),
                     0,
-                    opts_c.as_ptr() as *const libc::c_void,
+                    optses[k].as_ptr() as *const libc::c_void,
                 )
             };
             if rc != 0 {
-                fail();
+                unsafe { libc::_exit(3) };
             }
-            us.push(t0.elapsed().as_micros() as u64);
+            us[k] = t0.elapsed().as_micros() as u64;
         }
-        us.sort_unstable();
-        let med = us[us.len() / 2];
-        let bytes = med.to_le_bytes();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(us.as_ptr() as *const u8, N * std::mem::size_of::<u64>())
+        };
         unsafe {
             libc::write(wr, bytes.as_ptr() as *const libc::c_void, bytes.len());
             libc::_exit(0)
@@ -326,19 +342,40 @@ fn overlay_mount_cost_ms() -> Option<f64> {
     unsafe { libc::close(wr) };
     if pid < 0 {
         unsafe { libc::close(rd) };
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::commands::remove_tree_forced(&dir);
         return None;
     }
-    let mut buf = [0u8; 8];
-    let n = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+
+    // A BOUNDED wait. Without it, any reason the child fails to write - a deadlock, a stop signal,
+    // a kernel that hangs the mount - leaves doctor blocked with no output and no way out.
+    let mut pfd = libc::pollfd {
+        fd: rd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) } == 1;
+    let mut buf = [0u8; N * 8];
+    let n = if ready {
+        unsafe { libc::read(rd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
+    } else {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        -1
+    };
     unsafe { libc::close(rd) };
     let mut st = 0i32;
     unsafe { libc::waitpid(pid, &mut st, 0) };
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = crate::commands::remove_tree_forced(&dir);
     if n != buf.len() as isize || !libc::WIFEXITED(st) || libc::WEXITSTATUS(st) != 0 {
         return None;
     }
-    Some(u64::from_le_bytes(buf) as f64 / 1000.0)
+    let mut us = [0u64; N];
+    for (k, slot) in us.iter_mut().enumerate() {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&buf[k * 8..k * 8 + 8]);
+        *slot = u64::from_ne_bytes(w);
+    }
+    us.sort_unstable();
+    Some(us[N / 2] as f64 / 1000.0)
 }
 
 fn can_create_userns() -> bool {
@@ -396,13 +433,26 @@ fn check_cgroup() -> R {
             "boxes still run (isolation holds); enable the unified cgroup v2 hierarchy for resource caps".into(),
         );
     }
-    // A systemd --user manager gives kern a delegated scope for the box. Same predicate the box
-    // start itself uses, so doctor can't report an availability the runtime would disagree with.
+    // No systemd --user manager does NOT mean no caps, and this row used to say it did. Inside WSL2
+    // there is no user manager at all, yet kern runs in the root cgroup with `memory` in its
+    // `subtree_control` and a box reads its `memory.max` back as 268435456 while 200 MiB under
+    // `--memory 32m` exits 137. doctor called that "best-effort" and "may not bind" on a platform kern
+    // ships for, on the same machine where the runtime correctly printed no warning at all.
+    //
+    // So ask the question the runtime asks. `memory_cap_enforceable()` is the predicate `box` itself
+    // gates its warning on, which is what the comment here used to claim and was not.
     if !kern_isolation::user_systemd_present() {
-        return R::Warn(
-            "cgroup v2 present but no systemd --user manager - resource caps are best-effort".into(),
-            "on a host with neither systemd-user nor a delegated cgroup, `--memory`/`--pids-limit` may not bind".into(),
-        );
+        return if kern_isolation::memory_cap_enforceable() {
+            R::Ok(
+                "cgroup v2, no systemd --user manager needed: caps enforced in the current cgroup"
+                    .into(),
+            )
+        } else {
+            R::Warn(
+                "cgroup v2 present, no systemd --user manager, and the `memory` controller is not available in this cgroup - `--memory`/`--pids-limit` will not bind".into(),
+                "boxes still run and the isolation holds; caps need `memory` enabled in this tree's `cgroup.subtree_control`".into(),
+            )
+        };
     }
     // A scope alone isn't enough: the box's `memory.max` only enforces if the **memory controller**
     // is actually delegated to the user manager. Some distros (notably Raspberry Pi OS) delegate only

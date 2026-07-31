@@ -63,17 +63,17 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 | Runtime | Cold start | What it does at that price |
 |---|---:|---|
 | **kern** `box --rootfs` | **2.2 ms** | overlay + self-pivot + seccomp |
-| **kern** `box --image` | **3.3 ms** | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
-| bubblewrap | 3.0 ms | a sandbox *primitive*, no images, caps, or lifecycle |
+| **kern** `box --image` | **3.6 ms** | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
+| bubblewrap | 2.9 ms | a sandbox *primitive*, no images, caps, or lifecycle |
 | crun | 5.2 ms (June; not installed on the machine re-measured here) | OCI runtime (C): bundle + cgroup setup |
 | runc (rootless) | 13.8 ms | OCI runtime (Go): bundle + cgroup (high run-to-run variance) |
 | podman (rootless) | 287.5 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
-| **docker run --rm** | 289.2 ms | client → daemon round-trip |
+| **docker run --rm** | 292.9 ms | client → daemon round-trip |
 
 kern's bare box adds **no** cgroup cap (like bubblewrap). Adding one used to cost a `systemd-run`
 round trip and put the capped path at ~5.5 ms; since 0.6.15 kern can cap directly in its own delegated
 slice, and **there the cap costs 0.25 ms**: 2.20 ms uncapped, **2.45 ms with caps on**, 2.49 ms with an
-explicit `--memory 512m`. The cap still bites (200 MiB under `--memory 32m` exits 137).
+explicit `--memory 512m`. The cap still bites (200 MiB under `--memory 32m` exits 137; on the Arduino UNO Q's Android kernel the same write is stopped with 143/SIGTERM rather than 137/SIGKILL, with `memory.max` read back as 33554432 either way).
 
 ⚠️ **"There" is doing work in that sentence.** The direct slice is reachable only when kern runs inside
 the systemd user manager's tree, which a desktop session gives you and an **SSH session does not**: a
@@ -137,11 +137,11 @@ round-trip per run: 200 runs took ~62 s vs kern's **0.37 s**).
 
 | Runtime | Wall-clock |
 |---|---:|
-| **kern** `--rootfs` | **0.07 s** |
-| bubblewrap | 0.15 s |
-| **docker run --rm** | 18.74 s |
+| **kern** `--rootfs` | **0.09 s** |
+| bubblewrap | 0.17 s |
+| **docker run --rm** | 15.96 s |
 
-This is where a daemonless, lock-free design shows: kern fans out 200 concurrent boxes in 70 ms,
+This is where a daemonless, lock-free design shows: kern fans out 200 concurrent boxes in 90 ms,
 **~2× bubblewrap** and **~267× Docker**. (kern's overlay path was earlier verified at 30/30 and
 many-sharing-one-rootfs at 12/12, see the test suite.)
 
@@ -176,10 +176,10 @@ back as 268435456 from inside a box in the same session:
 
 | host | kernel | **kern** | bubblewrap | runc | docker |
 |---|---|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.6 ms** | 3.0 ms | 13.8 ms † | 289.2 ms † |
-| Raspberry Pi 5 | v6.6-rpi | **11.9 ms** | ✗ | ✗ | ✗ |
-| Jetson Orin Nano | v5.15-tegra | **13.4 ms** | 5.6 ms | 32 ms † | 472 ms † |
-| Arduino UNO Q | **v6.16 Android** | **91.7 ms** | 15.0 ms | 76 ms † | 858 ms † |
+| x86_64 desktop | v7.0 | **2.6 ms** | 2.9 ms | 13.8 ms † | 292.9 ms † |
+| Raspberry Pi 5 | v6.6-rpi | **11.8 ms** | ✗ | ✗ | ✗ |
+| Jetson Orin Nano | v5.15-tegra | **12.5 ms** | 5.6 ms | 32 ms † | 472 ms † |
+| Arduino UNO Q | **v6.16 Android** | **91.5 ms** | 15.0 ms | 76 ms † | 858 ms † |
 
 ✗ = **not installed on that board**, checked one binary at a time: on the Pi 5, docker, podman, runc,
 crun, bwrap, nerdctl, lxc-start and systemd-nspawn are all absent. † carried over from an earlier
@@ -201,17 +201,26 @@ Not an explanation offered, one measured. `systemd-run --user --scope /bin/true`
 | host | kern, caps ON | kern, cgroup off | difference | `systemd-run --scope` alone |
 |---|---:|---:|---:|---:|
 | x86_64 desktop | 2.6 | 2.3 | 0.3 | 4.2 (**not paid**: direct path) |
-| Raspberry Pi 5 | 11.9 | 2.7 | 9.2 | 9.4 |
-| Jetson Orin Nano | 13.4 | 4.1 | 9.3 | 9.0 |
-| Arduino UNO Q | 91.7 | 33.5 | 58.2 | 59.9 |
+| Raspberry Pi 5 | 11.8 | 2.7 | 9.2 | 9.4 |
+| Jetson Orin Nano | 12.5 | 4.1 | 9.3 | 9.0 |
+| Arduino UNO Q | 91.5 | 33.5 | 58.2 | 59.9 |
+
+⚠️ **`kern doctor` reports a SMALLER number for the same board, and the two are not the same quantity.**
+This column times `systemd-run --user --scope /bin/true` on its own: 59.9 ms on the Arduino. doctor
+times the same command but reports it as a FLOOR ("at least 39 ms"), because a box does not merely
+create the scope, it re-execs kern inside it. Reconcile against the DIFFERENCE column, never against
+doctor's floor: 58.2 measured here against 59.9 standalone is what closes.
 
 On all three boards the difference and the standalone scope agree to within 1.7 ms. The x86 row is the
 control and it is the interesting one: the scope costs 4.2 ms there too, and kern does not pay it,
 because it caps directly in its own delegated slice for 0.3 ms instead.
 
 WSL2 is the third kernel that settles it: there is no `systemd-run` at all, so the scope is not even
-possible, and a box costs **4.2 ms with the cap enforced**. That figure is from the previous round and
-could not be re-taken (the Windows host was powered off), so it is quoted as such rather than folded in.
+possible, and a box costs **3.4 ms with the cap enforced** (3.0 with `KERN_NO_SCOPE=1`, which changes
+nothing there because the direct path was already the only one). Re-measured on 2026-07-31 on the same
+Windows 11 host, with `memory.max` read back as 268435456 and 200 MiB under `--memory 32m` exiting 137
+in the same run. The 4.2 ms this table used to quote was an earlier round; the newer figure is faster
+and it is the one that reproduces.
 
 ### The toll is avoidable, and that is the headline
 
@@ -230,9 +239,9 @@ systemd-run --user --scope bash     # pay it once, then run kern inside that she
 
 | board | as an SSH login | inside one scope | + `--bind-rootfs` |
 |---|---:|---:|---:|
-| Raspberry Pi 5 | 11.7 ms | **3.0** | **2.8** |
-| Jetson Orin Nano | 12.8 ms | **4.6** | **4.2** |
-| Arduino UNO Q | 91.9 ms | **35.5** | **11.3** |
+| Raspberry Pi 5 | 11.8 ms | **3.0** | **2.8** |
+| Jetson Orin Nano | 12.5 ms | **4.6** | **4.2** |
+| Arduino UNO Q | 91.5 ms | **35.5** | **11.3** |
 
 All four columns come from ONE sitting per board, so they compare with each other; the small drift
 against the table above (11.7 vs 11.9 on the Pi) is two rounds an hour apart, not a change.
@@ -270,14 +279,14 @@ default overlay against it compares two mount strategies, not two runtimes.
 
 | board | kern, cgroup off, `--bind-rootfs` | bubblewrap | |
 |---|---:|---:|---|
-| x86_64 desktop | **2.2 ms** | 3.0 ms | kern |
+| x86_64 desktop | **2.2 ms** | 2.9 ms | kern |
 | Raspberry Pi 5 | **2.3 ms** | not installed | |
 | Jetson Orin Nano | **3.5 ms** | 5.6 ms | kern |
 | Arduino UNO Q | **9.6 ms** | 15.0 ms | kern |
 
 **kern is ahead of bubblewrap on every host where both are installed, at the same level of work.** And on
 x86, where kern reaches its direct cgroup path, kern *enforcing a memory limit* is 2.6 ms against
-bubblewrap's 3.0 enforcing nothing.
+bubblewrap's 2.9 enforcing nothing.
 
 `--bind-rootfs` is worth reaching for only on the Arduino: it takes that board from 91.7 ms to 69.2 with
 caps enforced and from 33.5 to 9.6 with the cgroup off, against a few tenths of a millisecond everywhere
@@ -375,7 +384,7 @@ So the Windows-side crossing costs about **63 ms per command** with the exe, on 
 measured. The fallback row is several times that, but it is a different host as well as a second process,
 so the gap is not the price of the batch wrapper alone.
 
-The comparable Linux figure is the **3.3 ms** OCI-image row above, not the 2.2 ms prepared-rootfs one. The
+The comparable Linux figure is the **3.6 ms** OCI-image row above, not the 2.2 ms prepared-rootfs one. The
 inside-WSL numbers are 20 boxes in 0.13 s, one series each, timed in the distro with `time` around the
 whole loop so the shell's 10 ms resolution lands on the total rather than on each box: single samples, not
 distributions.
