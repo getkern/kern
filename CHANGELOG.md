@@ -19,6 +19,28 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+## [0.6.28], 2026-07-31
+
+### Fixed
+
+- **`waitpid` and `poll` are now restarted on `EINTR`.** Both return -1 when a signal is delivered
+  while they block, and all ten call sites read that -1 as a real outcome: an interrupted `waitpid`
+  left its `status` untouched and the caller decoded whatever it was initialised to as the child's
+  exit code, and an interrupted `poll` was indistinguishable from "the timeout expired, nothing to
+  read". kern installs a handler for almost nothing, which is why this looked unreachable, but kern
+  does not run alone: a `SIGWINCH` from a resized terminal reaches `kern top`, a profiler's
+  `SIGPROF` reaches anything run under one, and a shell's job-control signals reach a foreground
+  box. The retry lives in one new module (`eintr`) rather than at ten sites, because a condition
+  re-derived at every call site is how this project has produced its most expensive defects.
+- **A restarted `poll` no longer restarts its clock.** The naive retry re-issues `poll` with the
+  ORIGINAL timeout, so a steady drip of signals extends a bounded wait without limit: the 10 s cap
+  on the `doctor` overlay probe could have become unbounded. The remaining time is now computed
+  from a `CLOCK_MONOTONIC` deadline, which is what a bounded wait was always supposed to mean.
+- **`kern top` polled a descriptor it did not own.** The event loop builds a two-slot `pollfd`
+  array but only the first slot is valid when the inotify watch could not be opened, and the
+  count guarding that was computed and then not used. Found while routing the call through the
+  new wrapper.
+
 ## [0.6.27], 2026-07-30
 
 ### Fixed

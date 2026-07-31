@@ -533,8 +533,10 @@ pub fn run() -> Result<(), crate::error::Error> {
                     revents: 0,
                 },
             ];
+            // Only the first slot is guaranteed valid: the inotify fd is absent when the watch could
+            // not be opened. Polling the whole array would hand `poll` a stale descriptor.
             let nfds = if ino_fd >= 0 { 2 } else { 1 };
-            if unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 1000) } <= 0 {
+            if crate::eintr::poll(&mut pfds[..nfds], 1000) <= 0 {
                 snap = refresh_full(
                     &mut prev,
                     &mut prev_cpu,

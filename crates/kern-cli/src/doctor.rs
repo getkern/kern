@@ -180,7 +180,7 @@ pub fn info() -> Result<(), Error> {
             unsafe { libc::_exit(if rc == 0 { 0 } else { 1 }) };
         }
         let mut st = 0i32;
-        unsafe { libc::waitpid(pid, &mut st, 0) };
+        crate::eintr::waitpid(pid, &mut st, 0);
         libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
     };
     row("userns", if userns { "enabled" } else { "DISABLED" });
@@ -353,7 +353,7 @@ fn overlay_mount_cost_ms() -> Option<f64> {
         events: libc::POLLIN,
         revents: 0,
     };
-    let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) } == 1;
+    let ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), 10_000) == 1;
     let mut buf = [0u8; N * 8];
     let n = if ready {
         unsafe { libc::read(rd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
@@ -363,7 +363,7 @@ fn overlay_mount_cost_ms() -> Option<f64> {
     };
     unsafe { libc::close(rd) };
     let mut st = 0i32;
-    unsafe { libc::waitpid(pid, &mut st, 0) };
+    crate::eintr::waitpid(pid, &mut st, 0);
     let _ = crate::commands::remove_tree_forced(&dir);
     if n != buf.len() as isize || !libc::WIFEXITED(st) || libc::WEXITSTATUS(st) != 0 {
         return None;
@@ -388,7 +388,7 @@ fn can_create_userns() -> bool {
         return false;
     }
     let mut st = 0i32;
-    unsafe { libc::waitpid(pid, &mut st, 0) };
+    crate::eintr::waitpid(pid, &mut st, 0);
     libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
 }
 

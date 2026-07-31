@@ -2673,7 +2673,7 @@ fn remove_dir_all_ranged(dir: &std::path::Path) {
     map(&newgidmap, gid, sub_gid, gc);
     let _ = unsafe { libc::write(p2c[1], b"1".as_ptr().cast(), 1) };
     let mut st = 0;
-    unsafe { libc::waitpid(pid, &mut st, 0) };
+    crate::eintr::waitpid(pid, &mut st, 0);
 }
 
 /// Fork a health-checker for a detached box: every `interval` s it runs `health_cmd` (via
@@ -2946,7 +2946,7 @@ fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_secs: u64) -> 
                 };
                 // Exited within the grace: nothing left to kill, and we say so without the SIGKILL.
                 let ms = grace_secs.saturating_mul(1000).min(i32::MAX as u64) as i32;
-                if unsafe { libc::poll(&mut pfd, 1, ms) } > 0 {
+                if crate::eintr::poll(std::slice::from_mut(&mut pfd), ms) > 0 {
                     unsafe { libc::close(fd) };
                     return true;
                 }
@@ -2975,7 +2975,7 @@ fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_secs: u64) -> 
             events: libc::POLLIN,
             revents: 0,
         };
-        let ready = unsafe { libc::poll(&mut pfd, 1, 1000) };
+        let ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), 1000);
         unsafe { libc::close(pidfd) };
         ready > 0
     } else {
@@ -3010,7 +3010,7 @@ fn cancel_foreground_timeout(wd: Option<(i32, i32)>) {
         unsafe {
             libc::close(wfd);
             libc::kill(wd_pid, libc::SIGKILL);
-            libc::waitpid(wd_pid, std::ptr::null_mut(), 0);
+            crate::eintr::reap(wd_pid);
         }
     }
 }
@@ -3050,7 +3050,7 @@ fn run_probe(pid1: i32, probe: &[String], timeout: u64) -> bool {
         return false;
     }
     let mut st = 0i32;
-    if unsafe { libc::waitpid(probe_pid, &mut st, 0) } <= 0 {
+    if crate::eintr::waitpid(probe_pid, &mut st, 0) <= 0 {
         return false;
     }
     libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
@@ -3119,7 +3119,7 @@ fn await_box_started(
         unsafe { libc::close(rd) };
         if n > 0 {
             let mut st = 0i32;
-            unsafe { libc::waitpid(child, &mut st, 0) };
+            crate::eintr::waitpid(child, &mut st, 0);
             // The box's own error went to its per-box log (its stderr was detached there), so the
             // launcher only knows it died. `waitpid` above has reaped the supervisor, so the log is
             // now fully written - surface its tail inline. This turns the failure from an opaque
@@ -3248,7 +3248,7 @@ fn supervise_box(
             unsafe { libc::close(wr) };
         }
         let mut st = 0i32;
-        let code = if runner > 0 && unsafe { libc::waitpid(runner, &mut st, 0) } > 0 {
+        let code = if runner > 0 && crate::eintr::waitpid(runner, &mut st, 0) > 0 {
             if libc::WIFEXITED(st) {
                 libc::WEXITSTATUS(st)
             } else if libc::WIFSIGNALED(st) {
@@ -3443,13 +3443,13 @@ fn run_detached(
     if let Some(tp) = timeout_pid {
         unsafe {
             libc::kill(tp, libc::SIGKILL);
-            libc::waitpid(tp, std::ptr::null_mut(), 0);
+            crate::eintr::reap(tp);
         }
     }
     if let Some(hp) = health_pid {
         unsafe {
             libc::kill(hp, libc::SIGTERM);
-            libc::waitpid(hp, std::ptr::null_mut(), 0);
+            crate::eintr::reap(hp);
         }
         registry::clear_health(name.as_str(), pid);
     }
@@ -7280,7 +7280,7 @@ fn merged_view_extract(
     // ---- PARENT: close our copy of the out fd, reap the child, map its exit code to a precise error. ----
     unsafe { libc::close(out_fd) };
     let mut status = 0i32;
-    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+    if crate::eintr::waitpid(pid, &mut status, 0) < 0 {
         return Err(Error::Oci("merged-view: waitpid failed".into()));
     }
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
@@ -9944,7 +9944,7 @@ fn probe_opaque_honored() -> bool {
         unsafe { probe_opaque_child(&tmp, euid, egid) };
     }
     let mut status = 0i32;
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    let waited = crate::eintr::waitpid(pid, &mut status, 0);
     remove_build_tree(&tmp);
     waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
@@ -14450,7 +14450,7 @@ mod image_rm_tests {
             "kill_box must confirm the foreground box is gone"
         );
         // Reap the zombie (kill_box confirms via the pidfd BEFORE the process is reaped).
-        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        crate::eintr::reap(child);
         assert_ne!(
             unsafe { libc::kill(child, 0) },
             0,

@@ -470,7 +470,7 @@ impl Drop for Capture {
         // of the real stderr, so closing ours can't cut it off - but reaping first also avoids a zombie.)
         unsafe {
             let mut status = 0i32;
-            libc::waitpid(self.logger_pid, &mut status, 0);
+            crate::eintr::waitpid(self.logger_pid, &mut status, 0);
             libc::close(self.saved_err);
         }
     }
