@@ -155,6 +155,7 @@ pub fn help() -> Result<(), Error> {
     --no-uid-range      Use the single-uid map (an --image box maps a uid RANGE by default)
     --stop-signal <s>   Signal sent before the SIGKILL on stop (name or number; default SIGTERM)
     --stop-timeout <n>  Seconds the workload gets to exit on its own before the SIGKILL (default 10)
+    --timeout <n>       Auto-stop: SIGTERM at n seconds, SIGKILL 2 seconds later (so n+2 worst case)
     --restart-max <n>   How many times --restart retries before giving up (default 10)
     --ulimit <n=s[:h]>  Set a resource limit (e.g. nofile=1024:2048); rootless can only LOWER; repeatable
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable

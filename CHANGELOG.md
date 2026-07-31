@@ -23,6 +23,13 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ### Fixed
 
+- **`--timeout N` is documented as what it does: SIGTERM at N, SIGKILL two seconds later.** The
+  flag was described as "auto-stop after N seconds" in the help, the doc comment and CONFIG.md, and
+  none of the three mentioned the grace, so `--timeout 30` in a job that budgets exactly 30 s
+  overruns by 2. Found because a test asserted the wrong semantics and failed; the behaviour is
+  unchanged and matches `docker stop`, it had simply never been timed. The 2 s is the foreground
+  watchdog's own and is unrelated to `--stop-timeout`, which defaults to 10.
+
 - **`waitpid` and `poll` are now restarted on `EINTR`.** Both return -1 when a signal is delivered
   while they block, and all ten call sites read that -1 as a real outcome: an interrupted `waitpid`
   left its `status` untouched and the caller decoded whatever it was initialised to as the child's

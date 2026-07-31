@@ -247,7 +247,7 @@ cap_drop   = ["ALL"]              # --cap-drop (repeatable)
 
 # supervision (detached boxes)
 restart              = true       # --restart
-timeout              = "300"      # --timeout  (auto-stop after N seconds)
+timeout              = "300"      # --timeout  (SIGTERM at N, SIGKILL 2s later: N+2 worst case)
 health_cmd           = "wget -qO- localhost/health"   # --health-cmd
 health_interval      = 30         # --health-interval (integer seconds)
 health_retries       = "3"        # --health-retries

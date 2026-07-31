@@ -138,6 +138,13 @@ pub enum Command {
         /// `--env-file <file>` (repeatable): read `K=V` lines from a file into the box's environment.
         env_file: Vec<String>,
         /// `--timeout <sec>`: stop the box automatically after this many seconds (0 = no timeout).
+        ///
+        /// N is when the SIGTERM lands, NOT when the process is gone: a workload that ignores it
+        /// gets a fixed 2 s grace and then a SIGKILL, so the wall-clock is N+2 in that case. This is
+        /// `docker stop`'s shape and it is deliberate, but it was never written down and never
+        /// timed, so `--timeout 30` in a CI job that budgets exactly 30 s would overrun. The 2 s
+        /// here is the foreground watchdog's own (`commands::mod`), unrelated to `--stop-timeout`,
+        /// which defaults to 10 and governs `kern stop`.
         timeout: u64,
         /// `--nice <n>`: scheduling niceness (-20..19) for the box workload.
         nice: Option<i64>,
