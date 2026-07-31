@@ -86,6 +86,74 @@ fn check_scope_toll() -> R {
     )
 }
 
+/// Will a DETACHED box outlive the session that started it?
+///
+/// On a headless board this is the whole point of `-d`: ssh in, start a service, log out, expect it to
+/// keep serving. It does not, by default. kern puts each box in a transient systemd scope under
+/// `user@<uid>.service`, and when the last session of a user without **lingering** ends, systemd stops
+/// that service and every scope under it. The box dies, its `/run/user/<uid>` runtime dir (where kern's
+/// registry lives) is removed with it, and the next login finds no box, no port and no `kern logs`.
+///
+/// Measured on a Raspberry Pi 5 on 2026-08-01: a detached box publishing `0.0.0.0:8099` was gone 20 s
+/// after the last ssh session closed, with nothing left running. After `loginctl enable-linger`, the
+/// same box kept serving the page to another machine with no session open at all. Same cause, and the
+/// same fix, as rootless podman, which documents it for exactly this reason.
+///
+/// Read from `/var/lib/systemd/linger/<user>`, which is where logind records it: a file test, no
+/// subprocess, on a command a user runs when something is already wrong.
+fn check_linger() -> R {
+    // As real root kern drives the SYSTEM manager, so boxes are not under `user@<uid>.service` and
+    // nothing about a login session can stop them. Decided by the SAME predicate that picks the
+    // manager (`systemd_scope_mode`), not by re-deriving "am I root" here, so the two cannot drift.
+    // Without this the check fired on every root host and told people to enable lingering for `root`,
+    // which fixes nothing: measured on a Contabo VPS on 2026-08-01, a detached box as root was still
+    // running with its port bound 30 s after every session had closed, lingering off throughout.
+    if kern_isolation::systemd_scope_mode() == "--system" {
+        return R::Ok(
+            "running as root: boxes go to the system manager, so a detached box is not tied to a login session".into(),
+        );
+    }
+    // No user manager (WSL2, a bare container) means no scope to be stopped and nothing to fix here.
+    if !kern_isolation::user_systemd_present() {
+        return R::Ok(
+            "no systemd user manager here: a detached box is not tied to a session".into(),
+        );
+    }
+    let Some(user) = current_username() else {
+        return R::Ok("could not resolve the current user name to check systemd lingering".into());
+    };
+    if std::path::Path::new(&format!("/var/lib/systemd/linger/{user}")).exists() {
+        return R::Ok(
+            "systemd lingering is on: a detached box outlives the session that started it".into(),
+        );
+    }
+    R::Warn(
+        "systemd lingering is OFF for this user, so a DETACHED box dies when your last session ends: \
+         systemd stops `user@<uid>.service` and every box scope under it, and removes the \
+         /run/user/<uid> registry with it (measured on a Raspberry Pi 5: box, port and `kern logs` all \
+         gone 20 s after logout)"
+            .into(),
+        format!("`sudo loginctl enable-linger {user}` - one command, once per machine, and detached boxes then survive logout (this is the same requirement rootless podman documents)"),
+    )
+}
+
+/// The current user's login name, from the password database via `getpwuid`. `None` if the uid has no
+/// entry (a container with no `/etc/passwd`), which is a reason to say nothing rather than guess.
+fn current_username() -> Option<String> {
+    // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc, read before any other
+    // call that could overwrite it; a NULL return is the documented "no such user" and is checked.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_name.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr((*pw).pw_name)
+            .to_str()
+            .ok()
+            .map(str::to_string)
+    }
+}
+
 pub fn doctor() -> Result<(), Error> {
     let p = Palette::detect();
     let mut results: Vec<R> = vec![
@@ -96,6 +164,7 @@ pub fn doctor() -> Result<(), Error> {
         // Resource enforcement (cgroup v2 + delegation).
         check_cgroup(),
         check_scope_toll(),
+        check_linger(),
         // Root filesystem strategy.
         check_overlay(),
         // Optional feature: multi-uid mapping.
