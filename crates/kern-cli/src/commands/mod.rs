@@ -993,6 +993,43 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // them into a RAM-backed `/run/secrets` tmpfs (mode 0400) that never touches the overlay upper.
     let secrets = crate::secret::parse_secrets(args.secrets)?;
 
+    // SECURITY: `--ssh` cannot mean anything with `--net`, and what it WOULD do is dangerous.
+    // `--ssh <port>` publishes `127.0.0.1:<port>` → box `:22`. With `--net` the box has no network
+    // namespace of its own, so "box `:22`" is the HOST's `:22`. On any host that runs sshd - every
+    // board in a fleet, every server - the forwarder therefore lands on the HOST's sshd while kern
+    // prints `ssh -p <port> … root@127.0.0.1` as the way into the box. Measured on 2026-07-31 with an
+    // image that has no sshd at all: the banner on the published port was byte-identical to the
+    // host's own (`SSH-2.0-OpenSSH_9.6p1`). On a host WITHOUT sshd it is no better: the box's own
+    // sshd binds the host's `:22`, exposing the box to the whole network on the standard port.
+    // Refuse, like `--egress-allow` above: a flag whose promise the network mode cannot keep.
+    if args.share_net && args.ssh_port.is_some() {
+        return Err(Error::Sandbox(
+            "--ssh cannot be combined with --net: --ssh publishes the box's port 22, and with --net \
+             the box has no network of its own, so port 22 is the HOST's. kern would hand you the \
+             host's sshd (or expose the box's on the host's :22). Drop --net for an isolated network, \
+             or use --pod for a shared network that is still not the host's."
+                .to_string(),
+        ));
+    }
+    // SECURITY, the general case behind `--ssh` above: `-p` publishes THE BOX'S port, and with `--net`
+    // the box has no port of its own. The forwarder connects to `127.0.0.1:<box_port>` in the shared
+    // (host) network, where kern cannot tell the box's listener from any other process on the machine.
+    // If the box's service is not up - it crashed, it is still starting, it was never in the image -
+    // the mapping quietly serves whatever host process owns that number, under the box's name and in
+    // `kern ps`. That is not a warning-shaped problem: it is a claim kern cannot substantiate, so it
+    // is refused, exactly as `--egress-allow` is refused for the same reason (it filters the box's OWN
+    // network). The way to get outbound AND a published port is `--pod`, whose network is shared but
+    // is not the host's, and where `-p` means the pod's port again.
+    if args.share_net && !args.ports.is_empty() {
+        return Err(Error::Sandbox(
+            "-p cannot be combined with --net: with a shared network the box has no port of its own, \
+             so kern cannot tell the box's listener from any other process on this host, and would \
+             publish whichever one holds that number. Drop --net for an isolated network where -p is \
+             the only way in, or use `kern pod create` + --pod for a shared network that is not the \
+             host's (outbound works there, and -p means the pod's port)."
+                .to_string(),
+        ));
+    }
     // `--ssh`: authorize a key (generate a throwaway keypair, or use `--ssh-key`) and publish the
     // in-box sshd on the host port (→ box `:22`) via the ordinary rootless forwarder. `eff_ports`
     // is the user's `-p` maps plus that SSH mapping.
