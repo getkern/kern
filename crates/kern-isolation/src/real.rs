@@ -2390,9 +2390,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         .collect::<Result<_, _>>()?;
 
     // `-p` forwarders: fork them NOW, BEFORE the cgroup join and the `unshare`, so they stay in the
-    // host network + user namespace (and out of the box's cgroup). Each blocks until we send it the
-    // box's PID 1 after the fork below. (Empty `ports` → no forwarders.)
-    let forwarders = crate::ports::fork_forwarders(ports);
+    // host network + user namespace (and out of the box's cgroup). Each BINDS its host socket here
+    // and reports the outcome, so a port we cannot publish fails the box instead of leaving `kern ps`
+    // showing a mapping nothing serves; each then blocks until we send it the box's PID 1 after the
+    // fork below. (Empty `ports` → no forwarders.) The returned set is RAII: every error return
+    // between here and the box's start tears the bound ports down.
+    let forwarders = crate::ports::fork_forwarders(ports)
+        .map_err(|(hp, why)| Error::Spec(format!("cannot publish host port {hp}: {why}")))?;
 
     // Best-effort cgroup v2 cap (memory + PIDs) BEFORE namespacing, so the forked workload
     // inherits it. Degrades gracefully where the hierarchy isn't delegated. The returned guard owns
@@ -2615,9 +2619,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     }
     // Report PID 1 (for `kern exec`) and start the `-p` forwarders now that the box's net ns exists.
     on_started(pid);
-    for f in &forwarders {
-        f.activate(pid);
-    }
+    forwarders.activate(pid);
     // `-it`: hand the terminal to the box. Drop our copy of the slave so the master sees EOF when
     // the box exits, then pump host stdio <-> master until then. Single-threaded by design - the
     // fork above must run in a single-threaded process (the child does non-async-signal-safe setup),
@@ -2627,14 +2629,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
             unsafe { libc::close(slave) };
         }
         let code = pty_pump_and_wait(master, pid);
-        forwarders.iter().for_each(|f| f.stop());
-        return Ok(code);
+        return Ok(code); // `forwarders` drops here and stops them
     }
     // Reap the box (EINTR-robust, so a signal can't return early and drop the cgroup guard on a
     // still-live box → EBUSY leak).
     let mut status = 0i32;
     let rc = reap_retry_eintr(pid, &mut status);
-    forwarders.iter().for_each(|f| f.stop());
+    // `forwarders` drops on every return below, stopping them after the box is reaped.
     if rc < 0 {
         return Err(Error::last("waitpid"));
     }
