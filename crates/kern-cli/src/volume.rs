@@ -858,7 +858,7 @@ fn usage() {
         "\
 {b}kern volume{z} - named persistent volumes
 
-    {c}create{z} <name>       Create a volume (also auto-created by `-v name:/dest`)
+    {c}create{z} <name> [--size N]   Create a volume (also auto-created by `-v name:/dest`)
     {c}ls{z}                  List volumes with sizes
     {c}inspect{z} <name>      Show a volume's path, size and metadata
     {c}edit{z} <name> [--name NEW] [--size N|0]   Rename and/or re-quota a volume
@@ -905,6 +905,65 @@ mod tests {
     // module's env-mutating tests (e.g. `builds`), which also repoint XDG_DATA_HOME - a per-module lock
     // wouldn't (they'd race across modules).
     use crate::TEST_ENV_LOCK as ENV_LOCK;
+
+    /// Every flag a `volume` subcommand ACCEPTS must appear in the text `usage()` prints.
+    ///
+    /// `kern volume create --size 32m` has worked for as long as the quota has existed, two examples
+    /// in `examples/` use it, and `usage()` never mentioned it: the line read `create <name>` while
+    /// `edit` right below it advertised `[--size N|0]`. So the only way to find the flag was to read
+    /// the source or to already know. That is the same rule written twice drifting apart, the class
+    /// `help_and_parser_agree` guards for the top-level verbs, and the subcommands had no guard at
+    /// all.
+    ///
+    /// Reads THIS file rather than a hand-kept list, so a flag added to a parser and not to the help
+    /// fails here instead of shipping undocumented. The negative control is built in: if the slicing
+    /// ever stops finding the parsers, `flags` is empty and the assertion below fails on the count
+    /// rather than passing vacuously.
+    #[test]
+    fn every_flag_a_volume_subcommand_accepts_is_in_its_help() {
+        let src = include_str!("volume.rs");
+        let body = |name: &str| -> &str {
+            let start = src
+                .find(&format!("\nfn {name}("))
+                .unwrap_or_else(|| panic!("cannot locate `fn {name}` in volume.rs"));
+            let rest = &src[start + 1..];
+            let end = rest.find("\nfn ").unwrap_or(rest.len());
+            &rest[..end]
+        };
+
+        // Per SUBCOMMAND, not per file. The first version of this test looked for each flag anywhere
+        // in `usage()` and passed against the very help it was written to reject: `edit` advertised
+        // `--size` two lines below `create`, so the flag was "documented" while the line a reader of
+        // `create` actually reads said nothing. A check that cannot fail on the defect it was written
+        // for is worse than no check, because it reads as coverage.
+        let help = body("usage");
+        let help_line = |verb: &str| -> &str {
+            let needle = format!("{{c}}{verb}{{z}}");
+            help.lines()
+                .find(|l| l.contains(&needle))
+                .unwrap_or_else(|| panic!("no `{verb}` line in the volume help"))
+        };
+
+        let mut checked = 0usize;
+        for (func, verb) in [("create", "create"), ("edit_cmd", "edit")] {
+            let line = help_line(verb);
+            for piece in body(func).split("\"--").skip(1) {
+                let flag = piece.split('"').next().unwrap_or_default();
+                if flag.is_empty() || !flag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    line.contains(&format!("--{flag}")),
+                    "`volume {verb}` accepts --{flag}, and its help line does not mention it: {line}"
+                );
+            }
+        }
+        assert!(
+            checked >= 3,
+            "the parsers were not found, so this test proves nothing: {checked} flags checked"
+        );
+    }
 
     #[test]
     fn is_named_distinguishes_names_from_paths_and_urls() {
