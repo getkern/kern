@@ -1,8 +1,10 @@
 # Benchmarks
 
-Measured on one machine, 20-core / 28-thread x86_64, Linux 6.17, NVMe, systemd-user, against the runtimes
-installed there: **Docker 29.1.3** (daemon up), **Podman 4.9.3** (rootless), **crun 1.28**,
-**runc 1.3.3** (rootless), **bubblewrap 0.9**. The workload is `/bin/true` in Alpine with the
+Re-measured 2026-08-01 at **kern 0.6.30** on one machine: Intel i7-14700KF, 28 threads, **Linux
+7.0.0**, NVMe, systemd-user with `cpu memory pids` delegated, CPU governor **powersave** (a figure
+taken under `performance` is not comparable with one taken here). Against the runtimes installed on
+it: **Docker 29.1.3** (daemon up), **Podman 4.9.3** (rootless), **runc 1.3.3** (rootless),
+**bubblewrap 0.9**. `crun` is NOT installed here; its row below is from June and says so. The workload is `/bin/true` in Alpine with the
 **image/rootfs already local**, so this measures *runtime overhead*, not download time. All ran the
 same Alpine rootfs (Docker/Podman via their image store; kern/bwrap/crun/runc via the same exported
 rootfs directory). This is a 0.x project, treat these as "fast class", not a guarantee.
@@ -50,10 +52,10 @@ KERN=./target/release/kern python3 examples/benchmark.py --runs 500 --conc 100
 commands shown inline; only those depend on a specific image or a systemd-user manager.)
 
 > **TL;DR.** kern is in the **fastest tier**: it leads the no-cgroup-cap sandboxes (ahead of
-> `bubblewrap`), and a hard cgroup cap now costs 0.25 ms rather than a `systemd-run` round trip: while being the only one of them that ships a complete daemonless container UX
+> `bubblewrap`), and a hard cgroup cap costs **0.19 ms** rather than a `systemd-run` round trip: while being the only one of them that ships a complete daemonless container UX
 > (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~1.8 MB** binary. Against the real
-> engines it's **~133× faster to start** (2.2 ms against Docker's 292.9 and `podman`'s 287.5, the
-> table below; ~80× if you compare the `--image` path's 3.6 ms, which does more) and carries no
+> engines it's **~120× faster to start** (2.44 ms against Docker's 292.5 and `podman`'s 289.0, the
+> table below; ~81× if you compare the `--image` path's 3.61 ms, which does more) and carries no
 > resident daemon. It is *not* "the fastest in the world", the top tier is within a couple ms,
 > i.e. noise; the honest claim is **top-tier speed + a full runtime in a tiny daemonless binary**.
 
@@ -63,18 +65,21 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 
 | Runtime | Cold start | What it does at that price |
 |---|---:|---|
-| **kern** `box --rootfs` | **2.2 ms** | overlay + self-pivot + seccomp |
-| **kern** `box --image` | **3.6 ms** | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
-| bubblewrap | 2.9 ms | a sandbox *primitive*, no images, caps, or lifecycle |
+| **kern** `box --rootfs`, uncapped | **2.44 ms** | overlay + self-pivot + seccomp. Uncapped is what makes it comparable to bubblewrap |
+| **kern** `box --rootfs`, capped (the default) | **2.63 ms** | the same, plus a real cgroup cap: +0.19 ms |
+| **kern** `box --bind-rootfs` | 2.49 ms | no overlay, the source is shared and mutable |
+| **kern** `box --image` | **3.61 ms** (2.65 with `--no-uid-range`) | the same, plus the rootless uid-range mapping: two setuid helpers (`newuidmap`/`newgidmap`), ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, which a rootless process does not have, so the helpers are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing. Opt out with `--no-uid-range`. |
+| bubblewrap | 2.8 ms | a sandbox *primitive*, no images, caps, or lifecycle |
 | crun | 5.2 ms (June; not installed on the machine re-measured here) | OCI runtime (C): bundle + cgroup setup |
-| runc (rootless) | 13.8 ms | OCI runtime (Go): bundle + cgroup (high run-to-run variance) |
-| podman (rootless) | 287.5 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
-| **docker run --rm** | 292.9 ms | client → daemon round-trip |
+| runc (rootless) | 14.6 ms | OCI runtime (Go): bundle + cgroup (high run-to-run variance) |
+| podman (rootless) | 289.0 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
+| **docker run --rm** | 292.5 ms | client → daemon round-trip |
 
 kern's bare box adds **no** cgroup cap (like bubblewrap). Adding one used to cost a `systemd-run`
 round trip and put the capped path at ~5.5 ms; since 0.6.15 kern can cap directly in its own delegated
-slice, and **there the cap costs 0.25 ms**: 2.20 ms uncapped, **2.45 ms with caps on**, 2.49 ms with an
-explicit `--memory 512m`. The cap still bites (200 MiB under `--memory 32m` exits 137; on the Arduino UNO Q's Android kernel the same write is stopped with 143/SIGTERM rather than 137/SIGKILL, with `memory.max` read back as 33554432 either way).
+slice, and **there the cap costs 0.19 ms**: 2.44 ms uncapped, **2.63 ms with caps on**, both measured
+today over 200 runs x 5 batches. Adding `--memory 64m --cpus 1 --pids-limit 64` on the `--image` path
+costs 0.52 ms (3.61 to 4.13). The cap still bites (200 MiB under `--memory 32m` exits 137; on the Arduino UNO Q's Android kernel the same write is stopped with 143/SIGTERM rather than 137/SIGKILL, with `memory.max` read back as 33554432 either way).
 
 ⚠️ **"There" is doing work in that sentence.** The direct slice is reachable only when kern runs inside
 the systemd user manager's tree, which a desktop session gives you and an **SSH session does not**: a
@@ -93,7 +98,7 @@ choose between a fast box and a capped one. kern capped (2.45 ms) is faster than
 runtime measured here uncapped, and the physical floor for `unshare`+`exec` is ~1-2 ms, so the top
 tier sits within a couple ms of itself and of its own run-to-run noise. Nobody "wins"
 single-shot latency outright. The real gap is to the **engines**: `podman` (~288 ms) and Docker
-(~289 ms) fork `conmon` / round-trip a daemon every run, so kern is **~125x faster** than the
+(~292 ms) fork `conmon` / round-trip a daemon every run, so kern is **~120x faster** than the
 engines while shipping the container UX they ship.
 
 ### Real image, not `/bin/true`
@@ -123,14 +128,20 @@ box like `apt install`, which is the workload, not the runtime.)
 
 | Runtime | Throughput |
 |---|---:|
-| **kern** `--rootfs` | **542 runs/s** |
-| bubblewrap | 387 runs/s |
-| crun | 193 runs/s |
-| runc | 82 runs/s |
-| **docker run --rm** | **3.2 runs/s** |
+| **kern** `--rootfs` (uncapped) | **410 runs/s** |
+| bubblewrap | 357 runs/s |
+| runc | 68 runs/s |
+| podman (rootless) | 3.5 runs/s |
+| **docker run --rm** | **3.4 runs/s** |
 
-kern is **~1.4× bubblewrap, ~2.8× crun, ~6.6× runc**, and **~170× Docker** (which pays a daemon
-round-trip per run: 200 runs took ~62 s vs kern's **0.37 s**).
+kern is **~1.1× bubblewrap** and **~6× runc**, and **~120× Docker**, which pays a daemon round-trip
+per run.
+
+These are `1000 / ms` applied to the cold-start table above, and that is now literally true. It was
+not before: this table used to read 542, 387 and 82 runs/s, which imply 1.85, 2.58 and 12.2 ms, none
+of which are the numbers printed one section up. Three of its five rows came from an earlier, faster
+session while the sentence above them claimed "same data as cold start". Both tables now come from
+one run of `examples/benchmark.py` on 2026-08-01.
 
 ## Concurrency, 200 isolated starts in parallel (wall-clock, all 200/200 succeeded)
 
@@ -138,13 +149,27 @@ round-trip per run: 200 runs took ~62 s vs kern's **0.37 s**).
 
 | Runtime | Wall-clock |
 |---|---:|
-| **kern** `--rootfs` | **0.09 s** |
-| bubblewrap | 0.17 s |
-| **docker run --rm** | 15.96 s |
+| **kern** `--rootfs` | **0.10 s** |
+| bubblewrap | 0.15 s |
+| runc | 0.31 s |
+| **docker run --rm** | 16.21 s |
+| podman (rootless) | 41.93 s |
 
-This is where a daemonless, lock-free design shows: kern fans out 200 concurrent boxes in 90 ms,
-**~2× bubblewrap** (0.17 s) and **~177× Docker** (15.96 s). (kern's overlay path was earlier verified at 30/30 and
-many-sharing-one-rootfs at 12/12, see the test suite.)
+This is where a daemonless, lock-free design shows: kern fans out 200 concurrent boxes in 100 ms,
+**~1.5× bubblewrap** (0.15 s) and **~162× Docker** (16.21 s). Every runtime completed 200/200.
+
+**It keeps scaling past the point the table stops.** Measured in the same session:
+
+| kern boxes at once | wall-clock | succeeded | rate |
+|---:|---:|---:|---:|
+| 200 | 0.10 s | 200/200 | 1970 box/s |
+| 500 | 0.31 s | 500/500 | 1613 box/s |
+| 1000 | 0.61 s | 1000/1000 | 1640 box/s |
+
+A thousand simultaneous kernel-isolated boxes in 0.61 s, none refused, on a 28-core desktop. The rate
+is flat from 500 to 1000, so the limit at this size is the machine rather than anything serialising
+inside kern. (The overlay path was earlier verified at 30/30 and many-sharing-one-rootfs at 12/12,
+see the test suite.)
 
 ## Runs everywhere, the same static binary, on boards where the engines can't
 
@@ -414,28 +439,69 @@ command from a PowerShell you are already in, not for a loop that starts hundred
 `kern.cmd` row exists because an antivirus removing the exe should not leave you with nothing; it
 preserves the *function*, not the speed.
 
+## Where a box start actually goes
+
+`KERN_TIMING=1` instruments both the parent and the box side. One `kern box --image alpine:3.19`,
+2026-08-01, this machine:
+
+| phase | cost |
+|---|---:|
+| `pivot+mount_proc` | 523 us |
+| `seccomp` | 185 us |
+| `proc-mask` (the thirteen mounts that close the `core_pattern` escape) | 173 us |
+| `parent:image+command` | 153 us |
+| `rootfs(overlay)` | 112 us |
+| `parent:setup->spawn` | 101 us |
+| `dev` | 97 us |
+| `unshare+private` | 92 us |
+| `parent:config+volumes` | 74 us |
+| `parent:claim` | 62 us |
+| `cgroup-view` | 49 us |
+| `parent:teardown` | 48 us |
+| `parent:name-check` | 27 us |
+| `volumes` | 2 us |
+
+The single largest item is the pivot and the `/proc` mount, and the two hardening phases that follow
+it, `seccomp` and `proc-mask`, cost 358 us together. That is the price of the boundary, and it is
+listed here rather than folded into a total so it can be argued with.
+
+⚠️ These are ABSOLUTE phase durations. `OPEN_ITEMS.md` quotes smaller figures for some of the same
+names (`proc-mask` 66 us, `seccomp` +60 us), and those are DELTAS, what the feature added when it
+landed. The two are different measurements of different things and must not be subtracted from each
+other.
+
 ## Footprint
 
 | | |
 |---|---:|
-| **kern** binary (the whole thing) | **~1.8 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 1.81 MB, aarch64 1.50 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
+| **kern** binary (the whole thing) | **~1.8 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 1.83 MB, aarch64 1.50 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
 | kern resident memory at rest | **0**: no daemon |
-| kern RSS per box (setup) | ~7 MB |
+| kern memory per box, marginal | **0.35 MB** (PSS, at 50 live boxes) |
+| kern memory per box, one box alone | 1.65 MB PSS / 4.6 MB RSS |
 | bubblewrap binary | 70 KB (launcher only) |
 | runc binary | ~10 MB |
-| **Docker** resident | **~186 MB RSS** always on (`dockerd` ~121 MB + `containerd` ~65 MB) |
+| **Docker** resident | **154 MB RSS** always on with zero containers running (`dockerd` 99 MB + `containerd` 55 MB, measured 2026-08-01; it was ~186 MB when this row was first written, so it moves with the Docker version) |
 
 kern is **~6× smaller than runc** (1.8 MB vs ~10 MB) and needs no bundle scaffolding; bwrap is
-smaller still but is only a launcher (no images/caps/lifecycle). Docker keeps ~186 MB resident
-before you run anything.
+smaller still but is only a launcher (no images/caps/lifecycle). Docker keeps 154 MB resident
+before you run anything; kern keeps **zero**, which `ps -eo rss,args | grep kern` shows directly when
+no box is up.
 
 > Reproduce: `ls -l $(command -v kern)` (binary); `ps -o rss= -C dockerd -C containerd` (Docker
-> resident, sum the KB); the per-box RSS is the box pid1's RSS while a box is up.
+> resident, sum the KB); for the per-box cost, sum `Pss` from `/proc/<pid>/smaps_rollup` over kern's
+> own processes for that box.
+>
+> **This row said "~7 MB RSS per box" and RSS was the wrong measure.** kern runs two processes per
+> box and both are the same static binary, so summing their RSS counts the shared pages twice. PSS
+> divides shared pages by the number of sharers, which is what "how much more memory does one more
+> box cost" actually means. Measured today: one box alone is 4.6 MB RSS but **1.65 MB PSS**, and with
+> 50 boxes up at once the total PSS is 17.5 MB, so the marginal box costs **0.35 MB**. The old figure
+> overstated the footprint by a factor of twenty at density, in the direction that flatters nobody:
+> the density argument this project makes was being undersold by its own benchmark file.
 >
 > The two per-architecture sizes are the PUBLISHED artifacts, unpacked from the release tarballs
-> (1,901,536 and 1,577,448 bytes at v0.6.29), not a local build: a local `cargo build --release`
-> here produces 1.70 MB with a different toolchain, and quoting that would understate what anyone
-> actually downloads.
+> (1,913,824 and 1,577,448 bytes at v0.6.30), not a local build: a local `cargo build --release`
+> here produces 1,783,048 bytes, and quoting that would understate what anyone actually downloads.
 
 ## Resource caps (where systemd-user is present)
 
