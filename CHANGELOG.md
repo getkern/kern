@@ -19,6 +19,34 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+### Security
+
+- **An OCI whiteout that could not be applied was reported as applied.** `remove_no_follow` returned
+  `()`, so a refused unlink was indistinguishable from a completed one and `merge_layer` returned
+  `Ok`: the file the image declared deleted stayed in the rootfs, and nothing said so. The condition
+  needs no crafted image. `merge_dir` copies the staging directory's mode onto the destination BEFORE
+  recursing into it, so a layer that both makes a directory read-only and deletes a file inside it
+  removes kern's own write permission on the parent first, and the unlink fails `EACCES`. Whiteouts
+  are how an image removes a secret, a setuid binary or a vulnerable library that an earlier layer
+  added, so this is the difference between the rootfs the manifest describes and the rootfs on disk.
+
+  Both removal helpers are now fallible and every call site propagates. A refused removal is retried
+  once with kern's own write+search permission restored on the PARENT directory (unlinking is governed
+  by the parent's mode, and kern extracted that parent, so it owns it); the parent's mode is put back
+  on both the success and the failure path, so the image's declared permissions still win. If the
+  removal still cannot be done, the pull FAILS naming the path and both OS errors. No-follow survives
+  the retry: the choice between `remove_dir_all` and `remove_file` comes from the original
+  `symlink_metadata`, so a symlink is unlinked and never traversed and a racing replacement cannot
+  turn a file removal into a directory walk. `clear_dir` (opaque whiteouts) gets the same treatment,
+  including a `read_dir` failure, which it used to swallow whole; a missing directory stays the
+  desired end state rather than an error.
+
+  Found by a mechanical sweep rather than by reading: of 40 discarded outcomes in `pull.rs`, 14 are in
+  tests and 22 are cleanup or `kill`/`wait`/`flush` after a decision. Four were not, and this was the
+  one that decides rootfs contents. The regression test constructs the permission precondition and
+  skips itself under DAC override, where the precondition cannot exist.
+
+
 ### Fixed
 
 - **`kern doctor` named a systemd manager that wasn't there.** The lingering check asked "am I root?"

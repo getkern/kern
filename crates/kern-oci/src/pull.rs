@@ -2143,7 +2143,7 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
     if dir.join(".wh..wh..opq").exists()
         && whiteout_dir_symlink_free(dest_s, &dir_rel.to_string_lossy())
     {
-        clear_dir(&dest.join(dir_rel));
+        clear_dir(&dest.join(dir_rel))?;
     }
 
     for entry in std::fs::read_dir(dir).map_err(|e| OciError::Extract(e.to_string()))? {
@@ -2176,7 +2176,7 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
                 && victim_name != ".."
                 && !victim_name.contains('/');
             if fname.as_ref() != ".wh..wh..opq" && plain_victim {
-                remove_no_follow(&target.with_file_name(victim_name));
+                remove_no_follow(&target.with_file_name(victim_name))?;
             }
             continue; // never materialise a whiteout marker
         }
@@ -2188,7 +2188,7 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
             match std::fs::symlink_metadata(&target) {
                 Ok(m) if m.is_dir() => {}
                 Ok(_) => {
-                    remove_no_follow(&target);
+                    remove_no_follow(&target)?;
                     std::fs::create_dir(&target).map_err(|e| OciError::Extract(e.to_string()))?;
                 }
                 Err(_) => {
@@ -2211,12 +2211,12 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
             merge_dir(base, &src, dest, dest_s)?;
         } else if ft.is_symlink() {
             let link = std::fs::read_link(&src).map_err(|e| OciError::Extract(e.to_string()))?;
-            remove_no_follow(&target);
+            remove_no_follow(&target)?;
             std::os::unix::fs::symlink(&link, &target)
                 .map_err(|e| OciError::Extract(e.to_string()))?;
         } else {
             // Regular file (device/special nodes were rejected by check_layer_safe).
-            remove_no_follow(&target);
+            remove_no_follow(&target)?;
             if std::fs::rename(&src, &target).is_err() {
                 std::fs::copy(&src, &target).map_err(|e| OciError::Extract(e.to_string()))?;
             }
@@ -2226,21 +2226,98 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
 }
 
 /// Remove a path without following symlinks (a symlink is unlinked, never traversed).
-fn remove_no_follow(p: &Path) {
-    match std::fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => {
-            let _ = std::fs::remove_dir_all(p);
+///
+/// FALLIBLE ON PURPOSE. This is how an OCI whiteout deletes a file, and it used to return `()`: a
+/// refused unlink was indistinguishable from a completed one, so `merge_layer` reported `Ok` while
+/// the file the image declared deleted was still in the rootfs. Reachable from a plain image, not a
+/// crafted one - `merge_dir` copies the staging directory's mode onto the destination BEFORE it
+/// recurses into it, so a layer that both makes a directory read-only and deletes a file inside it
+/// removes our own write permission on the parent first, and the unlink fails `EACCES`. Whiteouts
+/// are how an image removes a secret, a setuid binary or a vulnerable library that an earlier layer
+/// added, so "declared deleted, still present, nothing said" is the difference between the rootfs
+/// the manifest describes and the rootfs on disk.
+///
+/// A missing path is the desired end state, not a failure.
+///
+/// On refusal it retries ONCE with our own write+search permission restored on the PARENT directory.
+/// Unlinking is governed by the parent's mode, not the victim's, and kern extracted that parent, so
+/// it owns it and may chmod it. The parent's mode is put back either way, so the image's declared
+/// permissions still win: the widening exists only for the duration of the unlink.
+///
+/// No-follow is preserved across the retry: the decision between `remove_dir_all` and `remove_file`
+/// comes from the ORIGINAL `symlink_metadata`, so a symlink is unlinked and never traversed, and a
+/// racing replacement cannot turn a file removal into a directory walk.
+fn remove_no_follow(p: &Path) -> Result<(), OciError> {
+    let md = match std::fs::symlink_metadata(p) {
+        Ok(m) => m,
+        // ENOENT (or an unreadable parent) means there is nothing here to delete, which is exactly
+        // what the whiteout asked for.
+        Err(_) => return Ok(()),
+    };
+    let attempt = || -> std::io::Result<()> {
+        if md.is_dir() {
+            std::fs::remove_dir_all(p)
+        } else {
+            std::fs::remove_file(p)
         }
-        Ok(_) => {
-            let _ = std::fs::remove_file(p);
-        }
-        Err(_) => {}
+    };
+    let first = match attempt() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    // Retry with the parent widened. `parent()` is `None` only for a path with no directory
+    // component, which cannot happen here: every caller joins onto the destination rootfs.
+    let Some(parent) = p.parent() else {
+        return Err(OciError::Extract(format!(
+            "cannot remove {}: {first}",
+            p.display()
+        )));
+    };
+    use std::os::unix::fs::PermissionsExt;
+    // `st_mode` carries the file-type bits; mask to the permission bits so the mode we restore is
+    // the one `chmod(2)` actually accepts.
+    let saved = std::fs::metadata(parent)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777);
+    if let Some(mode) = saved {
+        // u+wx: write to create/remove entries, execute to traverse. Nothing is granted to group or
+        // other, and it lasts only until the restore below.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode | 0o300));
     }
+    let second = attempt();
+    if let Some(mode) = saved {
+        // Restore unconditionally, including on the failure path: the image's mode is authoritative
+        // and must not be left widened because a removal failed.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode));
+    }
+    second.map_err(|e| {
+        OciError::Extract(format!(
+            "cannot remove {} (whiteout or replacement): {e} (first attempt: {first})",
+            p.display()
+        ))
+    })
 }
 
 /// Remove every direct child of `d` (no-follow). Used for opaque-dir whiteouts.
-fn clear_dir(d: &Path) {
-    if let Ok(rd) = std::fs::read_dir(d) {
+///
+/// FALLIBLE for the same reason as [`remove_no_follow`]: an opaque whiteout that cannot be applied
+/// leaves the directory's earlier contents in the rootfs, and returning `()` made that indistinguishable
+/// from a directory that was cleared. A `read_dir` that fails with anything other than "the directory
+/// is not there" is also a failure to apply the whiteout, not a reason to move on quietly.
+fn clear_dir(d: &Path) -> Result<(), OciError> {
+    let rd = match std::fs::read_dir(d) {
+        Ok(rd) => rd,
+        // Nothing to clear is the end state an opaque whiteout asks for.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(OciError::Extract(format!(
+                "opaque whiteout: cannot read {}: {e}",
+                d.display()
+            )))
+        }
+    };
+    {
         for e in rd.flatten() {
             // NEVER delete kern's own transient files: the layer cache dir (`dest`) also holds the
             // in-flight prefetch blob (`.kern-layer-<i>-*`) and, in `dest`'s parent, staging dirs.
@@ -2251,9 +2328,10 @@ fn clear_dir(d: &Path) {
             if e.file_name().to_string_lossy().starts_with(".kern-") {
                 continue;
             }
-            remove_no_follow(&e.path());
+            remove_no_follow(&e.path())?;
         }
     }
+    Ok(())
 }
 
 fn is_manifest_list(m: &str) -> bool {
@@ -2799,6 +2877,75 @@ mod tests {
     }
 
     /// SECURITY (regression): an OCI whiteout whose victim strips to `..` (member name `.wh...`) must
+    /// An OCI whiteout that CANNOT be applied must not pass for one that was.
+    ///
+    /// `remove_no_follow` returns `()`, so a failed unlink is indistinguishable from a successful
+    /// one, and `merge_layer` returns `Ok`. The condition is reachable from a plain image, not a
+    /// crafted one: `merge_dir` copies the staging directory's mode onto the destination BEFORE it
+    /// recurses into it, so a layer that both makes a directory read-only and deletes a file inside
+    /// it removes the caller's write permission on the parent first. The unlink then fails `EACCES`
+    /// and the file the image declared deleted stays in the rootfs.
+    ///
+    /// That matters beyond tidiness: whiteouts are how an image removes a secret, a setuid binary or
+    /// a vulnerable library added by an earlier layer. Silently not removing it is the difference
+    /// between the rootfs the manifest describes and the rootfs on disk.
+    ///
+    /// Skipped when the test runs with DAC override (root ignores the directory mode), because there
+    /// the precondition cannot be created at all - and a test that cannot fail is not a test.
+    #[test]
+    fn a_whiteout_that_cannot_be_applied_is_not_reported_as_applied() {
+        let base = std::env::temp_dir().join(format!("kern-oci-wh-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Precondition probe: can this uid write into a mode-0555 directory it owns? Root can.
+        let probe = base.join("probe");
+        std::fs::create_dir_all(&probe).expect("probe dir");
+        set_mode(&probe, 0o555);
+        let dac_override = std::fs::write(probe.join("x"), b"x").is_ok();
+        set_mode(&probe, 0o755);
+        if dac_override {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // running with DAC override: the precondition is not constructible
+        }
+
+        // Destination rootfs from an earlier layer: `dir/victim` exists.
+        let dest = base.join("dest");
+        std::fs::create_dir_all(dest.join("dir")).expect("dest dir");
+        std::fs::write(dest.join("dir/victim"), b"secret").expect("victim");
+
+        // The new layer: same directory, made read-only, with a whiteout for `victim`.
+        let staging = base.join("stg");
+        std::fs::create_dir_all(staging.join("dir")).expect("staging dir");
+        std::fs::write(staging.join("dir/.wh.victim"), b"").expect("whiteout marker");
+        set_mode(&staging.join("dir"), 0o555);
+
+        let merged = merge_layer(&staging, &dest);
+
+        // Restore write permission before asserting, so the assertion failure path can still clean up.
+        set_mode(&dest.join("dir"), 0o755);
+        let survived = dest.join("dir/victim").exists();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            !survived || merged.is_err(),
+            "the whiteout was not applied and merge_layer still returned Ok: the file the image \
+             declared deleted is still in the rootfs, and nothing said so"
+        );
+        assert!(
+            !survived,
+            "the whiteout must be APPLIED, not merely reported as failed: kern owns the parent \
+             directory and can restore its own write permission to complete the unlink"
+        );
+    }
+
+    /// `chmod` helper for the tests above: a mode is set or the test is meaningless, so a failure is
+    /// reported rather than ignored.
+    fn set_mode(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|e| panic!("chmod {:o} on {}: {e}", mode, p.display()));
+    }
+
     /// NOT delete the rootfs's PARENT. Without the guard, `with_file_name("..")` → `<dest>/..` and
     /// `remove_no_follow` would `remove_dir_all` files OUTSIDE the image (other pulled images / store).
     #[test]
