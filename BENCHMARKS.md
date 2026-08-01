@@ -470,6 +470,54 @@ keep-alive connection with p99 pinned at 42.0 ms**, while opening a fresh connec
 2614/s. Bandwidth was unaffected throughout, 1195 MB/s, which is exactly why it went unnoticed: a
 benchmark that downloads one large file through a published port sees nothing wrong.
 
+## What a published port costs at scale, and on a protocol that is not HTTP
+
+The forwarder forks **one process per accepted connection**, which each `setns` into the box. Nobody
+had measured what that costs when the connections are real and many, so:
+
+**Connections held open at once** (nginx behind `-p`, each client keeps its connection):
+
+| held open | forwarder processes | RSS | PSS | per connection |
+|---:|---:|---:|---:|---:|
+| 0 | 3 | 6.1 MB | 1.7 MB | |
+| 200 | 203 | 266.9 MB | 11.9 MB | **52.9 kB** PSS |
+| 500 | 503 | 658.3 MB | 27.2 MB | 52.3 kB |
+| 1000 | 1003 | 1310.7 MB | 52.6 MB | 52.2 kB |
+
+Read the PSS column. RSS says 1336 kB per connection and that is the same double-counting as the
+per-box row above: every child is the same static binary, so its pages are charged to each of them.
+The marginal cost of one more open connection is **52 kB and one PID**. Closing them all returns
+exactly to 3 processes and 1.7 MB, with nothing left behind.
+
+The ceiling is the PID limit rather than memory: `RLIMIT_NPROC` is 115,919 on this host, so the
+design runs out of processes long before it runs out of RAM. A service expecting six-figure
+simultaneous connections wants `--net` or a pod, not `-p`.
+
+**Connections opened and closed as fast as possible** (one request each, then closed):
+
+| opened at once | completed | wall | rate | p99 |
+|---:|---:|---:|---:|---:|
+| 100 | 100/100 | 0.02 s | 4940 conn/s | 1.45 ms |
+| 500 | 500/500 | 0.09 s | 5393 conn/s | 1.46 ms |
+| 1000 | 1000/1000 | 0.19 s | 5277 conn/s | 1.72 ms |
+| 2000 | 2000/2000 | 0.37 s | 5352 conn/s | 1.76 ms |
+
+Nothing was refused and the rate is flat, so the fork per connection is not the bottleneck at this
+size. Sampling every 5 ms during 300 of these never caught more than one extra process alive: the
+children finish faster than they can be counted.
+
+**Redis, which is the shape HTTP is not**: strict request/response on one persistent connection,
+3000 SET+GET round trips.
+
+| | ops/s | p50 | p99 |
+|---|---:|---:|---:|
+| behind `-p` | 71,606 | 0.027 ms | 0.03 ms |
+| direct, `--net` | 124,992 | 0.016 ms | 0.02 ms |
+
+The pump costs about **11 us per round trip**, which on a protocol this fast is 43% of throughput. It
+is invisible on HTTP, where a request costs far more than 11 us, and it is the reason to reach for a
+pod or `--net` when the workload is a chatty database rather than a web server.
+
 ## `kern run` costs 4.9 ms and `kern box` costs 3.6, which looks backwards
 
 `run` does LESS than `box`, no namespaces, no overlay, no seccomp, and measures slower. Both figures
