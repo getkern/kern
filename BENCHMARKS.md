@@ -439,6 +439,39 @@ command from a PowerShell you are already in, not for a loop that starts hundred
 `kern.cmd` row exists because an antivirus removing the exe should not leave you with nothing; it
 preserves the *function*, not the speed.
 
+## `kern run` costs 4.9 ms and `kern box` costs 3.6, which looks backwards
+
+`run` does LESS than `box`, no namespaces, no overlay, no seccomp, and measures slower. Both figures
+are real, and the asymmetry is structural rather than a defect. Measured 2026-08-01, 200 runs x 3:
+
+| | ms/run | what the cap does |
+|---|---:|---|
+| `kern run -- /bin/true` | 4.70 | still capped: `memory.max` 512 MiB, `pids.max` 512 |
+| `kern run --memory 64m` | 4.88 | |
+| `kern run --cpus 1` | 5.78 | a `CPUQuota` property costs ~0.9 ms more than a memory one |
+| `kern run --memory 64m` with `KERN_NO_SCOPE=1` | **0.91** | `memory.max` reads `max`: no cap at all |
+| `/bin/true` with no kern | 0.29 | the floor: fork + exec |
+
+The ~4 ms is the `systemd-run --user --scope` round trip, and `box` stopped paying it in 0.6.15 while
+`run` cannot. `box` leaves a supervisor process alive for the box's lifetime, so it can create the
+cgroup directly under kern's delegated slice and remove it from that supervisor's `Drop`. `run`
+**`exec()`s in place**: the kern process becomes the workload, so nothing of kern remains to do the
+removal, and a directly created cgroup would be orphaned once per invocation, forever. The scope's
+`--collect` is what reaps it.
+
+So the 4 ms buys the cap, and this is what it buys:
+
+```console
+$ kern run --memory 64m -- python3 -c "b=bytearray(200*1024*1024)"
+Killed                                        # exit 137
+$ KERN_NO_SCOPE=1 kern run --memory 64m -- python3 -c "b=bytearray(200*1024*1024)"
+kern: warning: requested resource cap(s) could not be enforced
+                                              # exit 0, 200 MiB allocated
+```
+
+`KERN_NO_SCOPE=1` is 5x faster and removes the cap entirely; it says so on stderr rather than letting
+you find out later. Use it where you want `run` as a plain launcher and are capping some other way.
+
 ## Where a box start actually goes
 
 `KERN_TIMING=1` instruments both the parent and the box side. One `kern box --image alpine:3.19`,
