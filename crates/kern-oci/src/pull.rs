@@ -2235,6 +2235,59 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
     Ok(())
 }
 
+/// An open DIRECTORY descriptor, used to read and change a directory's mode by OBJECT rather than by
+/// NAME.
+///
+/// `std::fs::metadata` and `std::fs::set_permissions` both follow symlinks. Every mode change in this
+/// module is applied to a path built from attacker-supplied layer content, so a symlink at the final
+/// component - planted by an earlier layer, or swapped in between a check and the call - would move
+/// the `chmod` onto its target, potentially a directory outside the image. `merge_dir`'s
+/// `whiteout_dir_symlink_free` guard already refuses such paths, but that is a check-then-use: this
+/// closes the class structurally instead of relying on the ordering.
+///
+/// `O_DIRECTORY` refuses anything that is not a directory and `O_NOFOLLOW` refuses a symlink at the
+/// final component, so the descriptor can only ever refer to a real directory; `fstat` and `fchmod`
+/// then act on that descriptor, and re-pointing the name afterwards changes nothing.
+struct DirHandle(libc::c_int);
+
+impl DirHandle {
+    /// Open `dir` for mode work. `None` if it is not a directory, is a symlink, or cannot be opened -
+    /// each of which means there is no mode of ours to adjust here.
+    fn open(dir: &Path) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c` is NUL-terminated and outlives the call; `open` only reads it.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        (fd >= 0).then_some(DirHandle(fd))
+    }
+
+    /// The directory's permission bits (`st_mode & 0o7777`), or `None` if `fstat` fails.
+    fn mode(&self) -> Option<u32> {
+        // SAFETY: `st` is fully initialised by `fstat` on success, and only read when it returns 0.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::fstat(self.0, &mut st) };
+        (r == 0).then(|| st.st_mode & 0o7777)
+    }
+
+    /// Set the directory's permission bits. `false` if the kernel refused.
+    fn chmod(&self, mode: u32) -> bool {
+        // SAFETY: a plain syscall on a descriptor this handle owns.
+        unsafe { libc::fchmod(self.0, mode as libc::mode_t) == 0 }
+    }
+}
+
+impl Drop for DirHandle {
+    fn drop(&mut self) {
+        // SAFETY: the fd was opened by `open` above and is closed exactly once, here.
+        unsafe { libc::close(self.0) };
+    }
+}
+
 /// Grant OURSELVES `u+wx` on a directory we are about to descend into or empty, best-effort.
 ///
 /// Unlinking an entry is governed by the mode of the DIRECTORY that holds it, and reading it needs
@@ -2243,14 +2296,17 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
 /// the decision. If the chmod is refused, the `read_dir`/`remove_*` that follows fails and THAT error
 /// is the one that propagates, naming the operation that actually mattered.
 ///
-/// Nothing is granted to group or other, and only the bits needed to delete are added.
+/// Nothing is granted to group or other, and only the bits needed to delete are added. Applied
+/// through [`DirHandle`], so it can never land on a symlink's target.
 fn grant_self_wx(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(m) = std::fs::metadata(dir) {
-        let mode = m.permissions().mode() & 0o7777;
-        if mode & 0o300 != 0o300 {
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o300));
-        }
+    let Some(h) = DirHandle::open(dir) else {
+        return;
+    };
+    let Some(mode) = h.mode() else {
+        return;
+    };
+    if mode & 0o300 != 0o300 {
+        let _ = h.chmod(mode | 0o300);
     }
 }
 
@@ -2391,22 +2447,22 @@ fn remove_no_follow(p: &Path) -> Result<(), OciError> {
             p.display()
         )));
     };
-    use std::os::unix::fs::PermissionsExt;
-    // `st_mode` carries the file-type bits; mask to the permission bits so the mode we restore is
-    // the one `chmod(2)` actually accepts.
-    let saved = std::fs::metadata(parent)
-        .ok()
-        .map(|m| m.permissions().mode() & 0o7777);
-    if let Some(mode) = saved {
+    // Widen through a DESCRIPTOR, never through the path: `set_permissions` follows symlinks, and this
+    // parent is built from attacker-supplied layer content. One handle is held across both the widen
+    // and the restore, so the two provably act on the SAME directory even if the name is re-pointed
+    // in between.
+    let handle = DirHandle::open(parent);
+    let saved = handle.as_ref().and_then(DirHandle::mode);
+    if let (Some(h), Some(mode)) = (handle.as_ref(), saved) {
         // u+wx: write to create/remove entries, execute to traverse. Nothing is granted to group or
         // other, and it lasts only until the restore below.
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode | 0o300));
+        let _ = h.chmod(mode | 0o300);
     }
     let second = attempt();
-    if let Some(mode) = saved {
+    if let (Some(h), Some(mode)) = (handle.as_ref(), saved) {
         // Restore unconditionally, including on the failure path: the image's mode is authoritative
         // and must not be left widened because a removal failed.
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode));
+        let _ = h.chmod(mode);
     }
     second.map_err(|e| {
         OciError::Extract(format!(
@@ -3131,6 +3187,59 @@ mod tests {
         assert!(
             !survived,
             "the whiteout of a read-only directory tree was not applied"
+        );
+    }
+
+    /// Every mode change in this module must land on the DIRECTORY it names, never on a symlink's
+    /// target.
+    ///
+    /// The paths are built from attacker-supplied layer content, and `std::fs::set_permissions`
+    /// follows symlinks, so a planted `dir -> /somewhere/else` would have moved kern's `u+wx` widen
+    /// onto a directory outside the image. `merge_dir`'s symlink guard already refuses such paths,
+    /// but that is a check-then-use; `DirHandle` closes it structurally with
+    /// `O_DIRECTORY | O_NOFOLLOW`, and this pins that.
+    #[test]
+    fn a_mode_change_never_follows_a_symlink_out_of_the_image() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kern-oci-chmod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // The victim: a directory OUTSIDE the image, deliberately narrow.
+        let victim = base.join("outside");
+        std::fs::create_dir_all(&victim).expect("victim dir");
+        set_mode(&victim, 0o500);
+
+        // A layer planted `link -> outside` where kern is about to widen a directory.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("plant the symlink");
+
+        grant_self_wx(&link);
+
+        let after = std::fs::metadata(&victim)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0);
+        // Opening the symlink itself must be refused outright, and a regular file too.
+        let opened_link = DirHandle::open(&link).is_some();
+        let plain = base.join("plain");
+        std::fs::write(&plain, b"x").expect("plain file");
+        let opened_file = DirHandle::open(&plain).is_some();
+        // A real directory still opens, or the guard would be indistinguishable from a broken open.
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let opened_real = DirHandle::open(&real).is_some();
+
+        let _ = std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            after, 0o500,
+            "the widen followed the symlink and changed a directory outside the image"
+        );
+        assert!(!opened_link, "O_NOFOLLOW must refuse a symlink");
+        assert!(!opened_file, "O_DIRECTORY must refuse a regular file");
+        assert!(
+            opened_real,
+            "a real directory must still open, or the guard proves nothing"
         );
     }
 

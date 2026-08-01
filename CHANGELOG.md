@@ -57,6 +57,16 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **Every mode change in the image-merge path now acts on a descriptor, not a name.** The permission
+  repair added for read-only whiteout trees used `std::fs::metadata` + `set_permissions`, both of which
+  FOLLOW symlinks, on paths built from attacker-supplied layer content. `merge_dir`'s
+  `whiteout_dir_symlink_free` guard already refuses such paths, but that is a check-then-use. A
+  `DirHandle` opened with `O_DIRECTORY | O_NOFOLLOW` now backs every read and write of a directory
+  mode, and one handle is held across both the widen and the restore so the two provably act on the
+  same object. Demonstrated: with the path-based version, a planted `link -> outside` moved kern's
+  `u+wx` onto a 0500 directory outside the image; with the descriptor-based one it does not, and the
+  open is refused for a symlink and for a regular file alike.
+
 - **`kern pull` declared a dangling image ready to run.** A cache entry was considered complete on its
   sentinel and its config sidecar, never on the ROOTFS those two describe. With `<ref>/` pruned or
   cleaned by hand, `kern pull` printed "already cached" and "run it: kern box …" while `kern images`
