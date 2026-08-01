@@ -705,9 +705,23 @@ def test_concurrent_calls_on_one_sandbox_do_not_fight_over_the_env_file():
     old code also never removed the file: a persistent `workspace=` accumulated one per session.
     """
     import concurrent.futures as cf
+    import subprocess
+
+    def live_box_pids() -> set[int]:
+        """PIDs of live `kern box` processes, read from ps.
+
+        The SDK leaves a box behind per call on this build, a defect documented in OPEN_ITEMS.md and
+        NOT understood yet, and `kern ps` does not list them, so `kern stop` cannot reap them either.
+        A 24-call test would therefore multiply a known leak by 24 and leave the machine worse than it
+        found it. This reaps only what THIS test started, by difference, and it is a workaround for a
+        product defect rather than a fix for it: when the lifecycle bug is settled, delete this.
+        """
+        out = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True, text=True).stdout
+        return {int(ln.split()[0]) for ln in out.splitlines() if " kern box " in f" {ln} "}
 
     n = 24
     errors: list[str] = []
+    pids_before = live_box_pids()
 
     with Sandbox(env={"KERN_TEST_VAR": "x"}) as sbx:
         def call(_):
@@ -721,6 +735,12 @@ def test_concurrent_calls_on_one_sandbox_do_not_fight_over_the_env_file():
             ok = sum(1 for r in ex.map(call, range(n)) if r)
 
         leftover = [f for f in os.listdir(sbx._ws) if f.startswith(".kern-env")]
+
+    for pid in live_box_pids() - pids_before:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
 
     assert not errors, f"concurrent calls raised: {errors[:3]}"
     assert ok == n, f"only {ok}/{n} concurrent calls succeeded"

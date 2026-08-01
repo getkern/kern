@@ -86,13 +86,21 @@ the memory controller is not delegated gets no warning. The correct predicate
 `cgroup_enable=memory` removed to verify against, which is a physical board rather than a code
 change.
 
-## The Python and Node SDK test suites leave two boxes each behind
+## The Python and Node SDK test suites leave boxes behind
 
-Measured 2026-07-29 against this build, from a clean slate (zero `kern` processes): `pytest` in
-`bindings/python` ends 61/61 green and leaves **2** `pysbx-*` boxes running; `node --test` in
-`bindings/node` ends 50/50 green and leaves **2** `jssbx-*`. They carry the SDK's 24 h `--timeout`
-backstop, so they do expire on their own, but until then `kern ps` does not list them and
-`kern stop --all` answers "no running boxes to stop" while four of them are alive.
+Re-measured 2026-08-01 at kern-sandbox 0.1.12, from a clean slate (zero `kern box` processes):
+`pytest` in `bindings/python` ends 65/65 green and leaves **2** `pysbx-*` boxes running; `node --test`
+in `bindings/node` ends 54/54 green and leaves **5** `jssbx-*`. The Node side was 2 when this was
+first written on 2026-07-29 and is 5 now, so it tracks the number of execution tests rather than
+being a fixed cost. They carry the SDK's 24 h `--timeout` backstop, so they do expire on their own,
+but until then `kern ps` does not list them and `kern stop --all` answers "no running boxes to stop"
+while seven of them are alive.
+
+It scales with the CALLS, not with the suites: the concurrency regression tests added in 0.1.12 fire
+24 and 16 calls, and left **60** boxes behind before they were made to reap what they start. Those
+two tests now kill, by pid difference, only the boxes they themselves created, which is a workaround
+inside a test for a defect in the product and is marked as one: when the lifecycle bug below is
+settled, that code goes.
 
 What it is NOT, each ruled out by measurement rather than by reading: a registry defect (a plain
 detached box is listed and stopped correctly), the orphan-on-launcher-death bug (a box whose

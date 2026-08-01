@@ -803,6 +803,25 @@ test("concurrent calls on one Sandbox do not fight over the env file", exec, asy
   //   error: sandbox: cannot read --env-file '...': No such file or directory
   // Measured at 30 concurrent runCode calls before the fix: 2 failed that way and one file was left
   // behind. The security property is unchanged; only the NAME is per-call.
+  // The SDK leaves a box behind per call on this build, a defect documented in OPEN_ITEMS.md and not
+  // understood yet, and `kern ps` does not list them, so `kern stop` cannot reap them. A 16-call test
+  // would multiply a known leak by 16 and leave the machine worse than it found it. Reap only what
+  // THIS test started, by difference. This is a workaround for a product defect, not a fix: when the
+  // lifecycle bug is settled, delete it.
+  const { execFileSync } = require("node:child_process");
+  const liveBoxPids = () => {
+    let out = "";
+    try {
+      out = execFileSync("ps", ["-eo", "pid,args"], { encoding: "utf8" });
+    } catch {
+      return new Set();
+    }
+    return new Set(
+      out.split("\n").filter((l) => ` ${l} `.includes(" kern box ")).map((l) => Number(l.trim().split(/\s+/)[0])),
+    );
+  };
+  const pidsBefore = liveBoxPids();
+
   const sb = new Sandbox({ env: { KERN_TEST_VAR: "x" } });
   await sb.open();
   try {
@@ -820,6 +839,15 @@ test("concurrent calls on one Sandbox do not fight over the env file", exec, asy
     assert.deepStrictEqual(leftover, [], "env files left behind in the workspace");
   } finally {
     await sb.close();
+    for (const pid of liveBoxPids()) {
+      if (!pidsBefore.has(pid)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
   }
 });
 
