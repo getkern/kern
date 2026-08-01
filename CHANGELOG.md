@@ -57,6 +57,18 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **`kern volume create --size N` reported success when the quota had not been written.** The cap
+  lives ONLY in the volume's `meta.json`: `size_limit()` reads that file and returns `None` when it
+  cannot, and `None` means "no cap" everywhere downstream. `create` wrote it with a discarded result,
+  then printed the volume name and returned success, so a failed write produced a volume that exists,
+  is reported created, and has no quota. `volume edit` has always propagated the identical write,
+  which is how the inconsistency surfaced: one operation, two dispositions. The realistic trigger is a
+  full disk, where `create_dir_all` costs a few inodes and succeeds while the file write hits
+  `ENOSPC`, losing the cap at the moment it would have mattered. The auto-create inside
+  `resolve_named` stays best-effort and now says why in the code: that sidecar carries only a
+  timestamp, never a `size_limit`, so a volume created implicitly by `-v name:/path` has no
+  enforcement to lose and a box start should not fail over it.
+
 - **A pull could leave a full copy of every layer on disk, silently.** Staging is extracted with
   `--same-permissions`, so an image shipping a read-only directory made the four
   `remove_dir_all(&staging)` cleanups fail with `EACCES`; all four discarded the result, so the disk

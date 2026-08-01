@@ -89,6 +89,11 @@ pub fn resolve_named(name: &str) -> Result<String, Error> {
     if !data.exists() {
         std::fs::create_dir_all(&data)
             .map_err(|e| Error::Volume(format!("cannot create volume '{name}': {e}")))?;
+        // DECLARED best-effort, unlike the `create` path above, and the difference is the content:
+        // this sidecar carries only a creation timestamp, never a `size_limit` - a volume auto-created
+        // by `-v name:/path` asked for no quota, so there is no enforcement to lose. Failing a box
+        // start because a cosmetic timestamp could not be written would cost more than the timestamp
+        // is worth. The volume itself is the `data` directory created (and checked) just above.
         let _ = std::fs::write(
             vol.join("meta.json"),
             format!("{{\"created\":{}}}", crate::registry::now_unix()),
@@ -494,7 +499,15 @@ fn create(args: &[String]) -> Result<(), Error> {
         Some(n) => format!("{{\"created\":{created},\"size_limit\":{n}}}"),
         None => format!("{{\"created\":{created}}}"),
     };
-    let _ = std::fs::write(vol.join("meta.json"), meta);
+    // NOT best-effort: `meta.json` is the ONLY place the quota lives. `size_limit()` reads this file
+    // and returns `None` when it cannot, and `None` means "no cap" everywhere downstream - so a
+    // discarded failure here produced a volume that exists, printed its name, and had no quota. The
+    // realistic trigger is a full disk, where `create_dir_all` costs a few inodes and succeeds while
+    // the file write hits `ENOSPC`: the cap is lost at the moment it would have mattered. `edit_cmd`
+    // has always propagated the identical write; this is the same operation and now has the same
+    // disposition.
+    std::fs::write(vol.join("meta.json"), meta)
+        .map_err(|e| Error::Volume(format!("cannot write volume metadata for '{name}': {e}")))?;
     println!("{name}");
     Ok(())
 }
@@ -932,6 +945,48 @@ mod tests {
         assert!(resolve_named("../evil").is_err());
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    /// `volume create --size N` must not report success when the quota it was asked for was not
+    /// written.
+    ///
+    /// The quota lives ONLY in `meta.json`: `size_limit()` reads that file and returns `None` if it
+    /// cannot, and `None` means "no quota" everywhere downstream. `create` wrote it with `let _ =`,
+    /// then printed the name and returned `Ok`, so a failed write produced a volume that exists,
+    /// reports success, and has no cap. `edit_cmd` propagates the same write, which is how the
+    /// inconsistency was found: one operation, two dispositions.
+    ///
+    /// The realistic trigger is a full disk. `create_dir_all` costs a few inodes and succeeds where
+    /// the subsequent file write hits `ENOSPC`, so the quota is lost at exactly the moment it would
+    /// have mattered. This test forces the same class of failure deterministically by pre-planting
+    /// `meta.json` as a DIRECTORY, which makes `fs::write` fail `EISDIR` on every filesystem.
+    #[test]
+    fn volume_create_refuses_when_the_quota_cannot_be_written() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-volmeta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_DATA_HOME", &tmp);
+
+        // Pre-plant `meta.json` as a directory: `create_dir_all(vol/data)` still succeeds, and the
+        // metadata write that carries `size_limit` cannot.
+        let vol = tmp.join("kern/volumes/capped");
+        std::fs::create_dir_all(vol.join("meta.json")).expect("plant meta.json as a directory");
+
+        let r = create(&["capped".to_string(), "--size".to_string(), "1g".to_string()]);
+        let quota = size_limit("capped");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_DATA_HOME");
+
+        assert!(
+            r.is_err(),
+            "the quota could not be written and create still reported success; \
+             size_limit() then reads {quota:?}, so the volume has no cap at all"
+        );
+        assert_eq!(
+            quota, None,
+            "sanity: with an unwritable meta.json there is no quota to read back"
+        );
     }
 
     #[test]
