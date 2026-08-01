@@ -57,6 +57,43 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **The TUI performed destructive actions and lifecycle keys without reporting a refusal.** Both
+  paths reuse the CLI helpers inside `quiet_io`, which redirects fd 1 and fd 2 to `/dev/null` so a
+  helper's `println!` cannot corrupt the alt-screen; it also sent their error messages there, and the
+  `Result` itself was discarded. A refused stop or pause left an unchanged list, a key that appeared
+  to do nothing and no reason anywhere; a confirmed `volume rm` or `image rm` that was refused (still
+  in use) left the item on screen after the `y`. `quiet_io` now carries the helper's result out of the
+  muted section, and both paths report through the overlay pane the log view already uses.
+
+- **`builds::remove` answered the wrong question.** It returned `existed`, sampled BEFORE the removal,
+  and discarded the removal's own result, so it reported "was there a record?" while both callers read
+  it as "was the record deleted?". `kern build rm <id>` printed "removed build '<id>'" for a record
+  still on disk, and `kern build prune` counted it among the pruned. Three outcomes cannot travel in a
+  bool sampled at the wrong moment: it returns `Ok(true)` (gone), `Ok(false)` (never there) or `Err`
+  (there and not removable), and both callers now say which.
+
+- **An image's config sidecar was written best-effort.** That is not the trade the `.ok` sentinel
+  beside it makes: a missing sentinel means the image is not recognised and the next run rebuilds it,
+  which is wasteful and self-correcting, while a missing config means the image IS recognised and
+  simply has no entrypoint, no env and no user, so the box silently falls back to a shell and the
+  workload runs with a different identity than the image declares. `write_image_config` is fallible
+  and all six production call sites (pull, load, commit, two build paths) refuse rather than publish
+  an image without its config.
+
+- **A quota'd volume could be mounted EMPTY over data that still existed.** The one-time seeding of a
+  freshly created ext4 image from the volume's plain `data/` dir ran through `cp -a` with both the
+  spawn error and the exit status discarded. The two backends are distinct on-disk locations, so a
+  failed copy mounts an empty volume while the data sits elsewhere: the workload sees nothing, may
+  recreate or overwrite it, and nothing said the copy had not happened. It now refuses the box start
+  and names where the existing data still is.
+
+- **Smaller, same class.** The overlay work dir is cleared as a precondition now (overlayfs requires
+  it empty) instead of surfacing later as a bare `mount: invalid argument`; a box whose
+  `/etc/resolv.conf` could not be placed says so rather than leaving "DNS does not resolve in here"
+  with no stated cause; and the two `registry::register` calls that record a box's PID 1 report when
+  they fail, because that field is what `kern exec` joins and a stale `0` made it fail with "box is
+  not running" about a running box.
+
 - **`kern rename` could report success while the box kept its old name.** The displayed name comes
   from the `name=` field INSIDE the registry entry body (`load_live` then `parse`), not from the entry
   file name. `rename` renamed the FILE with `?` and rewrote the BODY with a discarded result, so a

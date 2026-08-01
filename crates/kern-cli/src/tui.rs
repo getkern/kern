@@ -593,7 +593,11 @@ pub fn run() -> Result<(), crate::error::Error> {
             // Confirm a destructive action: `y` performs it, anything else cancels.
             Mode::Confirm { action, .. } => {
                 if matches!(key.first(), Some(b'y' | b'Y')) {
-                    perform_pending(action);
+                    // A destructive action that was refused must say so. `mode` was reset to `Nav` by
+                    // the `replace` above, so setting the overlay here is what the other arms do too.
+                    if let Some(err) = perform_pending(action) {
+                        mode = Mode::Overlay(err);
+                    }
                     dirty = true;
                 }
             }
@@ -751,16 +755,16 @@ fn nav_boxes(k: u8, sel: usize, rows: &[Row], mode: &mut Mode) -> bool {
     let Some(name) = rows.get(sel).map(|r| r.name.clone()) else {
         return false;
     };
-    match k {
-        b's' | b'k' => quiet_io(|| {
-            let _ = crate::commands::stop(std::slice::from_ref(&name), false);
-        }),
-        b'p' => quiet_io(|| {
-            let _ = crate::commands::pause(std::slice::from_ref(&name), false, true);
-        }),
-        b'u' => quiet_io(|| {
-            let _ = crate::commands::pause(std::slice::from_ref(&name), false, false);
-        }),
+    // Every lifecycle key now reports its outcome. `quiet_io` redirects fd 1 and 2 to /dev/null so a
+    // reused CLI helper's `println!` cannot corrupt the alt-screen - which ALSO sent its error message
+    // there. A refused stop (the box exited a moment ago) or a refused pause (a host with no freezer
+    // controller) left the user with an unchanged list, a key that appeared to do nothing, and no
+    // reason for it. The result is carried out of the muted section and shown in the same overlay pane
+    // the log view already uses.
+    let outcome = match k {
+        b's' | b'k' => quiet_io(|| crate::commands::stop(std::slice::from_ref(&name), false)),
+        b'p' => quiet_io(|| crate::commands::pause(std::slice::from_ref(&name), false, true)),
+        b'u' => quiet_io(|| crate::commands::pause(std::slice::from_ref(&name), false, false)),
         b'\r' | b'\n' => {
             *mode = Mode::Overlay(
                 crate::commands::box_log_tail(&name).unwrap_or_else(|| "(no output yet)".into()),
@@ -768,6 +772,9 @@ fn nav_boxes(k: u8, sel: usize, rows: &[Row], mode: &mut Mode) -> bool {
             return false;
         }
         _ => return false,
+    };
+    if let Err(e) = outcome {
+        *mode = Mode::Overlay(format!("{name}: {e}"));
     }
     true
 }
@@ -907,33 +914,42 @@ fn image_detail(img: &crate::commands::ImageEntry) -> String {
     )
 }
 
-/// Carry out a confirmed destructive action, muting the helper's stdio.
-fn perform_pending(action: Pending) {
+/// Carry out a confirmed destructive action, muting the helper's stdio. Returns the failure text when
+/// the action did NOT happen, for the caller to show.
+///
+/// Every arm used to discard its result while `quiet_io` sent the helper's own message to /dev/null,
+/// so a refused `volume rm` (a volume still bound by a running box), a refused `image rm` (an image
+/// still in use) or a failed profile delete left the item on screen after a `y` confirmation, with
+/// nothing to explain why. A destructive action that did not happen is exactly the case a user needs
+/// told.
+fn perform_pending(action: Pending) -> Option<String> {
     match action {
-        Pending::RemoveVolume(name) => quiet_io(|| {
-            let _ = crate::volume::run(&["rm".to_string(), name]);
-        }),
-        Pending::PruneVolumes => quiet_io(|| {
-            let _ = crate::volume::run(&["prune".to_string()]);
-        }),
-        Pending::DeleteProfile(section, name) => {
-            let _ = delete_profile(section, &name);
-        }
-        Pending::RemoveImage(name) => quiet_io(|| {
-            let _ = crate::commands::image_rm(&[name]);
-        }),
-        Pending::PruneImages => quiet_io(|| {
-            let _ = crate::commands::image_prune();
-        }),
-        Pending::DeleteBuild(id) => {
-            crate::builds::remove(&id);
-        }
+        Pending::RemoveVolume(name) => quiet_io(|| crate::volume::run(&["rm".to_string(), name]))
+            .err()
+            .map(|e| e.to_string()),
+        Pending::PruneVolumes => quiet_io(|| crate::volume::run(&["prune".to_string()]))
+            .err()
+            .map(|e| e.to_string()),
+        Pending::DeleteProfile(section, name) => delete_profile(section, &name).err(),
+        Pending::RemoveImage(name) => quiet_io(|| crate::commands::image_rm(&[name]))
+            .err()
+            .map(|e| e.to_string()),
+        Pending::PruneImages => quiet_io(crate::commands::image_prune)
+            .err()
+            .map(|e| e.to_string()),
+        // `remove` reports three outcomes: gone, never there, or could not be removed. Only the last
+        // is a failure to show - "there was no such record" means the list was stale, and the refresh
+        // that follows the confirmation already corrects it.
+        Pending::DeleteBuild(id) => match crate::builds::remove(&id) {
+            Ok(_) => None,
+            Err(e) => Some(format!("build '{id}': {e}")),
+        },
     }
 }
 
 /// Run `f` with fd 1 and fd 2 redirected to `/dev/null`, then restored - so a reused CLI helper's
 /// `println!`/`eprintln!` can't corrupt the alt-screen. Used for the lifecycle key actions.
-fn quiet_io(f: impl FnOnce()) {
+fn quiet_io<T>(f: impl FnOnce() -> T) -> T {
     let _ = std::io::stdout().flush();
     let (s1, s2) = unsafe { (libc::dup(1), libc::dup(2)) };
     let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
@@ -944,7 +960,7 @@ fn quiet_io(f: impl FnOnce()) {
             libc::close(null);
         }
     }
-    f();
+    let out = f();
     let _ = std::io::stdout().flush();
     unsafe {
         if s1 >= 0 {
@@ -956,6 +972,7 @@ fn quiet_io(f: impl FnOnce()) {
             libc::close(s2);
         }
     }
+    out
 }
 
 // ───────────────────────────── Profiles & Volumes: model ─────────────────────────────
@@ -3193,6 +3210,62 @@ mod tests {
             r: "",
             z: "",
         }
+    }
+
+    /// A lifecycle key that FAILS must say so on screen.
+    ///
+    /// `nav_boxes` reuses the CLI helpers inside `quiet_io`, which redirects fd 1 and fd 2 to
+    /// /dev/null so their `println!` cannot corrupt the alt-screen. That also swallowed their error
+    /// message, and the `Result` itself was discarded - so a refused stop left an unchanged list, a
+    /// key that appeared to do nothing, and no reason anywhere. The outcome is now carried out of the
+    /// muted section and shown in the overlay pane the log view already uses.
+    ///
+    /// Driven with a box name that cannot exist, so `commands::stop` returns the "no running box"
+    /// error without touching anything on this machine.
+    #[test]
+    fn a_failed_lifecycle_key_is_reported_in_the_overlay() {
+        let name = format!("tui-absent-{}-{}", std::process::id(), 0xC0FFEEu32);
+        let rows = vec![row(&name, false)];
+        let mut mode = Mode::Nav;
+
+        let changed = nav_boxes(b's', 0, &rows, &mut mode);
+
+        assert!(
+            changed,
+            "a lifecycle key still counts as a state-changing action, so the caller re-reads the list"
+        );
+        match &mode {
+            Mode::Overlay(text) => {
+                assert!(
+                    text.contains(&name),
+                    "the overlay must name the box the action failed on: {text:?}"
+                );
+            }
+            other => panic!(
+                "a refused stop must be reported; the TUI stayed in {:?} with nothing on screen",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    /// The same contract for a CONFIRMED destructive action: `perform_pending` returns the failure
+    /// text instead of discarding it, so the caller can show it. Driven with a volume name that
+    /// cannot exist, which `volume rm` refuses without touching this machine's volume store.
+    #[test]
+    fn a_refused_destructive_action_returns_its_reason() {
+        let name = format!("tui-novol-{}-{}", std::process::id(), 0xBADF00Du32);
+        let outcome = perform_pending(Pending::RemoveVolume(name.clone()));
+        let text = match outcome {
+            Some(t) => t,
+            None => panic!(
+                "removing a volume that does not exist is refused, so perform_pending must return \
+                 the reason rather than letting the confirmation look like it worked"
+            ),
+        };
+        assert!(
+            !text.is_empty(),
+            "the returned failure text must carry the reason, not an empty string"
+        );
     }
 
     fn row(name: &str, paused: bool) -> Row {

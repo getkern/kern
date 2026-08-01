@@ -336,24 +336,44 @@ pub fn filter_builds(
 }
 
 /// Delete one build record (and its log). Returns whether it existed.
-pub fn remove(id: &str) -> bool {
+/// Delete one build-history record. `Ok(true)` = it was there and is gone; `Ok(false)` = there was
+/// nothing by that id; `Err` = it was there and could NOT be removed.
+///
+/// It used to return `existed`, computed BEFORE the removal, and discard the removal's result - so it
+/// answered "was there a record?" while every caller read it as "was the record deleted?".
+/// `kern build rm <id>` printed "removed build '<id>'" for a record still on disk. Three outcomes
+/// cannot be carried by a bool that is sampled at the wrong moment, so they are three variants now.
+pub fn remove(id: &str) -> std::io::Result<bool> {
     if !valid_id(id) {
-        return false;
+        return Ok(false);
     }
     let dir = record_dir(id);
-    let existed = dir.is_dir();
-    let _ = std::fs::remove_dir_all(&dir);
-    existed
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(true),
+        // Someone else removed it between the check and here: the caller's intent is satisfied.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
-/// Keep the `keep` newest records, delete the rest. Returns how many were removed. Build records have
-/// no liveness (a build is a past event), so retention is count-based, not "is it still running".
-/// Uses the name-only newest-first order so pruning a large history doesn't open every `meta` first.
+/// Keep the `keep` newest records, delete the rest. Returns how many were ACTUALLY removed. Build
+/// records have no liveness (a build is a past event), so retention is count-based, not "is it still
+/// running". Uses the name-only newest-first order so pruning a large history doesn't open every
+/// `meta` first.
+///
+/// A record that cannot be removed is counted as not removed AND reported. The caller prints the
+/// returned number, so a silent failure would make "pruned N record(s)" a claim about records still
+/// on disk, with the shortfall attributable to nothing.
 pub fn prune(keep: usize) -> usize {
     let mut removed = 0;
     for id in record_ids_newest_first().into_iter().skip(keep) {
-        if remove(&id) {
-            removed += 1;
+        match remove(&id) {
+            Ok(true) => removed += 1,
+            Ok(false) => {} // vanished between listing and removal: nothing was pruned by us
+            Err(e) => eprintln!("kern: build record '{id}' could NOT be removed: {e}"),
         }
     }
     removed
@@ -711,6 +731,69 @@ mod tests {
         });
     }
 
+    /// `remove` must report whether the record is GONE, not whether it was there a moment ago.
+    ///
+    /// It returned `existed`, sampled BEFORE the removal, and discarded the removal's own result, so
+    /// it answered "was there a record?" while both callers read it as "was the record deleted?".
+    /// `kern build rm <id>` printed "removed build '<id>'" for a record still on disk, and
+    /// `kern build prune` counted it among the pruned.
+    ///
+    /// The failure is constructed rather than waited for: unlinking a directory entry is governed by
+    /// the mode of the PARENT, so a read-only parent makes `remove_dir_all` fail `EACCES` with the
+    /// record still present. Skipped under DAC override, where the precondition cannot be built.
+    #[test]
+    fn remove_reports_whether_the_record_is_gone_not_whether_it_existed() {
+        with_tmp_home(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let id = "1720-99";
+            write(&rec(id, 1, Status::Ok)).expect("write the record");
+            assert!(get(id).is_some(), "precondition: the record exists");
+
+            let dir = record_dir(id);
+            let parent = match dir.parent() {
+                Some(p) => p.to_path_buf(),
+                None => return, // no parent to lock down: nothing to construct
+            };
+            let saved = match std::fs::metadata(&parent) {
+                Ok(m) => m.permissions().mode() & 0o7777,
+                Err(_) => return,
+            };
+            let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555));
+            let dac_override = std::fs::create_dir(parent.join("probe-dac")).is_ok();
+            let outcome = if dac_override {
+                None // root ignores the mode: the precondition does not exist here
+            } else {
+                Some(remove(id))
+            };
+            let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(saved));
+            let _ = std::fs::remove_dir_all(parent.join("probe-dac"));
+
+            if let Some(r) = outcome {
+                assert!(
+                    r.is_err(),
+                    "the record could not be removed, so `remove` must not report a removal: {r:?}"
+                );
+                // The record DIRECTORY is still on disk: `remove_dir_all` empties a writable
+                // directory first and only then fails on the final `rmdir` against the read-only
+                // parent. So the removal is genuinely incomplete - which is exactly what the `Err`
+                // states, and what the old `existed` return called a success.
+                assert!(
+                    dir.exists(),
+                    "sanity: the record directory survived, so the removal did not complete"
+                );
+            }
+
+            // Positive control: with the parent writable again, the same id removes and reports it.
+            assert!(matches!(remove(id), Ok(true)), "a present record removes");
+            assert!(get(id).is_none(), "and is gone afterwards");
+            // And a second removal reports "there was nothing", not "removed".
+            assert!(
+                matches!(remove(id), Ok(false)),
+                "a missing record is not a removal"
+            );
+        });
+    }
+
     #[test]
     fn invalid_id_is_rejected_everywhere() {
         with_tmp_home(|| {
@@ -718,7 +801,7 @@ mod tests {
             assert!(!valid_id(".hidden"));
             assert!(valid_id("1720-42"));
             // remove/get on a traversing id do nothing / return None.
-            assert!(!remove("../etc"));
+            assert!(matches!(remove("../etc"), Ok(false)));
             assert!(get("../../x").is_none());
             let bad = Record {
                 id: "../escape".into(),

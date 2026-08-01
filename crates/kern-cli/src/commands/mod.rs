@@ -967,11 +967,29 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                             .map(|mut d| d.next().is_some())
                             .unwrap_or(false);
                         if has_data {
-                            let _ = std::process::Command::new("cp")
+                            // NOT best-effort. This is the one-time seeding of a freshly created ext4
+                            // image from the volume's plain `data/` dir when a quota'd volume is first
+                            // upgraded to the enforced backend. The two backends are DISTINCT on-disk
+                            // locations, so a discarded failure mounts an EMPTY volume over data that
+                            // still exists elsewhere: the workload sees no data, may recreate or
+                            // overwrite it, and nothing said the copy did not happen. Refusing costs a
+                            // failed box start; not refusing costs the dataset.
+                            let st = std::process::Command::new("cp")
                                 .arg("-a")
                                 .arg(format!("{}/.", data.display()))
                                 .arg(&m)
-                                .status();
+                                .status()
+                                .map_err(|e| {
+                                    Error::Volume(format!(
+                                        "seeding volume '{name_v}' into its quota'd backend: {e}"
+                                    ))
+                                })?;
+                            if !st.success() {
+                                return Err(Error::Volume(format!(
+                                    "seeding volume '{name_v}' into its quota'd backend failed ({st});                                      the existing data is still in {} and the box was not started",
+                                    data.display()
+                                )));
+                            }
                         }
                     }
                     ext4_handles.push(h);
@@ -1343,7 +1361,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             if let Some((inst, path)) = reg_state.as_mut() {
                 inst.pid1 = pid1;
                 if path.is_some() {
-                    let _ = registry::register(inst);
+                    // The callback is `FnOnce(i32) -> ()`, so there is no channel to propagate on;
+                    // report instead of discarding. This re-registration is what records the box's
+                    // PID 1, and `kern exec` opens `/proc/<pid1>/ns/*`: with a stale `pid1` of 0 it
+                    // fails with "box is not running (its namespaces are gone)" about a box that is
+                    // running perfectly well.
+                    if let Err(e) = registry::register(inst) {
+                        eprintln!(
+                            "kern: warning: could not record the box's PID 1 in the registry: {e} -                              `kern exec` on this box will not find it"
+                        );
+                    }
                 }
             }
             if let Some(p) = egress_pending.take() {
@@ -2091,7 +2118,19 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
             Some(dir) => {
                 let root = PathBuf::from(dir);
                 let w = root.join("work");
-                let _ = std::fs::remove_dir_all(&w); // fresh workdir per RUN (overlay requirement)
+                // overlayfs REQUIRES an empty workdir, so this is a precondition, not tidying. Left
+                // discarded, a refused removal surfaced later as a bare `mount: invalid argument` with
+                // no way to connect it to the leftover directory that caused it.
+                match std::fs::remove_dir_all(&w) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(Error::Sandbox(format!(
+                            "overlay work dir {}: cannot clear it, and overlayfs requires it empty: {e}",
+                            w.display()
+                        )))
+                    }
+                }
                 (build_upper_dir(&root), w)
             }
             None => (eph.join("upper"), eph.join("work")),
@@ -2133,8 +2172,15 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         if b.share_net {
             if let Ok(conf) = std::fs::read("/etc/resolv.conf") {
                 let etc = upper.join("etc");
-                if std::fs::create_dir_all(&etc).is_ok() {
-                    let _ = std::fs::write(etc.join("resolv.conf"), conf);
+                // Best-effort, and now audible. A box whose `resolv.conf` could not be written still
+                // runs and still reaches every literal IP, so this must not fail the box - but silence
+                // turned "DNS does not resolve in here" into a symptom with no stated cause.
+                let placed = std::fs::create_dir_all(&etc)
+                    .and_then(|()| std::fs::write(etc.join("resolv.conf"), conf));
+                if let Err(e) = placed {
+                    eprintln!(
+                        "kern: warning: could not place /etc/resolv.conf in the box: {e} -                          name resolution will not work inside it (literal IPs still do)"
+                    );
                 }
             }
         }
@@ -2323,7 +2369,15 @@ fn resolve_image_command(
 /// Serialize an image's OCI runtime config to a small tab-delimited sidecar (one directive per line)
 /// so `kern box --image` can reapply it on a cache hit without re-pulling. Kept OUTSIDE the rootfs
 /// (a sibling of the cache dir) so the file never appears inside the box.
-fn write_image_config(path: &std::path::Path, c: &kern_oci::ImageConfig) {
+/// Write an image's config sidecar (`<ref>.image`): entrypoint, cmd, env, workdir, user.
+///
+/// FALLIBLE. It returned `()` and discarded the write, which is not the same trade as the `.ok`
+/// sentinel written beside it. A missing SENTINEL means the image is not recognised and the next run
+/// re-pulls or rebuilds it: wasteful, self-correcting, and visible. A missing CONFIG means the image
+/// IS recognised and simply has no entrypoint, no env and no user, so the box silently falls back to
+/// a shell and the workload runs with a different identity and environment than the image declares.
+/// That is a wrong state, not lost work, and every caller now refuses rather than publishing it.
+fn write_image_config(path: &std::path::Path, c: &kern_oci::ImageConfig) -> std::io::Result<()> {
     let mut s = String::new();
     let mut line = |k: &str, v: &str| {
         // A value with an embedded newline can't round-trip line-based; such values don't occur in
@@ -2350,7 +2404,7 @@ fn write_image_config(path: &std::path::Path, c: &kern_oci::ImageConfig) {
     if let Some(u) = &c.user {
         line("user", u);
     }
-    let _ = std::fs::write(path, s);
+    std::fs::write(path, s)
 }
 
 /// Read back a [`write_image_config`] sidecar. A missing/garbled file yields the default config.
@@ -3283,7 +3337,14 @@ fn supervise_box(
                     if let Some(cur) = registry::name_for_pid(inst.pid) {
                         inst.name = cur;
                     }
-                    let _ = registry::register(inst);
+                    // Same reason as the foreground path: no channel to propagate on, so report.
+                    // A discarded failure here leaves the entry without this box's PID 1, which is
+                    // what `kern exec` joins.
+                    if let Err(e) = registry::register(inst) {
+                        eprintln!(
+                            "kern: warning: could not record the box's PID 1 in the registry: {e} -                              `kern exec` on this box will not find it"
+                        );
+                    }
                 },
                 None,  // detached boxes have no terminal to attach
                 ports, // the runtime forks `-p` forwarders before unshare, kills them on box exit
@@ -5695,10 +5756,12 @@ pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
 /// `kern build rm <id>...` - delete build-history records.
 pub fn build_rm(ids: &[String]) -> Result<(), Error> {
     for id in ids {
-        if crate::builds::remove(id) {
-            println!("removed build '{id}'");
-        } else {
-            eprintln!("kern: no build '{id}'");
+        // Three outcomes, three messages. "removed" used to be printed whenever the record had
+        // existed, whether or not the removal succeeded.
+        match crate::builds::remove(id) {
+            Ok(true) => println!("removed build '{id}'"),
+            Ok(false) => eprintln!("kern: no build '{id}'"),
+            Err(e) => eprintln!("kern: build '{id}' could NOT be removed: {e}"),
         }
     }
     Ok(())
@@ -6833,7 +6896,8 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
         std::fs::rename(&img.rootfs, &dest).map_err(|e| Error::Oci(format!("load rootfs: {e}")))?;
         std::fs::write(cache.join(format!("{safe}.ok")), primary.as_bytes())
             .map_err(|e| Error::Oci(format!("load sentinel: {e}")))?;
-        write_image_config(&cache.join(format!("{safe}.image")), &img.config);
+        write_image_config(&cache.join(format!("{safe}.image")), &img.config)
+            .map_err(|e| Error::Oci(format!("load image config: {e}")))?;
         println!("loaded '{primary}'");
         // Extra RepoTags become aliases (content-shared where possible), like `docker load`.
         for t in img.repo_tags.iter().skip(1) {
@@ -7003,7 +7067,8 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         workdir: None,
         user: None,
     };
-    write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg);
+    write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
+        .map_err(|e| Error::Oci(format!("commit image config: {e}")))?;
     std::fs::write(cache.join(format!("{dst_safe}.ok")), image.as_bytes())
         .map_err(|e| Error::Oci(format!("commit marker: {e}")))?;
     println!("committed box '{box_ref}' → image '{image}'  (run: kern box <name> --image {image})");
@@ -8263,7 +8328,8 @@ fn pull_to_cache(
         // this write could pair the new rootfs with the old config. Harmless for a same-tag refresh
         // (identical config); a genuinely different image at the same tag is a known concurrency edge
         // of `--pull always` (don't re-pull a tag while concurrently starting it).
-        write_image_config(&cfgfile, &config);
+        write_image_config(&cfgfile, &config)
+            .map_err(|e| Error::Oci(format!("image config for '{image}': {e}")))?;
         let _ = std::fs::write(&sentinel, image.as_bytes());
         return Ok((dir.to_string_lossy().into_owned(), config));
     }
@@ -8296,7 +8362,8 @@ fn pull_to_cache(
                 return Err(Error::Oci(e.to_string()));
             }
         };
-        write_image_config(&cfgfile, &config);
+        write_image_config(&cfgfile, &config)
+            .map_err(|e| Error::Oci(format!("image config for '{image}': {e}")))?;
         let _ = std::fs::write(&sentinel, image.as_bytes());
     }
     // lock released when `lock` drops
@@ -9411,7 +9478,8 @@ fn build_run(
     let _ = std::fs::remove_dir_all(cache.join(format!("{safe}.diff")));
     let _ = std::fs::remove_file(cache.join(format!("{safe}.base")));
     let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
-    write_image_config(&cache.join(format!("{safe}.image")), &config);
+    write_image_config(&cache.join(format!("{safe}.image")), &config)
+        .map_err(|e| Error::Sandbox(format!("image config for '{tag}': {e}")))?;
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
     // Record the content key so the NEXT identical build hits the flat cache above and skips the rebuild.
     write_flat_key(tag, &flat_key);
@@ -9928,7 +9996,8 @@ fn build_layered_cached(
     let _ = std::fs::remove_file(cache.join(format!("{safe}.base")));
     std::fs::write(cache.join(format!("{safe}.layers")), manifest)
         .map_err(|e| Error::Sandbox(format!("finalize image '{tag}': {e}")))?;
-    write_image_config(&cache.join(format!("{safe}.image")), &config);
+    write_image_config(&cache.join(format!("{safe}.image")), &config)
+        .map_err(|e| Error::Sandbox(format!("image config for '{tag}': {e}")))?;
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
     announce_built(tag);
     Ok(())
@@ -13758,7 +13827,15 @@ mod net_resource_tests {
         let dir = std::env::temp_dir().join(format!("kern-imgcfg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let f = dir.join("x.image");
-        write_image_config(&f, &c);
+        write_image_config(&f, &c).expect("write the config sidecar");
+        // A write that cannot happen must be reported, not discarded. The sidecar used to be written
+        // with `let _ =`, so an image could be cached and announced ready with no entrypoint, no env
+        // and no user, and the box silently fell back to a shell. Forced here with a path whose
+        // parent does not exist, which fails on every filesystem.
+        assert!(
+            write_image_config(&dir.join("no-such-dir").join("x.image"), &c).is_err(),
+            "an unwritable config sidecar must be an error, not a silent no-op"
+        );
         let r = read_image_config(&f);
         assert_eq!(r.entrypoint, c.entrypoint);
         assert_eq!(r.cmd, c.cmd);
