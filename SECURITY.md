@@ -51,7 +51,7 @@ host **kernel**: a kernel privilege-escalation bug is an escape.
 kern's bet is startup latency, footprint and daemonless simplicity, not being a hypervisor. Pick
 the boundary your threat model needs; kern is honest about which one it is.
 
-## Current status (0.6.9, honest)
+## Current status (0.6.30, honest)
 
 What is **enforced now** by `kern box`:
 - user + PID + network (loopback-only) + UTS + IPC + mount namespaces;
@@ -448,6 +448,25 @@ box access, not a hardened bastion, grant it only to workloads you'd trust with 
   parser is fuzzed. Extraction itself still runs the host `tar` into an isolated staging dir, then a
   no-follow merge.
 - Always-on seccomp blocks the dangerous syscall set regardless of flags.
+
+## Check it yourself
+
+The claims above are asserted by four adversarial suites in [pentest/](pentest/), which ask the
+kernel what is true rather than asking kern to report on itself: that a published port cannot tunnel
+into a host service, that `--ssh` does not hand out the host's shell, that `kern exec` does not escape
+the box, that a box cannot raise its own `memory.max` and sees no cgroup above its own, that a device
+not granted does not cross (asserted against a box WITHOUT the grant), and that a SIGKILLed
+supervisor does not leave a host port held.
+
+```sh
+cargo build --release
+sh pentest/run-with-local-registry.sh ./target/release/kern pentest/pentest-ports.sh
+```
+
+That wrapper serves the test image from your own loopback, so nothing here needs a registry account
+or a network. Exit status is 0 only if every asserted property held; a host that cannot answer a
+question reports `SKIP` with the reason and never counts it as a pass. Measured results, and what is
+deliberately NOT wired into CI, are in [pentest/README.md](pentest/README.md).
 
 ## Supported versions
 

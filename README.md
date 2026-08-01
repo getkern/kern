@@ -660,7 +660,10 @@ does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything 
 - **Kubernetes CRI** integration → containerd / CRI-O;
 - a **low-level OCI runtime** to slot *under* containerd/podman (the runc layer) → **crun**, **youki** (also Rust), or runc. kern isn't a runc-replacement; it's the *whole* daemonless UX (pull, build, run, compose) in one binary, not a runtime another engine drives.
 
-kern states every boundary that is cooperative or opt-in plainly in **[SECURITY.md](SECURITY.md)**; being honest about the edges is the point.
+kern states every boundary that is cooperative or opt-in plainly in **[SECURITY.md](SECURITY.md)**; being honest about the edges is the point. You do not have to take any of it on trust: the four
+adversarial suites in **[pentest/](pentest/)** assert those boundaries against the kernel rather than
+against kern's own reporting, and `sh pentest/run-with-local-registry.sh ./target/release/kern
+pentest/pentest-ports.sh` runs them with no registry account and no network.
 
 ## How it works
 

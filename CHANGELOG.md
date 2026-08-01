@@ -19,6 +19,30 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [0.6.30], 2026-08-01
 
+### Added
+
+- **`pentest/`: the runnable evidence behind the isolation claims.** Four adversarial suites that ask
+  the kernel what is true rather than asking kern to report on itself, 76 cases on the host they were
+  measured on: that a
+  published port cannot tunnel into a host service, that `--ssh` does not hand out the host's shell
+  (it did, once, banner byte-identical), that `kern exec` does not escape the box, that a box cannot
+  raise its own `memory.max` and sees no cgroup above its own, that an ungranted device does not
+  cross (asserted against a box WITHOUT the grant, because "the device is in the box" means nothing
+  otherwise), and that a SIGKILLed supervisor does not leave a host port held. They had lived outside
+  the repository, which meant the answer to "how do I check this myself" was "you cannot".
+
+  `toy-registry.py` and `run-with-local-registry.sh` remove the registry from the loop entirely: a
+  one-layer OCI image is built from a directory already on disk and served on `127.0.0.1`, where kern
+  speaks plain HTTP by design and pins TLS everywhere else. On a host with an empty image cache the
+  wrapper builds a rootfs from the host's own busybox. This is not convenience: running these suites
+  against Docker Hub across six machines exhausted the unauthenticated pull limit, and for hours
+  afterwards every host answered 429, one suite reporting eight FAILs that were entirely the registry.
+
+  Measured on x86_64 at 0.6.30: ports 32/0/0, cache-edge 24/0/0, vdisk-web-ssh 10/0/2, combo 8/0/0,
+  identical against `alpine` and against the loopback fixture. Deliberately NOT wired into CI, and
+  the reason is written down: the GitHub runner refuses unprivileged user namespaces under its
+  AppArmor profile, so most cases would skip there and the green would mean nothing.
+
 ### Security
 
 - **An OCI whiteout that could not be applied was reported as applied.** `remove_no_follow` returned
@@ -229,6 +253,17 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ### Fixed
 
+- **Three of the four suites declared `#!/bin/bash` and none of them needs bash.** Verified by running
+  all four under `dash`, with identical results. kern's own target hosts include an 8.5 MB Alpine
+  with no bash, which is exactly where the evidence most needs to be runnable.
+
+- **`pentest-combo.sh` failed where it should have skipped.** An image with no `/usr/sbin/sshd`
+  produces a published `--ssh` port that nothing answers, and the two assertions below it then read
+  "ssh into the box did not run a command", blaming kern for a missing package. It now asks the
+  RUNNING box whether the binary is there and skips with the reason. The four suites also took three
+  different positional signatures; they are now all `<kern> [image]`, with combo's sshd image moved
+  to `SSHIMG`, and two of them no longer default to a `/tmp` path left over from a debugging session.
+
 - **`kern doctor` named a systemd manager that wasn't there.** The lingering check asked "am I root?"
   before "is there a manager at all?", so on a WSL2 distro without systemd it answered "running as
   root: boxes go to the system manager". The conclusion was right and the reason was invented.
@@ -237,6 +272,9 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   rootless with lingering on.
 
 ### Documentation
+
+- **`SECURITY.md` said "Current status (0.6.9)"**, twenty-one releases behind, and had no answer to
+  "how do I verify this". It now names the version it describes and points at `pentest/`.
 
 - **`provenance/README.md` sent people to the wrong program.** `pip install opentimestamps-client` is
   refused on Debian 12+, Ubuntu 23.04+ and anything else following PEP 668; the shell then suggests
