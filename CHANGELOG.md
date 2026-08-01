@@ -17,7 +17,7 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [Unreleased]
+## [0.6.31], 2026-08-01
 
 ### Fixed
 
@@ -2328,6 +2328,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 - Project docs: README, SECURITY, ARCHITECTURE, CONTRIBUTING, CLA, CODE_OF_CONDUCT.
 - CI: build + test + clippy + fmt + cargo-audit + cargo-deny on x86 (skip-graceful for HW).
 
+[0.6.31]: https://github.com/getkern/kern/releases/tag/v0.6.31
 [0.6.30]: https://github.com/getkern/kern/releases/tag/v0.6.30
 [0.6.29]: https://github.com/getkern/kern/releases/tag/v0.6.29
 [0.6.28]: https://github.com/getkern/kern/releases/tag/v0.6.28

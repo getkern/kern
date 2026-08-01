@@ -863,7 +863,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.30.** Everything in [Features](#features) works today and is tested (689 Rust, 62 Python and 51
+**0.6.31.** Everything in [Features](#features) works today and is tested (691 Rust, 65 Python and 54
 Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
 real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
 starts in single-digit milliseconds from one **~1.8 MB** binary. Versioned under semver: each release is the official
@@ -875,18 +875,16 @@ What kern knows it does not know, or does not do yet, is written down in
 we have not attributed, why the seccomp filter is still a denylist, which fleet limit is a guard rail
 instead of a boundary. Declared debt is cheaper than silent debt.
 
-**Recently:** 0.6.30 is a correctness release rather than a feature one. An OCI whiteout that could
-not be applied was reported as applied, so a file an image declared deleted could stay in the rootfs
-with nothing saying so; image content is now deleted by a no-follow tree walk, directory modes are
-changed by descriptor rather than by name, a cache entry counts as complete only when its rootfs is
-there too, an absent exit code from a box is no longer read as success by the Python and Node
-bindings, and no `unwrap`, `expect` or `panic!` is left in production code. Before that: an
-explicit-`backend` resource-profile schema; `kern exec` joins the box's cgroup so an
-exec'd command inherits its `--memory`/`--pids` caps (with an honest warning where a rootless per-box
-scope can't be joined); a **warm kernel** and an **MCP server** (`kern-mcp`) for the Python/Node
-bindings; `kern commit` warm-start snapshots; an `--egress-allow` allowlist and `--landlock-rw`; and
-daemonless image **build** / **`tag`** / **`push`** with a Dockerfile/compose parser checked against a
-real `docker build`. Full per-release detail in **[CHANGELOG.md](CHANGELOG.md)**.
+**Recently:** 0.6.31 fixes a stall on published ports that anyone serving HTTP would have hit.
+`kern box -p` pumps bytes in userspace and neither side set `TCP_NODELAY`, so a response written as
+headers-then-body waited on the peer's 40 ms delayed-ACK timer, and only on a REUSED connection: the
+normal mode for HTTP/1.1, gRPC, Postgres and Redis. Measured with nginx on one keep-alive connection,
+**59 requests/s before and 12,479 after**, with p99 going from a pinned 42.0 ms to 0.27. Before that,
+0.6.30 was a correctness release: an OCI whiteout that could not be applied was reported as applied,
+image content is now deleted by a no-follow tree walk, directory modes are changed by descriptor
+rather than by name, a cache entry counts as complete only when its rootfs is there too, an absent
+exit code from a box is no longer read as success by the Python and Node bindings, and no `unwrap`,
+`expect` or `panic!` is left in production code. Full per-release detail in **[CHANGELOG.md](CHANGELOG.md)**.
 
 **Deliberately not here yet:** the headline **GPU slices** (on the [Roadmap](#roadmap)) and Docker-style
 overlay networking.
