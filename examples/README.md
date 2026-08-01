@@ -105,7 +105,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [multi-uid.sh](multi-uid.sh) | Who runs inside a box: single-uid default vs `--uid-range` (a ~65k sub-uid range) vs `--user 1000`; degrades honestly when `newuidmap`/`/etc/subuid` are absent |
 | [bind-rootfs-edge.sh](bind-rootfs-edge.sh) | `--bind-rootfs`, the edge/Android fast path that binds a `--rootfs` directly instead of an overlay; honest trade: writable & **shared**, not copy-on-write |
 | [init-reaper.sh](init-reaper.sh) | `--init`, a reaping PID 1: orphaned children pile up as zombies without it, get reaped (0) with it |
-| [edge-webserver-ssh.sh](edge-webserver-ssh.sh) | A web server on a headless board, published to the LAN, with `--ssh` into the box. The two things that bite on a board: build with `--net` but SERVE without it (`-p` and `--net` don't combine), and `loginctl enable-linger` or a detached box dies at logout |
+| [edge-webserver-ssh.sh](edge-webserver-ssh.sh) | A web server on a headless board, published to the LAN, with `--ssh` into the box. The two things that bite on a board: build with `--net` but SERVE without it (`-p` and `--net` don't combine), and `loginctl enable-linger` or a detached box dies at logout. The only example that leaves a box running on purpose (it holds host 8080 + 2222 so you can reach it from another machine); `KEEP=0` makes it clean up instead |
 | [resource-profiles.sh](resource-profiles.sh) + [kern-profiles.toml](kern-profiles.toml) | Reusable `[[vcpu]]` / `[[vdisk]]` / `[[vgpio]]` profiles in a kern.toml, attached via `--config` + `vcpu:` / `vdisk:` tokens |
 
 ### Real-life scenarios

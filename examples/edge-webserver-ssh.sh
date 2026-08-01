@@ -17,12 +17,19 @@
 # Measured end to end on a Raspberry Pi 5 (aarch64, kernel 6.6, rootless) on 2026-08-01: the page was
 # fetched from a different machine over the LAN with no session open on the Pi, and `ssh` landed in a
 # box that saw 8 processes where the host had 154 and could not see the host's SD card.
+#
+# This is the ONE example here that deliberately leaves something running when it exits: a server you
+# cannot curl from another machine is not a demonstration of anything. That has a cost, and it is
+# named rather than left to be discovered: the box keeps host ports 8080 and 2222 until it is stopped,
+# so the other examples that publish 8080 will refuse to start after this one has run (kern says the
+# port is taken, and it is). Run it with KEEP=0 to have it clean up after itself.
 set -eu
 kern="${KERN:-kern}"
 img="${IMG:-web-ssh:demo}"
 name="${NAME:-edgeweb}"
 webport="${WEBPORT:-8080}"
 sshport="${SSHPORT:-2222}"
+keep="${KEEP:-1}"
 
 cleanup() { $kern stop "$name" >/dev/null 2>&1 || true; $kern rm "$name" >/dev/null 2>&1 || true; }
 
@@ -87,4 +94,16 @@ echo "     - a handful of processes, not this host's"
 echo "     - /sys/fs/cgroup/memory.max = 134217728, the 128m cap"
 echo "     - no /dev/mmcblk0, /dev/sda or any host disk"
 echo
-echo "   stop it with:  $kern stop $name"
+
+if [ "$keep" = "1" ]; then
+  echo "== 6. the box is STILL RUNNING, and holds host ports ${webport} and ${sshport}"
+  echo "   that is the point of this example, and it is also why the other examples that publish"
+  echo "   ${webport} will refuse to start until you stop it."
+  echo
+  echo "   stop it with:   $kern stop $name"
+  echo "   or re-run with: KEEP=0 $0"
+else
+  echo "== 6. KEEP=0, so this example cleans up after itself"
+  cleanup
+  echo "   stopped '$name'; host ports ${webport} and ${sshport} are free again"
+fi
