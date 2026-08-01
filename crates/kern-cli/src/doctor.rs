@@ -102,6 +102,18 @@ fn check_scope_toll() -> R {
 /// Read from `/var/lib/systemd/linger/<user>`, which is where logind records it: a file test, no
 /// subprocess, on a command a user runs when something is already wrong.
 fn check_linger() -> R {
+    // ORDER MATTERS, and getting it wrong printed a false reason. Ask "is there a manager at all?"
+    // BEFORE "am I root?": on a WSL2 distro without systemd (`/proc/1/comm` = init, no
+    // `/run/systemd/system`) the root branch below answered "boxes go to the system manager", naming
+    // a manager that does not exist on that host. The conclusion was right and the reason was
+    // invented, which is the one thing this codebase does not do. Measured on WSL2 (kernel
+    // 6.18-microsoft-standard) on 2026-08-01.
+    if !kern_isolation::user_systemd_present() {
+        return R::Ok(
+            "no systemd manager here, so nothing stops a detached box when your session ends"
+                .into(),
+        );
+    }
     // As real root kern drives the SYSTEM manager, so boxes are not under `user@<uid>.service` and
     // nothing about a login session can stop them. Decided by the SAME predicate that picks the
     // manager (`systemd_scope_mode`), not by re-deriving "am I root" here, so the two cannot drift.
@@ -111,12 +123,6 @@ fn check_linger() -> R {
     if kern_isolation::systemd_scope_mode() == "--system" {
         return R::Ok(
             "running as root: boxes go to the system manager, so a detached box is not tied to a login session".into(),
-        );
-    }
-    // No user manager (WSL2, a bare container) means no scope to be stopped and nothing to fix here.
-    if !kern_isolation::user_systemd_present() {
-        return R::Ok(
-            "no systemd user manager here: a detached box is not tied to a session".into(),
         );
     }
     let Some(user) = current_username() else {
