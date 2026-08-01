@@ -2392,3 +2392,145 @@ mod dotenv_tests {
         assert!(parse("[box.a]\nimage = \"x\"\nexpose = [\"3000-3005\"]\n").is_err());
     }
 }
+
+/// Contract tests: invariants about the SHAPE of this module rather than its behaviour. They read
+/// this file's own source, so they cannot describe code that is no longer here.
+#[cfg(test)]
+mod contract_tests {
+    /// Every field of `ComposeBox` must REACH the box, or be named here with the reader that consumes
+    /// it. A field can be parsed out of a compose file, stored, and then referenced by nothing at all:
+    /// the file said something, kern accepted it, and it changed nothing. That is not hypothetical
+    /// bookkeeping, it is the exact shape of every defect found in the publishing path (a port
+    /// announced and never bound, a device grant dropped in silence, a disk-backed vdisk that was
+    /// RAM). Here it would be worse, because compose SHELLS OUT: a field missing from
+    /// `push_box_flags` never becomes an argument, and `kern box` cannot warn about a flag it was
+    /// never given.
+    ///
+    /// The check parses THIS file, so it cannot drift from the code it describes, and it fails with
+    /// the field name rather than a count. Adding a field to `ComposeBox` now forces a decision:
+    /// forward it, or state who reads it.
+    ///
+    /// Deliberately strict about the allowlist: each entry carries its consumer, so "it is handled
+    /// somewhere" is not an acceptable answer to this test.
+    #[test]
+    fn every_compose_field_is_forwarded_or_has_a_named_reader() {
+        const SRC: &str = include_str!("lib.rs");
+
+        // Field names of `pub struct ComposeBox { ... }`, ignoring doc comments and attributes.
+        let struct_body = {
+            let start = SRC
+                .find("pub struct ComposeBox {")
+                .expect("struct ComposeBox must exist");
+            let rest = &SRC[start..];
+            let end = rest
+                .find("\n}\n")
+                .expect("struct must be closed at column 0");
+            &rest[..end]
+        };
+        let mut fields: Vec<&str> = Vec::new();
+        for line in struct_body.lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("pub ") {
+                if let Some((name, _)) = rest.split_once(':') {
+                    let name = name.trim();
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+                    {
+                        fields.push(name);
+                    }
+                }
+            }
+        }
+        assert!(
+            fields.len() > 30,
+            "the field scan found only {} fields, so it is not reading the struct",
+            fields.len()
+        );
+
+        // Everything `push_box_flags` touches, as `self.<ident>`.
+        let fn_body = {
+            let start = SRC
+                .find("pub fn push_box_flags(&self, cmd: &mut std::process::Command) {")
+                .expect("push_box_flags must exist");
+            let rest = &SRC[start..];
+            let end = rest
+                .find("\n    }\n")
+                .expect("push_box_flags must be closed");
+            &rest[..end]
+        };
+        let mut forwarded: Vec<&str> = Vec::new();
+        let mut cur = fn_body;
+        while let Some(i) = cur.find("self.") {
+            let tail = &cur[i + 5..];
+            let n = tail
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
+                .unwrap_or(tail.len());
+            if n > 0 {
+                forwarded.push(&tail[..n]);
+            }
+            cur = &tail[n..];
+        }
+
+        // Field -> the reader that consumes it instead of `push_box_flags`. Structural fields are the
+        // command line's shape, not a flag; the rest name a real call site.
+        const READERS: &[(&str, &str)] = &[
+            ("name", "the `kern box <name>` argument itself"),
+            ("command", "the trailing `-- <command>`"),
+            (
+                "depends_on",
+                "topo_order / all_deps: start ordering, compose-only",
+            ),
+            ("depends_healthy", "all_deps + the health wait before start"),
+            ("depends_completed", "all_deps + the run-to-completion wait"),
+            ("build", "`kern build` runs before the box exists"),
+            (
+                "port",
+                "port_env() injects PORT=, and check_pod_global_conflicts claims the slot",
+            ),
+            (
+                "expose",
+                "check_pod_global_conflicts: a claim on the pod's shared namespace",
+            ),
+            (
+                "profiles",
+                "the YAML parser DROPS an inactive service, so it never reaches a command line",
+            ),
+            (
+                "net_aliases",
+                "extra-host resolution for the pod's shared namespace",
+            ),
+        ];
+
+        let mut orphans: Vec<&str> = Vec::new();
+        for f in &fields {
+            if forwarded.contains(f) {
+                continue;
+            }
+            if READERS.iter().any(|(k, _)| k == f) {
+                continue;
+            }
+            orphans.push(f);
+        }
+        assert!(
+            orphans.is_empty(),
+            "these ComposeBox fields are parsed and then reach nothing: {orphans:?}. \
+             Either forward them in push_box_flags, or add them to READERS with the reader that \
+             consumes them. A field that is stored and never read means the compose file said \
+             something kern silently ignored."
+        );
+
+        // The allowlist must not rot either: an entry naming a field that no longer exists is a stale
+        // exemption that would hide the next orphan.
+        let stale: Vec<&str> = READERS
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| !fields.contains(k))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "READERS names fields that ComposeBox no longer has: {stale:?}"
+        );
+    }
+}
