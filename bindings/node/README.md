@@ -1,7 +1,9 @@
 # kern-sandbox (Node.js / TypeScript)
 
-**[kern](https://github.com/getkern/kern)** is a fast, rootless, daemonless Linux sandbox runtime: a real,
-kernel-enforced box that starts in **~2.3 ms**, from one **~1.8 MB** binary, with no daemon. **kern-sandbox**
+**[kern](https://github.com/getkern/kern)** is a fast, rootless sandbox and virtual resource
+runtime for any workload, including untrusted and AI-generated code: a real, kernel-enforced box
+that starts in **3.6 ms** from an OCI image, out of one **~1.8 MB** binary, with no daemon.
+**kern-sandbox**
 is its Node / TypeScript binding: run untrusted or agent-generated code in a fresh, isolated box, from Node.
 
 On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). For Python, the same

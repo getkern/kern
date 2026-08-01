@@ -54,6 +54,23 @@ working images silently, and the migration needs a corpus of real workloads to v
 before it can be trusted. The denylist is enforced always, cannot be turned off, and the escape
 vectors it covers are tested.
 
+## Whether a survivable denial helps an attacker map the filter is unresolved
+
+Five denied syscalls return `ENOSYS` rather than killing the caller, so that software probing for an
+optional fast path falls back instead of dying (`SECURITY.md` has the set and the measurement). That
+choice is a deliberate compatibility trade, and it has a part we have measured and a part we have not.
+
+Measured: the errno leaks nothing. A denied `io_uring_setup` and syscall number 998, which exists on
+no kernel, are both `-1 ENOSYS` from inside the box, so a prober cannot tell "the filter refused this"
+from "this kernel has no such call". Also measured: the enumeration cost is asymmetric. A permitted
+syscall runs and returns its own errno, so the permitted set was always cheap to map; `ENOSYS` moves
+five calls out of the "costs a process per probe" bucket, while the ~27 in the kill set stay in it.
+
+Not measured, and stated as unknown rather than argued away: whether a cheaper map of the filter is
+worth anything to an attacker who already has code execution inside the box. Mapping is not bypassing,
+and we have no evidence either way. If it turns out to matter, the lever is to move the five to
+`SIGSYS` and lose the fallback behaviour, which is a compatibility decision, not a hard one.
+
 ## `KERN_MAX_CONCURRENT` is best-effort
 
 The fleet concurrency gate counts live boxes and then starts one, so two launches racing can both

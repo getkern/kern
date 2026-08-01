@@ -36,12 +36,19 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.11";
+const VERSION = "0.1.12";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
 const DEPS_DIR = ".deps"; // pip --target dir inside the workspace (added to PYTHONPATH for python)
 const ENV_FILE = ".kern-env"; // host-side 0600 env file (kept out of argv so values don't show in `ps`)
+// One file per CALL, `.kern-env.<box-name>`. A single fixed name made concurrent calls on the same
+// Sandbox fight over one path: one call `unlink`ed the file while kern was still starting for
+// another and had not read it yet, and that box died with
+//   error: sandbox: cannot read --env-file '...': No such file or directory
+// Measured at 30 concurrent runCode calls: 2 failed that way, and one file was left behind.
+// The `O_EXCL|O_NOFOLLOW` create is a security property and is unchanged; only the NAME is per-call.
+const ENV_SEP = ".";
 const INLINE_CODE_MAX = 128 * 1024; // above this, pass code via a file instead of argv (ARG_MAX guard)
 // Cap the results file the (untrusted) box writes before the binding reads it into host RAM: a malicious
 // cell could stream a multi-GB `.res` to disk (past its own memory cap) and OOM the host.
@@ -660,7 +667,9 @@ function tarCollect(dir, base, skip, out) {
     if (st.isDirectory()) tarCollect(abs, base, skip, out);
     else if (st.isFile()) {
       const rel = path.relative(base, abs);
-      if (rel === skip) continue; // our private --env-file, not user state
+      // `skip` names OUR env file. Since it is now one per call, match the `<skip>.` prefix too, so a
+      // file left behind by a process that died mid-call cannot end up inside a user's snapshot.
+      if (rel === skip || rel.startsWith(skip + ENV_SEP)) continue;
       tarWriteFile(out, rel.split(path.sep).join("/"), fs.readFileSync(abs));
     }
   }
@@ -835,6 +844,29 @@ class Sandbox {
 
   // -- the box invocation --------------------------------------------------------------------------
 
+  /** Host path of the private --env-file for the box called `name`, inside the workspace. */
+  _envPath(name) {
+    return path.join(this._ws, `${ENV_FILE}${ENV_SEP}${name}`);
+  }
+
+  /**
+   * Is `rel` one of OUR env files rather than user state? Exact-match on the legacy name plus the
+   * `.kern-env.` prefix, never a bare startsWith: a user file called `.kern-environment` is theirs
+   * and must still show up in `files` and in a snapshot.
+   */
+  static _isEnvFile(rel) {
+    return rel === ENV_FILE || rel.startsWith(ENV_FILE + ENV_SEP);
+  }
+
+  /** Remove this call's env file. Every exit path calls it; a missing file is the desired end state. */
+  _removeEnvFile(name) {
+    try {
+      fs.unlinkSync(this._envPath(name));
+    } catch {
+      /* ENOENT is fine: no env was passed, or it is already gone */
+    }
+  }
+
   _baseArgv(name, { network, timeoutS, isSetup = false }) {
     const argv = [
       this._kern, "box", name, "--image", this.image, "--ro",
@@ -867,8 +899,13 @@ class Sandbox {
     if (mergedEnv.PYTHONPATH === undefined) mergedEnv.PYTHONPATH = `${WORKSPACE}/${DEPS_DIR}`;
     // Pass env via a private 0600 --env-file, NOT `--env K=V` on argv (an argv value is visible in
     // `ps` to any local user for the box's lifetime; a credential in env= would leak).
-    if (Object.keys(mergedEnv).length > 0) {
-      const envPath = path.join(this._ws, ENV_FILE);
+    // `_ws` is set by open(); before that it is "". The public API is gated, but the unit tests call
+    // `_baseArgv` directly to inspect the argv, and with an empty workspace `path.join` yielded a
+    // RELATIVE path, so the env file was written into the current directory. Same as the Python side:
+    // it had been landing in the repository, hidden by a `.gitignore` line that stopped matching when
+    // the name became per-call. No workspace means nowhere to put it.
+    if (Object.keys(mergedEnv).length > 0 && this._ws) {
+      const envPath = this._envPath(name);
       const lines = [];
       for (const [k, v] of Object.entries(mergedEnv)) {
         const val = String(v);
@@ -923,6 +960,7 @@ class Sandbox {
           stdio: ["ignore", "pipe", "pipe"],
         });
       } catch (e) {
+        this._removeEnvFile(name);
         return reject(new SandboxError(`could not spawn the box: ${e.message}`));
       }
 
@@ -944,6 +982,9 @@ class Sandbox {
         settled = true;
         clearTimeout(timer);
         if (hardTimer) clearTimeout(hardTimer);
+        // kern has read the file by the time it exits; leaving it behind would accrete one per call
+        // in a persistent `workspace`.
+        this._removeEnvFile(name);
         const wallMs = Number((process.hrtime.bigint() - started) / 1000000n);
         const stdout = out.buffer().toString("utf8");
         const stderr = err.buffer().toString("utf8");
@@ -959,6 +1000,7 @@ class Sandbox {
       };
 
       child.on("error", (e) => {
+        this._removeEnvFile(name);
         if (e && e.code === "ENOENT")
           return reject(new SandboxError(`could not execute kern (${argv[0]}): not found`));
         return reject(new SandboxError(`could not execute kern: ${e.message}`));
@@ -1200,7 +1242,7 @@ class Sandbox {
   snapshot(dest) {
     this._requireEntered();
     this._requireSnapshotOptIn();
-    fs.writeFileSync(dest, tarPack(fs.realpathSync(this._ws), ENV_FILE));
+    fs.writeFileSync(dest, tarPack(fs.realpathSync(this._ws), ENV_FILE));  // prefix-excluded inside tarPack
   }
 
   /** Extract a snapshot (from snapshot()) into the workspace, SAFELY. Every member is vetted first:
@@ -1316,7 +1358,7 @@ class Sandbox {
         }
         if (!st.isFile()) continue; // excludes symlinks and non-regular files
         const rel = path.relative(base, fp);
-        if (rel === ENV_FILE) continue; // our private host-side env file, not a user artifact
+        if (Sandbox._isEnvFile(rel)) continue; // our private host-side env file, not a user artifact
         out[rel] = [Math.round(st.mtimeMs * 1e6), st.size];
       }
     }

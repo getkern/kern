@@ -21,6 +21,21 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ### Fixed
 
+- **kern-sandbox 0.1.12: two concurrent calls on one `Sandbox` fought over a single file.** Both
+  bindings wrote the workload's environment to one fixed host-side path, `<workspace>/.kern-env`,
+  unlinking it and re-creating it with `O_EXCL|O_NOFOLLOW` on every call. That create is a security
+  property, it refuses to write through a symlink the box may have planted, and it is unchanged; the
+  defect was the shared NAME. In Python the loser of the race got a bare `FileExistsError` straight
+  out of `run_code`: 11 of 40 concurrent calls failed that way, measured. In Node it was worse than
+  an error, because one call removed the file while kern was still starting for another and had not
+  read it yet, so that box died with
+  `error: sandbox: cannot read --env-file '...': No such file or directory`. The README advertises
+  100 concurrent calls, so this was on the documented path, not an exotic one. The file is now named
+  per call and removed on every exit path, including the two spawn failures, where it used to be left
+  behind: a persistent `workspace=` accumulated one per session. Verified by reverting each fix and
+  watching the new tests fail with those exact messages, then 100/100 concurrent calls succeeding
+  with zero files left.
+
 - **A mistyped flag on `kern pull` or `kern push` was skipped, and its VALUE became the image.**
   `parse_pull` takes the first argument that does not start with `-`, and the arm above it discarded
   anything that did, so one transposition was enough: `kern pull --platfrom linux/arm64 alpine:3.19`
@@ -32,6 +47,26 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   probing every verb with a deliberately bogus flag and comparing behaviour, not by reading.
 
 ### Documentation
+
+- **The SDK README quoted a speed trade that no longer exists, and the wrong side of it.** It read
+  "`enforce_limits=False` is about twice as fast", and gave `run(["true"])` as ~3.5 ms without
+  enforcement against ~7.5 with it. Measured today on the machine the table names, same session,
+  `python:3.12-slim`: **7.56 ms and 7.58 ms**, a ratio of 1.00, and isolating the switch on the bare
+  binary puts it at **0.15 ms, 1.05×**. The claim dated from when a cap meant a `systemd-run` scope
+  per box; since 0.6.15 kern applies caps in its own delegated slice, which `BENCHMARKS.md` already
+  documented. The advice was therefore inverted: the README offered giving up hard memory and PID
+  enforcement to buy milliseconds that are no longer there. Under 100 concurrent calls the same holds,
+  1.04× on wall clock against the quoted ~5×. The Node README had already been corrected
+  ("`false` is best-effort and NO faster"); the two contradicted each other.
+
+  Every other number in that section was re-measured beside it rather than inherited: `run_code`
+  16.0 ms against Docker's 286 ms (the README said 344, so it overstated the gap), native box start
+  2.57 ms from a rootfs and 3.62 ms from an image, and the wrapper's own overhead, +3.9 ms, which the
+  old table contradicted by placing the wrapped call BELOW the native one.
+
+- **Both binding READMEs and both package manifests described kern differently from the README.**
+  All four now carry the project's tagline. This ships with 0.1.12 rather than alone, so the text on
+  GitHub and the text on PyPI and npm change together instead of drifting apart.
 
 - **Two placeholders vanished when GitHub rendered the changelog.** `removed build '<id>'` sat in
   prose rather than in a code span, and a `<name>` line used backslash-escaped backticks inside a

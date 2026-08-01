@@ -793,3 +793,55 @@ test("a reply without a usable exit code is a fault, not a success", () => {
   assert.equal(bad.exitCode, 3);
   assert.equal(bad.fault, null);
 });
+
+test("concurrent calls on one Sandbox do not fight over the env file", exec, async () => {
+  // The env file used to be a single fixed `.kern-env` in the workspace, unlinked and re-created with
+  // O_EXCL|O_NOFOLLOW on every call (a deliberate refusal to write through a symlink the box may have
+  // planted). Concurrent calls therefore fought over one path, and here the loser did not even get a
+  // clean error: one call removed the file while kern was still starting for another and had not read
+  // it yet, so that box died with
+  //   error: sandbox: cannot read --env-file '...': No such file or directory
+  // Measured at 30 concurrent runCode calls before the fix: 2 failed that way and one file was left
+  // behind. The security property is unchanged; only the NAME is per-call.
+  const sb = new Sandbox({ env: { KERN_TEST_VAR: "x" } });
+  await sb.open();
+  try {
+    const n = 16;
+    const res = await Promise.allSettled(
+      Array.from({ length: n }, () => sb.run(["true"])),
+    );
+    const rejected = res.filter((r) => r.status === "rejected").map((r) => String(r.reason?.message).slice(0, 90));
+    const faulted = res
+      .filter((r) => r.status === "fulfilled" && !r.value.success)
+      .map((r) => `${r.value.fault?.type}: ${String(r.value.fault?.message ?? "").slice(0, 90)}`);
+    assert.deepStrictEqual(rejected, [], "concurrent calls must not reject");
+    assert.deepStrictEqual(faulted, [], "concurrent calls must not fault");
+    const leftover = fs.readdirSync(sb._ws).filter((f) => f.startsWith(".kern-env"));
+    assert.deepStrictEqual(leftover, [], "env files left behind in the workspace");
+  } finally {
+    await sb.close();
+  }
+});
+
+test("our env file is hidden from listings but a user file is not", () => {
+  // The filter became prefix-based when the env file went per-call. A bare startsWith would have
+  // swallowed a user's `.kern-environment` from `files` and from a snapshot, so it is anchored on the
+  // separator, and asserted in both directions.
+  assert.strictEqual(Sandbox._isEnvFile(".kern-env"), true);
+  assert.strictEqual(Sandbox._isEnvFile(".kern-env.box-abc123"), true);
+  assert.strictEqual(Sandbox._isEnvFile(".kern-environment"), false);
+  assert.strictEqual(Sandbox._isEnvFile("kern-env"), false);
+  assert.strictEqual(Sandbox._isEnvFile("notes.txt"), false);
+});
+
+test("the version in the code matches the one in package.json", () => {
+  // Same number written twice: npm publishes what package.json says, while anything reading
+  // `kern.version` reads the constant. A bumped manifest with a stale constant ships a package that
+  // misreports its own version. Its Python twin pins the other pair.
+  const pkg = require("../package.json");
+  assert.strictEqual(
+    kern.version,
+    pkg.version,
+    `kern.version is ${kern.version} but package.json says ${pkg.version}`,
+  );
+});

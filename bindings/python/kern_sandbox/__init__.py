@@ -63,7 +63,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -73,6 +73,10 @@ _DEFAULT_IMAGE = "python:3.12-slim"
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
 _DEPS_DIR = ".deps"  # pip --target dir inside the workspace (added to PYTHONPATH for run_code)
 _ENV_FILE = ".kern-env"  # host-side 0600 env file (kept out of argv so values don't show in `ps`)
+# One file per CALL, `.kern-env.<box-name>`: a single fixed name made two concurrent calls on the
+# same Sandbox race for one path. The plain `.kern-env` is still recognised so a workspace written
+# by an older version is filtered out of file diffs and snapshots rather than surfacing as user state.
+_ENV_SEP = "."
 # Cap the results file the (untrusted) box writes before the binding reads it back into host RAM: a
 # malicious cell could stream a multi-GB `.res` to disk (past its own memory cap) and OOM the host.
 _RESULTS_MAX = 64 * 1024 * 1024  # 64 MiB: generous for charts/tables, bounds the attacker-controlled read
@@ -808,8 +812,14 @@ class Sandbox:
         # component's whole point is running untrusted code beside sensitive data (a credential in
         # `env=` would leak). The file lives in our own 0700 mkdtemp workspace, written 0600, so it is
         # not readable by other users; kern reads it before the box's env is set up. (Hacker-mode audit.)
-        if merged_env:
-            env_path = os.path.join(self._ws, _ENV_FILE)
+        # `_ws` is set by `__enter__`; before that it is "". The public API is gated by
+        # `_require_entered`, but the unit tests call `_base_argv` directly to inspect the argv, and
+        # with an empty workspace `os.path.join` yielded a RELATIVE path: the env file was written into
+        # the current directory. It has been landing in the repository for as long as those tests have
+        # existed, hidden by a `.kern-env` line in `.gitignore` that stopped matching when the name
+        # became per-call. No workspace means nowhere to put it, so there is nothing to write.
+        if merged_env and self._ws:
+            env_path = self._env_path(name)
             # SECURITY: the box has rw access to the workspace and could plant `.kern-env` as a symlink
             # to a host file (e.g. ~/.ssh/authorized_keys); a follow-through open would O_TRUNC-clobber
             # it. Unlink any existing entry (removing a planted symlink), then create fresh with
@@ -854,44 +864,60 @@ class Sandbox:
                 raise SandboxError("command/code must not contain a NUL byte")
         before = self._snapshot() if self.track_files else None  # skip the O(N) walk when not tracked
         name = _unique_name()
+        # The env file is named after THIS box, and removed in the `finally` below. It used to be one
+        # fixed `.kern-env` per workspace, which two concurrent calls on the same Sandbox raced for:
+        # both `unlink`ed it, both re-created it with `O_EXCL`, and the loser got a bare
+        # `FileExistsError` out of `run_code`. Measured at 40 threads: 11 of 40 calls failed that way.
+        # The `O_EXCL|O_NOFOLLOW` create is a security property (it refuses to write through a symlink
+        # the box may have planted) and is kept exactly as it was; only the NAME becomes per-call, so
+        # two calls no longer contend for one path. It is also cleaned up now: with a persistent
+        # `workspace=`, the old fixed file was left behind after every session.
         argv = self._base_argv(name, network=network, timeout_s=timeout_s, is_setup=is_setup) + ["--"] + list(command)
         child_env = dict(os.environ)
         if not self.enforce_limits:
             child_env["KERN_NO_SCOPE"] = "1"
         started = time.monotonic()
         try:
-            # start_new_session so the box + kern share a process group we can signal as a unit.
-            proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
-                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env,
-                start_new_session=True,
-            )
-        except FileNotFoundError as e:
-            raise SandboxError(f"could not execute kern: {e}") from e
-        except OSError as e:
-            # E2BIG (argv too long) and other spawn-time OS errors → a clean typed error, not a raw
-            # OSError leaking out of the binding. (run_code already routes large code via a file.)
-            raise SandboxError(f"could not spawn the box: {e}") from e
-        out = _CappedReader(proc.stdout, self.max_output_bytes, cb_out)
-        err = _CappedReader(proc.stderr, self.max_output_bytes, cb_err)
-        out.start()
-        err.start()
-        we_timed_out = False
-        try:
-            proc.wait(timeout=timeout_s)  # OUR deadline - the authority for a `timeout` fault
-        except subprocess.TimeoutExpired:
-            we_timed_out = True
-            self._teardown(proc, name, child_env)
-        # Join readers, but BOUNDED: a CPU-bound box can survive our signals and hold the pipe open
-        # until kern's own --timeout backstop reaps it a few seconds later; never hang the caller on it.
-        join_deadline = 8.0 if we_timed_out else None
-        out.join(join_deadline)
-        err.join(join_deadline)
-        # Reap the process so returncode is populated and no zombie lingers (bounded - the backstop has
-        # reaped the box by now in the timeout case).
-        try:
-            proc.wait(timeout=8.0)
-        except subprocess.TimeoutExpired:
-            pass
+            try:
+                # start_new_session so the box + kern share a process group we can signal as a unit.
+                proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+                    argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as e:
+                raise SandboxError(f"could not execute kern: {e}") from e
+            except OSError as e:
+                # E2BIG (argv too long) and other spawn-time OS errors → a clean typed error, not a raw
+                # OSError leaking out of the binding. (run_code already routes large code via a file.)
+                raise SandboxError(f"could not spawn the box: {e}") from e
+            out = _CappedReader(proc.stdout, self.max_output_bytes, cb_out)
+            err = _CappedReader(proc.stderr, self.max_output_bytes, cb_err)
+            out.start()
+            err.start()
+            we_timed_out = False
+            try:
+                proc.wait(timeout=timeout_s)  # OUR deadline - the authority for a `timeout` fault
+            except subprocess.TimeoutExpired:
+                we_timed_out = True
+                self._teardown(proc, name, child_env)
+            # Join readers, but BOUNDED: a CPU-bound box can survive our signals and hold the pipe open
+            # until kern's own --timeout backstop reaps it a few seconds later; never hang the caller on it.
+            join_deadline = 8.0 if we_timed_out else None
+            out.join(join_deadline)
+            err.join(join_deadline)
+            # Reap the process so returncode is populated and no zombie lingers (bounded - the backstop
+            # has reaped the box by now in the timeout case).
+            try:
+                proc.wait(timeout=8.0)
+            except subprocess.TimeoutExpired:
+                pass
+        finally:
+            # Every exit path, including the two SandboxErrors above: kern has read the file by the time
+            # it exits, and leaving it behind would accrete one per call in a persistent workspace.
+            try:
+                os.unlink(self._env_path(name))
+            except OSError:
+                pass
         wall_ms = int((time.monotonic() - started) * 1000)
         stdout = out.buf.decode("utf-8", "replace")
         stderr = err.buf.decode("utf-8", "replace")
@@ -971,6 +997,19 @@ class Sandbox:
         return None
 
     # -- workspace file I/O (host-direct; single-uid → box files are host-owned) ---------------------
+
+    def _env_path(self, name: str) -> str:
+        """Host path of the private --env-file for the box called ``name``, inside the workspace."""
+        return os.path.join(self._ws, f"{_ENV_FILE}{_ENV_SEP}{name}")
+
+    @staticmethod
+    def _is_env_file(rel: str) -> bool:
+        """Is ``rel`` one of OUR env files, and not user state?
+
+        Exact-match on the legacy name plus the `.kern-env.` prefix, never a bare `startswith`:
+        a user file called `.kern-environment` is theirs and must still appear in `files`/`snapshot`.
+        """
+        return rel == _ENV_FILE or rel.startswith(_ENV_FILE + _ENV_SEP)
 
     def _ws_path(self, rel: str) -> str:
         """Resolve a workspace-relative path for host-side I/O, refusing any escape out of the workspace.
@@ -1107,7 +1146,7 @@ class Sandbox:
         # times faster than the default 9 with a negligible ratio penalty. Speed over ratio here.
         with tarfile.open(dest, "w:gz", compresslevel=1, format=tarfile.USTAR_FORMAT) as tf:
             for entry in sorted(os.listdir(self._ws)):
-                if entry == _ENV_FILE:
+                if self._is_env_file(entry):
                     continue  # our private 0600 --env-file, not user state
                 tf.add(os.path.join(self._ws, entry), arcname=entry)
 
@@ -1173,7 +1212,7 @@ class Sandbox:
                 if not stat.S_ISREG(st.st_mode):
                     continue
                 rel = os.path.relpath(fp, base)
-                if rel == _ENV_FILE:
+                if self._is_env_file(rel):
                     continue  # our private host-side --env-file, not a user artifact
                 out[rel] = (st.st_mtime_ns, st.st_size)
         return out

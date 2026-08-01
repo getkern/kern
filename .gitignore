@@ -4,7 +4,7 @@ target/
 .DS_Store
 
 # Runtime env file the sandbox bindings write into a workspace (0600, PYTHONPATH etc.); never a source file.
-.kern-env
+.kern-env*
 
 # Pulled/built OCI rootfs - `kern pull`/`kern build` with no --dest writes into the CWD as
 # `<name>_<tag>-<hash>/` plus `.image`/`.lock`/`.layers`/`.base`/`.diff` sidecars. Never commit a
@@ -74,3 +74,4 @@ clip.mp4
 
 __pycache__/
 *.pyc
+kern-sandbox-*.tgz

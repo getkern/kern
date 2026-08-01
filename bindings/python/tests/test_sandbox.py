@@ -688,3 +688,74 @@ def test_a_reply_without_a_usable_exit_code_is_a_fault_not_a_success():
     # And a genuine non-zero exit is preserved rather than coerced.
     bad = k._result_from_reply(b'{"rc":3,"stdout":"","stderr":"boom"}', started)
     assert not bad.success and bad.exit_code == 3 and bad.fault is None
+
+
+@integration
+def test_concurrent_calls_on_one_sandbox_do_not_fight_over_the_env_file():
+    """Two calls on the SAME Sandbox must not race for one host-side `--env-file` path.
+
+    The env file used to be a single fixed `.kern-env` in the workspace. Every call unlinked it and
+    re-created it with `O_EXCL|O_NOFOLLOW` (a deliberate refusal to write through a symlink the box
+    may have planted), so two concurrent calls fought over one path: the loser got a bare
+    `FileExistsError` straight out of `run_code`. Measured at 40 threads before the fix: 11 of 40
+    failed that way, and the README advertises 100 concurrent calls.
+
+    The security property is unchanged; only the NAME is per-call. Asserted on the failure mode that
+    was observed (an exception escaping the call), with the leftover-file check beside it, because the
+    old code also never removed the file: a persistent `workspace=` accumulated one per session.
+    """
+    import concurrent.futures as cf
+
+    n = 24
+    errors: list[str] = []
+
+    with Sandbox(env={"KERN_TEST_VAR": "x"}) as sbx:
+        def call(_):
+            try:
+                return sbx.run(["true"]).success
+            except Exception as e:  # noqa: BLE001 - the defect surfaced as a raw OSError
+                errors.append(f"{type(e).__name__}: {e}")
+                return False
+
+        with cf.ThreadPoolExecutor(max_workers=n) as ex:
+            ok = sum(1 for r in ex.map(call, range(n)) if r)
+
+        leftover = [f for f in os.listdir(sbx._ws) if f.startswith(".kern-env")]
+
+    assert not errors, f"concurrent calls raised: {errors[:3]}"
+    assert ok == n, f"only {ok}/{n} concurrent calls succeeded"
+    assert not leftover, f"env files left in the workspace: {leftover}"
+
+
+def test_our_env_file_is_hidden_from_file_listings_but_a_user_file_is_not():
+    """`.kern-env*` is ours; a user file whose name merely STARTS with it is theirs.
+
+    The filter became prefix-based when the env file went per-call, and a bare `startswith` would
+    have swallowed a user's `.kern-environment` from `files` and from `snapshot()`. Separator-anchored
+    instead, and asserted in both directions so the hiding cannot quietly widen.
+    """
+    assert Sandbox._is_env_file(".kern-env")
+    assert Sandbox._is_env_file(".kern-env.box-abc123")
+    assert not Sandbox._is_env_file(".kern-environment")
+    assert not Sandbox._is_env_file("kern-env")
+    assert not Sandbox._is_env_file("notes.txt")
+
+
+def test_the_version_in_the_code_matches_the_one_in_pyproject():
+    """`__version__` and the packaging metadata are the same number written twice.
+
+    They drifted once already: the release that publishes to PyPI reads `pyproject.toml`, while
+    anything importing the module reads `__version__`, so a bumped manifest and a stale constant ship
+    a package whose own `kern_sandbox.__version__` reports the PREVIOUS release. Four places carry
+    this version (two manifests, two sources); this test pins the Python pair, and its Node twin pins
+    the other.
+    """
+    import pathlib
+    import tomllib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    meta = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = meta["project"]["version"]
+    assert kern.__version__ == declared, (
+        f"kern_sandbox.__version__ is {kern.__version__} but pyproject.toml says {declared}"
+    )
