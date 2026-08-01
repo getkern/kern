@@ -587,10 +587,24 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image.
         Some("build") => parse_build(&rest)?,
         // `pull <image>`: fetch into the image cache; `--dest <dir>` extracts a rootfs instead.
-        Some("pull") => parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?,
+        // An unknown flag used to be SKIPPED here, and the next token then became the image, because
+        // `parse_pull` takes the first argument that is not a flag. One typo was enough:
+        // `kern pull --platfrom linux/arm64 alpine:3.19` tried to pull an image literally named
+        // `linux/arm64`, silently dropped the `alpine:3.19` the caller asked for, and failed with
+        // "it may be private (run `kern login`)" - which sends the reader to authentication for a
+        // spelling mistake. Thirty other verbs already refuse unknown flags; `pull` and `push` were
+        // the two that did not.
+        Some("pull") => {
+            reject_unknown_flags("pull", &rest, &["--dest", "--platform"])?;
+            parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?
+        }
         // `push <local-ref> [as <remote-ref>]` - publish a cached image. `as` lets you retag on push
         // (e.g. `kern push myapp as ghcr.io/me/myapp:1.0`).
         Some("push") => {
+            // Same shape as `pull`: the filter below drops anything starting with `-`, so an unknown
+            // flag was discarded and ITS VALUE was read as the local ref. `push` takes no flags at
+            // all, which makes the allowed list empty and the rule exact.
+            reject_unknown_flags("push", &rest, &[])?;
             let args: Vec<&&str> = rest
                 .iter()
                 .skip(1)
@@ -2745,6 +2759,61 @@ mod tests {
     /// rootfs under a host-arch key is cache poisoning, a class already fixed once here. Since a bare
     /// `pull` now fills the cache, the combination must be REFUSED rather than silently falling back
     /// to a directory, which would be a third behaviour for one verb.
+    /// A mistyped flag on `pull`/`push` must be REFUSED, not skipped with its value read as the ref.
+    ///
+    /// `parse_pull` takes the first argument that does not start with `-`, and the old arm skipped
+    /// anything that did, so `kern pull --platfrom linux/arm64 alpine:3.19` (one transposition) took
+    /// `linux/arm64` as the image, dropped `alpine:3.19` entirely, and reported
+    /// "cannot access 'linux/arm64' ... it may be private (run `kern login`)". The user is then told
+    /// to authenticate because of a spelling mistake, and the image they named never appears in any
+    /// message. `push` had the same shape through its `filter(|a| !a.starts_with('-'))`.
+    ///
+    /// Asserted on the exact typo that produced it, plus the positive control that the correctly
+    /// spelled flag still parses, so this cannot pass on a build that refuses everything.
+    #[test]
+    fn a_mistyped_flag_on_pull_or_push_is_refused_instead_of_eating_the_image() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+        let err = p(&["pull", "--platfrom", "linux/arm64", "alpine:3.19"])
+            .expect_err("a mistyped flag must not parse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--platfrom"),
+            "the error must name the flag that was not understood: {msg}"
+        );
+
+        let err = p(&["push", "--bogus", "x", "alpine:3.19"]).expect_err("push takes no flags");
+        assert!(
+            format!("{err}").contains("--bogus"),
+            "push must name the unknown flag: {err}"
+        );
+
+        // Positive control: the correctly spelled flags still reach the command intact.
+        let cmd = p(&[
+            "pull",
+            "--platform",
+            "linux/arm64",
+            "--dest",
+            "/tmp/x",
+            "alpine:3.19",
+        ])
+        .expect("the documented spelling still parses")
+        .1;
+        assert!(
+            matches!(&cmd, Command::Pull { image, dest: Some(d), platform: Some(pl) }
+                     if image == "alpine:3.19" && d == "/tmp/x" && pl == "linux/arm64"),
+            "the correct spelling must be unaffected: {cmd:?}"
+        );
+        let cmd = p(&["push", "myimg", "as", "ghcr.io/me/myimg:1"])
+            .expect("push still parses")
+            .1;
+        assert!(
+            matches!(&cmd, Command::Push { local, remote: Some(r) }
+                     if local == "myimg" && r == "ghcr.io/me/myimg:1"),
+            "push's positional form must be unaffected: {cmd:?}"
+        );
+    }
+
     #[test]
     fn platform_without_dest_is_refused_because_the_cache_is_host_arch() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());

@@ -863,7 +863,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 ## Project status
 
-**0.6.30.** Everything in [Features](#features) works today and is tested (688 Rust, 62 Python and 51
+**0.6.30.** Everything in [Features](#features) works today and is tested (689 Rust, 62 Python and 51
 Node tests; clippy-clean, `cargo-deny`-clean, adversarially reviewed slice by slice); the isolation is
 real. kern trades Docker's breadth (overlay networks, a plugin ecosystem) for a small, fast core that
 starts in single-digit milliseconds from one **~1.8 MB** binary. Versioned under semver: each release is the official

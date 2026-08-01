@@ -52,7 +52,8 @@ commands shown inline; only those depend on a specific image or a systemd-user m
 > **TL;DR.** kern is in the **fastest tier**: it leads the no-cgroup-cap sandboxes (ahead of
 > `bubblewrap`), and a hard cgroup cap now costs 0.25 ms rather than a `systemd-run` round trip: while being the only one of them that ships a complete daemonless container UX
 > (OCI pull, overlay, `ps`/`exec`/`logs`/`top`, compose) in a **~1.8 MB** binary. Against the real
-> engines it's **~125× faster to start** (`podman` ~288 ms, Docker ~289 ms) and carries no
+> engines it's **~133× faster to start** (2.2 ms against Docker's 292.9 and `podman`'s 287.5, the
+> table below; ~80× if you compare the `--image` path's 3.6 ms, which does more) and carries no
 > resident daemon. It is *not* "the fastest in the world", the top tier is within a couple ms,
 > i.e. noise; the honest claim is **top-tier speed + a full runtime in a tiny daemonless binary**.
 
@@ -142,7 +143,7 @@ round-trip per run: 200 runs took ~62 s vs kern's **0.37 s**).
 | **docker run --rm** | 15.96 s |
 
 This is where a daemonless, lock-free design shows: kern fans out 200 concurrent boxes in 90 ms,
-**~2× bubblewrap** and **~267× Docker**. (kern's overlay path was earlier verified at 30/30 and
+**~2× bubblewrap** (0.17 s) and **~177× Docker** (15.96 s). (kern's overlay path was earlier verified at 30/30 and
 many-sharing-one-rootfs at 12/12, see the test suite.)
 
 ## Runs everywhere, the same static binary, on boards where the engines can't

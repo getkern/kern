@@ -1,12 +1,13 @@
 # Introducing kern: a container runtime that does less than Docker, on purpose
 
-*A fast, daemonless, rootless Linux sandbox & virtual-resource runtime, one ~1.8 MB static binary,
-one Rust dependency (`libc`). It starts a real, kernel-enforced box in ~2.3 ms, embeds from Python or
-Rust, and runs the same on a laptop, in CI, or on a Raspberry Pi.*
+*A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and
+AI-generated code. One ~1.8 MB static binary, one Rust dependency (`libc`), no daemon. It starts a
+real, kernel-enforced box in 2.2 ms, embeds from Python or Rust, and runs the same on a laptop, in
+CI, or on a Raspberry Pi.*
 
 Most container tooling is built around a daemon. You install a service that stays resident, holds the
 image store and the network, and every `run` is a round-trip to it. That buys a lot of features, and
-it costs a resident process, a socket to secure, ~289 ms of start latency, and a footprint that keeps
+it costs a resident process, a socket to secure, ~293 ms of start latency, and a footprint that keeps
 kern off a lot of small machines entirely.
 
 kern is the other trade. There is no daemon. `kern box` forks one short-lived process, sets up Linux
@@ -61,13 +62,15 @@ One isolated `/bin/true`, warm image cache, on an x86_64 desktop (Linux 6.17, me
 | bubblewrap | 2.9 ms | a sandbox *primitive*, no images, caps, or lifecycle |
 | crun | 5.2 ms (not installed on the machine re-measured) | OCI runtime (C) |
 | runc (rootless) | 13.8 ms | OCI runtime (Go) |
-| podman (rootless) | 288 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
-| docker run | 289 ms | client → daemon round-trip |
+| podman (rootless) | 287.5 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
+| docker run --rm | 292.9 ms | client → daemon round-trip |
 
 The honest version: **nobody wins single-shot latency outright**: the top tier is all within a couple
 of milliseconds, i.e. noise. kern leads that tier while being the only one of them that ships a full
 daemonless container UX (OCI pull *and build*, overlay, volumes, secrets, `ps`/`exec`/`logs`, compose)
-in ~1.8 MB. The real gap is to the *engines*: **~80-160× faster to start** than podman/Docker, which
+in ~1.8 MB. The real gap is to the *engines*: **~80-133× faster to start** than podman/Docker (the
+spread is the two kern paths: 2.2 ms with `--rootfs`, 3.6 ms with `--image`, which also maps a uid
+range), which
 fork `conmon` or round-trip a daemon every run, and kern keeps **0 RAM resident** where Docker holds
 ~186 MB before you run anything. Full method, including where kern *ties* (I/O, cold pull, in-box
 compute overhead, all physics, not runtime), is in
@@ -96,7 +99,7 @@ test you hope exists, [that's a separate post](what-the-type-system-buys-you.md)
 
 That's strong for first-party and semi-trusted workloads, CI, dev, edge, your own agents' code. It is
 **not** a hardware-virtualization boundary. For actively hostile, multi-tenant, untrusted code where
-you want a VM boundary, reach for a microVM, a deliberate trade for ~2.3 ms starts and a ~1.8 MB
+you want a VM boundary, reach for a microVM, a deliberate trade for 2.2 ms starts and a ~1.8 MB
 footprint. [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md) marks every guarantee
 that's cooperative or opt-in, and says exactly when to use kern versus a microVM.
 
@@ -117,7 +120,8 @@ kern doctor                                    # will boxes even run on this hos
 
 kern deliberately skips a lot that Docker has, overlay networks, a plugin ecosystem, because the
 point is a small, fast, honest core you can read, embed, and put anywhere. Everything above works
-today and is tested (454 tests, clippy-clean, security-audited slice by slice). The CLI isn't frozen
+today and is tested (689 Rust, 62 Python and 51 Node tests, clippy-clean, security-audited slice by
+slice). The CLI isn't frozen
 until 1.0.
 
 Code, benchmarks, and the honest security account:

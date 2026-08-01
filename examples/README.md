@@ -49,7 +49,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [nested-privileged.sh](nested-privileged.sh) | Run a `kern box` inside a `kern box`, `--privileged` relaxes exactly 5 syscalls (rootless-only), keeps the rest blocked |
 | [save-load-interop.sh](save-load-interop.sh) | `kern save` / `kern load`, move an image as a plain tar, Docker-loadable both ways, no registry |
 
-### Things kern makes trivial (that otherwise need a daemon, root, or a hand-built rootfs)
+## Things kern makes trivial (that otherwise need a daemon, root, or a hand-built rootfs)
 
 | Example | What it shows |
 |---|---|
@@ -57,7 +57,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [build-and-extract.sh](build-and-extract.sh) | Compile in a disposable toolchain; keep the artifact, your host never gets the compiler |
 | [parallel-matrix.sh](parallel-matrix.sh) | Run one command across a matrix of images **all at once** (daemonless fan-out, no serialization) |
 
-### Secrets, storage & volumes
+## Secrets, storage & volumes
 
 | Example | What it shows |
 |---|---|
@@ -65,7 +65,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [named-volumes.sh](named-volumes.sh) | `kern volume create/inspect/rm`: a named volume persists across boxes (write in A, read in B); `--size` records a quota (a hard cap needs root/ext4-loop, use `vdisk:` for a rootless-enforced size) |
 | [vdisk-scratch.sh](vdisk-scratch.sh) | A `vdisk:` scratch disk from a `[[vdisk]]` profile (`--config`), mounted at `/vdisk/<name>`, a rootless size cap the kernel enforces (writing past it → `ENOSPC`) |
 
-### Lifecycle & operations
+## Lifecycle & operations
 
 | Example | What it shows |
 |---|---|
@@ -79,7 +79,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [log-triage.sh](log-triage.sh) | Incident triage on a huge log: `logs --tail N` seeks a bounded window near EOF (O(lines shown), not O(file size)), pulling the crash tail off a ~200k-line log instantly, plus a `ps` state snapshot |
 | [gc-prune-doctor.sh](gc-prune-doctor.sh) | Housekeeping: `kern doctor` preflight, `kern prune` (stopped-box leftovers), `kern gc` (reap dead boxes) |
 
-### Networking & pods
+## Networking & pods
 
 | Example | What it shows |
 |---|---|
@@ -88,7 +88,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [port-publish-advanced.sh](port-publish-advanced.sh) | `-p` beyond a single port: a host↔box port **range**, a `/udp` mapping, and default-loopback vs explicit `0.0.0.0:` bind |
 | [tun-device.sh](tun-device.sh) | `--tun` provisions `/dev/net/tun` inside the box (present with `--tun`, absent without) for a userspace VPN |
 
-### Build, registry & platform
+## Build, registry & platform
 
 | Example | What it shows |
 |---|---|
@@ -98,7 +98,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [tag-and-push-local.sh](tag-and-push-local.sh) | `kern tag` + `kern push` round-trip against a throwaway `registry:2` box on `127.0.0.1:5000` (loopback ⇒ plain-HTTP OK), then pull it back |
 | [pull-policy.sh](pull-policy.sh) | `--pull missing\|never\|always`: reuse cache (missing), fail closed offline (never), and force a fresh pull with an atomic swap a LIVE box survives (always, zero-downtime image refresh) |
 
-### Users, edge & resource profiles
+## Users, edge & resource profiles
 
 | Example | What it shows |
 |---|---|
@@ -108,7 +108,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [edge-webserver-ssh.sh](edge-webserver-ssh.sh) | A web server on a headless board, published to the LAN, with `--ssh` into the box. The two things that bite on a board: build with `--net` but SERVE without it (`-p` and `--net` don't combine), and `loginctl enable-linger` or a detached box dies at logout. The only example that leaves a box running on purpose (it holds host 8080 + 2222 so you can reach it from another machine); `KEEP=0` makes it clean up instead |
 | [resource-profiles.sh](resource-profiles.sh) + [kern-profiles.toml](kern-profiles.toml) | Reusable `[[vcpu]]` / `[[vdisk]]` / `[[vgpio]]` profiles in a kern.toml, attached via `--config` + `vcpu:` / `vdisk:` tokens |
 
-### Real-life scenarios
+## Real-life scenarios
 
 | Example | What it shows |
 |---|---|
@@ -124,7 +124,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [scale-test.sh](scale-test.sh) | Burst N isolated boxes (~2.3 ms each, no dockerd), drive the whole set from `ps -q`: count, `--filter` sample, then reap with one `kern stop $(kern ps -q)` |
 | [device-isolation.sh](device-isolation.sh) | Give a box exactly one hardware device (i2c / serial / spi) and nothing else |
 
-### Per-language dev & build boxes (your host stays clean)
+## Per-language dev & build boxes (your host stays clean)
 
 | Example | What it shows |
 |---|---|
@@ -133,7 +133,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [python-data.sh](python-data.sh) | A Python data task with no python/pip on the host: `pip install` in the one `--net` step, then process a bound-in CSV network-off, output to `-v` |
 | [rust-build.sh](rust-build.sh) | Compile Rust in a `--memory`/`--cpus`-capped `rust` box (governed build), run the extracted binary in a separate minimal box |
 
-### Services & stacks
+## Services & stacks
 
 | Example | What it shows |
 |---|---|
@@ -142,7 +142,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [scheduled-job.sh](scheduled-job.sh) | Daemonless cron-like pattern: a loop starting a fresh, capped, self-removing box each interval, honest that kern has no built-in scheduler (pair with host cron) |
 | [compose-webstack.sh](compose-webstack.sh) + [compose-webstack.toml](compose-webstack.toml) | A richer `kern compose` stack: a cache with a `--health-cmd` and a web front-end gated on `depends_healthy`, brought up in health order and torn down |
 
-### AI / agent sandboxing (run model-generated code safely)
+## AI / agent sandboxing (run model-generated code safely)
 
 Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fresh box, sandbox events (timeout / OOM-kill / blocked escape) come back as **data**, not exceptions, so an agent loop can read and react to them.
 
@@ -155,7 +155,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | [per-request-workers.py](per-request-workers.py) | A stdlib-only pool mapping N requests to N fresh throwaway boxes, so one request's timeout/crash is contained to its own box |
 | [sandboxed-eval.sh](sandboxed-eval.sh) | The shell angle for agents that shell out: eval an untrusted snippet `--read-only --network none` + capped, using the exit code as the signal (benign / blocked / timeout-killed) |
 
-### Data, batch & scraping
+## Data, batch & scraping
 
 | Example | What it shows |
 |---|---|
@@ -164,7 +164,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | [etl-with-deps.sh](etl-with-deps.sh) | Deps installed once online (a `kern build` `RUN` step) into an image snapshot, then the transform runs that image **network-off** over `:ro` data |
 | [parallel-fanout-limited.sh](parallel-fanout-limited.sh) | Bounded-concurrency fan-out: a POSIX sliding window caps in-flight boxes at N so a big batch never spawns them all at once |
 
-### CI & dev-workflow integration
+## CI & dev-workflow integration
 
 | Example | What it shows |
 |---|---|
@@ -174,7 +174,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | [Makefile.kern](Makefile.kern) + [makefile-kern-demo.sh](makefile-kern-demo.sh) | Hermetic `make lint/test/build` where each target runs in a `kern box`, a machine with only kern (no toolchain) can build and test |
 | [airgapped-ci.sh](airgapped-ci.sh) | Supply-chain-hardened CI: seed the base image once, then every step is `--pull never` (fails closed on any un-seeded image) and network-off. Deterministic, offline, no surprise pulls |
 
-### Side-by-side with other tools
+## Side-by-side with other tools
 
 | Example | What it shows |
 |---|---|
@@ -183,7 +183,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | [compare-vs-docker.sh](compare-vs-docker.sh) | Same isolated `/bin/true`, kern vs `docker run`, timed, and kern needs no daemon |
 | [compare-vs-bwrap.sh](compare-vs-bwrap.sh) | Same speed class as bubblewrap, but kern adds OCI images, overlay, and lifecycle |
 
-### Embed kern in your own program
+## Embed kern in your own program
 
 Don't shell out, call kern as a library and get a structured result back (exit code, stdout/stderr
 with truncation flags, wall time). Ideal for running LLM/agent-generated code or CI steps.
@@ -193,7 +193,7 @@ with truncation flags, wall time). Ideal for running LLM/agent-generated code or
 | [embed-python.py](embed-python.py) | The `kern_sandbox` Python package: a fresh box per `run_code`, file-state on disk, sandbox faults (timeout/OOM/blocked-escape) as data, not exceptions |
 | [embed-rust.rs](embed-rust.rs) | The `kern-isolation` crate's fluent `Sandbox::builder()…build()?.run(...)` → a structured `Outcome` |
 
-### Windows
+## Windows
 
 | Example | What it shows |
 |---|---|

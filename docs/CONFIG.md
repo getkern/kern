@@ -13,7 +13,7 @@ The parser is hand-rolled (no `serde`/`toml`) and **tolerant**: an unrecognized 
 line of TOML it doesn't model, is **ignored, not rejected**, so a `kern.toml` shared with another kern
 edition still loads. A *malformed value* of a key it DOES implement is always an error, with its line.
 
-### Which file is in effect
+## Which file is in effect
 
 | source | applies to |
 |---|---|

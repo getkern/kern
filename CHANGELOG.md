@@ -17,6 +17,45 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [Unreleased]
+
+### Fixed
+
+- **A mistyped flag on `kern pull` or `kern push` was skipped, and its VALUE became the image.**
+  `parse_pull` takes the first argument that does not start with `-`, and the arm above it discarded
+  anything that did, so one transposition was enough: `kern pull --platfrom linux/arm64 alpine:3.19`
+  tried to pull an image literally named `linux/arm64`, dropped the `alpine:3.19` the caller asked
+  for, and reported `cannot access 'linux/arm64' ... it may be private (run kern login)`. The user is
+  sent to authenticate over a spelling mistake, and the image they actually named appears in no
+  message at all. `push` had the same shape through its `filter(|a| !a.starts_with('-'))`. Thirty
+  other verbs already called `reject_unknown_flags`; these two were the ones that did not. Found by
+  probing every verb with a deliberately bogus flag and comparing behaviour, not by reading.
+
+### Documentation
+
+- **Two placeholders vanished when GitHub rendered the changelog.** `removed build '<id>'` sat in
+  prose rather than in a code span, and a `<name>` line used backslash-escaped backticks inside a
+  code span, a form markdown does not support, which closed the span early. GitHub parsed both as
+  HTML tags and dropped them, so the text read `removed build ''`. Confirmed by rendering the file
+  through GitHub's own API and counting: 2 of 2 `<id>` and 21 of 21 `<name>` now survive, where
+  before it was 1 and 20. The whole 30-file corpus was checked the same way and has no others.
+
+- **Three numbers did not follow from the tables printed beside them.** `BENCHMARKS.md` claimed
+  `~267× Docker` for the 200-box fan-out where its own row gives 15.96 s against kern's 0.09, which
+  is ~177×; the TL;DR claimed `~125×` and quoted `Docker ~289 ms` where the table says 292.9, so the
+  ratio is ~133× against the `--rootfs` path and ~80× against `--image`. `blog/introducing-kern.md`
+  said `~2.3 ms` in prose and `2.2 ms` in its own table two screens down, gave podman/Docker as
+  288/289 against the table's 287.5/292.9, and claimed `~80-160×` where no pair of its rows produces
+  160. Every ratio in the docs now derives from a number printed next to it.
+
+- **`examples/README.md` had no `## ` heading at all** (fifteen sections were `### ` directly under
+  the title) and `docs/CONFIG.md` opened with an `### ` before its first `## `. GitHub builds its
+  outline sidebar from those levels, so both documents nested wrongly. Anchors are derived from the
+  heading TEXT, so no link changed.
+
+- **The blog posts used a different one-line description of kern than the README.** Both now open
+  with the project's stated tagline.
+
 ## [0.6.30], 2026-08-01
 
 ### Added
@@ -183,7 +222,7 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 - **`builds::remove` answered the wrong question.** It returned `existed`, sampled BEFORE the removal,
   and discarded the removal's own result, so it reported "was there a record?" while both callers read
-  it as "was the record deleted?". `kern build rm <id>` printed "removed build '<id>'" for a record
+  it as "was the record deleted?". `kern build rm <id>` printed `removed build '<id>'` for a record
   still on disk, and `kern build prune` counted it among the pruned. Three outcomes cannot travel in a
   bool sampled at the wrong moment: it returns `Ok(true)` (gone), `Ok(false)` (never there) or `Err`
   (there and not removable), and both callers now say which.
@@ -2174,7 +2213,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
   Applies to both foreground (inline) and detached boxes (visible via `kern logs <name>`).
 - **Truthful detached start (`kern box -d`)**: a readiness pipe (`FD_CLOEXEC` write end, closed by
   the box's successful `execvp` → EOF) makes the launcher print `started` only once the box is
-  actually up, and `box '<name>' exited before starting, run \`kern logs <name>\`` (exit 1) if it
+  actually up, and ``box '<name>' exited before starting, run `kern logs <name>` `` (exit 1) if it
   dies first. No sleep, no poll, the only added latency is the box's real start time (~4 ms; ~7 ms
   with the systemd cgroup scope), the same a foreground box already pays. `compose` inherits this:
   a dependent box now starts only after its dependency is genuinely running.
