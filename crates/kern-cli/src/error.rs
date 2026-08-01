@@ -174,11 +174,16 @@ mod tests {
         assert!(oci_hint("registry: no manifest for aarch64").contains("image name"));
         // A rate limit must NOT get the name/tag hint: the error itself states that the name is not
         // the problem, and two contradicting lines are worse than one.
-        let rl = oci_hint("registry: registry-1.docker.io is rate-limiting this pull of 'library/alpine'");
+        let rl = oci_hint(
+            "registry: registry-1.docker.io is rate-limiting this pull of 'library/alpine'",
+        );
         assert!(
             !rl.contains("check the image name"),
             "a rate limit must not be hinted as a naming problem: {rl}"
         );
-        assert!(rl.contains("quota"), "the hint must name the actual remedy: {rl}");
+        assert!(
+            rl.contains("quota"),
+            "the hint must name the actual remedy: {rl}"
+        );
     }
 }
