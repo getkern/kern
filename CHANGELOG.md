@@ -1365,7 +1365,7 @@ egress boundary, a write-allowlist, warm-start snapshots, and honest fleet budge
   `[[cpu]]` `vcpus` are rejected with a message naming the replacement. Update `kern.toml`: `[[vcpu]]`
   `vcpus`→`cpus`, `cpus`→`cpuset`, `priority`→`nice`; `[[cpu]]` `vcpus`→`cores`.
 
-## [0.6.4], 2026-07-15
+## 0.6.4, 2026-07-15
 
 ### Added
 - **`kern build` parses real-world Dockerfiles.** Comments inside `\` line-continuations, the `SHELL`
@@ -1391,7 +1391,7 @@ egress boundary, a write-allowlist, warm-start snapshots, and honest fleet budge
 - The RAM-backed (tmpfs) vdisk scratch warning now says it is **EPHEMERAL**, not merely that it
   "counts against RAM".
 
-## [0.6.3], 2026-07-13
+## 0.6.3, 2026-07-13
 
 ### Added
 - **Guided, "impossible to get wrong" profile forms in `kern top`.** Creating a vcpu/vgpio/vdisk
@@ -1427,7 +1427,7 @@ egress boundary, a write-allowlist, warm-start snapshots, and honest fleet budge
   `renderD*` GPU node) instead of always showing "none detected".
 - `save_named_block` is fail-closed: it refuses to write a `kern.toml` that would not re-parse.
 
-## [0.6.2], 2026-07-12
+## 0.6.2, 2026-07-12
 
 ### Added
 - **Nested boxes, `kern box --privileged`.** A full `kern box` can now run *inside* another
@@ -1471,7 +1471,7 @@ egress boundary, a write-allowlist, warm-start snapshots, and honest fleet budge
   instead of dying. Real escape vectors (kexec, kernel modules, the mount API, `bpf`, `ptrace`, the
   nesting set) still hard-KILL. The two sets are asserted disjoint.
 
-## [0.6.1], 2026-07-08
+## 0.6.1, 2026-07-08
 
 **docker-compose YAML compatibility**, **image registry `push`**, and a split-out, fuzzed compose
 parser, each built dev → test → clean-code → security-audit (multi-agent, adversarially verified).
@@ -1603,7 +1603,7 @@ parser, each built dev → test → clean-code → security-audit (multi-agent, 
   affects both the compose parser and the `kern.toml` profile loader, and only changes output for the
   rare line with an escaped quote before an unquoted-looking `#` (previously that value was truncated).
 
-## [0.5.7], 2026-07-03
+## 0.5.7, 2026-07-03
 
 **The full 0.5 launch.** kern grows from a fast sandbox/OCI runtime into a **feature-complete
 daemonless container + resource runtime**: the entire private feature set minus GPU/intelligence.
@@ -1802,7 +1802,7 @@ Each feature slice was adversarially audited; highlights:
   tree you still control the perms; the exec-failure hint now names the uid/rootfs cause instead of
   the misleading "command must exist … loader" message.
 
-## [0.4.0], 2026-06-28
+## 0.4.0, 2026-06-28
 
 The resource-governor verb (`kern run`), tunable CPU/memory caps, interactive PTY, port
 publishing, restart/health supervision, and a defense-in-depth hardening pass (least-privilege
@@ -1887,7 +1887,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
   codegen shrinks it ~14% (musl x86_64 804 → **688 KB**, glibc **594 KB**) with **no** latency cost
  , measured a hair faster (better I-cache). There is no hot CPU path to slow down.
 
-## [0.3.3], contextual hint for box-not-running errors
+## 0.3.3, contextual hint for box-not-running errors
 
 ### Fixed
 - **`stop`/`exec`/`logs` on a box that isn't running now show the right hint** ("run `kern ps` to
@@ -1895,14 +1895,14 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
   namespaces and a valid --rootfs directory"), which was misleading for a simple lookup miss. New
   `Error::NotRunning` variant separates a lookup miss from a sandbox-setup failure.
 
-## [0.3.2], `kern stop` takes multiple names + `--all`
+## 0.3.2, `kern stop` takes multiple names + `--all`
 
 ### Added
 - **`kern stop <name>...`** now stops **every** name given (previously it stopped only the first and
   silently ignored the rest), and **`kern stop --all`** stops every running box. A requested name
   that isn't running is reported on stderr instead of being silently dropped.
 
-## [0.3.1], `--uid-range` fallback hardening
+## 0.3.1, `--uid-range` fallback hardening
 
 ### Fixed
 - **`--uid-range` now degrades gracefully when `newuidmap`/`newgidmap` are present but fail at
@@ -1913,7 +1913,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
   therefore always starts, with or without a usable subordinate-id range. The single-uid map write
   is now shared by the default and the fallback paths.
 
-## [0.3.0], Real sandbox execution
+## 0.3.0, Real sandbox execution
 
 ### Added
 - **`kern box <name> (--image <ref>|--rootfs <dir>) [-- cmd...]` runs a command in a real
@@ -2138,7 +2138,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 - `kern run` resource quotas (CPU/memory), tunable `--memory`/`--cpus`, interactive PTY (`-it`),
   port publishing (`-p`), image build, and GPU slices. See the README roadmap.
 
-## [0.2.0], Sandbox hardening
+## 0.2.0, Sandbox hardening
 
 ### Added
 - `kern-isolation`: **mount-ordering typestate** `Rootfs<Mounted>` → `create_old_root()` →
@@ -2158,7 +2158,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
   chars). Blocks path traversal, NUL, whitespace, control characters, shell metacharacters and
   argument-injection by construction. Fuzzed with 40+ hostile inputs: zero crashes/panics.
 
-## [0.1.0], Foundation
+## 0.1.0, Foundation
 
 ### Added
 - Workspace foundation: `kern-cli` (binary `kern`), `kern-common`, `kern-oci`, `kern-isolation`.
@@ -2168,15 +2168,25 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 - Project docs: README, SECURITY, ARCHITECTURE, CONTRIBUTING, CLA, CODE_OF_CONDUCT.
 - CI: build + test + clippy + fmt + cargo-audit + cargo-deny on x86 (skip-graceful for HW).
 
+[0.6.29]: https://github.com/getkern/kern/releases/tag/v0.6.29
+[0.6.28]: https://github.com/getkern/kern/releases/tag/v0.6.28
+[0.6.27]: https://github.com/getkern/kern/releases/tag/v0.6.27
+[0.6.26]: https://github.com/getkern/kern/releases/tag/v0.6.26
+[0.6.25]: https://github.com/getkern/kern/releases/tag/v0.6.25
+[0.6.24]: https://github.com/getkern/kern/releases/tag/v0.6.24
+[0.6.23]: https://github.com/getkern/kern/releases/tag/v0.6.23
+[0.6.22]: https://github.com/getkern/kern/releases/tag/v0.6.22
+[0.6.21]: https://github.com/getkern/kern/releases/tag/v0.6.21
+[0.6.20]: https://github.com/getkern/kern/releases/tag/v0.6.20
+[0.6.19]: https://github.com/getkern/kern/releases/tag/v0.6.19
+[0.6.18]: https://github.com/getkern/kern/releases/tag/v0.6.18
+[0.6.15]: https://github.com/getkern/kern/releases/tag/v0.6.15
+[0.6.14]: https://github.com/getkern/kern/releases/tag/v0.6.14
+[0.6.13]: https://github.com/getkern/kern/releases/tag/v0.6.13
+[0.6.12]: https://github.com/getkern/kern/releases/tag/v0.6.12
+[0.6.11]: https://github.com/getkern/kern/releases/tag/v0.6.11
+[0.6.10]: https://github.com/getkern/kern/releases/tag/v0.6.10
+[0.6.9]: https://github.com/getkern/kern/releases/tag/v0.6.9
+[0.6.8]: https://github.com/getkern/kern/releases/tag/v0.6.8
+[0.6.7]: https://github.com/getkern/kern/releases/tag/v0.6.7
 [0.6.5]: https://github.com/getkern/kern/releases/tag/v0.6.5
-[0.6.4]: https://github.com/getkern/kern/releases/tag/v0.6.4
-[0.6.3]: https://github.com/getkern/kern/releases/tag/v0.6.3
-[0.6.2]: https://github.com/getkern/kern/releases/tag/v0.6.2
-[0.5.7]: https://github.com/getkern/kern/releases/tag/v0.5.7
-[0.3.3]: https://github.com/getkern/kern/releases/tag/v0.3.3
-[0.3.2]: https://github.com/getkern/kern/releases/tag/v0.3.2
-[0.3.1]: https://github.com/getkern/kern/releases/tag/v0.3.1
-[0.4.0]: https://github.com/getkern/kern/releases/tag/v0.4.0
-[0.3.0]: https://github.com/getkern/kern/releases/tag/v0.3.0
-[0.2.0]: https://github.com/getkern/kern/releases/tag/v0.2.0
-[0.1.0]: https://github.com/getkern/kern/releases/tag/v0.1.0
