@@ -439,6 +439,37 @@ command from a PowerShell you are already in, not for a loop that starts hundred
 `kern.cmd` row exists because an antivirus removing the exe should not leave you with nothing; it
 preserves the *function*, not the speed.
 
+## What a published port costs, on a real application
+
+`kern box -p H:B` forks a process that copies bytes both ways in userspace, so every byte of every
+request crosses it. Measured with **nginx**, not `/bin/true`, both against the same image: once behind
+`-p` on an isolated netns, and once over `--net` where nginx binds the host port directly and there is
+no pump at all. The difference is the pump.
+
+| kept-alive connections | through `-p` | direct (`--net`) |
+|---:|---:|---:|
+| 1 | 12,479 req/s | 12,037 |
+| 4 | 19,605 | 17,019 |
+| 16 | 19,425 | 17,185 |
+| 32 | 18,364 | 17,623 |
+
+| | through `-p` | direct |
+|---|---:|---:|
+| p99, 1 connection | 0.27 ms | 0.19 ms |
+| bandwidth, 32 MiB body | 1195 MB/s | 1250 MB/s |
+| a FRESH connection per request, 16 conc. | 10,085 req/s | 10,113 |
+
+Publishing is therefore close to free on this machine: within noise on request rate, 4% on bandwidth,
+and 0.08 ms of p99. A fresh connection per request costs the same either way, because there the cost
+is the TCP handshake and nginx's own accept path, not the pump.
+
+⚠️ **These are the numbers after a 0.6.30 fix, and before it they were not close to free.** Neither
+side of the pump set `TCP_NODELAY`, so a response written as headers-then-body waited on the peer's
+40 ms delayed-ACK timer, and only on a REUSED connection. The same nginx measured **59 req/s on one
+keep-alive connection with p99 pinned at 42.0 ms**, while opening a fresh connection per request gave
+2614/s. Bandwidth was unaffected throughout, 1195 MB/s, which is exactly why it went unnoticed: a
+benchmark that downloads one large file through a published port sees nothing wrong.
+
 ## `kern run` costs 4.9 ms and `kern box` costs 3.6, which looks backwards
 
 `run` does LESS than `box`, no namespaces, no overlay, no seccomp, and measures slower. Both figures

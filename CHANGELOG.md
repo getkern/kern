@@ -21,6 +21,40 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ### Fixed
 
+- **A published port stalled 40 ms on every reused connection: Nagle was left on in the forwarder.**
+  `kern box -p` pumps bytes in userspace, and neither side of that pump set `TCP_NODELAY`. A response
+  written as headers-then-body therefore waited on the peer's delayed-ACK timer, and it bit ONLY on a
+  kept-alive connection: the normal mode for HTTP/1.1, gRPC, Postgres and Redis.
+
+  Measured with nginx behind `-p`, one keep-alive connection: **59 requests/s with p99 pinned at
+  exactly 42.0 ms** at every concurrency level, against **2614/s when every request opened a FRESH
+  connection**. A proxy that is 44x faster when you stop reusing the connection is the signature of a
+  timer rather than of load, and a constant p99 to one decimal place is not contention.
+
+  With `TCP_NODELAY` on both the accepted socket and the socket into the box:
+
+  | keep-alive connections | before | after |
+  |---:|---:|---:|
+  | 1 | 59 req/s | **12,479** |
+  | 4 | 272 | 19,605 |
+  | 16 | 832 | 19,425 |
+  | 32 | 1,780 | 18,364 |
+
+  p99 goes from a pinned 42.0 ms to 0.27 ms at one connection, and the forwarder now measures at
+  parity with not having one: 19,425 req/s through `-p` against 17,185 for the same nginx reached
+  directly over `--net`. Bandwidth was never the problem and is unchanged, 1195 MB/s against 1250 on
+  a 32 MiB body, which is why this survived: anyone benchmarking a published port with a large
+  download would have seen nothing wrong.
+
+  Found by benchmarking a real application rather than `/bin/true`. The regression test asserts the
+  option reads back from `getsockopt` with the control that a fresh socket has Nagle ON, so it cannot
+  pass vacuously, and it was watched failing when the level is `SOL_SOCKET` instead of `IPPROTO_TCP`.
+
+  A shell-level case was written for `pentest-ports.sh` and then REMOVED, which is worth recording:
+  neither an echo server nor a two-write responder reproduces the stall, because both close the
+  connection after one exchange and the defect needs a reused one. Measured at 0.18 and 0.63 ms
+  against an unfixed binary, so it would have shipped as coverage that could never fail.
+
 - **kern-sandbox 0.1.12: two concurrent calls on one `Sandbox` fought over a single file.** Both
   bindings wrote the workload's environment to one fixed host-side path, `<workspace>/.kern-env`,
   unlinking it and re-creating it with `O_EXCL|O_NOFOLLOW` on every call. That create is a security
