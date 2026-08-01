@@ -471,12 +471,14 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         toks.remove(0);
                     }
                     toks.retain(|t| !t.contains("<<"));
-                    if toks.len() != 1 {
+                    // Exactly one token, checked immediately above; `pop` is then `Some`. Taken as a
+                    // pattern rather than asserted so the length check and the use cannot drift.
+                    let [dst] = toks.as_slice() else {
                         return err("COPY <<DELIM needs exactly a destination path");
-                    }
+                    };
                     out.push(Instr::WriteFile {
                         content: hd.body.clone(),
-                        dst: toks.pop().unwrap(),
+                        dst: dst.clone(),
                         chmod: hd_chmod,
                     });
                     continue;
@@ -540,11 +542,12 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         .iter()
                         .filter(|t| t.starts_with("http://") || t.starts_with("https://"))
                         .count();
-                    if toks.len() != 2 || n_urls != 1 {
+                    // Exactly two tokens and exactly one URL; destructured so the arity check and the
+                    // use are the same statement.
+                    let ([url, dst], 1) = (toks.as_slice(), n_urls) else {
                         return err("ADD <url> takes exactly one URL and a destination");
-                    }
-                    let dst = toks.pop().unwrap();
-                    let url = toks.pop().unwrap();
+                    };
+                    let (url, dst) = (url.clone(), dst.clone());
                     out.push(Instr::AddUrl {
                         url,
                         dst,
@@ -553,10 +556,11 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     });
                     continue;
                 }
-                if toks.len() < 2 {
+                // At least two tokens, so the last one is the destination and at least one source
+                // remains. `pop` states the emptiness case instead of asserting it away.
+                let Some(dst) = toks.pop().filter(|_| !toks.is_empty()) else {
                     return err(&format!("{kw} needs at least a source and a destination"));
-                }
-                let dst = toks.pop().unwrap();
+                };
                 out.push(Instr::Copy {
                     srcs: toks,
                     dst,

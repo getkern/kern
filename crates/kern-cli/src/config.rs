@@ -291,16 +291,62 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
             Ctx::None => {} // a key before any section - ignore (tolerant of foreign layouts)
             Ctx::Skip => {} // an unimplemented section - ignore its keys (schema-compat, no output)
             Ctx::Kern => apply_kern(&mut cfg.kern, key, val).map_err(at)?,
-            Ctx::Cpu => apply_cpu(cfg.cpu.last_mut().unwrap(), key, val).map_err(at)?,
-            Ctx::Vcpu => apply_vcpu(cfg.vcpu.last_mut().unwrap(), key, val).map_err(at)?,
-            Ctx::Gpio => apply_gpio(cfg.gpio.last_mut().unwrap(), key, val).map_err(at)?,
-            Ctx::UsbPort => {
-                let ports = &mut cfg.gpio.last_mut().unwrap().usb_ports;
-                apply_usb_port(ports.last_mut().unwrap(), key, val).map_err(at)?;
+            // Each `Ctx` is only entered right after its table is pushed, so `last_mut()` is `Some`
+            // by construction. `ok_or` says that instead of asserting it: this parses a file the user
+            // hand-edits, and a shape nobody anticipated must be a line-numbered error, not an abort.
+            Ctx::Cpu => {
+                let e = cfg
+                    .cpu
+                    .last_mut()
+                    .ok_or_else(|| at("[[cpu]] value before its table".into()))?;
+                apply_cpu(e, key, val).map_err(at)?
             }
-            Ctx::Vgpio => apply_vgpio(cfg.vgpio.last_mut().unwrap(), key, val).map_err(at)?,
-            Ctx::Disk => apply_disk(cfg.disk.last_mut().unwrap(), key, val).map_err(at)?,
-            Ctx::Vdisk => apply_vdisk(cfg.vdisk.last_mut().unwrap(), key, val).map_err(at)?,
+            Ctx::Vcpu => {
+                let e = cfg
+                    .vcpu
+                    .last_mut()
+                    .ok_or_else(|| at("[[vcpu]] value before its table".into()))?;
+                apply_vcpu(e, key, val).map_err(at)?
+            }
+            Ctx::Gpio => {
+                let e = cfg
+                    .gpio
+                    .last_mut()
+                    .ok_or_else(|| at("[[gpio]] value before its table".into()))?;
+                apply_gpio(e, key, val).map_err(at)?
+            }
+            Ctx::UsbPort => {
+                let g = cfg
+                    .gpio
+                    .last_mut()
+                    .ok_or_else(|| at("[[gpio.usb_ports]] outside a [[gpio]] table".into()))?;
+                let port = g
+                    .usb_ports
+                    .last_mut()
+                    .ok_or_else(|| at("[[gpio.usb_ports]] value before its table".into()))?;
+                apply_usb_port(port, key, val).map_err(at)?;
+            }
+            Ctx::Vgpio => {
+                let e = cfg
+                    .vgpio
+                    .last_mut()
+                    .ok_or_else(|| at("[[vgpio]] value before its table".into()))?;
+                apply_vgpio(e, key, val).map_err(at)?
+            }
+            Ctx::Disk => {
+                let e = cfg
+                    .disk
+                    .last_mut()
+                    .ok_or_else(|| at("[[disk]] value before its table".into()))?;
+                apply_disk(e, key, val).map_err(at)?
+            }
+            Ctx::Vdisk => {
+                let e = cfg
+                    .vdisk
+                    .last_mut()
+                    .ok_or_else(|| at("[[vdisk]] value before its table".into()))?;
+                apply_vdisk(e, key, val).map_err(at)?
+            }
         }
         i += 1;
     }

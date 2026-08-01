@@ -1159,13 +1159,15 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
                 break;
             }
         };
-        let tgt = cstr(&format!("/proc/self/fd/{tgt_fd}")).unwrap(); // decimal fd → never NUL
-                                                                     // Deliberately NON-recursive (`MS_BIND`, not `MS_BIND | MS_REC`) - same rationale as the bind
-                                                                     // root above: if the operator's volume source has host filesystems mounted *underneath* it
-                                                                     // (a NAS share, an external disk), a recursive bind would clone those submounts into the box.
-                                                                     // The RO remount below is per-mount (`MS_REMOUNT` is not recursive on Linux), so a recursive
-                                                                     // bind would leave every cloned submount WRITABLE under a `:ro` volume - silently breaking the
-                                                                     // operator's explicit read-only contract. A plain bind exposes the directory tree only.
+        // A decimal fd can never contain a NUL, so this cannot fail - returned as an error rather than
+        // asserted, because this runs inside the box's mount setup where an abort has no message path.
+        let tgt = cstr(&format!("/proc/self/fd/{tgt_fd}"))?;
+        // Deliberately NON-recursive (`MS_BIND`, not `MS_BIND | MS_REC`) - same rationale as the bind
+        // root above: if the operator's volume source has host filesystems mounted *underneath* it
+        // (a NAS share, an external disk), a recursive bind would clone those submounts into the box.
+        // The RO remount below is per-mount (`MS_REMOUNT` is not recursive on Linux), so a recursive
+        // bind would leave every cloned submount WRITABLE under a `:ro` volume - silently breaking the
+        // operator's explicit read-only contract. A plain bind exposes the directory tree only.
         let r = unsafe {
             libc::mount(
                 src.as_ptr(),
@@ -1190,7 +1192,7 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
                     break;
                 }
             };
-            let ro_tgt = cstr(&format!("/proc/self/fd/{ro_fd}")).unwrap(); // decimal fd → never NUL
+            let ro_tgt = cstr(&format!("/proc/self/fd/{ro_fd}"))?; // decimal fd, but stated not asserted
             let r2 = unsafe {
                 libc::mount(
                     ptr::null(),

@@ -43,8 +43,9 @@ impl SandboxCtx {
     /// `kern box <name> --plan` to show exactly what the sandbox setup would do.
     pub fn plan(&self) -> Vec<String> {
         let mut rec = Recorder::default();
-        // The `Recorder` only appends to a vec; it cannot fail.
-        self.build_root(&mut rec).expect("Recorder is infallible");
+        // The `Recorder` only appends to a vec, so this cannot fail. If it ever does, the plan is
+        // shown as far as it got rather than aborting the process on a read-only command.
+        let _ = self.build_root(&mut rec);
         rec.calls
     }
 }

@@ -450,8 +450,8 @@ fn valid_registry(host: &str) -> bool {
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            && label.as_bytes()[0] != b'-'
-            && *label.as_bytes().last().unwrap() != b'-'
+            && !label.starts_with('-')
+            && !label.ends_with('-')
     })
 }
 
@@ -1497,7 +1497,14 @@ pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(),
                 OciError::Tool("gzip", e.to_string())
             }
         })?;
-    let mut stdout = child.stdout.take().expect("stdout piped");
+    // `.stdout(Stdio::piped())` was set on the spawn above, so this is `Some` by construction; say so
+    // with an error rather than an abort, since this runs while decompressing an untrusted layer.
+    let Some(mut stdout) = child.stdout.take() else {
+        return Err(OciError::Tool(
+            bin,
+            "child stdout was not piped".to_string(),
+        ));
+    };
     let res = vet_tar_stream(&mut stdout);
     // We stop reading at the end-of-archive marker (or on rejection), so the decompressor may take a
     // SIGPIPE - its exit status isn't meaningful here. Truncation/corruption is caught inside
@@ -2271,7 +2278,7 @@ impl DirHandle {
         // SAFETY: `st` is fully initialised by `fstat` on success, and only read when it returns 0.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let r = unsafe { libc::fstat(self.0, &mut st) };
-        (r == 0).then(|| st.st_mode & 0o7777)
+        (r == 0).then_some(st.st_mode & 0o7777)
     }
 
     /// Set the directory's permission bits. `false` if the kernel refused.

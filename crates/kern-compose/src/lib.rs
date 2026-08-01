@@ -899,7 +899,10 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
                 return Err(format!("box '{}' depends on unknown box '{d}'", b.name));
             }
             succ.entry(d).or_default().push(b.name.as_str());
-            *indeg.get_mut(b.name.as_str()).unwrap() += 1;
+            // `indeg` was seeded with every box name, so the entry is there by construction - but
+            // `or_insert(0)` states that instead of asserting it, and an unexpected shape becomes a
+            // wrong ordering rather than an abort in a parser that also runs under the fuzzer.
+            *indeg.entry(b.name.as_str()).or_insert(0) += 1;
         }
     }
     // Seed the queue in file order for a deterministic result.
@@ -913,7 +916,9 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
         order.push(n.to_string());
         if let Some(ms) = succ.get(n) {
             for &m in ms {
-                let e = indeg.get_mut(m).unwrap();
+                // Same construction as above: the successor is a known box name. Skipping an
+                // unknown one keeps the traversal total instead of aborting the process.
+                let Some(e) = indeg.get_mut(m) else { continue };
                 *e -= 1;
                 if *e == 0 {
                     queue.push_back(m);
@@ -953,7 +958,10 @@ pub fn topo_levels(boxes: &[ComposeBox]) -> Result<Vec<Vec<String>>, String> {
                 return Err(format!("box '{}' depends on unknown box '{d}'", b.name));
             }
             succ.entry(d).or_default().push(b.name.as_str());
-            *indeg.get_mut(b.name.as_str()).unwrap() += 1;
+            // `indeg` was seeded with every box name, so the entry is there by construction - but
+            // `or_insert(0)` states that instead of asserting it, and an unexpected shape becomes a
+            // wrong ordering rather than an abort in a parser that also runs under the fuzzer.
+            *indeg.entry(b.name.as_str()).or_insert(0) += 1;
         }
     }
     // Level 0 = every indegree-0 box, in file order. Then repeatedly: emit the current level, decrement
@@ -980,7 +988,8 @@ pub fn topo_levels(boxes: &[ComposeBox]) -> Result<Vec<Vec<String>>, String> {
         for &n in &level {
             if let Some(ms) = succ.get(n) {
                 for &m in ms {
-                    let e = indeg.get_mut(m).unwrap();
+                    // Same construction as above; skip an unknown successor rather than abort.
+                    let Some(e) = indeg.get_mut(m) else { continue };
                     *e -= 1;
                     if *e == 0 {
                         next.push(m);

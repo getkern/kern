@@ -18,7 +18,14 @@ use std::os::unix::io::RawFd;
 
 /// Open `/proc/<pid1>/root` as an `O_PATH` dirfd - the box's root for confined resolution.
 fn box_root_fd(pid1: i32) -> std::io::Result<RawFd> {
-    let p = std::ffi::CString::new(format!("/proc/{pid1}/root")).unwrap();
+    // A decimal pid can never contain a NUL, so this cannot fail - stated as an error rather than
+    // asserted, because `panic = "abort"` turns a wrong assumption here into a dead process.
+    let Ok(p) = std::ffi::CString::new(format!("/proc/{pid1}/root")) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "box root path contained a NUL",
+        ));
+    };
     let fd = unsafe {
         libc::open(
             p.as_ptr(),

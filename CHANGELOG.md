@@ -57,6 +57,18 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **Zero `unwrap`/`expect`/`panic!` left in production code.** The workspace had sixteen, each safe by
+  construction and each an abort if that construction were ever wrong - and `panic = "abort"` gives no
+  second chance. They are now stated rather than asserted: the `[[cpu]]`/`[[vcpu]]`/`[[gpio]]`/
+  `[[gpio.usb_ports]]`/`[[vgpio]]`/`[[disk]]`/`[[vdisk]]` context arms return a line-numbered config
+  error, the `COPY`/`ADD` arity checks destructure instead of checking-then-popping (so the check and
+  the use cannot drift), the two `/proc/self/fd/<n>` C strings and the `/proc/<pid>/root` one return an
+  error, the compose topological sort skips an unknown successor rather than aborting a parser that
+  also runs under the fuzzer, and `--plan` shows what it recorded instead of aborting a read-only
+  command. Verified through the CLI, not just the compiler: a `[[gpio.usb_ports]]` outside a `[[gpio]]`,
+  an `ADD` with two URLs and a `COPY` with no destination each produce their line-numbered error, and a
+  valid config with a `[[gpio.usb_ports]]` table still grants its device.
+
 - **Every mode change in the image-merge path now acts on a descriptor, not a name.** The permission
   repair added for read-only whiteout trees used `std::fs::metadata` + `set_permissions`, both of which
   FOLLOW symlinks, on paths built from attacker-supplied layer content. `merge_dir`'s
