@@ -6,7 +6,7 @@
 
 **A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
 
-**A real, kernel-enforced container in ~3.6 ms, out of one ~1.8 MB binary with no daemon.**
+**A real, kernel-enforced container in 3.3 ms, out of one 1.8 MB binary with no daemon.**
 
 <p align="center">
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.6 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
@@ -76,7 +76,7 @@ print(r.stdout, r.success)                     # → a fresh, discarded-after bo
 
 That call measures **16 ms** end to end on the x86_64 desktop (median of 60, after warm-up), and the
 subtraction is worth publishing rather than a summary of it: **~8.4 ms** is CPython starting at all
-(`python3 -c pass` on the host, same machine), **~3.6 ms** is the box, and the remaining **~4.3 ms** is
+(`python3 -c pass` on the host, same machine), **~3.3 ms** is the box, and the remaining **~4.3 ms** is
 the binding's own work, which is not attributed further. So the interpreter is about half of it, not
 "nearly all" - the shape this figure used to be described with.
 
@@ -104,9 +104,9 @@ otherwise reach for a container, a cloud sandbox, or root.
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes** | opt-in (rootless mode) | yes |
-| Cold start (a bare box) | **~2.2 ms** | ~289 ms | ~288 ms |
-| Cold start (from an OCI image) | **~3.6 ms** | ~289 ms | ~288 ms |
-| Footprint | **one 1.8 MB static binary** | ~186 MB daemon stack | multi-binary install |
+| Cold start (a bare box) | **2.1 ms** | ~294 ms | ~281 ms |
+| Cold start (from an OCI image) | **3.3 ms** | ~294 ms | ~281 ms |
+| Footprint | **one 1.83 MB static binary** | 154 MB daemon stack, resident with zero containers | multi-binary install |
 | OCI images (pull / build) | **yes** | yes | yes |
 | Resource caps without a full box | **yes (`kern run`)** | no | no |
 
@@ -400,9 +400,10 @@ A sandboxed shell from any OCI image. The image stays read-only; your writes go 
 kern box dev --image alpine -it -- sh
 ```
 
-That box starts in **~3.6 ms**, not the ~2.2 ms of a bare rootfs box: an OCI image gets a rootless
+That box starts in **3.3 ms**, not the 2.1 ms of a bare rootfs box: an OCI image gets a rootless
 uid-range mapping so an official image can drop privilege in its entrypoint, and that costs two
-setuid helpers (~1.1 ms, run concurrently, unavoidable without `CAP_SETUID`). Measure it yourself
+setuid helpers (0.9 ms, run concurrently, unavoidable without `CAP_SETUID`; measured as 3.33 against
+2.43 with `--no-uid-range`). Measure it yourself
 with `kern bench --image alpine`, or drop it with `--no-uid-range` if your workload stays root.
 
 ### Cap what it can use
@@ -722,26 +723,26 @@ timed with the shell:
 
 | what you actually type | kern | docker | podman |
 |---|---:|---:|---:|
-| a throwaway box (`run … true`) | **3.6 ms** | 292.9 ms | 287.5 ms |
-| `exec` into a running service | **1.2 ms** | 42.2 ms | 150.6 ms |
-| list what is running (`ps`) | **0.7 ms** | 8.2 ms | 15.3 ms |
-| read logs | **0.7 ms** | 8.3 ms | 39.9 ms |
-| stop a service (init handles SIGTERM) | **4.7 ms** | ~300 ms | |
+| a throwaway box (`run … true`) | **3.4 ms** | 290.8 ms | 290.5 ms |
+| `exec` into a running service | **0.79 ms** | 43.3 ms | 148.6 ms |
+| list what is running (`ps`) | **0.30 ms** | 8.2 ms | 13.5 ms |
+| read logs | **0.35 ms** | 8.2 ms | 37.5 ms |
+| stop a service (`--init` handles SIGTERM) | **2.4 ms** | ~300 ms | |
 | bring a 2-service stack up | **185 ms** | 301 ms | |
 
 > Reproduce any row with `time`, on both sides. No script of ours is involved.
 
 **One row needs a caveat we would rather state than be caught on.** Stopping a service whose init does
-*not* handle SIGTERM takes 10 s on Docker and Podman, and 4.7 ms on kern. That is **not** Docker being
+*not* handle SIGTERM takes 10 s on Docker and Podman, and 2.7 ms on kern. That is **not** Docker being
 slow: a PID-namespace init discards signals it has no handler for, so the container genuinely cannot
 die of SIGTERM, and waiting the full grace before `SIGKILL` is the correct, documented behaviour. kern
 reads `/proc/<pid>/status` first and skips a wait that provably cannot end. The honest comparison is
-the row above, with an init that *does* handle the signal: 4.7 ms against ~300, for the same reason every
+the row above, with an init that *does* handle the signal: 2.4 ms against ~300, for the same reason every
 other row is fast, not because of a container that ignores signals.
 
 | host | kernel | **kern** | bubblewrap | runc | docker |
 |---|---|---:|---:|---:|---:|
-| x86_64 desktop | v7.0 | **2.6 ms** | 2.9 ms | 13.8 ms | 292.9 ms |
+| x86_64 desktop | v7.0 | **2.2 ms** | 3.0 ms | 13.2 ms | 294.4 ms |
 | Raspberry Pi 5 | v6.6-rpi | **11.8 ms** † | not installed | not installed | not installed |
 | Jetson Orin Nano | v5.15-tegra | **12.5 ms** † | 5.6 ms | 32 ms ‡ | 472 ms ‡ |
 | Arduino UNO Q | **v6.16 Android** | **91.5 ms** † | 15.0 ms | 76 ms ‡ | 858 ms ‡ |
