@@ -608,10 +608,10 @@ other.
 | kern memory per box, one box alone | 1.65 MB PSS / 4.6 MB RSS |
 | bubblewrap binary | 70 KB (launcher only) |
 | runc binary | ~10 MB |
-| **Docker** resident | **154 MB RSS** always on with zero containers running (`dockerd` 99 MB + `containerd` 55 MB, measured 2026-08-01; it was ~186 MB when this row was first written, so it moves with the Docker version) |
+| **Docker** resident | **154 to 160 MB RSS** always on with zero containers running (`dockerd` + `containerd`, both readings 2026-08-01: 154 idle, 160 after an afternoon of use. It was ~186 MB when this row was first written, so it moves with the Docker version AND with how much the daemon has done since it started, which is why it is quoted as a range) |
 
 kern is **~6× smaller than runc** (1.8 MB vs ~10 MB) and needs no bundle scaffolding; bwrap is
-smaller still but is only a launcher (no images/caps/lifecycle). Docker keeps 154 MB resident
+smaller still but is only a launcher (no images/caps/lifecycle). Docker keeps 154 to 160 MB resident
 before you run anything; kern keeps **zero**, which `ps -eo rss,args | grep kern` shows directly when
 no box is up.
 

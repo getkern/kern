@@ -6,16 +6,16 @@
 
 **A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
 
-**A real, kernel-enforced container in 3.3 ms, out of one 1.8 MB binary with no daemon.**
+**A real, kernel-enforced container in 3.4 ms, out of one 1.83 MB binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in ~3.6 ms against docker run's ~289 ms. A real OCI image, rootless, a 1.8 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.83 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` the only dependency</sub>
 
 **Runs everywhere Linux does: bare Linux, Windows (via WSL2), and ARM boards** (Raspberry Pi, NVIDIA
-Jetson, Arduino UNO Q), where a 186 MB Docker daemon is a poor fit (on the Pi 5 tested here, no engine
+Jetson, Arduino UNO Q), where a ~160 MB Docker daemon is a poor fit (on the Pi 5 tested here, no engine
 was installed at all).
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
@@ -76,7 +76,7 @@ print(r.stdout, r.success)                     # → a fresh, discarded-after bo
 
 That call measures **16 ms** end to end on the x86_64 desktop (median of 60, after warm-up), and the
 subtraction is worth publishing rather than a summary of it: **~8.4 ms** is CPython starting at all
-(`python3 -c pass` on the host, same machine), **~3.3 ms** is the box, and the remaining **~4.3 ms** is
+(`python3 -c pass` on the host, same machine), **~3.4 ms** is the box, and the remaining **~4.3 ms** is
 the binding's own work, which is not attributed further. So the interpreter is about half of it, not
 "nearly all" - the shape this figure used to be described with.
 
@@ -105,8 +105,8 @@ otherwise reach for a container, a cloud sandbox, or root.
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes** | opt-in (rootless mode) | yes |
 | Cold start (a bare box) | **2.1 ms** | ~294 ms | ~281 ms |
-| Cold start (from an OCI image) | **3.3 ms** | ~294 ms | ~281 ms |
-| Footprint | **one 1.83 MB static binary** | 154 MB daemon stack, resident with zero containers | multi-binary install |
+| Cold start (from an OCI image) | **3.4 ms** | ~294 ms | ~281 ms |
+| Footprint | **one 1.83 MB static binary** | 154 to 160 MB daemon stack, resident with zero containers | multi-binary install |
 | OCI images (pull / build) | **yes** | yes | yes |
 | Resource caps without a full box | **yes (`kern run`)** | no | no |
 
@@ -134,8 +134,9 @@ translates what maps, **refuses** what would change behaviour, and never silentl
 
 - ⚡ **Daemonless & tiny.** No `dockerd`-style service. A ~1.8 MB static binary, **one Rust dependency**
   (`libc`); it shells out to the system's `curl`/`tar` only to *pull* images (running a box needs
-  neither). A cold start faster than a daemon round-trip; **~2 MB** RSS per box vs an always-on
-  ~186 MB daemon (`dockerd` + `containerd`). `kern ps` reads state straight from the kernel.
+  neither). A cold start faster than a daemon round-trip; **0.35 MB** of real memory per extra box
+  (PSS at 50 live boxes) vs an always-on daemon that measured 154 MB idle and 160 MB after an
+  afternoon's use here (`dockerd` + `containerd`, zero containers running either time). `kern ps` reads state straight from the kernel.
 - 👤 **Rootless by default.** Unprivileged user namespaces: your uid maps to root *inside* the box,
   and only there. Single-uid is the default and is `libc`-pure (no helper, smallest id surface);
   `--uid-range` opts into a full sub-id range (`apt`, `www-data`-style drops) via the standard
@@ -400,10 +401,10 @@ A sandboxed shell from any OCI image. The image stays read-only; your writes go 
 kern box dev --image alpine -it -- sh
 ```
 
-That box starts in **3.3 ms**, not the 2.1 ms of a bare rootfs box: an OCI image gets a rootless
+That box starts in **3.4 ms**, not the 2.1 ms of a bare rootfs box: an OCI image gets a rootless
 uid-range mapping so an official image can drop privilege in its entrypoint, and that costs two
-setuid helpers (0.9 ms, run concurrently, unavoidable without `CAP_SETUID`; measured as 3.33 against
-2.43 with `--no-uid-range`). Measure it yourself
+setuid helpers (0.9 ms, run concurrently, unavoidable without `CAP_SETUID`; measured as 3.4 against
+2.4 with `--no-uid-range`). Measure it yourself
 with `kern bench --image alpine`, or drop it with `--no-uid-range` if your workload stays root.
 
 ### Cap what it can use
@@ -537,7 +538,7 @@ installer sets up WSL2 and drops in a pre-baked kern distro, so isolation, `--cp
 all enforced for real (measured on a stock 6.18 WSL2 kernel: a 128m box reads back `memory.max =
 134217728`). Honest
 caveat: you're inside the WSL2 VM, so it's "no Docker Desktop", not "no VM". kern does **not** run on stock Android-the-OS (Bionic, SELinux, userns off). Daemonless is a big
-win on RAM-constrained boards (0 resident vs ~186 MB), see **[EDGE.md](EDGE.md)**. ARM CI is tracked
+win on RAM-constrained boards (0 resident vs ~160 MB), see **[EDGE.md](EDGE.md)**. ARM CI is tracked
 in the issues.
 
 ## Docker compatibility
@@ -751,7 +752,7 @@ kern and bubblewrap were measured together on 2026-07-30, three repeats each, me
 idle host. ‡ = runc and docker are carried over from the earlier round and were **not** re-measured that
 night. On the **Pi 5, kern is the only runtime present at all**: docker, podman, runc, crun, bwrap,
 nerdctl, lxc and systemd-nspawn are all absent, checked one by one. One ~1.8 MB static binary just works
-where the others are each a setup step (Docker alone is a ~186 MB daemon stack). That reach, not a
+where the others are each a setup step (Docker alone is a ~160 MB daemon stack). That reach, not a
 latency crown, is what the boards are here to show.
 
 † **The kern column enforces resource caps and the bubblewrap column does not, because bubblewrap has no
@@ -806,11 +807,13 @@ with the cap enforced, against 4.2 ms for `systemd-run --user --scope /bin/true`
 which is the round trip kern is avoiding. **3.4 ms inside WSL2** with the cap enforced, re-measured on
 2026-07-31; `systemd-run` does not exist there at all, so the direct path was already the only one.
 
-kern is the fastest sandbox on the desktop at **~2.2 ms**, ahead of bubblewrap at 2.9 by 0.7 ms, and the top tier is
+kern is the fastest sandbox on the desktop at **2.2 ms**, ahead of bubblewrap at 3.0 by 0.8 ms, and the top tier is
 all within a few ms: nobody wins single-shot latency outright. The real gap is to the **engines**,
-**~125x faster** than podman (~288 ms) and Docker (~289 ms), which round-trip a daemon every run. Beyond
-one start: **~457 boxes/s**, **~2 MB** RSS per box, **0 resident** where Docker keeps ~186 MB before you
-run anything. Where the time goes, phase by phase: **[BENCHMARKS.md](BENCHMARKS.md)**.
+**~132x faster** on that same bare-rootfs path and **~86x** on the `--image` path that also maps a uid
+range, against podman at 290.5 ms and Docker at 290.8, which round-trip a daemon every run. Beyond
+one start: **451 boxes/s**, **0.35 MB** of real memory per additional box (PSS at 50 live boxes; the
+RSS a monitor shows is 4.6 MB because two processes share one static binary's pages), **0 resident**
+where Docker keeps 154 to 160 MB with zero containers running. Where the time goes, phase by phase: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 Reproduce with **[`examples/benchmark.py`](examples/benchmark.py)** (auto-detects the runtimes you
 have). kern does *less* than Docker (no overlay networks yet, see [Roadmap](#roadmap)); this compares
@@ -827,7 +830,7 @@ Runnable, live-verified scripts in **[examples/](examples/)**:
 | Safely vet an untrusted `curl … sh` install script (no net, no host access) | [safe-install-script.sh](examples/safe-install-script.sh) |
 | Per-job pipeline: read-only input → isolated processing → output | [data-pipeline.sh](examples/data-pipeline.sh) |
 | Build/test a repo in a clean box (laptop or on-device) | [ci-in-a-box.sh](examples/ci-in-a-box.sh) |
-| Many isolated services on a small board (few MB vs a 186 MB daemon) | [edge-many-services.sh](examples/edge-many-services.sh) |
+| Many isolated services on a small board (a fraction of a MB each vs a ~160 MB daemon) | [edge-many-services.sh](examples/edge-many-services.sh) |
 | Head-to-head timing: kern vs `docker run` | [compare-vs-docker.sh](examples/compare-vs-docker.sh) |
 
 …plus governed runs, port-published services, compose stacks and more, see

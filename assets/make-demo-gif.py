@@ -7,7 +7,12 @@ next to them. When the binary grew and the image path got its uid-range map, the
 there was simply nothing to edit when the facts moved.
 
 Every claim the frame makes is a constant at the top of this file, so changing a number is a diff
-rather than a re-recording. Keep them measured:
+rather than a re-recording.
+
+That is necessary and it was not sufficient. On 2026-08-01 the constant below read `~3.3 ms` while
+the COMMITTED GIF still showed `~3.6`: someone had edited the source and never re-run the script, so
+the file that exists to keep the picture honest had itself gone stale. **Editing a constant here is
+half the job; regenerate and commit the .gif in the same change.** Keep them measured:
 
     kern box app --image alpine -- true      # the image path, uid-range map included
     ls -l target/x86_64-unknown-linux-musl/release/kern
@@ -27,9 +32,9 @@ from PIL import Image, ImageDraw, ImageFont
 # `--image` costs more than a prepared rootfs (~2 ms) because kern maps a uid RANGE for it, which
 # is what lets an official image drop privilege in its entrypoint. The command shown here is the
 # image one, so the number shown here has to be the image one.
-KERN_MS = "~3.3 ms"
-DOCKER_MS = "~289 ms"
-BINARY_SIZE = "1.8 MB"
+KERN_MS = "3.4 ms"
+DOCKER_MS = "291 ms"
+BINARY_SIZE = "1.83 MB"
 HOST = "Intel i7-14700KF, Linux 7.0"
 
 COMMAND = 'kern box app --image alpine -- echo "hello from a real container"'
