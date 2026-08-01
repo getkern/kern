@@ -57,6 +57,24 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **`kern rename` could report success while the box kept its old name.** The displayed name comes
+  from the `name=` field INSIDE the registry entry body (`load_live` then `parse`), not from the entry
+  file name. `rename` renamed the FILE with `?` and rewrote the BODY with a discarded result, so a
+  failed rewrite left the file called `<new>-<pid>` with a body still saying `<old>` and returned
+  `Ok`: the user is told the rename worked, `kern ps` keeps showing the old name, and the two halves
+  of the entry disagree about the box's identity. The body is now rewritten FIRST, on the entry that
+  still exists, so a refused rewrite changes nothing at all; if the file rename then fails, the body
+  is put back and the error is returned. `atomic_rewrite` is fallible, removes its staged temp when
+  the rename over the entry fails, and treats a MISSING entry as "the box is gone", which is not an
+  error. The regression test asserts the whole contract rather than one branch: either the box answers
+  to the new name, or nothing changed.
+
+- **`kern update` recorded new caps best-effort and said nothing when it could not.** The cgroup write
+  has already happened at that point, so the kernel IS enforcing the new limit and failing the command
+  would be the wrong trade; the registry rewrite therefore stays best-effort. It now says so when it
+  fails, because otherwise `ps` and `inspect` keep showing the previous cap with nothing to attribute
+  the discrepancy to.
+
 - **`kern volume create --size N` reported success when the quota had not been written.** The cap
   lives ONLY in the volume's `meta.json`: `size_limit()` reads that file and returns `None` when it
   cannot, and `None` means "no cap" everywhere downstream. `create` wrote it with a discarded result,

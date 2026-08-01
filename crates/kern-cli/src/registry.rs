@@ -479,14 +479,42 @@ pub fn unregister(path: &Path) {
 /// LIVE box. The temp's trailing `-` segment isn't all-digits, so `entry_split`/`well_formed_entry`
 /// skip it and `list()` never mistakes it for a second box. No-op if `entry` is already gone.
 /// Best-effort. `dir` is the instances directory (where `entry` lives).
-fn atomic_rewrite(dir: &Path, entry: &Path, pid: i32, tag: &str, f: impl FnOnce(&str) -> String) {
+/// Replace an entry's body atomically: stage the new text in a hidden temp beside it, then `rename`
+/// it over the entry (same-directory rename, so the reader sees the old body or the new one, never a
+/// half-written one).
+///
+/// FALLIBLE. It returned `()` and discarded both the write and the rename, which made "the body was
+/// replaced" indistinguishable from "the body was not touched" - and the entry BODY is where the
+/// box's displayed name and caps live, so a discarded failure means `kern ps` reports something the
+/// caller believes it changed. A MISSING entry is not a failure: the box is gone, and there is
+/// nothing to rewrite. An entry that exists and cannot be read is, because that is a rewrite that
+/// did not happen.
+///
+/// The staged temp is removed when the rename fails, so a refused replace cannot leave litter in the
+/// registry directory that a later run would have to reason about.
+fn atomic_rewrite(
+    dir: &Path,
+    entry: &Path,
+    pid: i32,
+    tag: &str,
+    f: impl FnOnce(&str) -> String,
+) -> io::Result<()> {
+    if !entry.exists() {
+        return Ok(()); // the box is gone: nothing to rewrite, and that is not an error
+    }
     let Some(body) = read_entry_capped(entry) else {
-        return;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot read registry entry {}", entry.display()),
+        ));
     };
     let tmp = dir.join(format!(".{tag}-{}-{pid}.tmp", std::process::id()));
-    if fs::write(&tmp, f(&body)).is_ok() {
-        let _ = fs::rename(&tmp, entry); // atomic body replace
+    fs::write(&tmp, f(&body))?;
+    if let Err(e) = fs::rename(&tmp, entry) {
+        let _ = fs::remove_file(&tmp); // never leave a staged body behind
+        return Err(e);
     }
+    Ok(())
 }
 
 /// Rename a running box: move its `instances/<old>-<pid>` entry to `<new>-<pid>`, rewrite the `name=`
@@ -500,10 +528,25 @@ pub fn rename(old: &str, new: &str, pid: i32) -> io::Result<()> {
     let d = dir()?;
     let old_entry = d.join(format!("{old}-{pid}"));
     let new_entry = d.join(format!("{new}-{pid}"));
-    fs::rename(&old_entry, &new_entry)?; // atomic: one entry at all times (body name= still `old` here)
-    atomic_rewrite(&d, &new_entry, pid, "rename", |body| {
+    // BODY FIRST, on the entry that still exists. The displayed name comes from the body's `name=`
+    // field (`load_live` -> `parse`), not from the file name, so rewriting the file first and the body
+    // second left a window whose failure was permanent AND silent: the file called `<new>-<pid>` with
+    // a body still saying `<old>`, and `Ok` returned. Done in this order, a refused rewrite changes
+    // nothing at all.
+    atomic_rewrite(&d, &old_entry, pid, "rename", |body| {
         rewrite_name_field(body, new)
-    });
+    })?;
+    // Atomic: exactly one entry exists at every instant.
+    if let Err(e) = fs::rename(&old_entry, &new_entry) {
+        // The body now says `new` while the file is still `<old>-<pid>`. Put the body back so the
+        // registry is exactly as it was before this call. Best-effort BECAUSE it is a recovery
+        // attempt on a path that is already returning an error: if it fails too, the error below has
+        // already told the caller the registry directory is not behaving.
+        let _ = atomic_rewrite(&d, &old_entry, pid, "rename", |body| {
+            rewrite_name_field(body, old)
+        });
+        return Err(e);
+    }
     if let Ok(l) = logs_dir() {
         let _ = fs::rename(
             l.join(format!("{old}-{pid}.log")),
@@ -545,9 +588,17 @@ pub fn update_caps(name: &str, pid: i32, memory_max: Option<u64>, pids_max: Opti
     // the old-name entry - which would duplicate the box under two names.
     let cur = name_for_pid(pid).unwrap_or_else(|| name.to_string());
     let entry = d.join(format!("{cur}-{pid}"));
-    atomic_rewrite(&d, &entry, pid, "update", |body| {
+    // Best-effort ON PURPOSE, and reported. The caller has already written the new cap into the
+    // box's cgroup - the kernel is enforcing it - so failing `kern update` because the bookkeeping
+    // could not follow would be the wrong trade. What is NOT acceptable is silence: `ps`/`inspect`
+    // would then keep showing the previous cap with nothing to attribute the discrepancy to.
+    if let Err(e) = atomic_rewrite(&d, &entry, pid, "update", |body| {
         rewrite_caps(body, memory_max, pids_max)
-    });
+    }) {
+        eprintln!(
+            "kern: the new caps are enforced but could not be recorded for '{cur}': {e} -              `kern ps` and `kern inspect` will keep showing the previous values"
+        );
+    }
 }
 
 /// Rewrite only the `memory_max=`/`pids_max=` lines that have a `Some` replacement, preserving every
@@ -1378,6 +1429,82 @@ mod tests {
         assert_eq!(find_ref(&numname).map(|i| i.name), Some(numname.clone()));
         unregister(&p1);
         unregister(&p2);
+    }
+
+    /// `rename` must be all-or-nothing: either the box answers to the new name, or nothing changed.
+    ///
+    /// The displayed name comes from the `name=` field INSIDE the entry body (`load_live` -> `parse`),
+    /// not from the file name. `rename` renamed the FILE with `?` and rewrote the BODY with a
+    /// discarded result, so a failed rewrite left the file called `<new>-<pid>` while the body still
+    /// said `<old>` - and returned `Ok`. The user is told the rename worked and `kern ps` keeps
+    /// showing the old name, with the two halves of the registry entry disagreeing about the box's
+    /// identity.
+    ///
+    /// The failure is forced deterministically rather than waited for: `atomic_rewrite` stages through
+    /// `.rename-<our-pid>-<box-pid>.tmp` in the registry directory, so pre-planting that path as a
+    /// DIRECTORY makes its `fs::write` fail `EISDIR` on every filesystem.
+    #[test]
+    fn rename_is_all_or_nothing_when_the_body_cannot_be_rewritten() {
+        let _g = reg_guard();
+        let pid = std::process::id() as i32; // this process is alive, so the entry is "live"
+        let old = format!("rn-old-{pid}");
+        let new = format!("rn-new-{pid}");
+        let path = register(&Instance {
+            name: old.clone(),
+            pid,
+            pid1: 0,
+            rootfs: String::new(),
+            command: String::new(),
+            started: 1,
+            starttime: proc_starttime(pid),
+            ports: String::new(),
+            volumes: String::new(),
+            pod: String::new(),
+            workdir: String::new(),
+            egress: String::new(),
+            landlock_rw: String::new(),
+            memory_max: None,
+            pids_max: None,
+            labels: String::new(),
+            stop_signal: 0,
+            stop_grace: 0,
+            def_hash: String::new(),
+        })
+        .expect("register the box under its original name");
+        let d = dir().expect("registry dir");
+        let blocker = d.join(format!(".rename-{}-{pid}.tmp", std::process::id()));
+        std::fs::create_dir_all(&blocker).expect("plant the staging path as a directory");
+
+        let outcome = rename(&old, &new, pid);
+        let by_new = find_ref(&new).map(|i| i.name);
+        let by_old = find_ref(&old).map(|i| i.name);
+
+        let _ = std::fs::remove_dir_all(&blocker);
+        unregister(&path);
+        unregister(&d.join(format!("{new}-{pid}")));
+        unregister(&d.join(format!("{old}-{pid}")));
+
+        if outcome.is_ok() {
+            assert_eq!(
+                by_new.as_deref(),
+                Some(new.as_str()),
+                "rename reported success, so the box must answer to '{new}'"
+            );
+            assert!(
+                by_old.is_none(),
+                "rename reported success, so '{old}' must no longer resolve"
+            );
+        } else {
+            assert_eq!(
+                by_old.as_deref(),
+                Some(old.as_str()),
+                "rename failed, so the registry must be exactly as it was: the box still '{old}'"
+            );
+            assert!(
+                by_new.is_none(),
+                "rename failed, so '{new}' must not resolve to anything"
+            );
+        }
     }
 
     #[test]
