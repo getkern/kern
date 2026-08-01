@@ -67,7 +67,11 @@ What is **enforced now** by `kern box`:
   `--cap-add SYS_ADMIN`) is held only over the box's **own** user namespace and the always-on seccomp
   denylist still blocks the escape syscalls it would otherwise unlock, so `--cap-add` cannot breach
   the host, and an unknown cap name is a hard error (a typo can't silently leave a cap in place);
-- always-on **seccomp** denylist (~27 syscalls: kexec(+`_file_load`) / module load-unload /
+- always-on **seccomp** denylist, **33 syscalls denied**: 24 that hard-kill plus the 9 that return
+  `ENOSYS` (the split is described below); a rootless `--privileged` box denies 5 fewer. Do not take
+  the number from this file, ask the binary: `kern box <name> --image <ref> --show-config` prints
+  `seccomp_denied_syscalls`, read from the live lists rather than from a constant. The set is
+  (kexec(+`_file_load`) / module load-unload /
   ptrace + `process_vm_readv`/`writev` / reboot / swap / the classic **and** new mount API, including
   the whole reconfiguration family `mount_setattr` / `fspick` / `fsopen`/`fsconfig`/`fsmount` /
   `open_tree`/`move_mount`, so a box cannot re-mount its own root writable / `pivot_root` / `setns` /
@@ -122,7 +126,7 @@ from inside a box on x86_64, kernel 7.0, `Seccomp: 2`:
 So the errno itself discloses nothing: a filtered call is byte-identical to one this kernel does not
 implement. What is cheap to enumerate is the **permitted** set, and it always was, because a permitted
 syscall simply runs and returns its own errno. `ENOSYS` moves five syscalls from "costs the prober a
-process" to "free"; the ~27 in the kill set still cost one process each. Whether mapping a filter
+process" to "free"; the 24 in the kill set still cost one process each. Whether mapping a filter
 helps an attacker who already has code execution in the box is a separate question, and an open one:
 mapping is not bypassing. It is written down as unresolved in
 [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than argued either way here.

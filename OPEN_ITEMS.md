@@ -64,7 +64,7 @@ Measured: the errno leaks nothing. A denied `io_uring_setup` and syscall number 
 no kernel, are both `-1 ENOSYS` from inside the box, so a prober cannot tell "the filter refused this"
 from "this kernel has no such call". Also measured: the enumeration cost is asymmetric. A permitted
 syscall runs and returns its own errno, so the permitted set was always cheap to map; `ENOSYS` moves
-five calls out of the "costs a process per probe" bucket, while the ~27 in the kill set stay in it.
+five calls out of the "costs a process per probe" bucket, while the 24 in the kill set stay in it.
 
 Not measured, and stated as unknown rather than argued away: whether a cheaper map of the filter is
 worth anything to an attacker who already has code execution inside the box. Mapping is not bypassing,
