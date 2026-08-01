@@ -46,6 +46,27 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   one that decides rootfs contents. The regression test constructs the permission precondition and
   skips itself under DAC override, where the precondition cannot exist.
 
+- **A whiteout of a read-only DIRECTORY TREE now succeeds instead of failing the pull.** Widening the
+  victim's parent is not enough: emptying `foo/` needs write+search on `foo` itself and on every
+  directory below it. `chmod 555 /opt/foo` in one layer and `rm -rf /opt/foo` in a later one is an
+  ordinary Dockerfile, and docker and containerd extract as root and never meet the case, so refusing
+  that pull would have been a regression against them rather than a hardening. Image content is now
+  deleted by a no-follow tree walk that repairs kern's own permissions as it descends: iterative with
+  an explicit stack, so a deep tree cannot exhaust the call stack; post-order, so a directory goes
+  only after its children; and the file-vs-directory decision comes from `symlink_metadata` at every
+  level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
+  plants exactly that symlink and asserts its target survives.
+
+- **A pull could leave a full copy of every layer on disk, silently.** Staging is extracted with
+  `--same-permissions`, so an image shipping a read-only directory made the four
+  `remove_dir_all(&staging)` cleanups fail with `EACCES`; all four discarded the result, so the disk
+  grew with nothing to attribute it to. Three of them are cleanup after a decision and stay
+  best-effort, but now name the path when they fail. The fourth is not cleanup at all: it clears a
+  leftover staging BEFORE extracting into it, and `create_dir_all` succeeds whether or not the
+  directory was emptied, so a swallowed failure there would extract on top of content the run never
+  produced and merge the union as if it were the layer. That one now refuses. Verified: three real
+  multi-layer images pull and run, and the cache holds zero leftover staging directories afterwards.
+
 
 ### Fixed
 

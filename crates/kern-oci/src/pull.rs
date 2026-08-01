@@ -1106,7 +1106,17 @@ fn process_layer(
     // wrapper): we're already in-ns root when non-root, so it has the caps.
     let unpack = unpack_as_root(move || {
         let staging = dest.with_file_name(format!(".kern-stg-{}", digest.replace([':', '/'], "_")));
-        let _ = std::fs::remove_dir_all(&staging);
+        // NOT best-effort. This clears a leftover staging from an interrupted earlier run BEFORE
+        // extracting into it, and `create_dir_all` below succeeds whether or not the directory was
+        // emptied - so a swallowed failure here would extract on top of content this run never
+        // produced and merge the union as if it were the layer. Refuse instead: a staging we could not
+        // clear is not a staging we can vouch for.
+        remove_tree_no_follow(&staging).map_err(|e| {
+            OciError::Extract(format!(
+                "cannot clear the layer staging dir {}: {e}",
+                staging.display()
+            ))
+        })?;
         std::fs::create_dir_all(&staging).map_err(|e| OciError::Extract(e.to_string()))?;
         let staging_s = staging.to_string_lossy().into_owned();
         // `--same-permissions`: preserve the image's EXACT modes, including the sticky bit and world-write
@@ -1121,7 +1131,7 @@ fn process_layer(
         // edge builds often lack even when a standalone `zstd` is present. `--no-same-owner`
         // `--same-permissions` are preserved on every path (see the mode-preservation note above).
         let extract_err = |e: OciError| -> OciError {
-            let _ = std::fs::remove_dir_all(&staging);
+            discard_staging(&staging);
             e
         };
         // The filtered layer is a PLAIN tar with device members stripped, so extraction collapses to a
@@ -1146,11 +1156,11 @@ fn process_layer(
             Err(e) => return Err(extract_err(e)),
         };
         if !succeeded {
-            let _ = std::fs::remove_dir_all(&staging);
+            discard_staging(&staging);
             return Err(OciError::Extract("layer extraction failed".into()));
         }
         let merged = merge_layer(&staging, dest);
-        let _ = std::fs::remove_dir_all(&staging);
+        discard_staging(&staging);
         merged
     });
     let _ = std::fs::remove_file(&filtered); // remove the filtered plain tar (extraction consumed it)
@@ -2225,6 +2235,113 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
     Ok(())
 }
 
+/// Grant OURSELVES `u+wx` on a directory we are about to descend into or empty, best-effort.
+///
+/// Unlinking an entry is governed by the mode of the DIRECTORY that holds it, and reading it needs
+/// search permission, so a layer that shipped `chmod 555` on a directory blocks both. kern extracted
+/// that directory, so it owns it and may chmod it. Best-effort on purpose: this is an enabler, not
+/// the decision. If the chmod is refused, the `read_dir`/`remove_*` that follows fails and THAT error
+/// is the one that propagates, naming the operation that actually mattered.
+///
+/// Nothing is granted to group or other, and only the bits needed to delete are added.
+fn grant_self_wx(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(m) = std::fs::metadata(dir) {
+        let mode = m.permissions().mode() & 0o7777;
+        if mode & 0o300 != 0o300 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o300));
+        }
+    }
+}
+
+/// Delete a directory tree without ever following a symlink, repairing our own permissions as it
+/// descends.
+///
+/// Replaces `std::fs::remove_dir_all` on image content for one reason: `remove_dir_all` gives up on a
+/// directory it cannot enter, and an image may legitimately ship one. `chmod 555 /opt/foo` in one
+/// layer and `rm -rf /opt/foo` in a later one is an ordinary Dockerfile; docker and containerd extract
+/// as root and never meet the case, so refusing that pull would be a regression against them rather
+/// than a hardening. Widening the victim's PARENT is not enough - emptying `foo` needs write+search on
+/// `foo` itself, and on every directory below it.
+///
+/// ITERATIVE, with an explicit stack, so a deep tree cannot exhaust the call stack. Post-order: a
+/// directory is removed only after its children are gone. Termination is structural rather than
+/// capped - no symlink is ever traversed, so the walk stays inside one finite tree and cannot cycle
+/// (a filesystem cannot contain a directory cycle without symlinks; hardlinked directories are
+/// refused by every Linux filesystem).
+///
+/// NO-FOLLOW at every level: the file-vs-directory decision comes from `symlink_metadata`, so a
+/// symlink to a directory is unlinked as a link and never descended. This is what stops a planted
+/// `dir/escape -> /somewhere/else` from turning a whiteout into a deletion outside the rootfs.
+///
+/// Modes are NOT restored on the way out: every directory this touches is about to cease to exist.
+/// If the removal fails partway, some directories are left wider than the image declared - but that
+/// error fails the pull, so the half-deleted tree is never published as an image.
+fn remove_tree_no_follow(root: &Path) -> std::io::Result<()> {
+    // `(path, children_already_pushed)`. Pushing the directory back with `true` before its children
+    // is what makes the traversal post-order under LIFO.
+    let mut stack: Vec<(std::path::PathBuf, bool)> = vec![(root.to_path_buf(), false)];
+    while let Some((dir, expanded)) = stack.pop() {
+        if expanded {
+            match std::fs::remove_dir(&dir) {
+                Ok(()) => {}
+                // Already gone: the end state we wanted.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            continue;
+        }
+        grant_self_wx(&dir);
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        stack.push((dir.clone(), true));
+        for entry in rd {
+            let entry = entry?;
+            let path = entry.path();
+            // `symlink_metadata`, never `metadata`: a symlink to a directory must be unlinked, not
+            // descended. `entry.file_type()` is the same syscall-free source, but reading it again
+            // here keeps the no-follow decision at the point it is used.
+            let md = match std::fs::symlink_metadata(&path) {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if md.is_dir() {
+                stack.push((path, false));
+            } else {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove a layer's staging directory after it has served its purpose, and SAY SO if that fails.
+///
+/// Best-effort by design: a cleanup that cannot run must not fail a pull whose layer already merged
+/// correctly. Silent, however, it was the same defect class as the rest of this file - staging is
+/// extracted with `--same-permissions`, so an image shipping a `chmod 555` directory made
+/// `remove_dir_all` fail with `EACCES` and every pull of that image left a full copy of the layer on
+/// disk with nothing to attribute the growth to. `remove_tree_no_follow` repairs the permissions it
+/// needs, so this should now only fire on a real filesystem error, and when it does the message names
+/// the path.
+fn discard_staging(staging: &Path) {
+    if let Err(e) = remove_tree_no_follow(staging) {
+        eprintln!(
+            "kern: could not remove the layer staging dir {}: {e} - it will keep using disk until \
+             removed by hand",
+            staging.display()
+        );
+    }
+}
+
 /// Remove a path without following symlinks (a symlink is unlinked, never traversed).
 ///
 /// FALLIBLE ON PURPOSE. This is how an OCI whiteout deletes a file, and it used to return `()`: a
@@ -2256,7 +2373,7 @@ fn remove_no_follow(p: &Path) -> Result<(), OciError> {
     };
     let attempt = || -> std::io::Result<()> {
         if md.is_dir() {
-            std::fs::remove_dir_all(p)
+            remove_tree_no_follow(p)
         } else {
             std::fs::remove_file(p)
         }
@@ -2935,6 +3052,85 @@ mod tests {
             !survived,
             "the whiteout must be APPLIED, not merely reported as failed: kern owns the parent \
              directory and can restore its own write permission to complete the unlink"
+        );
+    }
+
+    /// The deep case the single-level retry does NOT cover, pinned as a behaviour rather than left as
+    /// a sentence in a commit message.
+    ///
+    /// Removing `dir/inner` requires emptying `inner` first, which needs write+search on `inner`
+    /// ITSELF, not on its parent. A layer that does `chmod 555 /opt/foo` and a later layer that does
+    /// `rm -rf /opt/foo` produces exactly that: a `.wh.foo` whose victim is a directory kern cannot
+    /// descend into. Widening only the parent is not enough.
+    ///
+    /// This is a legitimate image. Docker and containerd extract as root and never meet the case, so
+    /// refusing the pull would be a functional regression against them, not a hardening. The removal
+    /// therefore repairs permissions as it descends, and this test is the proof that it does.
+    #[test]
+    fn a_whiteout_of_a_read_only_directory_tree_is_applied() {
+        let base = std::env::temp_dir().join(format!("kern-oci-wh-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let probe = base.join("probe");
+        std::fs::create_dir_all(&probe).expect("probe dir");
+        set_mode(&probe, 0o555);
+        let dac_override = std::fs::write(probe.join("x"), b"x").is_ok();
+        set_mode(&probe, 0o755);
+        if dac_override {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // DAC override: the precondition cannot be constructed
+        }
+
+        // Earlier layer: `dir/inner/{victim,deeper/leaf}`, with BOTH inner levels read-only.
+        let dest = base.join("dest");
+        std::fs::create_dir_all(dest.join("dir/inner/deeper")).expect("dest tree");
+        std::fs::write(dest.join("dir/inner/victim"), b"secret").expect("victim");
+        std::fs::write(dest.join("dir/inner/deeper/leaf"), b"secret").expect("leaf");
+        // A symlink pointing OUT of the tree: the removal must unlink it, never follow it.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("keepme"), b"untouched").expect("keepme");
+        std::os::unix::fs::symlink(&outside, dest.join("dir/inner/escape")).expect("escape link");
+        set_mode(&dest.join("dir/inner/deeper"), 0o555);
+        set_mode(&dest.join("dir/inner"), 0o555);
+
+        // New layer: whiteout for the whole `inner` directory.
+        let staging = base.join("stg");
+        std::fs::create_dir_all(staging.join("dir")).expect("staging dir");
+        std::fs::write(staging.join("dir/.wh.inner"), b"").expect("whiteout marker");
+
+        let merged = merge_layer(&staging, &dest);
+
+        // Re-widen whatever survived so the assertions can read, and cleanup can run.
+        for p in [
+            dest.join("dir/inner/deeper"),
+            dest.join("dir/inner"),
+            dest.join("dir"),
+        ] {
+            if p.exists() {
+                let _ = std::fs::set_permissions(&p, {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::Permissions::from_mode(0o755)
+                });
+            }
+        }
+        let survived = dest.join("dir/inner").exists();
+        let escaped = !outside.join("keepme").exists();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+
+        assert!(
+            !escaped,
+            "the removal followed a symlink out of the rootfs and deleted its target"
+        );
+        assert!(
+            merged.is_ok(),
+            "a read-only directory tree is a legitimate image (chmod 555 then rm -rf); refusing the \
+             pull would be a regression against docker, which extracts as root: {merged:?}"
+        );
+        assert!(
+            !survived,
+            "the whiteout of a read-only directory tree was not applied"
         );
     }
 
