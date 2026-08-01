@@ -986,7 +986,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                                 })?;
                             if !st.success() {
                                 return Err(Error::Volume(format!(
-                                    "seeding volume '{name_v}' into its quota'd backend failed ({st});                                      the existing data is still in {} and the box was not started",
+                                    "seeding volume '{name_v}' into its quota'd backend failed ({st}); the existing data is still in {} and the box was not started",
                                     data.display()
                                 )));
                             }
@@ -6402,7 +6402,9 @@ fn pull_into_cache(image: &str) -> Result<(), Error> {
     // it: an entry mid-extraction has the directory and no sentinel, which is what makes a partial
     // pull read as absent.
     let key = sanitize_ref(image);
-    let had = cache_dir().join(format!("{key}.ok")).exists();
+    // "Already cached" must mean RUNNABLE, not "a sentinel file exists". Asked with the same predicate
+    // the pull itself uses, so the message cannot claim a hit the resolver treated as a miss.
+    let had = cache_entry_complete(&cache_dir(), &key);
     let (path, _cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
     println!(
         "{g}{}{z} {image}",
@@ -8216,6 +8218,33 @@ fn resolve_image_depth(
     pull_to_cache(image, policy)
 }
 
+/// Is the FLAT cache entry for `safe` complete, i.e. actually runnable?
+///
+/// ONE definition, used by every gate in [`pull_to_cache`] and by the `already cached` message, because
+/// this question was being asked four times with three different answers. The completeness of an entry
+/// is three files, not one:
+///
+/// * `<safe>.ok` - the sentinel, written LAST, so an interrupted extraction reads as absent;
+/// * `<safe>.image` - the config sidecar; without it the box loses the image's entrypoint, env and
+///   user and silently falls back to a shell;
+/// * `<safe>/` - the rootfs itself, which is what the overlay lower actually mounts.
+///
+/// The third was missing everywhere. A sentinel whose directory had been pruned or cleaned by hand made
+/// `kern pull` print "already cached" and "run it: …" while `kern images` said `dangling` about the
+/// same ref at the same instant (`image_stat` already knew: no flat dir, no diff, no manifest means
+/// nothing to run), and `kern box --image <ref>` then died with `mount(overlay) failed: No such file or
+/// directory`, naming neither the image nor the cause. Reproduced with a `node:20-slim` whose rootfs
+/// was gone.
+///
+/// Keeping it in one function also closes a `--pull never` hole: with the sentinel present and the
+/// sidecar missing, the old top-of-function check passed, the fast path was skipped, and control fell
+/// into the fetch block - so `--pull never` went to the network.
+fn cache_entry_complete(cache: &std::path::Path, safe: &str) -> bool {
+    cache.join(format!("{safe}.ok")).exists()
+        && cache.join(format!("{safe}.image")).exists()
+        && cache.join(safe).is_dir()
+}
+
 /// Pull `image` into a local cache and return `(rootfs path, its OCI runtime config)`. Reuse is gated
 /// on a sibling completion sentinel (`<ref>.ok`), not "directory is non-empty" - so an interrupted
 /// pull (or a stray file) never makes a partial/poisoned rootfs look valid; we re-pull cleanly. The
@@ -8235,18 +8264,27 @@ fn pull_to_cache(
     // `.base` already returned in `resolve_image_depth`, so reaching here with no sentinel means this
     // registry image is genuinely not cached. Lock-free with zero fs side-effects (matches the old
     // pre-check); the `.image` sidecar layout stays owned by this one function.
-    if policy == PullPolicy::Never && !sentinel.exists() {
+    if policy == PullPolicy::Never && !cache_entry_complete(&cache, &safe) {
         return Err(Error::Oci(format!(
-            "image '{image}' is not present locally and `--pull never` was given"
+            "image '{image}' is not usable locally (no complete cache entry: it needs its rootfs, its \
+             sentinel and its config sidecar) and `--pull never` was given"
         )));
     }
     own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
-    // A cache entry is COMPLETE only with BOTH its sentinel and its config sidecar. An entry written
-    // before the sidecar existed stayed broken forever otherwise: the sentinel short-circuited every
-    // later pull, the config read back empty, and a box with no explicit command exec'd a shell that
-    // exits at once when detached, leaving no log. Treating it as a miss re-fetches and repairs it,
-    // once, without the user having to know that `--pull always` was the way out.
-    if policy != PullPolicy::Always && sentinel.exists() && cfgfile.exists() {
+    // A cache entry is COMPLETE only with its sentinel, its config sidecar AND the rootfs they
+    // describe. An entry written before the sidecar existed stayed broken forever otherwise: the
+    // sentinel short-circuited every later pull, the config read back empty, and a box with no
+    // explicit command exec'd a shell that exits at once when detached, leaving no log.
+    //
+    // The ROOTFS check closes the symmetric hole. A sentinel whose `<ref>/` directory is gone - the
+    // image was pruned, the cache was cleaned by hand, a filesystem was reset - made `kern pull` print
+    // "already cached" and "run it: kern box ...", and `kern images` said `dangling` about the same
+    // ref at the same moment, because `image_stat` already knows that no flat dir, no diff and no
+    // manifest means nothing to run. `kern box --image <ref>` then died with
+    // `mount(overlay) failed: No such file or directory`, naming neither the image nor the cause.
+    // Reproduced on a developer machine with `node:20-slim`. Treating it as a miss re-fetches and
+    // repairs it, once, without the user having to know that `--pull always` was the way out.
+    if policy != PullPolicy::Always && cache_entry_complete(&cache, &safe) {
         // fast path: already cached (and not a forced `--pull always` re-fetch)
         return Ok((
             dir.to_string_lossy().into_owned(),
@@ -8333,17 +8371,57 @@ fn pull_to_cache(
         let _ = std::fs::write(&sentinel, image.as_bytes());
         return Ok((dir.to_string_lossy().into_owned(), config));
     }
-    // Reached when the entry is missing OR incomplete (sentinel without config sidecar).
-    if !sentinel.exists() || !cfgfile.exists() {
+    // Reached when the entry is missing OR incomplete. Same predicate as the fast path above, so the
+    // two cannot disagree about what "cached" means - which is exactly what let a sentinel without a
+    // rootfs skip both the fast path AND this fetch, and fall through to a `return Ok` naming a
+    // directory that does not exist.
+    if !cache_entry_complete(&cache, &safe) {
         // Only `missing` reaches here uncached (`never` failed closed at the top; `always` returned in
         // its own branch). Re-checked under the lock: a concurrent pull may have finished while we
-        // waited, in which case the sentinel now exists and we skip the fetch.
-        if sentinel.exists() {
-            eprintln!("→ image '{image}' is cached without its config - re-fetching it once");
-        } else {
+        // waited, in which case the entry is now complete and we skip the fetch.
+        if !sentinel.exists() {
             eprintln!("→ image '{image}' not cached - pulling once (reused after)");
+        } else if !dir.is_dir() {
+            eprintln!("→ image '{image}' is cached without its rootfs - re-fetching it once");
+        } else {
+            eprintln!("→ image '{image}' is cached without its config - re-fetching it once");
         }
-        let _ = std::fs::remove_dir_all(&dir); // clear any partial extraction
+        // INVALIDATE THE ENTRY BEFORE TOUCHING THE ROOTFS. The sentinel is written LAST precisely so
+        // that an interrupted extraction reads as absent - but that only holds when there was no
+        // sentinel to begin with. On a REPAIR (a stale sentinel whose rootfs was pruned or cleaned by
+        // hand) the old sentinel and sidecar survive, so an interruption partway leaves a directory
+        // holding nothing but prefetch blobs behind a sentinel that still says "complete", and the
+        // next resolve hands that empty rootfs to overlayfs. Reproduced by interrupting a repair with
+        // a closed pipe (`kern pull … | head -3` → SIGPIPE mid-extraction).
+        //
+        // Clearing both first makes an interrupted repair read exactly like an interrupted first pull:
+        // incomplete, therefore re-fetched. A missing file is already the desired state; anything else
+        // means we cannot guarantee the invalidation, and continuing would rebuild the same trap.
+        for stale in [&sentinel, &cfgfile] {
+            match std::fs::remove_file(stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::Oci(format!(
+                        "cannot invalidate the stale cache entry {}: {e}",
+                        stale.display()
+                    )))
+                }
+            }
+        }
+        // Clear any partial extraction (and any prefetch blobs left by an interrupted run). Not
+        // discarded: extracting on top of content this run did not produce is how a partial layer set
+        // becomes an image that looks whole.
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Oci(format!(
+                    "cannot clear the partial image dir {}: {e}",
+                    dir.display()
+                )))
+            }
+        }
         std::fs::create_dir_all(&dir).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
         // The `box --image` cache path pulls the host arch; `box --platform` (foreign-arch box) is
         // Slice B, deferred with the multi-stage work - so no platform override here yet.

@@ -57,6 +57,41 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **`kern pull` declared a dangling image ready to run.** A cache entry was considered complete on its
+  sentinel and its config sidecar, never on the ROOTFS those two describe. With `<ref>/` pruned or
+  cleaned by hand, `kern pull` printed "already cached" and "run it: kern box …" while `kern images`
+  said `dangling` about the same ref at the same instant, because `image_stat` already knew that no
+  flat dir, no diff and no manifest means nothing to run. `kern box --image <ref>` then died with
+  `mount(overlay) failed: No such file or directory`, naming neither the image nor the cause. Found by
+  a node SDK integration test that had been failing for thirteen days on a developer machine for
+  exactly this reason.
+
+  The question "is this entry usable?" was being asked in four places with three different answers; it
+  is one predicate now, used by the `--pull never` gate, the fast path, the post-lock re-check and the
+  "already cached" message. That also closes a `--pull never` hole: with the sentinel present and the
+  sidecar missing, the old top-of-function check passed, the fast path was skipped and control fell
+  into the fetch block, so `--pull never` went to the network.
+
+- **An interrupted REPAIR left a rootfs that read as complete.** The sentinel is written last precisely
+  so an interrupted extraction reads as absent, but that only holds when there was no sentinel to begin
+  with. Repairing an entry whose rootfs had gone kept the stale sentinel and sidecar in place, so an
+  interruption partway left a directory holding nothing but prefetch blobs behind a sentinel still
+  saying "complete", and the next resolve handed that empty rootfs to overlayfs. Reproduced by
+  interrupting a repair with a closed pipe (SIGPIPE mid-extraction). Both files are now removed BEFORE
+  the rootfs is touched, so an interrupted repair reads exactly like an interrupted first pull, and the
+  pre-clean of the partial directory is no longer discarded either.
+
+- **Both SDK bindings let the sandboxed code declare its own failed run successful.** The kernel reply
+  is JSON written INSIDE the box, by the code the sandbox exists to contain - the comment beside it said
+  as much. Every field was defensively coerced, which is right for `stdout`, `stderr` and `results`, and
+  wrong for exactly one: `rc` fell back to `0`, and `success` is `exit_code == 0 and fault is None`. A
+  cell could therefore report a failed run as successful by omitting one key or sending a string.
+  Python was the worse of the two, defaulting a MISSING key to 0 as well. An absent or non-integer `rc`
+  is now a protocol violation handled like the malformed replies beside it: the in-box runner always
+  emits `"rc"`. Python also rejects a JSON `true`, which subclasses `int` there and would have become
+  exit code 1. The decode was extracted into one named method per binding so the untrusted-input
+  boundary is a single place a test can drive directly.
+
 - **The TUI performed destructive actions and lifecycle keys without reporting a refusal.** Both
   paths reuse the CLI helpers inside `quiet_io`, which redirects fd 1 and fd 2 to `/dev/null` so a
   helper's `println!` cannot corrupt the alt-screen; it also sent their error messages there, and the
