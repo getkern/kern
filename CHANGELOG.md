@@ -17,7 +17,7 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [Unreleased]
+## [0.6.30], 2026-08-01
 
 ### Security
 
@@ -245,6 +245,20 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   explicit warning about the apt package of the same name, and `ots info` + `sha256sum` promoted as
   the check that needs no Bitcoin node. Also corrects a claim: `ots verify` was described as using "a
   local or public Bitcoin node", and there is no public fallback.
+
+- **Every version link in this file now points at a release that exists.** Eleven definitions pointed
+  at `releases/tag/v0.1.0` through `v0.6.4`: the July clean-slate reset re-dated the history and those
+  tags did not survive it, so the oldest release on GitHub is v0.6.5 and all eleven answered 404. The
+  mirror-image half was just as wrong: v0.6.5 through v0.6.29, which DO have releases, had no
+  definition at all, so their headings rendered as bare `[0.6.29]` brackets linking nowhere. A version
+  with a tag now links to its release, a version without one drops the brackets and reads as plain
+  text. Verified by requesting all of them.
+
+- **The project-status line was two releases and 21 tests behind.** It read "0.6.27 ... 667 Rust, 61
+  Python and 50 Node tests"; the measured counts are 688, 62 and 51. The binary-size row in
+  `BENCHMARKS.md` said aarch64 `~1.3 MB` where the published artifact is 1.50 MB, so it is now quoted
+  from the release tarballs, with a note that a local build here produces a smaller binary than the
+  one anyone actually downloads.
 
 ## [0.6.29], 2026-08-01
 
@@ -2168,6 +2182,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 - Project docs: README, SECURITY, ARCHITECTURE, CONTRIBUTING, CLA, CODE_OF_CONDUCT.
 - CI: build + test + clippy + fmt + cargo-audit + cargo-deny on x86 (skip-graceful for HW).
 
+[0.6.30]: https://github.com/getkern/kern/releases/tag/v0.6.30
 [0.6.29]: https://github.com/getkern/kern/releases/tag/v0.6.29
 [0.6.28]: https://github.com/getkern/kern/releases/tag/v0.6.28
 [0.6.27]: https://github.com/getkern/kern/releases/tag/v0.6.27

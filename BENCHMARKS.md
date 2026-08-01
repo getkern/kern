@@ -417,7 +417,7 @@ preserves the *function*, not the speed.
 
 | | |
 |---|---:|
-| **kern** binary (the whole thing) | **~1.8 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 ~1.8 MB, aarch64 ~1.3 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
+| **kern** binary (the whole thing) | **~1.8 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 1.81 MB, aarch64 1.50 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
 | kern resident memory at rest | **0**: no daemon |
 | kern RSS per box (setup) | ~7 MB |
 | bubblewrap binary | 70 KB (launcher only) |
@@ -430,6 +430,11 @@ before you run anything.
 
 > Reproduce: `ls -l $(command -v kern)` (binary); `ps -o rss= -C dockerd -C containerd` (Docker
 > resident, sum the KB); the per-box RSS is the box pid1's RSS while a box is up.
+>
+> The two per-architecture sizes are the PUBLISHED artifacts, unpacked from the release tarballs
+> (1,901,536 and 1,577,448 bytes at v0.6.29), not a local build: a local `cargo build --release`
+> here produces 1.70 MB with a different toolchain, and quoting that would understate what anyone
+> actually downloads.
 
 ## Resource caps (where systemd-user is present)
 
