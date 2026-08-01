@@ -57,6 +57,16 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **A registry rate limit was reported as a malformed manifest.** Docker Hub answers an over-quota
+  anonymous pull with HTTP 429 and `{"errors":[{"code":"TOOMANYREQUESTS","message":"You have reached
+  your unauthenticated pull rate limit..."}]}`. That body carries none of the auth keywords the error
+  classifier looked for, so it fell through to "no layers in manifest", under a hint telling the user
+  to check the image name and tag - of an image whose name and tag were perfectly correct. Hit while
+  verifying this session's work across six machines, which is how it was found. The registry's own
+  `message` is now quoted rather than paraphrased (it carries the current limit and the URL that
+  explains it), `MANIFEST_UNKNOWN`/`NAME_UNKNOWN` are reported as an absent manifest, and the hint
+  under a rate limit no longer contradicts the error above it.
+
 - **`cargo test` deleted the image cache of the machine it ran on.** `help_and_parser_agree` runs each
   hardened verb to check that the parser accepts every flag `--help` advertises, and two of those verbs
   - `gc` and `prune` - delete for a living. Only `XDG_RUNTIME_DIR` was redirected, so the destructive

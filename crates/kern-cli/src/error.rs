@@ -100,6 +100,12 @@ fn oci_hint(msg: &str) -> String {
     {
         "pull/push need `curl`, GNU `tar`, `gzip`, `sha256sum` (and `zstd` for zstd-compressed images) on PATH, plus a working network"
             .into()
+    } else if msg.contains("rate-limiting") {
+        // The error already says the name and tag are NOT the problem, and already names the way out.
+        // Appending the generic name/tag hint under it made the two lines contradict each other, which
+        // is worse than no hint: the reader has to guess which half to believe.
+        "an authenticated pull has a much higher quota; `kern login <registry>` once and it persists"
+            .into()
     } else {
         // Registry / manifest / not-found: the name or tag is the likely culprit.
         "check the image name and tag exist; private images need `kern login` first".into()
@@ -166,5 +172,13 @@ mod tests {
         assert!(!reg.contains("curl"));
         // "no manifest for <arch>" and local cache errors fall through to the same safe hint.
         assert!(oci_hint("registry: no manifest for aarch64").contains("image name"));
+        // A rate limit must NOT get the name/tag hint: the error itself states that the name is not
+        // the problem, and two contradicting lines are worse than one.
+        let rl = oci_hint("registry: registry-1.docker.io is rate-limiting this pull of 'library/alpine'");
+        assert!(
+            !rl.contains("check the image name"),
+            "a rate limit must not be hinted as a naming problem: {rl}"
+        );
+        assert!(rl.contains("quota"), "the hint must name the actual remedy: {rl}");
     }
 }

@@ -500,6 +500,40 @@ fn valid_path_component(c: &str) -> bool {
 /// at `kern login` rather than the opaque "no layers"; otherwise the tag is malformed or absent.
 fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     let low = manifest.to_ascii_lowercase();
+
+    // RATE LIMIT first, because it is the one a working setup hits and the one the old wording sent
+    // people furthest from. Docker Hub answers an over-quota anonymous pull with HTTP 429 and
+    // `{"errors":[{"code":"TOOMANYREQUESTS","message":"You have reached your unauthenticated pull rate
+    // limit..."}]}`. That body contains none of the auth keywords below, so it fell through to "no
+    // layers in manifest" and a hint about checking the image name - about an image whose name is
+    // perfectly correct. Measured against Docker Hub on 2026-08-01 after a burst of pulls across six
+    // machines. The registry's own `message` is quoted rather than paraphrased: it is the field the
+    // distribution spec provides for exactly this, and it carries the current limit and its URL.
+    if low.contains("toomanyrequests") || low.contains("rate limit") {
+        let said = first_str(manifest, "message").unwrap_or_default();
+        let said = if said.is_empty() {
+            String::new()
+        } else {
+            format!(" - {said}")
+        };
+        return OciError::Registry(format!(
+            "{registry} is rate-limiting this pull of '{repo}'{said}. Authenticate with \
+             `kern login {registry}` (an authenticated pull has a much higher quota), or wait and \
+             retry - the image name and tag are not the problem"
+        ));
+    }
+    // The tag or the repository genuinely does not exist: the registry says which.
+    if low.contains("manifest_unknown") || low.contains("name_unknown") {
+        let said = first_str(manifest, "message").unwrap_or_default();
+        return OciError::Registry(format!(
+            "{registry} has no such manifest for '{repo}'{}",
+            if said.is_empty() {
+                String::new()
+            } else {
+                format!(" - {said}")
+            }
+        ));
+    }
     let auth_ish = manifest.trim().is_empty()
         || low.contains("unauthorized")
         || low.contains("denied")
@@ -3247,6 +3281,53 @@ mod tests {
         assert!(
             opened_real,
             "a real directory must still open, or the guard proves nothing"
+        );
+    }
+
+    /// A registry that says WHY must not be paraphrased into something else.
+    ///
+    /// Docker Hub answers an over-quota anonymous pull with HTTP 429 and a `TOOMANYREQUESTS` body.
+    /// That body carries none of the auth keywords the classifier looked for, so it fell through to
+    /// "no layers in manifest" with a hint to check the image name - about an image whose name is
+    /// correct. The bodies below are the real ones, captured from Docker Hub and from the OCI
+    /// distribution spec's error shape.
+    #[test]
+    fn a_registry_error_is_reported_as_the_registry_stated_it() {
+        let rate = r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit"}]}"#;
+        let e = manifest_error(rate, "registry-1.docker.io", "library/alpine").to_string();
+        assert!(
+            e.contains("rate-limiting") && e.contains("kern login"),
+            "a 429 must be reported as a rate limit with the way out: {e}"
+        );
+        assert!(
+            !e.contains("no layers in manifest"),
+            "a 429 must not be reported as a malformed manifest: {e}"
+        );
+        assert!(
+            e.contains("increase-rate-limit"),
+            "the registry's own message carries the limit and its URL; quote it: {e}"
+        );
+
+        let unknown = r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}"#;
+        let e = manifest_error(unknown, "ghcr.io", "org/app").to_string();
+        assert!(
+            e.contains("no such manifest"),
+            "a MANIFEST_UNKNOWN must say the manifest is absent: {e}"
+        );
+
+        // The two pre-existing branches must still behave, or this test would be trading one wrong
+        // answer for another.
+        let denied = r#"{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}"#;
+        let e = manifest_error(denied, "registry-1.docker.io", "private/app").to_string();
+        assert!(
+            e.contains("kern login"),
+            "a denial still points at login: {e}"
+        );
+        let garbage = "{\"schemaVersion\":2}";
+        let e = manifest_error(garbage, "r", "x").to_string();
+        assert!(
+            e.contains("no layers in manifest"),
+            "a manifest with no layers is still exactly that: {e}"
         );
     }
 
