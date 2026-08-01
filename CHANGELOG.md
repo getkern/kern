@@ -19,6 +19,25 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [Unreleased]
 
+### Fixed
+
+- **`kern doctor` named a systemd manager that wasn't there.** The lingering check asked "am I root?"
+  before "is there a manager at all?", so on a WSL2 distro without systemd it answered "running as
+  root: boxes go to the system manager". The conclusion was right and the reason was invented.
+  Measured on WSL2 (kernel 6.18-microsoft-standard, `/proc/1/comm` = init, no `/run/systemd/system`)
+  on 2026-08-01. Verified on all three branches afterwards: no systemd at all, root with systemd, and
+  rootless with lingering on.
+
+### Documentation
+
+- **`provenance/README.md` sent people to the wrong program.** `pip install opentimestamps-client` is
+  refused on Debian 12+, Ubuntu 23.04+ and anything else following PEP 668; the shell then suggests
+  `apt install ots`, which is Open Text Summarizer, an unrelated program that cannot read these files.
+  Someone checking a release could reasonably conclude the proof was broken. Now: pipx or a venv, an
+  explicit warning about the apt package of the same name, and `ots info` + `sha256sum` promoted as
+  the check that needs no Bitcoin node. Also corrects a claim: `ots verify` was described as using "a
+  local or public Bitcoin node", and there is no public fallback.
+
 ## [0.6.29], 2026-08-01
 
 ### Security
