@@ -57,6 +57,31 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   level, so a planted `dir/escape -> /elsewhere` is unlinked as a link and never descended. The test
   plants exactly that symlink and asserts its target survives.
 
+- **`cargo test` deleted the image cache of the machine it ran on.** `help_and_parser_agree` runs each
+  hardened verb to check that the parser accepts every flag `--help` advertises, and two of those verbs
+  - `gc` and `prune` - delete for a living. Only `XDG_RUNTIME_DIR` was redirected, so the destructive
+  verbs operated on the developer's real image cache. Three images on this machine had lost their
+  rootfs that way, one of them three days before anyone noticed, and a node SDK integration test had
+  been failing ever since for what looked like an unrelated reason. Isolated by bisecting the test
+  binaries against a snapshot of the cache. The suite now redirects `HOME`, `XDG_CACHE_HOME`,
+  `XDG_DATA_HOME`, `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR` into one private temp tree; `HOME` matters
+  because every directory resolver falls back to it when its XDG variable is unset.
+
+- **`remove_image` ignored the cache it was handed.** It takes a cache directory as a parameter, which
+  is what lets a test drive it against a fabricated tree, and then called `sweep_orphan_layers()` -
+  which resolved `cache_dir()` on its own and swept the REAL layer store. A unit test deleting from a
+  temp cache therefore reclaimed layers from the developer's, which is how a five-day-old
+  `ubuntu:latest` lost its layers. The sweep takes the cache as a parameter now, so an argument that
+  exists for testability is honoured all the way down.
+
+- **A cache directory holding only prefetch blobs is no longer "complete".** `dir.is_dir()` is true for
+  a directory that contains nothing but kern's own `.kern-layer-*` downloads, which is what an
+  extraction that never merged leaves behind. The completeness test now rejects that shape, and keeps
+  accepting an EMPTY directory: a finished extraction consumes each blob as it goes, so "no entries at
+  all" means the image genuinely had none, and rejecting it would re-pull that image on every
+  invocation forever. The re-fetch message also names the part that is actually missing - it reported
+  "cached without its config" for an entry whose config was present and whose rootfs was blob-only.
+
 - **Zero `unwrap`/`expect`/`panic!` left in production code.** The workspace had sixteen, each safe by
   construction and each an abort if that construction were ever wrong - and `panic = "abort"` gives no
   second chance. They are now stated rather than asserted: the `[[cpu]]`/`[[vcpu]]`/`[[gpio]]`/

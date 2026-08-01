@@ -4513,7 +4513,7 @@ pub fn gc(images: bool) -> Result<(), Error> {
     // Sweep orphaned build layers: a `kern build` that changes a RUN/COPY leaves its old layer dirs
     // in `L/`, referenced by no image. Delete any `L/<key>` (+ `.ok`) not named in a `<tag>.layers`
     // manifest - bounds the layer cache without nuking the shared, still-referenced layers.
-    let (n, freed) = sweep_orphan_layers();
+    let (n, freed) = sweep_orphan_layers(&cache_dir());
     if n > 0 {
         let p = crate::ui::Palette::detect();
         println!(
@@ -4667,15 +4667,17 @@ pub(crate) fn remove_tree_forced(path: &std::path::Path) -> std::io::Result<()> 
 
 /// Delete build-layer dirs in `L/` not referenced by any `<tag>.layers` manifest. Returns
 /// `(count, bytes_freed)`. Only touches `L/<32hex>` entries, never a pulled/built image itself.
-fn sweep_orphan_layers() -> (usize, u64) {
-    let cache = cache_dir();
-    let lc = layer_cache_dir();
+fn sweep_orphan_layers(cache: &std::path::Path) -> (usize, u64) {
+    // The cache is a PARAMETER, not `cache_dir()`. `remove_image` already takes one so it can be
+    // driven against a temp tree by a test, and this call ignored it and swept the real user cache -
+    // so a unit test deleting from a fabricated cache reached into the developer's layer store.
+    let lc = cache.join("L");
     // Collect every layer key still referenced by some image's `.layers` manifest. This set is used
     // to decide what to DELETE, so it must be COMPLETE: if we can't read a manifest (transient IO /
     // permission error), a layer referenced only by it would look orphaned and be wrongly deleted.
     // Fail closed - abort the whole sweep (delete nothing) rather than sweep on a partial set.
     let mut referenced = std::collections::HashSet::new();
-    if let Ok(rd) = std::fs::read_dir(&cache) {
+    if let Ok(rd) = std::fs::read_dir(cache) {
         for e in rd.flatten() {
             if e.path().extension().and_then(|s| s.to_str()) == Some("layers") {
                 match std::fs::read_to_string(e.path()) {
@@ -5542,7 +5544,7 @@ fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     }
     // Reclaim layers this image was the last to reference (the sweep fails closed, so a shared layer is
     // never dropped while another image's manifest still names it).
-    let (_, layer_freed) = sweep_orphan_layers();
+    let (_, layer_freed) = sweep_orphan_layers(cache);
     Some(freed + layer_freed)
 }
 
@@ -5584,7 +5586,7 @@ pub fn image_rm(refs: &[String]) -> Result<(), Error> {
 /// tagged image is kept; only dangling layers are freed. Invoked from the `kern top` Images tab (`p`);
 /// the CLI equivalent is `kern gc` (which also prunes dead-box sidecars).
 pub(crate) fn image_prune() -> Result<(), Error> {
-    let (n, freed) = sweep_orphan_layers();
+    let (n, freed) = sweep_orphan_layers(&cache_dir());
     let p = crate::ui::Palette::detect();
     if n == 0 {
         println!("{}nothing to prune - no orphaned layers{}", p.d, p.z);
@@ -8240,9 +8242,20 @@ fn resolve_image_depth(
 /// sidecar missing, the old top-of-function check passed, the fast path was skipped, and control fell
 /// into the fetch block - so `--pull never` went to the network.
 fn cache_entry_complete(cache: &std::path::Path, safe: &str) -> bool {
-    cache.join(format!("{safe}.ok")).exists()
-        && cache.join(format!("{safe}.image")).exists()
-        && cache.join(safe).is_dir()
+    if !cache.join(format!("{safe}.ok")).exists() || !cache.join(format!("{safe}.image")).exists() {
+        return false;
+    }
+    let dir = cache.join(safe);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return false; // not a directory, or unreadable: not something to hand to overlayfs
+    };
+    // A directory holding ONLY kern's own prefetch blobs (`.kern-layer-*`) is an extraction that
+    // downloaded and never merged - which is what an interrupted pull used to leave behind a stale
+    // sentinel. An EMPTY directory is accepted: a completed extraction removes each blob as it
+    // consumes it, so "no entries at all" means the image genuinely had nothing, and rejecting it
+    // would re-pull that image on every single invocation, forever.
+    !rd.flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(".kern-"))
 }
 
 /// Pull `image` into a local cache and return `(rootfs path, its OCI runtime config)`. Reuse is gated
@@ -8379,10 +8392,17 @@ fn pull_to_cache(
         // Only `missing` reaches here uncached (`never` failed closed at the top; `always` returned in
         // its own branch). Re-checked under the lock: a concurrent pull may have finished while we
         // waited, in which case the entry is now complete and we skip the fetch.
+        // Name the reason accurately: a blob-only directory EXISTS, so testing `is_dir()` here
+        // reported "without its config" for an entry whose config was present and whose rootfs was
+        // never merged. Each arm now tests the thing it names.
+        let rootfs_usable = std::fs::read_dir(&dir).is_ok_and(|rd| {
+            !rd.flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(".kern-"))
+        });
         if !sentinel.exists() {
             eprintln!("→ image '{image}' not cached - pulling once (reused after)");
-        } else if !dir.is_dir() {
-            eprintln!("→ image '{image}' is cached without its rootfs - re-fetching it once");
+        } else if !rootfs_usable {
+            eprintln!("→ image '{image}' is cached without a usable rootfs - re-fetching it once");
         } else {
             eprintln!("→ image '{image}' is cached without its config - re-fetching it once");
         }

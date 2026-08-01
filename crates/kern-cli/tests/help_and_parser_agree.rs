@@ -12,8 +12,28 @@
 
 use std::process::Command;
 
+/// A `kern` whose ENTIRE state lives under a private temp tree.
+///
+/// This suite RUNS the hardened verbs to see whether the parser accepts each advertised flag, and two
+/// of them - `gc` and `prune` - delete things for a living. Only `XDG_RUNTIME_DIR` was redirected, so
+/// `cargo test` reaped the developer's real image cache: three images on this machine had lost their
+/// rootfs that way, one of them three days before anyone noticed, and a node SDK integration test had
+/// been failing ever since for what looked like an unrelated reason. A test that destroys the data of
+/// the machine it runs on also invalidates every verification run that follows it.
+///
+/// `HOME` is redirected too, because every one of kern's directory resolvers falls back to it when its
+/// XDG variable is unset - redirecting only the XDG names would leave that fallback pointing at the
+/// real home.
 fn kern() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_kern"))
+    let sandbox = std::env::temp_dir().join(format!("kern-help-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&sandbox);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_kern"));
+    c.env("HOME", &sandbox)
+        .env("XDG_CACHE_HOME", sandbox.join("cache"))
+        .env("XDG_DATA_HOME", sandbox.join("data"))
+        .env("XDG_CONFIG_HOME", sandbox.join("config"))
+        .env("XDG_RUNTIME_DIR", sandbox.join("run"));
+    c
 }
 
 /// The verbs whose flags are now checked at parse time. `top` is absent on purpose and not in silence:
@@ -70,10 +90,6 @@ fn every_flag_help_advertises_is_accepted_by_the_parser() {
             // unrelated reasons (no config, nothing to prune) and that is not what is under test.
             let out = kern()
                 .args([verb.to_string(), flag.clone(), "1".to_string()])
-                .env(
-                    "XDG_RUNTIME_DIR",
-                    std::env::temp_dir().join("kern-help-test"),
-                )
                 .output()
                 .expect("run kern");
             let err = String::from_utf8_lossy(&out.stderr);
