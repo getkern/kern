@@ -1595,6 +1595,15 @@ class Kernel {
       const kind = looksLikeStartupFailure(err) ? "startup_failed" : "killed";
       return this._teardownResult(kind, err.trim() || "the kernel box exited", started);
     }
+    return this._resultFromReply(reply, started);
+  }
+
+  /** Turn one kernel reply into an `ExecutionResult`.
+   *
+   * Extracted so the UNTRUSTED-INPUT boundary is one named place a test can drive directly: `reply`
+   * is JSON written INSIDE the box, by the same code the sandbox exists to contain. Every field is
+   * attacker-chosen, and the question for each is what a missing or wrong-typed value must mean. */
+  _resultFromReply(reply, started) {
     let obj;
     try {
       obj = JSON.parse(reply);
@@ -1603,15 +1612,25 @@ class Kernel {
     }
     if (!obj || typeof obj !== "object")
       return this._teardownResult("killed", "the kernel sent a non-object reply", started);
+    // `rc` is the ONE field whose absence cannot be defaulted. `success` is
+    // `exitCode === 0 && fault === null`, so coercing a missing or non-integer `rc` to 0 - which is
+    // what this did - reported a SUCCESSFUL run. Since the JSON comes from the box, a cell could
+    // declare its own failed run successful by omitting the field or sending a string. An unusable
+    // status is not a status: it is a protocol violation by the in-box runner, which always emits
+    // `"rc"`, and it is handled like the malformed replies above. `Number.isInteger` also rejects a
+    // boolean, a float and a numeric string, which is what it is here for.
+    if (!Number.isInteger(obj.rc))
+      return this._teardownResult("killed", "the kernel reply carried no usable exit code", started);
+    // The REMAINING fields are informational, so a wrong type degrades to an empty value rather than
+    // failing the call: coerced so a caller doing `r.stdout.trim()` cannot be crashed by a box that
+    // sent a number.
     const results = Array.isArray(obj.results)
       ? obj.results.filter((r) => r && typeof r === "object").map((r) => new Result(r))
       : [];
-    // obj is UNTRUSTED (box-controlled JSON): coerce scalars so a non-string stdout / non-int rc can't
-    // crash a caller doing r.stdout.trim() or arithmetic on r.exitCode.
     return new ExecutionResult({
       stdout: typeof obj.stdout === "string" ? obj.stdout : "",
       stderr: typeof obj.stderr === "string" ? obj.stderr : "",
-      exitCode: Number.isInteger(obj.rc) ? obj.rc : 0,
+      exitCode: obj.rc,
       durationMs: Date.now() - started,
       fault: null,
       files: [],

@@ -1462,6 +1462,16 @@ class Kernel:
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
             fault = "startup_failed" if _looks_like_startup_failure(err) else "killed"
             return self._teardown_result(fault, err.strip() or "the kernel box exited", started)
+        return self._result_from_reply(reply, started)
+
+    def _result_from_reply(self, reply: bytes, started: float) -> ExecutionResult:
+        """Turn one kernel reply into an :class:`ExecutionResult`.
+
+        Extracted so the UNTRUSTED-INPUT boundary is one named place that can be driven directly by a
+        test: `reply` is JSON written INSIDE the box, by the same code the sandbox exists to contain.
+        Every field is therefore attacker-chosen, and the question for each is what a missing or
+        wrong-typed value must mean.
+        """
         dur = int((time.monotonic() - started) * 1000)
         try:
             obj = json.loads(reply.decode("utf-8", "replace"))
@@ -1469,13 +1479,24 @@ class Kernel:
             return self._teardown_result("killed", "the kernel sent a malformed reply", started)
         if not isinstance(obj, dict):
             return self._teardown_result("killed", "the kernel sent a non-object reply", started)
-        # obj is UNTRUSTED (box-controlled JSON): coerce the scalar fields so a non-string stdout / non-int
-        # rc can't crash a caller that does r.stdout.strip() or arithmetic on r.exit_code.
+        # `rc` is the ONE field whose absence cannot be defaulted. `success` is
+        # `exit_code == 0 and fault is None`, so coercing a missing or non-integer `rc` to 0 - which is
+        # what this did - reported a SUCCESSFUL run. Since the JSON comes from the box, a cell could
+        # declare its own failed run successful by omitting the field or sending a string. An unusable
+        # status is not a status: it is a protocol violation by the in-box runner, which always emits
+        # `"rc"`, and it is handled like the malformed replies above.
+        #
+        # `bool` is excluded explicitly: in Python it subclasses `int`, so a JSON `true` would
+        # otherwise be accepted and become exit code 1.
+        rc = obj.get("rc")
+        if isinstance(rc, bool) or not isinstance(rc, int):
+            return self._teardown_result(
+                "killed", "the kernel reply carried no usable exit code", started
+            )
+        # The REMAINING fields are informational, so a wrong type degrades to an empty value rather
+        # than failing the call: coerced so a caller doing `r.stdout.strip()` cannot be crashed by a
+        # box that sent a number.
         results = [Result(data=d) for d in obj.get("results", []) if isinstance(d, dict)]
-        try:
-            rc = int(obj.get("rc", 0))
-        except (TypeError, ValueError):
-            rc = 0
         return ExecutionResult(
             stdout=str(obj.get("stdout", "")),
             stderr=str(obj.get("stderr", "")),

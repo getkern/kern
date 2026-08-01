@@ -757,3 +757,39 @@ test("kernel: warm cells are far faster than a cold one-shot", exec, async () =>
     }
   });
 });
+
+test("a reply without a usable exit code is a fault, not a success", () => {
+  // The kernel reply is JSON written INSIDE the box, by the code the sandbox exists to contain.
+  // `rc` was read as `Number.isInteger(obj.rc) ? obj.rc : 0`, so a missing field or a wrong type
+  // became exit code 0 - and `success` is `exitCode === 0 && fault === null`. A cell could therefore
+  // report its own failed run as successful by omitting one key. Every shape below is what an
+  // untrusted payload can send.
+  const k = new kern.Kernel(new Sandbox(), 5);
+  const started = Date.now();
+
+  for (const reply of [
+    '{"stdout":"","stderr":"","results":[]}', // no rc at all
+    '{"rc":"0","stdout":"","stderr":""}', // rc as a string
+    '{"rc":null,"stdout":"","stderr":""}', // rc explicitly null
+    '{"rc":0.5,"stdout":"","stderr":""}', // rc as a non-integer number
+    '{"rc":true,"stdout":"","stderr":""}', // rc as a bool
+    '{"rc":[0],"stdout":"","stderr":""}', // rc as an array
+  ]) {
+    const r = k._resultFromReply(reply, started);
+    assert.equal(r.success, false, `${reply} must not be reported as a successful run`);
+    assert.notEqual(r.fault, null, `${reply} must carry a fault explaining why`);
+    assert.notEqual(r.exitCode, 0, `${reply} must not present exit code 0`);
+  }
+
+  // Positive control: a well-formed reply still produces an ordinary successful result, or the
+  // assertions above would pass on a binding that rejects everything.
+  const ok = k._resultFromReply('{"rc":0,"stdout":"hi","stderr":"","results":[]}', started);
+  assert.equal(ok.success, true);
+  assert.equal(ok.exitCode, 0);
+  assert.equal(ok.stdout, "hi");
+  // And a genuine non-zero exit is preserved rather than coerced.
+  const bad = k._resultFromReply('{"rc":3,"stdout":"","stderr":"boom"}', started);
+  assert.equal(bad.success, false);
+  assert.equal(bad.exitCode, 3);
+  assert.equal(bad.fault, null);
+});

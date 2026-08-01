@@ -656,3 +656,35 @@ def test_kernel_is_warm_far_faster_than_a_cold_cell():
                 k.run_code("sum(range(1000))")
             warm = (time.monotonic() - t) / 20
     assert warm < cold / 10
+
+
+def test_a_reply_without_a_usable_exit_code_is_a_fault_not_a_success():
+    """The kernel reply is JSON written INSIDE the box, by the code the sandbox exists to contain.
+
+    `rc` was read as `int(obj.get("rc", 0))`, so a missing field or a wrong type became exit code 0 -
+    and `success` is `exit_code == 0 and fault is None`. A cell could therefore report its own failed
+    run as successful by omitting one key. Every shape below is what an untrusted payload can send.
+    """
+    k = Kernel(_cfg(), timeout_s=5)
+    started = time.monotonic()
+
+    for reply in (
+        b'{"stdout":"","stderr":"","results":[]}',        # no rc at all
+        b'{"rc":"0","stdout":"","stderr":""}',            # rc as a string
+        b'{"rc":null,"stdout":"","stderr":""}',           # rc explicitly null
+        b'{"rc":0.0,"stdout":"","stderr":""}',            # rc as a float
+        b'{"rc":true,"stdout":"","stderr":""}',           # rc as a bool (an int subclass in Python)
+        b'{"rc":[0],"stdout":"","stderr":""}',            # rc as a list
+    ):
+        r = k._result_from_reply(reply, started)
+        assert not r.success, f"{reply!r} must not be reported as a successful run"
+        assert r.fault is not None, f"{reply!r} must carry a fault explaining why"
+        assert r.exit_code != 0, f"{reply!r} must not present exit code 0"
+
+    # Positive control: a well-formed reply still produces an ordinary successful result, or the
+    # assertions above would pass on a binding that rejects everything.
+    ok = k._result_from_reply(b'{"rc":0,"stdout":"hi","stderr":"","results":[]}', started)
+    assert ok.success and ok.exit_code == 0 and ok.stdout == "hi"
+    # And a genuine non-zero exit is preserved rather than coerced.
+    bad = k._result_from_reply(b'{"rc":3,"stdout":"","stderr":"boom"}', started)
+    assert not bad.success and bad.exit_code == 3 and bad.fault is None
