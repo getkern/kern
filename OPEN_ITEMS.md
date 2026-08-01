@@ -88,6 +88,46 @@ change.
 
 ## The Python and Node SDK test suites leave boxes behind
 
+Re-measured 2026-08-01 at kern-sandbox 0.1.12, each run from a clean slate (zero `kern box`
+processes): `pytest` in `bindings/python` ends 65/65 green and leaves **2** `pysbx-*` boxes running;
+`node --test` in `bindings/node` ends 54/54 green and leaves **5** `jssbx-*`. The Node side was 2 when
+this was first written on 2026-07-29, so the cost tracks the number of execution tests rather than
+being fixed. They carry the SDK's 24 h `--timeout` backstop, so they do expire on their own, but until
+then `kern ps` does not list them and `kern stop --all` answers "no running boxes to stop" while seven
+of them are alive.
+
+**It is confined to the test suites. Normal SDK usage does not leak**, and that was measured rather
+than assumed: against the published 0.1.12 in a clean venv, ten sequential `run()`, ten sequential
+`run_code()`, sixteen concurrent `run()` and sixteen concurrent `run_code()` each leave **zero** boxes
+behind. So the mechanism is in what the suites do (timeout and kill paths, most likely) and not in the
+per-call lifecycle a user exercises.
+
+A retraction belongs here, because the wrong version of this section was published first. Commit
+`2728c08` claimed the concurrency regression tests added in 0.1.12 left 53 boxes of their own and made
+them reap what they start. That attribution was wrong: it came from a count taken WITHOUT clearing the
+manual 40-thread and 30-call reproduction runs done minutes earlier, so those boxes were counted as
+the suites'. Measured properly, from a clean slate and with the reaping removed, the full Python suite
+leaves 2 with the new test and 2 without it, and the Node suite leaves 5 either way. The tests
+contribute nothing, and the reaping code has been removed rather than left in place justified by a
+story that does not hold.
+
+## `KERN_MAX_CONCURRENT` is best-effort
+
+The fleet concurrency gate counts live boxes and then starts one, so two launches racing can both
+pass. `KERN_FLEET_MEMORY_MAX` and `KERN_FLEET_PIDS_MAX` are real cgroup limits and do not have this
+property. The concurrency count is a guard rail, not a boundary, and is documented as one.
+
+## The `--memory not enforced` warning is gated on the request
+
+`cgroup.rs` warns when `--memory` was ASKED FOR and cannot be applied, not when a cap would be
+applicable and this box ended up without one. A box that takes the default 512 MiB on a host where
+the memory controller is not delegated gets no warning. The correct predicate
+(`memory_cap_enforceable()`) already exists; wiring the warning to it needs a host with
+`cgroup_enable=memory` removed to verify against, which is a physical board rather than a code
+change.
+
+## The Python and Node SDK test suites leave boxes behind
+
 Re-measured 2026-08-01 at kern-sandbox 0.1.12, from a clean slate (zero `kern box` processes):
 `pytest` in `bindings/python` ends 65/65 green and leaves **2** `pysbx-*` boxes running; `node --test`
 in `bindings/node` ends 54/54 green and leaves **5** `jssbx-*`. The Node side was 2 when this was
