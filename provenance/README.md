@@ -19,20 +19,42 @@ or the author required.
 
 ## Verify
 
-```sh
-pip install opentimestamps-client        # provides `ots`
-ots verify provenance/v0.6.7.provenance.txt.ots
-```
-
-`ots verify` confirms the `.txt` against the Bitcoin block it is anchored to (a local or public
-Bitcoin node is used to read the block header time). You can also inspect the raw attestation
-without a node:
+**Installing the client.** On Debian 12+, Ubuntu 23.04+ and anything else following PEP 668, a bare
+`pip install` is refused with `externally-managed-environment`. Use one of:
 
 ```sh
-ots info provenance/v0.6.7.provenance.txt.ots   # shows BitcoinBlockHeaderAttestation(<block height>)
+pipx install opentimestamps-client                       # if you have pipx
+# or a throwaway venv:
+python3 -m venv ~/.venv-ots && ~/.venv-ots/bin/pip install opentimestamps-client
+~/.venv-ots/bin/ots --version
 ```
 
-Cross-check the reported block height and merkle root on any block explorer.
+> **Do not `apt install ots`.** When the `ots` command is missing, the shell helpfully suggests that
+> package. It is a **different program** (Open Text Summarizer, `section: universe/text`), and it will
+> not read these files. The apt package that IS related, `python3-opentimestamps`, is the library, not
+> the `ots` command-line client.
+
+**Reading the proof, no node required.** This is the check most people want:
+
+```sh
+ots info provenance/v0.6.29.provenance.txt.ots   # BitcoinBlockHeaderAttestation(<height>) + merkle root
+sha256sum provenance/v0.6.29.provenance.txt      # the hash the block attests to
+```
+
+Cross-check each reported block height and merkle root on any block explorer. A release is normally
+anchored in more than one block, because several independent calendars submit it; two calendars
+landing in the same block is normal and is not a missing anchor. Freshly stamped releases show only
+`PendingAttestation` until a block confirms, a few hours later.
+
+**Full verification** needs a local Bitcoin node:
+
+```sh
+ots verify provenance/v0.6.29.provenance.txt.ots
+```
+
+Without one it stops with `Could not connect to Bitcoin node`. That is not a failed proof, it is a
+missing verifier: `ots` reads the block header from your own node precisely so that it does not have
+to trust anybody's block explorer. If you do not run a node, use the `ots info` route above.
 
 ## Cross-check the tag
 
