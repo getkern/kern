@@ -1,8 +1,12 @@
 # Benchmarks
 
 Re-measured 2026-08-01 at **kern 0.6.30** on one machine: Intel i7-14700KF, 28 threads, **Linux
-7.0.0**, NVMe, systemd-user with `cpu memory pids` delegated, CPU governor **powersave** (a figure
-taken under `performance` is not comparable with one taken here). Against the runtimes installed on
+7.0.0**, NVMe, systemd-user with `cpu memory pids` delegated, CPU governor `powersave` on the
+`intel_pstate` driver, which is not the handicap the name suggests and was checked rather than
+assumed: sampling every core every 50 ms across 400 box starts, the core running kern sat at a median
+of **5501 MHz against a 5500 MHz ceiling**, so it is at full turbo throughout and `performance` has
+nothing left to give it. (The mean across all 28 threads is 4126 MHz because the rest are idle at
+800: this is a single-threaded workload on a many-core machine.) Against the runtimes installed on
 it: **Docker 29.1.3** (daemon up), **Podman 4.9.3** (rootless), **runc 1.3.3** (rootless),
 **bubblewrap 0.9**. `crun` is NOT installed here; its row below is from June and says so. The workload is `/bin/true` in Alpine with the
 **image/rootfs already local**, so this measures *runtime overhead*, not download time. All ran the
