@@ -104,8 +104,8 @@ whether boxes will run here before you try. Boards, WSL2, checksums and the long
 ```sh
 kern box dev --image alpine -it -- sh              # a throwaway shell in a real OCI image
 kern run --memory 256M --cpus 0.5 -- ./crunch      # cap a process, no sandbox
-kern box svc --image alpine -d -p 8080:80 \        # a service: published, restarted, health-checked
-  --restart --health-cmd 'wget -qO- localhost:80' -- httpd -f
+kern box svc --image nginx:alpine -d -p 8080:80 \  # a service: published, restarted, health-checked
+  --restart --health-cmd 'wget -qO- localhost:80' -- nginx -g 'daemon off;'
 kern ps                                            # what is running, with PORTS and HEALTH
 kern exec svc -it -- sh                            # shell into it
 kern top                                           # live TUI: boxes, CPU/RAM, profiles, volumes
@@ -115,7 +115,8 @@ kern compose stack.toml up                         # a multi-box stack, kern TOM
 Untrusted code, with the defaults doing the work:
 
 ```sh
-kern box job --image python:3.12-slim --read-only --cap-drop ALL --memory 256m -- python3 /w/x.py
+kern box job --image python:3.12-slim --read-only --cap-drop ALL --memory 256m \
+  -v ./job:/w -- python3 /w/x.py
 ```
 
 No network unless you ask, a read-only root, dangerous capabilities dropped, seccomp always on.
