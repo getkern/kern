@@ -91,8 +91,22 @@ loopback for a box that had never started. That mislabelling was the real defect
 independently of the names: the helper now fails with the exit status and the box's own stderr, and
 the 12-box concurrency test collects each failure's reason instead of counting successes.
 
-After both fixes: 60 parallel executions, zero failures, and three consecutive full suites at 691
-tests green.
+After both fixes, locally: 60 parallel executions with zero failures, and three consecutive full
+suites at 691 tests green.
+
+**The fix is NOT in the tree, and that is the honest part of this entry.** Pushed twice, `0eb338b`
+and `923c987`, and GitHub's CI went red both times on the `test` step with nothing but
+`Process completed with exit code 101`. The job log needs admin rights on the repository to download,
+so the failure could not be read, and three attempts to reproduce the runner's conditions locally all
+came back green: the full suite under an `LD_PRELOAD` that makes `unshare(2)` return `EPERM`, which is
+what AppArmor does to the runner and what `userns_plausible()` probes for, passes 691 tests with zero
+failures. So the cause is something the simulation does not capture.
+
+`crates/kern-cli/tests/sandbox_run.rs` is therefore back at the last green revision and main is green.
+The defect it addressed is real and reproducible on demand (four concurrent runs of the binary, 40 of
+40 red), it just does not bite CI, which runs the suite once on a host where these tests skip. Redo it
+with the job log in hand: the two halves are unique per-process box names and a `kern_out` that fails
+with the box's own stderr instead of returning an empty stdout for the next assertion to mislabel.
 
 ## `KERN_MAX_CONCURRENT` is best-effort
 
