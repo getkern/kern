@@ -34,7 +34,7 @@ directory).
 Profiles are **resource-centric**: you declare a named slice once, then attach it to as many boxes as
 you like by its prefix (declare-then-carve, attach-by-prefix). The CPU field names are spelled to match
 the CLI flags, see the divergence note at the end. A GPU family is on the
-[Roadmap](../README.md#roadmap), not in this schema.
+[Roadmap](../ROADMAP.md), not in this schema.
 
 > **Editing by hand? Three rules cover everything:**
 >
@@ -323,7 +323,7 @@ Every key maps to a flag one-to-one, nothing to learn twice. If you know the fla
   are always on and cannot be disabled from config (hardening over blind parity, by design).
 - **Keys this edition does not model** (a `[[vgpu]]` / `[[gpu]]` family among them) are **ignored,
   not rejected**, so a `kern.toml` shared with another kern edition still loads here. What is on the
-  roadmap is listed in the [README](../README.md#roadmap); what is in the schema is this document.
+  roadmap is listed in the [roadmap](../ROADMAP.md); what is in the schema is this document.
 
 ## Fleet limits (environment)
 

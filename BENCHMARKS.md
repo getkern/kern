@@ -567,6 +567,31 @@ kern: warning: requested resource cap(s) could not be enforced
 `KERN_NO_SCOPE=1` is 5x faster and removes the cap entirely; it says so on stderr rather than letting
 you find out later. Use it where you want `run` as a plain launcher and are capping some other way.
 
+## A working day, not a cold start
+
+Cold start is quoted everywhere because it is easy to measure, but nobody notices 300 ms once. What a
+developer feels is the twentieth `exec` of the afternoon. Same machine, same images, real commands,
+timed with the shell:
+
+| what you actually type | kern | docker | podman |
+|---|---:|---:|---:|
+| a throwaway box (`run … true`) | **3.4 ms** | 290.8 ms | 290.5 ms |
+| `exec` into a running service | **0.79 ms** | 43.3 ms | 148.6 ms |
+| list what is running (`ps`) | **0.30 ms** | 8.2 ms | 13.5 ms |
+| read logs | **0.35 ms** | 8.2 ms | 37.5 ms |
+| stop a service (`--init` handles SIGTERM) | **2.4 ms** | ~300 ms | |
+| bring a 2-service stack up | **185 ms** | 301 ms | |
+
+> Reproduce any row with `time`, on both sides. No script of ours is involved.
+
+**One row needs a caveat we would rather state than be caught on.** Stopping a service whose init does
+*not* handle SIGTERM takes 10 s on Docker and Podman, and 2.7 ms on kern. That is **not** Docker being
+slow: a PID-namespace init discards signals it has no handler for, so the container genuinely cannot
+die of SIGTERM, and waiting the full grace before `SIGKILL` is the correct, documented behaviour. kern
+reads `/proc/<pid>/status` first and skips a wait that provably cannot end. The honest comparison is
+the row above, with an init that *does* handle the signal: 2.4 ms against ~300, for the same reason every
+other row is fast, not because of a container that ignores signals.
+
 ## Where a box start actually goes
 
 `KERN_TIMING=1` instruments both the parent and the box side. One `kern box --image alpine:3.19`,
@@ -656,7 +681,7 @@ delegated, else caps are skipped (documented in [SECURITY.md](SECURITY.md)).
 Not every figure quoted in the README lives here, on purpose. The day-to-day operations table
 (`exec`, `ps`, `logs`, bringing a stack up) is measured differently, by typing the commands and
 timing them with the shell, so it lives next to that claim in
-[README.md § A working day, not a cold start](README.md#a-working-day-not-a-cold-start) with its own
+[A working day, not a cold start](#a-working-day-not-a-cold-start) with its own
 reproduction line. Copying those numbers into this file would give each of them two homes, and two
 homes is how a number drifts.
 

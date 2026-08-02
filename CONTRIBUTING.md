@@ -49,6 +49,22 @@ without warning. This is **blocking** on review, same as tests:
 - A new flag must land with a parser test asserting it populates the right `Command` field, and a
   rejection must land with a test asserting the `Usage` error (see `cpu_ram_flag_freeze`).
 
+## Documentation has a gate too
+
+Prose is checked the same way code is, mechanically, before the commit:
+
+```sh
+python3 scripts/no-ai-slop.py          # every tracked .md; exit 1 on a hit
+grep -rlP '\x{2014}' --include='*.md' .   # the em-dash: must print nothing
+```
+
+`no-ai-slop.py` refuses a fixed list of markers that read as machine-written: `delve`, `leverage`,
+`seamless`, `robust`, `comprehensive`, `utilize`, `not only X but also Y`, sentence-opening
+`Furthermore`, and the rest. It ignores anything inside a code span, a link target or a fenced block,
+because a word in backticks is a symbol and not the document's voice. The reason it exists is
+commercial rather than aesthetic: readers who see one of those words decide a model wrote the page
+and stop, before checking a single measurement.
+
 ## Reporting security issues
 
 Do **not** open a public issue, see `SECURITY.md`.
