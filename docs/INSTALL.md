@@ -1,7 +1,11 @@
 # Installing kern
 
-One static binary, no daemon, no runtime dependencies beyond `libc`. This page is the long form; the
-[README](../README.md) has the one-liner most people need.
+One static binary and no daemon. Its only Rust dependency is `libc`, and a box built from a
+`--rootfs` needs nothing else on the host. The image path is the exception and is stated as one:
+`kern pull` and `--image` shell out to the system `curl` and `tar` rather than linking a TLS stack
+and a decompressor, which is most of why the binary is 1.83 MB. `kern doctor` reports whether both
+are present. This page is the long form; the [README](../README.md) has the one-liner most people
+need.
 
 
 **🐧 Linux & ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q). One line; auto-detects `x86-64` / `aarch64`:

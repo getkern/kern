@@ -12,7 +12,7 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.83 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-<sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` the only dependency</sub>
+<sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -34,6 +34,12 @@ kern runs Linux workloads in real, kernel-enforced sandboxes: user, PID, mount, 
 namespaces, an overlay or read-only root pivoted in, an always-on seccomp filter, and cgroup v2
 limits. It pulls OCI images, builds them, runs them, and gets out of the way. No background daemon,
 one short-lived process per box.
+
+The binary is 1.83 MB because it carries only what it has to. The entire Rust dependency tree is
+`libc`, JSON and the OCI manifests are parsed by hand, and `pull` uses the `curl` and `tar` already
+on the machine instead of linking a TLS stack and a decompressor. Those two are therefore a real
+requirement of the image path, and `kern doctor` checks for them; a box from a `--rootfs` needs
+neither.
 
 It has **two verbs**. `kern box` wraps a process in a full isolated slice. `kern run` caps a resource
 on a process you launch yourself, with no sandbox. Isolation is simply the first resource kern
