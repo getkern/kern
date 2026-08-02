@@ -14,6 +14,15 @@ Served from **github.com** (read the script first if you like). It downloads the
 your arch and verifies the sha256 before installing. No Rust toolchain required. (`getkern.dev/install.sh`
 is a short alias.)
 
+**From source**, if you would rather build it yourself or want a target we do not publish a binary for:
+
+```sh
+cargo install --git https://github.com/getkern/kern getkern --locked
+```
+
+`--locked` builds against the committed `Cargo.lock`, so you get the dependency versions the release
+was tested with. This is the one route that does need a Rust toolchain.
+
 **🪟 Windows.** One line in PowerShell (no Docker Desktop, no Ubuntu):
 
 ```powershell

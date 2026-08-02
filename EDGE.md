@@ -64,7 +64,7 @@ It has been run by hand (static `aarch64-musl` binary) on:
 ## Install (ARM)
 
 ```sh
-curl -fsSL https://getkern.dev/install.sh | sh     # picks the linux-aarch64 static binary
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # picks linux-aarch64
 # or build natively on the board (e.g. Jetson L4T): cargo build --release
 ```
 

@@ -20,7 +20,7 @@
 [![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 ```sh
-curl -fsSL https://getkern.dev/install.sh | sh     # Linux, x86-64 and ARM
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 kern box dev --image alpine -it -- sh
 ```
 
@@ -69,10 +69,18 @@ still a denylist, which fleet limit is a guard rail instead of a boundary.
 ## Install
 
 ```sh
-curl -fsSL https://getkern.dev/install.sh | sh                     # Linux, x86-64 / aarch64
-irm https://getkern.dev/install.ps1 | iex                          # Windows, via WSL2
-cargo install --git https://github.com/getkern/kern --locked       # from source
+# Linux, x86-64 / aarch64, including Raspberry Pi, Jetson and UNO Q
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+
+# Windows, via WSL2
+irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+
+# from source
+cargo install --git https://github.com/getkern/kern getkern --locked
 ```
+
+Served from github.com, so read the script first if you like; it verifies the sha256 of the release
+binary before installing. `getkern.dev/install.sh` is a short alias for the same file.
 
 Needs a Linux kernel with unprivileged user namespaces and cgroup v2. `kern doctor` tells you
 whether boxes will run here before you try. Boards, WSL2, checksums and the long form:
