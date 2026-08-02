@@ -2,9 +2,7 @@
 
 <img src="assets/brand/kern-logo.png" width="260" alt="kern">
 
-# kern
-
-**A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.**
+**kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
 
 **A real, kernel-enforced container in 3.4 ms, out of one 1.83 MB binary with no daemon.**
 
@@ -20,6 +18,7 @@
 [![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 ```sh
+# Linux and ARM boards. Windows (WSL2) and building from source are just below.
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 kern box dev --image alpine -it -- sh
 ```
