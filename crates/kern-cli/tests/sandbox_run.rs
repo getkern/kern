@@ -57,13 +57,24 @@ fn kern_out(args: &[&str]) -> std::process::Output {
     // mislabelling was observed on 2026-08-01, twice, under a machine loaded by benchmarks, and it
     // cost the time it takes to rule out a real isolation regression. Fail here instead, with the
     // status and stderr the box itself produced, so the message names the cause.
-    if out.stdout.is_empty() && !out.status.success() {
+    //
+    // EXCEPT where the caller is about to skip. Several hosts cannot run a box at all: the GitHub
+    // runner refuses unprivileged user namespaces under its AppArmor profile, and a board without
+    // `newuidmap` falls back to a single-uid map. Every caller checks stderr for those markers and
+    // returns early, and that check happens AFTER this function returns, so panicking here would turn
+    // a deliberate skip into a red suite. The first version of this guard did exactly that and took
+    // CI down on a machine where every one of these tests is supposed to skip.
+    let err = String::from_utf8_lossy(&out.stderr);
+    let host_cannot_run = ["user namespaces", "using single-uid map", "newuidmap"]
+        .iter()
+        .any(|m| err.contains(m));
+    if out.stdout.is_empty() && !out.status.success() && !host_cannot_run {
         panic!(
             "`kern {}` produced no stdout after {} retries: status {:?}, stderr: {}",
             args.join(" "),
             tries,
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            err.trim()
         );
     }
     out
