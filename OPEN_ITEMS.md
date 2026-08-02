@@ -71,6 +71,29 @@ worth anything to an attacker who already has code execution inside the box. Map
 and we have no evidence either way. If it turns out to matter, the lever is to move the five to
 `SIGSYS` and lose the fallback behaviour, which is a compatibility decision, not a hard one.
 
+## The integration tests used fixed box names, and it was not a kern defect
+
+Recorded because the diagnosis took a wrong turn first. Two integration tests failed once during a
+loaded session, `box_run_hardening_uts_net_seccomp` with "loopback present" and
+`many_boxes_share_one_bind_rootfs_concurrently`, and nine consecutive full runs afterwards were green,
+which is the worst shape a failure can have: it looks like an isolation regression and cannot be
+reproduced on demand.
+
+Reproduced deliberately by running four instances of the test binary at once: **40 of 40 executions
+failed**. The cause was in the tests. Every box name was a fixed literal (`t`, `isobox`, `c0`..`c11`,
+`cgexec`) and the registry those names live in is per-USER, not per-test-process, so two runs collide
+and kern correctly refuses the second with `a box named 'c0' is already starting or running`. Any
+other process on the machine starting a box called `t` would have done the same.
+
+kern behaved correctly throughout. What was broken was that the tests could not say so: `kern_out`
+retried five times and then returned an empty stdout, and the next assertion reported a missing
+loopback for a box that had never started. That mislabelling was the real defect, and it is fixed
+independently of the names: the helper now fails with the exit status and the box's own stderr, and
+the 12-box concurrency test collects each failure's reason instead of counting successes.
+
+After both fixes: 60 parallel executions, zero failures, and three consecutive full suites at 691
+tests green.
+
 ## `KERN_MAX_CONCURRENT` is best-effort
 
 The fleet concurrency gate counts live boxes and then starts one, so two launches racing can both

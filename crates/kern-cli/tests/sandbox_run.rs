@@ -18,6 +18,28 @@ fn kern() -> Command {
 /// concurrent boxes capture stdout to files, and 250/250 exit 0). Every caller asserts on
 /// non-empty stdout, so retrying-on-empty is correct and never masks a wrong-output bug. The
 /// userns-skip (stderr mentions "user namespaces") is returned as-is so callers can skip.
+/// A box name nothing else on this machine can be using.
+///
+/// Every box name in this file used to be a fixed literal (`t`, `isobox`, `c0`..`c11`), and the
+/// registry those names live in is per-USER, not per-test-process. Two runs of this binary at once,
+/// which is what happens when the suite runs beside anything else that starts a box, collide and kern
+/// correctly refuses the second: `a box named 'c0' is already starting or running`. The test then
+/// reported that as an isolation failure. Reproduced on 2026-08-01 by running four instances of this
+/// binary in parallel: 10 of 12 boxes refused in the concurrency test, and eight other tests red in
+/// the same round, none of them a defect in kern.
+///
+/// The pid makes it unique across processes and the counter across calls inside one, so a test that
+/// starts several boxes cannot collide with itself either.
+fn boxname(stem: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "{stem}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn kern_out(args: &[&str]) -> std::process::Output {
     let mut out = kern().args(args).output().expect("run kern");
     let mut tries = 0;
@@ -28,6 +50,21 @@ fn kern_out(args: &[&str]) -> std::process::Output {
         std::thread::sleep(std::time::Duration::from_millis(80));
         out = kern().args(args).output().expect("run kern");
         tries += 1;
+    }
+    // A run that produced NOTHING on stdout after the retries is not a result, and returning it makes
+    // the caller's next assertion lie: `assert!(net.contains("lo"), "loopback present")` reports a
+    // missing loopback when what actually happened is that the box never started. That exact
+    // mislabelling was observed on 2026-08-01, twice, under a machine loaded by benchmarks, and it
+    // cost the time it takes to rule out a real isolation regression. Fail here instead, with the
+    // status and stderr the box itself produced, so the message names the cause.
+    if out.stdout.is_empty() && !out.status.success() {
+        panic!(
+            "`kern {}` produced no stdout after {} retries: status {:?}, stderr: {}",
+            args.join(" "),
+            tries,
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     out
 }
@@ -85,6 +122,7 @@ fn build_rootfs(busybox: &Path, tag: &str) -> PathBuf {
 
 #[test]
 fn box_run_isolates_and_propagates_exit_code() {
+    let n_t = boxname("t");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -97,7 +135,15 @@ fn box_run_isolates_and_propagates_exit_code() {
     let rootfs = root.to_str().unwrap();
 
     // A successful command exits 0.
-    let out = kern_out(&["box", "t", "--rootfs", rootfs, "--", "/bin/busybox", "true"]);
+    let out = kern_out(&[
+        "box",
+        &n_t,
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "true",
+    ]);
     let err = String::from_utf8_lossy(&out.stderr);
     // Runtime confirmation that userns really is usable here; otherwise skip.
     if err.contains("user namespaces") {
@@ -115,7 +161,7 @@ fn box_run_isolates_and_propagates_exit_code() {
     let out2 = kern()
         .args([
             "box",
-            "t",
+            &n_t,
             "--rootfs",
             rootfs,
             "--",
@@ -132,7 +178,7 @@ fn box_run_isolates_and_propagates_exit_code() {
     let ro = kern()
         .args([
             "box",
-            "t",
+            &n_t,
             "--rootfs",
             rootfs,
             "--read-only",
@@ -149,7 +195,7 @@ fn box_run_isolates_and_propagates_exit_code() {
     // Default (writable overlay): writing succeeds, but the lower rootfs stays untouched.
     let rw = kern_out(&[
         "box",
-        "t",
+        &n_t,
         "--rootfs",
         rootfs,
         "--",
@@ -173,6 +219,7 @@ fn box_run_isolates_and_propagates_exit_code() {
 
 #[test]
 fn box_detached_appears_in_ps_then_prunes() {
+    let n_pstest = boxname("pstest");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -192,7 +239,7 @@ fn box_detached_appears_in_ps_then_prunes() {
         .env("XDG_RUNTIME_DIR", &xdg)
         .args([
             "box",
-            "pstest",
+            &n_pstest,
             "--rootfs",
             rootfs,
             "-d",
@@ -220,7 +267,7 @@ fn box_detached_appears_in_ps_then_prunes() {
             .args(["ps", "--json"])
             .output()
             .expect("run kern");
-        if String::from_utf8_lossy(&listing.stdout).contains("pstest") {
+        if String::from_utf8_lossy(&listing.stdout).contains(&n_pstest) {
             listed = true;
             break;
         }
@@ -237,7 +284,7 @@ fn box_detached_appears_in_ps_then_prunes() {
             .args(["ps", "--json"])
             .output()
             .expect("run kern");
-        if !String::from_utf8_lossy(&after.stdout).contains("pstest") {
+        if !String::from_utf8_lossy(&after.stdout).contains(&n_pstest) {
             pruned = true;
             break;
         }
@@ -251,6 +298,8 @@ fn box_detached_appears_in_ps_then_prunes() {
 
 #[test]
 fn inspect_shows_detail_then_prune_reclaims_logs() {
+    let n_ghost = boxname("ghost");
+    let n_insp = boxname("insp");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -269,7 +318,7 @@ fn inspect_shows_detail_then_prune_reclaims_logs() {
         .env("XDG_RUNTIME_DIR", &xdg)
         .args([
             "box",
-            "insp",
+            &n_insp,
             "--rootfs",
             rootfs,
             "-d",
@@ -293,11 +342,14 @@ fn inspect_shows_detail_then_prune_reclaims_logs() {
     for _ in 0..40 {
         let o = kern()
             .env("XDG_RUNTIME_DIR", &xdg)
-            .args(["inspect", "insp", "--json"])
+            .args(["inspect", &n_insp, "--json"])
             .output()
             .expect("run kern");
         let s = String::from_utf8_lossy(&o.stdout);
-        if o.status.success() && s.contains("\"name\":\"insp\"") && s.contains("\"pid\":") {
+        if o.status.success()
+            && s.contains(&format!("\"name\":\"{n_insp}\""))
+            && s.contains("\"pid\":")
+        {
             assert!(
                 s.contains("sleep"),
                 "inspect should include the command: {s}"
@@ -312,7 +364,7 @@ fn inspect_shows_detail_then_prune_reclaims_logs() {
     // Inspecting a name that isn't running fails (and would carry the `kern ps` hint).
     let miss = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["inspect", "ghost"])
+        .args(["inspect", &n_ghost])
         .output()
         .expect("run kern");
     assert!(!miss.status.success(), "inspect of a dead name must fail");
@@ -324,7 +376,7 @@ fn inspect_shows_detail_then_prune_reclaims_logs() {
             .args(["ps", "--json"])
             .output()
             .expect("run kern");
-        if !String::from_utf8_lossy(&after.stdout).contains("insp") {
+        if !String::from_utf8_lossy(&after.stdout).contains(&n_insp) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -354,6 +406,7 @@ fn inspect_shows_detail_then_prune_reclaims_logs() {
 
 #[test]
 fn detached_box_with_bad_command_reports_failure_not_started() {
+    let n_badcmd = boxname("badcmd");
     // A detached box whose command can't exec must NOT print a misleading "started": the readiness
     // pipe makes the launcher wait for the box's `execvp` (EOF = up) and report failure otherwise.
     let Some(busybox) = static_busybox() else {
@@ -373,7 +426,7 @@ fn detached_box_with_bad_command_reports_failure_not_started() {
         .env("XDG_RUNTIME_DIR", &xdg)
         .args([
             "box",
-            "badcmd",
+            &n_badcmd,
             "--rootfs",
             rootfs,
             "-d",
@@ -409,6 +462,7 @@ fn detached_box_with_bad_command_reports_failure_not_started() {
 
 #[test]
 fn box_logs_capture_output_and_stats_list_the_box() {
+    let n_logtest = boxname("logtest");
     // A detached box's stdout is captured to a per-box log (`kern logs <name>`), and the live box
     // appears in `kern stats --json`. Skip-graceful like the rest of this suite.
     let Some(busybox) = static_busybox() else {
@@ -428,7 +482,7 @@ fn box_logs_capture_output_and_stats_list_the_box() {
         .env("XDG_RUNTIME_DIR", &xdg)
         .args([
             "box",
-            "logtest",
+            &n_logtest,
             "--rootfs",
             rootfs,
             "-d",
@@ -452,7 +506,7 @@ fn box_logs_capture_output_and_stats_list_the_box() {
     std::thread::sleep(std::time::Duration::from_millis(700));
     let logs = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["logs", "logtest"])
+        .args(["logs", &n_logtest])
         .output()
         .expect("run kern");
     let logs = String::from_utf8_lossy(&logs.stdout);
@@ -469,7 +523,7 @@ fn box_logs_capture_output_and_stats_list_the_box() {
         .expect("run kern");
     let stats = String::from_utf8_lossy(&stats.stdout);
     assert!(
-        stats.contains("logtest"),
+        stats.contains(&n_logtest),
         "stats --json should list the live box: {stats}"
     );
 
@@ -477,7 +531,7 @@ fn box_logs_capture_output_and_stats_list_the_box() {
     std::thread::sleep(std::time::Duration::from_secs(2));
     let post = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["logs", "logtest"])
+        .args(["logs", &n_logtest])
         .output()
         .expect("run kern");
     assert!(
@@ -493,6 +547,8 @@ fn box_logs_capture_output_and_stats_list_the_box() {
 /// writes, a later box reads back. Fully rootless (a dir bind-mount).
 #[test]
 fn named_volume_persists_across_boxes() {
+    let n_va = boxname("va");
+    let n_vb = boxname("vb");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -511,7 +567,7 @@ fn named_volume_persists_across_boxes() {
         .env("XDG_DATA_HOME", &data)
         .args([
             "box",
-            "va",
+            &n_va,
             "--rootfs",
             rootfs,
             "-v",
@@ -543,7 +599,7 @@ fn named_volume_persists_across_boxes() {
             .env("XDG_DATA_HOME", &data)
             .args([
                 "box",
-                "vb",
+                &n_vb,
                 "--rootfs",
                 rootfs,
                 "-v",
@@ -581,6 +637,7 @@ fn named_volume_persists_across_boxes() {
 /// and the size cap is really enforced - writing past it fails with ENOSPC.
 #[test]
 fn box_vdisk_mounts_size_capped_volume() {
+    let n_vd = boxname("vd");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -601,7 +658,7 @@ fn box_vdisk_mounts_size_capped_volume() {
         .env("XDG_CONFIG_HOME", &cfgdir)
         .args([
             "box",
-            "vd",
+            &n_vd,
             "vdisk:scratch",
             "--rootfs",
             root.to_str().unwrap(),
@@ -639,6 +696,7 @@ fn box_vdisk_mounts_size_capped_volume() {
 /// real host device (any `/dev/i2c-*` or `/dev/gpiochip*`); skipped where none exist (typical CI).
 #[test]
 fn box_vgpio_passes_listed_devices_only() {
+    let n_vg = boxname("vg");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -671,7 +729,7 @@ fn box_vgpio_passes_listed_devices_only() {
         .env("XDG_CONFIG_HOME", &cfgdir)
         .args([
             "box",
-            "vg",
+            &n_vg,
             "vgpio:io",
             "--rootfs",
             root.to_str().unwrap(),
@@ -708,6 +766,7 @@ fn box_vgpio_passes_listed_devices_only() {
 /// workload runs pinned to the profile's CPUs. Profile token order (before/after the name) is free.
 #[test]
 fn box_applies_vcpu_profile() {
+    let n_bp = boxname("bp");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -728,7 +787,7 @@ fn box_applies_vcpu_profile() {
         .env("XDG_CONFIG_HOME", &cfgdir)
         .args([
             "box",
-            "bp",
+            &n_bp,
             "vcpu:pin0",
             "--rootfs",
             root.to_str().unwrap(),
@@ -853,6 +912,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
 /// `Cpus_allowed_list`, which on any multi-CPU host differs from the unpinned `0-N`.
 #[test]
 fn box_cpuset_pins_cpus() {
+    let n_pin = boxname("pin");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -865,7 +925,7 @@ fn box_cpuset_pins_cpus() {
     let rootfs = root.to_str().unwrap();
     let out = kern_out(&[
         "box",
-        "pin",
+        &n_pin,
         "--rootfs",
         rootfs,
         "--cpuset-cpus",
@@ -894,6 +954,7 @@ fn box_cpuset_pins_cpus() {
 
 #[test]
 fn symlinked_dev_in_rootfs_cannot_escape() {
+    let n_esc = boxname("esc");
     // SECURITY regression: a hostile rootfs whose `/dev` is a symlink to a host path must NOT let
     // /dev setup create files / bind devices at that host location. Synthetic, self-contained.
     let Some(busybox) = static_busybox() else {
@@ -918,7 +979,7 @@ fn symlinked_dev_in_rootfs_cannot_escape() {
     let out = kern()
         .args([
             "box",
-            "esc",
+            &n_esc,
             "--rootfs",
             rootfs.to_str().unwrap(),
             "--",
@@ -942,6 +1003,7 @@ fn symlinked_dev_in_rootfs_cannot_escape() {
 
 #[test]
 fn box_does_not_leak_host_environment() {
+    let n_ev = boxname("ev");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -957,7 +1019,15 @@ fn box_does_not_leak_host_environment() {
     let run = || {
         kern()
             .env("KERN_TEST_SECRET", "do-not-leak-me")
-            .args(["box", "ev", "--rootfs", rootfs, "--", "/bin/busybox", "env"])
+            .args([
+                "box",
+                &n_ev,
+                "--rootfs",
+                rootfs,
+                "--",
+                "/bin/busybox",
+                "env",
+            ])
             .output()
             .expect("run kern")
     };
@@ -990,6 +1060,7 @@ fn box_does_not_leak_host_environment() {
 
 #[test]
 fn box_provides_essential_dev_nodes() {
+    let n_dv = boxname("dv");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1003,7 +1074,7 @@ fn box_provides_essential_dev_nodes() {
     // /dev/urandom must be readable (a real device, not a faked regular file).
     let out = kern_out(&[
         "box",
-        "dv",
+        &n_dv,
         "--rootfs",
         rootfs,
         "--",
@@ -1033,6 +1104,7 @@ fn box_provides_essential_dev_nodes() {
 /// filter. This test is the adversarial counterpart to `box_provides_essential_dev_nodes`.
 #[test]
 fn box_denies_unauthorized_devices() {
+    let n_dd = boxname("dd");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1048,7 +1120,7 @@ fn box_denies_unauthorized_devices() {
     //     so a hostile workload can't reach the host disk even with the mknod syscall available.
     let out = kern_out(&[
         "box",
-        "dd",
+        &n_dd,
         "--rootfs",
         rootfs,
         "--",
@@ -1082,6 +1154,7 @@ fn box_denies_unauthorized_devices() {
 
 #[test]
 fn box_run_hardening_uts_net_seccomp() {
+    let n_isobox = boxname("isobox");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1096,7 +1169,7 @@ fn box_run_hardening_uts_net_seccomp() {
     // UTS: hostname inside is the box name, not the host's.
     let out = kern_out(&[
         "box",
-        "isobox",
+        &n_isobox,
         "--rootfs",
         rootfs,
         "--",
@@ -1110,14 +1183,14 @@ fn box_run_hardening_uts_net_seccomp() {
     }
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "isobox",
+        n_isobox,
         "UTS namespace: hostname should be the box name"
     );
 
     // NET: the network namespace exposes only loopback.
     let net = kern_out(&[
         "box",
-        "isobox",
+        &n_isobox,
         "--rootfs",
         rootfs,
         "--",
@@ -1136,7 +1209,7 @@ fn box_run_hardening_uts_net_seccomp() {
     let killed = kern()
         .args([
             "box",
-            "isobox",
+            &n_isobox,
             "--rootfs",
             rootfs,
             "--",
@@ -1163,7 +1236,7 @@ fn box_run_hardening_uts_net_seccomp() {
     // the fresh procfs carries the read-only /proc/sys submount.
     let mounts = kern_out(&[
         "box",
-        "isobox",
+        &n_isobox,
         "--rootfs",
         rootfs,
         "--",
@@ -1186,6 +1259,8 @@ fn box_run_hardening_uts_net_seccomp() {
 /// and a `:ro` volume rejects writes. The only sanctioned way data enters/leaves a box.
 #[test]
 fn box_volume_roundtrips_data_and_ro_is_enforced() {
+    let n_vro = boxname("vro");
+    let n_vrw = boxname("vrw");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1209,7 +1284,7 @@ fn box_volume_roundtrips_data_and_ro_is_enforced() {
     let rw = format!("{}:/rw", host.join("rw").display());
     let out = kern_out(&[
         "box",
-        "vrw",
+        &n_vrw,
         "--rootfs",
         rootfs,
         "-v",
@@ -1236,7 +1311,7 @@ fn box_volume_roundtrips_data_and_ro_is_enforced() {
     let rovol = format!("{}:/ro:ro", host.join("ro").display());
     let ro = kern_out(&[
         "box",
-        "vro",
+        &n_vro,
         "--rootfs",
         rootfs,
         "-v",
@@ -1261,6 +1336,7 @@ fn box_volume_roundtrips_data_and_ro_is_enforced() {
 /// `--env` and `--workdir` reach the workload.
 #[test]
 fn box_env_and_workdir_apply() {
+    let n_e = boxname("e");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1273,7 +1349,7 @@ fn box_env_and_workdir_apply() {
     let rootfs = root.to_str().unwrap();
     let out = kern_out(&[
         "box",
-        "e",
+        &n_e,
         "--rootfs",
         rootfs,
         "--env",
@@ -1303,6 +1379,7 @@ fn box_env_and_workdir_apply() {
 /// ubiquitous. A sticky world-writable `/dev` tmpfs + `fs.protected_regular` used to break it.
 #[test]
 fn box_dev_null_is_writable() {
+    let n_dn = boxname("dn");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1315,7 +1392,7 @@ fn box_dev_null_is_writable() {
     let rootfs = root.to_str().unwrap();
     let out = kern_out(&[
         "box",
-        "dn",
+        &n_dn,
         "--rootfs",
         rootfs,
         "--",
@@ -1341,6 +1418,7 @@ fn box_dev_null_is_writable() {
 /// PID namespace (a tiny process table), and propagates the command's exit code.
 #[test]
 fn box_exec_enters_running_box() {
+    let n_xbox = boxname("xbox");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1358,7 +1436,7 @@ fn box_exec_enters_running_box() {
         .env("XDG_RUNTIME_DIR", &xdg)
         .args([
             "box",
-            "xbox",
+            &n_xbox,
             "--rootfs",
             rootfs,
             "-d",
@@ -1381,11 +1459,11 @@ fn box_exec_enters_running_box() {
     // exec sees the box's hostname.
     let h = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["exec", "xbox", "--", "/bin/busybox", "hostname"])
+        .args(["exec", &n_xbox, "--", "/bin/busybox", "hostname"])
         .output()
         .expect("run kern");
     assert!(
-        String::from_utf8_lossy(&h.stdout).contains("xbox"),
+        String::from_utf8_lossy(&h.stdout).contains(&n_xbox),
         "exec should see the box's hostname: {}",
         String::from_utf8_lossy(&h.stdout)
     );
@@ -1393,7 +1471,7 @@ fn box_exec_enters_running_box() {
     // exec propagates the exit code.
     let code = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["exec", "xbox", "--", "/bin/busybox", "sh", "-c", "exit 7"])
+        .args(["exec", &n_xbox, "--", "/bin/busybox", "sh", "-c", "exit 7"])
         .output()
         .expect("run kern");
     assert_eq!(
@@ -1404,7 +1482,7 @@ fn box_exec_enters_running_box() {
 
     let _ = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["stop", "xbox"])
+        .args(["stop", &n_xbox])
         .output();
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
@@ -1414,6 +1492,7 @@ fn box_exec_enters_running_box() {
 /// subdirectory created/removed in the shared rootfs used to race (self-pivot removed it).
 #[test]
 fn many_boxes_share_one_bind_rootfs_concurrently() {
+    let n_p = boxname("p");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1429,7 +1508,7 @@ fn many_boxes_share_one_bind_rootfs_concurrently() {
     let probe = kern()
         .args([
             "box",
-            "p",
+            &n_p,
             "--rootfs",
             &rootfs,
             "--read-only",
@@ -1449,10 +1528,10 @@ fn many_boxes_share_one_bind_rootfs_concurrently() {
         .map(|i| {
             let rootfs = rootfs.clone();
             std::thread::spawn(move || {
-                kern()
+                let out = kern()
                     .args([
                         "box",
-                        &format!("c{i}"),
+                        &boxname(&format!("c{i}")),
                         "--rootfs",
                         &rootfs,
                         "--read-only",
@@ -1461,20 +1540,29 @@ fn many_boxes_share_one_bind_rootfs_concurrently() {
                         "true",
                     ])
                     .output()
-                    .expect("run kern")
-                    .status
-                    .success()
+                    .expect("run kern");
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                (i, out.status.success(), err)
             })
         })
         .collect();
-    let ok = handles
+    // Collect the FAILURES with their reason, not a bare count. `ok != 12` on its own says a box did
+    // not start and nothing about why, so a transient environmental refusal reads exactly like the
+    // `.old_root` race this test exists to catch.
+    let results: Vec<(usize, bool, String)> = handles
         .into_iter()
-        .map(|h| h.join().unwrap_or(false))
-        .filter(|&b| b)
-        .count();
-    assert_eq!(
-        ok, 12,
-        "all 12 boxes sharing one bind rootfs should start (no .old_root race)"
+        .map(|h| h.join().unwrap_or((0, false, "thread panicked".into())))
+        .collect();
+    let failed: Vec<&(usize, bool, String)> = results.iter().filter(|(_, ok, _)| !ok).collect();
+    assert!(
+        failed.is_empty(),
+        "all 12 boxes sharing one bind rootfs should start (no .old_root race); {} failed: {}",
+        failed.len(),
+        failed
+            .iter()
+            .map(|(i, _, err)| format!("c{i}: {err}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1485,6 +1573,7 @@ fn many_boxes_share_one_bind_rootfs_concurrently() {
 /// (and a host write) through a planted symlink.
 #[test]
 fn volume_target_through_a_symlink_is_refused() {
+    let n_vesc = boxname("vesc");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1509,7 +1598,7 @@ fn volume_target_through_a_symlink_is_refused() {
     let out = kern()
         .args([
             "box",
-            "vesc",
+            &n_vesc,
             "--rootfs",
             rootfs.to_str().unwrap(),
             "-v",
@@ -1541,10 +1630,11 @@ fn volume_target_through_a_symlink_is_refused() {
 /// root). Caught before any sandbox setup, so this needs no user namespace.
 #[test]
 fn volume_target_with_dotdot_is_rejected() {
+    let n_vdd = boxname("vdd");
     let out = kern()
         .args([
             "box",
-            "vdd",
+            &n_vdd,
             "--image",
             "alpine",
             "-v",
@@ -1569,6 +1659,7 @@ fn volume_target_with_dotdot_is_rejected() {
 /// Creating an entry in `/dev` must fail, while the bound device nodes stay usable.
 #[test]
 fn read_only_dev_is_not_writable() {
+    let n_rodev = boxname("rodev");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1582,7 +1673,7 @@ fn read_only_dev_is_not_writable() {
     // /dev/null still writable; creating a new /dev entry refused; root refused.
     let out = kern_out(&[
         "box",
-        "rodev",
+        &n_rodev,
         "--rootfs",
         rootfs,
         "--read-only",
@@ -1619,6 +1710,7 @@ fn read_only_dev_is_not_writable() {
 /// (then kern falls back to the single-uid map, which is also fine).
 #[test]
 fn ranged_uid_map_when_subids_available() {
+    let n_idr = boxname("idr");
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -1644,7 +1736,7 @@ fn ranged_uid_map_when_subids_available() {
     // The range is opt-in (`--uid-range`); the default is a single-uid map.
     let out = kern_out(&[
         "box",
-        "idr",
+        &n_idr,
         "--rootfs",
         rootfs,
         "--uid-range",
@@ -1693,6 +1785,7 @@ fn ranged_uid_map_when_subids_available() {
 
 #[test]
 fn single_uid_map_is_the_default() {
+    let n_su = boxname("su");
     // Without `--uid-range`, the box gets a single-uid identity map (one row: box uid 0 = caller)
     // regardless of whether subids exist - the fast, most-isolated default. This is the perf-and-
     // security default that lets a bare box beat heavier runtimes; the range is strictly opt-in.
@@ -1708,7 +1801,7 @@ fn single_uid_map_is_the_default() {
     let rootfs = root.to_str().unwrap();
     let out = kern_out(&[
         "box",
-        "su",
+        &n_su,
         "--rootfs",
         rootfs,
         "--",
@@ -1732,6 +1825,8 @@ fn single_uid_map_is_the_default() {
 
 #[test]
 fn bind_rootfs_writes_reach_source_while_overlay_keeps_it_immutable() {
+    let n_bm = boxname("bm");
+    let n_om = boxname("om");
     // `--bind-rootfs` binds the source directly (faster on slow-overlay kernels) - a write inside
     // the box lands in the source dir. The default overlay keeps the source immutable. This pins
     // both halves of the documented trade-off.
@@ -1749,7 +1844,7 @@ fn bind_rootfs_writes_reach_source_while_overlay_keeps_it_immutable() {
     // Bind mode: a write at the box root must appear in the source directory.
     let out = kern_out(&[
         "box",
-        "bm",
+        &n_bm,
         "--bind-rootfs",
         "--rootfs",
         rootfs,
@@ -1771,7 +1866,7 @@ fn bind_rootfs_writes_reach_source_while_overlay_keeps_it_immutable() {
     // Overlay (default): a write must NOT leak to the source.
     kern_out(&[
         "box",
-        "om",
+        &n_om,
         "--rootfs",
         rootfs,
         "--",
@@ -1789,6 +1884,7 @@ fn bind_rootfs_writes_reach_source_while_overlay_keeps_it_immutable() {
 
 #[test]
 fn bind_rootfs_net_does_not_clobber_a_symlinked_host_file() {
+    let n_bn = boxname("bn");
     // Security regression: `--bind-rootfs --net` must NOT do a host-side write through a symlink in
     // the (possibly untrusted) rootfs. A `/etc/resolv.conf -> <outside file>` symlink must leave
     // that outside file untouched - kern injects no resolv.conf in bind mode for exactly this reason.
@@ -1810,7 +1906,7 @@ fn bind_rootfs_net_does_not_clobber_a_symlinked_host_file() {
 
     let out = kern_out(&[
         "box",
-        "bn",
+        &n_bn,
         "--bind-rootfs",
         "--net",
         "--rootfs",
@@ -1992,9 +2088,12 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
         eprintln!("skip: unprivileged user namespaces unavailable");
         return;
     }
-    let tag = "cgexec";
+    // Unique per process, like every other box name here: this one is bound to a variable rather than
+    // written inline at each call site, which is why the sweep that made the others unique missed it.
+    let tag_owned = boxname("cgexec");
+    let tag: &str = &tag_owned;
     let _ = kern().args(["stop", tag]).output(); // clear any leftover from a prior aborted run
-    let root = build_rootfs(&busybox, tag);
+    let root = build_rootfs(&busybox, "cgexec");
     let rootfs = root.to_str().unwrap();
 
     let start = kern()
