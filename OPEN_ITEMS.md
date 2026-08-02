@@ -108,6 +108,42 @@ The defect it addressed is real and reproducible on demand (four concurrent runs
 with the job log in hand: the two halves are unique per-process box names and a `kern_out` that fails
 with the box's own stderr instead of returning an empty stdout for the next assertion to mislabel.
 
+## The Python SDK pays a 3.2 ms floor that is CPython's, not kern's
+
+`kern_sandbox.run_code` latencies land on three discrete values, 15.8, 31.5 and 64 ms, and a natural
+distribution does not do that. Measured over 200 calls, `python:3.12-slim`, 2026-08-01: 188 at 15-16
+ms, 10 at 31-32, 2 at 64.
+
+The cause is `subprocess.Popen.wait(timeout=...)` in CPython's standard library, which does not block
+on `waitpid`: it polls with an exponential backoff, from `subprocess.py` directly,
+
+    delay = 0.0005                          # 500 us
+    delay = min(delay * 2, remaining, .05)
+    time.sleep(delay)
+
+so its wake-ups fall at **0.5, 1.5, 3.5, 7.5, 15.5, 31.5, 63.5 ms**. Those are the observed clusters
+to the decimal. `bindings/python/kern_sandbox/__init__.py` calls it at line 899 to enforce its own
+deadline, which is what selects the polling branch.
+
+Three measurements separate whose cost it is, all on the same host, image and workload:
+
+| | p50 | shape |
+|---|---:|---|
+| `kern box --image python:3.12-slim -- python3 -c print(1)`, no binding | 12.28 ms | smooth, 10 to 15 |
+| the same through the **Node** binding, which does not use CPython | 13.22 ms | smooth, 11 to 17 |
+| the same through the **Python** binding | 15.79 ms | quantised: 15.5 / 31.5 / 64 |
+
+So the box is not quantised and neither is Node. The real work is 12.28 ms and the first useful poll
+lands at 15.5, which makes **3.2 ms per call, 26%, pure sleep**, plus a tail that doubles when the
+process finishes just after a check.
+
+The shape of the fix, not applied and deliberately not applied before a release: the two reader
+threads already reach EOF when the box closes its pipes, which is exactly when it exits, so joining
+them with the deadline and then calling `proc.wait()` with NO timeout uses the blocking `waitpid`
+path and never polls. The deadline stays enforceable by a watchdog that tears the box down, which is
+what labels a `timeout` fault today. It is a change to a lifecycle whose other failure mode is still
+open two entries above, so it wants its own release and its own measurement, not the eve of one.
+
 ## `KERN_MAX_CONCURRENT` is best-effort
 
 The fleet concurrency gate counts live boxes and then starts one, so two launches racing can both
