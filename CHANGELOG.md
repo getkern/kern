@@ -17,6 +17,87 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.32], 2026-08-02
+
+### Fixed
+
+- **`--timeout` left a watchdog process behind whenever the supervisor was killed rather than
+  allowed to exit.** `--timeout N` forks a watchdog in the HOST namespace, before the box's
+  `unshare(CLONE_NEWPID)`, so that it can signal the box's ns-init. It then slept `N` out, and the
+  only thing that stopped it early was the supervisor's own cancellation on a normal exit. Kill the
+  supervisor before it reaches that line and the watchdog was orphaned for the remainder of the
+  deadline: 884 KB, one pid and one entry in every `ps`, for as long as the deadline had left.
+
+  `kern stop` alone is a race (it SIGKILLs pid 1, then sweeps the supervisor's process group), and
+  measured over six trials it leaked 0 of 6 that way. SIGKILLing the supervisor directly leaked
+  **6 of 6**, and that is not a synthetic case: it is exactly what the Python and Node bindings do
+  after `kern stop`, which is how **fourteen** of these accumulated in one evening of running the
+  SDK suites, each carrying the SDK's 86405 s deadline, so each due to sleep for a day.
+
+  The watchdog now waits on a **pidfd** for the box's exit with the deadline only as a cap, so it
+  leaves the instant there is nothing left to guard, whoever killed the supervisor and whether or
+  not anyone got to cancel it. The deadline itself is unchanged and still fires: a box that outlives
+  it gets SIGTERM, then SIGKILL after the same 2 s grace, and the grace now also ends early if the
+  box dies on the SIGTERM. Every failure mode of the new wait (no `pidfd_open`, an unreadable clock,
+  an fd that cannot be polled, EINTR) degrades to sleeping the deadline out, which is precisely the
+  old behaviour, so a signal can never fire EARLY on a box that still has time left.
+
+  It deliberately does NOT key on the supervisor's death: SIGKILL a supervisor and the box's pid 1
+  is orphaned but keeps running, and enforcing the deadline on exactly that box is the watchdog's
+  reason to exist. Keying on the box's own exit keeps the safety net and removes the leak.
+
+  This also closes the entry in `OPEN_ITEMS.md` that described the SDK suites as leaving **boxes**
+  behind. That description was wrong, and the correction is recorded there: the survivors were not
+  boxes. Examined rather than counted, each was `kern` at 884 KB RSS, 0% CPU, one thread, asleep in
+  `hrtimer_nanosleep`, with no children and the HOST's namespaces. The box really was gone and
+  `kern ps` was right to show nothing. Both SDK suites now finish from a clean slate with **zero**
+  kern processes alive.
+
+  Pinned by `stopping_a_box_leaves_no_timeout_watchdog_behind`, which fails against 0.6.31.
+
+- **kern-sandbox 0.1.13: every wait in both bindings was on a clock instead of on an event.** Three
+  separate places, one shape, each measured before and after.
+
+  **Python, every call.** The binding enforced its own deadline with `Popen.wait(timeout=...)`,
+  which does not block on the child: it polls on an exponential backoff (`delay = 0.0005`, then
+  `delay = min(delay * 2, remaining, .05)`) whose wake-ups land at 0.5, 1.5, 3.5, 7.5, 15.5 and
+  31.5 ms. Work finishing at 13.6 ms was not noticed until 15.5, and 200 identical calls landed on
+  three discrete values rather than a distribution: 188 at 15-16 ms, 10 at 31-32, 2 at 64. It is now
+  a `poll(2)` on a **pidfd**, readable the instant the box exits, with the deadline enforced by the
+  kernel. Re-measured over 200 calls: p50 **15.75 to 13.91**, p90 **31.86 to 16.16**, p99 **64.03 to
+  34.34**, floor **15.61 to 11.74**, and the quantisation is gone. A bare `run(["true"])`, pinned by
+  the same rounding to the 7.5 ms wake-up, is **4.03 ms**, which puts the binding's own overhead
+  over a native `kern box` at **0.23 ms** where the published figure was +3.9. `select` was not
+  used: it is bounded by `FD_SETSIZE` on the fd NUMBER, so a caller holding many sockets would get a
+  `ValueError` out of a library that has nothing to do with its fd count.
+
+  **Node, after every call.** A 250 ms `setInterval` armed on every call was never cleared by the
+  code that resolves it; it cleared itself on its own next tick, and until then it kept the event
+  loop alive. Measured between a call resolving and the process being able to exit: **224 to 232 ms
+  of dead time, against 19 to 27 ms of real work**. The interval only existed to notice a flag set
+  in one place, so it is deleted and that one place acts directly. Re-measured: **0.2 ms**.
+
+  **Node, closing a persistent kernel.** `close()` did `await setTimeout(150)` unconditionally,
+  whether or not the box had already gone: **152 ms measured** for a box that exits in a few. It now
+  waits on the child's own `exit` event with that 150 ms as a cap only. Re-measured: **16 to 18 ms**,
+  the remainder being the `kern stop` it spawns, which is real work.
+
+  Six regression tests, all verified to fail against 0.1.12. The Python ones assert the MECHANISM
+  rather than a duration (a timed wait is simply not allowed to happen while a pidfd is available),
+  so they cannot flap on a loaded machine, and both fallback branches are exercised: with
+  `os.pidfd_open` deleted, and with it raising ENOSYS as a syscall filter would. The ENOSYS branch
+  was hit 71 times in one suite run, so it is live code and not decoration.
+
+- **A stale cross-reference put two different numbers on the same measurement.** `BENCHMARKS.md`
+  pointed at "the 3.6 ms OCI-image row above" while the row, the README table and the rest of
+  `BENCHMARKS.md` all say **3.4 ms**. Both binding READMEs and the launch blog post carried the same
+  stale 3.6. All aligned on the measured figure.
+
+- **`OPEN_ITEMS.md` shipped three of its sections twice, and the second copy was the OLD text.**
+  Including the claim that the 0.1.12 concurrency tests left 60 boxes of their own, which the newer
+  copy immediately above it explicitly retracts. A reader scrolling down found a retracted claim
+  presented as current. The stale block is removed.
+
 ## [0.6.31], 2026-08-01
 
 ### Fixed
@@ -2328,6 +2409,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 - Project docs: README, SECURITY, ARCHITECTURE, CONTRIBUTING, CLA, CODE_OF_CONDUCT.
 - CI: build + test + clippy + fmt + cargo-audit + cargo-deny on x86 (skip-graceful for HW).
 
+[0.6.32]: https://github.com/getkern/kern/releases/tag/v0.6.32
 [0.6.31]: https://github.com/getkern/kern/releases/tag/v0.6.31
 [0.6.30]: https://github.com/getkern/kern/releases/tag/v0.6.30
 [0.6.29]: https://github.com/getkern/kern/releases/tag/v0.6.29

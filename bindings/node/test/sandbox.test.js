@@ -845,3 +845,41 @@ test("the version in the code matches the one in package.json", () => {
     `kern.version is ${kern.version} but package.json says ${pkg.version}`,
   );
 });
+
+test("a resolved call leaves no timer holding the event loop", exec, async () => {
+  // A call used to arm a 250 ms setInterval that `finish` never cleared, so it survived the call and
+  // kept the loop alive until its own next tick: measured 224 to 232 ms of dead time between the call
+  // resolving and the process being able to exit, against 19 to 27 ms of real work. A one-shot script
+  // therefore spent ten times longer waiting on a stale timer than running the box.
+  //
+  // Asserted as a count of live handles rather than as a duration, so it cannot flap: the deadline
+  // timer is cleared by `finish`, and nothing else may be left behind.
+  await withSandbox({ image: "alpine", timeoutS: 30 }, async (s) => {
+    const live = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+    const before = live();
+    await s.run(["/bin/true"]);
+    assert.strictEqual(
+      live(),
+      before,
+      "a resolved call must not leave a timer behind (the 250 ms interval used to outlive it)",
+    );
+  });
+});
+
+test("closing a persistent kernel waits for the exit instead of sleeping a fixed 150 ms", exec, async () => {
+  // `close()` used to `await setTimeout(150)` unconditionally, whether or not the box was already
+  // gone: 152 ms measured on every close, for a box that exits in a few. It now waits on the child's
+  // own exit event with that 150 ms only as a cap.
+  //
+  // The bound is deliberately just under the old hard floor: 150 ms was a sleep, so ANY value below
+  // it fails against the previous code no matter how fast the machine, while 145 leaves nine times
+  // the measured 16 ms of headroom for a loaded runner.
+  await withSandbox({ image: "python:3.12-slim", timeoutS: 30 }, async (s) => {
+    const k = await s.kernel();
+    await k.runCode("x = 1");
+    const t = Date.now();
+    await k.close();
+    const ms = Date.now() - t;
+    assert.ok(ms < 145, `close() took ${ms} ms; it used to sleep a fixed 150 ms regardless`);
+  });
+});

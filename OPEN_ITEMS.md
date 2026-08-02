@@ -108,24 +108,24 @@ The defect it addressed is real and reproducible on demand (four concurrent runs
 with the job log in hand: the two halves are unique per-process box names and a `kern_out` that fails
 with the box's own stderr instead of returning an empty stdout for the next assertion to mislabel.
 
-## The Python SDK pays a 3.2 ms floor that is CPython's, not kern's
+## RESOLVED: the Python SDK paid a 3.2 ms floor that was CPython's, not kern's
 
-`kern_sandbox.run_code` latencies land on three discrete values, 15.8, 31.5 and 64 ms, and a natural
-distribution does not do that. Measured over 200 calls, `python:3.12-slim`, 2026-08-01: 188 at 15-16
-ms, 10 at 31-32, 2 at 64.
+`kern_sandbox.run_code` latencies landed on three discrete values, 15.8, 31.5 and 64 ms, and a
+natural distribution does not do that. Measured over 200 calls, `python:3.12-slim`, 2026-08-01: 188
+at 15-16 ms, 10 at 31-32, 2 at 64.
 
-The cause is `subprocess.Popen.wait(timeout=...)` in CPython's standard library, which does not block
-on `waitpid`: it polls with an exponential backoff, from `subprocess.py` directly,
+The cause was `subprocess.Popen.wait(timeout=...)` in CPython's standard library, which does not
+block on `waitpid`: it polls with an exponential backoff, from `subprocess.py` directly,
 
     delay = 0.0005                          # 500 us
     delay = min(delay * 2, remaining, .05)
     time.sleep(delay)
 
-so its wake-ups fall at **0.5, 1.5, 3.5, 7.5, 15.5, 31.5, 63.5 ms**. Those are the observed clusters
-to the decimal. `bindings/python/kern_sandbox/__init__.py` calls it at line 899 to enforce its own
-deadline, which is what selects the polling branch.
+so its wake-ups fall at **0.5, 1.5, 3.5, 7.5, 15.5, 31.5, 63.5 ms**. Those were the observed clusters
+to the decimal. The binding called it to enforce its own deadline, which is what selected the polling
+branch.
 
-Three measurements separate whose cost it is, all on the same host, image and workload:
+Three measurements separated whose cost it was, all on the same host, image and workload:
 
 | | p50 | shape |
 |---|---:|---|
@@ -133,16 +133,12 @@ Three measurements separate whose cost it is, all on the same host, image and wo
 | the same through the **Node** binding, which does not use CPython | 13.22 ms | smooth, 11 to 17 |
 | the same through the **Python** binding | 15.79 ms | quantised: 15.5 / 31.5 / 64 |
 
-So the box is not quantised and neither is Node. The real work is 12.28 ms and the first useful poll
-lands at 15.5, which makes **3.2 ms per call, 26%, pure sleep**, plus a tail that doubles when the
-process finishes just after a check.
-
-The shape of the fix, not applied and deliberately not applied before a release: the two reader
-threads already reach EOF when the box closes its pipes, which is exactly when it exits, so joining
-them with the deadline and then calling `proc.wait()` with NO timeout uses the blocking `waitpid`
-path and never polls. The deadline stays enforceable by a watchdog that tears the box down, which is
-what labels a `timeout` fault today. It is a change to a lifecycle whose other failure mode is still
-open two entries above, so it wants its own release and its own measurement, not the eve of one.
+Fixed in kern-sandbox **0.1.13**: the wait is a `poll(2)` on a pidfd, which becomes readable the
+instant the box exits, so the deadline is enforced by the kernel instead of by a sleep loop, with a
+fallback to the old polling wait wherever `pidfd_open` is unavailable. Re-measured over 200 calls:
+p50 15.75 to 13.91, p90 31.86 to 16.16, p99 64.03 to 34.34, floor 15.61 to 11.74, and the three
+clusters are replaced by a continuous distribution. The bare-box call, which the same rounding had
+pinned to the 7.5 ms wake-up, measures 4.03.
 
 ## `KERN_MAX_CONCURRENT` is best-effort
 
@@ -159,74 +155,36 @@ the memory controller is not delegated gets no warning. The correct predicate
 `cgroup_enable=memory` removed to verify against, which is a physical board rather than a code
 change.
 
-## The Python and Node SDK test suites leave boxes behind
+## RESOLVED, and what was published about it was wrong
 
-Re-measured 2026-08-01 at kern-sandbox 0.1.12, each run from a clean slate (zero `kern box`
-processes): `pytest` in `bindings/python` ends 65/65 green and leaves **2** `pysbx-*` boxes running;
-`node --test` in `bindings/node` ends 54/54 green and leaves **5** `jssbx-*`. The Node side was 2 when
-this was first written on 2026-07-29, so the cost tracks the number of execution tests rather than
-being fixed. They carry the SDK's 24 h `--timeout` backstop, so they do expire on their own, but until
-then `kern ps` does not list them and `kern stop --all` answers "no running boxes to stop" while seven
-of them are alive.
+This section said the SDK test suites leave **boxes** behind: 2 `pysbx-*` after the Python suite and
+5 `jssbx-*` after the Node one, invisible to `kern ps`, alive for 24 h on the SDK's `--timeout`
+backstop. The count was right and the diagnosis was not, in the way that matters: **they were not
+boxes**. One survivor was finally examined instead of counted, and it was `kern` itself at 884 KB
+RSS, 0% CPU, one thread, asleep in `hrtimer_nanosleep`, with no children, the HOST's pid/user/mount
+namespaces, and a cgroup inherited from whatever launched it. The box really was gone, and `kern ps`
+was right to show nothing.
 
-**It is confined to the test suites. Normal SDK usage does not leak**, and that was measured rather
-than assumed: against the published 0.1.12 in a clean venv, ten sequential `run()`, ten sequential
-`run_code()`, sixteen concurrent `run()` and sixteen concurrent `run_code()` each leave **zero** boxes
-behind. So the mechanism is in what the suites do (timeout and kill paths, most likely) and not in the
-per-call lifecycle a user exercises.
+What survived was the `--timeout` **watchdog**, so the defect was in the kern binary and not in the
+bindings at all. `--timeout N` forks that watchdog in the host namespace, before the box's
+`unshare(CLONE_NEWPID)`, so that it can signal the box's ns-init. It then slept `N` out, and the only
+thing that stopped it early was the supervisor's own cancellation on a normal exit. Kill the
+supervisor before it reaches that line and the watchdog was orphaned for the remainder of the
+deadline: 86405 s for an SDK box, so a day per box. `kern stop` on its own is a race, since it
+SIGKILLs pid 1 and then sweeps the supervisor's process group, and it leaked 0 of 6 trials;
+SIGKILLing the supervisor directly, which is exactly what both bindings do straight after `kern
+stop`, leaked 6 of 6.
 
-A retraction belongs here, because the wrong version of this section was published first. Commit
-`2728c08` claimed the concurrency regression tests added in 0.1.12 left 53 boxes of their own and made
-them reap what they start. That attribution was wrong: it came from a count taken WITHOUT clearing the
-manual 40-thread and 30-call reproduction runs done minutes earlier, so those boxes were counted as
-the suites'. Measured properly, from a clean slate and with the reaping removed, the full Python suite
-leaves 2 with the new test and 2 without it, and the Node suite leaves 5 either way. The tests
-contribute nothing, and the reaping code has been removed rather than left in place justified by a
-story that does not hold.
+Fixed in kern **0.6.32**: the watchdog now waits on a pidfd for the box's exit with the deadline only
+as a cap, so it leaves the moment there is nothing left to guard, whatever killed the supervisor and
+whether or not anyone got to cancel it. Pinned by `stopping_a_box_leaves_no_timeout_watchdog_behind`,
+which fails against the previous binary. Both suites now finish from a clean slate with **zero** kern
+processes alive: 69 Python, 56 Node.
 
-## `KERN_MAX_CONCURRENT` is best-effort
-
-The fleet concurrency gate counts live boxes and then starts one, so two launches racing can both
-pass. `KERN_FLEET_MEMORY_MAX` and `KERN_FLEET_PIDS_MAX` are real cgroup limits and do not have this
-property. The concurrency count is a guard rail, not a boundary, and is documented as one.
-
-## The `--memory not enforced` warning is gated on the request
-
-`cgroup.rs` warns when `--memory` was ASKED FOR and cannot be applied, not when a cap would be
-applicable and this box ended up without one. A box that takes the default 512 MiB on a host where
-the memory controller is not delegated gets no warning. The correct predicate
-(`memory_cap_enforceable()`) already exists; wiring the warning to it needs a host with
-`cgroup_enable=memory` removed to verify against, which is a physical board rather than a code
-change.
-
-## The Python and Node SDK test suites leave boxes behind
-
-Re-measured 2026-08-01 at kern-sandbox 0.1.12, from a clean slate (zero `kern box` processes):
-`pytest` in `bindings/python` ends 65/65 green and leaves **2** `pysbx-*` boxes running; `node --test`
-in `bindings/node` ends 54/54 green and leaves **5** `jssbx-*`. The Node side was 2 when this was
-first written on 2026-07-29 and is 5 now, so it tracks the number of execution tests rather than
-being a fixed cost. They carry the SDK's 24 h `--timeout` backstop, so they do expire on their own,
-but until then `kern ps` does not list them and `kern stop --all` answers "no running boxes to stop"
-while seven of them are alive.
-
-It scales with the CALLS, not with the suites: the concurrency regression tests added in 0.1.12 fire
-24 and 16 calls, and left **60** boxes behind before they were made to reap what they start. Those
-two tests now kill, by pid difference, only the boxes they themselves created, which is a workaround
-inside a test for a defect in the product and is marked as one: when the lifecycle bug below is
-settled, that code goes.
-
-What it is NOT, each ruled out by measurement rather than by reading: a registry defect (a plain
-detached box is listed and stopped correctly), the orphan-on-launcher-death bug (a box whose
-launcher is SIGKILLed stays registered and `stop --all` ends it), and `KERN_NO_SCOPE=1`, which the
-SDK sets on every sandbox and which on its own leaves a box perfectly visible and stoppable. The
-`Kernel.__exit__` path closes stdin, waits 3 s and calls `_kill()` on timeout, and `_kill()` runs
-`kern stop <name>` before SIGKILLing the group, so on paper it should clean up.
-
-The mechanism is therefore somewhere in the binding's own lifecycle and is NOT isolated yet. It
-lives in `bindings/`, which ships as the separately versioned `kern-sandbox` package rather than in
-the kern binary, so it is written down here instead of being fixed in a hurry the afternoon of a
-release: a change to a lifecycle whose failure mode is not understood is how a leak becomes a kill
-of something that should have lived.
+The earlier retraction stands and is kept. Commit `2728c08` had claimed the 0.1.12 concurrency tests
+left 53 boxes of their own, from a count taken without clearing a manual reproduction run minutes
+earlier. That makes two wrong readings of one phenomenon, and both came from counting processes
+rather than opening one up.
 
 ## Binary size: measured 2026-07-31, deliberately NOT applied
 

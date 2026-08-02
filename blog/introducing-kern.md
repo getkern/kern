@@ -69,7 +69,7 @@ The honest version: **nobody wins single-shot latency outright**: the top tier i
 of milliseconds, i.e. noise. kern leads that tier while being the only one of them that ships a full
 daemonless container UX (OCI pull *and build*, overlay, volumes, secrets, `ps`/`exec`/`logs`, compose)
 in ~1.8 MB. The real gap is to the *engines*: **~80-133× faster to start** than podman/Docker (the
-spread is the two kern paths: 2.2 ms with `--rootfs`, 3.6 ms with `--image`, which also maps a uid
+spread is the two kern paths: 2.2 ms with `--rootfs`, 3.4 ms with `--image`, which also maps a uid
 range), which
 fork `conmon` or round-trip a daemon every run, and kern keeps **0 RAM resident** where Docker holds
 ~186 MB before you run anything. Full method, including where kern *ties* (I/O, cold pull, in-box

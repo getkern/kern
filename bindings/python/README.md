@@ -2,7 +2,7 @@
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless sandbox and virtual resource
 runtime for any workload, including untrusted and AI-generated code: a real, kernel-enforced box
-that starts in **3.6 ms** from an OCI image, out of one **~1.8 MB** binary, with no daemon.
+that starts in **3.4 ms** from an OCI image, out of one **~1.8 MB** binary, with no daemon.
 **kern-sandbox**
 is its Python binding: run untrusted or agent-generated code in a fresh, isolated box, straight from Python.
 
@@ -56,32 +56,41 @@ no KVM. The sandbox for an agent's dev loop, a CI step, or an air-gapped host.
 ## Performance
 
 Measured on one x86_64 desktop (Intel i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), kern
-0.6.30, `python:3.12-slim`, on 2026-08-01. p50 over 25 calls after a discarded warmup, every row from
+0.6.32, `python:3.12-slim`, on 2026-08-02. p50 over 25 calls after a discarded warmup, every row from
 the same session. Not aspirational. Your hardware will differ, measure and claim your own number.
 
 **Single call, sequential** (p50):
 
 | call (p50) | `enforce_limits=False` | default (`enforce_limits=True`) |
 | --- | --- | --- |
-| `run(["true"])` (bare box) | 7.56 ms | 7.58 ms |
-| `run_code("print(1)")` (+ Python interpreter start) | 15.8 ms | 16.0 ms |
-| `docker run --rm python:3.12-slim python3 -c` | n/a | 286 ms |
+| `run(["true"])` (bare box) | 4.03 ms | 4.22 ms |
+| `run_code("print(1)")` (+ Python interpreter start) | 13.55 ms | 13.87 ms |
+| `docker run --rm python:3.12-slim python3 -c` | n/a | 285 ms |
 
-For reference, `kern box` **natively** (no Python wrapper) is 2.57 ms from a prepared rootfs and
-3.62 ms from an OCI image on the same machine; the 7.56 ms bare-box row is that plus the wrapper's
-subprocess and reader-thread overhead, +3.9 ms.
+For reference, `kern box --image python:3.12-slim` **natively** (no Python wrapper) is 3.80 ms on the
+same machine in the same session, so the 4.03 ms bare-box row is that plus **0.23 ms** of wrapper:
+one subprocess, two reader threads, and the flags the binding adds that the native run does not
+(`--ro`, the caps, the workspace mount).
+
+That figure was **+3.9 ms until 0.1.13**, and almost all of it was one line of CPython. The binding
+enforced its own deadline with `Popen.wait(timeout=...)`, which does not block on the child: it polls
+on an exponential backoff whose wake-ups land at 0.5, 1.5, 3.5, 7.5, 15.5 and 31.5 ms. A bare box
+finishing at 4.0 ms was therefore not noticed until 7.5, and a `run_code` finishing at 13.6 not until
+15.5, which is why the old table read 7.56 and 16.0 and why 200 identical calls used to land on three
+discrete values instead of a distribution. The wait is now a `poll(2)` on a pidfd, which becomes
+readable the moment the box exits, so there is nothing left to round up to.
 
 **`enforce_limits=False` is no longer a speed knob, and the two columns above are the evidence.**
 It sets `KERN_NO_SCOPE=1`, which skips the per-box cgroup scope. That used to be a `systemd-run`
 round trip and cost several milliseconds, which is where "about twice as fast" came from. Since
 kern 0.6.15 the caps are applied directly in kern's own delegated slice, and the difference measured
-here is **0.15 ms, a ratio of 1.05×**, against giving up hard memory and PID enforcement. On a host
+here is **0.19 ms, a ratio of 1.05×**, against giving up hard memory and PID enforcement. On a host
 where cgroups cannot be delegated at all the old cost does return, so the option stays; on a normal
 delegated host, turning it off buys nothing and costs the caps. **Leave it on.**
 
 `run_code` runs *Python code*, so it pays the **CPython interpreter start** on top of the box, that's
-a Python cost, not kern's, and it is why `run_code` is 16.0 ms against the bare box's 7.6. Even so:
-**16.0 ms against Docker's 286 ms is about 18× faster** for the same task, and we quote the number you
+a Python cost, not kern's, and it is why `run_code` is 13.9 ms against the bare box's 4.2. Even so:
+**13.9 ms against Docker's 285 ms is about 20× faster** for the same task, and we quote the number you
 get from `run_code`, never the bare-box best case dressed up as the code-execution number.
 
 **Concurrency**: 100 concurrent `run_code` calls on one `Sandbox`, 100/100 succeeded, zero leaked
@@ -89,12 +98,15 @@ boxes, measured in the same session as the table above:
 
 | 100 concurrent `run_code` | wall | per-call p50 | per-call p95 |
 | --- | --- | --- | --- |
-| default (`enforce_limits=True`) | 0.31 s | 231 ms | 251 ms |
-| `enforce_limits=False` (best-effort caps) | 0.30 s | 202 ms | 240 ms |
+| default (`enforce_limits=True`) | 0.30 s | 211 ms | 241 ms |
+| `enforce_limits=False` (best-effort caps) | 0.31 s | 210 ms | 237 ms |
 
-The gap is **1.04× on wall clock**, so the same conclusion holds under load as it does sequentially:
-turning enforcement off is not a density win any more. It was one when caps meant a `systemd-run`
-scope per call; they have not since 0.6.15. **Leave the default on.**
+The gap is **1.03× on wall clock**, with the default marginally ahead, which is to say the two are
+the same to within the noise of the measurement. The same conclusion holds under load as it does
+sequentially: turning enforcement off is not a density win any more. It was one when caps meant a
+`systemd-run` scope per call; they have not since 0.6.15. **Leave the default on.** Note that a
+per-call p50 of 211 ms here is queueing, not latency: 100 boxes are competing for the machine, and
+the wall clock, 0.30 s for all 100, is the figure that describes it.
 
 Concurrent calls on one `Sandbox` are safe as of 0.1.12 and were not before it: every call wrote the
 same host-side `--env-file` path, so two in flight at once fought over it. In Python the loser got a
@@ -217,7 +229,7 @@ produces no result. You can still write an artifact to the workspace and `read_f
 **Warm kernel (kill the interpreter boot).** Each `run_code` starts a **fresh** interpreter, so it pays
 the CPython boot (~12 ms) every call. When you run many cells that share state (a REPL, a notebook, an
 agent's tool loop), open a `kernel()`: ONE warm interpreter in a long-lived box, fed cells over a pipe.
-In-memory state persists across cells and the per-cell cost drops from ~16 ms to **sub-millisecond**
+In-memory state persists across cells and the per-cell cost drops from ~14 ms to **sub-millisecond**
 (~300x). Same rich `results` capture as `run_code`.
 
 ```python

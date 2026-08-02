@@ -2906,9 +2906,13 @@ fn spawn_detached_stop(name: String) {
 /// watchdog is created in the caller's (host) pid namespace - it MUST be forked before the box's
 /// `unshare(CLONE_NEWPID)`, so it is an *ancestor* of the box and can therefore signal the box's
 /// ns-init (a same-namespace member cannot). It blocks reading the box's PID 1 from the returned
-/// pipe (written by `on_started`); once it has it, it sleeps `secs`, then SIGTERMs and - after a 2 s
-/// grace - SIGKILLs the box's PID 1, tearing down the whole namespace. If the pipe closes first (the
-/// box exited on its own and the caller cancels), the read returns 0 and the watchdog just exits.
+/// pipe (written by `on_started`); once it has it, it waits for that box to EXIT with `secs` as a
+/// cap, and only if the cap is reached does it SIGTERM and - after a 2 s grace - SIGKILL the box's
+/// PID 1, tearing down the whole namespace. If the pipe closes before a pid arrives (the box never
+/// started and the caller cancels), the read returns 0 and the watchdog just exits.
+///
+/// Waiting for the exit rather than sleeping the deadline out is what stops this process outliving
+/// the box it guards: see `wait_for_box_exit`.
 /// Returns `None` if the pipe/fork failed (the box simply runs without a timeout).
 fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
     let mut fds = [0i32; 2];
@@ -2957,11 +2961,118 @@ fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
     // `kill(pid1)` only on a kernel too old for pidfd (< 5.3) - the target boards are 5.15+.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
     unsafe {
-        libc::sleep(secs as libc::c_uint);
+        // WAIT FOR THE BOX TO EXIT, with `secs` as a CAP - do not sleep `secs` out. A pidfd becomes
+        // readable the instant the process it pins terminates, so the common case (the box finishes
+        // early) wakes us at once and we exit with nothing to enforce.
+        //
+        // This used to be a bare `sleep(secs)`, and `cancel_foreground_timeout` was the only thing
+        // that stopped it: the supervisor closes our pipe, SIGKILLs us and reaps us when the box
+        // exits normally. That covers a normal exit and NOTHING else. `kern stop` kills the
+        // supervisor, so the supervisor never runs its own cleanup, and this watchdog was left
+        // sleeping out the remainder of the deadline: 884 KB and a pid, for 24 h with the SDK's
+        // 86405 s default. Measured: `kern box difftest --timeout 300` then `kern stop difftest`
+        // reported success and left this process behind for the remaining 298 seconds, and running
+        // the two SDK teardown tests repeatedly accumulated 14 of them.
+        //
+        // Waiting on the pidfd fixes every one of those paths at once, because it keys on the fact
+        // that actually matters (the box is gone) instead of on the supervisor's cooperation.
+        //
+        // Note it deliberately does NOT key on our pipe reaching EOF. The supervisor dying is not
+        // the same event as the box dying: SIGKILL the supervisor and the box's pid 1 is orphaned
+        // but keeps running, and enforcing the deadline on exactly that box is this watchdog's
+        // reason to exist. The pidfd stays readable-on-exit whoever dies first, so the safety net
+        // is kept while the leak goes away.
+        if wait_for_box_exit(pidfd, secs.saturating_mul(1000)) {
+            libc::_exit(0); // the box is already gone: nothing to signal, nothing to leave behind
+        }
         signal_box(pidfd, pid1, libc::SIGTERM);
-        libc::sleep(2);
+        // Same again for the grace period: a box that dies on the SIGTERM must not hold us here for
+        // the full 2 s, and one that ignores it gets exactly the 2 s it used to get.
+        wait_for_box_exit(pidfd, 2000);
         signal_box(pidfd, pid1, libc::SIGKILL);
         libc::_exit(0);
+    }
+}
+
+/// CLOCK_MONOTONIC in milliseconds, or `None` if the clock cannot be read.
+///
+/// SAFETY: async-signal-safe (`clock_gettime` is on the POSIX list), so it is callable from the
+/// post-fork watchdog child, which must not touch the allocator or any libc lock.
+unsafe fn monotonic_ms() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) != 0 {
+        return None;
+    }
+    Some((ts.tv_sec as u64).saturating_mul(1000) + (ts.tv_nsec as u64) / 1_000_000)
+}
+
+/// Block until the process pinned by `pidfd` exits, or until `ms` milliseconds have passed.
+/// Returns true **only** when it was observed to exit.
+///
+/// Every failure mode degrades to "sleep the deadline out and report no exit", which is precisely
+/// the behaviour this replaces, so the caller's SIGTERM/SIGKILL can never fire EARLY on a live box:
+///
+///   * no pidfd at all (kernel < 5.3, or `pidfd_open` refused) -> sleep, exactly as before;
+///   * the clock cannot be read -> sleep, rather than loop on an unbounded deadline;
+///   * `POLLERR`/`POLLNVAL` (an fd we cannot wait on) -> sleep out what is left of the deadline;
+///   * `EINTR` -> retry, bounded by the absolute deadline, so a signal cannot shorten it.
+///
+/// SAFETY: async-signal-safe - `poll`, `clock_gettime` and `sleep` only, no allocation.
+unsafe fn wait_for_box_exit(pidfd: i32, ms: u64) -> bool {
+    // `sleep` takes whole seconds: round UP, so a sub-second deadline is never truncated to zero.
+    let sleep_out = |left: u64| {
+        if left > 0 {
+            libc::sleep(left.div_ceil(1000) as libc::c_uint);
+        }
+    };
+    if pidfd < 0 {
+        sleep_out(ms);
+        return false;
+    }
+    let Some(start) = monotonic_ms() else {
+        sleep_out(ms);
+        return false;
+    };
+    let deadline = start.saturating_add(ms);
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let Some(now) = monotonic_ms() else {
+            sleep_out(ms);
+            return false;
+        };
+        if now >= deadline {
+            return false;
+        }
+        let left = deadline - now;
+        // poll(2) takes an `int` of milliseconds. A deadline past ~24.8 days would overflow it, so
+        // it is waited out in chunks rather than clamped to -1, which would mean "forever" and would
+        // silently disarm the timeout.
+        let chunk = if left > i32::MAX as u64 {
+            i32::MAX
+        } else {
+            left as i32
+        };
+        pfd.revents = 0;
+        let r = libc::poll(&mut pfd, 1, chunk);
+        if r > 0 {
+            if pfd.revents & libc::POLLIN != 0 {
+                return true; // the pidfd fired: the box has terminated
+            }
+            // An fd we cannot wait on. Serve out the rest of the deadline the old way instead of
+            // returning false immediately, which would SIGTERM a box that still has time left.
+            let rest = monotonic_ms().map_or(0, |n| deadline.saturating_sub(n));
+            sleep_out(rest);
+            return false;
+        }
+        // r == 0: this chunk expired, the loop re-checks the deadline.
+        // r < 0: EINTR or another error; the deadline check at the top bounds the retry.
     }
 }
 

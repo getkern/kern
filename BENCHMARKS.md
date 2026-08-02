@@ -426,7 +426,7 @@ So the Windows-side crossing costs about **63 ms per command** with the exe, on 
 measured. The fallback row is several times that, but it is a different host as well as a second process,
 so the gap is not the price of the batch wrapper alone.
 
-The comparable Linux figure is the **3.6 ms** OCI-image row above, not the 2.2 ms prepared-rootfs one. The
+The comparable Linux figure is the **3.4 ms** OCI-image row above, not the 2.2 ms prepared-rootfs one. The
 inside-WSL numbers are 20 boxes in 0.13 s, one series each, timed in the distro with `time` around the
 whole loop so the shell's 10 ms resolution lands on the total rather than on each box: single samples, not
 distributions.

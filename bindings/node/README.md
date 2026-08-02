@@ -2,7 +2,7 @@
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless sandbox and virtual resource
 runtime for any workload, including untrusted and AI-generated code: a real, kernel-enforced box
-that starts in **3.6 ms** from an OCI image, out of one **~1.8 MB** binary, with no daemon.
+that starts in **3.4 ms** from an OCI image, out of one **~1.8 MB** binary, with no daemon.
 **kern-sandbox**
 is its Node / TypeScript binding: run untrusted or agent-generated code in a fresh, isolated box, from Node.
 
@@ -177,7 +177,7 @@ can still WRITE an artifact to the workspace and `readFile` it if you prefer.
 **Warm kernel (kill the interpreter boot).** Each `runCode` starts a **fresh** interpreter, paying the
 CPython boot (~12 ms) every call. When you run many cells that share state (a REPL, a notebook, an
 agent's tool loop), open a `kernel()`: ONE warm interpreter in a long-lived box, fed cells over a pipe.
-In-memory state persists across cells and the per-cell cost drops from ~16 ms to **sub-millisecond**
+In-memory state persists across cells and the per-cell cost drops from ~14 ms to **sub-millisecond**
 (~300x). Same rich `results` capture as `runCode`.
 
 ```js

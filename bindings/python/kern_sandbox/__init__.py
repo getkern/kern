@@ -38,6 +38,7 @@ import json
 import os
 import queue
 import re
+import select
 import shutil
 import signal
 import stat
@@ -63,7 +64,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.12"
+__version__ = "0.1.13"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -512,6 +513,70 @@ class ExecutionResult:
         return self.success
 
 
+def _wait_for_exit(proc: "subprocess.Popen", timeout: "float | None") -> bool:
+    """Block until ``proc`` exits, or until ``timeout`` seconds elapse. True iff it exited.
+
+    WHY NOT ``Popen.wait(timeout=...)``
+        CPython's timed wait does not block on the child: it polls with an exponential backoff
+        (``delay = 0.0005``, then ``delay = min(delay * 2, remaining, .05)``), so its wake-ups fall
+        at 0.5, 1.5, 3.5, 7.5, 15.5, 31.5, 63.5 ms. A box that exits in 12.3 ms is therefore not
+        noticed until 15.5: 3.2 ms of pure sleep on every call, 26% of the wall time, plus a tail
+        that doubles when the exit lands just after a poll. Measured over 200 identical calls before
+        this helper existed: 188 at 15-16 ms, 10 at 31-32, 2 at 64, against 12.28 ms of real work
+        for the same command run without the binding.
+
+        A pidfd becomes readable the moment the process terminates, so one ``poll(2)`` with the
+        deadline returns on the exit itself, with no sleeping at all, and the deadline is enforced
+        by the kernel instead of by a backoff loop.
+
+    WHY ``poll`` AND NOT ``select``
+        ``select.select`` is bounded by ``FD_SETSIZE`` (1024) on the fd NUMBER, so a caller that
+        embeds this binding in a process holding many sockets would get a ValueError out of a
+        library that has nothing to do with its fd count. ``poll`` has no such limit.
+
+    FALLBACK
+        ``os.pidfd_open`` needs Linux 5.3, and Python 3.9 (this package's floor). If it is missing
+        or refused (an old kernel, or a syscall filter in whatever sandbox the CALLER is itself
+        running under), we fall back to the polling wait: slower, never wrong. kern's own seccomp
+        denylist does not contain it, so a binding running nested inside a box keeps the fast path.
+    """
+    if proc.returncode is not None:
+        return True  # already reaped by an earlier wait; nothing to wait for
+    try:
+        fd = os.pidfd_open(proc.pid, 0)
+    except (AttributeError, OSError):
+        # No pidfd here. Poll exactly as CPython would have, and keep the same contract.
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        # poll() takes milliseconds. Round UP, never down: rounding a sub-millisecond deadline to 0
+        # would turn a short timeout into an instant one and mislabel a healthy run as a timeout.
+        # A negative timeout means "block forever", which is what timeout=None asks for.
+        ms = -1 if timeout is None else int(timeout * 1000.0 + 0.999)
+        # PEP 475: poll() is retried across EINTR with a recomputed deadline, so a signal arriving
+        # mid-wait cannot cut the deadline short.
+        if not poller.poll(ms):
+            return False
+    except OSError:
+        # poll() itself failed. Degrade to the backoff wait rather than report an exit we did not
+        # observe: claiming a timeout here would kill a healthy box.
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+    finally:
+        os.close(fd)
+    # The child is a zombie at this point, so this reap returns at once and cannot poll.
+    proc.wait()
+    return True
+
+
 class _CappedReader(threading.Thread):
     """Drain a pipe into a bounded buffer: keep at most ``cap`` bytes but KEEP reading past it
     (discarding overflow) so a flooding box never blocks on a full pipe. RAM is bounded to ``cap``.
@@ -894,11 +959,12 @@ class Sandbox:
             err = _CappedReader(proc.stderr, self.max_output_bytes, cb_err)
             out.start()
             err.start()
-            we_timed_out = False
-            try:
-                proc.wait(timeout=timeout_s)  # OUR deadline - the authority for a `timeout` fault
-            except subprocess.TimeoutExpired:
-                we_timed_out = True
+            # OUR deadline - the authority for a `timeout` fault. Blocking on a pidfd rather than
+            # polling: `Popen.wait(timeout=)` would sleep past the box's exit by 3.2 ms on every
+            # call (see _wait_for_exit). The teardown stays HERE, on this thread, where the child is
+            # still an unreaped zombie and its pid therefore cannot have been recycled under us.
+            we_timed_out = not _wait_for_exit(proc, timeout_s)
+            if we_timed_out:
                 self._teardown(proc, name, child_env)
             # Join readers, but BOUNDED: a CPU-bound box can survive our signals and hold the pipe open
             # until kern's own --timeout backstop reaps it a few seconds later; never hang the caller on it.
@@ -906,11 +972,9 @@ class Sandbox:
             out.join(join_deadline)
             err.join(join_deadline)
             # Reap the process so returncode is populated and no zombie lingers (bounded - the backstop
-            # has reaped the box by now in the timeout case).
-            try:
-                proc.wait(timeout=8.0)
-            except subprocess.TimeoutExpired:
-                pass
+            # has reaped the box by now in the timeout case). On the normal path _wait_for_exit above
+            # has already reaped, and this returns immediately on the returncode check.
+            _wait_for_exit(proc, 8.0)
         finally:
             # Every exit path, including the two SandboxErrors above: kern has read the file by the time
             # it exits, and leaving it behind would accrete one per call in a persistent workspace.
@@ -1581,7 +1645,9 @@ class Kernel:
             except (ProcessLookupError, OSError):
                 pass
             try:
-                self._proc.wait(timeout=5)
+                # Blocking on a pidfd, so a box that dies at once is reaped at once instead of on
+                # the backoff's next wake-up. A kill path must never raise: swallow everything.
+                _wait_for_exit(self._proc, 5)
             except Exception:
                 pass
 
@@ -1593,9 +1659,12 @@ class Kernel:
                 proc.stdin.close()
             except Exception:
                 pass
+            # Same contract as before: exited in time → done; timed out OR the wait failed → kill.
             try:
-                proc.wait(timeout=3)
+                exited = _wait_for_exit(proc, 3)
             except Exception:
+                exited = False
+            if not exited:
                 self._kill()
         elif proc is not None:
             self._kill()

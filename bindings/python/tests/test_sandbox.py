@@ -7,8 +7,10 @@
 Run: `pytest`  (integration auto-skips without a real kern; set `KERN_BIN=/path/to/kern`).
 """
 
+import errno
 import os
 import shutil
+import subprocess
 import time
 
 import pytest
@@ -759,3 +761,91 @@ def test_the_version_in_the_code_matches_the_one_in_pyproject():
     assert kern.__version__ == declared, (
         f"kern_sandbox.__version__ is {kern.__version__} but pyproject.toml says {declared}"
     )
+
+
+# ---------------------------------------------------------------------------
+# UNIT: the process wait
+#
+# These need no kern: `_wait_for_exit` is a primitive over a plain Popen, so they run everywhere,
+# including the CI hosts where the box tests skip. They assert the MECHANISM rather than a duration,
+# so a loaded machine cannot make them flap.
+# ---------------------------------------------------------------------------
+
+
+def _sleeper(seconds: str) -> subprocess.Popen:
+    """A child of our own, with no kern in the picture: the wait primitive is what is under test."""
+    return subprocess.Popen(
+        ["sleep", seconds], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="no os.pidfd_open on this interpreter")
+def test_the_wait_blocks_on_a_pidfd_instead_of_polling_for_the_exit():
+    """The whole point of the helper.
+
+    `Popen.wait(timeout=...)` does not block on the child: it polls on an exponential backoff whose
+    wake-ups land at 0.5, 1.5, 3.5, 7.5, 15.5, 31.5 ms, so a box that exits at 12.3 ms is not noticed
+    until 15.5. Measured over 200 identical calls, that cost 3.9 ms on the floor of every call and
+    pushed 32 of them into a 31 ms or 64 ms bucket they had no reason to be in.
+
+    A timed wait is therefore simply not allowed to happen while a pidfd is available, and that is
+    what this asserts: no clock, no threshold, nothing to go flaky.
+    """
+    proc = _sleeper("0.05")
+    real_wait = proc.wait
+    calls: list = []
+
+    def spy(timeout=None):
+        calls.append(timeout)
+        return real_wait(timeout=timeout)
+
+    proc.wait = spy
+    try:
+        assert kern._wait_for_exit(proc, 5) is True
+    finally:
+        proc.wait = real_wait
+        if proc.returncode is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 0, "the child must be reaped, not left a zombie"
+    assert calls == [None], f"a TIMED wait means we went back to polling the child: {calls}"
+
+
+def test_the_wait_falls_back_to_polling_when_pidfd_is_refused(monkeypatch):
+    """An old kernel, or a syscall filter in whatever sandbox the CALLER is itself running under, and
+    the helper degrades instead of failing. ENOSYS is what a filter returns. Slower, never wrong."""
+
+    def refused(pid, flags=0):
+        raise OSError(errno.ENOSYS, "Function not implemented")
+
+    monkeypatch.setattr(os, "pidfd_open", refused, raising=False)
+    proc = _sleeper("0.05")
+    try:
+        assert kern._wait_for_exit(proc, 5) is True
+        assert proc.returncode == 0
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_the_wait_reports_a_deadline_it_could_not_meet_and_leaves_the_child_alone():
+    """False means 'still running'. The caller owns the teardown, and it must find the child exactly
+    where it left it: this helper never kills and never reaps a live process. That ordering is also
+    what keeps the pid from being recycled under the teardown that follows."""
+    proc = _sleeper("30")
+    try:
+        assert kern._wait_for_exit(proc, 0.05) is False
+        assert proc.poll() is None, "the helper must not have reaped or killed a running child"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_the_wait_short_circuits_on_a_child_that_was_already_reaped():
+    """Guards a real hazard rather than a style point: calling pidfd_open on an already-reaped pid is
+    at best ESRCH and at worst a handle on whatever process inherited that number."""
+    proc = _sleeper("0")
+    proc.wait()
+    assert proc.returncode is not None
+    assert kern._wait_for_exit(proc, 0) is True

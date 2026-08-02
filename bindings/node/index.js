@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.12";
+const VERSION = "0.1.13";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -968,19 +968,16 @@ class Sandbox {
       const err = cappedCollector(child.stderr, this.maxOutputBytes, cbErr);
       let timedOut = false;
       let settled = false;
-
-      const timer = setTimeout(() => {
-        timedOut = true;
-        this._teardown(child, name, childEnv);
-      }, timeoutS * 1000);
-
-      // Hard safety net: a CPU-bound box can survive our signals until kern's backstop reaps it; never
-      // hang the caller. If close hasn't fired a few seconds after our teardown, resolve anyway.
+      // Both timers are armed further down, once `finish` exists. They are declared here, as `let`,
+      // so the closures that clear them can never reference a binding in its temporal dead zone
+      // whatever the callback ordering turns out to be.
+      let timer = null;
       let hardTimer = null;
+
       const finish = (code, signal) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         if (hardTimer) clearTimeout(hardTimer);
         // kern has read the file by the time it exits; leaving it behind would accrete one per call
         // in a persistent `workspace`.
@@ -1008,20 +1005,22 @@ class Sandbox {
       child.on("close", (code, signal) => {
         finish(code, signal);
       });
-      // arm the hard net only once we've decided to kill (teardown sets timedOut)
+      // Hard safety net: a CPU-bound box can survive our signals until kern's backstop reaps it;
+      // never hang the caller. If close hasn't fired a few seconds after our teardown, resolve anyway.
       const armHardNet = () => {
         if (hardTimer) return;
         hardTimer = setTimeout(() => finish(EXIT_SIGKILL, "SIGKILL"), 10000);
       };
-      // re-check shortly after the deadline in case teardown fired
-      const watch = setInterval(() => {
-        if (settled) {
-          clearInterval(watch);
-        } else if (timedOut) {
-          clearInterval(watch);
-          armHardNet();
-        }
-      }, 250);
+
+      timer = setTimeout(() => {
+        timedOut = true;
+        this._teardown(child, name, childEnv);
+        // Armed HERE, at the one place that decides to kill. It used to be noticed instead by a
+        // 250 ms setInterval that `finish` never cleared, so after every call that interval kept the
+        // event loop alive until its own next tick: measured 224 to 232 ms of dead time between a
+        // call resolving and the process being able to exit, against 19 to 27 ms of real work.
+        armHardNet();
+      }, timeoutS * 1000);
     });
   }
 
@@ -1726,7 +1725,24 @@ class Kernel {
       } catch {
         /* ignore */
       }
-      await new Promise((r) => setTimeout(r, 150));
+      // Wait for the exit EVENT, capped at 150 ms, rather than sleeping 150 ms unconditionally: that
+      // fixed sleep cost 152 ms on every close of a persistent kernel (measured) for a box that
+      // exits in a few. A child that is already gone has emitted `exit` and will not emit it again,
+      // so that case is tested directly instead of waited on.
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise((resolve) => {
+          let t = null;
+          const onExit = () => {
+            if (t !== null) clearTimeout(t);
+            resolve();
+          };
+          t = setTimeout(() => {
+            child.removeListener("exit", onExit);
+            resolve();
+          }, 150);
+          child.once("exit", onExit);
+        });
+      }
       this._kill();
     } else {
       this._kill();

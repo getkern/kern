@@ -2104,3 +2104,133 @@ fn config_setup_generates_a_config_that_validates() {
         "`kern config setup` produced a config its own validator rejects:\n{report}\n--- generated ---\n{generated}"
     );
 }
+
+/// Every live process whose `comm` is exactly `kern` and whose argv mentions `tag`.
+///
+/// Matching on `comm` is what makes this safe: a `pgrep -f` style scan also matches the shell or
+/// harness whose own command line happens to quote the box name, which is how the leak this test
+/// pins was mis-measured twice before it was understood.
+fn kern_procs_matching(tag: &str) -> usize {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut n = 0;
+    for e in entries.flatten() {
+        let p = e.path();
+        let Ok(comm) = fs::read_to_string(p.join("comm")) else {
+            continue; // not a pid dir, or the process exited under us
+        };
+        if comm.trim() != "kern" {
+            continue;
+        }
+        if let Ok(argv) = fs::read(p.join("cmdline")) {
+            if String::from_utf8_lossy(&argv).contains(tag) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn stopping_a_box_leaves_no_timeout_watchdog_behind() {
+    // `--timeout N` forks a watchdog in the HOST namespace, before the box's `unshare(CLONE_NEWPID)`,
+    // so that it can signal the box's ns-init. It used to `sleep(N)` outright, and the only thing
+    // that stopped it early was the supervisor's own `cancel_foreground_timeout`. Kill the
+    // supervisor before it reaches that line and the watchdog was orphaned, sleeping out the rest of
+    // the deadline: 884 KB and one pid per box, for 24 h at the SDK's 86405 s default, and invisible
+    // to `kern ps` because the box itself really was gone. It now waits on a pidfd for the box's
+    // exit with the deadline only as a cap, so it leaves as soon as there is nothing left to guard.
+    //
+    // THE TRIGGER IS A SIGKILL OF THE SUPERVISOR, NOT `kern stop`, and that is the whole design of
+    // this test. `kern stop` SIGKILLs the box's pid 1 and then sweeps the supervisor's process
+    // group, so whether the supervisor survives long enough to cancel its own watchdog is a race:
+    // measured over six trials it leaked 0 of 6 that way, while SIGKILLing the supervisor directly
+    // leaked 6 of 6. A test built on the racy path would have passed against the defect. SIGKILL is
+    // also not a synthetic case: it is exactly what the Python and Node bindings do (`kern stop`,
+    // then `killpg`), which is how fourteen of these accumulated in one evening of running the SDK
+    // suites.
+    //
+    // The deadline itself is asserted elsewhere (`box_run_isolates_and_propagates_exit_code` and
+    // the timeout tests). This one is only about what is left running afterwards.
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "wdog");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-wdog-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    // Unique per process, so a parallel test's box can never be counted as ours.
+    let name = format!("wdog{}", std::process::id());
+
+    // A FOREGROUND box (the watchdog path under test) with a deadline far longer than the test.
+    let child = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            rootfs,
+            "--timeout",
+            "300",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        eprintln!("skip: could not spawn kern");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    };
+
+    // Wait for it to actually be up (registration happens in the forked supervisor).
+    let mut up = false;
+    for _ in 0..60 {
+        if kern_procs_matching(&name) > 0 {
+            up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !up {
+        // userns refused at runtime, or the box never started: skip rather than fail.
+        eprintln!("skip: the box never came up");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+
+    // SIGKILL the supervisor: it gets no chance to cancel its own watchdog, which is the binding's
+    // teardown path and the deterministic form of the defect.
+    let _ = child.kill();
+    let _ = child.wait(); // reap it, so the supervisor itself is never counted as a leftover
+
+    // The watchdog exits as soon as the pidfd fires, but give the scheduler room on a loaded runner.
+    let mut left = kern_procs_matching(&name);
+    for _ in 0..50 {
+        if left == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        left = kern_procs_matching(&name);
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    assert_eq!(
+        left, 0,
+        "`kern stop` returned but {left} kern process(es) for box `{name}` are still alive: the \
+         --timeout watchdog is sleeping out the rest of its deadline instead of leaving with the box"
+    );
+}
