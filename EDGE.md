@@ -2,7 +2,7 @@
 
 kern is a great fit for small, RAM-constrained Linux boards, precisely because it has **no
 daemon**. On an 8 GB Jetson or a Raspberry Pi, a container *daemon* is a permanent tax:
-`dockerd` + `containerd` sit at **~186 MB RSS before you run anything**. kern's runtime cost at
+`dockerd` + `containerd` sit at **154 to 160 MB RSS before you run anything**. kern's runtime cost at
 rest is **zero**: each box is one short-lived process at a few MB, started in single-digit ms.
 That difference is the whole game on a device where memory is the scarce resource.
 
@@ -10,17 +10,25 @@ That difference is the whole game on a device where memory is the scarce resourc
 
 | | kern | daemon-based runtime |
 |---|---|---|
-| resident memory at rest | **0** | ~186 MB (dockerd + containerd) |
+| resident memory at rest | **0** | 154 to 160 MB (dockerd + containerd) |
 | per box | ~7 MB, gone on exit | shared daemon state |
 | binary | ~1.5 MB static (musl aarch64; ~1.8 MB x86_64) | tens of MB + daemon |
 | install | drop one static binary | service + socket + root setup |
 | privileges | rootless (user namespaces) | typically a root daemon/group |
 
-On a 4-8 GB board, "give back 186 MB and run rootless" is often the difference between *fits* and
+On a 4-8 GB board, "give back 150-odd MB and run rootless" is often the difference between *fits* and
 *doesn't*. You can run several isolated services, a per-job pipeline, or CI **on the device
 itself** without standing up an always-on engine.
 
 ## What's validated
+
+The **published** `aarch64` binary of the current release, 0.6.32, was run on all three boards on
+2026-08-03, from the release asset with its sha256 checked, not from a local build. On each: a box
+from a real OCI image starts, `mknod` inside it is refused (`Operation not permitted`), and the
+`--timeout` watchdog leaves nothing behind when its supervisor is SIGKILLed, which is the defect
+0.6.32 fixes and which reproduced 6 times out of 6 on x86 before it. Kernels covered: 6.6.51
+(Pi 5), 5.15.148-tegra (Jetson) and 6.16.7 (UNO Q), so both sides of the `pidfd_open` requirement
+that fix depends on.
 
 kern's isolation (namespaces + cgroup v2 + seccomp + pivot/overlay) is **architecture-neutral**.
 It has been run by hand (static `aarch64-musl` binary) on:
@@ -73,7 +81,7 @@ Prebuilt static binaries are published for `linux-aarch64` as well as `linux-x86
 ## Edge-shaped examples
 
 - [examples/edge-many-services.sh](examples/edge-many-services.sh), many isolated services on
-  one small board; `kern stats` shows the few-MB footprint vs a 186 MB daemon.
+  one small board; `kern stats` shows the few-MB footprint vs a 154 to 160 MB daemon.
 - [examples/data-pipeline.sh](examples/data-pipeline.sh), a per-job pipeline (read-only input →
   isolated processing → output volume), one box per sensor/file/tenant.
 - [examples/ci-in-a-box.sh](examples/ci-in-a-box.sh), build/test in a clean box **on the device**.

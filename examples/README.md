@@ -118,7 +118,7 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [web-service.sh](web-service.sh) | Run a web server in a box, publish it to the host with `-p`, and `curl` it |
 | [media-transcode.sh](media-transcode.sh) | Transcode media (ffmpeg) in a box, CPU-capped, your host needs no ffmpeg |
 | [serverless-per-request.sh](serverless-per-request.sh) | A fresh, isolated box per request, the function / serverless pattern |
-| [edge-many-services.sh](edge-many-services.sh) | Many isolated services on a small board, few-MB footprint vs a ~186 MB daemon |
+| [edge-many-services.sh](edge-many-services.sh) | Many isolated services on a small board, few-MB footprint vs a ~155 MB daemon |
 | [rolling-redeploy.sh](rolling-redeploy.sh) | Zero-downtime rolling redeploy: `--pull always` swaps the image atomically (live boxes survive), bring up new instances then retire old ones, fleet never drops below target. Daemonless, no k8s |
 | [canary-deploy.sh](canary-deploy.sh) | Canary with keep-old-on-failure: `--pull always` refresh, run one canary, gate on its verdict read back via `logs --tail`; prod is never touched if the canary is unhealthy |
 | [scale-test.sh](scale-test.sh) | Burst N isolated boxes (~2.3 ms each, no dockerd), drive the whole set from `ps -q`: count, `--filter` sample, then reap with one `kern stop $(kern ps -q)` |
