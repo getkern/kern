@@ -78,16 +78,16 @@ Served from **github.com** (read the script first if you like). It downloads the
 your arch and verifies the sha256 before installing. No Rust toolchain required.
 (`getkern.dev/install.sh` is a short alias.)
 
-**From source**, if you would rather build it yourself or want a target we do not publish a binary for:
-
-```sh
-cargo install --git https://github.com/getkern/kern getkern --locked
-```
-
 **🪟 Windows.** One line in PowerShell (no Docker Desktop, no Ubuntu):
 
 ```powershell
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+```
+
+**From source**, if you would rather build it yourself or want a target we do not publish a binary for:
+
+```sh
+cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
 Needs a Linux kernel with unprivileged user namespaces and cgroup v2. `kern doctor` tells you
