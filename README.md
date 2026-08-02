@@ -68,19 +68,27 @@ still a denylist, which fleet limit is a guard rail instead of a boundary.
 
 ## Install
 
+**🐧 Linux and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q). One line; auto-detects `x86-64` / `aarch64`:
+
 ```sh
-# Linux, x86-64 / aarch64, including Raspberry Pi, Jetson and UNO Q
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
 
-# Windows, via WSL2
-irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+Served from **github.com** (read the script first if you like). It downloads the release binary for
+your arch and verifies the sha256 before installing. No Rust toolchain required.
+(`getkern.dev/install.sh` is a short alias.)
 
-# from source
+**From source**, if you would rather build it yourself or want a target we do not publish a binary for:
+
+```sh
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-Served from github.com, so read the script first if you like; it verifies the sha256 of the release
-binary before installing. `getkern.dev/install.sh` is a short alias for the same file.
+**🪟 Windows.** One line in PowerShell (no Docker Desktop, no Ubuntu):
+
+```powershell
+irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+```
 
 Needs a Linux kernel with unprivileged user namespaces and cgroup v2. `kern doctor` tells you
 whether boxes will run here before you try. Boards, WSL2, checksums and the long form:
