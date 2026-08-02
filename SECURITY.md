@@ -107,9 +107,9 @@ What is **enforced now** by `kern box`:
 
 **What a denied syscall returns, and what that tells a prober.** The filter has two verdicts, and the
 split is deliberate. Real escape vectors (kexec, module load/unload, the mount API, `bpf`, `ptrace`,
-`setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Five that software merely
-*probes* for an optional fast path (`io_uring`, `userfaultfd`, `perf_event_open`, the keyring family,
-`syslog(2)`) return **`ENOSYS`** instead. They are equally denied, the syscall never runs; the
+`setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Nine, in the five families software merely
+*probes* for an optional fast path (`io_uring`'s three, `userfaultfd`, `perf_event_open`, the
+keyring's three, `syslog(2)`), return **`ENOSYS`** instead. They are equally denied, the syscall never runs; the
 difference is only what the caller sees, and it is the difference between Redis 8 falling back to its
 epoll path and Redis 8 dying. The two sets are asserted disjoint by a test.
 
@@ -125,8 +125,8 @@ from inside a box on x86_64, kernel 7.0, `Seccomp: 2`:
 
 So the errno itself discloses nothing: a filtered call is byte-identical to one this kernel does not
 implement. What is cheap to enumerate is the **permitted** set, and it always was, because a permitted
-syscall simply runs and returns its own errno. `ENOSYS` moves five syscalls from "costs the prober a
-process" to "free"; the 24 in the kill set still cost one process each. Whether mapping a filter
+syscall simply runs and returns its own errno. `ENOSYS` moves nine syscalls from "costs the prober a
+process" to "free"; the 24 in the kill set still cost one process each, and 9 plus 24 is the 33. Whether mapping a filter
 helps an attacker who already has code execution in the box is a separate question, and an open one:
 mapping is not bypassing. It is written down as unresolved in
 [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than argued either way here.

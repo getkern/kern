@@ -287,6 +287,59 @@ mod tests {
         }
     }
 
+    /// The syscall counts the documentation publishes are the counts the filter actually has.
+    ///
+    /// This exists because they drifted, and in the direction that flatters us. `SECURITY.md` said
+    /// "**33 syscalls denied**: 24 that hard-kill plus the 9 that return `ENOSYS`" in one paragraph
+    /// and "`ENOSYS` moves five syscalls" two paragraphs later: five is the number of FAMILIES
+    /// (io_uring, userfaultfd, perf_event_open, the keyring, syslog), nine is the number of calls,
+    /// and the page therefore offered 5 + 24 = 29 against its own 33. An outside security audit read
+    /// the smaller number and repeated it, which is the whole problem with a count that lives only
+    /// in prose: it understated a deliberate weakening by four syscalls, in the very section that
+    /// analyses that weakening.
+    ///
+    /// A number in a security document has to be able to fail a build. Skip-graceful: the repo root
+    /// is found by walking up, so a checkout without the docs (a packaged crate) does not fail here.
+    #[test]
+    fn the_syscall_counts_in_the_docs_match_the_filter() {
+        let kill = denylist(false).len();
+        let errno = errno_syscalls().len();
+        let total = kill + errno;
+        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        while !dir.join("SECURITY.md").is_file() {
+            if !dir.pop() {
+                eprintln!("skip: no SECURITY.md above CARGO_MANIFEST_DIR");
+                return;
+            }
+        }
+        let expect: [(&str, Vec<String>); 2] = [
+            (
+                "SECURITY.md",
+                vec![
+                    format!("**{total} syscalls denied**"),
+                    format!("{kill} that hard-kill"),
+                    format!("the {errno} that return"),
+                ],
+            ),
+            ("README.md", vec![format!("denylist of {total} syscalls")]),
+        ];
+        for (file, needles) in expect {
+            let path = dir.join(file);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                eprintln!("skip: cannot read {}", path.display());
+                continue;
+            };
+            for needle in needles {
+                assert!(
+                    text.contains(&needle),
+                    "{file} no longer contains {needle:?}. The filter denies {total} syscalls \
+                     ({kill} by SIGSYS, {errno} by ENOSYS); update the prose to match the code, \
+                     not the other way round."
+                );
+            }
+        }
+    }
+
     /// The KILL set and the ENOSYS set must stay DISJOINT, and - critically - the ENOSYS demotion must
     /// only ever apply to deny-but-degrade syscalls. A real escape vector (kexec, bpf, ptrace, the
     /// mount API) demoted to a mere ENOSYS would let a hostile payload keep probing instead of dying,
