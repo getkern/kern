@@ -329,15 +329,33 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
             // Scrubbed like every other borrowed string kern prints: pasta is a local binary and
             // not the threat model that `crate::ui::scrub` was written for, but the filter is free
             // and the alternative is one unscrubbed path that the next reader has to reason about.
-            let why = crate::ui::scrub(
-                String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("no output"),
-            )
+            // EVERY line, not the first. The comment above says pasta's message is the whole
+            // diagnosis and the code then took one line of it, which is wrong whenever the first
+            // line is not the error. Measured on WSL2, where pasta prints five lines and the first
+            // is informational:
+            //
+            //   Started as root, will change to nobody.        <- what kern used to report
+            //   No interfaces with usable IPv6 routes
+            //   Couldn't pick external interface: disabling IPv6
+            //   Could not open /proc/self/uid_map: Permission denied   <- the actual cause
+            //   Couldn't configure user mappings
+            //
+            // A reader given only the first line is told something true and useless, and would go
+            // looking at privilege dropping instead of uid maps. Joined with "; " and capped, so a
+            // pasta that decides to be verbose cannot flood the line either.
+            let joined = String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let why = crate::ui::scrub(if joined.is_empty() {
+                "no output"
+            } else {
+                &joined
+            })
             .chars()
-            .take(200)
+            .take(300)
             .collect::<String>();
             return Outbound::Failed(why);
         }

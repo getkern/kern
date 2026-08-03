@@ -4,24 +4,37 @@ Things kern knows it does not know, or does not do yet, written down on purpose.
 cheaper than silent debt: everything here has a shape, a way to settle it, and a reason it has not
 been settled. If you hit one of these, you are not the first, and nothing here is a surprise to us.
 
-## kern does not see an installed `pasta` on WSL2, and reports it as not installed
+## `pasta` starts on Linux and refuses on WSL2, and the reason is a permission on the user namespace
 
-On WSL2, with `passt` installed from apk and `/usr/bin/pasta` present, and a shell `PATH` that
-contains `/usr/bin`, `kern pod create` printed the NOT-INSTALLED branch: "NO outbound (install
-`passt`/`pasta` for egress)". Measured 2026-08-03 with the 0.6.34 binary, which tells that branch
-apart from "installed but did not start", so the failing step is `which_pasta`, not pasta itself.
+On WSL2 a pod comes up loopback-only. kern reports it correctly now:
 
-`which_pasta` reads `PATH`, joins `pasta` onto each entry and takes the first that `is_file()`. On
-Linux with the same code and pasta in `/usr/bin`, it finds it. What is different under WSL is not
-known, and guessing at it is what this file exists to prevent. The pod itself is unaffected: it comes
-up loopback-only, which is also what the message says, so the consequence is a wrong CAUSE rather
-than a wrong outcome.
+    network: loopback-only - services reach each other; pasta IS installed but did not start:
+    Started as root, will change to nobody.; Couldn't open user namespace /proc/1552/ns/user:
+    Permission denied
 
-Two measurement traps were hit while chasing it, and both are worth knowing before the next attempt.
-`command -v` kept reporting `/usr/bin/pasta` after `apk del passt` had removed it, because the shell
-caches command lookups; the file was gone and `ls` said so. And an earlier round appeared to show the
-same symptom on a distro built from the fixed rootfs, but that image carried a kern built BEFORE the
-branch existed, so its single message could not have said anything else.
+So `pasta` is found and executed, and the kernel refuses it the holder's user namespace. Running as
+uid 0 inside the distro is not enough. Why that permission is refused there and granted on every
+Linux host tested is **not established**, and the consequence is bounded: the pod comes up
+loopback-only, which is what the line says, so services still reach each other by name and only
+egress is missing.
+
+⚠️ **This entry previously said something else, and it was wrong.** It claimed kern could not SEE an
+installed pasta and blamed `which_pasta`. That conclusion came from a session where `apk add passt`
+had failed silently, because the distro predates the fix that writes `/etc/apk/repositories`, so
+pasta was never installed at all while `command -v` still answered from the shell's cache. The entry
+even documented that cache trap in its own text and then did not apply it to its own conclusion.
+Re-measured 2026-08-03 with the repositories written by hand: `apk add passt` succeeds,
+`/usr/bin/pasta -> passt` is a real 178016-byte binary that answers `--version`, and kern takes the
+INSTALLED branch. `which_pasta` was never at fault.
+
+Fixed with it: kern used to report only the FIRST line of pasta's stderr, which on WSL2 is the
+informational "Started as root, will change to nobody." The reader was handed a true and useless
+sentence and would go looking at privilege dropping instead of namespace permissions. All of the
+lines are reported now.
+
+How to settle what remains: run `pasta` by hand against a holder's `/proc/<pid>/ns/user` under
+`strace` on WSL2 and see which check refuses, then decide whether it is something kern can grant or
+a property of the WSL kernel. Not started.
 
 ## `stopping_a_box_leaves_no_timeout_watchdog_behind` fails about once in thirteen full runs
 
@@ -113,17 +126,29 @@ working images silently, and the migration needs a corpus of real workloads to v
 before it can be trusted. The denylist is enforced always, cannot be turned off, and the escape
 vectors it covers are tested.
 
+"Denylist" is now slightly narrow as a description, and the difference matters to anyone judging the
+shape rather than the contents. Two rules match a syscall NUMBER (kill, or `ENOSYS`), and a third
+inspects an ARGUMENT: `clone` cannot be denied by number without taking `fork` with it, so its flags
+are read out of the register they arrive in and only the namespace-creating ones are refused. That
+is the rule an outside reviewer is least likely to guess from the word "denylist", and the one that
+closes the gap `unshare`/`setns` alone left open.
+
 ## Whether a survivable denial helps an attacker map the filter is unresolved
 
-Nine denied syscalls, in five families, return `ENOSYS` rather than killing the caller, so that software probing for an
-optional fast path falls back instead of dying (`SECURITY.md` has the set and the measurement). That
-choice is a deliberate compatibility trade, and it has a part we have measured and a part we have not.
+Ten denied syscalls, in six families, return `ENOSYS` rather than killing the caller (`SECURITY.md`
+has the set and the measurement). Nine of them are there so that software probing for an optional
+fast path falls back instead of dying, which is a deliberate compatibility trade. The tenth,
+`clone3`, is there for a different reason and does not belong to that argument: its flags sit in a
+struct behind a pointer that a BPF filter cannot dereference, so there is no way to allow an ordinary
+`clone3` fork while refusing a namespace-creating one, and the whole call has to go. `ENOSYS` rather
+than a kill is what keeps that safe, since every libc that uses it probes it and falls back to
+`clone`. This entry has a part we have measured and a part we have not.
 
 Measured: the errno leaks nothing. A denied `io_uring_setup` and syscall number 998, which exists on
 no kernel, are both `-1 ENOSYS` from inside the box, so a prober cannot tell "the filter refused this"
 from "this kernel has no such call". Also measured: the enumeration cost is asymmetric. A permitted
 syscall runs and returns its own errno, so the permitted set was always cheap to map; `ENOSYS` moves
-nine calls out of the "costs a process per probe" bucket, while the 24 in the kill set stay in it.
+ten calls out of the "costs a process per probe" bucket, while the 24 in the kill set stay in it.
 
 Not measured, and stated as unknown rather than argued away: whether a cheaper map of the filter is
 worth anything to an attacker who already has code execution inside the box. Mapping is not bypassing,
@@ -214,6 +239,12 @@ the memory controller is not delegated gets no warning. The correct predicate
 `cgroup_enable=memory` removed to verify against, which is a physical board rather than a code
 change.
 
+The `--pids-limit` warning added in 0.6.34 has the SAME gating, deliberately and for the same
+reason: it fires on `pids_max.is_some()`, so an explicit request that cannot be applied is spoken
+while the `DEFAULT_PIDS_MAX` backstop failing is not. Warning about the default on every box start
+on such a host would be noise that trains the reader to ignore the line. Both are the same open
+question, and settling one settles the other.
+
 ## RESOLVED, and what was published about it was wrong
 
 This section said the SDK test suites leave **boxes** behind: 2 `pysbx-*` after the Python suite and
@@ -254,9 +285,10 @@ byte the same 1577448. The README, `docs/INSTALL.md` and `BENCHMARKS.md` were co
 1.84 after the release, because this is the one figure that cannot be measured before the CI produces
 the artifact.
 
-The rest of this entry is the 2026-07-31 investigation into shrinking it, unchanged:
+What follows is the 2026-07-31 investigation into shrinking it, kept unchanged because its
+conclusion still holds and its measurements are what a future attempt would start from.
 
-## Binary size: measured 2026-07-31, deliberately NOT applied
+### The 2026-07-31 investigation, unchanged
 
 Published: **1893344 B x86_64 (1.81 MB)**, **1577448 B aarch64 (1.50 MB)**. Growth since v0.6.22 is
 **+2.9%** over six releases, which is not a problem and was the thing worth checking first.
@@ -311,7 +343,7 @@ forwarder still exist", not "does something listen": probing the port would repo
 healthy when an unrelated process grabbed it after the forwarder died, which is a worse answer than no
 answer at all.
 
-## `--ssh` needs `newuidmap`, and three of our four boards do not have it
+## `--ssh` needs `newuidmap`, and no board ships it
 
 `--ssh` forks an sshd inside the box, and sshd's privilege separation needs more than one uid in the
 box's user namespace. kern's default single-uid map does not provide that, so `--ssh` requires the
@@ -319,11 +351,14 @@ box's user namespace. kern's default single-uid map does not provide that, so `-
 allocation for the caller.
 
 Measured 2026-07-31: present on an Ubuntu x86_64 desktop, **absent on a stock Raspberry Pi OS, on the
-Arduino UNO Q and on the Jetson Orin Nano**. kern detects it and warns before the box starts ("--ssh
-needs a uid range … so sshd will refuse the login"), which is the honest behaviour and not a defect,
-but it means the flag most likely to be reached for on a headless board is the one least likely to
-work there. The failure a user then sees from the client is
-`kex_exchange_identification: Connection closed by remote host`, which says nothing about uid maps.
+Arduino UNO Q and on the Jetson Orin Nano**. Re-checked 2026-08-03: the Pi 5 now HAS it, because
+`uidmap` was installed there on 2026-08-01 (see the last paragraph), so the live count is two of the
+three boards missing it, not three. The point the entry is making is about a FRESH board rather than
+ours: nothing here ships it, and the first thing a user does is not `apt install uidmap`.
+
+kern detects it and warns before the box starts ("--ssh needs a uid range … so sshd will refuse the
+login"), which is the honest behaviour and not a defect, but it means the flag most likely to be
+reached for on a headless board is the one least likely to work there.
 
 `kern doctor` already reports the ingredient (`--uid-range / --user / --ssh: newuidmap + /etc/subuid
 present`), so the environment fact is covered. What is not: the warning kern prints at box start does
