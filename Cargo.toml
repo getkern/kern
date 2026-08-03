@@ -18,8 +18,8 @@ edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
 repository = "https://github.com/getkern/kern"
-homepage = "https://github.com/getkern/kern"
-authors = ["kern contributors"]
+homepage = "https://getkern.dev"
+authors = ["Alex <261468952+getkerndev@users.noreply.github.com>"]
 
 # Release: optimized for a small, fast single binary. Startup speed is the headline
 # (opt-level = 3); fat LTO + one codegen unit give whole-program optimization; panic = abort

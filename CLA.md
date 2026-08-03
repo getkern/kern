@@ -1,5 +1,7 @@
 # Contributor License Agreement (CLA)
 
+The project maintainer is Alex ([@realexhub](https://github.com/realexhub)).
+
 By submitting a contribution to this project, you agree to the following:
 
 1. **Grant.** You grant the project maintainer a perpetual, worldwide, non-exclusive,

@@ -215,6 +215,12 @@ and timestamped to Bitcoin ([provenance/](provenance/)).
 Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has the workflow and the
 gates; contributions are covered by the [CLA](CLA.md).
 
+## Maintainer
+
+Alex, [@realexhub](https://github.com/realexhub). Commits and signed release tags are made from
+[@getkerndev](https://github.com/getkerndev), the project's commit identity, so the author on every
+commit and the key on every tag stay the same one.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [TRADEMARK.md](TRADEMARK.md).
