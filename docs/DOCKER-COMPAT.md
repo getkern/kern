@@ -4,9 +4,6 @@ kern speaks Docker's **formats**, so existing images and stacks work, but it doe
 the Docker Engine API. It is a lightweight alternative, not a drop-in clone. This page is the full
 matrix: what is supported, what is not, and where the differences bite.
 
-kern speaks Docker's **formats**, so your existing images and stacks just work, but it does **not**
-reimplement the Docker Engine API. It's a lightweight alternative, not a drop-in clone.
-
 | From your Docker setup | kern |
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd** |
@@ -29,6 +26,42 @@ container port**, even when their published ports differ. Two apps that both def
 to `:3000` is the common case, so kern refuses it *before* starting anything and names
 both services. The same applies to `net.*` sysctls, which belong to the namespace and
 therefore to the whole stack.
+
+**Outbound needs `pasta`, and kern says so when it is missing.** Reaching the internet
+from a rootless network namespace needs a userspace network stack, so `kern compose up`
+attaches `pasta` (the `passt` package) to the pod for NAT'd egress and DNS. It is on by
+default; `--no-outbound` turns it off. If `pasta` is not installed the pod comes up
+**loopback-only** and the bring-up line says which of the two you got, rather than
+leaving you to discover it when a `pip install` inside a service times out:
+
+```
+network: services reach each other by name + outbound to the internet (pasta)
+network: loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)
+```
+
+`pasta` is the only thing in kern that is worth installing separately, and it buys
+exactly this one capability. What it costs, measured on an Intel i7-14700KF, Linux 7.0,
+against the same targets from the host in the same session:
+
+| | in a pod | on the host | |
+|---|---:|---:|---|
+| service to service (shared loopback) | **0.14 ms** p50 | n/a | no bridge, no NAT, no DNS server |
+| TCP connect to a public IP | 28.4 ms | 29.3 ms | identical |
+| TLS handshake | 34.0 ms | 35.1 ms | identical |
+| DNS, name never resolved before | 32.8 ms p50 | 53.3 ms p50 | identical; both are just network latency |
+| download throughput | 1.64 MB/s | 1.80 MB/s | about 9% less |
+
+What `pasta` costs is **about 3.6 ms per network round trip**, measured against the same
+public IP from inside the pod and from the host: connect 29.8 ms against 26.2, and the
+request/response leg after it 30.0 against 26.4. It is a flat per-round-trip cost, so it
+shows up multiplied on anything with several: an HTTPS request, whose TLS handshake adds
+two more, reads about four times that.
+
+The other asymmetry worth knowing is that a pod has **no DNS cache**: a host running a
+caching resolver answers a repeated name in well under a millisecond, while the pod pays
+the full lookup every time, so a warm host can look ~29 ms faster per request on a name it
+has already seen. That is caching, not NAT: on a name neither side had resolved before, the
+pod was the faster of the two.
 
 Declare the port each service listens on and the conflict goes away:
 

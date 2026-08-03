@@ -5,6 +5,19 @@
 //! allow-by-default *denylist* (kern's "always-on" baseline); a stricter allowlist mode can land
 //! later. The filter is installed last, after kern's own setup syscalls, so it only constrains
 //! the workload. Wrong-arch syscalls are killed, closing the foreign-ABI number-confusion bypass.
+//!
+//! Three shapes of rule, and the difference matters when reading the program:
+//!
+//! 1. **Number equality → kill** ([`denylist`]): a syscall no sandboxed workload has any business
+//!    calling, so an attempt is treated as hostile and the process dies.
+//! 2. **Number equality → `ENOSYS`** ([`errno_syscalls`]): equally denied, the call never runs, but
+//!    the caller is told "not implemented" so software that merely PROBES an optional fast path
+//!    takes its fallback instead of dying mid-startup.
+//! 3. **Argument inspection → kill** ([`CLONE_NEW_MASK`]): `clone(2)` cannot be denied outright,
+//!    because it is how every program forks, so its flags are examined and only the
+//!    namespace-creating ones are refused. This is possible ONLY because `clone` passes flags in a
+//!    register; `clone3` passes them behind a pointer that BPF cannot follow, which is why that one
+//!    falls under rule 2 instead.
 
 use crate::Error;
 
@@ -14,7 +27,9 @@ const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
-#[cfg(target_arch = "x86_64")] // only the x32-ABI kill uses JSET (x86_64-only)
+// Used on EVERY arch by the `clone` flag check, and additionally on x86_64 by the x32-ABI kill. It
+// was `#[cfg(target_arch = "x86_64")]` while the x32 kill was its only user; the clone check made
+// that gate a compile error on aarch64, which no amount of x86 testing would have shown.
 const BPF_JSET: u16 = 0x40;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
@@ -37,9 +52,41 @@ const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
 
-// Offsets into `struct seccomp_data`.
+// Offsets into `struct seccomp_data`:
+//   int   nr;                    // 0
+//   __u32 arch;                  // 4
+//   __u64 instruction_pointer;   // 8
+//   __u64 args[6];               // 16, 24, 32, …
 const OFF_NR: u32 = 0;
 const OFF_ARCH: u32 = 4;
+/// Low 32 bits of `args[0]`. `BPF_LD|BPF_W|BPF_ABS` loads a 32-bit word, and every `CLONE_NEW*` bit
+/// lives in the low half, so this is the whole check on a little-endian target. kern only builds for
+/// x86_64 and aarch64 (both little-endian, enforced by [`AUDIT_ARCH`] having no other arm), and on a
+/// big-endian port this would have to become 20.
+const OFF_ARG0: u32 = 16;
+
+/// The namespace-creating bits of `clone(2)`'s flags. `unshare` and `setns` are in [`denylist`] and
+/// hard-kill, but `clone`/`clone3` take the SAME `CLONE_NEW*` flags and reach the same capability, so
+/// denying only the first two left the door open: measured inside a box, `unshare(CLONE_NEWUSER)` was
+/// SIGSYS-killed while `clone(CLONE_NEWUSER)` succeeded and handed the child a FULL capability set,
+/// bounding set included (`CapBnd` 00000110bdacffff → 000001ffffffffff, all 13 dropped caps back).
+///
+/// `clone` cannot simply be denied: it is how every program forks, and `fork`, `vfork`,
+/// `posix_spawn` and `pthread_create` are all `clone` with no namespace bit set. So the flags are
+/// inspected instead, which seccomp CAN do here because they arrive in a REGISTER (`args[0]`) rather
+/// than behind a pointer. `clone3` puts them in a `struct clone_args` behind a pointer, which
+/// seccomp-BPF cannot dereference at all; it is handled separately, in [`errno_syscalls`].
+///
+/// `CLONE_NEWTIME` (0x80) is deliberately absent: it is rejected by `clone` itself (it collides with
+/// the `CSIGNAL` byte) and is reachable only through `clone3`, which is denied outright.
+/// `CLONE_IO` (0x8000_0000) is likewise absent: it shares an io-context, it creates no namespace.
+const CLONE_NEW_MASK: u32 = 0x0002_0000  // CLONE_NEWNS
+    | 0x0200_0000                        // CLONE_NEWCGROUP
+    | 0x0400_0000                        // CLONE_NEWUTS
+    | 0x0800_0000                        // CLONE_NEWIPC
+    | 0x1000_0000                        // CLONE_NEWUSER
+    | 0x2000_0000                        // CLONE_NEWPID
+    | 0x4000_0000; // CLONE_NEWNET
 
 // The audit-arch token for the build target. A syscall number is only meaningful for one ABI,
 // so we kill anything arriving under a different arch.
@@ -67,8 +114,15 @@ fn nesting_syscalls() -> [libc::c_long; 5] {
     ]
 }
 
-/// Dangerous syscalls. `libc::SYS_*` resolves to the correct number for the compile target.
-/// `clone`/`clone3` are intentionally NOT blocked - they're how ordinary programs fork.
+/// Dangerous syscalls, denied by NUMBER and killed on sight.
+///
+/// `clone` is deliberately absent and always will be: it is how every program forks, so denying the
+/// number would kill `fork`, `vfork`, `posix_spawn` and `pthread_create` with it. It is filtered on
+/// its FLAGS instead, in `build_filter`, against [`CLONE_NEW_MASK`]. `clone3` is absent from this
+/// list too but is NOT permitted: its flags sit behind a pointer BPF cannot read, so it is refused
+/// wholesale with `ENOSYS` from [`errno_syscalls`], which is the only shape that leaves modern
+/// glibc's `clone3`-then-`clone` fallback working.
+///
 /// Returned as a `Vec` because a few `SYS_*` constants aren't exposed by `libc` on every arch
 /// (e.g. `kexec_file_load` on aarch64-musl), so they're added conditionally rather than as a
 /// fixed-size array.
@@ -142,8 +196,21 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
 /// while letting the fallback path (epoll/threads/no-op) take over. Not affected by `allow_nesting` -
 /// none of these are nesting syscalls. True escape vectors (kexec, modules, the mount API, bpf,
 /// ptrace, the nesting set) stay in [`denylist`] and still KILL.
-fn errno_syscalls() -> [libc::c_long; 9] {
+fn errno_syscalls() -> [libc::c_long; 10] {
     [
+        // `clone3(2)`: the ONLY entry here that is not a deny-but-degrade capability probe, and the
+        // reason it is here rather than in `denylist` is a hard limit of seccomp-BPF, not a policy
+        // choice. `clone3` takes its flags in a `struct clone_args` behind a POINTER, and a BPF
+        // filter cannot dereference memory: there is no way to allow an ordinary `clone3` fork while
+        // refusing `clone3(CLONE_NEWUSER)`. The whole call has to go, or the `CLONE_NEW*` denial that
+        // `CLONE_NEW_MASK` enforces on `clone` is bypassable by using the newer entry point.
+        //
+        // `ENOSYS` rather than a kill is what makes that safe, and it is what Docker and podman do
+        // for the same reason: every libc that uses `clone3` probes it and falls back to `clone` on
+        // `ENOSYS`. glibc 2.34+ does exactly this in `pthread_create`/`posix_spawn`; glibc below 2.34
+        // never calls it; musl calls `clone` directly and never `clone3`. Killing here would break
+        // `fork` on modern glibc images, which is the one failure mode that takes everything with it.
+        libc::SYS_clone3,
         // io_uring: bug-rich async-I/O (LPE-CVE history). Still fully denied - callers fall back to
         // epoll/thread-pool I/O, which is exactly what every one of them already ships as the default.
         libc::SYS_io_uring_setup,
@@ -183,14 +250,12 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
 }
 
-/// Install the filter: set `NO_NEW_PRIVS` (required for unprivileged seccomp), then load the BPF.
-/// `allow_nesting` (a rootless `--privileged` box) leaves the namespace + classic-mount syscalls
-/// allowed so a nested `kern box` can start; every other dangerous syscall stays blocked.
-pub fn install(allow_nesting: bool) -> Result<(), Error> {
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(Error::last("prctl(NO_NEW_PRIVS)"));
-    }
-
+/// Build the BPF program, separately from installing it, so the invariants that are invisible to a
+/// reader can be ASSERTED instead of trusted. A jump offset in this program is a raw instruction
+/// count: get one wrong and the filter still loads, still runs, and silently permits or refuses the
+/// wrong thing. `the_clone_flag_check_is_the_last_block_and_its_jumps_land_correctly` walks the
+/// emitted instructions and checks exactly that.
+fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
     // 1. Validate arch (mismatch → kill), then 2. load the syscall number.
     let mut prog: Vec<libc::sock_filter> = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
@@ -221,9 +286,50 @@ pub fn install(allow_nesting: bool) -> Result<(), Error> {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (errno); else skip
         prog.push(stmt(BPF_RET | BPF_K, errno_ret));
     }
+    // 3c. `clone(2)` carrying ANY namespace bit → kill; every other `clone` passes untouched.
+    //
+    // This closes the hole that denying `unshare`/`setns` alone left open: they are not the only way
+    // to make a namespace, and `clone` reaches the same capability with the same `CLONE_NEW*` flags.
+    // Measured before this block existed: inside a box `unshare(CLONE_NEWUSER)` died with SIGSYS
+    // while `clone(CLONE_NEWUSER)` succeeded and the child came back holding every capability kern
+    // had just dropped, bounding set included.
+    //
+    // It MUST be the last block before the default, because loading `args[0]` overwrites the
+    // accumulator, which until here holds `nr` for the equality chains above. Nothing after this
+    // reads `nr` again, so clobbering it is free; putting the block any earlier would silently
+    // break every comparison that follows it.
+    //
+    // Skipped entirely for a rootless `--privileged` box, for the same reason `nesting_syscalls`
+    // relaxes `unshare`/`setns` there: a nested `kern box` (or podman) has to be able to create its
+    // namespaces, and doing it through `clone` instead of `unshare` is an implementation detail of
+    // whichever runtime is nested. Refusing it here while allowing `unshare` would make the flag
+    // work for one runtime and not another.
+    if !allow_nesting {
+        // != clone → skip the three instructions below and land on the default ALLOW.
+        prog.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_clone as u32,
+            0,
+            3,
+        ));
+        prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0)); // A = low 32 bits of flags
+        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 0, 1)); // any bit → next (kill)
+        prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    }
     // 4. Default: allow.
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    prog
+}
 
+/// Install the filter: set `NO_NEW_PRIVS` (required for unprivileged seccomp), then load the BPF.
+/// `allow_nesting` (a rootless `--privileged` box) leaves the namespace + classic-mount syscalls
+/// allowed so a nested `kern box` can start; every other dangerous syscall stays blocked.
+pub fn install(allow_nesting: bool) -> Result<(), Error> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(Error::last("prctl(NO_NEW_PRIVS)"));
+    }
+
+    let mut prog = build_filter(allow_nesting);
     let fprog = libc::sock_fprog {
         len: prog.len() as u16,
         filter: prog.as_mut_ptr(),
@@ -245,7 +351,264 @@ pub fn install(allow_nesting: bool) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{denylist, errno_syscalls, nesting_syscalls};
+    use super::{
+        build_filter, denylist, errno_syscalls, nesting_syscalls, BPF_ABS, BPF_JEQ, BPF_JMP,
+        BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W, CLONE_NEW_MASK, OFF_ARG0,
+        SECCOMP_RET_KILL_PROCESS,
+    };
+
+    /// `CLONE_NEW_MASK` is the whole point of the argument-inspection rule, and a wrong bit in it is
+    /// invisible: too few and a namespace is creatable, too many and ordinary programs die. Pinned
+    /// against the kernel's own numbers (`linux/sched.h`) rather than against itself.
+    #[test]
+    fn clone_new_mask_is_exactly_the_namespace_bits() {
+        const CLONE_NEWNS: u32 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u32 = 0x0200_0000;
+        const CLONE_NEWUTS: u32 = 0x0400_0000;
+        const CLONE_NEWIPC: u32 = 0x0800_0000;
+        const CLONE_NEWUSER: u32 = 0x1000_0000;
+        const CLONE_NEWPID: u32 = 0x2000_0000;
+        const CLONE_NEWNET: u32 = 0x4000_0000;
+        let want = CLONE_NEWNS
+            | CLONE_NEWCGROUP
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWUSER
+            | CLONE_NEWPID
+            | CLONE_NEWNET;
+        assert_eq!(CLONE_NEW_MASK, want, "mask drifted from the kernel's flags");
+        assert_eq!(CLONE_NEW_MASK, 0x7E02_0000);
+
+        // Ordinary process creation must NOT trip it, or `fork` dies and everything with it.
+        const CLONE_VM: u32 = 0x0000_0100;
+        const CLONE_FS: u32 = 0x0000_0200;
+        const CLONE_FILES: u32 = 0x0000_0400;
+        const CLONE_SIGHAND: u32 = 0x0000_0800;
+        const CLONE_VFORK: u32 = 0x0000_4000;
+        const CLONE_THREAD: u32 = 0x0001_0000;
+        const CLONE_SYSVSEM: u32 = 0x0004_0000;
+        const CLONE_SETTLS: u32 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u32 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u32 = 0x0020_0000;
+        const CLONE_IO: u32 = 0x8000_0000;
+        const SIGCHLD: u32 = 17;
+        let benign = [
+            ("fork", SIGCHLD),
+            ("vfork", CLONE_VM | CLONE_VFORK | SIGCHLD),
+            (
+                "pthread_create",
+                CLONE_VM
+                    | CLONE_FS
+                    | CLONE_FILES
+                    | CLONE_SIGHAND
+                    | CLONE_THREAD
+                    | CLONE_SYSVSEM
+                    | CLONE_SETTLS
+                    | CLONE_PARENT_SETTID
+                    | CLONE_CHILD_CLEARTID,
+            ),
+            ("posix_spawn", CLONE_VM | CLONE_VFORK | SIGCHLD),
+            ("io-context share", CLONE_IO | SIGCHLD),
+        ];
+        for (what, flags) in benign {
+            assert_eq!(
+                flags & CLONE_NEW_MASK,
+                0,
+                "{what} would be SIGSYS-killed by the clone flag check"
+            );
+        }
+        // …and every namespace flag alone must trip it.
+        for (what, flag) in [
+            ("NEWNS", CLONE_NEWNS),
+            ("NEWCGROUP", CLONE_NEWCGROUP),
+            ("NEWUTS", CLONE_NEWUTS),
+            ("NEWIPC", CLONE_NEWIPC),
+            ("NEWUSER", CLONE_NEWUSER),
+            ("NEWPID", CLONE_NEWPID),
+            ("NEWNET", CLONE_NEWNET),
+        ] {
+            assert_ne!(
+                (flag | SIGCHLD) & CLONE_NEW_MASK,
+                0,
+                "clone(CLONE_{what}) would slip through"
+            );
+        }
+    }
+
+    /// The clone block reads `args[0]`, which OVERWRITES the accumulator that every equality
+    /// comparison before it depends on. It is therefore only correct as the final block, and its two
+    /// jumps have to land on exactly the right instructions. Both facts are invisible when reading
+    /// the emitter, so they are walked here on the instructions it actually produces.
+    #[test]
+    fn the_clone_flag_check_is_the_last_block_and_its_jumps_land_correctly() {
+        let prog = build_filter(false);
+        let n = prog.len();
+        assert!(n >= 5, "program too short: {n}");
+
+        // Layout of the tail, counted back from the end:
+        //   n-5  JEQ nr == SYS_clone      jt=0 (fall through), jf=3 (→ the final ALLOW)
+        //   n-4  LD  args[0] low word
+        //   n-3  JSET CLONE_NEW_MASK      jt=0 (→ KILL),       jf=1 (→ the final ALLOW)
+        //   n-2  RET KILL_PROCESS
+        //   n-1  RET ALLOW
+        let jeq = prog[n - 5];
+        assert_eq!(
+            jeq.code,
+            BPF_JMP | BPF_JEQ | BPF_K,
+            "instruction n-5 is not the clone equality test"
+        );
+        assert_eq!(jeq.k, libc::SYS_clone as u32, "n-5 does not test SYS_clone");
+        assert_eq!(
+            jeq.jt, 0,
+            "on a match it must fall through to the flag load"
+        );
+        assert_eq!(
+            jeq.jf as usize, 3,
+            "on a non-match it must skip to the default ALLOW"
+        );
+        // The false branch must land EXACTLY on the last instruction, and that must be the ALLOW.
+        assert_eq!(n - 5 + 1 + jeq.jf as usize, n - 1, "jf lands off the ALLOW");
+
+        let ld = prog[n - 4];
+        assert_eq!(ld.code, BPF_LD | BPF_W | BPF_ABS, "n-4 is not a word load");
+        assert_eq!(ld.k, OFF_ARG0, "n-4 loads the wrong seccomp_data offset");
+
+        let jset = prog[n - 3];
+        assert_eq!(jset.code, BPF_JMP | BPF_JSET | BPF_K, "n-3 is not a JSET");
+        assert_eq!(jset.k, CLONE_NEW_MASK, "n-3 tests the wrong mask");
+        assert_eq!(jset.jt, 0, "a set bit must fall through to the kill");
+        assert_eq!(jset.jf as usize, 1, "no set bit must skip to the ALLOW");
+        assert_eq!(
+            n - 3 + 1 + jset.jf as usize,
+            n - 1,
+            "jf lands off the ALLOW"
+        );
+
+        assert_eq!(prog[n - 2].code, BPF_RET | BPF_K, "n-2 is not a return");
+        assert_eq!(prog[n - 2].k, SECCOMP_RET_KILL_PROCESS, "n-2 does not kill");
+        assert_eq!(prog[n - 1].code, BPF_RET | BPF_K, "n-1 is not a return");
+        assert_eq!(prog[n - 1].k, super::SECCOMP_RET_ALLOW, "n-1 is not ALLOW");
+
+        // Nothing after the clone block may read `nr`: the accumulator no longer holds it.
+        // Equivalently, the block is last, which the offsets above already pin.
+    }
+
+    /// A rootless `--privileged` box omits the clone flag check, for the same reason it omits
+    /// `unshare`/`setns`: a nested runtime has to create its namespaces, and which syscall it picks
+    /// is its own business. The relaxation must be EXACTLY that and nothing else.
+    #[test]
+    fn privileged_omits_the_clone_check_and_nothing_more() {
+        let strict = build_filter(false);
+        let nested = build_filter(true);
+        assert!(
+            nested.len() < strict.len(),
+            "privileged must emit fewer instructions"
+        );
+        // 4 instructions for the clone block, plus 2 per omitted nesting syscall.
+        let expected_drop = 4 + 2 * nesting_syscalls().len();
+        assert_eq!(
+            strict.len() - nested.len(),
+            expected_drop,
+            "privileged relaxed something other than the clone block + the nesting set"
+        );
+        // The nested program must NOT contain a JSET on the namespace mask anywhere.
+        assert!(
+            !nested
+                .iter()
+                .any(|i| i.code == (BPF_JMP | BPF_JSET | BPF_K) && i.k == CLONE_NEW_MASK),
+            "the clone flag check survived into the privileged filter"
+        );
+        // …while the strict one must contain exactly one.
+        assert_eq!(
+            strict
+                .iter()
+                .filter(|i| i.code == (BPF_JMP | BPF_JSET | BPF_K) && i.k == CLONE_NEW_MASK)
+                .count(),
+            1,
+            "the clone flag check must appear exactly once"
+        );
+    }
+
+    /// Every number the filter emits is cast `c_long as u32`, and every length is cast
+    /// `usize as u16`. Both casts are safe for the values that exist today and neither is checked at
+    /// run time, so the invariant is pinned here instead. They are not cosmetic:
+    ///
+    /// * a syscall number that did not fit `u32` would be emitted TRUNCATED, so the filter would
+    ///   compare against a number nothing calls and the syscall it was meant to deny would be
+    ///   allowed. Silently, with the entry still visibly present in [`denylist`];
+    /// * a program longer than `u16::MAX` would have its length wrap, and the kernel would load a
+    ///   TRUNCATED filter, permitting everything past the cut. The kernel's own `BPF_MAXINSNS`
+    ///   (4096) rejects such a program first, which is a guard we do not own, so the margin to it is
+    ///   asserted here as well.
+    #[test]
+    fn every_emitted_number_and_length_survives_its_cast() {
+        const BPF_MAXINSNS: usize = 4096;
+        let numbers: Vec<libc::c_long> = denylist(false)
+            .into_iter()
+            .chain(denylist(true))
+            .chain(errno_syscalls())
+            .chain(nesting_syscalls())
+            .chain(std::iter::once(libc::SYS_clone))
+            .collect();
+        assert!(!numbers.is_empty());
+        for nr in numbers {
+            assert!(
+                nr > 0,
+                "syscall number {nr} is not positive: the cast to u32 would wrap"
+            );
+            assert!(
+                u32::try_from(nr).is_ok(),
+                "syscall number {nr} does not fit u32: the emitted filter constant would be truncated"
+            );
+        }
+        for nesting in [false, true] {
+            let n = build_filter(nesting).len();
+            assert!(
+                n < BPF_MAXINSNS,
+                "filter is {n} instructions, at or past the kernel's BPF_MAXINSNS ({BPF_MAXINSNS}): \
+                 prctl would refuse to load it"
+            );
+            assert!(
+                u16::try_from(n).is_ok(),
+                "filter is {n} instructions, which does not fit the u16 `sock_fprog.len`: the \
+                 kernel would load a truncated program and allow everything past the cut"
+            );
+            // Ample margin, so this fails while there is still room to think rather than on the
+            // release that finally crosses the line.
+            assert!(
+                n < BPF_MAXINSNS / 4,
+                "filter grew to {n} instructions, over a quarter of BPF_MAXINSNS"
+            );
+        }
+    }
+
+    /// `clone3` has to be denied by NUMBER, because its flags are behind a pointer BPF cannot read.
+    /// It must be in the ENOSYS set and not the kill set: killing it breaks `fork` on any glibc that
+    /// probes `clone3` first, which is every glibc from 2.34 on.
+    #[test]
+    fn clone3_is_denied_by_enosys_not_by_a_kill() {
+        assert!(
+            errno_syscalls().contains(&libc::SYS_clone3),
+            "clone3 must be denied: it is the pointer-argument bypass of the clone flag check"
+        );
+        assert!(
+            !denylist(false).contains(&libc::SYS_clone3),
+            "clone3 in the KILL set would break fork on glibc >= 2.34, which probes it first"
+        );
+        assert!(
+            !denylist(true).contains(&libc::SYS_clone3),
+            "clone3 must not be in the kill set for a privileged box either"
+        );
+        // `clone` itself must NEVER be denied by number: that is how every program forks.
+        assert!(
+            !denylist(false).contains(&libc::SYS_clone),
+            "clone must not be denied by number, only by flags"
+        );
+        assert!(
+            !errno_syscalls().contains(&libc::SYS_clone),
+            "clone must not be ENOSYS'd either"
+        );
+    }
 
     /// Every high-value syscall a sandboxed workload must never run stays DENIED - whether by a kill
     /// (escape vectors) or by ENOSYS (deny-but-degrade). A regression that drops an entry from BOTH

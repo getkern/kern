@@ -141,6 +141,9 @@ A tighter **minimal set**: start a box, a service, mounts, resource limits, live
 | [reverse-proxy-pod.sh](reverse-proxy-pod.sh) | An `nginx` box in front of an app box in one `--pod` (shared loopback, peer-by-name); only nginx's port is published, a host request reaches the app through the proxy |
 | [scheduled-job.sh](scheduled-job.sh) | Daemonless cron-like pattern: a loop starting a fresh, capped, self-removing box each interval, honest that kern has no built-in scheduler (pair with host cron) |
 | [compose-webstack.sh](compose-webstack.sh) + [compose-webstack.toml](compose-webstack.toml) | A richer `kern compose` stack: a cache with a `--health-cmd` and a web front-end gated on `depends_healthy`, brought up in health order and torn down |
+| [compose-declared-ports.sh](compose-declared-ports.sh) | One stack is one pod, so two services cannot both listen on the same internal port; kern refuses that stack up front instead of letting the loser die with `EADDRINUSE` in its own log. Walks `ports:` / `port:` / `expose:`, ranges, and `--no-pod` |
+| [compose-systemd-unit.sh](compose-systemd-unit.sh) | Start a stack at boot on a daemonless runtime: `kern compose <file> systemd` prints a unit and installs nothing. Honest that it brings the stack up and down but does **not** supervise it |
+| [stack-python-postgres/run.sh](stack-python-postgres/run.sh) | A two-service stack end to end: a Python API and the official `postgres` in one pod, the API reaching the DB on `localhost:5432`, a note written over HTTP and read back out of the database |
 
 ## AI / agent sandboxing (run model-generated code safely)
 
@@ -150,6 +153,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 |---|---|
 | [agent-tool-runner.py](agent-tool-runner.py) | The canonical "code execution tool" an LLM calls: run model-generated Python in a network-off box, return `{success, stdout, fault}`, a runaway loop returns a `timeout` fault, an exfiltration attempt gets no route out |
 | [code-interpreter.py](code-interpreter.py) | A stateful notebook-style session where **file** state persists turn to turn (write CSV → aggregate → format), a dep installed once via `setup=` |
+| [agent-code-interpreter.py](agent-code-interpreter.py) | The same idea taken to its edges: a `pip install` under an **egress allowlist** (PyPI reachable, exfiltration not), stdout **streamed** as it runs, a matplotlib figure returned as a mime-typed result with no Jupyter kernel, timeout/OOM/blocked-syscall as data, snapshot-and-resume, and the same box running JavaScript |
 | [warm-kernel.py](warm-kernel.py) | The **warm kernel** (`sbx.kernel()`): one persistent interpreter so **in-memory** state persists across cells and each cell is **sub-millisecond** (vs ~14 ms cold), with rich chart results, confined errors, network still off, and a per-cell timeout that tears it down |
 | [mcp-code-interpreter.md](mcp-code-interpreter.md) | Wire **`kern-mcp`** into Claude Desktop / Cursor / Windsurf: a local, **network-off** code interpreter (run_code / write_file / read_file / list_files, charts as image blocks); `KERN_MCP_KERNEL=1` routes it through the warm kernel |
 | [per-request-workers.py](per-request-workers.py) | A stdlib-only pool mapping N requests to N fresh throwaway boxes, so one request's timeout/crash is contained to its own box |
@@ -179,6 +183,8 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | Example | What it shows |
 |---|---|
 | [familiar-commands.sh](familiar-commands.sh) | Coming from Docker / AWS / GCP? The same verbs and building blocks, mapped to kern |
+| [run-vs-box.sh](run-vs-box.sh) | The two verbs side by side, because the names collide with Docker's and the collision is backwards: the one spelled `run` is the one that does **not** isolate. Prints uid, hostname, pid 1 and whether `$HOME` is reachable, bare / under `kern run` / under `kern box`, so the difference stops being an argument about names |
+| [docker-shim.sh](docker-shim.sh) | Symlink `docker` to kern and keep typing what you already type: kern reads its own `argv[0]`, translates the command line and runs it rootless and daemonless. No socket, no configuration |
 | [benchmark.py](benchmark.py) | Reproduce the whole **Performance** table, kern vs bubblewrap / crun / runc / podman / docker (auto-detects what's installed) |
 | [compare-vs-docker.sh](compare-vs-docker.sh) | Same isolated `/bin/true`, kern vs `docker run`, timed, and kern needs no daemon |
 | [compare-vs-bwrap.sh](compare-vs-bwrap.sh) | Same speed class as bubblewrap, but kern adds OCI images, overlay, and lifecycle |

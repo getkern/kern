@@ -70,7 +70,7 @@ pub fn help() -> Result<(), Error> {
     {c}diff{z} <box>                                                     List filesystem changes vs the image (C/D)
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     {c}prune{z}                                                          Remove stopped-box sidecar files (logs/health)
-    {c}gc{z} [--images]                                                  Full cleanup: prune + scratch + build layers (+ --images)
+    {c}gc{z} [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
     {c}recover{z}                                                        Reclaim orphaned scratch of dead boxes (also done by gc)
     {c}history{z} [-n N]                                                 Recently-run boxes
 
@@ -508,14 +508,32 @@ fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
 /// Clamp a `--cpuset-cpus` list to the host's CPU range (`0..host`), so an over-wide pin (`0-9999` on
 /// a 4-CPU box) becomes the valid subset (`0-3`) instead of a raw `systemd`/kernel "Failed to parse
 /// AllowedCPUs" that aborts the box start. Each range/single is intersected with `[0, host-1]`;
-/// out-of-range items are dropped. Returns the ORIGINAL untouched if nothing in it exists (so the
-/// backend still rejects an all-invalid pin loudly rather than us silently running unpinned) or if the
-/// format is unparseable (the CLI validator already vetted it). Warns once, like `clamp_cpus`.
-fn clamp_cpuset(set: Option<String>) -> Option<String> {
-    let s = set?;
-    let host = host_cpu_count();
+/// out-of-range items are dropped. Warns once, like `clamp_cpus`.
+///
+/// A list in which NOTHING exists on this host is REFUSED rather than passed through. It used to be
+/// passed through, on the reasoning that "the backend rejects an all-invalid pin loudly rather than
+/// us silently running unpinned". Measured on a 28-CPU machine, that reasoning was false for the
+/// values people actually mistype: `--cpuset-cpus 28` (one past the end) reached systemd, which
+/// accepted it, applied nothing, printed nothing, and exited 0 with the process free to use all 28
+/// CPUs. Only absurd values (`999999`) overflow systemd's parser and fail loudly, so the fallback
+/// worked precisely where it was not needed and failed on the off-by-one. A resource cap that cannot
+/// be applied must not silently become no cap, the same fail-closed rule `--user` follows.
+///
+/// Refusing rather than clamping is deliberate here and differs from [`clamp_cpus`]. Clamping
+/// `--cpus 999` to 28 moves TOWARD the request (you wanted a lot, you get the most there is), while
+/// clamping `--cpuset-cpus 28` to `0-27` INVERTS it: the caller asked to be confined to one CPU and
+/// would be handed the whole machine. There is no safe subset to pick, so the caller is told.
+fn clamp_cpuset(set: Option<String>) -> Result<Option<String>, Error> {
+    let Some(s) = set else {
+        return Ok(None);
+    };
+    let host = host_cpu_count(); // >= 1 by construction, so `host - 1` cannot underflow
     let max = host - 1;
     let mut out: Vec<String> = Vec::new();
+    // Distinguishes "every item parsed and every item was out of range" (refuse) from "an item did
+    // not parse at all" (leave it to the backend, since the CLI validator already vetted the form
+    // and a parser disagreement here is our bug, not the caller's).
+    let mut parsed_any = false;
     for part in s.split(',') {
         let part = part.trim();
         if part.is_empty() {
@@ -524,8 +542,9 @@ fn clamp_cpuset(set: Option<String>) -> Option<String> {
         match part.split_once('-') {
             Some((a, b)) => {
                 let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else {
-                    return Some(s); // unparseable - leave it (format was validated at the CLI boundary)
+                    return Ok(Some(s)); // unparseable - leave it (the CLI boundary vetted the form)
                 };
+                parsed_any = true;
                 let (lo, hi) = (a.min(b), a.max(b));
                 if lo > max {
                     continue; // wholly above the host range → drop
@@ -538,14 +557,28 @@ fn clamp_cpuset(set: Option<String>) -> Option<String> {
                 });
             }
             None => match part.parse::<usize>() {
-                Ok(n) if n <= max => out.push(n.to_string()),
-                Ok(_) => {} // single CPU out of range → drop
-                Err(_) => return Some(s),
+                Ok(n) if n <= max => {
+                    parsed_any = true;
+                    out.push(n.to_string());
+                }
+                Ok(_) => parsed_any = true, // single CPU out of range → drop
+                Err(_) => return Ok(Some(s)),
             },
         }
     }
     if out.is_empty() {
-        return Some(s); // nothing requested exists → let the backend reject it loudly
+        if parsed_any {
+            let range = if max == 0 {
+                "0".to_string()
+            } else {
+                format!("0-{max}")
+            };
+            return Err(Error::Cli(format!(
+                "--cpuset-cpus {s}: this machine has {host} CPU(s), numbered {range}, so none of \
+                 the CPUs you asked for exist. Refusing rather than starting with no pin at all."
+            )));
+        }
+        return Ok(Some(s));
     }
     let clamped = out.join(",");
     if clamped != s && std::env::var_os("KERN_SCOPE").is_none() {
@@ -553,7 +586,7 @@ fn clamp_cpuset(set: Option<String>) -> Option<String> {
             "kern: --cpuset-cpus {s} exceeds the {host} available CPUs - clamping to {clamped}"
         );
     }
-    Some(clamped)
+    Ok(Some(clamped))
 }
 
 /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-v ...] [--env ...] [-- cmd...]` - run
@@ -783,7 +816,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let cpus = clamp_cpus(cpus);
     // Clamp the pin list to the host CPUs too (flag OR profile), so an over-wide `0-9999` becomes the
     // valid subset instead of aborting the box with systemd's raw "Failed to parse AllowedCPUs".
-    let cpuset = clamp_cpuset(cpuset);
+    // Refuses outright when NOTHING in the list exists here: see `clamp_cpuset`.
+    let cpuset = clamp_cpuset(cpuset)?;
     // `--show-config`: a dry run - print the resolved box configuration and exit BEFORE any host-side
     // mount or the systemd-scope re-exec, so nothing is created or torn down.
     if args.show_config {
@@ -1668,7 +1702,7 @@ pub fn run(
     // re-execs once and returns here under KERN_SCOPE. Where systemd --user isn't present it's a
     // no-op and the best-effort in-process cgroup below applies the same caps.
     let cpus = clamp_cpus(cpus);
-    let cpuset = clamp_cpuset(cpuset);
+    let cpuset = clamp_cpuset(cpuset)?;
     // `kern run` exec()s in place (no supervisor to reap the cgroup) → `false`: it must use the systemd
     // `--scope --collect` path (which auto-removes the cgroup on exit), never the direct kern.slice path.
     reexec_in_scope_if_possible(
@@ -1896,10 +1930,16 @@ fn prepare_ssh(
         udp: false,
     }); // 127.0.0.1:<port> -> box :22
     let id = hint_key.map(|k| format!(" -i {k}")).unwrap_or_default();
-    eprintln!(
-        "kern: ssh: ssh -p {port}{id} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-         root@127.0.0.1"
-    );
+    // `accept-new`, and no known-hosts override at all. The line used to read
+    // `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`, which is two problems in one
+    // hint. It is not portable: a box started inside kern's WSL distro is most often reached with
+    // Windows' own ssh.exe, where the null device is `NUL` and `/dev/null` is a path that does not
+    // exist, so the printed command fails verbatim on the platform kern ships a bridge for
+    // (measured: `Host key verification failed`, then it worked with `NUL`). And it teaches the
+    // reader to switch host-key checking off wholesale to silence one first-connection prompt.
+    // `accept-new` pins the key on first sight and still refuses a CHANGED one, which is the part
+    // worth keeping; it needs OpenSSH 7.6 (2017), older than any Windows that ships ssh.exe.
+    eprintln!("kern: ssh: ssh -p {port}{id} -o StrictHostKeyChecking=accept-new root@127.0.0.1");
     Ok((Some(kern_isolation::SshSetup { authorized_key }), eff))
 }
 
@@ -3246,7 +3286,31 @@ fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> i32 {
     if let Some(child) = fork_detached() {
         return child;
     }
-    unsafe { libc::sleep(secs as libc::c_uint) };
+    // Wait for the SUPERVISOR to exit, with `secs` as a cap, rather than sleeping `secs` out.
+    //
+    // This is the detached twin of the foreground watchdog above, and it kept the bare `sleep` that
+    // one shed: `kern box x -d --timeout N` followed by `kern stop x` left this process asleep for
+    // the remainder of N, reparented to init, 884 KB and a pid per stopped box. Measured on this
+    // tree before the change: `--timeout 20`, stop after one second, and the process was still
+    // there at t=15 s and gone at t=20, exactly the deadline. `strace` showed it going straight
+    // from `setsid` to `clock_nanosleep(25s)`, with no `pidfd_open` anywhere.
+    //
+    // Keying on the supervisor loses nothing here, unlike in the foreground watchdog, and the guard
+    // below is why: this one only ever acts `if registry::pair_alive(&name, sup_pid)`, so a dead
+    // supervisor already meant "do nothing". Waiting on its exit reaches that same decision without
+    // holding a process for the deadline. The pidfd also pins that exact supervisor, so a pid
+    // recycled during the wait cannot make the pair-probe match a different box.
+    //
+    // The pidfd is opened AFTER `fork_detached`, never before: that helper runs `close_range(3, ..)`
+    // in the child, which would close an fd taken by the parent.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, sup_pid, 0) as i32 };
+    let supervisor_gone = unsafe { wait_for_box_exit(pidfd, secs.saturating_mul(1000)) };
+    if pidfd >= 0 {
+        unsafe { libc::close(pidfd) };
+    }
+    if supervisor_gone {
+        unsafe { libc::_exit(0) }; // nothing left to stop, and the pair-probe would say so too
+    }
     // Exact (name,pid)-PAIR probe: a by-name `find` would test the pid against whichever same-name
     // entry readdir yields first - a duplicate entry (fail-open unclaimed start / pre-claim kern)
     // could shadow the tracked box and the timeout would silently never fire.
@@ -5521,8 +5585,18 @@ pub fn images(json: bool) -> Result<(), Error> {
             println!("{repo} {size}  {}", fmt_age(now.saturating_sub(e.pulled)));
         }
         if dangling > 0 {
+            // `kern rmi <image>` and nothing else. This line used to offer `kern gc` as an
+            // alternative and `kern gc` does not touch a dangling entry: it prunes, sweeps orphaned
+            // build layers and box scratch, removes retired `--pull always` dirs and stale wait
+            // records, and leaves the image list exactly as it found it. Verified on a real
+            // dangling `ubuntu:latest`: it survived `gc` and went on the first `rmi`.
+            //
+            // Naming a command that does not work is worse here than naming none, because of what
+            // the reader reaches for next: `kern gc --images` is not a bigger version of the same
+            // reclaim, it calls `remove_tree_forced` on the whole cache. Someone chasing one broken
+            // entry down that path deletes every image they have.
             println!(
-                "{d}{dangling} dangling (missing layers) - reclaim with {z}{c}kern rmi <image>{z}{d} or {z}{c}kern gc{z}",
+                "{d}{dangling} dangling (missing layers) - reclaim with {z}{c}kern rmi <image>{z}",
                 d = p.d,
                 z = p.z,
                 c = p.c
@@ -13903,14 +13977,54 @@ mod net_resource_tests {
             format!("0-{max}")
         };
         assert_eq!(
-            clamp_cpuset(Some("0-9999".into())).as_deref(),
+            clamp_cpuset(Some("0-9999".into()))
+                .ok()
+                .flatten()
+                .as_deref(),
             Some(want.as_str())
         );
         // An in-range single is untouched; `None` passes through.
-        assert_eq!(clamp_cpuset(Some("0".into())).as_deref(), Some("0"));
-        assert!(clamp_cpuset(None).is_none());
-        // A single CPU far out of range is dropped → nothing valid → original kept (backend rejects).
-        assert_eq!(clamp_cpuset(Some("9999".into())).as_deref(), Some("9999"));
+        assert_eq!(
+            clamp_cpuset(Some("0".into())).ok().flatten().as_deref(),
+            Some("0")
+        );
+        assert!(clamp_cpuset(None).ok().flatten().is_none());
+        // Nothing in the list exists here → REFUSED, not passed through. This used to return the
+        // original on the reasoning that the backend would reject it loudly; measured on a 28-CPU
+        // machine, `--cpuset-cpus 28` reached systemd, applied nothing, printed nothing and exited 0
+        // with the process free to use every CPU. A cap that cannot be applied must not silently
+        // become no cap.
+        let err = clamp_cpuset(Some("9999".into())).expect_err("an impossible pin must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("9999"),
+            "the message must quote the request, got {msg}"
+        );
+        assert!(
+            msg.contains("Refusing"),
+            "the message must say it refused, got {msg}"
+        );
+        // The off-by-one is the case that actually mattered: one past the last CPU.
+        assert!(
+            clamp_cpuset(Some(host.to_string())).is_err(),
+            "CPU index {host} does not exist on a {host}-CPU host and must be refused"
+        );
+        // ... while the last real CPU is accepted untouched, so the refusal is not over-broad.
+        assert_eq!(
+            clamp_cpuset(Some(max.to_string()))
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some(max.to_string().as_str())
+        );
+        // A partially-valid list still clamps to the valid part rather than refusing.
+        assert_eq!(
+            clamp_cpuset(Some(format!("0,{host}")))
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("0")
+        );
     }
 
     #[test]

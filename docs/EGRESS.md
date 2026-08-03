@@ -18,6 +18,25 @@ to the listed domains** (and their subdomains). An agent can `pip install` from 
 to an arbitrary host. Without the flag the box's default is unchanged: **no outbound at all** (an isolated
 loopback-only netns). `--egress-allow` is strictly *more* open than the default, never less.
 
+## The client inside the box has to speak proxy
+
+kern hands the box the allowlist as a **forward proxy** and exports `http_proxy`, `https_proxy` and
+their uppercase spellings into its environment, so anything that honours those variables works with
+no change: `curl`, `pip`, `npm`, Go, Python's `urllib` and `requests`.
+
+One common client does not, and it is the one in the smallest image people reach for first. Alpine's
+default `wget` is busybox's, and busybox does not implement the `CONNECT` tunnel that HTTPS through a
+proxy needs. Measured with `--egress-allow example.com`:
+
+| client | `http://` | `https://` |
+|---|---|---|
+| busybox `wget` (alpine's default) | works | **fails**, `wget: error getting response` |
+| `curl` | works | works |
+
+So a first attempt with `kern box … --image alpine --egress-allow example.com -- wget https://example.com`
+reports a failure that is not the allowlist refusing anything: it is the client. `apk add curl` in the
+image, or any of the runtimes above, and the same box reaches the allowlisted host and nothing else.
+
 ## How it is enforced (the enforceable part)
 
 1. **The box runs in an isolated network namespace.** It has loopback and nothing else: no route to the

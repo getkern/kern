@@ -55,6 +55,17 @@ printf 'root:100000:65536\n' > "$ROOT/etc/subgid"
 # root in WSL, but keep them correct for any path.)
 chmod 4755 "$ROOT/usr/bin/newuidmap" "$ROOT/usr/bin/newgidmap" 2>/dev/null || true
 
+echo "== apk repositories, so \`apk add\` works INSIDE the shipped distro =="
+# The -X flags above configure THAT ONE apk.static invocation and write nothing into the rootfs, so
+# --initdb leaves the distro with a working apk binary and no repositories. Every later `apk add`
+# then fails with "no such package" even though the network is fine. Measured on the published
+# 0.6.32 distro: /etc/apk/repositories was absent, `apk add python3 py3-pip` (the exact command
+# install.ps1 prints at the end of a successful install, for anyone who wants the SDKs) failed, and
+# so did the openssh-client that `kern box --ssh` needs on the host side. Writing this file made
+# 24171 packages resolvable and both commands work.
+mkdir -p "$ROOT/etc/apk"
+printf '%s/main\n%s/community\n' "$CDN" "$CDN" > "$ROOT/etc/apk/repositories"
+
 echo "== resolv.conf + wsl.conf =="
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$ROOT/etc/resolv.conf"
 cat > "$ROOT/etc/wsl.conf" <<'EOF'

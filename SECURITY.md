@@ -60,14 +60,24 @@ What is **enforced now** by `kern box`:
   *after* the pivot, is compile-enforced by a typestate);
 - **least-privilege capabilities**: 13 never-needed dangerous caps (module load, raw I/O,
   `SYS_TIME`, `SYSLOG`, `BPF`, `PERFMON`, MAC/audit admin, `SYS_BOOT`, …) are dropped from the
-  effective/permitted/inheritable **and** the bounding set just before exec, so neither the
-  workload nor a setuid/file-capability binary can wield them (they're namespaced anyway, this
-  shrinks the surface against cap-gated kernel bugs). `--cap-drop CAP` / `--cap-drop ALL` drops more;
+  effective/permitted/inheritable **and** the bounding set just before exec, so no setuid or
+  file-capability binary in the image can wield them (they're namespaced anyway, this shrinks the
+  surface against cap-gated kernel bugs). **The one way a workload could undo this is closed**, and
+  it is worth knowing what it was, because it is the reason `clone` is filtered on its arguments: a
+  process that creates a nested user namespace is granted a full capability set by the kernel,
+  bounding set included, and until 0.6.34 `clone(CLONE_NEWUSER)` could create one even though
+  `unshare(CLONE_NEWUSER)` was SIGSYS-killed. Measured then: `CapBnd` went from `00000110bdacffff`
+  to `000001ffffffffff`, all 13 back. It was never a host breach, for the same reason `--cap-add` is
+  not: those caps are held over the nested namespace only, and the seccomp filter is not
+  capability-gated, so every syscall they would unlock stayed refused. It is now refused at the
+  source instead, on all six platforms this is tested on. The exception is deliberate: a rootless
+  `--privileged` box omits the check, because a nested runtime has to be able to create namespaces.
+  `--cap-drop CAP` / `--cap-drop ALL` drops more;
   `--cap-add CAP` keeps one that would otherwise be dropped (add wins). Even a re-added cap (e.g.
   `--cap-add SYS_ADMIN`) is held only over the box's **own** user namespace and the always-on seccomp
   denylist still blocks the escape syscalls it would otherwise unlock, so `--cap-add` cannot breach
   the host, and an unknown cap name is a hard error (a typo can't silently leave a cap in place);
-- always-on **seccomp** denylist, **33 syscalls denied**: 24 that hard-kill plus the 9 that return
+- always-on **seccomp** denylist, **34 syscalls denied**: 24 that hard-kill plus the 10 that return
   `ENOSYS` (the split is described below); a rootless `--privileged` box denies 5 fewer. Do not take
   the number from this file, ask the binary: `kern box <name> --image <ref> --show-config` prints
   `seccomp_denied_syscalls`, read from the live lists rather than from a constant. The set is
@@ -75,12 +85,26 @@ What is **enforced now** by `kern box`:
   ptrace + `process_vm_readv`/`writev` / reboot / swap / the classic **and** new mount API, including
   the whole reconfiguration family `mount_setattr` / `fspick` / `fsopen`/`fsconfig`/`fsmount` /
   `open_tree`/`move_mount`, so a box cannot re-mount its own root writable / `pivot_root` / `setns` /
-  `unshare` / `bpf` / `perf_event_open` / `userfaultfd` / `syslog`; the opt-in `--privileged` flag
+  `unshare` / `bpf` / `clone3` / `io_uring`'s three / `userfaultfd` / `perf_event_open` / the
+  keyring's three (`add_key`/`request_key`/`keyctl`) / `syslog`; the opt-in `--privileged` flag
   re-allows exactly five of these, `unshare`/`setns`/`mount`/`umount2`/`pivot_root`, rootless-only,
   for nested boxes, see below),
   wrong-arch syscalls killed, and on x86_64 every **x32-ABI** syscall (the `__X32_SYSCALL_BIT`
   variant, which shares the x86_64 arch token) is killed too, closing the classic bypass where the
   x32 alias of a denied syscall number would otherwise slip past a number-only denylist;
+- **`clone(2)` is filtered on its ARGUMENTS, not its number**, and it is the only rule of that shape.
+  Denying `unshare` and `setns` does not stop a workload from making a namespace, because `clone`
+  takes the same `CLONE_NEW*` flags and reaches the same capability. Measured before this existed:
+  inside a box `unshare(CLONE_NEWUSER)` died with SIGSYS while `clone(CLONE_NEWUSER)` succeeded, and
+  the child came back holding every capability kern had just dropped, **bounding set included**
+  (`CapBnd` `00000110bdacffff` → `000001ffffffffff`, all 13 back). `clone` cannot simply be denied,
+  since `fork`, `vfork`, `posix_spawn` and `pthread_create` are all `clone` with no namespace bit, so
+  the filter reads the flags out of the register they arrive in and kills only
+  `CLONE_NEWNS`/`NEWCGROUP`/`NEWUTS`/`NEWIPC`/`NEWUSER`/`NEWPID`/`NEWNET`. Every other `clone` passes
+  untouched. `clone3` is the same call with its flags in a struct behind a pointer, which a BPF
+  filter **cannot dereference**, so it is refused wholesale with `ENOSYS` (the answer Docker and
+  podman give, for the same reason): every libc that uses it probes it and falls back to `clone`.
+  A rootless `--privileged` box omits this check too, for the same reason it omits `unshare`;
 - **device access is deny-by-default**: the box's `/dev` is a fresh box-owned `tmpfs` that
   *shadows* the image's `/dev`, with only a minimal safe allowlist bound in from the host
   (`null`, `zero`, `full`, `random`, `urandom`). A raw disk, `/dev/mem`, or any other node is

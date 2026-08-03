@@ -39,30 +39,69 @@ fn box_root_fd(pid1: i32) -> std::io::Result<RawFd> {
     }
 }
 
-/// If `spec` is `<name>:<path>` and `name` is a running box, return `(pid1, path)`.
-fn as_box_ref(spec: &str) -> Option<(i32, String)> {
-    let (name, path) = spec.split_once(':')?;
-    if name.is_empty() || path.is_empty() {
-        return None;
+/// What one `kern cp` argument turned out to be.
+enum Side {
+    /// `<name>:<path>` naming a box that is running: its pid 1 and the in-box path.
+    Boxed(i32, String),
+    /// `<name>:<path>`-shaped, naming no running box. Carries the name so the error can say it.
+    NoSuchBox(String),
+    /// Anything else: a path on the host.
+    Host,
+}
+
+/// Classify one `kern cp` argument.
+///
+/// Separating "is this a box reference?" from "does that box exist?" is the whole point. Both used
+/// to collapse into a single `None`, so a correct spelling whose box merely was not running was
+/// reported as a SYNTAX error: `kern cp f.txt nobox:/tmp/x` answered "kern cp needs a box: one side
+/// must be <box>:<path>", which is precisely the thing the user had got right, and sent them to
+/// re-read a form that had nothing wrong with it. Docker answers "No such container: nobox".
+///
+/// An existing host path wins over the box reading, which keeps a file whose NAME contains a colon
+/// copyable: `kern cp weird:name.txt web:/tmp/` used to work by falling through the old `None` and
+/// still does. A first field containing `/` is a host path too (`./a:b`, `/tmp/a:b`), never a box
+/// name. Only a spec that is box-shaped AND names nothing on disk is reported as a missing box.
+fn classify(spec: &str) -> Side {
+    if std::path::Path::new(spec).exists() {
+        return Side::Host;
     }
-    let inst = crate::registry::find_ref(name)?;
+    let Some((name, path)) = spec.split_once(':') else {
+        return Side::Host;
+    };
+    if name.is_empty() || path.is_empty() || name.contains('/') {
+        return Side::Host;
+    }
+    let Some(inst) = crate::registry::find_ref(name) else {
+        return Side::NoSuchBox(name.to_string());
+    };
     let pid1 = if inst.pid1 > 0 {
         inst.pid1
     } else {
-        crate::registry::child_of(inst.pid)?
+        match crate::registry::child_of(inst.pid) {
+            Some(p) => p,
+            // Registered, but its init is already gone: a box on its way out. "No such box" is the
+            // truthful answer to "can I copy into it right now", and the alternative was to treat
+            // the whole spec as a host path and write a file called `name:path` in the cwd.
+            None => return Side::NoSuchBox(name.to_string()),
+        }
     };
-    Some((pid1, path.to_string()))
+    Side::Boxed(pid1, path.to_string())
 }
 
 /// `kern cp <src> <dst>` - exactly one of `src`/`dst` must be `<box>:<path>`.
 pub fn cp(src: &str, dst: &str) -> Result<(), Error> {
-    match (as_box_ref(src), as_box_ref(dst)) {
-        (Some(_), Some(_)) => Err(Error::Sandbox(
+    match (classify(src), classify(dst)) {
+        // Checked first: a missing box is a definite answer, and reporting it as anything else
+        // (bad syntax, or "needs a box") describes a problem the caller does not have.
+        (Side::NoSuchBox(name), _) | (_, Side::NoSuchBox(name)) => Err(Error::NotRunning(format!(
+            "no box named '{name}' is running"
+        ))),
+        (Side::Boxed(..), Side::Boxed(..)) => Err(Error::Sandbox(
             "box-to-box copy isn't supported - copy via the host in two steps".into(),
         )),
-        (Some((pid1, box_src)), None) => copy_out(pid1, &box_src, dst),
-        (None, Some((pid1, box_dst))) => copy_in(src, pid1, &box_dst),
-        (None, None) => Err(Error::Sandbox(
+        (Side::Boxed(pid1, box_src), Side::Host) => copy_out(pid1, &box_src, dst),
+        (Side::Host, Side::Boxed(pid1, box_dst)) => copy_in(src, pid1, &box_dst),
+        (Side::Host, Side::Host) => Err(Error::Sandbox(
             "kern cp needs a box: one side must be <box>:<path> (e.g. kern cp web:/etc/app.conf ./ )"
                 .into(),
         )),
@@ -205,13 +244,43 @@ use std::os::unix::io::FromRawFd;
 mod tests {
     use super::*;
 
+    /// The three answers `classify` must keep apart, because collapsing them is what produced a
+    /// syntax error for a correct spelling: the old shape of this test asserted that a box-shaped
+    /// spec with no live box came back as "not a box reference", which was the defect.
+    ///
+    /// No running box is needed. The only case that consults the registry is a box-shaped spec that
+    /// names nothing on disk, and on a host with no box by that name the lookup misses, which is
+    /// exactly the case under test.
     #[test]
-    fn as_box_ref_needs_a_running_box() {
-        // No such box → None (so it's treated as a host path).
-        assert!(as_box_ref("definitely-not-a-box:/etc/x").is_none());
-        assert!(as_box_ref("/plain/host/path").is_none());
-        assert!(as_box_ref("name:").is_none());
-        assert!(as_box_ref(":path").is_none());
+    fn a_missing_box_is_not_reported_as_a_syntax_error() {
+        // Box-shaped, no such box: the caller must be able to say WHICH name was missing.
+        match classify("definitely-not-a-box:/etc/x") {
+            Side::NoSuchBox(n) => assert_eq!(n, "definitely-not-a-box"),
+            _ => panic!("a box-shaped spec with no live box must classify as NoSuchBox"),
+        }
+        // An existing host path wins over the box reading, so a file whose NAME contains a colon
+        // stays copyable. This is the case the fix had to avoid breaking.
+        let dir = std::env::temp_dir().join(format!("kern-cp-test-{}", std::process::id()));
+        let weird = dir.join("weird:name.txt");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&weird, b"x").expect("temp file");
+        assert!(
+            matches!(classify(&weird.to_string_lossy()), Side::Host),
+            "an existing host path must classify as Host even with a colon in its name"
+        );
+        let _ = std::fs::remove_file(&weird);
+        let _ = std::fs::remove_dir(&dir);
+        // A first field containing a slash is a path, never a box name; and the degenerate halves.
+        for host in [
+            "./a:b",
+            "/tmp/a:b",
+            "/plain/host/path",
+            "plain-path",
+            ":path",
+            "boxname:",
+        ] {
+            assert!(matches!(classify(host), Side::Host), "{host} must be Host");
+        }
     }
 
     #[test]

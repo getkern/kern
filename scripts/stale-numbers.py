@@ -52,7 +52,13 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         {"BENCHMARKS.md"},  # explains the history of this very number
     ),
     (
-        r"\b3\.6 ms\b",
+        # Anchored on the CLAIM, not on the digits. An unanchored `3.6 ms` fired on "about 3.6 ms
+        # per network round trip", a measurement of pasta that has nothing to do with a cold start,
+        # and a gate that cries wolf is a gate that gets switched off. The figure only matters when
+        # it is next to the thing it measures, so the pattern requires one of those words on the
+        # same line.
+        r"\b3\.6 ms\b(?=[^\n]{0,80}(?:cold|start|box))"
+        r"|(?:cold|start|box)[^\n]{0,80}\b3\.6 ms\b",
         "3.4 ms",
         "cold start from an OCI image; the README table and BENCHMARKS.md both measure 3.4.",
         set(),
@@ -69,6 +75,19 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         "nine syscalls return ENOSYS, in five FAMILIES (io_uring, userfaultfd, perf_event_open, "
         "the keyring, syslog). Counting families as calls made 5 + 24 = 29 against a stated 33. "
         "Pinned from the code by the_syscall_counts_in_the_docs_match_the_filter.",
+        set(),
+    ),
+    (
+        # The README quoted a single multiplier against the engines and pointed the reader at
+        # BENCHMARKS.md for the method, where the same ratio read ~120x: BENCHMARKS measures kern
+        # CAPPED (2.45 ms), the README's table measures it uncapped (2.2). Neither was wrong and the
+        # two disagreed on the launch page. The README now states the range its own table produces.
+        r"\b~?132\s*x\b",
+        "128 to 134x",
+        "kern vs the engines on the README's own table: 281.5 / 2.2 = 128, 294.4 / 2.2 = 134. "
+        "BENCHMARKS.md's ~120x is the CAPPED comparison and says so. Re-measured on the shipping "
+        "binary 2026-08-03 the same script gave 123 to 128x, the whole table having drifted ~5% "
+        "that day with bubblewrap and docker too; the README records both rather than averaging.",
         set(),
     ),
     (

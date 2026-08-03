@@ -17,6 +17,342 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.34], 2026-08-03
+
+### Fixed
+
+- **`--pids-limit` could be accepted and silently not enforced, and the warning that exists for it
+  was looking in the wrong place.** Measured on a Raspberry Pi 5: `--pids-limit 999999999` exited 0
+  with the box's `pids.max` reading `max`, so the box ran with no fork-bomb guard and nothing said
+  so. On the same host 64, 256 and 1000000 were honoured exactly, which is what makes this the write
+  failing rather than the value being clamped. Reproduced on the Jetson and the UNO Q.
+
+  `warn_unenforced_caps` already covered pids, and that is why it stayed quiet: it asked
+  `capped_in_tree`, which walks UP from the box's cgroup and stops at the first real limit. Walking
+  up from the box on the Pi finds `pids.max=max` at the box itself, at `app.slice` and at
+  `user@1000.service`, then `pids.max=20370` at `user-1000.slice` and returns satisfied. But 20370
+  is systemd's session-wide `TasksMax` for the whole user, shared with every other process they run.
+  It is not a per-box limit and it does not become one by being finite: a fork bomb inside the box
+  would exhaust it against the session, which is the outcome `--pids-limit` exists to prevent.
+
+  The trap was already written down, in the fail-closed block of `apply_caps`, in those words, and
+  that block correctly keys on the box's own read-back instead. The rule was applied in one place
+  and not the other, which is this project's `derived-condition-duplicated` defect class rather than
+  a new one. `capped_here` is now the leaf-only counterpart to `capped_in_tree`, pids uses it, and a
+  test pins the difference so a refactor that collapses them fails rather than going quiet.
+
+  Memory and CPU keep the tree walk, and that is correct rather than an oversight: a parent
+  `memory.max` really does bound this box, while a parent `pids.max` does not bound it alone.
+  Checking only the leaf costs no false warning, verified on the same host where 64, 256 and 1000000
+  all land in the box's own cgroup exactly.
+
+  A second gap in the same area is closed with it: the direct cgroup path warned for I/O, memory and
+  CPU and not for pids, so a box whose pids write failed there was silent too. Four knobs, four
+  warnings, and `every_cap_knob_has_a_not_enforced_warning` asserts a fifth cannot be added without
+  one.
+
+  Verified on six targets: silence for the values that apply, the warning for the one that does not.
+  x86_64 and the Contabo VPS take the direct path and refuse the box outright, which is the stricter
+  and already-correct behaviour there; the Pi 5, the Jetson, the UNO Q and WSL2 warn.
+
+- **`clone`/`clone3` reached the namespace creation that `unshare`/`setns` are killed for.**
+  `unshare` and `setns` have been in the kill set since the filter existed, so the documented model
+  was that a box cannot make a namespace. It could. `clone` and `clone3` take the same `CLONE_NEW*`
+  flags and were deliberately not denied, because they are how every program forks. Measured in
+  three separate processes inside a box: `unshare(CLONE_NEWUSER)` died with SIGSYS while
+  `clone(CLONE_NEWUSER)`, `clone(CLONE_NEWUSER|CLONE_NEWNS)` and `clone3(CLONE_NEWUSER)` all
+  succeeded, and the child came back holding every capability kern drops before exec, **bounding set
+  included** (`CapBnd` `00000110bdacffff` to `000001ffffffffff`, all 13 restored).
+
+  It was never a host escape, which is why it is a Fixed and not a Security advisory: the uid stays
+  `65534`, a capability held in a nested user namespace grants nothing over host-owned objects, and
+  seccomp is inherited across `clone` and cannot be dropped under `NO_NEW_PRIVS`, so every syscall
+  those capabilities would unlock stayed refused. Verified end to end at the time: `mount` from
+  inside that nested namespace was SIGSYS-killed, so the read-only and masked-`/proc` contract held.
+  What it did break was the documented claim, and defence in depth was thinner than the page said.
+
+  The two halves need different mechanisms, and that is forced by seccomp, not chosen. `clone`
+  cannot be denied by number without killing `fork`, `vfork`, `posix_spawn` and `pthread_create`
+  with it, so its flags are read out of the register they arrive in (`args[0]`) and only
+  `CLONE_NEWNS`/`NEWCGROUP`/`NEWUTS`/`NEWIPC`/`NEWUSER`/`NEWPID`/`NEWNET` are killed. `clone3` puts
+  the same flags in a struct behind a pointer, which a BPF filter **cannot dereference**, so there
+  is no way to allow an ordinary `clone3` while refusing a namespace one: it is refused wholesale
+  with `ENOSYS`, the answer Docker and podman give for the same reason. `ENOSYS` rather than a kill
+  is what keeps that safe, because every libc that uses `clone3` probes it and falls back to
+  `clone`: glibc 2.34+ does exactly this, older glibc never calls it, musl never calls it. A
+  rootless `--privileged` box omits the flag check as well, for the same reason it omits `unshare`.
+
+  The count is now **34 syscalls denied**, 24 by SIGSYS and 10 by `ENOSYS`. `clone` is not among
+  them and never will be: it is the only rule in the filter that inspects an argument rather than a
+  number, and `the_clone_flag_check_is_the_last_block_and_its_jumps_land_correctly` walks the
+  emitted BPF instructions to assert it, because a wrong jump offset still loads, still runs, and
+  silently permits or refuses the wrong thing. The block has to be last, since reading `args[0]`
+  overwrites the accumulator every preceding comparison depends on.
+
+  Verified on **six targets** with the same probe, all identical: namespace clones and `unshare`
+  SIGSYS-killed, `fork`/`vfork`/`pthread_create` x8/`system()` untouched, `clone3` returning
+  `ENOSYS`. x86_64 (Linux 7.0), a Contabo VPS (Ubuntu 24.04, KVM), WSL2 (6.18), Raspberry Pi 5
+  (6.6.51), Jetson Orin Nano (5.15-tegra) and an Arduino UNO Q (Android 6.16.7). Against real
+  workloads on **glibc 2.41**, the version that probes `clone3` first: 16 Python threads,
+  `subprocess`, `os.fork`, `multiprocessing.Pool`, 8 Node `worker_threads`, `child_process`,
+  `apt-get update`, `apk add gcc`, and a `gcc` compile-and-run. All four pentest suites still pass
+  (74 assertions) and the `kern run` battery is 74/74 on all six.
+
+  One defect in the change was caught only by cross-compiling: `BPF_JSET` was
+  `#[cfg(target_arch = "x86_64")]`, since the x32-ABI kill had been its only user, and the flag
+  check made that a compile error on aarch64. No amount of x86 testing would have shown it.
+
+- **`--cpuset-cpus` silently dropped the pin when no requested CPU existed.** On a 28-CPU machine,
+  `kern run --cpuset-cpus 28 -- cmd` exited 0, printed nothing, and ran with `Cpus_allowed_list:
+  0-27`: the caller asked to be confined to one CPU and got the whole machine. Same for 29, 100 and
+  every value up to the point where systemd's own parser overflows. `kern box` had it too, through
+  the same function.
+
+  The code did this on purpose, and the reasoning is in the comment it shipped with: an all-invalid
+  pin was passed through untouched "so the backend still rejects an all-invalid pin loudly rather
+  than us silently running unpinned". Measured, that is false for the values people actually
+  mistype. Only absurd ones (`999999`) overflow systemd's parser and fail loudly; an off-by-one on
+  the CPU count is accepted, applied to nothing, and reported as success. The fallback worked
+  exactly where it was not needed and failed on the realistic case, and a unit test asserted the
+  pass-through, so the wrong behaviour was pinned rather than caught.
+
+  A list in which nothing exists is now refused with the count and the valid range: `--cpuset-cpus
+  28: this machine has 28 CPU(s), numbered 0-27, so none of the CPUs you asked for exist. Refusing
+  rather than starting with no pin at all.` Refusing rather than clamping is deliberate and differs
+  from `--cpus`: clamping `--cpus 999` to 28 moves toward the request, while clamping
+  `--cpuset-cpus 28` to `0-27` inverts it. A partially valid list still clamps and says so
+  (`0,28` becomes `0`), and the last real CPU is still accepted, so the refusal is not over-broad.
+
+  Found by an extreme pass over `kern run`, the least-exercised verb in the tree: 74 assertions over
+  exit-code propagation, stream fidelity (10 MB stdout byte-exact, NUL-safe), whether the memory and
+  CPU caps are real (they are: SIGKILL past `--memory 64m`, 50% of a core under `--cpus 0.5`), the
+  `--` contract, hostile cap values, signals and orphans, cgroup cleanup, and 50 concurrent runs.
+  Two of the 74 failed on the first pass. One was this. The other was the harness counting every
+  `kern` process on the machine rather than the ones it started, which reported four survivors that
+  belonged to a stale 0.6.31 on `PATH`, a bug fixed two releases ago.
+
+- **A `vgpio` device that is not on this host was skipped without a word.** Every other outcome in
+  that resolver speaks: a dangerous node is refused by name, an unrecognised kind is flagged, a node
+  the caller cannot open is called out with the fix. A path that simply does not exist was the last
+  silent arm, and a typo looks exactly like a portable profile from there: `/dev/i2c-l` for
+  `/dev/i2c-1` skips as quietly as a Pi profile attached on a desktop, and the box then starts
+  without the device its author asked for. It is now a note rather than an error, so a profile shared
+  across machines still runs, and a misspelling is visible.
+
+- **A pod with `pasta` installed was told to install `pasta`.** `setup_outbound` returned one `bool`
+  for four different outcomes, so `pod create` printed "NO outbound (install `passt`/`pasta` for
+  egress)" whether pasta was missing, present but refusing to start, or working with no DNS. Found on
+  WSL2 with `/usr/bin/pasta` present and the pod still coming up loopback-only, being told to install
+  what it already had. pasta's own explanation was going to `/dev/null`.
+
+  It now reports the cause: missing, or installed-and-failed with pasta's first line of stderr
+  carried through, or NAT-up-but-no-DNS, which used to be reported as no outbound at all even though
+  the pod could reach an IP. All three verified separately, including with a stub `pasta` that exits
+  non-zero: the line reads "pasta IS installed but did not start: pasta: cannot open netns: Operation
+  not permitted".
+
+- **`kern cp` reported a syntax error when the syntax was right and the box was simply not there.**
+  `as_box_ref` returned `None` for three different reasons, and the caller could only tell one story
+  about all three: `kern cp f.txt nobox:/tmp/x` answered "kern cp needs a box: one side must be
+  `<box>:<path>`", which is exactly the thing the caller had got right. Docker answers "No such
+  container: nobox". It now answers "no box named 'nobox' is running", with the `kern ps` hint.
+
+  The reading order is deliberate: an existing host path still wins over the box interpretation, so
+  `kern cp weird:name.txt web:/tmp/` keeps working, and a first field containing a slash is a path
+  rather than a name. Only a spec that is box-shaped AND names nothing on disk is reported as a
+  missing box. Both cases are pinned by tests, including the colon-in-a-filename one that the fix
+  had to avoid breaking.
+
+- **`kern images` told you to reclaim a dangling entry with a command that does not reclaim it.**
+  The footer read "N dangling (missing layers) - reclaim with `kern rmi <image>` or `kern gc`".
+  `kern gc` prunes, sweeps orphaned build layers and box scratch, removes retired `--pull always`
+  dirs and stale wait records, and does not touch the image list. Verified on a real dangling
+  `ubuntu:latest`: it survived `gc` and went on the first `rmi`. The footer now names `rmi` only.
+
+  Naming a command that does not work mattered more than usual here because of what the reader
+  reaches for next: `kern gc --images` is not a stronger reclaim, it calls `remove_tree_forced` on
+  the whole cache. Someone chasing one broken entry down that path deletes every image they have.
+  Its help line said "Full cleanup: prune + scratch + build layers (+ --images)" and now says
+  plainly that `--images` DELETES every cached image.
+
+- **A volume written by a box was undeletable, and the error sent the reader nowhere.** Every OCI
+  image box gets the uid RANGE by default, so a database image writes files owned by a uid that
+  exists only inside that box's user namespace. `kern volume rm` then fails with
+  `Permission denied (os error 13)` and the host user cannot fix it by any means available from the
+  host. The hint under it said "run `kern volume ls` to see existing volumes", which is true and
+  useless. Reproduced with `postgres:16-alpine`: its `pgdata/` comes out owned by a mapped uid.
+
+  The message now names the cause and prints the two commands that actually work, ready to paste:
+  empty the volume from INSIDE a box, which holds the mapping, then remove the husk. Verified by
+  running exactly what it prints, and the volume was gone. The generic hint is also dropped whenever
+  a volume error carries its own remedy, because a one-line pointer under two paste-ready commands is
+  noise, and noise under an instruction is how the instruction gets skipped. `Error::Volume` now
+  branches on the message, the same shape `oci_hint` already used.
+
+- **The `--timeout` watchdog leak was fixed in one of the two watchdogs.** 0.6.32 replaced the
+  foreground watchdog's `sleep(N)` with a pidfd wait, and closed the leak it described. The
+  **detached** path has its own watchdog, `spawn_timeout_stop`, and it kept the bare sleep. So
+  `kern box x -d --timeout N` followed by `kern stop x` still left one process asleep for the
+  remainder of `N`, reparented to init: 884 KB and a pid per stopped box, until its deadline.
+
+  Found by measurement, not by reading: a bottleneck audit ran 200 boxes and then eight detached
+  ones, and `kern ps` reported 0 boxes while `ps` reported 9 live `kern` processes. Isolated to one
+  command: `--timeout 20`, `kern stop` after a second, the process still there at t=15 s and gone at
+  t=20, exactly the deadline. `strace` showed it going from `setsid` straight to
+  `clock_nanosleep(25s)` with no `pidfd_open` anywhere, which is what separated it from the
+  already-fixed twin.
+
+  It now waits on a pidfd pinned to the supervisor, with `N` as a cap, through the same
+  `wait_for_box_exit` the foreground watchdog uses. Keying on the supervisor loses nothing here,
+  unlike in the foreground case: this watchdog only ever acts `if registry::pair_alive(&name,
+  sup_pid)`, so a dead supervisor already meant "do nothing", and the pidfd also pins that exact
+  supervisor so a recycled pid cannot make the pair-probe match a different box. Verified: `stop`
+  now leaves 0 processes where it left 1, eight detached boxes stopped in bulk leave 0 where they
+  left 8, and the deadline still fires on time (`-d --timeout 5` around a `sleep 60` stops the box
+  at 5 s).
+
+- **`apk` could not install anything in the WSL distro kern ships, so the command the installer
+  itself prints at the end of a successful install did not work.** `install.ps1` closes with "the
+  distro is a minimal Alpine, so for the SDKs add a runtime first: `apk add python3 py3-pip`". On
+  the published 0.6.32 distro that fails with `ERROR: unable to select packages: python3 (no such
+  package)`, and so does every other `apk add`, while the network is fine: `curl` to
+  `dl-cdn.alpinelinux.org` returns 200 in 0.23 s from inside the same distro.
+
+  `/etc/apk/repositories` was absent. The rootfs build passes the repositories to `apk.static` as
+  `-X` flags, which configure that one invocation and write nothing into the rootfs, so `--initdb`
+  left a distro with a working `apk` binary and no repositories at all. The build now writes the
+  file. Verified by building the rootfs and reading it back out of the tarball, and on the machine
+  by writing the same two lines by hand: `apk update` then resolves **24171 packages**,
+  `apk add python3` installs 3.12.13, and `apk add openssh-client` supplies the `ssh-keygen` that
+  `kern box --ssh` needs on the host side. The tarball stays 9.5 MB.
+
+  This only ever affected kern's own pre-baked WSL distro. On a normal Linux host the package
+  manager is the user's own and was never touched.
+
+- **A `box` flag typed on `run` now explains the two verbs instead of misdirecting.**
+  `kern run --image alpine -- sh` answered `unknown flag (put \`--\` before the command)`, which is
+  wrong twice: the `--` is not the problem, and the obvious next attempt is
+  `kern run -- --image alpine`, which hands the flag to the workload. `run` has no image and no
+  namespaces by design, so no placement of `--` was ever going to work.
+
+  It matters more than a bad hint usually does, because this is the one place a Docker reflex meets
+  kern and the two verbs are inverted relative to it: `docker run` starts a container, `kern run`
+  caps a process on the host and sandboxes nothing. Measured, `kern run -- sh -c 'id -u; hostname'`
+  reports the host's uid, the host's hostname and `systemd` as pid 1, identical to running the
+  command bare. Someone typing `kern run --read-only --network none -- ./untrusted` on that reflex
+  believes they are isolated and is not, and nothing in the output said otherwise.
+
+  Forty `box` flags now produce `` `kern run` has no --read-only. It caps a process on the host: no
+  image, no namespaces, no sandbox. That flag belongs to the sandboxed verb: kern box <name> --image
+  <ref> [-- CMD...] ``. A flag that is nobody's still gets the generic answer, since there is no verb
+  to redirect to. `every_box_only_flag_is_really_a_box_flag` checks the list against the `box` parser
+  itself rather than a second hand-kept copy, so the redirect can never name a flag `box` rejects.
+
+### Documentation
+
+- **`--egress-allow` needs a client that speaks proxy, and now says so.** kern hands the box the
+  allowlist as a forward proxy and exports `http_proxy`/`https_proxy` into it, so `curl`, `pip`,
+  `npm` and Python's HTTP stacks work unchanged. Alpine's default `wget` is busybox's, which does not
+  implement the `CONNECT` tunnel HTTPS through a proxy needs: measured, `http://` works and
+  `https://` fails with `wget: error getting response`. That is the first thing anyone testing the
+  feature on the smallest image will hit, and it reads as the allowlist refusing a host it did not
+  refuse. `docs/EGRESS.md` now has the table and the one-line fix.
+
+- **What `pasta` costs is now a number instead of a gap.** The pod-egress section shipped with an
+  unattributed +21.7 ms on time-to-first-byte, honest but unexplained. Measured properly against the
+  same public IP from inside a pod and from the host: connect 29.8 ms against 26.2, and the
+  request/response leg 30.0 against 26.4. It is **about 3.6 ms per network round trip**, flat, which
+  is why an HTTPS request reads about four times that: its TLS handshake adds two more round trips.
+  The gap was never mysterious, it was one cost multiplied by the number of trips.
+
+  Three attempts to measure it failed first, all for the same reason and none of them kern's: a
+  compose stack with a SINGLE service creates no pod, so there was no pasta, no egress, and `curl`
+  inside the box had nothing to answer. The docs page also carried its opening paragraph twice, in
+  two wordings; the second is gone.
+
+- **Pod egress was undocumented.** `kern compose` attaches `pasta` for NAT'd outbound and DNS when
+  it is installed, degrades to a loopback-only pod when it is not, and `--no-outbound` opts out.
+  None of that appeared in any `.md`: the words `pasta` and `passt` were in zero documentation files
+  (the only greps that matched were `passthrough`), so it existed solely in source comments and in
+  one line printed at bring-up. `docs/DOCKER-COMPAT.md` now states it next to the shared-namespace
+  model it belongs to, with what it costs, measured rather than asserted: service to service inside
+  a pod 0.14 ms p50, TCP connect and TLS handshake identical to the host through pasta, cold DNS
+  identical (32.8 ms in the pod against 53.3 on the host, both plain network latency), throughput
+  about 9% lower. The one real asymmetry is that a pod has no DNS cache, so a host running a caching
+  resolver answers a repeated name in under a millisecond while the pod pays the full lookup; the
+  first measurement of that gap read as +29 ms of "NAT overhead" and was caching on the host side,
+  which is why the cold-resolution control is in the table.
+
+### Security
+
+- **A registry's error text is scrubbed of control characters before it reaches the terminal.** The
+  change above carries a remote server's own message into kern's error output, and that message is
+  attacker-influenceable by definition: a hostile or compromised registry could answer with ANSI
+  escapes and repaint the line, erase what came before it, or move the cursor, so a refusal could be
+  made to read as a success. kern already strips control characters from every other untrusted
+  string it shows, through `ui::scrub`; this path was carrying one through without it.
+
+  Verified against a registry written to attack it: a `message` containing `ESC[2K ESC[1A ESC[32m
+  PUSH RIUSCITO BEL` and a newline. Before, `cat -v` showed the escapes intact in kern's output;
+  after, zero. What survives is inert printable text, and the newline is gone too, which is also
+  what keeps a multi-line reply from breaking the single-line error format. `pasta`'s stderr, added
+  in the same release, is scrubbed as well: it is a local binary and not the same threat, but one
+  unscrubbed path is one the next reader has to reason about.
+
+### Changed
+
+- **A registry that refuses a token request now reports what the registry said.** `kern push` to
+  ghcr.io failed with `no auth token in token response` and a hint to run `kern login`, addressed to
+  a user who had just logged in successfully. The registry's own answer was in the body and was
+  being discarded: `{"errors":[{"code":"DENIED","message":"requested access to the resource is
+  denied"}]}`. That message is carried through now, with the part the reader cannot infer, that the
+  credentials did reach the registry so the question is what that account may do with that name, not
+  whether to authenticate again. Verified against ghcr.io itself. (The failure that prompted it was
+  a GitHub *organisation* name used where the *user* name goes; the old text gave no way to see it.)
+
+- **The `ssh` command line `--ssh` prints is now portable, and no longer tells you to switch host
+  key checking off.** It read
+  `ssh -p N -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1`. A box
+  started inside kern's WSL distro is most often reached with Windows' own `ssh.exe`, where the null
+  device is `NUL`; run the printed line verbatim there and it fails with
+  `Host key verification failed`, measured, then works once `/dev/null` becomes `NUL`. So the hint
+  did not work on the one platform for which kern ships a bridge.
+
+  It now prints `-o StrictHostKeyChecking=accept-new` and no known-hosts override at all: one flag
+  instead of two, identical on Linux and Windows, and it keeps the protection that matters.
+  Verified in both directions: run verbatim against a host never seen before it connects with no
+  prompt, `known_hosts` grows by one line and `ssh-keygen -F` finds the entry; regenerate the box's
+  host keys and reconnect and it is refused, which `StrictHostKeyChecking=no` would not have done.
+  `accept-new` needs OpenSSH 7.6 (2017), older than any Windows that ships `ssh.exe`.
+
+- **The README quoted a multiplier its own table does not produce, and the page it cites for method
+  quoted a different one.** The Performance section read "the gap that matters is to the engines,
+  ~132x", two lines under a table giving kern 2.2 ms against podman 281.5 and docker 294.4, which is
+  128x and 134x. The reader who followed the link to `BENCHMARKS.md` for the method found ~120x
+  there. Neither figure was invented: `BENCHMARKS.md` divides the engines by kern **capped**
+  (2.45 ms) and says so, the README's table measures it uncapped. Three numbers for one ratio on the
+  launch page, and the largest of them was the one in the headline. The README now states the range
+  its own table produces, 128 to 134x, and `scripts/stale-numbers.py` has a rule so 132x cannot come
+  back.
+
+- **The example count had drifted, and ten examples were unreachable from the index.** The README
+  said "Ninety runnable examples" in two places while `examples/README.md` listed 84. Neither was
+  right: examples had been added with no row in the index, so `agent-code-interpreter.py`,
+  `docker-shim.sh`, `compose-declared-ports.sh`, `compose-systemd-unit.sh` and the two-service
+  `stack-python-postgres/` walk-through existed and nothing in the tree pointed at them. Two of them
+  were reachable only from a sentence in `docs/DOCKER-COMPAT.md`, the rest from nowhere. They are in
+  the index now, and both counts read the number of rows it actually has.
+
+- **The demo's alt text contradicted the demo.** `assets/demo.svg` describes itself to a screen
+  reader as "docker run takes about 308 ms" while the terminal drawn in the image reads ~289 ms. The
+  description is what a reader who cannot see the picture is given, so it was the only version of
+  that number some readers got, and it was the stale one.
+
+- **The Quickstart pointed at a file the reader does not have.** `kern compose stack.toml up` names
+  a `stack.toml` that exists in the repo as `examples/stack.toml`; the line now says where to get
+  one, so the only Quickstart entries that cannot be pasted verbatim are the ones that need a
+  terminal or a program of your own.
+
 ## [0.6.32], 2026-08-02
 
 ### Fixed
@@ -2409,6 +2745,7 @@ capabilities, loopback-by-default ports, a `syslog` seccomp block) from an adver
 - Project docs: README, SECURITY, ARCHITECTURE, CONTRIBUTING, CLA, CODE_OF_CONDUCT.
 - CI: build + test + clippy + fmt + cargo-audit + cargo-deny on x86 (skip-graceful for HW).
 
+[0.6.34]: https://github.com/getkern/kern/releases/tag/v0.6.34
 [0.6.32]: https://github.com/getkern/kern/releases/tag/v0.6.32
 [0.6.31]: https://github.com/getkern/kern/releases/tag/v0.6.31
 [0.6.30]: https://github.com/getkern/kern/releases/tag/v0.6.30

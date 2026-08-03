@@ -4,7 +4,7 @@
 
 **kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
 
-**A real, kernel-enforced container in 3.4 ms, out of one 1.83 MB binary with no daemon.**
+**A real, kernel-enforced container in ~3.4 ms, out of one 1.83 MB binary with no daemon.**
 
 <p align="center">
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.83 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
@@ -57,6 +57,11 @@ process, defined once in a `kern.toml` and attached by name. See
   from strangers, reach for a microVM (Firecracker, Kata) or gVisor. kern's ground is your own or
   semi-trusted code: CI jobs, build steps, dev sandboxes, an agent's tool-calls under your
   supervision.
+
+  This is the container model, not a kern limitation: Docker and Podman share the same kernel and
+  the same escape condition, which is why gVisor and Firecracker were built in the first place. We
+  say it out loud because an unknown tool has to. Where kern differs is which side of it you start
+  on: kern is rootless always, while Docker's daemon runs as root and its rootless mode is opt-in.
 - **Not free of the userns trade.** kern's isolation is built on an unprivileged user namespace, and
   userns has been a fertile source of kernel LPE bugs. Running untrusted code in a box hands it that
   surface to probe. [SECURITY.md](SECURITY.md) states this first, before any claim.
@@ -109,7 +114,7 @@ kern box svc --image nginx:alpine -d -p 8080:80 \  # a service: published, resta
 kern ps                                            # what is running, with PORTS and HEALTH
 kern exec svc -it -- sh                            # shell into it
 kern top                                           # live TUI: boxes, CPU/RAM, profiles, volumes
-kern compose stack.toml up                         # a multi-box stack, kern TOML or compose.yml
+kern compose stack.toml up                         # a multi-box stack (examples/) or a compose.yml
 ```
 
 Untrusted code, with the defaults doing the work:
@@ -128,8 +133,8 @@ Ninety runnable examples, each doing one thing: [examples/](examples/).
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **2.1 ms** | ~294 ms | ~281 ms |
-| Cold start, from an OCI image | **3.4 ms** | ~294 ms | ~281 ms |
+| Cold start, bare box | **~2.1 ms** | ~294 ms | ~281 ms |
+| Cold start, from an OCI image | **~3.4 ms** | ~294 ms | ~281 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.83 MB binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
@@ -140,7 +145,10 @@ Ninety runnable examples, each doing one thing: [examples/](examples/).
 ## Performance
 
 Measured 2026-08-01 on an Intel i7-14700KF, Linux 7.0.0, against the runtimes installed there. Every
-number below comes from one script you can run yourself, `python3 examples/benchmark.py`.
+number below comes from one script you can run yourself, `python3 examples/benchmark.py`. These are
+medians on that machine, quoted exactly because the method and the min-max spread are in
+[BENCHMARKS.md](BENCHMARKS.md); yours will differ with your CPU, kernel and filesystem, which is why
+the summary table above rounds.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
@@ -150,15 +158,22 @@ number below comes from one script you can run yourself, `python3 examples/bench
 A thousand simultaneous boxes take 0.65 s, all 1000 of them. One more live box costs 0.35 MB of real
 memory. `exec` into a running box is 0.79 ms against Docker's 43.3.
 
+Re-run on the released binary on 2026-08-03, the same script gives kern 2.3 ms and 0.10 s, a cold
+start from an OCI image of 3.40 ms against the 3.4 above, `exec` at 0.66 ms and 0.39 MB per live
+box. The whole table moved by that much on the day, **bubblewrap included** (0.19 s to 0.20) and
+runc and podman in opposite directions, which is what says the drift is the machine's state rather
+than kern's code. Quoting one dated run beats averaging two.
+
 kern is in the fastest tier and does not win single-shot latency outright: bubblewrap is 0.8 ms
 behind and the physical floor for `unshare` + `exec` is 1 to 2 ms. The gap that matters is to the
-engines, ~132x, and bubblewrap is a launcher with no images, caps or lifecycle. Method, per-phase
-breakdown, board numbers and the caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
+engines, 128 to 134x on the table above, and bubblewrap is a launcher with no images, caps or
+lifecycle. Method, per-phase breakdown, board numbers and the caveats:
+**[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
 Namespaces, a `pivot_root`, 13 dangerous capabilities dropped before exec, an always-on seccomp
-denylist of 33 syscalls, cgroup v2 limits, and a deny-by-default `/dev`. Where a boundary is
+denylist of 34 syscalls, cgroup v2 limits, and a deny-by-default `/dev`. Where a boundary is
 cooperative rather than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
 
 You do not have to take it on trust: [pentest/](pentest/) holds four adversarial suites that assert
@@ -190,7 +205,7 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**0.6.32.** Everything above works today and is tested: 693 Rust, 69 Python and 56 Node tests,
+**0.6.34.** Everything above works today and is tested: 703 Rust, 69 Python and 56 Node tests,
 clippy-clean, `cargo-deny`-clean. Semver, pre-1.0: the CLI and config surface can still change
 between minor versions, always called out in [CHANGELOG.md](CHANGELOG.md). Releases are signed tags
 and timestamped to Bitcoin ([provenance/](provenance/)).

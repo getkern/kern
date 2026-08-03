@@ -944,7 +944,20 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
                     real.display()
                 );
             }
-            Err(_) => {} // device not present on this host - skip
+            Err(_) => {
+                // Absent on this host. Skipping is right and stays right: a profile written for a Pi
+                // and attached on a desktop must not fail over a `/dev/gpiochip0` that machine does
+                // not have, which is what makes a profile portable at all.
+                //
+                // But a typo looks exactly like a portable profile from here - `/dev/i2c-l` for
+                // `/dev/i2c-1` skips just as quietly - and the box then starts without the device its
+                // author asked for, with nothing said. Every other arm of this match speaks; this one
+                // was the last silent path in the function. A NOTE, not an error: the box still runs.
+                eprintln!(
+                    "kern: vgpio device {path} is not present on this host - skipped (fine for a \
+                     profile shared across machines; check the spelling if you expected it here)"
+                );
+            }
         }
     }
 

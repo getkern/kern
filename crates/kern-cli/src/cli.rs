@@ -2073,6 +2073,54 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
 /// Parse `run [--memory M] [--cpus N] [--] <cmd...>`. Flags come first; the first bare token (or
 /// everything after `--`) begins the command, after which nothing is treated as a flag. An empty
 /// command is a usage error.
+/// Flags that belong to `box` and cannot mean anything on `run`, because `run` has no image and no
+/// namespaces. Every entry is checked against the `box` parser by
+/// `every_box_only_flag_is_really_a_box_flag`, so the redirect can never name a flag `box` does not
+/// take. `--rm` and `--name` are deliberately absent: they are Docker reflexes that `box` does not
+/// have either (a box is named positionally and is thrown away by default), so pointing at `box`
+/// for them would trade one wrong answer for another.
+const BOX_ONLY_FLAGS: &[&str] = &[
+    "--image",
+    "--rootfs",
+    "--bind-rootfs",
+    "-d",
+    "--detach",
+    "-p",
+    "--publish",
+    "-v",
+    "--volume",
+    "-i",
+    "-t",
+    "-it",
+    "-ti",
+    "--interactive",
+    "--tty",
+    "--network",
+    "--net",
+    "--read-only",
+    "--ro",
+    "-e",
+    "--env",
+    "--env-file",
+    "-w",
+    "--workdir",
+    "-u",
+    "--user",
+    "--cap-drop",
+    "--cap-add",
+    "--privileged",
+    "--secret",
+    "--tmpfs",
+    "--pids-limit",
+    "--restart",
+    "--health-cmd",
+    "--ssh",
+    "--pod",
+    "--hostname",
+    "--egress-allow",
+    "--landlock-rw",
+];
+
 fn parse_run(rest: &[&str]) -> Result<Command, Error> {
     let mut memory: Option<u64> = None;
     let mut memory_swap_max: Option<u64> = None;
@@ -2131,6 +2179,20 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
                     Some(v) => cpuset = Some((*v).to_string()),
                     None => return Err(Error::Usage(USAGE_CPUSET)),
                 }
+            }
+            // A `box` flag on `run` is the Docker reflex, and it is the one place where the two-verb
+            // split can hurt rather than merely confuse: `docker run` starts a container, `kern run`
+            // caps a process on the host with NO image, NO namespaces and NO sandbox. Someone who
+            // types `kern run --read-only --network none -- ./untrusted` believes they are isolated
+            // and is not. The generic answer below made it worse: it read "put `--` before the
+            // command", so the next attempt is `kern run -- --image alpine`, which passes the flag
+            // to the workload. Name the flag, say what `run` is, and name the verb that does it.
+            s if BOX_ONLY_FLAGS.contains(&s) => {
+                return Err(Error::Cli(format!(
+                    "`kern run` has no {s}. It caps a process on the host: no image, \
+                     no namespaces, no sandbox. That flag belongs to the sandboxed verb: \
+                     kern box <name> --image <ref> [-- CMD...]"
+                )))
             }
             s if s.starts_with('-') => {
                 return Err(Error::Usage(
@@ -3130,6 +3192,60 @@ mod tests {
         ));
         // Empty command → usage error.
         assert!(matches!(parse(&["run".into()]), Err(Error::Usage(_))));
+    }
+
+    /// A `box` flag typed on `run` gets the two-verb explanation, not "put `--` before the command".
+    /// The old answer was actively wrong: `kern run --image alpine -- sh` said to move the `--`, so
+    /// the obvious next attempt is `kern run -- --image alpine`, which hands `--image` to the
+    /// workload. This is the one place the Docker reflex meets kern, and the isolation-shaped flags
+    /// (`--read-only`, `--network`, `--cap-drop`) are the ones where a wrong answer lets someone
+    /// believe they are sandboxed when `run` never sandboxes anything.
+    #[test]
+    fn a_box_flag_on_run_explains_the_two_verbs() {
+        for flag in [
+            "--image",
+            "--read-only",
+            "--network",
+            "--cap-drop",
+            "-v",
+            "-d",
+        ] {
+            let err = parse(&["run".into(), (*flag).into(), "x".into()])
+                .expect_err("a box flag on run must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(flag),
+                "{flag}: the message must name the flag, got {msg}"
+            );
+            assert!(
+                msg.contains("kern box"),
+                "{flag}: must point at `box`, got {msg}"
+            );
+            assert!(
+                !msg.contains("put `--` before"),
+                "{flag}: must not repeat the misleading hint, got {msg}"
+            );
+        }
+        // The generic answer still stands for a flag that is nobody's: `run` has no `--frobnicate`
+        // and neither does `box`, so there is no verb to redirect to.
+        let err = parse(&["run".into(), "--frobnicate".into()]).expect_err("unknown flag");
+        assert!(err.to_string().contains("unknown flag"), "{err}");
+    }
+
+    /// Every entry in [`BOX_ONLY_FLAGS`] must really be a `box` flag, or the redirect sends someone
+    /// to a verb that rejects it too. Asserted against the `box` parser itself rather than a second
+    /// hand-kept list, which would be the same fact with two homes.
+    #[test]
+    fn every_box_only_flag_is_really_a_box_flag() {
+        let src = include_str!("cli.rs");
+        let start = src.find("fn parse_box").expect("parse_box exists");
+        let body = &src[start..];
+        for flag in BOX_ONLY_FLAGS {
+            assert!(
+                body.contains(&format!("\"{flag}\"")),
+                "BOX_ONLY_FLAGS names {flag}, which the box parser does not accept"
+            );
+        }
     }
 
     // The 0.5 CPU/RAM knob set is frozen: `--cpuset-cpus` (pinning) and `--memory-swap-max` (swap

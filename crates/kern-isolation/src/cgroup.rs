@@ -737,9 +737,11 @@ pub fn apply_limits(
         let _ = fs::remove_dir(&child);
         return None;
     }
-    // (A "not enforced" warning for memory/CPU comes LATER - after all writes - and is based on the
-    // EFFECTIVE limit up the cgroup tree, not this single inner write, since the outer systemd scope
-    // may be the real enforcer. See `capped_in_tree` below.)
+    // (The "not enforced" warnings come LATER, after all writes. memory and cpu are based on the
+    // EFFECTIVE limit up the cgroup tree, not on this single inner write, since the outer systemd
+    // scope may be the real enforcer; see `capped_in_tree`. pids is the exception and is based on
+    // `pids_ok` here, because the tree walk would find the session-wide `TasksMax` and call a box
+    // with no fork-bomb guard "capped".)
 
     // Optional CPU pinning (`--cpuset-cpus`, e.g. "0-3"). Best-effort: the `cpuset` controller is
     // frequently not delegated inside a systemd user scope, so a write failure is ignored. The CLI
@@ -803,6 +805,28 @@ pub fn apply_limits(
         eprintln!(
             "kern: --cpus not enforced - no cgroup cpu cap took effect (the `cpu` controller isn't \
              delegated to this rootless scope)"
+        );
+    }
+    // `--pids-limit` was the fourth knob and the only one that stayed SILENT when it did not take.
+    // Measured on a Raspberry Pi 5 (outside the systemd user manager, so `direct` is false and the
+    // per-dimension fail-closed below does not apply): `--pids-limit 999999999` returned 0 with
+    // `pids.max` reading `max`, i.e. the box ran with NO limit and nothing said so. 64, 256 and
+    // 1000000 were honoured exactly on the same host, so this is the write failing, not the value
+    // being clamped. Same family as `--cpus` and `--cpuset-cpus`: requested, accepted, not applied.
+    //
+    // Deliberately keyed on `pids_ok` - the box's OWN read-back - and NOT on `capped_in_tree`, for
+    // the reason spelled out at the fail-closed block below: the tree walk climbs above `kern.slice`
+    // into the shared `user-<uid>.slice`, whose systemd-default `TasksMax` (~83k, session-wide) is a
+    // finite value that would satisfy the check while giving this box no fork-bomb guard at all.
+    //
+    // Only for an EXPLICIT request, matching `--memory` above: the `DEFAULT_PIDS_MAX` backstop
+    // failing is worth knowing too, but warning about it on every box start on such a host would be
+    // noise that trains the reader to ignore the line.
+    if pids_max.is_some() && !pids_ok {
+        eprintln!(
+            "kern: --pids-limit not enforced - no cgroup pids cap took effect (the `pids` \
+             controller isn't delegated to this rootless scope, or the kernel refused the value); \
+             the box has no fork-bomb guard"
         );
     }
 
@@ -878,30 +902,69 @@ pub fn warn_unenforced_caps(memory: Option<u64>, cpus: Option<f64>, pids: Option
         return;
     };
     let dir = std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-    for (asked, file, flag, why) in [
+    // `walk_up` says whether an ANCESTOR may satisfy the check. It is true for memory and cpu,
+    // because those are genuine ceilings wherever in the chain they sit: a parent `memory.max` does
+    // bound this box. It is FALSE for pids, and that difference is the whole point of this being a
+    // tuple field rather than one rule for all three.
+    //
+    // Measured on a Raspberry Pi 5, `--pids-limit 999999999`, walking up from the box's own cgroup:
+    //
+    //   run-r853…scope       pids.max=max      <- the box itself: NO limit
+    //   app.slice            pids.max=max
+    //   user@1000.service    pids.max=max
+    //   user-1000.slice      pids.max=20370    <- finite, and SESSION-WIDE
+    //   user.slice           pids.max=max
+    //
+    // The walk found 20370 and stayed quiet, so the box ran with no fork-bomb guard and nothing said
+    // so. But 20370 is systemd's `TasksMax` for the whole user, shared with every other process they
+    // run: it is not a per-box limit and it does not become one by being finite. The caller asked to
+    // bound THIS box. The same trap is already written down at the fail-closed block in
+    // `apply_caps`, which is why that one keys on the box's own read-back; the rule was applied in
+    // one place and not the other.
+    //
+    // Checking only the box's own level does not cost a false warning: on the same host, 64, 256 and
+    // 1000000 all landed in the box's own cgroup exactly, and only 999999999 did not.
+    for (asked, file, flag, walk_up, why) in [
         (
             memory.is_some(),
             "memory.max",
             "--memory",
+            true,
             "the `memory` controller is not delegated to this cgroup",
         ),
         (
             cpus.is_some(),
             "cpu.max",
             "--cpus",
+            true,
             "this kernel's `cpu` controller exposes no bandwidth interface (`cpu.max`), only weights",
         ),
         (
             pids.is_some(),
             "pids.max",
-            "--pids",
-            "the `pids` controller is not delegated to this cgroup",
+            "--pids-limit",
+            false,
+            "no per-box `pids.max` took effect (an ancestor's session-wide `TasksMax` is not a \
+             per-box limit); the box has no fork-bomb guard",
         ),
     ] {
-        if asked && !capped_in_tree(&dir, file) {
+        let capped = if walk_up {
+            capped_in_tree(&dir, file)
+        } else {
+            capped_here(&dir, file)
+        };
+        if asked && !capped {
             eprintln!("kern: {flag} accepted but NOT enforced here - {why}; the box can exceed it");
         }
     }
+}
+
+/// Is a REAL cap in force on THIS cgroup, ignoring ancestors? The leaf-only counterpart to
+/// [`capped_in_tree`], for the one knob where an ancestor's limit does not answer the question:
+/// a `pids.max` two levels up is shared with every other process in that slice, so it bounds a
+/// fork bomb's blast radius against the session, not against this box.
+fn capped_here(dir: &std::path::Path, file: &str) -> bool {
+    fs::read_to_string(dir.join(file)).is_ok_and(|v| is_real_limit(&v))
 }
 
 /// Is a `memory.max`/`cpu.max`-style cap actually in force for the box - at THIS cgroup OR any
@@ -941,6 +1004,86 @@ mod tests {
             controller_available_in_tree(&d, "memory"),
             "memory listed = the host can cap, even with no memory.max file here"
         );
+    }
+
+    /// Every cap knob that can silently fail to apply must have a "not enforced" line. `--pids-limit`
+    /// was the fourth knob and the only one without one: measured on a Raspberry Pi 5,
+    /// `--pids-limit 999999999` exited 0 with `pids.max` reading `max`, so the box ran with no
+    /// fork-bomb guard and nothing said so, while 64 / 256 / 1000000 were honoured exactly on the
+    /// same host. The other three (`--memory`, `--cpus`, the I/O group) already warned, which is
+    /// what made the gap a silence rather than a design.
+    ///
+    /// Asserted against the source rather than by triggering the paths, because reproducing an
+    /// un-delegated controller needs a host configured that way and CI is not one. A fifth knob
+    /// added without its line is the regression this catches.
+    #[test]
+    fn every_cap_knob_has_a_not_enforced_warning() {
+        let src = include_str!("cgroup.rs");
+        // Only the emitted strings count, not the prose around them: an `eprintln!` line.
+        let emitted: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("not enforced") && !l.trim_start().starts_with("//"))
+            .collect();
+        for knob in ["--memory", "--cpus", "--pids-limit", "--iops"] {
+            assert!(
+                emitted.iter().any(|l| l.contains(knob)),
+                "no \"not enforced\" warning names {knob}; a cap that cannot be applied must not \
+                 become no cap in silence. Emitted lines: {emitted:?}"
+            );
+        }
+    }
+
+    /// `capped_here` must NOT accept an ancestor's limit, and `capped_in_tree` MUST. The two exist
+    /// only because of that difference, so a refactor that collapsed them would silence the pids
+    /// warning again exactly as it was silenced before: on a Raspberry Pi 5 the walk found
+    /// `pids.max=20370` on `user-1000.slice` and called a box with `pids.max=max` capped.
+    #[test]
+    fn capped_here_ignores_an_ancestors_limit_while_the_tree_walk_honours_it() {
+        // The fixture directory must be unique to THIS test, not merely to the process. The first
+        // version built `kern-cg-<pid>`, which is byte-for-byte what
+        // `capped_in_tree_reads_the_max_sentinel` builds: same process, same pid, same directory.
+        // Both run in parallel and both call `remove_dir_all` when done, so whichever finished
+        // first deleted the other's fixture mid-assertion. It failed on another machine while
+        // passing here, which is the shape a test-ordering race always takes.
+        let root = std::env::temp_dir().join(format!("kern-cg-capped-here-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        if fs::create_dir_all(&root).is_err() {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+        let parent = root.join("parent");
+        let child = parent.join("child");
+        if fs::create_dir_all(&child).is_err() {
+            eprintln!("skip: cannot build the fixture");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        // The ancestor carries a real limit; the leaf carries the `max` no-limit sentinel.
+        let _ = fs::write(parent.join("pids.max"), "20370\n");
+        let _ = fs::write(child.join("pids.max"), "max\n");
+
+        assert!(
+            !capped_here(&child, "pids.max"),
+            "capped_here must read the LEAF only: the box itself has no limit"
+        );
+        // The tree walk stops at /sys/fs/cgroup, which a temp dir is not under, so it inspects the
+        // leaf alone here. That is enough to pin the sentinel rule the two share.
+        assert!(
+            !capped_in_tree(&child, "pids.max"),
+            "the shared sentinel rule must read `max` as no limit"
+        );
+        // …and a real value at the leaf satisfies both.
+        let _ = fs::write(child.join("pids.max"), "256\n");
+        assert!(
+            capped_here(&child, "pids.max"),
+            "a real leaf limit must count"
+        );
+        assert!(
+            capped_in_tree(&child, "pids.max"),
+            "a real leaf limit must count for the walk too"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

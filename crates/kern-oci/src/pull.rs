@@ -762,15 +762,21 @@ fn download_blobs_oneconn(
     }
 }
 
+/// Drop every control character. The single definition of that rule in this crate: it is a security
+/// property in two different places (a credential must not inject a curl directive, a registry's
+/// error text must not inject a terminal escape), and two spellings of one rule is how one of them
+/// silently stops matching the other.
+fn without_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Escape a value for curl's `-K` config double-quoted string: backslash-escape `\` and `"`, and
 /// DROP control characters (`\n`/`\r`/…). A newline would otherwise close the `user = "…"` line and
 /// let a crafted credential inject an arbitrary curl directive; control chars can't appear in a valid
 /// HTTP Basic credential anyway. (`kern login` already reads a single line, so this is defence in
 /// depth against a hand-edited credentials file.)
 fn curl_cfg_escape(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
+    without_control_chars(s)
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
 }
@@ -892,7 +898,41 @@ pub(crate) fn discover_auth_scoped(
             // Docker uses `token`; GHCR/others use `access_token` (both per the OAuth2 token spec).
             let tok = first_str(&s, "token")
                 .or_else(|| first_str(&s, "access_token"))
-                .ok_or_else(|| OciError::Registry("no auth token in token response".into()))?;
+                .ok_or_else(|| {
+                    // A token endpoint that refuses answers with the registry's OWN diagnosis, and
+                    // that is the only thing here worth reading. GHCR replies
+                    // `{"errors":[{"code":"DENIED","message":"requested access to the resource is
+                    // denied"}]}` when the account cannot write that namespace, and this used to be
+                    // reported as "no auth token in token response" with a hint to run `kern login`,
+                    // to a user who had just run `kern login` successfully. Measured on a real push
+                    // to ghcr.io: the generic message sent the reader looking at the wrong thing.
+                    // Carry the registry's message through, and keep the generic one only when the
+                    // response has nothing to say.
+                    //
+                    // SCRUBBED: this text comes from a REMOTE server and is about to be printed to
+                    // the operator's terminal. A hostile or compromised registry could answer with
+                    // ANSI escapes and repaint the line, hide what it did, or move the cursor. kern
+                    // already strips control characters from every other untrusted string it shows
+                    // (registry search results, cached image refs); carrying a remote message
+                    // through without the same filter would have opened that hole in the one place
+                    // where the text is guaranteed to be attacker-influenced. Control characters
+                    // include newline and tab, which is also what keeps a multi-line reply from
+                    // breaking the single-line error format.
+                    let why = first_str(&s, "message")
+                        .or_else(|| first_str(&s, "details"))
+                        .or_else(|| first_str(&s, "error_description"))
+                        .or_else(|| first_str(&s, "error"))
+                        .map(|m| without_control_chars(&m))
+                        .filter(|m| !m.trim().is_empty());
+                    match why {
+                        Some(m) => OciError::Registry(format!(
+                            "{registry} refused the token request: {m} (the credentials reached it, \
+                             so this is about what that account may do with this name, not about \
+                             logging in again)"
+                        )),
+                        None => OciError::Registry("no auth token in token response".into()),
+                    }
+                })?;
             Ok(Auth::Bearer(tok))
         }
         Some(Challenge::Basic) => {
@@ -2601,6 +2641,32 @@ fn layer_digests(m: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod token_error_tests {
+    /// A registry's own words are carried into the error, so they must be stripped of control
+    /// characters first: that text is remote, attacker-influenceable, and printed to a terminal.
+    /// Without this, a crafted `message` could repaint the operator's line or hide what followed.
+    #[test]
+    fn a_registry_message_cannot_inject_terminal_escapes() {
+        use super::without_control_chars as scrub;
+        let hostile = "denied\u{1b}[2K\u{1b}[1A\u{1b}[32m ok, pushed\u{7}\nsecond line\ttab";
+        let clean = scrub(hostile);
+        assert!(
+            !clean.chars().any(|c| c.is_control()),
+            "no control character may survive: {clean:?}"
+        );
+        assert!(
+            clean.starts_with("denied"),
+            "the readable text is kept: {clean:?}"
+        );
+        assert!(
+            clean.contains("second line"),
+            "content is kept, only controls go: {clean:?}"
+        );
+        assert!(!clean.contains('\n') && !clean.contains('\t'));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3136,7 +3202,13 @@ mod tests {
         let merged = merge_layer(&staging, &dest);
 
         // Restore write permission before asserting, so the assertion failure path can still clean up.
+        // BOTH directories: `staging/dir` is the one this test sets to 0555, and it holds the
+        // `.wh.victim` marker. Leaving it read-only made every `remove_dir_all(&base)` below fail
+        // with "cannot remove .../stg/dir/.wh.victim: Permission denied" - silently, because each is
+        // behind a `let _ =` - so the test left its directory in /tmp on every single run. Measured:
+        // six runs, six survivors, and a plain `rm -rf` from a shell could not remove them either.
         set_mode(&dest.join("dir"), 0o755);
+        set_mode(&staging.join("dir"), 0o755);
         let survived = dest.join("dir/victim").exists();
         let _ = std::fs::remove_dir_all(&base);
 

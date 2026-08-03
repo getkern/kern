@@ -220,17 +220,34 @@ pub fn create_with_range(
     std::mem::forget(child);
     // OUTBOUND (default, opt-out with `--no-outbound`): if `pasta` (passt) is installed, attach it to
     // the pod net ns for NAT'd internet egress + DNS. Best-effort: absent/failed → loopback-only.
-    let outbound = want_outbound && setup_outbound(name, pid);
+    // `None` means "not attempted" (`--no-outbound`), and each `Some` is a real outcome. The
+    // alternative was a dummy `Outbound` value standing in for "not consulted", which is a lie the
+    // type would then carry to every reader of the match below.
+    let outbound = want_outbound.then(|| setup_outbound(name, pid));
     println!("created pod '{name}'");
     println!(
         "  add boxes: kern box <name> --pod {name} -d -- …  (publish a service with -p on its box)"
     );
-    if outbound {
-        println!("  network: services reach each other by name + outbound to the internet (pasta)");
-    } else if !want_outbound {
-        println!("  network: loopback-only (--no-outbound) - services reach each other; no egress");
-    } else {
-        println!("  network: loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)");
+    // One line per CAUSE. This was one line for five different states, and the one it printed told
+    // a user with pasta installed to install pasta.
+    match outbound {
+        None => {
+            println!("  network: loopback-only (--no-outbound) - services reach each other; no egress")
+        }
+        Some(Outbound::Up) => {
+            println!("  network: services reach each other by name + outbound to the internet (pasta)")
+        }
+        Some(Outbound::NotInstalled) => println!(
+            "  network: loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)"
+        ),
+        Some(Outbound::Failed(why)) => println!(
+            "  network: loopback-only - services reach each other; pasta IS installed but did not \
+             start: {why}"
+        ),
+        Some(Outbound::NoDns) => println!(
+            "  network: outbound is up but DNS is not - the pod can reach an IP and cannot resolve \
+             a name (kern could not write the pod's resolv.conf)"
+        ),
     }
     Ok(())
 }
@@ -276,21 +293,55 @@ fn pasta_args(dir: &std::path::Path, holder: i32) -> Vec<std::ffi::OsString> {
     a
 }
 
-fn setup_outbound(name: &str, holder: i32) -> bool {
+/// Why a pod did or did not get outbound. One `bool` used to cover all of these, and `create`
+/// printed the same "install `passt`/`pasta` for egress" line for every one of them - including to
+/// someone who had `pasta` installed and whose real problem was that it refused to start. Measured
+/// on WSL2 with `/usr/bin/pasta` present: the pod came up loopback-only and was told to install the
+/// thing it already had, while pasta's own explanation went to `/dev/null`.
+enum Outbound {
+    /// NAT and DNS are both up.
+    Up,
+    /// No `pasta` on PATH: the one case the old message actually described.
+    NotInstalled,
+    /// `pasta` is installed and did not start. Carries its first line of stderr when it produced
+    /// one, because that line is the only thing here that says WHY.
+    Failed(String),
+    /// The NAT attached but the pod's `resolv.conf` could not be written: addresses work, names do
+    /// not. Reporting this as "no outbound" was wrong in the other direction.
+    NoDns,
+}
+
+fn setup_outbound(name: &str, holder: i32) -> Outbound {
     let Some(pasta) = which_pasta() else {
-        return false;
+        return Outbound::NotInstalled;
     };
     let dir = pod_dir(name);
-    let ok = std::process::Command::new(pasta)
+    // stderr is CAPTURED, not discarded: when pasta refuses, its message is the whole diagnosis.
+    let out = std::process::Command::new(pasta)
         .args(pasta_args(&dir, holder))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return false;
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            // Scrubbed like every other borrowed string kern prints: pasta is a local binary and
+            // not the threat model that `crate::ui::scrub` was written for, but the filter is free
+            // and the alternative is one unscrubbed path that the next reader has to reason about.
+            let why = crate::ui::scrub(
+                String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no output"),
+            )
+            .chars()
+            .take(200)
+            .collect::<String>();
+            return Outbound::Failed(why);
+        }
+        Err(e) => return Outbound::Failed(e.to_string()),
     }
     // Seed the pod resolv.conf with the host's real (non-loopback) nameservers - reachable through
     // the NAT, so split-horizon/LAN DNS keeps working. Only if the host has NONE that are usable from
@@ -311,7 +362,14 @@ fn setup_outbound(name: &str, holder: i32) -> bool {
         resolv.push_str("nameserver 1.1.1.1\n"); // host has only a local stub → public fallback
     }
     // DNS is only "up" if we actually wrote the resolv.conf the box will bind - else don't claim it.
-    std::fs::write(resolv_path(name), resolv).is_ok()
+    // Distinguished from "no outbound at all": the NAT is attached either way, so a box can reach an
+    // IP but not resolve a name, and saying "no outbound" would send the reader after the wrong
+    // thing entirely.
+    if std::fs::write(resolv_path(name), resolv).is_ok() {
+        Outbound::Up
+    } else {
+        Outbound::NoDns
+    }
 }
 
 /// Locate the `pasta` binary (part of passt), or `None` if it isn't installed.

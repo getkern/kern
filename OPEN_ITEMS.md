@@ -4,6 +4,65 @@ Things kern knows it does not know, or does not do yet, written down on purpose.
 cheaper than silent debt: everything here has a shape, a way to settle it, and a reason it has not
 been settled. If you hit one of these, you are not the first, and nothing here is a surprise to us.
 
+## kern does not see an installed `pasta` on WSL2, and reports it as not installed
+
+On WSL2, with `passt` installed from apk and `/usr/bin/pasta` present, and a shell `PATH` that
+contains `/usr/bin`, `kern pod create` printed the NOT-INSTALLED branch: "NO outbound (install
+`passt`/`pasta` for egress)". Measured 2026-08-03 with the 0.6.34 binary, which tells that branch
+apart from "installed but did not start", so the failing step is `which_pasta`, not pasta itself.
+
+`which_pasta` reads `PATH`, joins `pasta` onto each entry and takes the first that `is_file()`. On
+Linux with the same code and pasta in `/usr/bin`, it finds it. What is different under WSL is not
+known, and guessing at it is what this file exists to prevent. The pod itself is unaffected: it comes
+up loopback-only, which is also what the message says, so the consequence is a wrong CAUSE rather
+than a wrong outcome.
+
+Two measurement traps were hit while chasing it, and both are worth knowing before the next attempt.
+`command -v` kept reporting `/usr/bin/pasta` after `apk del passt` had removed it, because the shell
+caches command lookups; the file was gone and `ls` said so. And an earlier round appeared to show the
+same symptom on a distro built from the fixed rootfs, but that image carried a kern built BEFORE the
+branch existed, so its single message could not have said anything else.
+
+## `stopping_a_box_leaves_no_timeout_watchdog_behind` fails about once in thirteen full runs
+
+Measured 2026-08-03: one failure in 13 `cargo test --all` runs. The same test passes 10 times out of
+10 run alone, and 6 out of 6 with six CPU spinners loading the machine, so neither isolation nor CPU
+contention reproduces it. Eight further full-suite runs after the first failure were all green, and
+the cause is therefore **not attributed**. A plausible story would be that the test's 5 s budget
+(50 polls, 100 ms apart) is too tight while 703 tests are starting and tearing down boxes in
+parallel, but that is a guess and this file exists to keep guesses out of the record.
+
+What is measured, and points away from the product: the behaviour under test is the `--timeout`
+watchdog fix from 0.6.32, verified then on the published binary (0 survivors of 6 where 0.6.31 left
+6), and verified again on 2026-08-03 with the 0.6.34 binary over 8 consecutive runs, delta 0. The
+test counts by a name unique to the test process, so a parallel test's box cannot be miscounted.
+
+Operationally: if CI reddens on this test alone, re-run the job before reading anything into it, and
+if it reddens twice in a row that is new information worth chasing. Settling it properly needs the
+failing run to report how many processes were left and whether they exited a moment later, which the
+assertion does not currently capture.
+
+## The test suite leaves empty temp dirs behind
+
+Every `cargo test --all` leaves a few empty directories in `/tmp`: `kern-cgcap-<pid>`,
+`kern-help-test-<pid>`, `kern-it-cmp-<pid>`, `kern-it-xdg-wdog-<pid>`. Measured after six runs on
+2026-08-03: 23 directories, 600 KB, all empty. It is test-only debris, invisible to anyone using
+kern.
+
+One of the five was a different thing and is fixed. `kern-oci-wh-perm-<pid>` did not merely survive
+the test, it survived `rm -rf` from a shell: `cannot remove .../stg/dir/.wh.victim: Permission
+denied`. That test deliberately sets a staging directory to mode 0555 and puts a whiteout marker
+inside it, and an entry cannot be unlinked from a directory with no write bit. It already restored
+the mode on the OTHER directory it locks, with a comment saying why, and simply did not do the same
+for this one, so all four of its `remove_dir_all` calls failed behind a `let _ =`. One line, and the
+test now leaves nothing.
+
+What remains is the plain kind: `help_and_parser_agree.rs` builds its sandbox in a helper called once
+per assertion and never removes it, and the others remove theirs on every exit path yet a directory
+is still there afterwards, which is not yet explained. Not chased on 2026-08-03 because the first
+lives in a helper shared by every assertion in that file, and rewriting shared test infrastructure
+hours before a release trades a real regression risk for a few empty inodes.
+
 ## 315 us of a bare box start are not attributed
 
 `kern bench --rootfs` reports **2.4 ms** on the machine BENCHMARKS.md describes. In the UNCAPPED

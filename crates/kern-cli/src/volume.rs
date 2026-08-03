@@ -777,7 +777,27 @@ fn remove(names: &[String]) -> Result<(), Error> {
                 "volume '{name}' is in use by box '{box_name}' - stop it first"
             ));
         } else if let Err(e) = std::fs::remove_dir_all(dir.join(name)) {
-            fails.push(format!("cannot remove volume '{name}': {e}"));
+            // EACCES here has exactly one cause worth naming, and it is the common one: a box that
+            // used the uid RANGE (every OCI image box by default, so every database image) wrote
+            // files owned by a uid that exists only inside that box's user namespace. The host user
+            // cannot traverse or unlink them, and no amount of retrying from the host will change
+            // that. Measured with `postgres:16-alpine`: `pgdata/` inside the volume comes out owned
+            // by a mapped uid and `kern volume rm` dies with "Permission denied (os error 13)".
+            //
+            // The remedy is not obvious and the old hint ("run `kern volume ls`") pointed nowhere:
+            // empty it from INSIDE a box, which holds the mapping, and then remove the husk. Both
+            // commands are printed ready to paste, because a user who hits this is stuck otherwise.
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                fails.push(format!(
+                    "cannot remove volume '{name}': {e} - it holds files owned by a uid that only \
+                     exists inside a box (an image running as its own user, e.g. a database). Empty \
+                     it from inside a box, which has that mapping, then remove it:\n    kern box \
+                     tmp --image alpine -v {name}:/v -- sh -c 'rm -rf /v/* /v/.[!.]*'\n    kern \
+                     volume rm {name}"
+                ));
+            } else {
+                fails.push(format!("cannot remove volume '{name}': {e}"));
+            }
         } else {
             println!("{name}");
         }

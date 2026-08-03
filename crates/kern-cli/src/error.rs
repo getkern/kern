@@ -22,7 +22,8 @@ pub enum Error {
     AlreadyRunning(String),
     /// A `kern volume` operation failed for a non-in-use reason (unknown name, bad name, I/O). The
     /// hint points at `kern volume ls` - NOT at boxes (that's [`AlreadyRunning`], used when a volume
-    /// is in use). ([`AlreadyRunning`]: Error::AlreadyRunning)
+    /// is in use) - and is dropped entirely when the message already carries its own remedy, which
+    /// it does for the EACCES case. ([`AlreadyRunning`]: Error::AlreadyRunning)
     Volume(String),
     /// An OCI image pull/extract failed.
     Oci(String),
@@ -61,7 +62,14 @@ impl Error {
             Error::AlreadyRunning(_) => {
                 Some("run `kern ps` to see running boxes; `kern stop <name>` frees the name".into())
             }
-            Error::Volume(_) => Some("run `kern volume ls` to see existing volumes".into()),
+            // A volume error that already carries its own remedy needs no generic pointer under it:
+            // printing "run `kern volume ls`" beneath two paste-ready commands is noise, and noise
+            // under an instruction is how an instruction gets skipped. Multi-line means the message
+            // brought its own fix. Same shape as `oci_hint` below, which branches on the message
+            // rather than on the variant.
+            Error::Volume(msg) => {
+                (!msg.contains('\n')).then(|| "run `kern volume ls` to see existing volumes".into())
+            }
             // The right hint depends on *why* the pull failed - telling someone whose image name is
             // wrong to "install curl and tar" sends them down the wrong path. Branch on the message.
             Error::Oci(msg) => Some(oci_hint(msg)),
