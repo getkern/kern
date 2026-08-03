@@ -57,8 +57,12 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         # and a gate that cries wolf is a gate that gets switched off. The figure only matters when
         # it is next to the thing it measures, so the pattern requires one of those words on the
         # same line.
-        r"\b3\.6 ms\b(?=[^\n]{0,80}(?:cold|start|box))"
-        r"|(?:cold|start|box)[^\n]{0,80}\b3\.6 ms\b",
+        # `\s*` and not a literal space: the launch post writes `3.6ms`, and the first version of
+        # this rule required `3.6 ms`, so the gate stayed silent on the one document it mattered
+        # most for. Same for every other rule here. A gate that only matches the spelling you
+        # happened to use when you wrote it is a gate for that document alone.
+        r"\b3\.6\s*ms\b(?=[^\n]{0,80}(?:cold|start|box))"
+        r"|(?:cold|start|box)[^\n]{0,80}\b3\.6\s*ms\b",
         "3.4 ms",
         "cold start from an OCI image; the README table and BENCHMARKS.md both measure 3.4.",
         set(),
@@ -91,7 +95,7 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         set(),
     ),
     (
-        r"\b344 ms\b",
+        r"\b344\s*ms\b",
         "285 to 294 ms",
         "docker run for the same task; 344 overstated the gap in kern's favour.",
         set(),
