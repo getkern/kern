@@ -4,10 +4,10 @@
 
 **kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
 
-**A real, kernel-enforced container in ~3.4 ms, out of one 1.83 MB binary with no daemon.**
+**A real, kernel-enforced container in ~3.4 ms, out of one 1.84 MB binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.83 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.84 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
@@ -34,7 +34,7 @@ namespaces, an overlay or read-only root pivoted in, an always-on seccomp filter
 limits. It pulls OCI images, builds them, runs them, and gets out of the way. No background daemon,
 one short-lived process per box.
 
-The binary is 1.83 MB because it carries only what it has to. The entire Rust dependency tree is
+The binary is 1.84 MB because it carries only what it has to. The entire Rust dependency tree is
 `libc`, JSON and the OCI manifests are parsed by hand, and `pull` uses the `curl` and `tar` already
 on the machine instead of linking a TLS stack and a decompressor. Those two are therefore a real
 requirement of the image path, and `kern doctor` checks for them; a box from a `--rootfs` needs
@@ -136,7 +136,7 @@ Ninety runnable examples, each doing one thing: [examples/](examples/).
 | Cold start, bare box | **~2.1 ms** | ~294 ms | ~281 ms |
 | Cold start, from an OCI image | **~3.4 ms** | ~294 ms | ~281 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
-| Footprint | **one 1.83 MB binary** | daemon stack | multi-binary install |
+| Footprint | **one 1.84 MB binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
 | `docker-compose.yml` | yes, read as-is | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |

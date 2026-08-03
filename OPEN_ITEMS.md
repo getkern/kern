@@ -245,6 +245,17 @@ left 53 boxes of their own, from a count taken without clearing a manual reprodu
 earlier. That makes two wrong readings of one phenomenon, and both came from counting processes
 rather than opening one up.
 
+## Binary size: measured 2026-08-03 on the published v0.6.34 assets, reduction deliberately NOT applied
+
+Published v0.6.34, read from the downloaded release artifacts and checksum-verified:
+**1926112 B x86_64 (1.84 MB)**, **1577448 B aarch64 (1.50 MB)**. x86_64 grew 32768 B (+1.7%) over
+v0.6.32's 1893344 B, which is the day's 1066 lines of Rust; **aarch64 did not move at all**, byte for
+byte the same 1577448. The README, `docs/INSTALL.md` and `BENCHMARKS.md` were corrected from 1.83 to
+1.84 after the release, because this is the one figure that cannot be measured before the CI produces
+the artifact.
+
+The rest of this entry is the 2026-07-31 investigation into shrinking it, unchanged:
+
 ## Binary size: measured 2026-07-31, deliberately NOT applied
 
 Published: **1893344 B x86_64 (1.81 MB)**, **1577448 B aarch64 (1.50 MB)**. Growth since v0.6.22 is

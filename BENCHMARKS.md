@@ -627,7 +627,7 @@ other.
 
 | | |
 |---|---:|
-| **kern** binary (the whole thing) | **~1.8 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 1.83 MB, aarch64 1.50 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
+| **kern** binary (the whole thing) | **~1.8 MB** static, stripped (one **Rust** dep, `libc`; OCI pull shells out to system `curl`/`tar`), musl x86_64 1.84 MB, aarch64 1.50 MB (release profile: `opt-level=z` + LTO + `panic=abort` + strip) |
 | kern resident memory at rest | **0**: no daemon |
 | kern memory per box, marginal | **0.35 MB** (PSS, at 50 live boxes) |
 | kern memory per box, one box alone | 1.65 MB PSS / 4.6 MB RSS |

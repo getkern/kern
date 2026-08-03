@@ -34,7 +34,7 @@ from PIL import Image, ImageDraw, ImageFont
 # image one, so the number shown here has to be the image one.
 KERN_MS = "3.4 ms"
 DOCKER_MS = "291 ms"
-BINARY_SIZE = "1.83 MB"
+BINARY_SIZE = "1.84 MB"
 HOST = "Intel i7-14700KF, Linux 7.0"
 
 COMMAND = 'kern box app --image alpine -- echo "hello from a real container"'
