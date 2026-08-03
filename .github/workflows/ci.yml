@@ -25,6 +25,15 @@ jobs:
       - name: test
         run: cargo test --all
         # HW/privilege-gated tests skip gracefully, so x86 CI stays green.
+      - name: docs
+        # The two prose gates. They existed before this step and ran only when someone remembered
+        # them, which is the same as not running: the three figures that drifted over the launch
+        # weekend (3.6 vs 3.4 ms, five vs nine ENOSYS syscalls, ~186 vs 154-160 MB) were all caught
+        # by hand or, in one case, by an outside reviewer repeating our own wrong number back to us.
+        # Pure stdlib Python, both under a second, both at zero on the corpus when this was added.
+        run: |
+          python3 scripts/no-ai-slop.py
+          python3 scripts/stale-numbers.py
 
   audit:
     name: cargo-audit + cargo-deny
