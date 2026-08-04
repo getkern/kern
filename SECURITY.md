@@ -57,14 +57,14 @@ privilege-escalation bug is an escape.
 - **Always-on seccomp**, **34 syscalls denied**: 24 that hard-kill plus the 10 that return `ENOSYS`,
   split described below; a rootless `--privileged` box denies 5 fewer. Do not take the number from
   this file, ask the binary: `kern box <name> --image <ref> --show-config` prints
-  `seccomp_denied_syscalls` from the live lists. The set is kexec (+`_file_load`), module
+  `seccomp_denied_syscalls` from the live lists. The set: kexec (+`_file_load`), module
   load/unload, `ptrace` + `process_vm_readv`/`writev`, reboot, swap, the classic **and** new mount
   API including the whole reconfiguration family (`mount_setattr`, `fspick`,
   `fsopen`/`fsconfig`/`fsmount`, `open_tree`/`move_mount`), so a box cannot re-mount its own root
   writable, plus `pivot_root`, `setns`, `unshare`, `bpf`, `clone3`, io_uring's three, `userfaultfd`,
   `perf_event_open`, the keyring's three and `syslog`. Wrong-arch syscalls are killed, and on x86_64
-  so is every **x32-ABI** syscall, closing the classic bypass where the x32 alias of a denied number
-  slips past a number-only denylist.
+  so is every **x32-ABI** syscall, closing the bypass where the x32 alias of a denied number slips
+  past a number-only denylist.
 - **`clone(2)` is filtered on its ARGUMENTS**, and it is the only rule of that shape. Denying
   `unshare` and `setns` does not stop a workload making a namespace, because `clone` takes the same
   `CLONE_NEW*` flags, and a process that creates a nested user namespace is handed a full capability
@@ -75,11 +75,11 @@ privilege-escalation bug is an escape.
   is refused wholesale with `ENOSYS`, the answer Docker and podman give for the same reason. Closed
   in 0.6.34, verified on six platforms.
 - **Device access is deny-by-default**: the box's `/dev` is a fresh box-owned tmpfs shadowing the
-  image's, with only `null`, `zero`, `full`, `random` and `urandom` bound in. Any other node is simply
+  image's, with only `null`, `zero`, `full`, `random` and `urandom` bound in. Any other node is
   **absent**, and one the box fabricates is **inert**: a filesystem mounted in an unprivileged user
-  namespace is flagged `SB_I_NODEV`, so a `mknod`'d node cannot be opened to reach a host device (on
-  kernels below 5.11 `mknod` itself returns `EPERM`; same outcome). The root, `/dev` and every extra
-  mount also carry `MS_NODEV`, so this holds without relying on the implicit userns behaviour.
+  namespace is flagged `SB_I_NODEV`, so a `mknod`'d node cannot be opened to reach a host device. The
+  root, `/dev` and every extra mount also carry `MS_NODEV`, so this does not rely on that implicit
+  userns behaviour.
 - **Landlock write-allowlist** (`--landlock-rw <path>`, opt-in, needs Linux 5.13+): a kernel LSM
   confines the box's writes to the named paths while the root stays read+exec, with symlinks opened
   `O_NOFOLLOW`. **A real boundary**, verified: a box with `--landlock-rw /tmp` writes `/tmp` and is
@@ -101,7 +101,7 @@ equally denied; the difference is only what the caller sees, and it is the diffe
 falling back to its epoll path and Redis dying. The two sets are asserted disjoint by a test.
 
 The obvious objection is that a survivable denial is easier to enumerate than a fatal one. Measured
-from inside a box on x86_64, kernel 7.0:
+inside a box on x86_64, kernel 7.0:
 
 | syscall probed inside the box | result |
 |---|---|
@@ -111,10 +111,9 @@ from inside a box on x86_64, kernel 7.0:
 | the same calls with no kern filter (control) | a *different* errno, never `ENOSYS` |
 
 So the errno discloses nothing: a filtered call is byte-identical to one this kernel does not
-implement. What is cheap to enumerate is the **permitted** set, and it always was, since a permitted
-syscall runs and returns its own errno. `ENOSYS` moves ten calls from "costs the prober a process"
-to "free"; the 24 in the kill set still cost one each. Whether mapping a filter helps an attacker who
-already has code execution in the box is a separate and open question, written down as unresolved in
+implement. What is cheap to enumerate is the **permitted** set, and always was, since a permitted
+syscall runs and returns its own errno. Whether mapping a filter helps an attacker who already has
+code execution in the box is a separate and open question, recorded as unresolved in
 [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than argued either way here.
 
 ### Read-only and cgroup-mask integrity
@@ -142,20 +141,19 @@ box can read `/proc/sys` but not write it, verified against `core_pattern`.
 
 ## Resource caps
 
-With a systemd **user** manager present, `kern box` runs inside a transient `systemd-run --user
---scope` with `MemoryMax`/`TasksMax`, so fork bombs and OOM are cgroup-enforced. Without it, a
-best-effort cgroup v2 path applies where the hierarchy is delegated, else it is skipped gracefully:
-on a host with **neither**, containment is not guaranteed. `--pids-limit N` sets `pids.max`, default
-512, on the same terms.
+With a systemd **user** manager present, `kern box` runs inside a transient scope with
+`MemoryMax`/`TasksMax`, so fork bombs and OOM are cgroup-enforced. Without it a best-effort cgroup v2
+path applies where the hierarchy is delegated, else it is skipped gracefully: on a host with
+**neither**, containment is not guaranteed. `--pids-limit N` sets `pids.max`, default 512, on the
+same terms.
 
-**`kern exec` and the box's caps.** An exec'd command joins the box's cgroup, and so inherits its
-caps, **only where the box sits in a delegated cgroup kern can write**. On the rootless per-box-scope
-path (an SSH login on an edge board, whose shell is a sibling scope) the kernel will not let `kern
-exec` migrate into the box's transient scope, so an exec'd command runs **outside** the box's caps.
-kern warns when the box has explicit caps rather than leak it silently. The box's own workload is
-always capped, and namespaces plus seccomp isolate the exec'd command regardless. Each exec does not
-get its own capped scope on purpose: that would grant every exec the box's full limit, so N execs
-could use N times the box's memory.
+**`kern exec` and the box's caps.** An exec'd command inherits them **only where the box sits in a
+delegated cgroup kern can write**. On the rootless per-box-scope path (an SSH login on an edge board,
+whose shell is a sibling scope) the kernel will not let it migrate into the box's transient scope, so
+the exec'd command runs **outside** the box's caps; kern warns rather than leak that silently. The
+box's own workload is always capped, and namespaces plus seccomp isolate the exec'd command
+regardless. Each exec does not get its own capped scope on purpose: that would grant every exec the
+box's full limit, so N execs could use N times the box's memory.
 
 ## Flags that change the posture
 
@@ -302,27 +300,27 @@ forwarder. It is for interactive box access, not a hardened bastion.
 - **Named volumes** live under `~/.local/share/kern/volumes`. The name is charset-validated to a
   single component and the resolved path is canonicalized and confined under the volumes dir, so a
   planted symlink cannot redirect the bind.
-- **Per-volume quota** is a real disk-backed quota only when the box runs privileged (ext4-on-loop);
-  otherwise it falls back to a plain directory and kern **says the quota is not enforced**, never
-  silently drops it. The size is clamped to a 64 TiB ceiling at create time and again when read back,
-  so a hand-edited `meta.json` cannot drive a multi-exabyte `mkfs`. The first privileged mount seeds
-  the fresh image from the unenforced backend, so upgrading does not hide files already written.
+- **Per-volume quota** is real only when the box runs privileged (ext4-on-loop); otherwise it falls
+  back to a plain directory and kern **says the quota is not enforced**, never silently drops it. The
+  size is clamped to 64 TiB at create time and again when read back, so a hand-edited `meta.json`
+  cannot drive a multi-exabyte `mkfs`. The first privileged mount seeds the fresh image from the
+  unenforced backend, so upgrading does not hide files already written.
 - **Network volumes** (`nfs://`, `smb://`, `sshfs://`) mount rootless via FUSE. Host and path are
   strictly validated (no shell metacharacters, control characters, or a leading `-` a tool would read
   as an option) and everything is spawned via argv, never a shell. A mount that cannot reach its
-  server is killed after 25 s, and unmounted when the box exits. `sshfs` uses
+  server is killed after 25 s and unmounted when the box exits. `sshfs` uses
   `StrictHostKeyChecking=accept-new`, so an active MITM at *first* contact could impersonate the
-  server; pin the host key beforehand on untrusted networks.
+  server: pin the host key beforehand on untrusted networks.
 
 ## Supervision (`--timeout`, `--health-action`)
 
-The watchdogs run **host-side**, never inside the box, and each is forked **before** the box's
-`unshare(CLONE_NEWPID)`, the only position from which it can reliably signal the box's ns-init. An
-in-box process cannot reach them: the foreground `--timeout` pipe is `FD_CLOEXEC`, severed at the
-workload's exec, and the target pid comes from the trusted `fork()` return or the host-only registry,
-never from anything the box can write. So an untrusted workload **cannot forge a pid to make the host
-signal an arbitrary process**. The foreground watchdog pins its target with a **pidfd** taken while
-the box is alive, so a delayed signal cannot land on a reused pid.
+The watchdogs run **host-side**, forked **before** the box's `unshare(CLONE_NEWPID)`, the only
+position from which they can reliably signal the box's ns-init. An in-box process cannot reach them:
+the foreground `--timeout` pipe is `FD_CLOEXEC`, severed at the workload's exec, and the target pid
+comes from the trusted `fork()` return or the host-only registry, never from anything the box can
+write. So an untrusted workload **cannot forge a pid to make the host signal an arbitrary process**.
+The foreground watchdog pins its target with a **pidfd** taken while the box is alive, so a delayed
+signal cannot land on a reused pid.
 
 Known, bounded limitation: `--health-action restart` re-reads PID 1 from the registry and `SIGKILL`s
 it, and during a restart gap that pid could in principle be reused by another process **of the same
