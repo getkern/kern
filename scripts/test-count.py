@@ -42,15 +42,31 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 
+class Broken(Exception):
+    """The tool ran and refused. Not the same thing as the tool being absent."""
+
+
 def _run(cmd: list[str], cwd: Path | None = None) -> str | None:
-    """Stdout of `cmd`, or None when it cannot run or exits non-zero."""
+    """Stdout of `cmd`. None when the tool is ABSENT; raises Broken when it ran and failed.
+
+    The distinction is the whole point. An earlier version returned None for both, so a workspace
+    that did not COMPILE reported "SKIP: cannot count the Rust tests here" and the gate exited 0.
+    That happened on 2026-08-04: two test constructions were missing a field added minutes earlier,
+    and the counter announced a clean skip over a broken build. A gate that goes quiet on the one
+    failure it is standing next to is worse than no gate.
+    """
     try:
         out = subprocess.run(
             cmd, capture_output=True, text=True, timeout=600, cwd=cwd or REPO
         )
+    except FileNotFoundError:
+        return None  # the toolchain is not installed here: a real skip
     except (OSError, subprocess.SubprocessError):
         return None
-    return out.stdout if out.returncode == 0 else None
+    if out.returncode != 0:
+        tail = "\n".join((out.stderr or out.stdout).strip().splitlines()[:6])
+        raise Broken(f"`{' '.join(cmd)}` exited {out.returncode}:\n{tail}")
+    return out.stdout
 
 
 def rust_count() -> int | None:
@@ -102,8 +118,14 @@ def main() -> int:
         print(f"SKIP: cannot read README.md: {e}")
         return 0
 
-    checks = (("Rust", rust_count()), ("Python", python_count()), ("Node", node_count()))
+    checks = []
     failed = 0
+    for language, counter in (("Rust", rust_count), ("Python", python_count), ("Node", node_count)):
+        try:
+            checks.append((language, counter()))
+        except Broken as e:
+            print(f"the {language} suite does not build, so its count cannot be checked:\n  {e}")
+            failed += 1
     for language, have in checks:
         if have is None:
             print(f"SKIP: cannot count the {language} tests here")

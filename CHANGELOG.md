@@ -17,9 +17,24 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [0.6.37], 2026-08-04
+## [0.6.38], 2026-08-04
 
 ### Fixed
+
+- **`--plan` resolved profiles against a different `kern.toml` than the launch would.** `box_plan`
+  called `config::load(None)`, which reads `$KERN_CONFIG` or `~/.config/kern/kern.toml`, while the
+  launch reads the path given to `--config`. So `kern box app --config ./kern.toml vcpu:slim --plan`
+  answered `cannot attach: no [[vcpu]] profile named 'slim' in kern.toml` about a profile declared
+  in the file it had just been handed, and the launch then attached it.
+
+  A preview that denies what will happen is worse than no preview, because it is believed. It was
+  introduced by the change in this same release that made `--plan` report all three profile kinds:
+  the reporting was right and the source was not, and the manual check that accepted it used
+  `KERN_CONFIG`, which is the one path that worked.
+
+  The regression test asserts the discriminant rather than the symptom: `--config <path>` and
+  `KERN_CONFIG=<path>` name the same file, so they must produce the same preview. Asserting only
+  "does not say cannot attach" would go quiet again the moment a third config source is added.
 
 - **A crafted `kern.toml` could repaint kern's own output.** A `backend` value holding the real
   bytes `ESC[2K ESC[1A ESC[32m` came out unfiltered, so the refusal erased its own line, moved the
@@ -146,8 +161,8 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 ## Earlier releases
 
 0.6.34 and everything before it live in the signed tags: `git show v0.6.34`, or the
-[tag list](https://github.com/getkern/kern/tags). All 27 are signed, and 26 of them carry an
+[tag list](https://github.com/getkern/kern/tags). All 28 are signed, and 27 of them carry an
 OpenTimestamps proof anchored to Bitcoin ([provenance/](provenance/)). The exception is v0.6.8,
 which predates the practice; a proof stamped today would attest to today, not to its release.
 
-[0.6.37]: https://github.com/getkern/kern/releases/tag/v0.6.37
+[0.6.38]: https://github.com/getkern/kern/releases/tag/v0.6.38

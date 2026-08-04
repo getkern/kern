@@ -27,6 +27,10 @@ pub enum Command {
         /// The `vcpu:`/`vgpio:`/`vdisk:` tokens on the command line. A preview that omits the
         /// hardware a profile hands over is not a preview of what will be created.
         profiles: Vec<String>,
+        /// `--config <path>`, carried because the preview resolves those tokens. Without it the
+        /// plan read a DIFFERENT kern.toml from the one the launch would use, and reported
+        /// "no [[vcpu]] profile named 'slim'" for a profile sitting in the file that was passed.
+        config: Option<String>,
     },
     /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-- cmd...]`: run in a sandbox.
     BoxRun {
@@ -1997,6 +2001,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
         Command::BoxPlan {
             name: name.unwrap_or_default().to_string(),
             profiles: profiles.clone(),
+            config: config.clone(),
         }
     } else {
         Command::BoxRun {
@@ -2529,7 +2534,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Version => commands::version(),
         Command::Banner => commands::banner(),
         Command::Help => commands::help(),
-        Command::BoxPlan { name, profiles } => commands::box_plan(&name, &profiles),
+        Command::BoxPlan {
+            name,
+            profiles,
+            config,
+        } => commands::box_plan(&name, &profiles, config.as_deref()),
         Command::BoxRun {
             name,
             rootfs,
@@ -2984,7 +2993,8 @@ mod tests {
             plan,
             Command::BoxPlan {
                 name: "web".into(),
-                profiles: vec![]
+                profiles: vec![],
+                config: None
             }
         );
         // A `--plan` that carries profiles keeps them: the preview resolves the device grants, so
@@ -3000,7 +3010,27 @@ mod tests {
             .1,
             Command::BoxPlan {
                 name: "web".into(),
-                profiles: vec!["vgpio:sensor".into()]
+                profiles: vec!["vgpio:sensor".into()],
+                config: None
+            }
+        );
+        // `--config` reaches the preview. Without this the plan resolved profiles against a
+        // different kern.toml than the launch and denied one that was declared in the file passed.
+        assert_eq!(
+            parse(&[
+                "box".into(),
+                "web".into(),
+                "--config".into(),
+                "/tmp/k.toml".into(),
+                "vcpu:slim".into(),
+                "--plan".into()
+            ])
+            .unwrap()
+            .1,
+            Command::BoxPlan {
+                name: "web".into(),
+                profiles: vec!["vcpu:slim".into()],
+                config: Some("/tmp/k.toml".into())
             }
         );
         // `box <name>` with no rootfs/image still routes to BoxRun (box_run reports the missing

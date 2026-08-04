@@ -2328,3 +2328,84 @@ fn a_hostile_kern_toml_cannot_inject_escapes_into_an_error() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--plan` must resolve profiles against the SAME kern.toml the launch would use.
+///
+/// It did not. `box_plan` called `config::load(None)`, which reads `$KERN_CONFIG` or the default
+/// location, while the launch reads the `--config` path. With a valid profile in the file that was
+/// passed, the preview printed `cannot attach: no [[vcpu]] profile named 'slim' in kern.toml` and
+/// the launch attached it. That is the worst shape a preview can take: it is believed, and it
+/// denies something that will happen.
+///
+/// The assertion is the discriminant that found it, not the symptom: the two ways of naming a
+/// config must produce the SAME preview. A test that only asserted "does not say cannot attach"
+/// would pass again the moment a third source is added and forgotten, which is how this arrived.
+#[test]
+fn the_plan_resolves_the_config_the_launch_would_use() {
+    let dir = std::env::temp_dir().join(format!("kern-plan-cfg-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let toml = dir.join("kern.toml");
+    fs::write(
+        &toml,
+        "[[vcpu]]\nname = \"slim\"\nbackend = \"host\"\ncpus = 1\nmemory = \"128M\"\n\
+         [[vdisk]]\nname = \"s\"\nbackend = \"ram\"\nsize = \"8M\"\n",
+    )
+    .expect("write kern.toml");
+    let path = toml.to_string_lossy().to_string();
+
+    let via_flag = kern()
+        .args([
+            "box",
+            "planbox",
+            "--config",
+            &path,
+            "--rootfs",
+            "/",
+            "vcpu:slim",
+            "vdisk:s",
+            "--plan",
+        ])
+        .output()
+        .expect("run kern");
+    let via_env = kern()
+        .args([
+            "box",
+            "planbox",
+            "--rootfs",
+            "/",
+            "vcpu:slim",
+            "vdisk:s",
+            "--plan",
+        ])
+        .env("KERN_CONFIG", &path)
+        .output()
+        .expect("run kern");
+
+    let pick = |out: &std::process::Output| -> Vec<String> {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("vcpu:") || l.contains("vdisk:"))
+            .map(str::trim)
+            .map(str::to_string)
+            .collect()
+    };
+    let (flag, env) = (pick(&via_flag), pick(&via_env));
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        !flag.is_empty(),
+        "--plan printed no profile line at all, so this test guards nothing: {:?}",
+        String::from_utf8_lossy(&via_flag.stdout)
+    );
+    assert_eq!(
+        flag, env,
+        "`--config <path>` and KERN_CONFIG=<path> named the same file and previewed differently, \
+         so --plan is reading a config the launch would not"
+    );
+    for line in &flag {
+        assert!(
+            !line.contains("cannot attach"),
+            "--plan refused a profile that is declared in the config it was handed: {line}"
+        );
+    }
+}

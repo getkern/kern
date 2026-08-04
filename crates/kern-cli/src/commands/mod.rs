@@ -207,7 +207,7 @@ pub fn banner() -> Result<(), Error> {
 /// would perform. Privilege-free: it records the sequence via the isolation seam rather than
 /// executing it, so it works anywhere and exercises the 0.2 step-sequence + mount-ordering
 /// typestate end to end.
-pub fn box_plan(name: &str, profiles: &[String]) -> Result<(), Error> {
+pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result<(), Error> {
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let ctx = SandboxCtx::new(name);
     println!("isolation plan for box '{}':", ctx.name.as_str());
@@ -236,7 +236,13 @@ pub fn box_plan(name: &str, profiles: &[String]) -> Result<(), Error> {
     }
     // Loaded once for all three: `--plan` is a preview, but reading the same file three times would
     // let two kinds disagree if it changed underneath.
-    let cfg = crate::config::load(None).map_err(Error::Config)?;
+    //
+    // `config`, not None. Passing None here reads $KERN_CONFIG or the default location while the
+    // launch would read the `--config` path, so the preview answered about a different file: with a
+    // valid profile in the file that was passed, `--plan` printed "cannot attach: no [[vcpu]]
+    // profile named 'slim' in kern.toml" and the launch attached it. A preview that resolves
+    // against a different source than the launch is worse than no preview, because it is believed.
+    let cfg = crate::config::load(config).map_err(Error::Config)?;
     for n in vcpu {
         match crate::config::resolve_vcpu(&cfg, n) {
             Ok(r) => {
