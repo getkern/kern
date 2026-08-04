@@ -7,7 +7,7 @@ schema for a `kern.toml` is in [CONFIG.md](CONFIG.md).
 
 One model: a box gets *only* what you slice for it; a bare `run` adds the same caps to a process that
 otherwise still sees the host. Every shipping cap is a real cgroup v2 or kernel control; devices are
-deny-by-default. GPU slices are on the [Roadmap](#roadmap).
+deny-by-default. GPU slices are on the [Roadmap](../ROADMAP.md).
 
 | Resource | Flag / profile | What the box gets | Enforcement |
 |---|---|---|---|
@@ -17,7 +17,7 @@ deny-by-default. GPU slices are on the [Roadmap](#roadmap).
 | **Devices** | `vgpio:` | *Only* the named GPIO/I²C/SPI/LED nodes, nothing else | fresh `/dev` + fd-pinned bind + capability deny-list (raw-mem/disk/kvm refused) |
 | **PIDs** | `--pids-limit` | Fork-bomb ceiling | cgroup `pids.max`, hard |
 | **Block I/O** | `--io-weight` | I/O bandwidth weight | cgroup `io` |
-| **GPU** | *(roadmap)* | Not shipped | see [Roadmap](#roadmap) |
+| **GPU** | *(roadmap)* | Not shipped | see [Roadmap](../ROADMAP.md) |
 
 ¹ Where the `memory` controller is not delegated to a non-root user's scope, kern warns and shows the one-line
 `.wslconfig` fix; enforced natively on Linux.

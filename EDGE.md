@@ -22,8 +22,7 @@ itself** without standing up an always-on engine.
 
 ## What's validated
 
-The **published** `aarch64` binary of the current release, 0.6.32, was run on all three boards on
-2026-08-03, from the release asset with its sha256 checked, not from a local build. On each: a box
+The **published** `aarch64` binary of 0.6.32 was run on all three boards on 2026-08-03, from the release asset with its sha256 checked, not from a local build. On each: a box
 from a real OCI image starts, `mknod` inside it is refused (`Operation not permitted`), and the
 `--timeout` watchdog leaves nothing behind when its supervisor is SIGKILLed, which is the defect
 0.6.32 fixes and which reproduced 6 times out of 6 on x86 before it. Kernels covered: 6.6.51

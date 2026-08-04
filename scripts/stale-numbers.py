@@ -106,6 +106,34 @@ ALWAYS_ALLOWED = {"CHANGELOG.md"}
 
 COMPILED = [(re.compile(p, re.IGNORECASE), now, why, ok) for p, now, why, ok in STALE]
 
+# A version number in prose is only stale when the sentence around it claims to describe the CURRENT
+# state. "kern 0.6.30, 2026-08-01" is a dated record and stays true forever; "the current release,
+# 0.6.32" and "## Current status (0.6.30, honest)" go wrong the instant the next tag is pushed, and
+# both of those were live in the tree on the morning of the launch, three releases out of date. So
+# this is anchored on the CLAIM, like the 3.6 ms rule above, and it reads the truth from Cargo.toml
+# rather than from a constant here that would itself need updating at every release.
+CURRENT_CLAIM = re.compile(
+    r"current\s+(?:release|version|status)[^\n]{0,30}?(\d+\.\d+\.\d+)"
+    r"|(\d+\.\d+\.\d+)\s+is\s+(?:the\s+)?current",
+    re.IGNORECASE,
+)
+
+
+def workspace_version() -> str:
+    """The one true version, read from Cargo.toml. Empty string disables the check."""
+    try:
+        with open("Cargo.toml", encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'\s*version\s*=\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+VERSION = workspace_version()
+
 
 def scan(path: str) -> list[tuple[int, str, str, str, str]]:
     try:
@@ -127,6 +155,20 @@ def scan(path: str) -> list[tuple[int, str, str, str, str]]:
             m = rx.search(line)
             if m:
                 hits.append((lineno, m.group(0).strip(), now, why, line.strip()[:96]))
+        if VERSION and path not in ALWAYS_ALLOWED:
+            m = CURRENT_CLAIM.search(line)
+            if m and (m.group(1) or m.group(2)) != VERSION:
+                hits.append(
+                    (
+                        lineno,
+                        m.group(0).strip(),
+                        VERSION,
+                        "this sentence claims to describe the current release. Either name the "
+                        "version Cargo.toml carries, or drop the word 'current' and let it stand "
+                        "as the dated record it is.",
+                        line.strip()[:96],
+                    )
+                )
     return hits
 
 

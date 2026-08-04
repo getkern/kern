@@ -51,7 +51,7 @@ host **kernel**: a kernel privilege-escalation bug is an escape.
 kern's bet is startup latency, footprint and daemonless simplicity, not being a hypervisor. Pick
 the boundary your threat model needs; kern is honest about which one it is.
 
-## Current status (0.6.30, honest)
+## Current status, honest
 
 What is **enforced now** by `kern box`:
 - user + PID + network (loopback-only) + UTS + IPC + mount namespaces;

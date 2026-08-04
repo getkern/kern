@@ -168,4 +168,4 @@ and BOM) and honours **`.dockerignore`** (also `.kernignore`), so a `COPY . /app
 confine `COPY --from=<stage>` to that stage's filesystem (a hostile source path or symlink can't read
 the host). Layers pull as gzip **or zstd**. `push` normalizes ownership and strips setuid/setgid, so an
 untrusted base can't smuggle a privilege-bit into what you publish. (`build`/`push` are the newest
-surface, see [Project status](#project-status).)
+surface, see [Status](../README.md#status).)

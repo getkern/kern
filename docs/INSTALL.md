@@ -28,7 +28,7 @@ kern runs inside **WSL2**, a real Linux kernel, so the isolation (namespaces + s
 cap work for real, `--memory` included: measured on a stock WSL2 kernel (6.18), a 128m box reads back
 `memory.max = 134217728`. Where a host does not delegate the `memory` controller (a stock Raspberry Pi
 OS, and older WSL2 kernels), kern **warns** and shows the one-line fix rather than pretending, see
-[Requirements & limitations](#requirements--limitations). On a native Linux host `--memory` is enforced
+[Requirements and limitations](#requirements-and-limitations). On a native Linux host `--memory` is enforced
 out of the box. The installer ensures the WSL2 engine (self-elevating for the one reboot it may need, then
 resuming on its own), imports kern's **own** pre-baked distro (a tiny Alpine + kern, no Ubuntu, no
 manual steps), drops the `kern.exe` shim on your PATH, and verifies end-to-end. Every download is
@@ -111,7 +111,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 **Requires:**
 - A **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**. On Windows it runs under
-  WSL2; there is no native macOS/Windows port ([Roadmap](#roadmap)).
+  WSL2; there is no native macOS/Windows port ([Roadmap](../ROADMAP.md)).
 - Hard `--memory`/`--cpus`/`--pids` caps need a **delegated cgroup** (a systemd user manager, or root);
   without one they degrade to best-effort and kern says so. Microsoft's default WSL2 kernel and a stock
   Raspberry Pi OS, and WSL2 kernels older than the current one) don't delegate the `memory` controller,
@@ -125,14 +125,14 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 **Deliberately not here:**
 - **Not a microVM, not for hostile multi-tenancy.** A kernel vulnerability isn't contained: kern is a
   kernel-boundary sandbox for your own or semi-trusted code. When to reach for a microVM (Firecracker)
-  or gVisor instead is spelled out in [When to use kern (and when not)](#when-to-use-kern-and-when-not)
+  or gVisor instead is spelled out in [What kern is not](../README.md#what-kern-is-not)
   and the [threat model](../SECURITY.md).
 - **No overlay / software-defined networking** (a box gets an isolated netns, or the host's; a pod
   shares one) and no Docker plugin ecosystem.
 - **`kern exec` caps** are inherited only where kern can join the box's cgroup (root, or a delegated
   `kern.slice`); on a rootless per-box-scope host the exec'd command runs outside the box's
   `--memory`/`--pids` (namespaces + seccomp still isolate it), and kern warns.
-- **GPU** slices are on the [Roadmap](#roadmap), not shipped.
+- **GPU** slices are on the [Roadmap](../ROADMAP.md), not shipped.
 
 ## Platforms
 

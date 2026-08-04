@@ -4,9 +4,9 @@
 kern starts as a small, fast sandbox/OCI runtime and grows deliberately: the resources it governs are
 driven by what proves useful. These are directions under consideration, **not commitments or dates**,
 and some may never ship if they would change what kern is. Recently shipped work is under
-[Project status](#project-status), not here.
+[Status](README.md#status), not here.
 
-- **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped, and this
+- **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped, and the
   README will describe it when it is, not before. Nothing here touches a GPU today.
 - **More governed resources.** The same profile model could extend to other cgroup or kernel-real
   resources (I/O bandwidth, network shaping) as they prove useful.
