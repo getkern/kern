@@ -164,9 +164,14 @@ kern run vcpu:heavy -- ./train.sh            # the same slice, no sandbox
 kern box iot --image alpine vgpio:sensor -- ls /dev
 ```
 
+Declare as many `[[disk]]` pools as you have, one path each, and give a `vdisk:` exactly one
+`backend`: a pool id or `ram`. There is no "disk and ram", but several `vdisk:` with different
+backends attach to one box, each with its own cap. A backend naming no declared pool is refused when
+the config is read, not when the box runs.
+
 A `vdisk:` is a RAM-backed tmpfs when kern runs rootless, whatever its backend says, and an
 ext4-on-loop image with a real disk quota when it runs privileged in the foreground. kern says which
-one you got rather than letting you assume, and the size cap is enforced either way.
+one you got, per profile, rather than letting you assume, and the size cap is enforced either way.
 
 Profiles compose: several attach to one box, and an explicit flag beats a profile's own value. Every
 key is spelled like its CLI flag, so `cpus` is `--cpus` and `memory` is `--memory`.
