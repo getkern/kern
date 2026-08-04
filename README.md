@@ -193,7 +193,7 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**0.6.34.** Everything above works today and is tested: 703 Rust, 69 Python and 56 Node tests,
+**0.6.34.** Everything above works today and is tested: 704 Rust, 69 Python and 56 Node tests,
 clippy-clean, `cargo-deny`-clean. Semver, pre-1.0: the CLI and config surface can still change
 between minor versions, always called out in [CHANGELOG.md](CHANGELOG.md). Releases are signed tags
 and timestamped to Bitcoin ([provenance/](provenance/)).

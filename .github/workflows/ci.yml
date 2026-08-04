@@ -34,6 +34,7 @@ jobs:
         run: |
           python3 scripts/no-ai-slop.py
           python3 scripts/stale-numbers.py
+          python3 scripts/test-count.py
 
   audit:
     name: cargo-audit + cargo-deny
