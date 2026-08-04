@@ -234,6 +234,26 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 - **A Resource profiles section in the README**, with every command in it executed rather than
   written: `vgpio:` grants exactly the node it names, measured against a host carrying three.
 
+- **A `--json` line in the Quickstart**, because every read verb now answers in JSON and a reader
+  scanning the page would not otherwise know. The `jq` example it shows was run against a box with a
+  failing health check, so `.health == "unhealthy"` is a value that occurs, not one imagined.
+
+### Verified on hardware
+
+The 0.6.43 binary was run on all six targets, the two defects above checked on each rather than
+assumed from x86: `kern <verb> --help` filtered to the verb under a real pty (161 lines to 75), and
+a volume directory carrying a raw `ESC` in its name round-tripped through `volume ls --json` as
+`` with `"usable":false`, never as a raw byte.
+
+- **UNO Q** (Android + Debian, aarch64), **Raspberry Pi 5** (aarch64), **Jetson Orin Nano**
+  (tegra 5.15, aarch64): all three green, cross-built with `aarch64-linux-gnu-gcc`.
+- **WSL2** (`PCALEX`, musl x86_64): green, and 50 box starts end-to-end at 5 ms each. The
+  uncapped-host notice stayed silent, correctly, because this kernel delegates the `memory`
+  controller.
+- **VPS** (getkern.dev, Ubuntu 24.04, x86_64, the one target not configured by hand): green.
+  `doctor` reports the AppArmor userns restriction; with it relaxed a box runs, and `--privileged`
+  is refused as root, as designed.
+
 ## Earlier releases
 
 0.6.34 and everything before it live in the signed tags: `git show v0.6.34`, or the
