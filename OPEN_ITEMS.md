@@ -79,9 +79,9 @@ with cgroup caps on, which is what users run, the same span went from 4.92 ms to
 
 ## Binary size is not being reduced
 
-Published v0.6.35, read from the checksum-verified release artifacts: **1926112 B x86_64 (1.84 MB)**
-and **1577448 B aarch64 (1.50 MB)**, byte-for-byte the same sizes as v0.6.34 despite the code added
-between them. The release profile is already at its limit.
+Read from the checksum-verified release artifacts: **1926112 B x86_64 (1.84 MB)** and **1577448 B
+aarch64 (1.50 MB)**, unchanged across the last two releases despite the code added between them. The
+release profile is already at its limit.
 
 ⚠️ A local cross-build is not the number to quote. The aarch64 binary built here with
 `aarch64-linux-gnu-gcc` is 1642984 B, exactly 65536 more, because that linker aligns segments to

@@ -38,6 +38,8 @@ Exit:   0 clean, 1 if anything was flagged.
 
 from __future__ import annotations
 
+import glob
+import os
 import re
 import subprocess
 import sys
@@ -162,12 +164,12 @@ def excluded_manifests_agree() -> list[str]:
     """Manifests that ship in the release but cannot inherit the workspace version.
 
     `windows/kern-win` is cross-compiled by release.yml and published as `kern-windows-x86_64.exe`,
-    so it ships with every release, and it sat at 0.6.7 while the workspace was at 0.6.35: 28
-    releases of drift on an artifact users download. Nothing surfaces that number to a user, which is
-    precisely why nobody noticed. `fuzz` is exempt on purpose: 0.0.0 says "never published".
+    so it ships with every release, and it sat at 0.6.7 while the workspace had moved 28 minors past
+    it: that much drift on an artifact users download. Nothing surfaces that number to a user, which
+    is precisely why nobody noticed. `fuzz` is exempt on purpose: 0.0.0 says "never published".
 
     The in-workspace path dependencies restate a version they cannot inherit either. It is only a
-    requirement (`0.6.7` means `^0.6.7`, which 0.6.35 satisfies, which is why nothing ever
+    requirement (`0.6.7` means `^0.6.7`, which every later 0.6.x satisfies, which is why nothing ever
     complained), but it is what a `cargo publish` would carry, and it sat 28 releases behind too.
     """
     bad = []
@@ -195,6 +197,54 @@ def excluded_manifests_agree() -> list[str]:
                     )
     except OSError:
         pass
+    return bad
+
+
+def provenance_counts_agree() -> list[str]:
+    """The CHANGELOG counts the signed tags and the timestamp proofs. Both are countable.
+
+    "All 27 are signed and timestamped to Bitcoin" was wrong on 2026-08-04: 27 tags were signed but
+    only 26 had an OpenTimestamps proof, because v0.6.8 predates the practice. It read as a blanket
+    guarantee, which is the one kind of claim a reader cannot check cheaply and therefore takes on
+    trust. Both halves are counted from the repository here.
+
+    SKIPS, rather than fails, on a checkout with no tags: `actions/checkout` fetches none by default,
+    and a gate that fails on a shallow clone teaches people to ignore it.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "tag"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    # The section counts the EARLIER releases, so the tag and proof for the version documented at
+    # the top of the file are excluded. Without that the number would be wrong twice per release:
+    # once between the commit and the tag, and again between the tag and the OpenTimestamps stamp.
+    here = f"v{VERSION}" if VERSION else None
+    tags = [t for t in out.stdout.split() if t.startswith("v") and t != here]
+    if out.returncode != 0 or len(tags) < 2:
+        return []  # no tags here: nothing to compare against
+
+    proofs = [
+        p for p in glob.glob("provenance/*.provenance.txt.ots")
+        if not (here and os.path.basename(p).startswith(f"{here}."))
+    ]
+    try:
+        text = open("CHANGELOG.md", encoding="utf-8").read()
+    except OSError:
+        return []
+
+    bad = []
+    m = re.search(r"All (\d+) are signed", text)
+    if m and int(m.group(1)) != len(tags):
+        bad.append(
+            f"CHANGELOG.md says {m.group(1)} signed tags, `git tag` lists {len(tags)}"
+        )
+    m = re.search(r"(\d+) of them carry an\s+OpenTimestamps proof", text)
+    if m and int(m.group(1)) != len(proofs):
+        bad.append(
+            f"CHANGELOG.md says {m.group(1)} OpenTimestamps proofs, provenance/ holds {len(proofs)}"
+        )
     return bad
 
 
@@ -257,6 +307,11 @@ def main(argv: list[str]) -> int:
         print(f"\n{problem}")
         print("       an excluded workspace or a path dependency ships in the release but cannot "
               "inherit the version, so it has to be bumped by hand. This is that hand.")
+    for problem in provenance_counts_agree():
+        total += 1
+        print(f"\n{problem}")
+        print("       the signed-tag and timestamp counts are a trust claim, and both are "
+              "countable from this repository. Count them.")
     n = len(files)
     print(f"\n{total} stale figure{'' if total == 1 else 's'} in {n} file{'' if n == 1 else 's'}")
     return 1 if total else 0
