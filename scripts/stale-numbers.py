@@ -245,6 +245,22 @@ def provenance_counts_agree() -> list[str]:
         bad.append(
             f"CHANGELOG.md says {m.group(1)} OpenTimestamps proofs, provenance/ holds {len(proofs)}"
         )
+
+    # Having a proof and being IN a Bitcoin block are two different states, and the page claimed the
+    # stronger one for both: 27 proofs existed, 26 were confirmed, and a freshly stamped proof waits
+    # hours for a calendar to reach a block plus six confirmations. Counted from the bytes rather
+    # than from `ots`, which is not installed on the CI runner and would make this check vanish
+    # exactly where it is unattended. This 8-byte tag is the Bitcoin block-header attestation; it
+    # agrees with `ots info` on every file in provenance/, checked when this was written.
+    confirmed = sum(
+        1 for p in proofs if bytes.fromhex("0588960d73d71901") in open(p, "rb").read()
+    )
+    m = re.search(r"of which (\d+) are confirmed in a Bitcoin block", text)
+    if m and int(m.group(1)) != confirmed:
+        bad.append(
+            f"CHANGELOG.md says {m.group(1)} proofs are confirmed in a Bitcoin block, "
+            f"{confirmed} of the {len(proofs)} carry the attestation"
+        )
     return bad
 
 

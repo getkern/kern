@@ -162,7 +162,9 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 0.6.34 and everything before it live in the signed tags: `git show v0.6.34`, or the
 [tag list](https://github.com/getkern/kern/tags). All 28 are signed, and 27 of them carry an
-OpenTimestamps proof anchored to Bitcoin ([provenance/](provenance/)). The exception is v0.6.8,
-which predates the practice; a proof stamped today would attest to today, not to its release.
+OpenTimestamps proof ([provenance/](provenance/)), of which 26 are confirmed in a Bitcoin block.
+The rest are stamped and waiting: a calendar takes hours to get into a block and then six
+confirmations, so the newest proof is always pending for a while. The one tag with no proof at all
+is v0.6.8, which predates the practice; stamping it today would attest to today, not to its release.
 
 [0.6.38]: https://github.com/getkern/kern/releases/tag/v0.6.38
