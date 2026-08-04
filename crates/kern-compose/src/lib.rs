@@ -408,8 +408,8 @@ pub fn parse_expose_entry(raw: &str) -> Result<(u16, bool), String> {
         ));
     }
     let (num, proto) = raw.split_once('/').unwrap_or((raw, "tcp"));
-    // Confronto senza distinzione di maiuscole: non ho dati che confermino che Docker accetti
-    // `/TCP`, ma accettarlo non puo' rompere nulla, mentre rifiutare un file altrove valido si'.
+    // Case-insensitive: there is no evidence here that Docker accepts `/TCP`, but accepting it
+    // cannot break anything, whereas refusing an otherwise valid file can.
     let proto = proto.trim();
     let udp = if proto.eq_ignore_ascii_case("tcp") {
         false
@@ -778,10 +778,10 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "cpus" => b.cpus = Some(s(val)?),
             "cpuset" => b.cpuset = Some(s(val)?),
             "swap_max" => b.swap_max = Some(s(val)?),
-            // Questi tre esistevano come flag CLI e come chiavi Docker, ma NON come chiavi del
-            // profilo kern: uno stack kern-nativo non poteva esprimerli, contro la regola "campo del
-            // profilo == flag CLI 1:1". La validazione resta a valle, dove gia' vive per il percorso
-            // YAML, cosi' le due strade non possono divergere sul valore accettato.
+            // These three existed as CLI flags and as Docker keys but NOT as kern profile keys, so
+            // a kern-native stack could not express them, against the project's "profile field ==
+            // CLI flag, 1:1" rule. Validation stays downstream, where it already lives for the YAML
+            // path, so the two routes cannot diverge on what value they accept.
             "restart_max" => b.restart_max = Some(s(val)?),
             "stop_signal" => b.stop_signal = Some(s(val)?),
             "stop_grace_period" => b.stop_grace_period = Some(s(val)?),
@@ -830,12 +830,12 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "env" => b.env = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "env_file" => b.env_file = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "ports" => b.ports = parse_string_array(val).map_err(|e| line_err(i, &e))?,
-            // Malformata = RIFIUTATA, con il numero di riga, mentre lo stesso valore in un
-            // `docker-compose.yml` avvisa e viene saltato. Voluto, non incoerente: questo e' il
-            // formato di kern, dove un refuso e' un refuso da correggere; quello e' il file di
-            // qualcun altro, dove rifiutare l'intero stack per una riga di sola documentazione
-            // sarebbe il compromesso sbagliato. Il PARSER e' lo stesso, quindi la stringa significa
-            // la stessa cosa in entrambe; cambia solo che cosa se ne fa chi la legge.
+            // Malformed = REFUSED, with the line number, where the same value in a
+            // `docker-compose.yml` is warned and skipped. Deliberate rather than inconsistent: this
+            // is kern's own format, where a typo is a typo to fix; that is someone else's file,
+            // where refusing a whole stack over one line of pure documentation would be the wrong
+            // trade. The PARSER is the same, so the string means the same thing in both; only what
+            // the reader does with it differs.
             "expose" => {
                 b.expose.clear();
                 for raw in parse_string_array(val).map_err(|e| line_err(i, &e))? {
@@ -863,9 +863,9 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "tmpfs" => b.tmpfs = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "cap_add" => b.cap_add = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "cap_drop" => b.cap_drop = parse_string_array(val).map_err(|e| line_err(i, &e))?,
-            // Cinque campi avevano il flag CLI e la chiave Docker ma non quella del profilo kern:
-            // uno stack kern-nativo non poteva esprimerli. La legge del progetto e' "campo del
-            // profilo == flag CLI 1:1", e questa era l'unica meta' mancante.
+            // Five fields had the CLI flag and the Docker key but not the kern profile key, so a
+            // kern-native stack could not express them. The project's law is "profile field == CLI
+            // flag, 1:1", and this was the only half of it missing.
             "add_host" => b.add_host = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "ulimits" => b.ulimits = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "labels" => b.labels = parse_string_array(val).map_err(|e| line_err(i, &e))?,
@@ -2244,18 +2244,18 @@ mod dotenv_tests {
         );
         assert!(stated.contains(&"PORT=3000".to_string()));
     }
-    /// GUARDIA STRUTTURALE. Un campo che raggiunge la struct ma non `merge_from` viene scartato in
-    /// SILENZIO da un file override, che e' la forma peggiore che un difetto possa prendere in una
-    /// fusione: il file dice una cosa, lo stack ne fa un'altra, e nessuno lo segnala. Quattro campi
-    /// erano gia' in questo stato (`port`, `restart_max`, `stop_signal`, `stop_grace_period`).
+    /// STRUCTURAL GUARD. A field that reaches the struct but not `merge_from` is dropped SILENTLY
+    /// by an override file, which is the worst shape a defect can take in a merge: the file says one
+    /// thing, the stack does another, and nothing reports it. Four fields were already in that state
+    /// (`port`, `restart_max`, `stop_signal`, `stop_grace_period`).
     ///
-    /// Il test NON elenca i campi a mano, altrimenti ripeterebbe l'errore che deve intercettare:
-    /// fonde una scatola COMPLETA sopra una vuota e confronta la rappresentazione `Debug` con quella
-    /// della stessa scatola non fusa. Qualunque campo che `merge_from` dimentica appare come una
-    /// differenza. Il prossimo campo aggiunto e' coperto senza toccare questo test.
+    /// The test does NOT list the fields by hand, which would repeat the very mistake it exists to
+    /// catch: it merges a COMPLETE box over an empty one and compares the `Debug` representation
+    /// against the same box unmerged. Any field `merge_from` forgets shows up as a difference, and
+    /// the next field added is covered without touching this test.
     #[test]
     fn every_optional_field_survives_a_merge() {
-        // Ogni chiave che il parser conosce, con un valore non-default.
+        // Every key the parser knows, each with a non-default value.
         const FULL: &str = concat!(
             "[box.a]\n",
             "image = \"img\"\n",
@@ -2305,7 +2305,7 @@ mod dotenv_tests {
             "command = [\"true\"]\n",
         );
 
-        // Due istanze identiche: una resta il riferimento, l'altra viene fusa sopra una vuota.
+        // Two identical instances: one stays the reference, the other is merged over an empty box.
         let reference = parse(FULL).expect("parses").remove(0);
         let overriding = parse(FULL).expect("parses").remove(0);
         let mut base = ComposeBox::new("a".to_string());
@@ -2318,8 +2318,8 @@ mod dotenv_tests {
              differisce, poi aggiungilo alla macro giusta (opt!/flag!/seq!)"
         );
 
-        // Controllo positivo: se la fusione non facesse NULLA, il test sopra dovrebbe fallire.
-        // Senza questo, una `merge_from` svuotata passerebbe solo quando anche il riferimento e' vuoto.
+        // Positive control: if the merge did NOTHING, the assertion above would have to fail.
+        // Without it, a gutted `merge_from` would pass whenever the reference is empty too.
         let empty = ComposeBox::new("a".to_string());
         assert_ne!(
             format!("{empty:?}"),
@@ -2327,26 +2327,26 @@ mod dotenv_tests {
             "il riferimento deve essere diverso da una scatola vuota, altrimenti non prova nulla"
         );
     }
-    /// `expose:` e' la grafia Compose di cio' che `port:` dichiara, quindi finisce nello stesso spazio
-    /// di porte del pod. La sintassi ha tre forme e due modi di essere sbagliata, e un solo lettore le
-    /// deve interpretare tutte allo stesso modo per entrambe le grafie del file.
+    /// `expose:` is the Compose spelling of what `port:` declares, so it lands in the same pod port
+    /// space. The syntax has three shapes and two ways of being wrong, and one reader has to
+    /// interpret all of them the same way for both spellings of the file.
     #[test]
     fn expose_entries_parse_every_docker_form_and_refuse_the_rest() {
         assert_eq!(parse_expose_entry("3000"), Ok((3000, false)));
         assert_eq!(parse_expose_entry("3000/tcp"), Ok((3000, false)));
         assert_eq!(parse_expose_entry("53/udp"), Ok((53, true)));
-        // Maiuscole accettate: rifiutare un file altrove valido costa piu' che tollerarle.
+        // Upper case accepted: refusing an otherwise valid file costs more than tolerating it.
         assert_eq!(parse_expose_entry("3000/TCP"), Ok((3000, false)));
         assert_eq!(parse_expose_entry("53/UDP"), Ok((53, true)));
         assert_eq!(parse_expose_entry("  8080  "), Ok((8080, false)));
         assert_eq!(parse_expose_entry("65535"), Ok((65535, false)));
         assert_eq!(parse_expose_entry("1"), Ok((1, false)));
 
-        // Un intervallo e' rifiutato PER NOME, non espanso in silenzio.
+        // A range is refused BY NAME, not silently expanded.
         let r = parse_expose_entry("3000-3005").expect_err("range");
         assert!(r.contains("range") && r.contains("3000-3005"), "{r}");
 
-        // Zero, fuori intervallo, protocollo ignoto, testo: tutti rifiutati.
+        // Zero, out of range, unknown protocol, plain text: all refused.
         for bad in ["0", "65536", "-1", "3000/sctp", "http", "", "3000/", "/udp"] {
             assert!(
                 parse_expose_entry(bad).is_err(),
@@ -2355,19 +2355,19 @@ mod dotenv_tests {
         }
     }
 
-    /// Le due grafie condividono il PARSER ma non la DISPOSIZIONE di una voce malformata, e la
-    /// differenza e' una scelta, non un'incoerenza: il TOML e' il formato di kern (un refuso si dice
-    /// subito, con la riga), lo YAML e' il file di qualcun altro (rifiutare l'intero stack per una
-    /// riga di sola documentazione sarebbe il compromesso sbagliato).
+    /// The two spellings share the PARSER but not the DISPOSAL of a malformed entry, and the
+    /// difference is a choice rather than an inconsistency: the TOML is kern's own format, where a
+    /// typo is said at once with its line, and the YAML is someone else's file, where refusing a
+    /// whole stack over one line of pure documentation would be the wrong trade.
     ///
-    /// Il test tiene ferme ENTRAMBE nello stesso posto. Erano gia' divergenti mentre un commento
-    /// affermava che non potevano esserlo: nessuno le aveva mai asserite insieme.
+    /// This holds BOTH of them in one place. They had already drifted apart while a comment asserted
+    /// that they could not, because nobody had ever asserted them together.
     #[test]
     fn range_disposition_differs_by_spelling_on_purpose() {
         let yaml = "services:\n  a:\n    image: alpine\n    expose: [\"3000-3005\"]\n";
         let toml = "[box.a]\nimage = \"alpine\"\nexpose = [\"3000-3005\"]\n";
 
-        // YAML: accettato, l'intervallo saltato, il resto del servizio intatto.
+        // YAML: accepted, the range skipped, the rest of the service untouched.
         let parsed = parse(yaml).expect("un intervallo non deve far fallire un compose YAML");
         assert_eq!(parsed.len(), 1);
         assert!(
@@ -2376,12 +2376,12 @@ mod dotenv_tests {
         );
         assert_eq!(parsed[0].image.as_deref(), Some("alpine"));
 
-        // TOML: rifiutato, e il messaggio nomina la riga e il valore.
+        // TOML: refused, and the message names the line and the value.
         let e = parse(toml).expect_err("un intervallo deve far fallire un profilo kern");
         assert!(e.contains("3000-3005") && e.contains("range"), "{e}");
 
-        // Controllo positivo: una voce VALIDA arriva alla stessa conclusione in entrambe le grafie,
-        // che e' cio' che condividere il parser deve garantire.
+        // Positive control: a VALID entry reaches the same conclusion in both spellings, which is
+        // what sharing the parser is supposed to guarantee.
         for src in [
             "services:\n  a:\n    image: alpine\n    expose: [\"53/udp\"]\n",
             "[box.a]\nimage = \"alpine\"\nexpose = [\"53/udp\"]\n",
@@ -2391,9 +2391,9 @@ mod dotenv_tests {
         }
     }
 
-    /// Le tre sorgenti di porta (`port:`, `expose:`, `ports:`) sono la stessa affermazione e devono
-    /// finire nello stesso spazio, altrimenti il preflight protegge solo quella che gli capita di
-    /// guardare. Qui si verifica che il parser le porti tutte fino alla struct.
+    /// The three port sources (`port:`, `expose:`, `ports:`) are the same statement and must land
+    /// in the same space, or the preflight only protects whichever one it happens to look at. This
+    /// checks that the parser carries all three through to the struct.
     #[test]
     fn expose_reaches_the_box_from_both_spellings() {
         let b = parse("[box.a]\nimage = \"x\"\nexpose = [\"3000\", \"53/udp\"]\n")
@@ -2401,8 +2401,8 @@ mod dotenv_tests {
             .remove(0);
         assert_eq!(b.expose, vec![(3000, false), (53, true)]);
 
-        // Una voce malformata nel profilo kern e' un errore di file, non un avviso: il profilo e'
-        // scritto per kern, quindi non c'e' un "file per il resto valido" da salvare.
+        // A malformed entry in a kern profile is a file error, not a warning: the profile is
+        // written for kern, so there is no "otherwise valid file" to rescue.
         assert!(parse("[box.a]\nimage = \"x\"\nexpose = [\"3000-3005\"]\n").is_err());
     }
 }

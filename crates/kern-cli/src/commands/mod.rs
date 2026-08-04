@@ -653,9 +653,9 @@ fn fleet_gate_and_budget() -> Result<(), Error> {
 }
 
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
-    // Il PADRE non era strumentato: `KERN_TIMING` copriva solo il setup nel figlio, quindi il tempo
-    // speso qui era invisibile e non poteva essere ottimizzato da nessuno, perche' nessuno poteva
-    // vederlo. Le marche sotto costano un `getenv` quando la variabile non c'e'.
+    // The PARENT was not instrumented: `KERN_TIMING` covered only the child's setup, so the time
+    // spent here was invisible and nobody could optimise it, because nobody could see it. The marks
+    // below cost one `getenv` when the variable is unset.
     let mut pt = kern_isolation::PhaseTimer::new();
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
@@ -11863,10 +11863,10 @@ fn check_pod_global_conflicts(
         // way an INTERNAL-only service (reached by name, publishing nothing) becomes visible here at
         // all. Derived from `ports:` alone, this check saw only the services that publish, so the
         // stack it protected was the smaller half of the stack. Declared ports are TCP.
-        // Tre sorgenti, UNO spazio: `port:` (dichiarata, iniettata come PORT), `expose:` (dichiarate,
-        // grafia Compose) e le mappature di `ports:` (pubblicate). Sono tutte la stessa affermazione,
-        // "questo servizio lega questa porta nel namespace del pod", e vanno confrontate insieme o il
-        // controllo protegge solo la sorgente che gli e' capitato di guardare.
+        // Three sources, ONE space: `port:` (declared, injected as PORT), `expose:` (declared,
+        // the Compose spelling) and the mappings from `ports:` (published). They are all the same
+        // statement, "this service binds this port in the pod namespace", and have to be compared
+        // together or the check protects only the source it happened to look at.
         let declared = b.port.map(|p| (p, false));
         for (port, udp) in
             declared
@@ -15284,11 +15284,12 @@ mod pod_global_tests {
         }
     }
 
-    /// `expose:` entra nello stesso spazio di `port:` e `ports:`. Senza, un `docker-compose.yml`
-    /// reale che usa la grafia Compose restava fuori dal preflight e collideva a runtime.
+    /// `expose:` joins the same space as `port:` and `ports:`. Without it, a real
+    /// `docker-compose.yml` using the Compose spelling stayed outside the preflight and collided at
+    /// runtime.
     #[test]
     fn expose_shares_the_port_space_with_port_and_ports() {
-        // expose contro port dichiarata.
+        // expose against a declared port.
         let mut a = svc("api");
         a.expose = vec![(3000, false)];
         let mut b = svc("admin");
@@ -15309,17 +15310,17 @@ mod pod_global_tests {
         f.expose = vec![(3000, false)];
         assert!(err(&[e, f]).contains("3000/tcp"));
 
-        // Il protocollo conta: udp e tcp sullo stesso numero sono socket diversi.
+        // The protocol matters: udp and tcp on the same number are different sockets.
         let mut g = svc("api");
         g.expose = vec![(53, true)];
         let mut h = svc("dns");
         h.expose = vec![(53, false)];
         assert!(
             check_pod_global_conflicts(&[g, h], false).is_ok(),
-            "udp e tcp non collidono"
+            "udp and tcp do not collide"
         );
 
-        // Un servizio che dichiara la stessa porta in due grafie afferma un fatto due volte.
+        // A service declaring the same port in two spellings states one fact twice.
         let mut solo = svc("api");
         solo.port = Some(3000);
         solo.expose = vec![(3000, false)];
@@ -15485,27 +15486,27 @@ mod pod_global_tests {
         assert!(check_pod_global_conflicts(&[svc("db"), ok_app], false).is_ok());
     }
 
-    /// Il gate sta DENTRO la funzione, e questo test e' il motivo per cui ci resta.
+    /// The gate lives INSIDE the function, and this test is why it stays there.
     ///
-    /// Prima era riscritto a ogni sito di chiamata e i siti hanno divergiuto: `up` lo applicava,
-    /// `systemd` girava senza gate, e `config` (il verbo che risponde a "questo file parte?") non
-    /// chiamava affatto il controllo, quindi dichiarava sano uno stack che `up` rifiutava. Chi
-    /// riportasse il gate fuori di qui, in uno solo dei tre siti, riaprirebbe quella divergenza.
+    /// It used to be restated at every call site, and the sites drifted: `up` applied it, `systemd`
+    /// ran with no gate at all, and `config`, the verb that answers "does this file come up?", never
+    /// called the check, so it declared healthy a stack that `up` refused. Moving the gate back out,
+    /// into one of the three sites, would reopen that divergence.
     #[test]
     fn the_gate_is_inside_so_no_caller_can_restate_it_differently() {
-        // `ComposeBox` non e' Clone, quindi la coppia si ricostruisce a ogni asserzione.
+        // `ComposeBox` is not Clone, so the pair is rebuilt for each assertion.
         let pair = || {
             let (mut a, mut b) = (svc("a"), svc("b"));
             a.port = Some(3100);
             b.port = Some(3100);
             [a, b]
         };
-        // Controllo positivo: la collisione c'e' davvero, altrimenti sotto non si starebbe misurando
-        // il gate ma l'assenza del conflitto.
+        // Positive control: the collision is really there, otherwise the assertions below would be
+        // measuring the absence of a conflict rather than the gate.
         assert!(err(&pair()).contains("3100"));
-        // `--no-pod`: ogni servizio ha la sua namespace, la collisione non esiste piu'.
+        // `--no-pod`: each service gets its own namespace, so the collision no longer exists.
         assert!(check_pod_global_conflicts(&pair(), true).is_ok());
-        // Un servizio solo non condivide con nessuno, a prescindere dal flag.
+        // A lone service shares with nobody, whatever the flag says.
         let [solo, _] = pair();
         assert!(check_pod_global_conflicts(&[solo], false).is_ok());
     }
@@ -15906,9 +15907,9 @@ mod managed_unit_ownership {
     }
 }
 
-/// Un verbo che il parser accetta ma che ne' l'help ne' il messaggio d'uso nominano e' un verbo che
-/// non esiste per chi legge. `systemd` e' stato esattamente questo, perche' la lista era scritta a
-/// mano in tre posti. Ora ce n'e' una sola, e questi test la ancorano da entrambi i lati.
+/// A verb the parser accepts but that neither the help nor the usage message names is a verb that
+/// does not exist for the reader. `systemd` was exactly that, because the list was written by hand
+/// in three places. There is one list now, and these tests anchor it from both sides.
 #[cfg(test)]
 mod compose_verbs_are_one_list {
     use super::*;
@@ -15924,17 +15925,17 @@ mod compose_verbs_are_one_list {
             );
             assert!(
                 help.split('|').any(|v| v == *name),
-                "'{name}' e' accettato ma non compare nel testo d'aiuto: {help}"
+                "'{name}' is accepted but does not appear in the help text: {help}"
             );
         }
-        // Il testo non deve annunciare nulla che il parser rifiuti.
+        // The text must not announce anything the parser refuses.
         for v in help.split('|') {
             assert!(
                 ComposeAction::from_verb(v).is_some(),
-                "il testo d'aiuto annuncia '{v}', che il parser non accetta"
+                "the help text announces '{v}', which the parser does not accept"
             );
         }
-        // Nessun duplicato: due voci con lo stesso nome renderebbero la seconda irraggiungibile.
+        // No duplicates: two entries with the same name would make the second unreachable.
         let mut names: Vec<&str> = COMPOSE_VERBS.iter().map(|(n, _)| *n).collect();
         let total = names.len();
         names.sort_unstable();
@@ -15957,18 +15958,18 @@ mod compose_verbs_are_one_list {
     }
 }
 
-/// L'arresto grazioso aspettava l'intero periodo di grazia anche quando l'init del box non poteva
-/// riceverne il segnale: un PID 1 di namespace scarta i segnali di cui non ha un gestore, quindi un
-/// `sleep` non muore mai di SIGTERM. `kern stop` ci metteva 9013 ms invece di 2, e un `compose down`
-/// di quattro servizi sarebbe stato 36 secondi.
+/// The graceful stop waited out the whole grace period even when the box's init could not receive
+/// the signal: a namespace PID 1 discards signals it has no handler for, so a `sleep` never dies of
+/// SIGTERM. `kern stop` took 9013 ms instead of 2, and a `compose down` of four services would have
+/// been 36 seconds.
 #[cfg(test)]
 mod stop_does_not_wait_for_the_impossible {
     use super::*;
 
     #[test]
     fn a_signal_the_init_cannot_catch_is_not_waited_for() {
-        // Questo processo di test ha una maschera SigCgt reale: qualunque cosa contenga, la funzione
-        // deve leggerla senza panicare e rispondere in modo coerente con /proc.
+        // This test process has a real SigCgt mask: whatever it holds, the function must read it
+        // without panicking and answer consistently with /proc.
         let me = std::process::id() as i32;
         let status = std::fs::read_to_string(format!("/proc/{me}/status")).unwrap_or_default();
         let mask = status
@@ -15988,15 +15989,15 @@ mod stop_does_not_wait_for_the_impossible {
 
     #[test]
     fn an_unknown_process_stays_on_the_patient_path() {
-        // Non sapere deve significare ASPETTARE, non uccidere presto: sbagliare in quella direzione
-        // costa un'attesa, sbagliare nell'altra troncherebbe uno spegnimento reale a meta'.
-        assert!(init_catches_signal(0, libc::SIGTERM), "pid non valido");
-        assert!(init_catches_signal(-1, libc::SIGTERM), "pid negativo");
+        // Not knowing must mean WAIT, not kill early: erring that way costs a wait, erring the
+        // other way would cut a real shutdown in half.
+        assert!(init_catches_signal(0, libc::SIGTERM), "invalid pid");
+        assert!(init_catches_signal(-1, libc::SIGTERM), "negative pid");
         assert!(
             init_catches_signal(i32::MAX, libc::SIGTERM),
-            "pid inesistente: /proc non leggibile, quindi si aspetta"
+            "pid that does not exist: /proc unreadable, so we wait"
         );
-        // Un numero di segnale fuori intervallo non deve far scorrere il bit oltre la maschera.
+        // A signal number out of range must not shift the bit past the mask.
         let me = std::process::id() as i32;
         assert!(init_catches_signal(me, 0));
         assert!(init_catches_signal(me, 65));

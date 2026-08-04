@@ -1060,33 +1060,33 @@ mod fuzz_robustness {
         );
     }
 
-    /// Il re-exec sotto `systemd-run --scope` deve ripetere il comando DECISO, non quello digitato.
+    /// The re-exec under `systemd-run --scope` must replay the DECIDED command, not the typed one.
     ///
-    /// Trovato sul Pi 5, non a tavolino: `docker run --rm alpine echo hi` attraverso il symlink che
-    /// il README documenta falliva con "kern run: unknown flag". kern si ri-esegue per applicare il
-    /// tetto via scope, e la seconda passata riceveva `argv[0]` gia' risolto dal symlink (quindi lo
-    /// shim non si riconosceva) insieme agli argomenti NON tradotti. Da root non succedeva, perche'
-    /// il percorso diretto non si ri-esegue: per questo era passato inosservato su ogni macchina di
-    /// sviluppo.
+    /// Found on the Pi 5 rather than at a desk: `docker run --rm alpine echo hi` through the symlink
+    /// the README documents failed with "kern run: unknown flag". kern re-execs itself to apply the
+    /// cap through a scope, and the second pass received `argv[0]` already resolved through the
+    /// symlink, so the shim did not recognise itself, together with the UNTRANSLATED arguments. As
+    /// root it did not happen, because the direct path does not re-exec: which is why it went
+    /// unnoticed on every development machine.
     #[test]
     fn the_reexec_replays_the_translated_argv_not_the_typed_one() {
         let typed: Vec<String> = ["run", "--rm", "alpine:3.19", "echo", "hi"]
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        let translated = translate(&typed).expect("docker run e' traducibile");
-        // Controllo positivo: la traduzione cambia davvero la forma, altrimenti sotto non si
-        // starebbe distinguendo nulla.
-        assert_ne!(translated, typed, "la traduzione deve cambiare l'argv");
+        let translated = translate(&typed).expect("docker run is translatable");
+        // Positive control: the translation really does change the shape, otherwise the assertions
+        // below would be distinguishing nothing.
+        assert_ne!(translated, typed, "the translation must change the argv");
         assert_eq!(translated.first().map(String::as_str), Some("box"));
         assert!(
             !translated.iter().any(|a| a == "--rm"),
-            "`--rm` sta nel secchio DROP e non deve sopravvivere: {translated:?}"
+            "`--rm` is in the DROP bucket and must not survive: {translated:?}"
         );
 
         set_effective(&translated);
-        // Cio' che il re-exec e la unit persistente rigiocano e' la forma tradotta, che kern sa
-        // parlare, e non `run --rm …`, che il verbo `run` di kern rifiuta.
+        // What the re-exec and the persistent unit replay is the translated form, which kern
+        // speaks, and not `run --rm …`, which kern's own `run` verb refuses.
         assert_eq!(effective_args(), translated);
         assert_eq!(effective_args().first().map(String::as_str), Some("box"));
     }

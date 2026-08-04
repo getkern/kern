@@ -573,11 +573,11 @@ mod display_name_tests {
     #[test]
     fn a_pod_member_shows_its_service_name_and_a_lone_box_is_untouched() {
         assert_eq!(display_box_name("proj-9f6e-web", "proj-9f6e"), "web");
-        // Nessun pod: intatto.
+        // No pod: left alone.
         assert_eq!(display_box_name("solitario", ""), "solitario");
-        // Prefisso che NON corrisponde: intatto, non tagliato a caso.
+        // A prefix that does NOT match: left alone, not trimmed at random.
         assert_eq!(display_box_name("altro-web", "proj-9f6e"), "altro-web");
-        // Il nome del pod senza il trattino non deve mordere il nome del servizio.
+        // The pod name without its hyphen must not bite into the service name.
         assert_eq!(display_box_name("projweb", "proj"), "projweb");
     }
 }

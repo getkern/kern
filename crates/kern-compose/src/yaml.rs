@@ -1847,30 +1847,21 @@ fn service_to_box(
                 b.ports = ports_value(node, name, &mut declared);
                 b.expose.extend(declared);
             }
-            // `port:` is kern's own key, not a Compose Specification one: it declares the port this
-            // service LISTENS on inside the shared namespace, so the preflight can see a service that
-            // publishes nothing. Parsed here rather than passed through as text, so a malformed value
-            // fails at the file that wrote it. An out-of-range or non-numeric value is warned and
-            // ignored rather than fatal: this key is an addition to a Docker file that is otherwise
-            // valid, and refusing to run a working stack over it would be the wrong trade.
-            // `expose:` e' la grafia Compose di "ascolto qui": stesso spazio delle porte del pod di
-            // `ports:` e `port:`, quindi entra nello stesso preflight. Non inietta nulla (in Docker
-            // documenta e basta). Una voce malformata avvisa e viene saltata: e' un'aggiunta a un file
-            // per il resto valido, e rifiutare l'intero stack per una riga sarebbe il compromesso
-            // sbagliato. Gli INTERVALLI (`3000-3005`) sono dichiarati non supportati invece di essere
-            // espansi in silenzio: espanderli renderebbe il messaggio di collisione impossibile da
-            // leggere, e nessuno li usa per un servizio che ne ascolta una sola.
-            // `expose:` e' la grafia Compose di "ascolto qui": stesso spazio delle porte del pod di
-            // `ports:` e `port:`, quindi entra nello stesso preflight. Non inietta nulla (in Docker
-            // documenta e basta). La sintassi la legge `parse_expose_entry`, condivisa col profilo
-            // kern: la stessa stringa significa la stessa cosa in entrambe le grafie.
+            // `expose:` is Compose's spelling of "I listen here": the same pod port space as
+            // `ports:` and `port:`, so it enters the same preflight. It injects nothing, since in
+            // Docker the key only documents. The syntax is read by `parse_expose_entry`, shared with
+            // the kern profile, so the same string means the same thing in both spellings.
             //
-            // La DISPOSIZIONE di una voce malformata invece differisce, ed e' voluto: qui si avvisa e
-            // si salta, nel TOML di kern si rifiuta con il numero di riga. Un `docker-compose.yml` e'
-            // il file di qualcun altro e rifiutare l'intero stack per una riga di documentazione
-            // sarebbe il compromesso sbagliato; un profilo kern e' il formato di kern, dove un refuso
-            // va detto subito. Stesso parser, disposizione diversa, ed e' fissata da un test che
-            // asserisce ENTRAMBE le grafie insieme, cosi' nessuna delle due puo' cambiare in silenzio.
+            // What DOES differ is the disposal of a malformed entry, deliberately: here it is warned
+            // and skipped, in kern's own TOML it is refused with a line number. A
+            // `docker-compose.yml` is someone else's file, and refusing a whole working stack over
+            // one line of documentation would be the wrong trade; a kern profile is kern's format,
+            // where a typo should be said at once. Same parser, different disposal, pinned by a test
+            // that asserts BOTH spellings together so neither can drift in silence.
+            //
+            // RANGES (`3000-3005`) are declared unsupported rather than silently expanded: expanding
+            // them would make the collision message unreadable, and nobody writes one for a service
+            // that listens on a single port.
             "expose" => {
                 for raw in list_value(node) {
                     match crate::parse_expose_entry(&raw) {
@@ -1879,6 +1870,12 @@ fn service_to_box(
                     }
                 }
             }
+            // `port:` is kern's own key, not a Compose Specification one: it declares the port this
+            // service LISTENS on inside the shared namespace, so the preflight can see a service that
+            // publishes nothing. Parsed here rather than passed through as text, so a malformed value
+            // fails at the file that wrote it. An out-of-range or non-numeric value is warned and
+            // ignored rather than fatal, for the same reason `expose:` is: this key is an addition to
+            // a Docker file that is otherwise valid.
             "port" => match node.scalar.as_deref().map(scalar_str) {
                 Some(v) => match v.trim().parse::<u16>() {
                     Ok(n) if n > 0 => b.port = Some(n),

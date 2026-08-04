@@ -65,9 +65,9 @@ pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::{preflight as preflight_ports, PortMap};
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
-/// Il cronometro per fase, esportato perche' il PADRE non era strumentato affatto: `KERN_TIMING`
-/// copriva solo il setup nel figlio, quindi il tempo speso prima della fork era invisibile e nessuno
-/// poteva vederlo nemmeno volendo.
+/// The per-phase timer, exported because the PARENT was not instrumented at all: `KERN_TIMING`
+/// covered only the child's setup, so the time spent before the fork was invisible, and no amount
+/// of looking would have shown it.
 pub use real::PhaseTimer;
 pub use real::{
     default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
