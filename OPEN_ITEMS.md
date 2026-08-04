@@ -79,7 +79,7 @@ with cgroup caps on, which is what users run, the same span went from 4.92 ms to
 
 ## Binary size is not being reduced
 
-Read from the checksum-verified v0.6.37 release artifacts: **1926112 B x86_64 (1.84 MB)** and
+Read from the checksum-verified v0.6.38 release artifacts: **1926112 B x86_64 (1.84 MB)** and
 **1642984 B aarch64 (1.57 MB)**. The release profile is already at its limit.
 
 The x86_64 figure has not moved in three releases. The aarch64 one gained exactly 65536 B, one
