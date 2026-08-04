@@ -191,13 +191,10 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | | |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | install on Linux, WSL2 and ARM boards, with checksums |
-| [docs/RESOURCES.md](docs/RESOURCES.md) | `vcpu:` / `vdisk:` / `vgpio:` and the two-verb model |
-| [docs/CONFIG.md](docs/CONFIG.md) | the `kern.toml` schema, field by field |
 | [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) | what of Docker works, what does not, and where it differs |
-| [docs/STORAGE.md](docs/STORAGE.md) · [docs/EGRESS.md](docs/EGRESS.md) | volumes and the egress allowlist |
-| [BENCHMARKS.md](BENCHMARKS.md) · [EDGE.md](EDGE.md) | measurements, and running on a Pi, Jetson or UNO Q |
+| [docs/RESOURCES.md](docs/RESOURCES.md) · [docs/CONFIG.md](docs/CONFIG.md) · [docs/STORAGE.md](docs/STORAGE.md) · [docs/EGRESS.md](docs/EGRESS.md) | the two-verb model, the `kern.toml` schema, volumes and egress |
 | [SECURITY.md](SECURITY.md) · [OPEN_ITEMS.md](OPEN_ITEMS.md) | the threat model, and the known gaps |
-| [ARCHITECTURE.md](ARCHITECTURE.md) · [CHANGELOG.md](CHANGELOG.md) | how it is built, and what changed |
+| [BENCHMARKS.md](BENCHMARKS.md) · [EDGE.md](EDGE.md) | measurements, and running on a Pi, Jetson or UNO Q |
 | [examples/](examples/) · [blog/](blog/) | ninety runnable scripts, and longer write-ups |
 
 Embed it from Python or Node with [`kern-sandbox`](bindings/python/README.md): a fresh box per call,
