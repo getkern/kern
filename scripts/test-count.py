@@ -78,10 +78,22 @@ def rust_count() -> int | None:
 
 
 def python_count() -> int | None:
-    """Python binding tests, collected without running them."""
+    """Python binding tests, collected without running them.
+
+    pytest is probed by IMPORT before it is invoked. `python -m pytest` on a machine without it
+    exits 1 with "No module named pytest", which is indistinguishable by exit code from a suite that
+    fails to collect, and treating the two the same turned the CI runner (which installs no Python
+    test deps) red on 2026-08-04. An absent tool is a skip; a tool that ran and refused is a
+    failure, and only the import can tell them apart.
+    """
     tests = REPO / "bindings" / "python"
     if not (tests / "tests").is_dir():
         return None
+    probe = subprocess.run(
+        [sys.executable, "-c", "import pytest"], capture_output=True, text=True, timeout=60
+    )
+    if probe.returncode != 0:
+        return None  # pytest is not installed here
     out = _run([sys.executable, "-m", "pytest", "tests/", "--collect-only", "-q"], cwd=tests)
     if out is None:
         return None
