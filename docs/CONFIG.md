@@ -9,9 +9,9 @@ there, sharing **one schema philosophy** (every key mirrors a CLI flag):
 - **Compose stacks**: `[box.NAME]` tables in a compose file, brought up by `kern compose` in
   `depends_on` order.
 
-The parser is hand-rolled (no `serde`/`toml`) and **tolerant**: an unrecognized section or key, or a
-line of TOML it doesn't model, is **ignored, not rejected**, so a `kern.toml` shared with another kern
-edition still loads. A *malformed value* of a key it DOES implement is always an error, with its line.
+The parser is hand-rolled (no `serde`/`toml`) and **tolerant**: an unrecognized section or key is
+**ignored, not rejected**, so a `kern.toml` shared with another kern edition still loads. A malformed
+value of a key it DOES implement is always an error, with its line.
 
 ## Which file is in effect
 
@@ -21,11 +21,10 @@ edition still loads. A *malformed value* of a key it DOES implement is always an
 | **`KERN_CONFIG=<path>`** | **everything**: reads *and* writes. `config list`/`add`/`rm`/`setup`/`edit`, `validate`, `info`, and every profile token |
 | `$XDG_CONFIG_HOME/kern/kern.toml`, else `~/.config/kern/kern.toml` | the default when neither is set |
 
-`KERN_CONFIG` is the way to keep a per-project config: export it and every kern command, including
-the ones that *edit* the file, uses it. `kern info` prints the path in effect, which is the quickest
-way to confirm which file you are about to change. An exported-but-empty `KERN_CONFIG` counts as
-unset (it would otherwise resolve to a relative path and drop a `kern.toml` in the current
-directory).
+`KERN_CONFIG` is how you keep a per-project config: export it and every kern command, including the
+ones that *edit* the file, uses it. `kern info` prints the path in effect. An exported-but-empty
+`KERN_CONFIG` counts as unset, since it would otherwise resolve to a relative path and drop a
+`kern.toml` in the current directory.
 
 ---
 
@@ -142,9 +141,9 @@ let `kern top` / `kern config setup` pre-fill it from what it detects on the hos
 
 **How to write an entry.** `i2c` takes a bus number (`"1"`, `"i2c-1"`) or a full path; `spi` takes
 `BUS.CS` (`"0.0"`, `"spidev0.0"`) or a full path. **Every other field takes the full `/dev/…` path**
-(`uart = ["/dev/ttyUSB0"]`, not `["ttyUSB0"]`). An entry kern cannot resolve to a path is skipped with
-a line on stderr saying which field and which entry: a device grant that vanished quietly used to be
-indistinguishable from one that was honoured, right up until the workload failed.
+(`uart = ["/dev/ttyUSB0"]`, not `["ttyUSB0"]`). An entry kern cannot resolve is skipped with a line on
+stderr naming the field and the entry, because a device grant that vanishes quietly is
+indistinguishable from one that was honoured until the workload fails.
 
 `pins`/`pwm`/`adc`/`onewire` are lines of a controller, so they need a `backend` naming a `[[gpio]]`
 id. The rest are standalone host device nodes: use `backend = "host"`, or any declared `[[gpio]]` id as
@@ -173,9 +172,8 @@ is bounded to the box's run, so `-d` and `-it` take the tmpfs path even as root;
 
 ### Physical declarations, what a profile's `backend` points at
 
-Declaring these is optional (a profile can use the reserved `host`/`ram` backend without them), but
-every profile **must name a `backend`**: a declared block below, or `host` (vcpu/vgpio) / `ram` (vdisk).
-Field shapes:
+Declaring these is optional (a profile can use the reserved `host`/`ram` backend), but every profile
+**must name a `backend`**: a block below, or `host` (vcpu/vgpio) / `ram` (vdisk). Field shapes:
 
 ```toml
 [[cpu]]   # a physical CPU budget a [[vcpu]] splits
@@ -196,8 +194,9 @@ id = "pool"; path = "/var/lib/kern/disks"; default = true; size = "100g"; iops =
 ## Compose, `[box.NAME]` tables
 
 `kern compose <file>` brings up a stack of `[box.NAME]` tables in `depends_on` order (it also reads a
-`docker-compose.yml`). Every key maps to a `kern box` flag one-to-one, `compose` shells out to
-`kern box`, so a value can never mean something different from its flag.
+`docker-compose.yml`). `compose` shells out to `kern box`, so a value can never mean something
+different from its flag. Every key maps to one, except `port` and `expose`, which are pod-scoped and
+described below.
 
 ```toml
 [box.api]
@@ -244,6 +243,17 @@ tun        = false                # --tun   (expose /dev/net/tun)
 ports      = ["127.0.0.1:8080:80"]  # --publish / -p  (repeatable)
 ssh        = "2222"               # --ssh PORT  (in-box sshd on host PORT)
 ssh_key    = "/keys/id.pub"       # --ssh-key   (authorize this pubkey instead of a throwaway)
+add_host   = ["db:10.0.0.5"]      # --add-host N:IP (IP may be `host-gateway`; repeatable)
+# Pod-scoped, and the only two keys with no CLI flag: a pod shares one network namespace, so kern
+# needs to know what each service LISTENS on to refuse a collision before it starts anything.
+port       = 3000                 # the port this service listens on inside the pod
+expose     = ["8080", "9000/udp"] # the same, for several; documented, not published
+
+# process & metadata
+init       = true                 # --init     (reaping PID 1: no zombies, forwards SIGTERM)
+labels     = ["team=api"]         # --label / -l  (repeatable; selectable with `ps --filter label=`)
+sysctls    = ["net.core.somaxconn=1024"]  # --sysctl (namespaced knobs only; repeatable)
+ulimits    = ["nofile=1024:2048"] # --ulimit  (rootless can only LOWER; repeatable)
 
 # environment / secrets
 env        = ["LOG=debug", "PORT=8080"]   # --env / -e  (repeatable)
@@ -256,6 +266,9 @@ cap_drop   = ["ALL"]              # --cap-drop (repeatable)
 
 # supervision (detached boxes)
 restart              = true       # --restart
+restart_max          = 10         # --restart-max (retries before giving up; default 10)
+stop_signal          = "SIGTERM"  # --stop-signal  (name or number)
+stop_grace_period    = "30s"      # --stop-timeout (seconds before the SIGKILL; default 10)
 timeout              = "300"      # --timeout  (SIGTERM at N, SIGKILL 2s later: N+2 worst case)
 health_cmd           = "wget -qO- localhost/health"   # --health-cmd
 health_interval      = 30         # --health-interval (integer seconds)
@@ -270,29 +283,29 @@ volumes    = ["/data:/data:ro", "/etc/app:/app"]  # --volume / -v  (repeatable)
 
 ### Key → flag map (the non-obvious ones)
 
-| TOML key   | CLI flag            |
-|------------|---------------------|
-| `cpuset`   | `--cpuset-cpus`     |
-| `swap_max` | `--memory-swap-max` |
-| `ssh`      | `--ssh`             |
-| `user`     | `--user`            |
-| `volumes`  | `--volume` / `-v`   |
-| `env`      | `--env` / `-e`      |
-| `secrets`  | `--secret`          |
-| `ports`    | `--publish` / `-p`  |
-| `net`      | `--net`             |
+| TOML key            | CLI flag            |
+|---------------------|---------------------|
+| `cpuset`            | `--cpuset-cpus`     |
+| `swap_max`          | `--memory-swap-max` |
+| `volumes`           | `--volume` / `-v`   |
+| `env`               | `--env` / `-e`      |
+| `secrets`           | `--secret`          |
+| `ports`             | `--publish` / `-p`  |
+| `labels`            | `--label` / `-l`    |
+| `sysctls`           | `--sysctl`          |
+| `ulimits`           | `--ulimit`          |
+| `stop_grace_period` | `--stop-timeout`    |
 
-Everything else shares the flag's long name (`memory`, `cpus`, `workdir`, `read_only`, `uid_range`,
-`bind_rootfs`, `restart`, `timeout`, `nice`, `tun`, `hostname`, `pids_limit`, `io_weight`, `tmpfs`,
-`env_file`, `cap_add`, `cap_drop`, `ssh_key`, `image`, `rootfs`, and the
-`health_cmd`/`health_interval`/`health_retries`/`health_start_period`/`health_timeout`/`health_action`
-family).
+Everything else shares the flag's long name. **Two keys have no flag**, `port` and `expose`: they
+declare what a service listens on so `compose` can refuse a port collision inside the shared pod
+namespace before starting anything, which is a property of the stack rather than of one box.
 
 ---
 
 ## The one rule: TOML mirrors the CLI
 
-Every key maps to a flag one-to-one, nothing to learn twice. If you know the flag, you know the key.
+Every key maps to a flag, nothing to learn twice. If you know the flag, you know the key. The two
+exceptions are named above and exist because a pod is not a box.
 
 - **Scalar** → a **quoted string** carrying the exact CLI argument: `memory = "512m"`, `cpus = "1.5"`,
   `cpuset = "0-3"`. (Numeric profile fields like `cpus = 4.0` / `iops = 1000` / `nice = -5` are
@@ -307,9 +320,9 @@ Every key maps to a flag one-to-one, nothing to learn twice. If you know the fla
 - Bools are bare `true` / `false`. Integers/floats are bare (`health_interval = 30`, `cpus = 4.0`).
 - Arrays are `["a", "b"]` / `[17, 27]`; a comma inside a quoted element does not split it.
 - `#` starts a comment outside a string.
-- **Unknown keys and sections are ignored, not rejected**: a `kern.toml` written for another kern
-  edition still loads, so config is portable across editions. The trade-off is deliberate: a typo in a
-  key name is silently skipped, so lean on `kern config` / `kern top` (which validate live) when authoring.
+- **Unknown keys and sections are ignored, not rejected**, so a `kern.toml` written for another kern
+  edition still loads. The trade is deliberate and has a cost: a typo in a key name is silently
+  skipped, so lean on `kern config` / `kern top`, which validate live.
 
 ## Deliberate choices in this schema
 

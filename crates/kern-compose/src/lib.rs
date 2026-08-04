@@ -765,6 +765,10 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             .ok_or_else(|| format!("line {}: expected `key = value`", i + 1))?;
         let b = &mut boxes[idx];
         let s = |v: &str| parse_string(v).map_err(|e| line_err(i, &e));
+        // BOX-KEYS-BEGIN - every arm below is asserted to appear in docs/CONFIG.md by
+        // `every_box_key_is_documented`. Ten of them were not, and that file is the one the README
+        // calls the schema field by field, so a user reading it could not learn that `ulimits`,
+        // `sysctls`, `init` or `stop_signal` work at all. Move this marker if the match moves.
         match key.trim() {
             // Scalars - quoted strings carrying the exact CLI argument.
             "image" => b.image = Some(s(val)?),
@@ -868,6 +872,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "sysctls" => b.sysctls = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             other => return Err(format!("line {}: unknown key '{other}'", i + 1)),
         }
+        // BOX-KEYS-END
     }
     if boxes.is_empty() {
         return Err("no [box.NAME] tables found".into());
@@ -2540,6 +2545,59 @@ mod contract_tests {
         assert!(
             stale.is_empty(),
             "READERS names fields that ComposeBox no longer has: {stale:?}"
+        );
+    }
+    /// Every key the `[box.NAME]` parser accepts must appear in `docs/CONFIG.md`, the file the
+    /// README calls "the `kern.toml` schema, field by field". Ten did not: `add_host`, `expose`,
+    /// `init`, `labels`, `port`, `restart_max`, `stop_grace_period`, `stop_signal`, `sysctls` and
+    /// `ulimits` were parsed, forwarded and working, and documented nowhere. A schema reference
+    /// that omits a working field is worse than no reference at all, because a reader concludes the
+    /// field does not exist. The sibling test above pins field -> reader; this one pins key -> docs,
+    /// so a key cannot be added in silence at either end.
+    #[test]
+    fn every_box_key_is_documented() {
+        let src = include_str!("lib.rs");
+        let (Some(start), Some(end)) = (src.find("// BOX-KEYS-BEGIN"), src.find("// BOX-KEYS-END"))
+        else {
+            panic!("the BOX-KEYS markers are gone; this test can no longer find the key match");
+        };
+        let mut keys: Vec<&str> = Vec::new();
+        for line in src[start..end].lines() {
+            let Some(rest) = line.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(q) = rest.find('"') else { continue };
+            let key = &rest[..q];
+            if rest[q + 1..].trim_start().starts_with("=>")
+                && !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            {
+                keys.push(key);
+            }
+        }
+        assert!(
+            keys.len() > 30,
+            "only {} keys parsed out of the marker block: the arm shape changed and this test \
+             would now pass by finding nothing",
+            keys.len()
+        );
+
+        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        while !dir.join("docs").join("CONFIG.md").is_file() {
+            if !dir.pop() {
+                eprintln!("skip: no docs/CONFIG.md above CARGO_MANIFEST_DIR");
+                return;
+            }
+        }
+        let Ok(doc) = std::fs::read_to_string(dir.join("docs").join("CONFIG.md")) else {
+            eprintln!("skip: cannot read docs/CONFIG.md");
+            return;
+        };
+        let missing: Vec<&str> = keys.iter().copied().filter(|k| !doc.contains(k)).collect();
+        assert!(
+            missing.is_empty(),
+            "these `[box.NAME]` keys are accepted by the parser and appear nowhere in \
+             docs/CONFIG.md: {missing:?}. Document them, or stop accepting them."
         );
     }
 }
