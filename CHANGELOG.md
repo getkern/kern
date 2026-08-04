@@ -17,9 +17,37 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [0.6.38], 2026-08-04
+## [0.6.39], 2026-08-04
 
 ### Fixed
+
+- **A box with no memory cap on a host that cannot enforce one said nothing.** Every box carries a
+  cap, the default 512 MiB when none is typed, so "this cap cannot be enforced" is true of every box
+  on such a host. The warning was gated on the user having typed `--memory`, so the common case ran
+  with unbounded RAM in silence. An outside tester on a host like that reported the limits as "soft"
+  with no way to tell a degraded host from a degraded runtime.
+
+  What kept it gated was a real objection: a line on every 2 ms box start is noise that trains the
+  reader to skip it. The resolution is that this is a property of the HOST, not of the box, so it is
+  stated once per host, claimed with `O_CREAT|O_EXCL` so two boxes starting in the same instant race
+  in the kernel and exactly one prints. A `Once` alone cannot do it: it is per process, and every box
+  is a new process. An explicit `--memory` keeps its per-invocation warning, since asking for a
+  specific ceiling and not getting it is a different failure from starting a default box. Where the
+  marker cannot be written at all, the notice repeats rather than going quiet.
+
+  Verified end to end against a host that does not delegate the controller, reproduced in a mount
+  namespace with a `/sys/fs/cgroup` carrying no `memory` in any node: first box warns, second is
+  silent, `--memory 64m` warns again. The discriminant is the published 0.6.38 binary in the same
+  namespace, which prints nothing at all. Measured cost of moving the check onto every box start:
+  33 us between the two binaries, against 48 to 66 us of spread between two runs of the same one,
+  so not distinguishable from zero at this resolution.
+
+- **`kern box --help` listed `--timeout` twice**, and the entry a reader reaches first was the one
+  that omits what actually happens: SIGTERM at n seconds, SIGKILL 2 seconds after that. An outside
+  tester read the short entry, saw a box still alive at n, and reported the timeout as broken. It is
+  not: measured at a constant 2.0 s of grace on 1, 2 and 5 second timeouts, and the process dies of
+  SIGKILL because it is PID 1 in its namespace and the kernel gives PID 1 no default SIGTERM action.
+  `no_verb_advertises_a_flag_twice` now refuses a flag listed twice in one verb's help.
 
 - **`--plan` resolved profiles against a different `kern.toml` than the launch would.** `box_plan`
   called `config::load(None)`, which reads `$KERN_CONFIG` or `~/.config/kern/kern.toml`, while the
@@ -161,10 +189,10 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 ## Earlier releases
 
 0.6.34 and everything before it live in the signed tags: `git show v0.6.34`, or the
-[tag list](https://github.com/getkern/kern/tags). All 28 are signed, and 27 of them carry an
+[tag list](https://github.com/getkern/kern/tags). All 29 are signed, and 28 of them carry an
 OpenTimestamps proof ([provenance/](provenance/)), of which 26 are confirmed in a Bitcoin block.
 The rest are stamped and waiting: a calendar takes hours to get into a block and then six
 confirmations, so the newest proof is always pending for a while. The one tag with no proof at all
 is v0.6.8, which predates the practice; stamping it today would attest to today, not to its release.
 
-[0.6.38]: https://github.com/getkern/kern/releases/tag/v0.6.38
+[0.6.39]: https://github.com/getkern/kern/releases/tag/v0.6.39

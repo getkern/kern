@@ -44,14 +44,14 @@ A pod there comes up loopback-only, and kern reports why: `Couldn't open user na
 permission is refused there and granted on every Linux host tested is not established. The
 consequence is bounded: services still reach each other by name, only egress is missing.
 
-## The `--memory not enforced` warning is gated on the request
+## A host that delegates `memory` but not `pids` says nothing about the task ceiling
 
-The warning fires when `--memory` was asked for and cannot be applied, not when a box ends up with
-no cap at all. A box taking the default 512 MiB on a host that does not delegate the memory
-controller gets no warning. `--pids-limit` is gated the same way and for the same reason: warning
-about the default on every box start on such a host would be noise that trains the reader to ignore
-the line. The correct predicate (`memory_cap_enforceable()`) already exists; wiring the warning to
-it needs a host with `cgroup_enable=memory` removed to verify against.
+The uncapped-host notice is driven by `memory_cap_enforceable()`, so it covers the case that
+actually occurs: a kernel booted without `cgroup_enable=memory` delegates neither. A host that
+delegates `memory` and withholds `pids` alone would take the default `TasksMax=512` silently. Not
+observed on any host tested, and no predicate for it exists yet; it is written here rather than
+guessed at, because the fix is a second controller check and the cost of getting it wrong is a
+warning that fires on healthy hosts.
 
 ## `KERN_MAX_CONCURRENT` is best-effort
 

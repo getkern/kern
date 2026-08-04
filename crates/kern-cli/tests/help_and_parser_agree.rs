@@ -176,3 +176,50 @@ fn every_flag_the_parser_accepts_is_advertised_in_help() {
          make this test pass without checking anything"
     );
 }
+
+/// No verb may advertise the same flag twice in one `--help`.
+///
+/// `kern box --help` listed `--timeout` on two lines: "Auto-stop the box after N seconds" and
+/// "Auto-stop: SIGTERM at n seconds, SIGKILL 2 seconds later (so n+2 worst case)". Both were true
+/// and only the second was complete, so a reader who scanned to the first entry and stopped had no
+/// way to know a kill can land n+2 seconds in. An outside tester read it that way and reported the
+/// timeout as broken; it was not, it was measured at a constant 2.0 s of grace on 1, 2 and 5 second
+/// timeouts.
+///
+/// One fact with two homes is the class this project keeps paying for. Two entries for one flag
+/// cannot be kept in agreement by attention, so they are refused.
+#[test]
+fn no_verb_advertises_a_flag_twice() {
+    for verb in ["box", "run", "compose", "pull", "push", "volume", "pod"] {
+        let out = kern().args([verb, "--help"]).output().expect("run kern");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut seen: Vec<&str> = Vec::new();
+        let mut dupes: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            // Only the definition lines: a flag NAMED inside a description is a reference, not a
+            // second entry, and refusing those would make every cross-reference a failure.
+            let t = line.trim_start();
+            if line.len() == t.len() || !t.starts_with("--") {
+                continue;
+            }
+            let flag = t.split([' ', '=', ',']).next().unwrap_or("");
+            if flag.len() < 3 {
+                continue;
+            }
+            if seen.contains(&flag) {
+                dupes.push(flag);
+            } else {
+                seen.push(flag);
+            }
+        }
+        assert!(
+            !seen.is_empty(),
+            "`kern {verb} --help` advertised no flags at all, so this test guards nothing"
+        );
+        assert!(
+            dupes.is_empty(),
+            "`kern {verb} --help` lists {dupes:?} more than once. Two entries for one flag drift \
+             apart, and the reader believes whichever they reach first."
+        );
+    }
+}

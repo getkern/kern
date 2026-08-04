@@ -132,7 +132,6 @@ pub fn help() -> Result<(), Error> {
     --health-start-period N  Grace period where failures keep it starting (default 0)
     --health-timeout N  Kill a single check that exceeds N seconds (default 0 = none)
     --health-action A   On unhealthy: restart | stop | none (default none)
-    --timeout N         Auto-stop the box after N seconds (0 = no timeout)
     --net [host|none]   Share the host network (bare/host); none = isolated (default)
     --network <mode>    host = share host net (= --net); none = isolated (default)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
@@ -4048,6 +4047,64 @@ const SCOPE_MEMORY_MAX: &str = "MemoryMax=512M";
 const SCOPE_SWAP_MAX: &str = "MemorySwapMax=0";
 const SCOPE_TASKS_MAX: &str = "TasksMax=512";
 
+/// Where the "this host cannot enforce resource caps" notice records that it has been shown.
+///
+/// Persistent user data, so it survives a reboot: the host property it records does too, since it
+/// comes from the kernel command line. Mirrors [`crate::volume::volumes_dir`] and
+/// [`crate::builds::builds_dir`] rather than inventing a fourth location rule.
+fn uncapped_notice_path() -> PathBuf {
+    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(x).join("kern").join("uncapped-notice");
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return PathBuf::from(h).join(".local/share/kern/uncapped-notice");
+    }
+    PathBuf::from(format!("/tmp/kern-uncapped-notice-{}", unsafe {
+        libc::getuid()
+    }))
+}
+
+/// True the first time this host is told its resource caps are not enforceable, false afterwards.
+///
+/// `create_new` is `O_CREAT|O_EXCL`, so two boxes starting at the same instant race in the kernel
+/// and exactly one of them prints. A `Once` alone would not do: it is per PROCESS, and every box is
+/// a new process, which is precisely how this ends up on every line.
+///
+/// FAILURE MODES, each decided rather than left to chance:
+///   * marker already there  -> `AlreadyExists` -> false. The steady state, one `openat` that fails.
+///   * parent dir missing    -> created, then retried once. A first run has no `~/.local/share/kern`.
+///   * cannot create at all  -> TRUE, every time. A read-only HOME with no writable `/tmp` is rare;
+///     an unbounded box is worth a repeated line more than it is worth silence, so this fails loud.
+///   * host later fixed      -> the marker is stale and the notice stays quiet, which is correct:
+///     `memory_cap_enforceable()` is checked FIRST, so a host that now enforces never reaches here.
+fn claim_uncapped_host_notice() -> bool {
+    claim_notice_at(&uncapped_notice_path())
+}
+
+/// Testable core of [`claim_uncapped_host_notice`]. Split for the same reason `config::load_impl` is:
+/// the wrapper reads `XDG_DATA_HOME`/`HOME`, and a test that set those would be mutating
+/// process-global state under a parallel test runner.
+fn claim_notice_at(path: &std::path::Path) -> bool {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    match opts.open(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => {
+            if let Some(parent) = path.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    return true;
+                }
+            }
+            match opts.open(path) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(_) => true,
+            }
+        }
+    }
+}
+
 /// If a systemd user manager is available and we aren't already inside a kern scope, re-exec
 /// the whole `kern` invocation under `systemd-run --user --scope` with cgroup caps, so the
 /// sandbox (and any fork bomb in it) is hard-limited. This replaces the process on success; on
@@ -4073,21 +4130,33 @@ fn reexec_in_scope_if_possible(
     // (namespaces + seccomp) is unaffected - ONLY the resource cap is. Printed once, in the original
     // invocation (the scope re-exec returned above), and never on a normal host, where the controller
     // IS available up the tree so `memory_cap_enforceable()` is true.
-    if (memory.is_some() || memory_swap_max.is_some())
-        && std::env::var_os("KERN_BUILD_STEP").is_none()
-        && !kern_isolation::memory_cap_enforceable()
-    {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            eprintln!(
-                "kern: warning: --memory is not enforced on this host - the kernel doesn't delegate \
-                 the cgroup v2 `memory` controller (Microsoft's default WSL2 kernel, or Raspberry Pi \
-                 OS without `cgroup_enable=memory`). The box still runs and stays isolated \
-                 (namespaces + seccomp), but its RAM is UNCAPPED. Fix on WSL: add \
-                 `kernelCommandLine = cgroup_enable=memory cgroup_memory=1` under `[wsl2]` in \
-                 `%UserProfile%\\.wslconfig`, then `wsl --shutdown`. Same limit as Docker/Podman here."
-            );
-        });
+    // A box ALWAYS carries a memory cap, the default 512 MiB when none is typed, so "the cap cannot
+    // be enforced" is true of every box on such a host and not only of the ones that asked. Gating
+    // this on the REQUEST left the common case silent: a default box on a host that does not
+    // delegate the controller ran with unbounded RAM and said nothing, and an outside tester
+    // reported the limits as "soft" with no way to tell a degraded host from a degraded runtime.
+    //
+    // What kept it that way is a real objection: a line on every 2 ms box start is noise that trains
+    // the reader to skip it. The resolution is that this is a HOST fact and not a box fact, so it is
+    // stated once per host. An explicit request keeps its per-invocation warning, because asking for
+    // `--memory 256m` and silently not getting it is a different failure from starting a default box.
+    if std::env::var_os("KERN_BUILD_STEP").is_none() && !kern_isolation::memory_cap_enforceable() {
+        let asked = memory.is_some() || memory_swap_max.is_some();
+        if asked || claim_uncapped_host_notice() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let what = if asked { "--memory is" } else { "resource caps are" };
+                eprintln!(
+                    "kern: warning: {what} not enforced on this host - the kernel doesn't delegate \
+                     the cgroup v2 `memory` controller (Microsoft's default WSL2 kernel, or Raspberry Pi \
+                     OS without `cgroup_enable=memory`). The box still runs and stays isolated \
+                     (namespaces + seccomp), but its RAM is UNCAPPED, including the 512M default. \
+                     Fix on WSL: add `kernelCommandLine = cgroup_enable=memory cgroup_memory=1` under \
+                     `[wsl2]` in `%UserProfile%\\.wslconfig`, then `wsl --shutdown`. Same limit as \
+                     Docker/Podman here. `kern doctor` reports it every time; this line prints once."
+                );
+            });
+        }
     }
     if kern_common::env_flag("KERN_NO_SCOPE") {
         // Opt-out fast path: skip the systemd transient scope (which costs a `systemd-run` spawn +
@@ -4348,6 +4417,50 @@ fn render_ps_format(tmpl: &str, b: &registry::Instance, now: u64) -> Result<Stri
     }
     push_unescaped(&mut out, rest);
     Ok(out)
+}
+
+#[cfg(test)]
+mod uncapped_notice_tests {
+    /// The uncapped-host notice fires exactly ONCE per host, and keeps firing when it cannot record
+    /// that it fired.
+    ///
+    /// A `Once` is per PROCESS and every box is a new process, so the per-process guard alone put
+    /// this line on every single box start. That noise is why the warning was gated on an explicit
+    /// `--memory` instead, which in turn left a DEFAULT box on a non-delegating host running with
+    /// unbounded RAM in silence. The marker is what lets the notice be both quiet and honest.
+    #[test]
+    fn the_uncapped_host_notice_is_claimed_once() {
+        let dir = std::env::temp_dir().join(format!("kern-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("uncapped-notice");
+
+        // First call creates the parent chain and claims it; every later call declines.
+        assert!(
+            super::claim_notice_at(&path),
+            "the first call did not claim the notice, so a host would never be told"
+        );
+        assert!(
+            path.exists(),
+            "the marker was not written, so the claim cannot be remembered across processes"
+        );
+        for i in 0..5 {
+            assert!(
+                !super::claim_notice_at(&path),
+                "call {} claimed the notice again: the line would repeat on every box start",
+                i + 2
+            );
+        }
+
+        // Unwritable location: fail LOUD. An unbounded box is worth a repeated line more than it is
+        // worth silence, so a path that can never be created must keep returning true.
+        let refused = std::path::Path::new("/proc/self/cannot-create-here/marker");
+        assert!(
+            super::claim_notice_at(refused) && super::claim_notice_at(refused),
+            "an unwritable marker silenced the notice instead of repeating it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
