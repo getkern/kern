@@ -1912,9 +1912,7 @@ pub(crate) fn validate_profile_refs(
             if let Some(e) = cfg.vcpu.iter().find(|e| e.name == name) {
                 require_backend(
                     e.backend.as_deref().unwrap_or(""),
-                    BACKEND_HOST,
-                    "cpu:",
-                    "[[cpu]]",
+                    ProfileKind::Vcpu,
                     cfg.cpu.iter().map(|c| c.id.as_str()),
                 )?;
                 if let Some(x) = e.extends.as_deref().filter(|x| !x.is_empty()) {
@@ -1928,9 +1926,7 @@ pub(crate) fn validate_profile_refs(
             if let Some(e) = cfg.vgpio.iter().find(|e| e.name == name) {
                 require_backend(
                     &e.backend,
-                    BACKEND_HOST,
-                    "gpio:",
-                    "[[gpio]]",
+                    ProfileKind::Vgpio,
                     cfg.gpio.iter().map(|g| g.id.as_str()),
                 )?;
             }
@@ -1939,9 +1935,7 @@ pub(crate) fn validate_profile_refs(
             if let Some(e) = cfg.vdisk.iter().find(|e| e.name == name) {
                 require_backend(
                     &e.backend,
-                    BACKEND_RAM,
-                    "disk:",
-                    "[[disk]]",
+                    ProfileKind::Vdisk,
                     cfg.disk.iter().map(|d| d.name.as_str()),
                 )?;
             }
@@ -1958,6 +1952,84 @@ pub(crate) fn validate_profile_refs(
 pub(crate) const BACKEND_HOST: &str = "host";
 pub(crate) const BACKEND_RAM: &str = "ram";
 
+/// A backend sentinel and what it MEANS, carried together so a call site cannot pass one with the
+/// other's wording.
+///
+/// [`require_backend`] is generic over the three profile kinds and took the value and the
+/// description as two separate arguments. Every kind was given "for the whole host", which is true
+/// for `host` and describes nothing for `ram`: the vdisk error told the reader to write
+/// `backend = "ram"` "for the whole host", while this module's own doc comment two lines above says
+/// `ram` is a RAM-backed tmpfs. Pairing them in one constant makes the mismatch unrepresentable
+/// instead of merely tested for.
+///
+/// Two `&'static str` behind a `Copy` struct: passed by value, no allocation, no indirection beyond
+/// the pointers themselves.
+#[derive(Clone, Copy)]
+pub(crate) struct Sentinel {
+    /// The reserved value a `backend` may take instead of naming a declared physical block.
+    pub(crate) value: &'static str,
+    /// What it gives the profile, worded to complete `use backend = "..." for ___`.
+    pub(crate) means: &'static str,
+}
+
+/// Which profile kind a backend is being checked for.
+///
+/// [`require_backend`] used to take the sentinel, its wording, the `kind:` prefix and the physical
+/// block name as FOUR parallel arguments that all had to agree. They did not: every kind was handed
+/// "for the whole host", which describes `host` and says nothing about `ram`. Collapsing them into
+/// one value makes every mismatch unrepresentable rather than merely tested for, because a call site
+/// now names the kind and the four derived strings come from one place.
+///
+/// A fieldless enum with `const fn` accessors: it exists only at compile time, and every call
+/// monomorphises to the same string constants the four arguments used to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ProfileKind {
+    /// `[[vcpu]]` slices the host CPU, so its sentinel is the whole of it.
+    Vcpu,
+    /// `[[vgpio]]` grants device nodes, so its sentinel is the host's own.
+    Vgpio,
+    /// `[[vdisk]]` places an image on a pool, so its sentinel is memory rather than a disk.
+    Vdisk,
+}
+
+impl ProfileKind {
+    /// The reserved backend value, with the description that is true FOR THIS KIND.
+    pub(crate) const fn sentinel(self) -> Sentinel {
+        match self {
+            Self::Vcpu => Sentinel {
+                value: BACKEND_HOST,
+                means: "the whole host CPU",
+            },
+            Self::Vgpio => Sentinel {
+                value: BACKEND_HOST,
+                means: "the host's own device nodes",
+            },
+            Self::Vdisk => Sentinel {
+                value: BACKEND_RAM,
+                means: "a RAM-backed tmpfs",
+            },
+        }
+    }
+
+    /// The `kind:` prefix a `backend` may carry on either side of the reference.
+    pub(crate) const fn prefix(self) -> &'static str {
+        match self {
+            Self::Vcpu => "cpu:",
+            Self::Vgpio => "gpio:",
+            Self::Vdisk => "disk:",
+        }
+    }
+
+    /// The physical block a backend must name, as it is spelled in a `kern.toml`.
+    pub(crate) const fn phys(self) -> &'static str {
+        match self {
+            Self::Vcpu => "[[cpu]]",
+            Self::Vgpio => "[[gpio]]",
+            Self::Vdisk => "[[disk]]",
+        }
+    }
+}
+
 /// A virtual profile's `backend` is MANDATORY - there is no ambiguous "attach to whatever" default.
 /// It must be either the reserved `sentinel` (the whole host) or a declared physical id/name (matched
 /// via the `prefix:` form on either side). Empty/absent, or a value naming nothing, is a hard error
@@ -1966,19 +2038,20 @@ pub(crate) const BACKEND_RAM: &str = "ram";
 /// iterator scan, a format only on the error path); panic-free (no `unwrap`/`expect`/`panic!`).
 fn require_backend<'a>(
     backend: &str,
-    sentinel: &str,
-    prefix: &str,
-    phys: &str,
+    kind: ProfileKind,
     declared: impl Iterator<Item = &'a str>,
 ) -> Result<(), String> {
+    let Sentinel { value, means } = kind.sentinel();
+    let (prefix, phys) = (kind.prefix(), kind.phys());
     let b = backend.trim();
     if b.is_empty() {
         return Err(format!(
             "a `backend` is required (the host resource this profile slices): use \
-             `backend = \"{sentinel}\"` for the whole host, or name a declared {phys} id"
+             `backend = \"{value}\"` for {means}, or name a declared {phys} id \
+             (`kern config setup` writes one per resource it finds on this host)"
         ));
     }
-    if b == sentinel {
+    if b == value {
         return Ok(());
     }
     let mut declared = declared;
@@ -1986,8 +2059,9 @@ fn require_backend<'a>(
         return Ok(());
     }
     Err(format!(
-        "backend '{b}' is not a configured {phys} id (use `backend = \"{sentinel}\"` for the whole \
-         host, or declare a matching {phys})"
+        "backend '{b}' is not a configured {phys} id (use `backend = \"{value}\"` for {means}, or \
+         declare a {phys}: `kern config setup` writes one per resource it finds on this host, and \
+         `kern top` materialises one from a device you pick)"
     ))
 }
 
@@ -2967,5 +3041,125 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "DO-NOT-TOUCH");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "b = 2\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The three profile kinds must get an error that is TRUE for each of them, not one sentence reused
+/// three times.
+///
+/// `require_backend` is generic over vcpu/vgpio/vdisk and said "use `backend = \"{sentinel}\"` for
+/// the whole host" for all three. For a vdisk the sentinel is `ram`, and "ram for the whole host"
+/// describes nothing: the function's own doc comment, three lines above, says `ram` means a
+/// RAM-backed tmpfs. The message misdescribed the fix it was recommending.
+///
+/// It also said "declare a matching [[disk]]" without saying how, which is the half of an error
+/// message that costs a user the search.
+#[cfg(test)]
+mod the_backend_error_is_true_for_each_kind {
+    use super::{require_backend, ProfileKind};
+
+    const KINDS: [ProfileKind; 3] = [ProfileKind::Vcpu, ProfileKind::Vgpio, ProfileKind::Vdisk];
+
+    fn msg(kind: ProfileKind) -> String {
+        match require_backend("nothing-declared", kind, std::iter::empty()) {
+            Ok(()) => panic!("a backend naming nothing must not be accepted"),
+            Err(e) => e,
+        }
+    }
+
+    /// The four strings that used to be four call-site arguments now come from one value, so this
+    /// asserts the derivation rather than the call sites: a kind cannot be given another kind's
+    /// sentinel, prefix or block name without editing this table.
+    #[test]
+    fn every_kind_derives_its_own_four_strings() {
+        for (k, value, means, prefix, phys) in [
+            (
+                ProfileKind::Vcpu,
+                "host",
+                "the whole host CPU",
+                "cpu:",
+                "[[cpu]]",
+            ),
+            (
+                ProfileKind::Vgpio,
+                "host",
+                "the host's own device nodes",
+                "gpio:",
+                "[[gpio]]",
+            ),
+            (
+                ProfileKind::Vdisk,
+                "ram",
+                "a RAM-backed tmpfs",
+                "disk:",
+                "[[disk]]",
+            ),
+        ] {
+            let s = k.sentinel();
+            assert_eq!(s.value, value, "{k:?} sentinel value");
+            assert_eq!(s.means, means, "{k:?} sentinel description");
+            assert_eq!(k.prefix(), prefix, "{k:?} prefix");
+            assert_eq!(k.phys(), phys, "{k:?} physical block");
+        }
+        // The defect this replaced: `ram` described as the whole host.
+        assert!(!ProfileKind::Vdisk.sentinel().means.contains("whole host"));
+    }
+
+    #[test]
+    fn each_message_is_true_for_its_own_kind() {
+        for k in KINDS {
+            let e = msg(k);
+            let s = k.sentinel();
+            assert!(
+                e.contains(&format!("`backend = \"{}\"` for {}", s.value, s.means)),
+                "{k:?}: {e}"
+            );
+            assert!(e.contains(k.phys()), "{k:?} does not name its block: {e}");
+        }
+    }
+
+    /// "declare one" without saying how is the half of an error message that costs a search.
+    #[test]
+    fn every_kind_says_how_to_declare_the_physical_block() {
+        for k in KINDS {
+            let e = msg(k);
+            assert!(e.contains("kern config setup"), "{k:?}: {e}");
+            assert!(e.contains("kern top"), "{k:?}: {e}");
+        }
+    }
+
+    /// An empty backend is a different error and must carry the same "how": a hand-written config
+    /// hits it first.
+    #[test]
+    fn the_missing_backend_error_also_says_how() {
+        for k in KINDS {
+            let Err(e) = require_backend("", k, std::iter::empty()) else {
+                panic!("{k:?}: an empty backend must be refused");
+            };
+            assert!(e.contains("a `backend` is required"), "{k:?}: {e}");
+            assert!(e.contains(k.sentinel().means), "{k:?}: {e}");
+            assert!(e.contains("kern config setup"), "{k:?}: {e}");
+        }
+    }
+
+    /// A validator that only says no is not one anybody can use. Every kind must accept its own
+    /// sentinel, a prefixed id and the bare form of that id.
+    #[test]
+    fn the_sentinel_and_a_declared_id_are_accepted_for_every_kind() {
+        for k in KINDS {
+            let declared = format!("{}0", k.prefix());
+            assert!(
+                require_backend(k.sentinel().value, k, std::iter::empty()).is_ok(),
+                "{k:?} rejected its own sentinel"
+            );
+            assert!(
+                require_backend(&declared, k, std::iter::once(declared.as_str())).is_ok(),
+                "{k:?} rejected a declared id"
+            );
+            assert!(
+                require_backend("0", k, std::iter::once(declared.as_str())).is_ok(),
+                "{k:?} rejected the bare form of a declared id"
+            );
+        }
     }
 }

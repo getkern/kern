@@ -39,6 +39,32 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   why the opt-out exists: a workload binding a port below 1024 inside the box needs
   `CAP_NET_BIND_SERVICE`. Pass `cap_drop=()` or `capDrop: []`.
 
+- **Three asymmetries between the profile kinds, found by building the parity matrix rather than by
+  reading.** `vcpu:`, `vgpio:` and `vdisk:` are one model attached the same way, and three places
+  treated one of them differently:
+
+  `kern run` told you it ignores a `vdisk:` and said nothing about a `vgpio:`, which under `run` is
+  cooperative metadata (`KERN_VGPIO_NAME`/`_PINS`) and confines nothing, because there is no mount
+  namespace either way. A device grant that silently grants nothing is the worst shape this can
+  take. Both notices are also emitted once now: `run` re-execs through `systemd-run --user --scope`
+  and printed the vdisk line twice on the default path, which only `KERN_NO_SCOPE=1` hid.
+
+  `--plan` previewed `vgpio:` device grants and neither the caps nor the disk, so a box carrying all
+  three previewed one. The comment justifying the vgpio case stated the principle exactly: a preview
+  that lists three mounts while saying nothing about `/dev/i2c-5` is not a preview of what will be
+  created. It now reports all three, resolved with the same calls the launch makes, and a profile
+  that cannot attach says so at plan time.
+
+  The dangling-backend error told every kind to "use `backend = \"{sentinel}\"` for the whole host".
+  For a `vdisk:` the sentinel is `ram`, and this module's own doc comment says `ram` is a RAM-backed
+  tmpfs: the message misdescribed the fix it was recommending. It also said "declare a matching
+  [[disk]]" without saying how.
+
+  Fixed by construction rather than by wording: the sentinel, its description, the `kind:` prefix and
+  the physical block name were four parallel arguments that all had to agree, and now come from one
+  `ProfileKind`. A call site names the kind; it cannot hand one kind another's strings. The message
+  names `kern config setup` and `kern top` as the two ways to declare a physical block.
+
 - **kern reported only the FIRST line of `pasta`'s stderr** when a pod could not get outbound
   networking. On WSL2 that line is "Started as root, will change to nobody.", true and useless: the
   reason is four lines below. All of them are joined now, capped and scrubbed.

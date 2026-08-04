@@ -214,20 +214,56 @@ pub fn box_plan(name: &str, profiles: &[String]) -> Result<(), Error> {
     for (i, step) in ctx.plan().iter().enumerate() {
         println!("  {}. {step}", i + 1);
     }
-    // The mount sequence is only half of what a box gets. A `vgpio:` profile hands over real device
-    // nodes, and a preview that lists three mounts while saying nothing about `/dev/i2c-5` is not a
-    // preview of what will be created. Resolved against THIS host (the same call the launch makes),
-    // so the preview and the launch cannot disagree, and a profile that cannot attach says so here
-    // instead of at launch.
-    let vgpio: Vec<&str> = profiles
-        .iter()
-        .filter_map(|p| p.strip_prefix("vgpio:"))
-        .filter(|n| !n.is_empty())
-        .collect();
-    if vgpio.is_empty() {
+    // The mount sequence is only half of what a box gets. A profile hands over real caps, real
+    // device nodes and a real mount, and a preview that lists three mounts while saying nothing
+    // about `/dev/i2c-5`, a 256M ceiling or a 48M scratch disk is not a preview of what will be
+    // created. That reasoning was applied to `vgpio:` alone, so a box carrying all three kinds
+    // previewed one of them; all three are reported now.
+    //
+    // Every one is resolved against THIS host with the same call the launch makes, so the preview
+    // and the launch cannot disagree, and a profile that cannot attach says so here instead of at
+    // launch.
+    let pick = |kind: &str| -> Vec<&str> {
+        profiles
+            .iter()
+            .filter_map(|p| p.strip_prefix(kind))
+            .filter(|n| !n.is_empty())
+            .collect()
+    };
+    let (vcpu, vgpio, vdisk) = (pick("vcpu:"), pick("vgpio:"), pick("vdisk:"));
+    if vcpu.is_empty() && vgpio.is_empty() && vdisk.is_empty() {
         return Ok(());
     }
+    // Loaded once for all three: `--plan` is a preview, but reading the same file three times would
+    // let two kinds disagree if it changed underneath.
     let cfg = crate::config::load(None).map_err(Error::Config)?;
+    for n in vcpu {
+        match crate::config::resolve_vcpu(&cfg, n) {
+            Ok(r) => {
+                let mut caps: Vec<String> = Vec::new();
+                if let Some(c) = r.cpus {
+                    caps.push(format!("cpus {c}"));
+                }
+                if let Some(m) = r.memory {
+                    caps.push(format!("memory {}", kern_common::fmt_bytes(m)));
+                }
+                if let Some(s) = &r.cpuset {
+                    caps.push(format!("cpuset {s}"));
+                }
+                if let Some(nc) = r.nice {
+                    caps.push(format!("nice {nc}"));
+                }
+                if caps.is_empty() {
+                    // A profile that resolves to nothing is worth saying: it attaches and caps
+                    // nothing, which is not what the name suggests.
+                    println!("  resource caps from vcpu:{n}: none set");
+                } else {
+                    println!("  resource caps from vcpu:{n}: {}", caps.join(", "));
+                }
+            }
+            Err(e) => println!("  vcpu:{n}: cannot attach: {e}"),
+        }
+    }
     for n in vgpio {
         match crate::config::resolve_vgpio(&cfg, n) {
             Ok(r) if r.devs.is_empty() && r.sysfs.is_empty() && r.pins.is_empty() => {
@@ -249,6 +285,39 @@ pub fn box_plan(name: &str, profiles: &[String]) -> Result<(), Error> {
                 }
             }
             Err(e) => println!("  vgpio:{n}: cannot attach: {e}"),
+        }
+    }
+    for n in vdisk {
+        match crate::config::resolve_vdisk(&cfg, n) {
+            Ok(r) => {
+                let size = r
+                    .size
+                    .map_or_else(|| "uncapped".to_string(), kern_common::fmt_bytes);
+                println!("  disk from vdisk:{n}: mount /vdisk/{n}, size {size}");
+                // Which backend actually lands is decided by privilege at launch, not by the
+                // profile, so the preview says both rather than picking one and being wrong half
+                // the time.
+                match &r.backend_dir {
+                    Some(d) => println!(
+                        "    ext4-on-loop under {d} when privileged in the foreground, \
+                         RAM-backed tmpfs otherwise"
+                    ),
+                    None => println!("    RAM-backed tmpfs (counts against the box's memory)"),
+                }
+                if let Some(i) = r.iops {
+                    println!("    iops {i} (ext4-on-loop backend only)");
+                }
+                if let Some(bw) = r.bandwidth {
+                    println!(
+                        "    bandwidth {} (ext4-on-loop backend only)",
+                        kern_common::fmt_bytes(bw)
+                    );
+                }
+                if r.persistent {
+                    println!("    persistent (ext4-on-loop backend only)");
+                }
+            }
+            Err(e) => println!("  vdisk:{n}: cannot attach: {e}"),
         }
     }
     Ok(())
@@ -1679,6 +1748,13 @@ pub fn run(
             "run [--memory M] [--cpus N] [--cpuset-cpus L] [--config F] [vcpu:PROFILE] [--] <cmd...>",
         ));
     }
+    // Both notices below are emitted on the FIRST pass only. `run` re-execs itself through
+    // `systemd-run --user --scope` to get an enforced cap and this code runs again on the way back,
+    // so an unguarded `eprintln!` prints twice: the vdisk one did, for as long as it existed, and
+    // `KERN_NO_SCOPE=1` was the only way to see it once. Same guard as the four other
+    // first-pass-only checks in this file. The env vars are NOT guarded: the second pass is the one
+    // that execs the workload, so it needs them set.
+    let first_pass = std::env::var_os("KERN_SCOPE").is_none();
     // `run` has no sandbox, so a `vgpio:` profile can't confine devices - instead export it as env
     // (`KERN_VGPIO_NAME`/`_PINS`), so a cooperative workload can find its pins. To
     // actually *isolate* the peripherals, use `kern box vgpio:NAME …`.
@@ -1691,9 +1767,20 @@ pub fn run(
             .collect();
         std::env::set_var("KERN_VGPIO_NAME", names.join(","));
         std::env::set_var("KERN_VGPIO_PINS", pins.join(","));
+        // Say it, for the same reason the vdisk line below exists. `run` treats the two the same way
+        // (neither can confine without a mount namespace) and used to report only one of them, so a
+        // vgpio profile attached here looked like a device grant and was cooperative metadata. A
+        // grant that silently grants nothing is the worst shape this can take.
+        if first_pass {
+            eprintln!(
+                "kern: vgpio profile(s) under `run` export KERN_VGPIO_NAME/_PINS for a cooperative \
+                 workload and confine nothing: `run` has no mount namespace, so the process sees \
+                 the host's own /dev. Use `kern box vgpio:NAME …` for the device grant."
+            );
+        }
     }
     // A `vdisk:` needs a mount namespace to isolate - `run` has none. Say so rather than pretend.
-    if !vdisk.is_empty() {
+    if !vdisk.is_empty() && first_pass {
         eprintln!(
             "kern: vdisk profile(s) ignored by `run` (no mount namespace) - use `kern box vdisk:NAME …`"
         );
@@ -16130,5 +16217,57 @@ mod config_verbs_are_defined_in_one_place {
                 "the usage string does not mention `{verb}`: {CONFIG_USAGE}"
             );
         }
+    }
+}
+
+/// `--plan` must preview every kind of profile a box can carry, not the one that was implemented
+/// first.
+///
+/// It reported `vgpio:` device grants and nothing else, so a box attached to a CPU cap, a device and
+/// a scratch disk previewed one of the three. The comment justifying the vgpio case said it exactly:
+/// a preview that lists three mounts while saying nothing about `/dev/i2c-5` is not a preview of what
+/// will be created. A 256M ceiling and a 48M disk are no different.
+///
+/// Asserted on the FUNCTION BODY rather than on behaviour because the output goes to stdout and the
+/// resolvers need a config file on disk; the shape is what regresses when a fourth kind is added or
+/// a third is dropped. Scoped to the body so this test's own text cannot satisfy it.
+#[cfg(test)]
+mod the_plan_previews_every_profile_kind {
+    #[test]
+    fn all_three_kinds_are_picked_and_resolved() {
+        let src = include_str!("mod.rs");
+        let Some(start) = src.find("pub fn box_plan") else {
+            panic!("box_plan is gone; this contract test cannot find what it guards");
+        };
+        let body = &src[start..];
+        let Some(end) = body.find("\n}\n") else {
+            panic!("cannot find the end of box_plan");
+        };
+        let body = &body[..end];
+
+        for kind in ["vcpu:", "vgpio:", "vdisk:"] {
+            assert!(
+                body.contains(&format!("pick(\"{kind}\")")),
+                "box_plan no longer picks {kind} profiles out of the attached list, so a box \
+                 carrying one previews without it"
+            );
+        }
+        for resolver in ["resolve_vcpu", "resolve_vgpio", "resolve_vdisk"] {
+            assert!(
+                body.contains(resolver),
+                "box_plan no longer calls {resolver}, so that kind is either unreported or \
+                 reported from the raw config instead of the resolved values the launch uses"
+            );
+        }
+        // Each kind must also report a failure to attach HERE rather than at launch, which is the
+        // whole reason the plan resolves instead of printing the profile names back.
+        // The FORMAT string, not the phrase: the doc comment above the function also contains
+        // "cannot attach", and counting that made the first version of this assertion read 4.
+        assert_eq!(
+            body.matches("cannot attach: {e}").count(),
+            3,
+            "every kind must say why it cannot attach at PLAN time rather than at launch; found a \
+             different number of Err arms that print it"
+        );
     }
 }
