@@ -31,20 +31,18 @@ kern box dev --image alpine -it -- sh
 
 kern runs Linux workloads in real, kernel-enforced sandboxes: user, PID, mount, network, UTS and IPC
 namespaces, an overlay or read-only root pivoted in, an always-on seccomp filter, and cgroup v2
-limits. It pulls OCI images, builds them, runs them, and gets out of the way. No background daemon,
-one short-lived process per box.
+limits. It pulls OCI images, builds them, runs them, and gets out of the way. No daemon, one
+short-lived process per box.
 
-The binary is 1.84 MB because it carries only what it has to. The entire Rust dependency tree is
-`libc`, JSON and the OCI manifests are parsed by hand, and `pull` uses the `curl` and `tar` already
-on the machine instead of linking a TLS stack and a decompressor. Those two are therefore a real
-requirement of the image path, and `kern doctor` checks for them; a box from a `--rootfs` needs
-neither.
+It is 1.84 MB because it carries only what it has to: the entire Rust dependency tree is `libc`,
+JSON and OCI manifests are parsed by hand, and `pull` uses the `curl` and `tar` already on the
+machine instead of linking a TLS stack and a decompressor. `kern doctor` checks for those two; a box
+from a `--rootfs` needs neither.
 
 It has **two verbs**. `kern box` wraps a process in a full isolated slice. `kern run` caps a resource
 on a process you launch yourself, with no sandbox. Isolation is simply the first resource kern
-manages; the same model slices CPU (`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`) per
-process, defined once in a `kern.toml` and attached by name. See
-[docs/RESOURCES.md](docs/RESOURCES.md).
+manages; the same model slices CPU (`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`), defined
+once in a `kern.toml` and attached by name. [docs/RESOURCES.md](docs/RESOURCES.md).
 
 <p align="center">
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.8 MB static binary, no daemon.">
@@ -52,16 +50,14 @@ process, defined once in a `kern.toml` and attached by name. See
 
 ## What kern is not
 
-- **Not a hypervisor.** The boundary is the Linux kernel: namespaces, capabilities, seccomp and
-  cgroups. A kernel privilege-escalation bug is an escape. For actively hostile, multi-tenant code
-  from strangers, reach for a microVM (Firecracker, Kata) or gVisor. kern's ground is your own or
-  semi-trusted code: CI jobs, build steps, dev sandboxes, an agent's tool-calls under your
-  supervision.
+- **Not a hypervisor.** The boundary is the Linux kernel, so a kernel privilege-escalation bug is an
+  escape. For actively hostile, multi-tenant code from strangers, reach for a microVM (Firecracker,
+  Kata) or gVisor. kern's ground is your own or semi-trusted code: CI jobs, build steps, dev
+  sandboxes, an agent's tool-calls under your supervision.
 
-  This is the container model, not a kern limitation: Docker and Podman share the same kernel and
-  the same escape condition, which is why gVisor and Firecracker were built in the first place. We
-  say it out loud because an unknown tool has to. Where kern differs is which side of it you start
-  on: kern is rootless always, while Docker's daemon runs as root and its rootless mode is opt-in.
+  This is the container model, not a kern limitation: Docker and Podman share the same kernel and the
+  same escape condition, which is why gVisor and Firecracker exist. Where kern differs is which side
+  you start on: rootless always, where Docker's daemon runs as root and rootless is opt-in.
 - **Not free of the userns trade.** kern's isolation is built on an unprivileged user namespace, and
   userns has been a fertile source of kernel LPE bugs. Running untrusted code in a box hands it that
   surface to probe. [SECURITY.md](SECURITY.md) states this first, before any claim.
@@ -72,9 +68,9 @@ process, defined once in a `kern.toml` and attached by name. See
 - **Not shipping GPU slices.** They are on the [roadmap](ROADMAP.md) and there is no GPU code in this
   edition, so there is nothing here to trust or to attack yet.
 
-What it does not know or does not do yet is written down in [OPEN_ITEMS.md](OPEN_ITEMS.md) rather
-than left for you to find: an unattributed gap in a startup measurement, why the seccomp filter is
-still a denylist, which fleet limit is a guard rail instead of a boundary.
+What it does not know or does not do yet is in [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than left for
+you to find: an unattributed gap in a startup measurement, why the seccomp filter is still a
+denylist, which fleet limit is a guard rail instead of a boundary.
 
 ## Install
 
@@ -145,10 +141,8 @@ Ninety runnable examples, each doing one thing: [examples/](examples/).
 ## Performance
 
 Measured 2026-08-01 on an Intel i7-14700KF, Linux 7.0.0, against the runtimes installed there. Every
-number below comes from one script you can run yourself, `python3 examples/benchmark.py`. These are
-medians on that machine, quoted exactly because the method and the min-max spread are in
-[BENCHMARKS.md](BENCHMARKS.md); yours will differ with your CPU, kernel and filesystem, which is why
-the summary table above rounds.
+number comes from one script you can run yourself, `python3 examples/benchmark.py`. Medians on that
+machine; yours will differ with your CPU, kernel and filesystem, which is why the table above rounds.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
@@ -158,17 +152,14 @@ the summary table above rounds.
 A thousand simultaneous boxes take 0.65 s, all 1000 of them. One more live box costs 0.35 MB of real
 memory. `exec` into a running box is 0.79 ms against Docker's 43.3.
 
-Re-run on the released binary on 2026-08-03, the same script gives kern 2.3 ms and 0.10 s, a cold
-start from an OCI image of 3.40 ms against the 3.4 above, `exec` at 0.66 ms and 0.39 MB per live
-box. The whole table moved by that much on the day, **bubblewrap included** (0.19 s to 0.20) and
-runc and podman in opposite directions, which is what says the drift is the machine's state rather
-than kern's code. Quoting one dated run beats averaging two.
+Re-run on the released binary on 2026-08-03: 2.3 ms, 0.10 s, `exec` 0.66 ms. The whole table moved
+by that much on the day, **bubblewrap included**, which is the machine's state rather than kern's
+code.
 
-kern is in the fastest tier and does not win single-shot latency outright: bubblewrap is 0.8 ms
-behind and the physical floor for `unshare` + `exec` is 1 to 2 ms. The gap that matters is to the
-engines, 128 to 134x on the table above, and bubblewrap is a launcher with no images, caps or
-lifecycle. Method, per-phase breakdown, board numbers and the caveats:
-**[BENCHMARKS.md](BENCHMARKS.md)**.
+kern does not win single-shot latency outright: bubblewrap is 0.8 ms ahead, and the physical floor
+for `unshare` + `exec` is 1 to 2 ms. The gap that matters is to the engines, 128 to 134x above, and
+bubblewrap is a launcher with no images, caps or lifecycle. Method, per-phase breakdown, board
+numbers and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
@@ -214,9 +205,9 @@ gates; contributions are covered by the [CLA](CLA.md).
 
 ## Maintainer
 
-Alex, [@realexhub](https://github.com/realexhub). Commits and signed release tags are made from
-[@getkerndev](https://github.com/getkerndev), the project's commit identity, so the author on every
-commit and the key on every tag stay the same one.
+Alex, [@realexhub](https://github.com/realexhub). Commits and signed tags come from
+[@getkerndev](https://github.com/getkerndev), the project's commit identity, so every commit has the
+same author and every tag the same key.
 
 ## License
 
