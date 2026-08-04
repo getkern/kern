@@ -110,10 +110,13 @@ inside a box in the same session.
 crun, bwrap, nerdctl, lxc-start and systemd-nspawn are all absent. † carried over from an earlier
 session; only kern and bubblewrap were measured in this round.
 
-**On the two boards where both are installed, bubblewrap's number is lower than kern's.** Said
-plainly, because it is the kind of thing a reader finds in a minute. bubblewrap is a sandbox
-primitive with no images, no lifecycle and no resource caps at all, so it never does cgroup work.
-kern's board figures include enforcing caps through a systemd transient scope.
+**On the two boards where both are installed, bubblewrap's number is lower than kern's in this
+table.** Said plainly, because it is the kind of thing a reader finds in a minute. The two columns
+are not the same work: bubblewrap is a sandbox primitive with no images, no lifecycle and no
+resource caps at all, so it never does cgroup work, while kern's board figures include enforcing
+caps through a systemd transient scope. Measured at the same level of work, kern is ahead on every
+host where both are installed, and ahead even while enforcing a cap bubblewrap does not:
+[At the same level of work](#at-the-same-level-of-work), below.
 
 ### The scope is the whole gap, and the arithmetic closes
 

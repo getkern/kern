@@ -120,9 +120,9 @@ kern doctor                                    # will boxes even run on this hos
 
 kern deliberately skips a lot that Docker has, overlay networks, a plugin ecosystem, because the
 point is a small, fast, honest core you can read, embed, and put anywhere. Everything above works
-today and is tested (689 Rust, 62 Python and 51 Node tests, clippy-clean, security-audited slice by
-slice). The CLI isn't frozen
-until 1.0.
+today and is tested: clippy-clean, `cargo-deny`-clean, and audited slice by slice. The test counts
+are in the README rather than here, because a number in a post nobody rereads goes stale in a week
+and this one had (689, when this was written). The CLI isn't frozen until 1.0.
 
 Code, benchmarks, and the honest security account:
 **[github.com/getkern/kern](https://github.com/getkern/kern)**.

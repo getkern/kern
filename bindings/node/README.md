@@ -134,6 +134,10 @@ new Sandbox({
   pids,            // default 256
   timeoutS,        // default 30, MANDATORY per-call deadline
   network,         // default false (RELAXES ISOLATION)
+  capDrop,         // default ["ALL"]: capabilities dropped from every box. kern always drops
+                   // 13 dangerous ones; this drops the rest, which were held over the box's own
+                   // user namespace. Pass [] to keep them (needed only if the workload binds a
+                   // port below 1024 INSIDE the box).
   mounts,          // { hostSrc: boxTarget } or { src: [target, "ro"] }
   profiles,        // reusable kern.toml profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]
   env,             // { KEY: "value" }

@@ -64,7 +64,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.13"
+__version__ = "0.1.14"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -698,6 +698,28 @@ def _validate_domain(domain: str) -> str:
     return domain
 
 
+# A Linux capability name for `kern box --cap-drop`, with or without the CAP_ prefix, or the literal
+# ALL. Uppercase letters, digits and underscores only: the value is handed to kern as its own argv
+# element, so it must not be able to start with a dash or carry a space that could turn into another
+# flag. kern itself rejects a name it does not know (a typo cannot silently leave a cap in place);
+# this is the binding's first gate, and it is the same discipline as _validate_profile.
+# Underscore-JOINED segments, not "any of [A-Z0-9_]": the looser form accepted "CAP_", because the
+# optional prefix does not have to consume it and `[A-Z][A-Z0-9_]*` then reads it as C + AP_. Not a
+# way to smuggle a flag, but a name kern rejects at box start, and the point of validating here is to
+# fail at construction with a message that names the mistake.
+_CAP_RE = re.compile(r"^(?=.{1,32}$)(?:CAP_)?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$")
+
+
+def _validate_cap(name: str) -> str:
+    """Validate one capability name for ``--cap-drop`` before it reaches the argv."""
+    if not isinstance(name, str) or not _CAP_RE.fullmatch(name):
+        raise SandboxError(
+            f"invalid capability {name!r}: expected 'ALL' or an uppercase capability name such as "
+            "'NET_BIND_SERVICE' or 'CAP_NET_BIND_SERVICE'"
+        )
+    return name
+
+
 # Signal-derived exit codes (128 + signum) we classify.
 _EXIT_SIGKILL = 137  # 128 + 9  - SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
 _EXIT_SIGSYS = 159  # 128 + 31 - SIGSYS: a seccomp-denied syscall = a blocked escape attempt
@@ -746,6 +768,12 @@ class Sandbox:
         max_output_bytes: cap on captured stdout/stderr EACH; a flooding box can't OOM the host.
         enforce_limits: ``True`` (default) hard-enforces caps via a systemd scope (~6 ms start);
             ``False`` skips it for a ~3 ms start (best-effort caps).
+        cap_drop: Linux capabilities dropped from every box, as kern's ``--cap-drop`` takes them.
+            Default ``("ALL",)``. kern already drops 13 dangerous capabilities unconditionally; this
+            drops the remainder, which were otherwise held over the box's own user namespace. It is
+            defence in depth, not the boundary itself, and it changes one behaviour: a workload that
+            binds a port below 1024 INSIDE the box needs ``CAP_NET_BIND_SERVICE``. Pass
+            ``cap_drop=()`` for the pre-0.1.14 behaviour, or a narrower set.
     """
 
     image: str = _DEFAULT_IMAGE
@@ -762,6 +790,19 @@ class Sandbox:
     env: Mapping[str, str] | None = None
     max_output_bytes: int = 64 * 1024 * 1024
     enforce_limits: bool = True
+    # Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
+    # The default drops the lot: kern already drops 13 dangerous capabilities unconditionally, but the
+    # rest were still held over the box's own user namespace, and this is the one code path whose whole
+    # purpose is running code nobody has read. It is defence in depth rather than the boundary itself
+    # (those capabilities are namespaced, and the always-on seccomp filter refuses the escape syscalls
+    # they would unlock either way), and it is measured to cost nothing: `python3 -c` and
+    # `pip install --target` behave identically with and without it.
+    #
+    # It is NOT free of behaviour change, which is why it is a field and not a constant: a workload
+    # that binds a port below 1024 INSIDE the box's own network namespace needs CAP_NET_BIND_SERVICE
+    # and will get PermissionError. Pass `cap_drop=()` to keep the previous behaviour, or drop a
+    # narrower set, e.g. `cap_drop=("SYS_ADMIN", "NET_RAW")`.
+    cap_drop: Sequence[str] = ("ALL",)
     deps_readonly: bool = False  # mount setup= deps read-only for run_code (block cross-run poisoning)
     # track_files=True populates result.files by walking the workspace before AND after each call, which
     # is O(workspace file count): a long session that accumulates thousands of files makes every run_code
@@ -776,6 +817,7 @@ class Sandbox:
     _mount_args: list = field(default_factory=list, init=False, repr=False)
     _profile_args: list = field(default_factory=list, init=False, repr=False)
     _egress_allow: list = field(default_factory=list, init=False, repr=False)
+    _cap_drop_args: list = field(default_factory=list, init=False, repr=False)
     _ws: str = field(default="", init=False, repr=False)
     _own_ws: bool = field(default=False, init=False, repr=False)  # we created it → we delete it
     _entered: bool = field(default=False, init=False, repr=False)
@@ -799,6 +841,17 @@ class Sandbox:
                 self._mount_args += ["-v", f"{real}:{tgt}:ro" if ro else f"{real}:{tgt}"]
         self._profile_args = [_validate_profile(p) for p in (self.profiles or [])]
         self._egress_allow = [_validate_domain(d) for d in (self.egress_allow or [])]
+        # A str is a Sequence[str], so `cap_drop="ALL"` would iterate into ['A','L','L'] and produce
+        # three bogus flags instead of one. Refuse it by name rather than silently doing the wrong
+        # thing, and say what to write.
+        if isinstance(self.cap_drop, str):
+            raise SandboxError(
+                f"cap_drop must be a sequence of names, not a bare string: write "
+                f"cap_drop=({self.cap_drop!r},) for one, or cap_drop=() to drop none"
+            )
+        self._cap_drop_args = []
+        for cap in self.cap_drop or ():
+            self._cap_drop_args += ["--cap-drop", _validate_cap(cap)]
         if self._egress_allow and self.network:
             raise SandboxError(
                 "egress_allow and network=True are mutually exclusive: egress_allow gives a restricted "
@@ -851,6 +904,7 @@ class Sandbox:
         # the in-PID-namespace box (a CPU-bound box survives a SIGKILL of kern's parent process, but not
         # kern's own timeout teardown). OUR proc.wait deadline is the authority that LABELS a `timeout`
         # fault; kern's backstop guarantees the box is actually gone a few seconds later.
+        argv += self._cap_drop_args
         argv += ["--timeout", str(int(timeout_s) + 5)]
         if self.memory_mb is not None:
             argv += ["--memory", f"{self.memory_mb}m"]

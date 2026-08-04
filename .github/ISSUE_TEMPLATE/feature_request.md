@@ -8,4 +8,5 @@ labels: enhancement
 
 **Proposed behaviour**
 
-**Roadmap fit** (see README): which milestone does this belong to?
+**Roadmap fit**: does it belong under one of the directions in [ROADMAP.md](../../ROADMAP.md)?
+Those are directions rather than commitments or dates, so "none of them" is a fine answer.

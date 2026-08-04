@@ -41,6 +41,56 @@ test("version is exported", () => {
   assert.strictEqual(typeof kern.version, "string");
 });
 
+test("capabilities are dropped by default and the opt-out is explicit", () => {
+  // kern always drops 13 dangerous capabilities; the rest were held over the box's own user
+  // namespace, on the one code path whose purpose is running code nobody has read. Measured before
+  // this change: a box held CapEff 00000110bdacffff, and with the flag it holds 0000000000000000.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  try {
+    const argv = new Sandbox()._baseArgv("n", { network: false, timeoutS: 30 });
+    assert.ok(argv.includes("--cap-drop"), "the default must drop capabilities");
+    assert.strictEqual(argv[argv.indexOf("--cap-drop") + 1], "ALL");
+    assert.ok(argv.indexOf("--cap-drop") > argv.indexOf("--image"));
+
+    // The opt-out exists because the change is not behaviour-free: a workload binding a port below
+    // 1024 inside the box needs CAP_NET_BIND_SERVICE. It has to be asked for by name.
+    const off = new Sandbox({ capDrop: [] })._baseArgv("n", { network: false, timeoutS: 30 });
+    assert.ok(!off.includes("--cap-drop"));
+
+    // A narrower set is passed through one flag per name, in order.
+    const narrow = new Sandbox({ capDrop: ["SYS_ADMIN", "CAP_NET_RAW"] })._baseArgv("n", {
+      network: false,
+      timeoutS: 30,
+    });
+    assert.strictEqual(narrow.filter((a) => a === "--cap-drop").length, 2);
+    assert.strictEqual(narrow[narrow.indexOf("--cap-drop") + 1], "SYS_ADMIN");
+
+    // The setup box is hardened the same way: it installs dependencies, from the network, which is
+    // exactly when a hostile package would run its own code.
+    const setup = new Sandbox()._baseArgv("n", { network: true, timeoutS: 30, isSetup: true });
+    assert.ok(setup.includes("--cap-drop"));
+
+    // The names that MUST work, or the opt-out is useless.
+    for (const good of ["ALL", "SYS_ADMIN", "CAP_NET_BIND_SERVICE", "DAC_OVERRIDE", "MKNOD"])
+      assert.deepStrictEqual(new Sandbox({ capDrop: [good] })._capDropArgs, ["--cap-drop", good]);
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+
+  // capDrop reaches kern's argv, so it is validated like a profile token rather than trusted.
+  for (const bad of ["--net", "-v /etc:/etc", "net_admin", "NET ADMIN", "NET;rm", "NET\n", "",
+                     "CAP_", "1NET", "A".repeat(40), "--cap-add", "NET_", "_NET", "NET__RAW", "ALL "])
+    assert.throws(
+      () => new Sandbox({ capDrop: [bad] }),
+      SandboxError,
+      `should reject ${JSON.stringify(bad)}`,
+    );
+  // A bare string would spread into single characters and produce three bogus flags from "ALL".
+  assert.throws(() => new Sandbox({ capDrop: "ALL" }), SandboxError);
+});
+
 test("profiles validated and placed in argv", () => {
   // valid vcpu:/vgpio:/vdisk: profiles land as positional tokens (fake kern so the ctor completes)
   const prev = process.env.KERN_BIN;

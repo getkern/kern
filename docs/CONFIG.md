@@ -195,7 +195,8 @@ id = "pool"; path = "/var/lib/kern/disks"; default = true; size = "100g"; iops =
 
 `kern compose <file>` brings up a stack of `[box.NAME]` tables in `depends_on` order (it also reads a
 `docker-compose.yml`). `compose` shells out to `kern box`, so a value can never mean something
-different from its flag. Every key maps to one, except `port` and `expose`, which are pod-scoped and
+different from its flag. **Every service is started detached**, so there is no `detach` key: `up`
+adds `-d` itself and returns once the stack is up. Use `kern logs` and `kern ps` to follow it. Every key maps to one, except `port` and `expose`, which are pod-scoped and
 described below.
 
 ```toml

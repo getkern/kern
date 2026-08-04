@@ -134,6 +134,11 @@ Sandbox(
     max_output_bytes=64 << 20,  # cap on captured stdout/stderr EACH; overflow discarded, result.truncated set
     deps_readonly=False,        # True → run_code can't modify setup= deps (blocks cross-run poisoning)
     enforce_limits=True,        # hard-enforce caps via a systemd scope; False = best-effort, faster under load
+    cap_drop=("ALL","..."),  # capabilities dropped from every box; default drops ALL.
+                            # kern always drops 13 dangerous ones; this drops the rest,
+                            # which were held over the box's own user namespace. Pass
+                            # cap_drop=() to keep them (needed only if the workload binds
+                            # a port below 1024 INSIDE the box).
     track_files=True,           # populate result.files by diffing the workspace each call (O(files)); a long
 )                               # session that accretes files slows run_code -> set False (result.files [], O(1))
 ```

@@ -95,6 +95,29 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         set(),
     ),
     (
+        # Introduced by the very commit that was leaning the README for the launch: the sentence said
+        # bubblewrap was "0.8 ms ahead" while the table two lines above it read kern 2.2 and
+        # bubblewrap 3.0, so it handed a competitor a win it does not have on that machine, and an
+        # outside review repeated it back within the day. BENCHMARKS.md and EDGE.md are exempt,
+        # because on the ARM boards' DEFAULT path bubblewrap IS ahead and they say so with numbers.
+        r"bubblewrap is [0-9.]+\s*ms ahead",
+        "0.8 ms behind, on the README's own table",
+        "kern 2.2 ms against bubblewrap 3.0 on the x86 table, and ahead at the same level of work on "
+        "every host where both are installed. bubblewrap leads only on the boards' default path, "
+        "where kern enforces a cgroup cap and bubblewrap enforces none.",
+        {"BENCHMARKS.md", "EDGE.md"},
+    ),
+    (
+        # One number, two homes: BENCHMARKS.md measured 1000 boxes in 0.61 s and stated 1640 box/s in
+        # the same row (1000/0.61 = 1639), while the README said 0.65, which would be 1538.
+        r"\b0\.65\s*s\b(?=[^\n]{0,60}(?:thousand|1000))"
+        r"|(?:thousand|1000)[^\n]{0,60}\b0\.65\s*s\b",
+        "0.61 s",
+        "a thousand boxes in parallel; BENCHMARKS.md's table measures 0.61 s and its own rate column "
+        "agrees.",
+        set(),
+    ),
+    (
         r"\b344\s*ms\b",
         "285 to 294 ms",
         "docker run for the same task; 344 overstated the gap in kern's favour.",
@@ -133,6 +156,46 @@ def workspace_version() -> str:
 
 
 VERSION = workspace_version()
+
+
+def excluded_manifests_agree() -> list[str]:
+    """Manifests that ship in the release but cannot inherit the workspace version.
+
+    `windows/kern-win` is cross-compiled by release.yml and published as `kern-windows-x86_64.exe`,
+    so it ships with every release, and it sat at 0.6.7 while the workspace was at 0.6.35: 28
+    releases of drift on an artifact users download. Nothing surfaces that number to a user, which is
+    precisely why nobody noticed. `fuzz` is exempt on purpose: 0.0.0 says "never published".
+
+    The in-workspace path dependencies restate a version they cannot inherit either. It is only a
+    requirement (`0.6.7` means `^0.6.7`, which 0.6.35 satisfies, which is why nothing ever
+    complained), but it is what a `cargo publish` would carry, and it sat 28 releases behind too.
+    """
+    bad = []
+    try:
+        with open("windows/kern-win/Cargo.toml", encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'\s*version\s*=\s*"([^"]+)"', line)
+                if m:
+                    if VERSION and m.group(1) != VERSION:
+                        bad.append(
+                            f"windows/kern-win/Cargo.toml is {m.group(1)}, "
+                            f"the workspace is {VERSION}"
+                        )
+                    break
+    except OSError:
+        pass  # a checkout without the Windows tree is not a failure
+    try:
+        with open("crates/kern-cli/Cargo.toml", encoding="utf-8") as fh:
+            for i, line in enumerate(fh, 1):
+                m = re.search(r'path = "\.\./(kern-[a-z]+)", version = "([^"]+)"', line)
+                if m and VERSION and m.group(2) != VERSION:
+                    bad.append(
+                        f"crates/kern-cli/Cargo.toml:{i} requires {m.group(1)} "
+                        f"{m.group(2)}, the workspace is {VERSION}"
+                    )
+    except OSError:
+        pass
+    return bad
 
 
 def scan(path: str) -> list[tuple[int, str, str, str, str]]:
@@ -189,6 +252,11 @@ def main(argv: list[str]) -> int:
             print(f"  {lineno:>5}  {hit!r} was superseded by {now}")
             print(f"         {why}")
             print(f"         {ctx}")
+    for problem in excluded_manifests_agree():
+        total += 1
+        print(f"\n{problem}")
+        print("       an excluded workspace or a path dependency ships in the release but cannot "
+              "inherit the version, so it has to be bumped by hand. This is that hand.")
     n = len(files)
     print(f"\n{total} stale figure{'' if total == 1 else 's'} in {n} file{'' if n == 1 else 's'}")
     return 1 if total else 0

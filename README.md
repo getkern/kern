@@ -123,6 +123,52 @@ kern box job --image python:3.12-slim --read-only --cap-drop ALL --memory 256m \
 No network unless you ask, a read-only root, dangerous capabilities dropped, seccomp always on.
 Ninety runnable examples, each doing one thing: [examples/](examples/).
 
+## Resource profiles
+
+A slice is declared once in `~/.config/kern/kern.toml` and attached by name, to a sandboxed box or a
+bare process, with the same token.
+
+```toml
+[[cpu]]                     # the host budget a slice is carved from
+id    = "cpu:0"
+cores = 8.0
+
+[[vcpu]]                    # 1.5 cores and 512 MiB  ->  attach as  vcpu:heavy
+name    = "heavy"
+backend = "cpu:0"
+cpus    = 1.5
+memory  = "512m"
+
+[[vdisk]]                   # a 64 MiB scratch disk   ->  attach as  vdisk:scratch
+name    = "scratch"
+backend = "ram"
+size    = "64m"
+
+[[gpio]]                    # a controller anchor
+id = "gpio:0"
+
+[[vgpio]]                   # exactly one device node ->  attach as  vgpio:sensor
+name    = "sensor"
+backend = "gpio:0"
+i2c     = ["/dev/i2c-1"]
+```
+
+```sh
+kern validate ~/.config/kern/kern.toml       # check it before anything runs
+kern box train --image alpine vcpu:heavy vdisk:scratch -- ./train.sh
+kern run vcpu:heavy -- ./train.sh            # the same slice, no sandbox
+kern box iot --image alpine vgpio:sensor -- ls /dev
+```
+
+Profiles compose: several attach to one box, and an explicit flag beats a profile's own value. Every
+key is spelled like its CLI flag, so `cpus` is `--cpus` and `memory` is `--memory`.
+[docs/RESOURCES.md](docs/RESOURCES.md) has the field-by-field schema.
+
+**`vgpio:` is chip-granular, not per-line.** Asking for `pins` binds the whole `/dev/gpiochipN`, and
+that character device exposes every line of that controller. `pins = [17]` does not restrict the box
+to line 17: the kernel has no per-line mount boundary, so the pin list is cooperative metadata rather
+than a boundary. Naming a device node, as `i2c` above does, grants that node and nothing else.
+
 ## kern vs Docker vs Podman
 
 | | kern | Docker | Podman |
@@ -149,17 +195,20 @@ machine; yours will differ with your CPU, kernel and filesystem, which is why th
 | Cold start (bare box) | **2.2 ms** | 3.0 ms | 13.2 ms | 281.5 ms | 294.4 ms |
 | 200 boxes in parallel | **0.09 s** | 0.19 s | 0.30 s | 41.8 s | 16.6 s |
 
-A thousand simultaneous boxes take 0.65 s, all 1000 of them. One more live box costs 0.35 MB of real
+A thousand simultaneous boxes take 0.61 s, all 1000 of them. One more live box costs 0.35 MB of real
 memory. `exec` into a running box is 0.79 ms against Docker's 43.3.
 
 Re-run on the released binary on 2026-08-03: 2.3 ms, 0.10 s, `exec` 0.66 ms. The whole table moved
 by that much on the day, **bubblewrap included**, which is the machine's state rather than kern's
 code.
 
-kern does not win single-shot latency outright: bubblewrap is 0.8 ms ahead, and the physical floor
-for `unshare` + `exec` is 1 to 2 ms. The gap that matters is to the engines, 128 to 134x above, and
-bubblewrap is a launcher with no images, caps or lifecycle. Method, per-phase breakdown, board
-numbers and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
+Nobody wins single-shot latency outright: the physical floor for `unshare` + `exec` is 1 to 2 ms, so
+the top tier sits inside its own run-to-run noise. At the same level of work kern is ahead of
+bubblewrap on **every host where both are installed**, 2.2 ms against 2.9 here, 3.5 against 5.6 on a
+Jetson, 9.6 against 15.0 on an Arduino, and still ahead at 4.2 and 11.3 while enforcing a cgroup cap
+bubblewrap does not enforce at all. bubblewrap is a launcher with no images, caps or lifecycle. The
+gap that matters is to the engines, 128 to 134x above. Method, per-phase breakdown, board numbers
+and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
@@ -193,7 +242,7 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**0.6.34.** Everything above works today and is tested: 704 Rust, 69 Python and 56 Node tests,
+**0.6.35.** Everything above works today and is tested: 706 Rust, 72 Python and 57 Node tests,
 clippy-clean, `cargo-deny`-clean. Semver, pre-1.0: the CLI and config surface can still change
 between minor versions, always called out in [CHANGELOG.md](CHANGELOG.md). Releases are signed tags
 and timestamped to Bitcoin ([provenance/](provenance/)).

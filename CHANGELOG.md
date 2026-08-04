@@ -17,6 +17,142 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
+## [0.6.35], 2026-08-04
+
+### Fixed
+
+- **`kern-sandbox` did not drop capabilities, on the one code path whose purpose is running code
+  nobody has read** (`kern-sandbox` **0.1.14**, both bindings), while the README's own Quickstart
+  told a CLI user to write `--cap-drop ALL` for exactly that case. A `run_code` box was already
+  hardened with a read-only root, no network, an isolated workspace, a `--timeout` backstop and the
+  resource caps, and it still held `CapEff 00000110bdacffff`: kern's 13 dangerous capabilities were
+  gone and the rest were held over the box's own user namespace. It holds `0000000000000000` now,
+  verified end to end from both bindings.
+
+  Defence in depth rather than the host boundary, for the reason [SECURITY.md](SECURITY.md) gives
+  about `--cap-add`: those capabilities are namespaced, and the always-on seccomp filter refuses the
+  escape syscalls they would unlock either way. Measured to cost nothing on the supported workloads:
+  `python3 -c` runs, `pip install --target` over the network succeeds identically, and a native wheel
+  still compiles.
+
+  It is NOT behaviour-free, and the opt-out exists for the one case that changes: a workload binding
+  a port below 1024 INSIDE the box's own network namespace needs `CAP_NET_BIND_SERVICE`, measured to
+  go from working to `PermissionError`. Pass `cap_drop=()` in Python or `capDrop: []` in Node for the
+  previous behaviour, or a narrower set such as `("SYS_ADMIN", "NET_RAW")`. Names are validated at
+  construction like a profile token, since the value reaches kern's argv: `--net`, `net_admin`,
+  `NET ADMIN`, `CAP_`, a bare `"ALL"` string that would spread into three flags, and eleven other
+  shapes are refused with the spelling that works.
+
+- **The README said bubblewrap was "0.8 ms ahead" while its own table two lines above read kern 2.2
+  and bubblewrap 3.0.** Introduced by the commit that was leaning the README for the launch, and an
+  outside review repeated it back within the day. At the same level of work kern is ahead of
+  bubblewrap on every host where both are installed, and ahead even while enforcing a cgroup cap
+  bubblewrap does not enforce at all. bubblewrap leads only on the boards' default path, where kern
+  is paying a systemd scope to enforce those caps, which BENCHMARKS.md states plainly and now points
+  at the like-for-like table from.
+
+- **One number with two homes:** the README said a thousand boxes start in 0.65 s, BENCHMARKS.md
+  measures 0.61 and states 1640 box/s in the same row, and 1000/0.61 is 1639 while 1000/0.65 is 1538.
+
+- **`docs/CONFIG.md` documented 39 of the 49 `[box.NAME]` keys the parser accepts.** Missing:
+  `add_host`, `expose`, `init`, `labels`, `port`, `restart_max`, `stop_grace_period`, `stop_signal`,
+  `sysctls` and `ulimits`. All ten are parsed, forwarded and working, and several are the first thing
+  a Docker user reaches for. A reference that omits a working field is worse than no reference: the
+  reader concludes the field does not exist. Two of them, `port` and `expose`, also break the
+  document's own headline rule that every key maps to a CLI flag, because they are pod-scoped rather
+  than box-scoped; the rule now states its exceptions. It also never said that `compose up` starts
+  every service detached, so a reader went looking for a `detach` key that does not need to exist.
+
+- **`SECURITY.md` contradicted itself on the syscall counts.** One bullet said "34 syscalls denied:
+  24 that hard-kill plus the 10 that return ENOSYS" while two paragraphs below it still said "Nine,
+  in the five families" and "9 plus 24 is the 33", having been half-updated when `clone3` joined the
+  set in 0.6.34. The test covered only the first sentence, which is why the second survived a
+  release.
+
+- **Eight internal documentation links were dead**, in `ROADMAP.md`, `docs/DOCKER-COMPAT.md`,
+  `docs/INSTALL.md` and `docs/RESOURCES.md`. They pointed at README sections that had been renamed,
+  at a roadmap that became its own file, and in one case at a section of the very same file whose
+  title had changed from "&" to "and".
+
+- **Two sentences claimed to describe the CURRENT release while naming an older one**: `EDGE.md` said
+  "the current release, 0.6.32" and `SECURITY.md` was headed "Current status (0.6.30, honest)".
+
+- **An official image failed on a host without `newuidmap` and kern said nothing.** The `--image`
+  path maps a uid RANGE by default, because an image drops privilege in its entrypoint and needs
+  more than one id to do it. Where `newuidmap`/`newgidmap` or an `/etc/subuid` allocation is
+  missing, kern falls back to the safe single-uid map, and that fallback was silent: measured with
+  `nginx:alpine`, `chown nginx:nginx /tmp` succeeds with the range and returns
+  `chown: /tmp: Invalid argument` without it, so the image dies on an error of its own that names
+  neither the uid range nor kern.
+
+  The fix is deliberately NOT "warn earlier". A line at every box start on such a host is noise that
+  trains a reader to ignore stderr, and this project already carries one defect of that exact shape
+  in the `--memory` warning gated on the request rather than the outcome. The note is emitted on the
+  single combination that carries information: the range was wanted, could not be built, AND the box
+  exited non-zero. A zero exit says the box never needed it. An explicit `--no-uid-range` stays
+  silent, because that is the caller's own decision, and an explicit `--uid-range` keeps its existing
+  start-time warning rather than getting a second line about one situation.
+
+  The decision is a pure function so the gating is asserted rather than read, and both exit paths of
+  `run_in_sandbox_with` report: the PTY path returns early and is the one a refactor drops, which is
+  the same duplicated-condition shape, so a test counts the call sites and fails at one. Verified in
+  both directions. The end-to-end trigger was NOT reproduced on the development host, which has
+  `newuidmap` and a subuid allocation; what is verified there is the truth table, the call sites and
+  that `chown` fails exactly as described without the range.
+
+- **The README stated 703 Rust tests and the suite had 704**, and the gate written for it checked
+  only the Rust number while the Python one drifted from 71 to 72 in the same session. A gate that
+  covers one of the three counts in a sentence protects that sentence one third of the way. All
+  three are checked now, each from its own source: `cargo test -- --list` and
+  `pytest --collect-only` enumerate without running, and the Node count is read from the test file
+  because `node --test` has no list mode. Verified in all three directions plus the case where the
+  README drops a count entirely.
+
+- **Two manifests that ship in the release carried a version nothing could inherit.**
+  `windows/kern-win`, cross-compiled and published as `kern-windows-x86_64.exe`, was at 0.6.7, and
+  `crates/kern-cli` required its four sibling crates at 0.6.7. The dependency form is a requirement
+  (`^0.6.7`, satisfied by 0.6.35), which is why nothing ever complained, and it is what a
+  `cargo publish` would carry.
+
+- **kern reported only the FIRST line of `pasta`'s stderr** when a pod could not get outbound
+  networking. On WSL2 that first line is "Started as root, will change to nobody.", true and useless:
+  the reason is four lines below. All the lines are joined now, capped at 300 characters and scrubbed
+  as before, and the message ends with `Couldn't open user namespace /proc/<pid>/ns/user: Permission
+  denied`.
+
+### Changed
+
+- **The documentation is about half the words it was, with no measurement removed.** `CHANGELOG.md`
+  32409 to 6634 (38 released versions to 3; the rest live in the 26 signed tags, and the file says
+  so), `OPEN_ITEMS.md` 4149 to 918, `BENCHMARKS.md` 7614 to 3932, `SECURITY.md` 6484 to 3790, the
+  README's prose 1170 to 1044. What came out was duplication and narration: sections titled RESOLVED
+  in a file of open items, entries about the test suite rather than the product, paragraphs
+  explaining what an earlier version of the same file had got wrong. Every table, every figure and
+  every caveat stayed.
+
+- **The source comments are all in English.** Eighty-nine lines across six files were in Italian,
+  along with the assertion messages a failing test prints. On a public project soliciting
+  contributions, a comment a reader cannot read is a comment that is not there.
+
+- **The project names a maintainer.** `NOTICE` and the CLA said "kern contributors" and "the project
+  maintainer", a group and a party that appear nowhere else in the repo, and `Cargo.toml` shipped the
+  same phrase into the crate metadata. The contributor graph says one.
+
+### Added
+
+- **Five gates, because each of the above is a class rather than an incident.**
+  `scripts/stale-numbers.py` reads the version from `Cargo.toml` and flags any sentence claiming to
+  be current while naming a different one, checks the manifests that cannot inherit that version, and
+  carries the two figures above. `every_box_key_is_documented` slices the compose key match between
+  two markers and asserts every arm appears in `docs/CONFIG.md`. `scripts/test-count.py` counts with
+  `cargo test -- --list`, which enumerates without running, and compares against the README. Each is
+  verified in both directions: it fails on the defect it was written for.
+
+- `the_syscall_counts_in_the_docs_match_the_filter` now pins the word form in `SECURITY.md` as well,
+  and collapses whitespace before searching. These pages are hard-wrapped at 100 columns, so a needle
+  only had to straddle a line break to stop matching, and a green test would then have meant the
+  prose was reflowed rather than right.
+
 ## [0.6.34], 2026-08-03
 
 ### Fixed
@@ -548,6 +684,7 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 [tag list](https://github.com/getkern/kern/tags). All 26 tags are signed and timestamped to
 Bitcoin ([provenance/](provenance/)).
 
+[0.6.35]: https://github.com/getkern/kern/releases/tag/v0.6.35
 [0.6.34]: https://github.com/getkern/kern/releases/tag/v0.6.34
 [0.6.32]: https://github.com/getkern/kern/releases/tag/v0.6.32
 [0.6.31]: https://github.com/getkern/kern/releases/tag/v0.6.31

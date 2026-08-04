@@ -2469,6 +2469,9 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // into it; then we unshare only pid/uts/ipc (mount is unshared in the child). No uid map - the
     // holder already mapped the pod user ns. This branch is fully separate from the normal one, so a
     // non-pod box is byte-for-byte unaffected.
+    // Set in the non-pod branch below when a uid range was wanted and could not be built. Read once,
+    // at the two exit points, and only when the box also failed: see `hint_missing_uid_range`.
+    let mut range_unmet = false;
     if let Some(holder) = spec.pod_holder {
         let open_ns = |kind: &str| -> i32 {
             let p = format!("/proc/{holder}/ns/{kind}\0");
@@ -2532,6 +2535,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         } else {
             None
         };
+        // Wanted and not buildable. Recorded for the ONE moment it is information rather than
+        // noise: a non-zero exit, at the two returns below. `Requested` is deliberately excluded,
+        // because it was already reported above, and saying the same thing twice about one
+        // situation is how a message stops being read. Assigned here because the `match` below
+        // consumes `range`, and declared outside this branch because a `--pod` box takes the other
+        // one and never builds a range at all.
+        range_unmet = spec.uid_range == UidRange::ImageDefault && range.is_none();
         match range {
             Some(range) => apply_userns_range(ns_flags, euid, egid, &range)?,
             None => {
@@ -2631,6 +2641,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
             unsafe { libc::close(slave) };
         }
         let code = pty_pump_and_wait(master, pid);
+        hint_missing_uid_range(range_unmet, code);
         return Ok(code); // `forwarders` drops here and stops them
     }
     // Reap the box (EINTR-robust, so a signal can't return early and drop the cgroup guard on a
@@ -2641,7 +2652,51 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     if rc < 0 {
         return Err(Error::last("waitpid"));
     }
-    Ok(wait_code(status))
+    let code = wait_code(status);
+    hint_missing_uid_range(range_unmet, code);
+    Ok(code)
+}
+
+/// Say why an official image may have just failed, at the one moment that is information.
+///
+/// The `--image` path maps a uid RANGE by default, because an official image drops privilege in its
+/// entrypoint and needs more than one id to do it. Where `newuidmap`/`newgidmap` or an `/etc/subuid`
+/// allocation is missing the range cannot be built, and kern falls back to the safe single-uid map.
+/// That fallback is silent on purpose: most images do not care, and a line on every box start on
+/// such a host is noise that trains a reader to ignore stderr. This project already carries one
+/// defect of exactly that shape, in the `--memory` warning gated on the request rather than the
+/// outcome, so the fix here is deliberately not "warn earlier".
+///
+/// nginx does care. Measured with `nginx:alpine`: `chown nginx:nginx /tmp` succeeds with the range
+/// and fails with `chown: /tmp: Invalid argument` without it, which is what its entrypoint runs
+/// before starting. The image then dies on an error naming neither the uid range nor kern, and the
+/// reader has nothing to search for.
+///
+/// So the line is emitted on the single combination where it carries information: the range was
+/// wanted, could not be built, AND the box exited non-zero. It is worded as a possibility because it
+/// is one - a workload is free to fail for its own reasons, and nothing here can tell the two apart.
+/// A zero exit says the box did not need the range, which is the common case and stays silent.
+/// The decision, split from the printing so the gating is testable without capturing stderr. Both
+/// halves of the condition matter and each is a separate defect if dropped: without `range_unmet`
+/// the note fires on every failing box, which is noise; without `code != 0` it fires on every box on
+/// a host with no `newuidmap`, which is the noise the silent fallback exists to avoid.
+#[inline]
+const fn should_hint_uid_range(range_unmet: bool, code: i32) -> bool {
+    range_unmet && code != 0
+}
+
+#[inline]
+fn hint_missing_uid_range(range_unmet: bool, code: i32) {
+    if !should_hint_uid_range(range_unmet, code) {
+        return;
+    }
+    eprintln!(
+        "kern: note: this box ran with a single-uid map because a uid range was unavailable (needs \
+         newuidmap/newgidmap and an /etc/subuid+/etc/subgid allocation). An image that chowns or \
+         drops privilege in its entrypoint fails that way, with an error of its own that does not \
+         mention it. Install `uidmap` (Debian/Ubuntu) or `shadow-uidmap` (Alpine), or pass \
+         --no-uid-range to say the single-uid map is what you want."
+    );
 }
 
 /// Pump the host's stdin/stdout against a PTY `master` while the box (`pid`) runs, returning its
@@ -3813,5 +3868,69 @@ mod open_dev_pinned_tests {
                 "an intermediate symlink under /dev must not be followed"
             );
         }
+    }
+}
+
+/// The uid-range note has two halves to its condition and each is a separate defect if dropped, so
+/// the truth table is asserted rather than read.
+///
+/// It exists because an official image that `chown`s in its entrypoint dies on a host without
+/// `newuidmap`, with an error of its own that names neither the uid range nor kern. Measured with
+/// `nginx:alpine`: `chown nginx:nginx /tmp` succeeds with the range and returns
+/// `chown: /tmp: Invalid argument` without it.
+///
+/// It is NOT emitted when the range was simply not wanted (`--no-uid-range`, or a `--rootfs` box),
+/// which is the caller's own decision, and not when the box exited 0, which says the range was not
+/// needed. Those two exclusions are the whole reason the fallback can stay silent everywhere else.
+#[cfg(test)]
+mod uid_range_hint_fires_only_when_it_is_information {
+    use super::should_hint_uid_range;
+
+    #[test]
+    fn the_truth_table_is_exactly_one_of_four() {
+        // The only combination that carries information: wanted, unavailable, and the box failed.
+        assert!(
+            should_hint_uid_range(true, 1),
+            "unmet range + failure must speak"
+        );
+        assert!(
+            should_hint_uid_range(true, 137),
+            "any non-zero code, not just 1"
+        );
+        assert!(
+            should_hint_uid_range(true, -1),
+            "a signal-derived negative code is still a failure"
+        );
+
+        // Silent everywhere else, and each of these is a different reason.
+        assert!(
+            !should_hint_uid_range(true, 0),
+            "the box succeeded, so it never needed the range: saying so would be noise on every \
+             box start on a host without newuidmap, which is what the silent fallback avoids"
+        );
+        assert!(
+            !should_hint_uid_range(false, 1),
+            "the range was mapped or never wanted: this failure is the workload's own"
+        );
+        assert!(!should_hint_uid_range(false, 0), "nothing happened");
+    }
+
+    /// Both exit paths of `run_in_sandbox_with` must call it: the PTY path (`-it`) returns early and
+    /// is easy to forget, which is this project's `derived-condition-duplicated` shape. Asserted on
+    /// the source because the two returns cannot be funnelled into one without restructuring a
+    /// function that forks.
+    #[test]
+    fn every_exit_path_of_the_sandbox_reports_it() {
+        let src = include_str!("real.rs");
+        // Split so the needle does NOT appear verbatim in this file: `include_str!` pulls in this
+        // test too, and the first version counted its own search string as a third call site. It
+        // then "passed" when a real call was deleted, which is a test that measures itself.
+        let needle = concat!("hint_missing_uid_range", "(range_unmet, code);");
+        let calls = src.matches(needle).count();
+        assert_eq!(
+            calls, 2,
+            "run_in_sandbox_with has two returns that carry an exit code, the PTY one and the \
+             waitpid one, and both must report. Found {calls} call sites."
+        );
     }
 }

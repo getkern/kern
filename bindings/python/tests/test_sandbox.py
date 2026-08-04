@@ -8,6 +8,8 @@ Run: `pytest`  (integration auto-skips without a real kern; set `KERN_BIN=/path/
 """
 
 import errno
+import re
+from pathlib import Path
 import os
 import shutil
 import subprocess
@@ -46,6 +48,79 @@ def test_defaults_are_fail_closed():
     assert s.memory_mb is not None and s.pids is not None
     argv = s._base_argv("n", network=False, timeout_s=s.timeout_s)
     assert "--net" not in argv and "--timeout" in argv and "--ro" in argv
+
+
+def test_capabilities_are_dropped_by_default_and_the_opt_out_is_explicit():
+    """The default box drops every capability, and only an explicit `cap_drop=()` keeps them.
+
+    kern always drops 13 dangerous capabilities; the rest were held over the box's own user
+    namespace, on the one code path whose whole purpose is running code nobody has read, while the
+    README told a CLI user to write `--cap-drop ALL` for exactly that case. Measured before the
+    change: a box held CapEff 00000110bdacffff, and with the flag it holds 0000000000000000.
+    """
+    argv = _cfg()._base_argv("n", network=False, timeout_s=30)
+    assert "--cap-drop" in argv, "the default must drop capabilities"
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+    # The flag must land BEFORE the `--` that ends kern's own arguments, or kern would read it as
+    # part of the workload command. There is no `--` in _base_argv itself, so assert the shape that
+    # matters: it sits among the flags, after the image, and nothing follows it into the command.
+    assert argv.index("--cap-drop") > argv.index("--image")
+
+    # The opt-out exists because the change is not behaviour-free: a workload binding a port below
+    # 1024 inside the box needs CAP_NET_BIND_SERVICE. It has to be asked for by name.
+    assert "--cap-drop" not in _cfg(cap_drop=())._base_argv("n", network=False, timeout_s=30)
+
+    # A narrower set is passed through one flag per name, in order.
+    narrow = _cfg(cap_drop=("SYS_ADMIN", "CAP_NET_RAW"))._base_argv("n", network=False, timeout_s=30)
+    assert narrow.count("--cap-drop") == 2
+    assert narrow[narrow.index("--cap-drop") + 1] == "SYS_ADMIN"
+
+    # The setup box is hardened the same way: it installs dependencies, from the network, which is
+    # precisely when a hostile package would run its own code.
+    setup = _cfg()._base_argv("n", network=True, timeout_s=30, is_setup=True)
+    assert "--cap-drop" in setup
+
+
+def test_both_bindings_validate_a_capability_name_identically():
+    """The Python and Node bindings guard the same argv boundary with the same rule.
+
+    Two copies of one rule is this project's `derived-condition-duplicated` shape: if one binding
+    tightened or loosened its pattern, the same string would be accepted by one SDK and refused by
+    the other, and nothing would say so. The regexes are compared literally rather than by behaviour
+    because a behavioural comparison would need a JS engine, and a literal difference is the thing
+    that goes wrong first.
+
+    Skips when the Node source is absent, which is the case in a published wheel.
+    """
+    node = Path(__file__).resolve().parents[3] / "bindings" / "node" / "index.js"
+    if not node.is_file():
+        pytest.skip(f"no Node source at {node} (published wheel)")
+    src = node.read_text(encoding="utf-8")
+    m = re.search(r"const CAP_RE = /(.+)/;", src)
+    assert m, "bindings/node/index.js no longer defines CAP_RE"
+    from kern_sandbox import _CAP_RE
+
+    assert m.group(1) == _CAP_RE.pattern, (
+        f"the two bindings disagree on what a capability name is:\n"
+        f"  node:   {m.group(1)}\n"
+        f"  python: {_CAP_RE.pattern}"
+    )
+
+
+def test_a_capability_name_can_never_smuggle_another_flag():
+    """`cap_drop` reaches kern's argv, so it is validated like a profile token rather than trusted."""
+    for bad in ("--net", "-v /etc:/etc", "net_admin", "NET ADMIN", "NET;rm", "NET\n", "",
+                "CAP_", "1NET", "A" * 40, "--cap-add", "NET_", "_NET", "NET__RAW", "ALL "):
+        with pytest.raises(SandboxError):
+            _cfg(cap_drop=(bad,))
+    # And the names that MUST work, or the opt-out is useless: the bare form, the CAP_ form, and a
+    # multi-segment name. A validator that only ever says no is not one anybody can use.
+    for good in ("ALL", "SYS_ADMIN", "CAP_NET_BIND_SERVICE", "DAC_OVERRIDE", "MKNOD"):
+        assert _cfg(cap_drop=(good,))._cap_drop_args == ["--cap-drop", good]
+    # A bare string is a Sequence[str] and would iterate into single characters, producing three
+    # bogus flags from "ALL". Refused by name, with the spelling that works.
+    with pytest.raises(SandboxError):
+        _cfg(cap_drop="ALL")
 
 
 def test_profiles_validated_and_placed_in_argv():

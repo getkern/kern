@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.13";
+const VERSION = "0.1.14";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -552,6 +552,12 @@ function validateProfile(token) {
 // re-validates and SSRF-checks the resolved IPs; this is the binding's first gate.
 const DOMAIN_RE = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 
+// A Linux capability name for `kern box --cap-drop`, with or without the CAP_ prefix, or the literal
+// ALL. Underscore-JOINED uppercase segments rather than "any of [A-Z0-9_]": the looser form accepts
+// "CAP_", because the optional prefix does not have to consume it. Not a way to smuggle a flag, but
+// a name kern rejects at box start, and validating here exists to fail at construction instead.
+const CAP_RE = /^(?=.{1,32}$)(?:CAP_)?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/;
+
 /** Validate one egress-allowlist domain (an FQDN like "pypi.org") before it reaches the argv. */
 function validateDomain(domain) {
   if (typeof domain !== "string" || !DOMAIN_RE.test(domain))
@@ -560,6 +566,16 @@ function validateDomain(domain) {
         "(no scheme, port, path, wildcard or spaces)",
     );
   return domain;
+}
+
+/** Validate one capability name for `--cap-drop` before it reaches the argv. */
+function validateCap(name) {
+  if (typeof name !== "string" || !CAP_RE.test(name))
+    throw new SandboxError(
+      `invalid capability ${JSON.stringify(name)}: expected 'ALL' or an uppercase capability name ` +
+        "such as 'NET_BIND_SERVICE' or 'CAP_NET_BIND_SERVICE'",
+    );
+  return name;
 }
 
 /** Map a Node close event {code, signal} to a unix-style rc (128 + signum for a signal). */
@@ -765,6 +781,13 @@ class Sandbox {
     this.onStderr = opts.onStderr ?? null;
     this.enforceLimits = opts.enforceLimits ?? true;
     this.depsReadonly = opts.depsReadonly ?? false;
+    // Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
+    // The default drops the lot: kern already drops 13 dangerous capabilities unconditionally, but the
+    // rest were still held over the box's own user namespace, on the one code path whose purpose is
+    // running code nobody has read. Defence in depth rather than the boundary itself, and measured to
+    // cost nothing. It is NOT behaviour-free: a workload binding a port below 1024 INSIDE the box
+    // needs CAP_NET_BIND_SERVICE. Pass `capDrop: []` for the previous behaviour.
+    this.capDrop = opts.capDrop ?? ["ALL"];
     // trackFiles=true populates result.files by walking the workspace before AND after each call (O(N)
     // in file count); a long session that accretes files slows every runCode. false = result.files [], O(1).
     this.trackFiles = opts.trackFiles ?? true;
@@ -790,6 +813,17 @@ class Sandbox {
         this._mountArgs.push("-v", ro ? `${real}:${tgt}:ro` : `${real}:${tgt}`);
       }
     }
+    // A bare string has a .map-less shape here, but Array.from("ALL") would yield ["A","L","L"] and
+    // three bogus flags, so refuse the string by name and say what to write instead.
+    if (typeof this.capDrop === "string")
+      throw new SandboxError(
+        `capDrop must be an array of names, not a bare string: write capDrop: [${JSON.stringify(
+          this.capDrop,
+        )}] for one, or capDrop: [] to drop none`,
+      );
+    if (!Array.isArray(this.capDrop))
+      throw new SandboxError("capDrop must be an array of capability names");
+    this._capDropArgs = this.capDrop.flatMap((c) => ["--cap-drop", validateCap(c)]);
     this._profileArgs = (this.profiles || []).map(validateProfile);
     this._egressAllow = (this.egressAllow || []).map(validateDomain);
     if (this._egressAllow.length && this.network)
@@ -881,6 +915,7 @@ class Sandbox {
       }
     }
     // kern's own --timeout is a tight BACKSTOP just beyond our deadline; OUR wait is the authority.
+    argv.push(...this._capDropArgs);
     argv.push("--timeout", String(Math.floor(timeoutS) + 5));
     if (this.memoryMb !== null) argv.push("--memory", `${this.memoryMb}m`);
     if (this.cpus !== null) argv.push("--cpus", String(this.cpus));
