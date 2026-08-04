@@ -1754,7 +1754,13 @@ pub fn run(
     // `KERN_NO_SCOPE=1` was the only way to see it once. Same guard as the four other
     // first-pass-only checks in this file. The env vars are NOT guarded: the second pass is the one
     // that execs the workload, so it needs them set.
-    let first_pass = std::env::var_os("KERN_SCOPE").is_none();
+    //
+    // Short-circuited on the profile lists so `var_os` (which returns an owned `OsString`, i.e. an
+    // allocation) is not called on the common `kern run -- cmd` with no profile attached. The first
+    // version of this line was unconditional and put a getenv plus an allocation on every run for a
+    // message that could not be printed.
+    let first_pass =
+        (!vgpio.is_empty() || !vdisk.is_empty()) && std::env::var_os("KERN_SCOPE").is_none();
     // `run` has no sandbox, so a `vgpio:` profile can't confine devices - instead export it as env
     // (`KERN_VGPIO_NAME`/`_PINS`), so a cooperative workload can find its pins. To
     // actually *isolate* the peripherals, use `kern box vgpio:NAME …`.

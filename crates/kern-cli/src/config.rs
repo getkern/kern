@@ -2036,6 +2036,26 @@ impl ProfileKind {
 /// that names the fix - so a config (hand-written or LLM-generated) can never silently attach a
 /// profile to an ambiguous or non-existent host resource. Pure + allocation-light (one `trim`, an
 /// iterator scan, a format only on the error path); panic-free (no `unwrap`/`expect`/`panic!`).
+/// How much of an untrusted value is echoed back in an error.
+///
+/// A `kern.toml` is not always the user's own file, and the value is quoted into a message that goes
+/// to a terminal. A 4 KiB backend produced a 4362-byte error line, measured; the same class is
+/// already bounded on the `pasta` stderr path, at the same 300. Control characters are removed at
+/// the print site; this is the length half of the same problem.
+const ECHO_MAX: usize = 300;
+
+/// The first [`ECHO_MAX`] characters of an untrusted value, with an explicit marker when cut.
+///
+/// Counts CHARACTERS, not bytes: slicing a UTF-8 string at a byte offset can land mid-character and
+/// panic, and this runs on a value nobody validated.
+fn echo(value: &str) -> String {
+    if value.chars().count() <= ECHO_MAX {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(ECHO_MAX).collect();
+    format!("{head}… ({} chars)", value.chars().count())
+}
+
 fn require_backend<'a>(
     backend: &str,
     kind: ProfileKind,
@@ -2051,17 +2071,36 @@ fn require_backend<'a>(
              (`kern config setup` writes one per resource it finds on this host)"
         ));
     }
-    if b == value {
-        return Ok(());
+    // The declared ids are scanned BEFORE the sentinel shortcut, because the ambiguous case is
+    // exactly the one the shortcut used to skip: a `[[disk]]` whose id is literally `ram` makes
+    // `backend = "ram"` mean two things at once. This function would read the sentinel and
+    // `resolve_vdisk` would find the declared pool, so the two halves disagree, and renaming that
+    // block later would move the profile from a real disk to a tmpfs without a word. Measured: such
+    // a config was accepted and resolved to the declared pool.
+    //
+    // One pass over a handful of physical blocks, and no early break, so a collision later in the
+    // list is caught too.
+    let mut matched = false;
+    for id in declared {
+        if id == value {
+            return Err(format!(
+                "{phys} id '{}' is the reserved backend `{value}`, which already means {means}: a \
+                 profile naming it would be ambiguous. Rename the {phys}.",
+                echo(id)
+            ));
+        }
+        if backend_ref_matches(b, prefix, id) {
+            matched = true;
+        }
     }
-    let mut declared = declared;
-    if declared.any(|id| backend_ref_matches(b, prefix, id)) {
+    if b == value || matched {
         return Ok(());
     }
     Err(format!(
-        "backend '{b}' is not a configured {phys} id (use `backend = \"{value}\"` for {means}, or \
+        "backend '{}' is not a configured {phys} id (use `backend = \"{value}\"` for {means}, or \
          declare a {phys}: `kern config setup` writes one per resource it finds on this host, and \
-         `kern top` materialises one from a device you pick)"
+         `kern top` materialises one from a device you pick)",
+        echo(b)
     ))
 }
 
@@ -3140,6 +3179,79 @@ mod the_backend_error_is_true_for_each_kind {
             assert!(e.contains(k.sentinel().means), "{k:?}: {e}");
             assert!(e.contains("kern config setup"), "{k:?}: {e}");
         }
+    }
+
+    /// A physical block whose id IS the reserved sentinel makes the backend mean two things: this
+    /// validator would read the sentinel, `resolve_*` would find the declared block, and renaming
+    /// that block later would move the profile from a real resource to the host-wide one without a
+    /// word. Measured before this was closed: `[[disk]] id = "ram"` was accepted and resolved to the
+    /// declared pool.
+    #[test]
+    fn a_physical_id_equal_to_the_sentinel_is_refused_for_every_kind() {
+        for k in KINDS {
+            let sentinel = k.sentinel().value;
+            // Refused whatever the backend says: with the sentinel, where the ambiguity bites...
+            let Err(e) = require_backend(sentinel, k, std::iter::once(sentinel)) else {
+                panic!(
+                    "{k:?}: a {} id equal to `{sentinel}` must be refused",
+                    k.phys()
+                );
+            };
+            assert!(e.contains("is the reserved backend"), "{k:?}: {e}");
+            assert!(e.contains(k.phys()), "{k:?} does not name the block: {e}");
+            // ...and with anything else, so the collision is reported even when this profile did
+            // not happen to name it.
+            assert!(
+                require_backend("something-else", k, std::iter::once(sentinel)).is_err(),
+                "{k:?}: the collision must be reported regardless of this profile's backend"
+            );
+            // A collision LATER in the list is caught too: the scan does not stop at the first
+            // match.
+            let ids = ["real-one", sentinel];
+            assert!(
+                require_backend("real-one", k, ids.into_iter()).is_err(),
+                "{k:?}: a collision after a matching id was missed"
+            );
+        }
+    }
+
+    /// The value quoted back is untrusted and goes to a terminal. A 4 KiB backend produced a
+    /// 4362-byte error line, measured, which is the length half of the same problem the control
+    /// characters were. Truncation counts CHARACTERS: slicing UTF-8 at a byte offset can land
+    /// mid-character and panic, on a value nobody validated.
+    #[test]
+    fn an_oversized_backend_is_echoed_bounded_and_on_a_char_boundary() {
+        let long = "x".repeat(4096);
+        let Err(e) = require_backend(&long, super::ProfileKind::Vdisk, std::iter::empty()) else {
+            panic!("an undeclared backend must be refused");
+        };
+        assert!(e.contains("… (4096 chars)"), "no truncation marker: {e}");
+        assert!(e.len() < 900, "the error is {} bytes, unbounded", e.len());
+
+        // Multi-byte, so a byte-offset slice would panic or produce invalid UTF-8.
+        let wide = "è中\u{1f600}".repeat(200);
+        let Err(e) = require_backend(&wide, super::ProfileKind::Vdisk, std::iter::empty()) else {
+            panic!("an undeclared backend must be refused");
+        };
+        assert!(e.contains("… (600 chars)"), "{e}");
+        assert!(
+            e.is_char_boundary(e.len()),
+            "the message is not valid UTF-8"
+        );
+
+        // Exactly at the limit: not truncated, no marker.
+        let exact = "y".repeat(super::ECHO_MAX);
+        let Err(e) = require_backend(&exact, super::ProfileKind::Vdisk, std::iter::empty()) else {
+            panic!("an undeclared backend must be refused");
+        };
+        assert!(
+            !e.contains('…'),
+            "a value exactly at the limit was truncated: {e}"
+        );
+        assert!(
+            e.contains(&exact),
+            "the value at the limit was not echoed whole"
+        );
     }
 
     /// A validator that only says no is not one anybody can use. Every kind must accept its own

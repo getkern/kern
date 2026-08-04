@@ -77,7 +77,7 @@ fn main() -> ExitCode {
         match shim::translate(&args) {
             Ok(translated) => args = translated,
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: {}", ui::scrub(&e.to_string()));
                 return ExitCode::FAILURE;
             }
         }
@@ -92,9 +92,21 @@ fn main() -> ExitCode {
     match cli::run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            // These two lines are the ONLY place an error reaches the user, so they are where the
+            // control characters come off. An error message can carry a string kern did not write:
+            // a `backend` value out of a `kern.toml`, a size, a profile name, a registry's reply.
+            // Measured on 2026-08-04: a config whose `backend` held ESC[2K ESC[1A ESC[32m made the
+            // refusal erase its own line, move the cursor up and repaint in green, so a rejection
+            // could be made to read as a success. That class was closed for the registry path and
+            // never for this one.
+            //
+            // Scrubbed HERE rather than at the ~27 sites that format a config value, because the
+            // next message added would not be. No error message in this CLI is multi-line (checked
+            // across every `Error::*` construction), so dropping control characters joins nothing,
+            // and a clean message is byte-identical after the filter.
+            eprintln!("error: {}", ui::scrub(&e.to_string()));
             if let Some(hint) = e.hint() {
-                eprintln!("hint: {hint}");
+                eprintln!("hint: {}", ui::scrub(&hint));
             }
             ExitCode::FAILURE
         }

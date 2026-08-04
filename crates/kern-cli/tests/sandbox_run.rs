@@ -2234,3 +2234,97 @@ fn stopping_a_box_leaves_no_timeout_watchdog_behind() {
          --timeout watchdog is sleeping out the rest of its deadline instead of leaving with the box"
     );
 }
+
+/// A `kern.toml` is not always the user's own file: it travels with a project, a script exports
+/// `KERN_CONFIG`, `--config` takes a path. So the strings in it are untrusted input, and the error
+/// messages that quote them reach a terminal.
+///
+/// Measured on 2026-08-04, before this was closed: a `backend` value holding the real bytes
+/// `ESC[2K ESC[1A ESC[32m` came out of `kern` unfiltered, so the refusal erased its own line, moved
+/// the cursor up one, and repainted in green. A rejection could be made to read as a success. A
+/// carriage return did the same to the start of the line. Five fields leaked: the profile name, the
+/// size, and the `backend` of all three profile kinds.
+///
+/// The fix is at the two places an error reaches the user rather than at the sites that format a
+/// value, so a message added later is covered without anyone remembering. This test asserts the
+/// property end to end, on the real binary, because that is the only place the whole path exists.
+#[test]
+fn a_hostile_kern_toml_cannot_inject_escapes_into_an_error() {
+    let dir = std::env::temp_dir().join(format!("kern-ansi-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let cfg = dir.join("kern.toml");
+
+    // Real control bytes, not the text "\\u001b": an earlier version of this check wrote the escape
+    // sequence as literal characters, TOML never turned them into one byte, and it proved nothing.
+    let esc = "\u{1b}[2K\u{1b}[1A\u{1b}[32mLOOKS OK\u{1b}[0m";
+    let cases: [(&str, String); 3] = [
+        (
+            "vdisk backend",
+            format!("[[vdisk]]\nname = \"p\"\nbackend = \"{esc}\"\nsize = \"8m\"\n"),
+        ),
+        (
+            "vdisk size",
+            format!("[[vdisk]]\nname = \"p\"\nbackend = \"ram\"\nsize = \"{esc}\"\n"),
+        ),
+        (
+            "vcpu backend",
+            format!("[[vcpu]]\nname = \"p\"\nbackend = \"{esc}\"\ncpus = 1\n"),
+        ),
+    ];
+
+    for (what, body) in cases {
+        if std::fs::write(&cfg, &body).is_err() {
+            eprintln!("skip: cannot write {}", cfg.display());
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let kind = if what.starts_with("vcpu") {
+            "vcpu"
+        } else {
+            "vdisk"
+        };
+        let out = match kern()
+            .env("KERN_CONFIG", &cfg)
+            .args([
+                "box",
+                "ansiprobe",
+                "--image",
+                "alpine:3.19",
+                &format!("{kind}:p"),
+                "--",
+                "true",
+            ])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("skip: cannot run kern: {e}");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        // stderr AND stdout: an escape is just as effective on either stream.
+        for (stream, bytes) in [("stderr", &out.stderr), ("stdout", &out.stdout)] {
+            assert!(
+                !bytes.contains(&0x1b),
+                "{what}: an ESC byte (0x1b) reached {stream}, so a crafted kern.toml can repaint \
+                 kern's own output: {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            assert!(
+                !bytes.contains(&b'\r'),
+                "{what}: a carriage return reached {stream}, which overwrites the start of the \
+                 line: {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        // The message must still SAY something: scrubbing that emptied the error would pass the
+        // assertions above and be worse than the defect.
+        assert!(
+            !out.stderr.is_empty(),
+            "{what}: the box was refused with an empty stderr"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

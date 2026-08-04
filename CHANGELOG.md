@@ -39,6 +39,30 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
   why the opt-out exists: a workload binding a port below 1024 inside the box needs
   `CAP_NET_BIND_SERVICE`. Pass `cap_drop=()` or `capDrop: []`.
 
+- **A crafted `kern.toml` could repaint kern's own output.** A `backend` value holding the real
+  bytes `ESC[2K ESC[1A ESC[32m` came out unfiltered, so the refusal erased its own line, moved the
+  cursor up and repainted in green: a rejection could be made to read as a success. A carriage
+  return did the same to the start of the line. Five fields leaked, measured: the profile name, the
+  size, and the `backend` of all three kinds. A `kern.toml` is not always the user's own file, since
+  it travels with a project and `--config`/`KERN_CONFIG` take a path.
+
+  This class was closed for the registry path and never for this one. It is scrubbed at the two
+  places an error reaches the user rather than at the ~27 sites that format a config value, because
+  the next message added would not be; no error message in this CLI is multi-line, checked across
+  every construction, so removing control characters joins nothing and a clean message is unchanged.
+  What survives is inert printable text.
+
+  With it, the LENGTH half of the same problem: a 4 KiB backend produced a 4362-byte error line.
+  Bounded to 300 characters with the count named, truncating on CHARACTER boundaries, since slicing
+  UTF-8 at a byte offset can split a character.
+
+- **A physical block whose id was the reserved sentinel was accepted, and the two halves disagreed
+  about it.** `[[disk]] id = "ram"` made `backend = "ram"` mean two things: validation read the
+  reserved word and the resolver found the declared pool. Renaming that block would have moved the
+  profile from a real disk to a tmpfs without a word. The declared ids are scanned before the
+  sentinel shortcut now, so the collision is refused whatever the backend says, and a collision
+  later in the list is caught too.
+
 - **Three asymmetries between the profile kinds, found by building the parity matrix rather than by
   reading.** `vcpu:`, `vgpio:` and `vdisk:` are one model attached the same way, and three places
   treated one of them differently:
