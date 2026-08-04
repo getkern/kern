@@ -190,6 +190,7 @@ fn every_flag_the_parser_accepts_is_advertised_in_help() {
 /// cannot be kept in agreement by attention, so they are refused.
 #[test]
 fn no_verb_advertises_a_flag_twice() {
+    let mut total_flags = 0usize;
     for verb in ["box", "run", "compose", "pull", "push", "volume", "pod"] {
         let out = kern().args([verb, "--help"]).output().expect("run kern");
         let text = String::from_utf8_lossy(&out.stdout);
@@ -212,14 +213,212 @@ fn no_verb_advertises_a_flag_twice() {
                 seen.push(flag);
             }
         }
-        assert!(
-            !seen.is_empty(),
-            "`kern {verb} --help` advertised no flags at all, so this test guards nothing"
-        );
+        // Per-verb emptiness is NOT an error. `kern <verb> --help` is a slice of the reference, and
+        // only `box` and `run` carry an `OPTIONS for …` block; the rest describe their flags inline
+        // on the COMMANDS line, which this loop deliberately does not treat as definitions. The
+        // guard against a vacuous test is therefore at the SET level, below.
+        total_flags += seen.len();
         assert!(
             dupes.is_empty(),
             "`kern {verb} --help` lists {dupes:?} more than once. Two entries for one flag drift \
              apart, and the reader believes whichever they reach first."
+        );
+    }
+    assert!(
+        total_flags > 10,
+        "only {total_flags} flag definitions were found across every verb, so this test is passing \
+         because it parsed nothing rather than because nothing is duplicated"
+    );
+}
+
+/// Every READ verb accepts `--json`.
+///
+/// The project's read/edit split says a read verb answers on the CLI and in JSON, and `kern top`
+/// does the editing. Five verbs held to it and four did not: `volume ls`, `pod ls`, `config list`
+/// and `diff` refused the flag, so a script reading those had to parse a table. Parsing a table is
+/// how a box-controlled filename becomes a forged row: `kern diff` prints `C /path`, one space, and
+/// the path is chosen by the workload.
+///
+/// The list is written out rather than derived, because the failure this guards is a NEW read verb
+/// shipping without JSON, and a derived list would grow to include it and stay green.
+#[test]
+fn every_read_verb_accepts_json() {
+    // (argv, needs a live subject). The ones needing a subject are checked for FLAG ACCEPTANCE
+    // only: they must not fail with "unknown flag", and "no running box named" is a pass, since it
+    // proves the parser took the flag and the verb got as far as looking for its argument.
+    let verbs: [(&[&str], bool); 9] = [
+        (&["ps", "--json"], false),
+        (&["images", "--json"], false),
+        (&["stats", "--json"], false),
+        (&["volume", "ls", "--json"], false),
+        (&["pod", "ls", "--json"], false),
+        (&["config", "list", "--json"], false),
+        (&["builds", "--json"], false),
+        (&["diff", "no-such-box-here", "--json"], true),
+        (&["inspect", "no-such-box-here", "--json"], true),
+    ];
+    for (argv, needs_subject) in verbs {
+        let out = kern().args(argv).output().expect("run kern");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unknown flag") && !stderr.contains("unexpected argument"),
+            "`kern {}` refused --json: {stderr}",
+            argv.join(" ")
+        );
+        if needs_subject {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let t = stdout.trim();
+        assert!(
+            t.starts_with('[') || t.starts_with('{'),
+            "`kern {}` accepted --json and printed something that is not JSON: {t:?}",
+            argv.join(" ")
+        );
+    }
+}
+
+/// `kern <verb> --help` answers about THAT verb, not with the whole reference.
+///
+/// Six subcommands out of six (`volume`, `pod`, `config`, `compose`, `image`, `top`) answered the
+/// universal `<tool> <verb> --help` habit by printing all 160 lines, so the reader had to find their
+/// own verb in it. The assertion is on both halves: the page must be SHORTER than the full one, and
+/// it must actually name the verb. Asserting only "shorter" would pass on an empty page.
+#[test]
+fn every_verb_has_its_own_help() {
+    let full = kern().arg("--help").output().expect("run kern");
+    let full_lines = String::from_utf8_lossy(&full.stdout).lines().count();
+    assert!(
+        full_lines > 40,
+        "the full reference is only {full_lines} lines; this test's premise is gone"
+    );
+    for verb in [
+        "box", "run", "ps", "logs", "exec", "volume", "pod", "config", "diff", "images", "compose",
+        "stats", "pull", "push", "top",
+    ] {
+        let out = kern().args([verb, "--help"]).output().expect("run kern");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let n = text.lines().count();
+        assert!(
+            n > 1,
+            "`kern {verb} --help` printed {n} lines: it found nothing to say about the verb"
+        );
+        assert!(
+            n < full_lines,
+            "`kern {verb} --help` printed {n} lines against the reference's {full_lines}: it is \
+             still answering with the whole page"
+        );
+        assert!(
+            text.contains(verb),
+            "`kern {verb} --help` never names the verb it claims to describe: {text:?}"
+        );
+    }
+}
+
+/// The shell completions and the `COMMANDS:` reference describe the same verb set.
+///
+/// They are two hand-written descriptions of one parser, so they drifted. On 0.6.38 nine verbs the
+/// reference documents (`commit`, `rmi`, `rename`, `update`, `wait`, `diff`, `events`, `up`,
+/// `uninstall`) plus `down` could not be tab-completed: working commands, invisible to the discovery
+/// path most people actually use. `completions.rs` even carried the comment "kept in one place so
+/// all three shells stay in sync", which was true of the three shells and said nothing about the
+/// reference, which is the other place.
+///
+/// `help` and `version` are the declared exception: they are bare-word spellings of `--help` and
+/// `--version`, which live in `OPTIONS:` rather than `COMMANDS:`. The exception is written out here
+/// so that adding a second one is a deliberate edit rather than a silent widening.
+#[test]
+fn the_completions_and_the_reference_agree() {
+    let help = kern().arg("--help").output().expect("run kern");
+    let help = String::from_utf8_lossy(&help.stdout);
+    let comp = kern()
+        .args(["completions", "bash"])
+        .output()
+        .expect("run kern");
+    let comp = String::from_utf8_lossy(&comp.stdout);
+
+    // The reference's COMMANDS block, up to the first OPTIONS heading.
+    let start = help
+        .find("COMMANDS:")
+        .expect("the reference has a COMMANDS block");
+    let end = help[start..]
+        .find("OPTIONS")
+        .map_or(help.len(), |o| start + o);
+    let mut documented: Vec<&str> = Vec::new();
+    for line in help[start..end].lines().skip(1) {
+        // Verb tokens are the words that start a line or follow `|` or `/` on it. Colour codes are
+        // already gone from a captured stdout when it is not a tty.
+        for tok in line.split(|c: char| !(c.is_ascii_lowercase() || c == '-')) {
+            if tok.len() > 1 && line.trim_start().starts_with(tok) {
+                documented.push(tok);
+                break;
+            }
+        }
+    }
+    let vlist = comp
+        .lines()
+        .find(|l| l.trim_start().starts_with("verbs="))
+        .expect("the bash completion declares a verbs= list");
+    let completable: Vec<&str> = vlist
+        .trim()
+        .trim_start_matches("verbs=")
+        .trim_matches('"')
+        .split_whitespace()
+        .collect();
+
+    assert!(
+        completable.len() > 30,
+        "only {} completable verbs were parsed, so this test is comparing against nothing",
+        completable.len()
+    );
+    let missing: Vec<&&str> = documented
+        .iter()
+        .filter(|v| !completable.contains(v))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "documented but not tab-completable: {missing:?}. A verb the reference explains and the \
+         shell cannot offer is invisible where people look first."
+    );
+}
+
+/// The per-verb help must also be per-verb ON A TERMINAL, which is where everyone reads it.
+///
+/// `every_verb_has_its_own_help` runs the binary with stdout captured, so stdout is not a tty, so
+/// the palette is empty, so the filter matched on lines that had no colour codes in them and passed.
+/// On a real terminal the same command printed all 161 lines. The unit test on `strip_ansi` pins the
+/// cause; this pins the behaviour end to end, in the configuration the other test cannot reach.
+///
+/// SKIPS when `script(1)` is unavailable rather than failing: allocating a pty is the only way to
+/// make the shipped binary believe it is on a terminal, and a container without util-linux is not a
+/// defect in kern.
+#[test]
+fn the_per_verb_help_stays_per_verb_on_a_real_terminal() {
+    let bin = env!("CARGO_BIN_EXE_kern");
+    let probe = Command::new("script").arg("--version").output();
+    if !matches!(&probe, Ok(o) if o.status.success()) {
+        eprintln!("skip: script(1) is not available, so no pty can be allocated");
+        return;
+    }
+    let run = |args: &str| -> usize {
+        Command::new("script")
+            .args(["-qec", &format!("{bin} {args}"), "/dev/null"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+            .unwrap_or(0)
+    };
+    let full = run("--help");
+    assert!(
+        full > 40,
+        "the full reference came back as {full} lines under a pty; the pty run itself is broken, \
+         so this test proves nothing"
+    );
+    for verb in ["box", "run", "volume", "pod", "config", "diff"] {
+        let n = run(&format!("{verb} --help"));
+        assert!(
+            n > 1 && n < full,
+            "`kern {verb} --help` printed {n} lines under a pty against the reference's {full}: on \
+             a terminal it is still answering with the whole page"
         );
     }
 }

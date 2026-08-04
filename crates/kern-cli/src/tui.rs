@@ -818,9 +818,13 @@ fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mo
         }
         b'd' => {
             if let Some(v) = vols.get(sel) {
+                // PROMPT gets the scrubbed name (it is drawn on a terminal), ACTION gets the raw
+                // one (it becomes a path). Handing the scrubbed name to the action deleted whatever
+                // directory that string happened to name, which for a planted `a\nb` is the real
+                // volume `ab`: a confirmed delete landing on a volume the operator never selected.
                 *mode = Mode::Confirm {
                     prompt: format!("remove volume '{}' and its data?  (y/n)", v.name),
-                    action: Pending::RemoveVolume(v.name.clone()),
+                    action: Pending::RemoveVolume(v.raw.clone()),
                 };
             }
         }
@@ -1413,6 +1417,8 @@ fn edit_volume_form(v: &crate::volume::VolInfo) -> Form {
         Field::text("name", "volume name"),
         Field::text("size", "quota, e.g. 2g (blank = unlimited)"),
     ];
+    // Same split: the editable field shows the scrubbed name, `orig_name` carries the raw one so the
+    // rename finds the directory that is actually there.
     set_field(&mut fields, "name", v.name.clone());
     set_field(&mut fields, "size", size);
     Form {
@@ -1420,7 +1426,7 @@ fn edit_volume_form(v: &crate::volume::VolInfo) -> Form {
         fields,
         active: 0,
         submit: Submit::EditVolume {
-            orig_name: v.name.clone(),
+            orig_name: v.raw.clone(),
         },
         error: None,
         show_advanced: false,
@@ -3545,11 +3551,13 @@ mod tests {
         let vols = [
             crate::volume::VolInfo {
                 name: "boundless".into(),
+                raw: "boundless".into(),
                 size: 11,
                 quota: None,
             },
             crate::volume::VolInfo {
                 name: "capped".into(),
+                raw: "capped".into(),
                 size: 0,
                 quota: Some(2 * 1024 * 1024 * 1024),
             },

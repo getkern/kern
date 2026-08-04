@@ -123,6 +123,59 @@ pub fn pad_visible(text: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(pad), text)
 }
 
+/// Render `items` as a JSON array, `render` producing each element.
+///
+/// Eight emitters had written the same loop by hand: open a `[`, `enumerate`, push a `,` when the
+/// index is non-zero, close with `]`. The separator is the whole risk. Getting it wrong in one of
+/// eight places produces output that is not JSON at all, and the consumer that finds out is a script
+/// in someone else's pipeline. Written once, it cannot be got wrong in the ninth.
+///
+/// `render` returns an owned `String` because that is what every caller already builds with
+/// `format!`. These run once per invocation over a list a human asked for, never in a box-start
+/// path, so the allocation per element is not on any hot path; the array itself reserves once.
+pub fn json_array<T>(items: &[T], mut render: impl FnMut(&T) -> String) -> String {
+    let mut out = String::with_capacity(items.len() * 64 + 2);
+    out.push('[');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&render(item));
+    }
+    out.push(']');
+    out
+}
+
+/// Escape `s` as a JSON string literal, quotes included.
+///
+/// Lives here and not next to one emitter because FIVE verbs print JSON (`ps`, `images`, `stats`,
+/// `inspect`, `volume ls`) and a second copy of an escaper is how one of them ends up not escaping
+/// something. The control-character branch is the security-relevant one: a box name or a volume
+/// name is attacker-influenced in the case kern exists for, and a raw `0x1b` reaching a terminal
+/// that cats the output is a repaint of kern's own words. Same defect class as the `kern.toml`
+/// backend field, closed here by construction for every caller at once.
+///
+/// Not zero-copy on purpose: the escaped form is a different length than the input in the general
+/// case, and these emitters run once per invocation on a list a human asked for, not in a box-start
+/// path. The capacity is pre-reserved so the common case (nothing to escape) is a single allocation.
+pub fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if c.is_control() => o.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 /// Is this boolean env flag SET? A variable exported but EMPTY counts as unset.
 ///
 /// `KERN_NO_SCOPE= kern box …`, and the `export FOO=${FOO:-}` idiom every CI script uses, both leave the

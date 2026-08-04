@@ -106,6 +106,28 @@ with a size limit. Where the disk physically lives is a sensible default; it's w
 Like a quota'd volume, a vdisk uses the ext4-loop backend when the box is privileged, and a RAM-backed
 (`tmpfs`) fallback otherwise, kern says which one you got, and never silently drops the profile.
 
+### `persistent` also decides WHO the disk belongs to
+
+The toggle reads as a statement about time, "survives box removal", and it is also a statement about
+identity:
+
+| | where the image lives | two boxes on the same profile |
+|---|---|---|
+| `persistent = false` (default) | the box's own scratch dir | **one disk each**, empty at start, gone at exit |
+| `persistent = true` | the `[[disk]]` pool, or a per-user default | **one disk, shared by name** |
+
+So a persistent vdisk is closer to a named volume than to an `emptyDir`: the name is the disk. Two
+boxes cannot mount it at once, because an ext4 image mounted read-write twice corrupts, so kern takes
+an exclusive lock on it. **The second box does not fail: it gets a tmpfs for that run and says so.**
+
+```
+kern: vdisk 'cache' is in use by another box - using a tmpfs backend this run
+```
+
+That box runs normally and its writes to `/vdisk/cache` are discarded when it exits, which is the
+one case where a profile named `persistent` does not persist. If that matters to your workload,
+serialise the boxes or give each one its own profile.
+
 ---
 
 ## Advanced: pin a vdisk to a specific disk

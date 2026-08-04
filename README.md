@@ -123,6 +123,13 @@ kern box job --image python:3.12-slim --read-only --cap-drop ALL --memory 256m \
 No network unless you ask, a read-only root, dangerous capabilities dropped, seccomp always on.
 Ninety runnable examples, each doing one thing: [examples/](examples/).
 
+Every read verb also answers in JSON, so nothing has to parse a table:
+
+```sh
+kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
+kern volume ls --json          # ps · images · stats · inspect · builds · pod ls · config list · diff
+```
+
 ## Resource profiles
 
 A slice is declared once in `~/.config/kern/kern.toml` and attached by name, to a sandboxed box or a
@@ -255,7 +262,7 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**0.6.39.** Everything above works today and is tested: 718 Rust, 72 Python and 57 Node tests,
+**0.6.43.** Everything above works today and is tested: 725 Rust, 72 Python and 57 Node tests,
 clippy-clean, `cargo-deny`-clean. Semver, pre-1.0: the CLI and config surface can still change
 between minor versions, always called out in [CHANGELOG.md](CHANGELOG.md). Releases are signed tags
 and timestamped to Bitcoin ([provenance/](provenance/)).

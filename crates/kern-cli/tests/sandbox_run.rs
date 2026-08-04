@@ -2409,3 +2409,74 @@ fn the_plan_resolves_the_config_the_launch_would_use() {
         );
     }
 }
+
+/// `volume ls --json` must name volumes that EXIST, and must say which ones the other verbs refuse.
+///
+/// Two defects, both found by planting directories under `volumes/` rather than by reading:
+///
+///   1. The scan scrubbed control characters out of the name before anything saw it, so the listing
+///      reported 3 of 38 names that are not on disk. A script doing `kern volume rm "$name"` then
+///      either fails or, when the scrubbed form collides with another volume's real name (a name
+///      holding a newline scrubs down to one that may already exist), deletes the WRONG volume.
+///      `kern top`'s remove prompt fed the same scrubbed string to its destructive action.
+///   2. Once the raw name was reported, the listing contradicted the rest of the CLI: `inspect`,
+///      `rm` and `-v` refuse a name outside the creation charset, so `ls` was announcing volumes no
+///      other verb would touch. `usable` states that instead of leaving the reader to discover it.
+///
+/// A control byte must survive as an ESCAPE, never as a raw byte: preserving it keeps the name
+/// actionable, escaping it keeps it off a terminal.
+#[test]
+fn volume_json_reports_names_that_exist_and_flags_the_ones_it_cannot_use() {
+    let home = std::env::temp_dir().join(format!("kern-vjson-{}", std::process::id()));
+    let vols = home.join("kern").join("volumes");
+    let _ = fs::remove_dir_all(&home);
+    // `ok-one` is a name kern would itself create; the other two are plantable only from outside.
+    let weird = format!("we{}[31mird", '\u{1b}');
+    let newline = "two\nlines".to_string();
+    for name in ["ok-one".to_string(), weird, newline] {
+        let d = vols.join(&name).join("data");
+        if fs::create_dir_all(&d).is_err() {
+            eprintln!("skip: cannot plant volume dirs under {}", vols.display());
+            return;
+        }
+        if fs::write(vols.join(&name).join("meta.json"), "{\"created\":1}").is_err() {
+            eprintln!("skip: cannot write the meta.json sidecar");
+            return;
+        }
+    }
+    let out = kern()
+        .args(["volume", "ls", "--json"])
+        .env("XDG_DATA_HOME", &home)
+        .output()
+        .expect("run kern");
+    let stdout = out.stdout.clone();
+    let _ = fs::remove_dir_all(&home);
+
+    assert!(
+        !stdout.contains(&0x1b),
+        "a raw ESC byte reached stdout: the JSON path emitted a control byte instead of escaping \
+         it: {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let text = String::from_utf8_lossy(&stdout);
+    assert_eq!(
+        text.trim().lines().count(),
+        1,
+        "the JSON array spans more than one line, so a planted newline reached the output raw: \
+         {text:?}"
+    );
+    assert!(
+        text.contains("\\u001b"),
+        "the ESC byte was dropped instead of escaped, so the reported name is not the name on \
+         disk: {text:?}"
+    );
+    assert!(
+        text.contains("\\n"),
+        "the newline was dropped instead of escaped: {text:?}"
+    );
+    // The creation-charset verdict travels with each entry, and both values are present.
+    assert!(
+        text.contains("\"usable\":true") && text.contains("\"usable\":false"),
+        "`usable` does not distinguish a kern-created name from a planted one: {text:?}"
+    );
+}

@@ -4,7 +4,7 @@
 use crate::error::Error;
 use crate::registry;
 use crate::sandbox::SandboxCtx;
-use kern_common::BoxName;
+use kern_common::{json_str, BoxName};
 use kern_isolation::{
     exec_in_box, run_in_sandbox_with, MountMode, OverlayDirs, SandboxSpec, UidRange, Volume,
 };
@@ -18,12 +18,25 @@ pub fn version() -> Result<(), Error> {
 
 pub fn help() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
+    println!("{}", crate::ui::logo(&p));
+    println!("{}", help_text(&p));
+    Ok(())
+}
+
+/// The full reference as a STRING, so `kern <verb> --help` can serve a slice of the very same text.
+///
+/// `kern volume --help` used to print this whole page, and so did `pod`, `config`, `compose`,
+/// `image` and `top`: six out of six subcommands answered the universal `<tool> <verb> --help`
+/// habit with a 160-line wall in which the reader has to find their verb. Writing a second help
+/// text per verb is the obvious fix and the wrong one, because two texts describing one parser
+/// drift, which is the defect class this project keeps paying for. So there is still exactly one
+/// text and [`help_for`] filters it.
+fn help_text(p: &crate::ui::Palette) -> String {
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
     // The compose sub-verbs come from COMPOSE_VERBS, so help cannot describe a set of verbs the
     // parser does not accept, nor omit one it does.
     let cv = compose_verbs_help();
-    println!("{}", crate::ui::logo(&p));
-    println!(
+    format!(
         "\
   {b}kern {ver}{z}{d}: a fast, rootless sandbox & virtual resource runtime{z}
 
@@ -67,7 +80,7 @@ pub fn help() -> Result<(), Error> {
     {c}rename{z} <old> <new>                                             Give a running box a new name
     {c}update{z} <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
     {c}wait{z} <box>...                                                  Wait for running box(es) to exit; print exit code
-    {c}diff{z} <box>                                                     List filesystem changes vs the image (C/D)
+    {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D)
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     {c}prune{z}                                                          Remove stopped-box sidecar files (logs/health)
     {c}gc{z} [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
@@ -77,16 +90,16 @@ pub fn help() -> Result<(), Error> {
   {d}Multi-box{z}
     {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml)
     {c}up{z} [--no-pod] / {c}down{z}                                          Bring up / tear down the compose file in this dir
-    {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls / pod rm <name>     Shared-network pod (boxes reach each other by name)
+    {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls [--json] / pod rm <name>  Shared-network pod (boxes reach each other by name)
 
   {d}Config & storage{z}
-    {c}config{z} [list|edit|setup|probe|clear]                          List resource profiles; manage kern.toml
+    {c}config{z} [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml
     {c}config add{z} <kind:name> [--flags]                              Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     {c}config rm{z} <kind:name>                                         Delete a profile
     {c}validate{z} [path]                                                Check a kern.toml
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     {c}examples{z}                                                       Print an example kern.toml
-    {c}volume{z} <create|ls|rm|inspect|edit|prune>                       Manage named volumes
+    {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]           Manage named volumes
     {c}login{z} [registry] [--username U] / {c}logout{z} [registry]         Registry credentials (private pulls)
 
   {d}Diagnostics{z}
@@ -168,13 +181,154 @@ pub fn help() -> Result<(), Error> {
                         rootless-only; still blocks kexec/modules/bpf/io_uring (unlike Docker)
     --plan              Preview the isolation sequence and any device grants, without running
 
+{b}OPTIONS for run:{z}
+    -m, --memory <SIZE>     RAM ceiling for the process (e.g. 512m, 2g)
+    --memory-swap-max <S>   cgroup v2 swap allowance (NOT Docker's mem+swap total; 0 = no swap)
+    --cpus <N>              CPU quota, fractional allowed (0.5 = half a core)
+    --cpuset-cpus <LIST>    Pin to these CPUs (e.g. 0-3,8); a CPU that does not exist is dropped
+    --config <PATH>         kern.toml to resolve `vcpu:`/`vgpio:`/`vdisk:` profiles against
+    {d}`run` caps a process on the HOST: no image, no namespaces, no sandbox. For isolation use `box`.{z}
+
 {b}OPTIONS:{z}
     -V, --version  Print version
     -h, --help     Print this help
 
 {d}Docs & issues: {z}{c}https://github.com/getkern/kern{z}",
         ver = kern_common::VERSION
+    )
+}
+
+/// A copy of `s` with ANSI escape sequences and control characters removed.
+///
+/// One pass, one allocation, and it does not need to know the palette: a CSI sequence is `ESC [`
+/// followed by parameter/intermediate bytes and terminated by a final byte in `@`..`~`, and any
+/// other `ESC x` form is two bytes. Anything a palette can produce is covered, so this cannot go
+/// stale when a colour is added.
+///
+/// Deliberately not `ui::scrub`: scrub DELETES the ESC and leaves the `[1m` tail as printable text,
+/// which is right for its job (an error message must not repaint a terminal, and what remains is
+/// inert) and wrong for matching, where the residue is indistinguishable from content.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            match it.next() {
+                // CSI (`ESC [ … final`) and OSC (`ESC ] … BEL/ST`): consume up to the terminator.
+                // Every colour kern emits is a CSI SGR, so this is the branch that matters.
+                Some('[') => {
+                    for n in it.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    for n in it.by_ref() {
+                        // BEL, or the ST introducer whose ESC was already eaten by this loop.
+                        if n == '\u{7}' || n == '\\' {
+                            break;
+                        }
+                    }
+                }
+                // Charset designation (`ESC ( B`, `ESC ) 0`, …): one intermediate, one final. Nothing
+                // in kern emits these; they are handled because leaving the final byte behind turns
+                // an escape into a stray letter that reads as content, which is the failure mode this
+                // whole function exists to avoid.
+                Some('(') | Some(')') | Some('*') | Some('+') | Some('#') => {
+                    let _ = it.next();
+                }
+                // Any other two-byte form (`ESC 7`, `ESC =`, …) is fully consumed by the `next()`
+                // above. Out of scope, and stated rather than assumed: a form not listed here loses
+                // its ESC and keeps its payload.
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `kern <verb> --help`: the lines of the full reference that describe THAT verb.
+///
+/// What it selects, in order:
+///   1. every `COMMANDS:` line whose first coloured token is the verb, so `box <name> …` and
+///      `box <name> … --plan` both come out for `box` while `ps` does not match `push`;
+///   2. the verb's own `OPTIONS for <verb>:` block, if the reference carries one;
+///   3. a pointer to `kern --help`, because a filtered page must say it is filtered.
+///
+/// Falls back to the whole reference when nothing matched. A verb this cannot find is a verb the
+/// COMMANDS section does not document, and answering that with an empty page would hide the real
+/// defect; `every_verb_has_its_own_help` fails on it instead.
+pub fn help_for(verb: &str) -> Result<(), Error> {
+    let p = crate::ui::Palette::detect();
+    let full = help_text(&p);
+    // Colour codes sit between the indent and the verb, so matching is done on the line with the
+    // escapes REMOVED. Comparing against the raw line would silently stop matching the day the
+    // palette changes, and it would stop matching in the direction that looks like success.
+    //
+    // This is `strip_ansi` and NOT `scrub`-then-`replace`, which is what it was and which was broken
+    // in exactly the configuration nobody tests in: `scrub` deletes the ESC byte first, so the
+    // `[1m` tail survives and the subsequent `replace(p.b, …)` searches for a sequence that is no
+    // longer there. Every match then failed and the filter fell back to the whole reference. With
+    // stdout captured the palette is empty and the bug is invisible, which is why the test that
+    // covers this saw 75 lines while a terminal saw 161. It is also five allocations per line
+    // against one.
+    let plain = |s: &str| -> String { strip_ansi(s) };
+    let mut out: Vec<String> = Vec::new();
+    let mut in_commands = false;
+    let mut in_verb_options = false;
+    for line in full.lines() {
+        let flat = plain(line);
+        let trimmed = flat.trim_start();
+        if flat.contains("COMMANDS:") {
+            in_commands = true;
+            continue;
+        }
+        if trimmed.starts_with("OPTIONS for ") {
+            // "OPTIONS for box:" → "box"
+            let which = trimmed
+                .trim_start_matches("OPTIONS for ")
+                .trim_end_matches(':')
+                .trim();
+            in_verb_options = which == verb;
+            in_commands = false;
+            if in_verb_options {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+        if trimmed.starts_with("OPTIONS:") {
+            in_commands = false;
+            in_verb_options = false;
+            continue;
+        }
+        if in_verb_options {
+            out.push(line.to_string());
+            continue;
+        }
+        if in_commands && trimmed.split_whitespace().next() == Some(verb) {
+            out.push(line.to_string());
+        }
+    }
+    if out.is_empty() {
+        println!("{}", crate::ui::logo(&p));
+        println!("{full}");
+        return Ok(());
+    }
+    println!(
+        "{b}kern {verb}{z}{d} - from the full reference ({z}{c}kern --help{z}{d} for everything){z}",
+        b = p.b,
+        z = p.z,
+        d = p.d,
+        c = p.c
     );
+    for line in &out {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -4420,6 +4574,46 @@ fn render_ps_format(tmpl: &str, b: &registry::Instance, now: u64) -> Result<Stri
 }
 
 #[cfg(test)]
+mod strip_ansi_tests {
+    /// `strip_ansi` must remove the whole escape sequence, not just its ESC byte.
+    ///
+    /// This is the test that was missing, and its absence cost a shipped feature. `kern <verb>
+    /// --help` filters the reference by matching on de-coloured lines; the first implementation
+    /// called `ui::scrub` and then `replace`d the palette strings, but scrub removes the ESC first,
+    /// so `[1m` survived as printable text and every `replace` searched for a sequence that was no
+    /// longer present. Nothing matched, the filter fell back to the full 161-line page, and a
+    /// terminal user got exactly the wall the feature existed to remove.
+    ///
+    /// The integration test could not see it: `Command::output()` captures stdout, stdout is then
+    /// not a tty, the palette is empty, and with an empty palette the broken code is correct. So the
+    /// assertion lives here, on the function, with the colour codes written out.
+    #[test]
+    fn strip_ansi_removes_whole_sequences_not_just_the_escape_byte() {
+        let e = '\u{1b}';
+        let cases: [(String, &str); 6] = [
+            (format!("{e}[1mOPTIONS for box:{e}[0m"), "OPTIONS for box:"),
+            (format!("    {e}[36mbox{e}[0m <name>"), "    box <name>"),
+            (format!("{e}[38;5;208mtruecolor{e}[0m"), "truecolor"),
+            ("no escapes at all".to_string(), "no escapes at all"),
+            (format!("{e}(Bplain"), "plain"),
+            ("tab\there".to_string(), "tabhere"),
+        ];
+        for (input, want) in cases {
+            let got = super::strip_ansi(&input);
+            assert_eq!(
+                got, want,
+                "strip_ansi({input:?}) gave {got:?}; a leftover `[1m` is indistinguishable from \
+                 content and makes every match fail"
+            );
+            assert!(
+                !got.contains('['),
+                "strip_ansi left a `[` behind in {got:?}: the sequence was cut at the ESC only"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod uncapped_notice_tests {
     /// The uncapped-host notice fires exactly ONCE per host, and keeps firing when it cannot record
     /// that it fired.
@@ -4532,12 +4726,8 @@ pub fn ps(
         return Ok(());
     }
     if json {
-        let mut out = String::from("[");
-        for (i, b) in boxes.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!(
+        let out = kern_common::json_array(&boxes, |b| {
+            format!(
                 "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{}}}",
                 json_str(&b.name),
                 b.pid,
@@ -4547,9 +4737,8 @@ pub fn ps(
                 b.started,
                 json_str(&b.ports),
                 json_str(&registry::health_of(&b.name, b.pid)),
-            ));
-        }
-        out.push(']');
+            )
+        });
         println!("{out}");
     } else {
         // Build rows first so the PORTS column can size to its widest value (a published mapping
@@ -4664,28 +4853,6 @@ pub fn ps(
     Ok(())
 }
 
-/// Minimal JSON string escaping for `kern ps --json`.
-fn json_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            // Escape every other control char (C0/DEL/C1, incl. ESC `0x1b`) as `\u00XX` - keeps the
-            // JSON valid and stops a crafted registry name/description from injecting a real escape
-            // sequence into a terminal that cats the output.
-            c if c.is_control() => o.push_str(&format!("\\u{:04x}", c as u32)),
-            _ => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}
-
 /// A JSON number field, or `null` when the value is absent (`stats`/`inspect`). One definition so the
 /// two emitters render a missing metric the same way.
 fn json_num(v: Option<u64>) -> String {
@@ -4716,22 +4883,17 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
         boxes.retain(|b| names.iter().any(|n| hit(b, n)));
     }
     if json {
-        let mut out = String::from("[");
-        for (i, b) in boxes.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            // `null` (not 0) when the box has no dedicated cgroup to read - "unknown", not "zero".
-            let num = json_num;
-            out.push_str(&format!(
+        // `null` (not 0) when the box has no dedicated cgroup to read - "unknown", not "zero".
+        let num = json_num;
+        let out = kern_common::json_array(&boxes, |b| {
+            format!(
                 "{{\"name\":{},\"pid\":{},\"mem_bytes\":{},\"cpu_usec\":{}}}",
                 json_str(&b.name),
                 b.pid,
                 num(registry::mem_bytes(b.cgroup_pid())),
                 num(registry::cpu_usec(b.cgroup_pid()))
-            ));
-        }
-        out.push(']');
+            )
+        });
         println!("{out}");
     } else {
         let p = crate::ui::Palette::detect();
@@ -5453,7 +5615,7 @@ pub fn wait(names: &[String]) -> Result<(), Error> {
 /// wholly replaced in the box (`rm -rf d && mkdir d`, an overlayfs *opaque* dir) shows as `C d` without
 /// a per-file `D` for the wiped lower contents. Only overlay boxes have an upper: a `--bind-rootfs` box
 /// writes through to its source (nothing to diff) and a `--read-only` box has an empty upper (no changes).
-pub fn diff(name: &str) -> Result<(), Error> {
+pub fn diff(name: &str, json: bool) -> Result<(), Error> {
     let Some(inst) = registry::find_ref(name) else {
         return Err(Error::NotRunning(format!("no running box named '{name}'")));
     };
@@ -5468,6 +5630,22 @@ pub fn diff(name: &str) -> Result<(), Error> {
             out.sort_by(|a, b| a.1.cmp(&b.1));
             if out.len() >= DIFF_MAX_ENTRIES {
                 eprintln!("kern: diff truncated at {DIFF_MAX_ENTRIES} entries (upper too large)");
+            }
+            if json {
+                // `json_str` and NOT `ui::scrub` here. The two do different jobs and the JSON path
+                // needs the first: scrub DELETES control bytes, which silently changes a filename,
+                // and a consumer that then tries to `rm` what it was told exists would miss. Escaping
+                // preserves the byte and still cannot forge a line or reach a terminal, because the
+                // whole value stays inside one JSON string.
+                let buf = kern_common::json_array(&out, |(kind, path)| {
+                    format!(
+                        "{{\"change\":{},\"path\":{}}}",
+                        json_str(&kind.to_string()),
+                        json_str(path),
+                    )
+                });
+                println!("{buf}");
+                return Ok(());
             }
             for (kind, path) in &out {
                 // The path comes from an UNTRUSTED box-controlled filename: scrub control bytes so a
@@ -5756,20 +5934,15 @@ pub fn images(json: bool) -> Result<(), Error> {
     let rows = image_entries();
 
     if json {
-        let mut out = String::from("[");
-        for (i, e) in rows.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!(
+        let out = kern_common::json_array(&rows, |e| {
+            format!(
                 "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}}}",
                 json_str(&e.name),
                 e.size,
                 e.pulled,
                 e.dangling
-            ));
-        }
-        out.push(']');
+            )
+        });
         println!("{out}");
     } else if rows.is_empty() {
         println!("no images cached yet - pull one with `kern pull <image>` (or `kern box <name> --image <image>`)");
@@ -6047,14 +6220,7 @@ pub fn builds_list(
     };
     let recs = crate::builds::query(filter, status, limit);
     if json {
-        let mut out = String::from("[");
-        for (i, r) in recs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&build_json(r));
-        }
-        out.push(']');
+        let out = kern_common::json_array(&recs, build_json);
         println!("{out}");
     } else if recs.is_empty() {
         // Distinguish "history is empty" from "your query matched nothing" - else a filter that finds
@@ -6266,20 +6432,15 @@ fn fmt_age(secs: u64) -> String {
 pub fn search(query: &str, json: bool) -> Result<(), Error> {
     let results = kern_oci::search(query, 25).map_err(|e| Error::Oci(e.to_string()))?;
     if json {
-        let mut out = String::from("[");
-        for (i, r) in results.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!(
+        let out = kern_common::json_array(&results, |r| {
+            format!(
                 "{{\"name\":{},\"description\":{},\"stars\":{},\"official\":{}}}",
                 json_str(&r.name),
                 json_str(&r.description),
                 r.stars,
                 r.official
-            ));
-        }
-        out.push(']');
+            )
+        });
         println!("{out}");
     } else if results.is_empty() {
         println!("no images found for '{query}'");
@@ -13018,8 +13179,9 @@ fn compose_pod_name(file: &str) -> String {
 /// `kern config [list|edit|setup|probe|clear]` - dispatch the config-management subcommands. Bare
 /// `kern config` is `list`, which the parser resolves; listing is read-only and a missing config is
 /// not an error.
-pub fn config_cmd(sub: &str, force: bool) -> Result<(), Error> {
+pub fn config_cmd(sub: &str, force: bool, json: bool) -> Result<(), Error> {
     match sub {
+        "list" if json => config_list_json(),
         "list" => config_list(),
         "edit" => config_edit(),
         "setup" => config_setup(force),
@@ -13510,6 +13672,50 @@ fn config_probe() -> Result<(), Error> {
         "{d}`kern config setup` writes a kern.toml tailored to these - or `kern examples`{z}",
         d = p.d,
         z = p.z
+    );
+    Ok(())
+}
+
+/// `kern config list --json`: every declared profile, with the SAME attachability verdict the human
+/// listing prints.
+///
+/// `attachable` is the field that matters. The human listing gained "cannot attach: <why>" because
+/// `kern validate` and `kern config list` disagreed about one file: the listing showed a profile as
+/// healthy while validate refused it. Emitting the profiles here without the verdict would recreate
+/// that split for scripts, which are the readers least able to notice it.
+pub fn config_list_json() -> Result<(), Error> {
+    let Some(path) = crate::config::active_path().filter(|p| p.exists()) else {
+        // No config is not an error and not a sentence: an empty profile list with a null path is
+        // the same shape a caller handles when a config exists but declares nothing.
+        println!("{{\"path\":null,\"profiles\":[]}}");
+        return Ok(());
+    };
+    let cfg = crate::config::load(None).map_err(Error::Config)?;
+    let mut items: Vec<String> = Vec::new();
+    let mut push = |section: &str, name: &str| {
+        let bad = crate::config::validate_profile_refs(&cfg, section, name).err();
+        items.push(format!(
+            "{{\"kind\":{},\"name\":{},\"attachable\":{},\"reason\":{}}}",
+            json_str(section),
+            json_str(name),
+            bad.is_none(),
+            bad.as_ref()
+                .map_or_else(|| "null".to_string(), |w| json_str(w)),
+        ));
+    };
+    for e in &cfg.vcpu {
+        push("vcpu", &e.name);
+    }
+    for e in &cfg.vgpio {
+        push("vgpio", &e.name);
+    }
+    for e in &cfg.vdisk {
+        push("vdisk", &e.name);
+    }
+    println!(
+        "{{\"path\":{},\"profiles\":[{}]}}",
+        json_str(&path.to_string_lossy()),
+        items.join(",")
     );
     Ok(())
 }
@@ -16324,7 +16530,7 @@ mod config_verbs_are_defined_in_one_place {
         // drifting: a verb added there without a case here must fail loudly, because listing the
         // profiles and exiting 0 is indistinguishable from success.
         for stranger in ["show", "inspect", "ls", "", "LIST"] {
-            let e = config_cmd(stranger, false);
+            let e = config_cmd(stranger, false, false);
             assert!(
                 matches!(e, Err(Error::Usage(u)) if u == CONFIG_USAGE),
                 "config_cmd({stranger:?}) must be a usage error, got {e:?}"

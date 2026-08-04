@@ -17,9 +17,57 @@ flag or config key changes:
 
 Removals and deprecations are always listed under **Deprecated** / **Removed** here first.
 
-## [0.6.39], 2026-08-04
+## [0.6.43], 2026-08-04
 
 ### Fixed
+
+- **`volume ls --json` named volumes that do not exist, and `kern top` could delete the wrong one.**
+  The scan stripped control characters out of a name before anything saw it, so the listing reported
+  3 of 38 names that are not on disk. A script doing `kern volume rm "$name"` then fails or, when the
+  stripped form collides with another volume's real name, removes a volume nobody selected. `kern
+  top`'s remove prompt fed the same stripped string to its destructive action.
+
+  A name is now carried twice, because it answers two questions and one string cannot do both: the
+  stripped form for a terminal, the exact form for a syscall. The exact one is escaped on the way
+  into JSON, so the byte survives without ever reaching a terminal raw. Found by planting directories
+  under `volumes/`, not by reading: a name with a control byte cannot be created THROUGH kern, which
+  bounds the exposure and does not make a misdirected delete acceptable.
+
+  With it, the contradiction the fix exposed: `ls` listed names that `inspect`, `rm` and `-v` all
+  refuse, because `validate` enforces the creation charset. Loosening it is the wrong direction, it
+  is also what keeps a name to a single path component, so each entry now carries `usable` and the
+  table marks it.
+
+- **`kern <verb> --help` printed the whole 160-line reference on a terminal.** The per-verb filter
+  matched on de-coloured lines, and de-coloured them by stripping control characters and then
+  replacing the palette strings: the first step removes the ESC byte, so `[1m` survived as printable
+  text and every replacement searched for a sequence that was no longer there. Nothing matched and
+  the filter fell back to the full page.
+
+  It shipped because the test could not see it: with stdout captured, stdout is not a tty, the
+  palette is empty, and with an empty palette the broken code is correct. A terminal saw 161 lines
+  where the captured run saw 75. There is now a unit test on `strip_ansi` with the escape codes
+  written out, and an end-to-end test under a real pty.
+
+- **Ten verbs the reference documents could not be tab-completed**: `commit`, `rmi`, `rename`,
+  `update`, `wait`, `diff`, `events`, `up`, `down`, `uninstall`. The completion list and the
+  `COMMANDS:` block are two hand-written descriptions of one parser; the file even carried the
+  comment "kept in one place so all three shells stay in sync", which was true of the three shells
+  and silent about the other place. `the_completions_and_the_reference_agree` compares them now.
+
+- **Four read verbs refused `--json`**: `volume ls`, `pod ls`, `config list` and `diff`, while `ps`,
+  `images`, `stats`, `inspect` and `builds` accepted it. A script reading those four had to parse a
+  table, and `kern diff` prints `C /path` separated by one space with the path chosen by the
+  workload. `volume inspect` gained it too. `every_read_verb_accepts_json` keeps the set closed.
+
+- **`kern run` accepted six flags and the reference named two.** `--cpuset-cpus`, `--config` and
+  `--memory-swap-max` were documented nowhere. Found by the duplicate-flag gate, which reported that
+  `run` advertised no flags at all.
+
+- **`volume inspect` spelled an absent quota `none`**, which reads as "nothing allowed" as easily as
+  "no ceiling", while `volume ls` printed `∞` for the same volume. The table already refused a bare
+  `-` for exactly that ambiguity and the rule had not been applied here. Three views, one fact:
+  `unlimited`, `∞`, and `null` in JSON.
 
 - **A box with no memory cap on a host that cannot enforce one said nothing.** Every box carries a
   cap, the default 512 MiB when none is typed, so "this cap cannot be enforced" is true of every box
@@ -190,9 +238,9 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 0.6.34 and everything before it live in the signed tags: `git show v0.6.34`, or the
 [tag list](https://github.com/getkern/kern/tags). All 29 are signed, and 28 of them carry an
-OpenTimestamps proof ([provenance/](provenance/)), of which 26 are confirmed in a Bitcoin block.
-The rest are stamped and waiting: a calendar takes hours to get into a block and then six
-confirmations, so the newest proof is always pending for a while. The one tag with no proof at all
-is v0.6.8, which predates the practice; stamping it today would attest to today, not to its release.
+OpenTimestamps proof ([provenance/](provenance/)), of which 28 are confirmed in a Bitcoin block:
+every proof that exists is anchored. A freshly stamped one is pending for a few hours, since a
+calendar has to reach a transaction and then six confirmations. The one tag with no proof at all is
+v0.6.8, which predates the practice; stamping it today would attest to today, not to its release.
 
-[0.6.39]: https://github.com/getkern/kern/releases/tag/v0.6.39
+[0.6.43]: https://github.com/getkern/kern/releases/tag/v0.6.43

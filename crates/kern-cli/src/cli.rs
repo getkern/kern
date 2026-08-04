@@ -246,7 +246,11 @@ pub enum Command {
         outbound: bool,
         uid_range: bool,
     },
-    PodList,
+    PodList {
+        /// `--json`: the same scan as the table, machine-readable. Every read verb takes it; a verb
+        /// that does not is a hole a script falls into, and it falls into it by parsing a table.
+        json: bool,
+    },
     PodRemove {
         names: Vec<String>,
     },
@@ -383,7 +387,13 @@ pub enum Command {
     /// `kern diff <box>`: list filesystem changes vs the box's image.
     Diff {
         name: String,
+        /// `--json`: `[{"change":"C","path":"/etc/hosts"}]`. The human form prints `C /etc/hosts`,
+        /// which a script has to split on the first space, and a box-controlled filename is exactly
+        /// the input that makes that split wrong.
+        json: bool,
     },
+    /// `kern <verb> --help`: the slice of the full reference describing that verb.
+    HelpFor(String),
     /// `kern events`: stream box lifecycle events (start/die/rename) until interrupted.
     Events,
     /// `kern history [-n N]`: recent boxes (from their captured logs).
@@ -431,6 +441,8 @@ pub enum Command {
     Config {
         sub: String,
         force: bool,
+        /// `--json`, accepted by `config list` only. See the parser for why the other four refuse it.
+        json: bool,
     },
     /// `kern config add <kind:name> [--flags]`: create/replace a resource profile non-interactively -
     /// the CLI twin of `kern top`'s profile forms (same validation + surgical write).
@@ -552,7 +564,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
         }
         if saw_help {
-            return Ok((opts, Command::Help));
+            // The VERB's help, not the whole reference. `kern volume --help` printing 160 lines of
+            // everything was the same answer `kern pod --help` and four others gave, and the reader
+            // then has to find their verb in it. `help_for` falls back to the full page when the
+            // verb has no lines of its own, so nothing becomes less discoverable than it was.
+            return Ok((
+                opts,
+                match rest.first().copied() {
+                    Some(v) if !v.starts_with('-') => Command::HelpFor(v.to_string()),
+                    _ => Command::Help,
+                },
+            ));
         }
     }
     let cmd = match rest.first().copied() {
@@ -939,6 +961,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             Command::Config {
                 sub: "probe".into(),
                 force: false,
+                json: false,
             }
         }
         // `bench [--rootfs R] [--bind-rootfs] [-n N]`: measure box start→exit latency.
@@ -1018,12 +1041,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `diff <box>`: list filesystem changes vs the box's image (Docker parity).
         Some("diff") => {
-            reject_unknown_flags("diff", &rest, &[])?;
+            reject_unknown_flags("diff", &rest, &["--json"])?;
             match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
                 Some(n) => Command::Diff {
                     name: (*n).to_string(),
+                    json: rest.contains(&"--json"),
                 },
-                None => return Err(Error::Usage("diff <box>")),
+                None => return Err(Error::Usage("diff <box> [--json]")),
             }
         }
         // `wait <box>...`: block until each box exits, print its exit code (Docker parity).
@@ -1234,15 +1258,19 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .unwrap_or_else(|| "list".into());
             match sub.as_str() {
                 "list" | "edit" | "setup" | "probe" | "clear" => {
-                    // A flag these verbs do not take is REFUSED, never ignored. `kern config list
-                    // --json` used to print the human listing and exit 0, so a script that asked for
-                    // JSON silently got prose and could not tell; the same held for any typo. Only
-                    // the destructive verbs (setup/clear) take a flag at all, and it is the confirm.
+                    // A flag these verbs do not take is REFUSED, never ignored: a script that asked
+                    // for JSON and silently got prose could not tell, and the same held for any typo.
+                    // `--json` is accepted by `list` ALONE, because `list` is the only read verb here;
+                    // on `edit`/`setup`/`probe`/`clear` it stays an error rather than being tolerated,
+                    // since those change things and a caller passing --json to them has the wrong verb.
+                    let json = rest.contains(&"--json");
                     for a in rest.iter().skip(1) {
                         let s: &str = a;
-                        if s.starts_with('-') && !matches!(s, "--force" | "--yes" | "-y") {
+                        let ok = matches!(s, "--force" | "--yes" | "-y")
+                            || (s == "--json" && sub == "list");
+                        if s.starts_with('-') && !ok {
                             return Err(Error::Cli(format!(
-                                "config {sub}: unknown flag {s:?} - this verb takes no flags (only `config setup`/`clear` accept --force/--yes/-y)"
+                                "config {sub}: unknown flag {s:?} - `config list` takes --json; `config setup`/`clear` take --force/--yes/-y"
                             )));
                         }
                     }
@@ -1250,6 +1278,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                         force: rest
                             .iter()
                             .any(|a| *a == "--force" || *a == "--yes" || *a == "-y"),
+                        json,
                         sub,
                     }
                 }
@@ -2391,8 +2420,10 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
             })
         }
         Some("ls" | "list" | "ps") => {
-            reject_unknown_flags("pod ls", &rest[1..], &[])?;
-            Ok(Command::PodList)
+            reject_unknown_flags("pod ls", &rest[1..], &["--json"])?;
+            Ok(Command::PodList {
+                json: rest[1..].contains(&"--json"),
+            })
         }
         Some("rm" | "remove" | "down") => {
             reject_unknown_flags("pod rm", &rest[1..], &[])?;
@@ -2534,6 +2565,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Version => commands::version(),
         Command::Banner => commands::banner(),
         Command::Help => commands::help(),
+        Command::HelpFor(verb) => commands::help_for(&verb),
         Command::BoxPlan {
             name,
             profiles,
@@ -2713,7 +2745,13 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 kern_isolation::UidRange::Off
             },
         ),
-        Command::PodList => crate::pod::list(),
+        Command::PodList { json } => {
+            if json {
+                crate::pod::list_json()
+            } else {
+                crate::pod::list()
+            }
+        }
         Command::PodRemove { names } => crate::pod::remove(&names),
         Command::PodHolder => crate::pod::run_holder(),
         Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
@@ -2777,7 +2815,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             pids,
         } => commands::update(&name, memory, cpus, pids),
         Command::Wait { names } => commands::wait(&names),
-        Command::Diff { name } => commands::diff(&name),
+        Command::Diff { name, json } => commands::diff(&name, json),
         Command::Events => commands::events(),
         Command::History { count } => commands::history(count),
         Command::Login { registry, username } => {
@@ -2807,7 +2845,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env_file: env_file.as_deref(),
             profiles: &profiles,
         }),
-        Command::Config { sub, force } => commands::config_cmd(&sub, force),
+        Command::Config { sub, force, json } => commands::config_cmd(&sub, force, json),
         Command::ConfigAdd { args } => commands::config_add(&args),
         Command::ConfigRm { args } => commands::config_rm(&args),
         Command::Validate { path } => commands::validate(path.as_deref()),
@@ -2927,16 +2965,27 @@ mod tests {
     fn a_flag_the_config_verbs_do_not_take_is_refused_not_ignored() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
         for bad in [
-            vec!["config", "list", "--json"],
             vec!["config", "list", "--zzzz"],
-            vec!["config", "--json"],
             vec!["config", "probe", "-x"],
+            // `--json` is a READ flag, so it stays refused on the four verbs that change something.
+            // Tolerating it there would let `kern config clear --json` look like a query and delete
+            // the profiles.
+            vec!["config", "setup", "--json"],
+            vec!["config", "clear", "--json"],
+            vec!["config", "edit", "--json"],
+            vec!["config", "probe", "--json"],
         ] {
             assert!(p(&bad).is_err(), "{bad:?} should be refused");
         }
         for good in [
             vec!["config"],
             vec!["config", "list"],
+            // `config list --json` was refused until every read verb gained JSON: a script that
+            // asked for it got an error, and before that it got the human listing with exit 0.
+            vec!["config", "list", "--json"],
+            // Bare `config` IS `list`, so the flag has to work in that spelling too, or the reader
+            // has to know which of two identical commands takes it.
+            vec!["config", "--json"],
             vec!["config", "setup", "--force"],
             vec!["config", "clear", "-y"],
             // `add`/`rm` parse their own flags - the guard must not reach them.
@@ -2954,8 +3003,14 @@ mod tests {
         assert_eq!(parse(&["help".into()]).unwrap().1, Command::Help);
         // Bare `kern` → the short banner, not the full help.
         assert_eq!(parse(&[]).unwrap().1, Command::Banner);
-        // `kern <cmd> --help` / `-h` (any command, any position before `--`) → the full reference,
-        // NOT an "unknown flag" error. This is the universal `<tool> <cmd> --help` habit.
+        // `kern <cmd> --help` / `-h` (any command, any position before `--`) → the help FOR THAT
+        // COMMAND, NOT an "unknown flag" error. This is the universal `<tool> <cmd> --help` habit.
+        //
+        // It used to resolve to `Command::Help`, the whole 160-line reference, for every verb. That
+        // was better than an error and worse than an answer: six subcommands replied to a question
+        // about one verb by printing everything. `HelpFor` carries the verb; `commands::help_for`
+        // filters the single reference text and falls back to all of it when a verb has no lines,
+        // so nothing became less discoverable.
         for c in [
             vec!["box", "--help"],
             vec!["run", "-h"],
@@ -2967,9 +3022,10 @@ mod tests {
             let argv: Vec<String> = c.iter().map(|s| s.to_string()).collect();
             assert_eq!(
                 parse(&argv).unwrap().1,
-                Command::Help,
-                "`kern {}` should show help",
-                c.join(" ")
+                Command::HelpFor(c[0].to_string()),
+                "`kern {}` should show the help for `{}`",
+                c.join(" "),
+                c[0]
             );
         }
         // But a `--help` AFTER `--` is part of the box command, not a help request.

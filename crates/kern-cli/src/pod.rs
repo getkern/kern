@@ -421,7 +421,13 @@ pub fn add_member(name: &str, member: &str) -> Result<(), Error> {
 }
 
 /// `kern pod ls` - list pods (name, member count, alive/dead holder).
-pub fn list() -> Result<(), Error> {
+/// The pods on disk, sorted, as (name, member count, holder alive).
+///
+/// Split out of [`list`] so the human table and `--json` read the SAME scan. Two scanners is how
+/// `kern validate` and `kern config list` once gave two verdicts about one file, and a pod that
+/// shows `up` in the table and `"alive": false` in JSON would be the same defect with a worse
+/// blast radius, because only one of the two is what a script acts on.
+fn rows() -> Vec<(String, usize, bool)> {
     let root = pods_root();
     let mut rows: Vec<(String, usize, bool)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&root) {
@@ -444,6 +450,29 @@ pub fn list() -> Result<(), Error> {
         }
     }
     rows.sort();
+    rows
+}
+
+/// `kern pod ls --json`: one array, one line, empty when there are no pods.
+///
+/// `[]` and not the human "no pods - create one with ..." line: a script that has to special-case a
+/// sentence to learn there is nothing there is parsing prose. The name is escaped because it is a
+/// directory name on disk.
+pub fn list_json() -> Result<(), Error> {
+    let out = kern_common::json_array(&rows(), |(name, members, alive)| {
+        format!(
+            "{{\"name\":{},\"boxes\":{},\"alive\":{}}}",
+            kern_common::json_str(name),
+            members,
+            alive,
+        )
+    });
+    println!("{out}");
+    Ok(())
+}
+
+pub fn list() -> Result<(), Error> {
+    let rows = rows();
     if rows.is_empty() {
         println!("no pods - create one with `kern pod create <name>`");
         return Ok(());

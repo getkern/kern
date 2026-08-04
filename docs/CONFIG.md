@@ -161,7 +161,8 @@ size       = "2g"          # quota
 backend    = "disk:pool"   # REQUIRED: a declared [[disk]] pool, or "ram" for a RAM-backed tmpfs
 iops       = 1000          # optional I/O-ops limit
 bandwidth  = "50m"         # optional throughput limit
-persistent = true          # survive box removal (default: false → scratch, discarded)
+persistent = true          # survive box removal AND be shared by name across boxes
+                           # (default: false → a private scratch disk per box, discarded)
 ```
 
 A `vdisk:` appears in the box at `/vdisk/<name>`: a RAM tmpfs when rootless, or an ext4-on-loop image

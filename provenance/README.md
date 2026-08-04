@@ -12,10 +12,12 @@ Each release has two files:
 Together they let anyone prove the release existed at a given time, no trust in this repo, GitHub,
 or the author required.
 
-> **Scope:** proofs are kept only for tags that exist in *this* repository, currently **v0.6.5**
-> onward. The pre-launch development history was reorganized before the public release, so earlier
-> internal tags (and their old anchors) are not published here: a proof that names a tag you can't
-> resolve would be unverifiable, and this directory only carries what you can check end-to-end.
+> **Scope:** proofs are kept only for tags that exist in *this* repository, **v0.6.5** onward, with
+> one exception: **v0.6.8 has no proof**, and stamping it now would attest to now rather than to its
+> release, so the gap is left where it is instead of being filled with a later date. The pre-launch
+> development history was reorganized before the public release, so earlier internal tags (and their
+> old anchors) are not published here: a proof that names a tag you can't resolve would be
+> unverifiable, and this directory only carries what you can check end-to-end.
 
 ## Verify
 

@@ -449,13 +449,21 @@ pub fn run(args: &[String]) -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("create" | "c") => create(&args[1..]),
         Some("ls" | "list") => {
-            crate::cli::reject_unknown_flags("volume ls", &refs, &[])?;
-            list()
+            crate::cli::reject_unknown_flags("volume ls", &refs, &["--json"])?;
+            if refs.contains(&"--json") {
+                list_json()
+            } else {
+                list()
+            }
         }
         Some("rm" | "remove" | "delete") => remove(&args[1..]),
         Some("inspect" | "show") => {
-            crate::cli::reject_unknown_flags("volume inspect", &refs, &[])?;
-            inspect(args.get(1))
+            crate::cli::reject_unknown_flags("volume inspect", &refs, &["--json"])?;
+            // The NAME is the first non-flag argument, so `--json` may sit on either side of it:
+            // `volume inspect --json v1` and `volume inspect v1 --json` are the same command, and a
+            // reader who has to remember which order works has been handed a trap.
+            let json = refs.contains(&"--json");
+            inspect(args[1..].iter().find(|a| !a.starts_with("--")), json)
         }
         Some("edit") => edit_cmd(&args[1..]),
         Some("prune") => {
@@ -677,8 +685,25 @@ fn parse_size(s: &str) -> Result<u64, Error> {
 }
 
 /// A named volume for the `kern top` Volumes tab.
+///
+/// TWO names, because they answer two different questions and the same string cannot do both.
+/// `name` is safe to PRINT and `raw` is safe to ACT ON, and neither is safe as the other.
+///
+/// This carried only the scrubbed form, and both halves were wrong in the same way. `kern volume ls
+/// --json` reported 3 of 38 names that do not exist on disk, so a script doing `kern volume rm
+/// "$name"` either fails or, when the scrubbed form happens to be another volume's real name,
+/// deletes the WRONG volume. `kern top`'s remove prompt fed the same scrubbed string to
+/// `Pending::RemoveVolume`, so the destructive path had it too.
+///
+/// A name with a control byte cannot be created THROUGH kern, since `validate` refuses one, so this
+/// needs a directory planted under `volumes/` by something other than kern. That bounds the
+/// exposure; it does not make a delete that hits a different volume acceptable.
 pub(crate) struct VolInfo {
+    /// Scrubbed of control characters: for a terminal, a table, a prompt. Never for a syscall.
     pub name: String,
+    /// Exactly the directory name on disk: for JSON, for `rm`, for building a path. Never printed
+    /// raw to a terminal, which is what `name` is for.
+    pub raw: String,
     /// Bytes used by the volume's `data/` dir.
     pub size: u64,
     /// Quota (bytes) from `meta.json`, if one was set at create time.
@@ -698,12 +723,13 @@ pub(crate) fn entries() -> Vec<VolInfo> {
             let Ok(meta) = std::fs::read_to_string(p.join("meta.json")) else {
                 continue;
             };
-            let Some(name) = e.file_name().to_str().map(crate::ui::scrub) else {
+            let Some(raw) = e.file_name().to_str().map(str::to_string) else {
                 continue;
             };
             let quota = json_u64(&meta, "size_limit").filter(|n| *n > 0 && *n <= MAX_VDISK_BYTES);
             out.push(VolInfo {
-                name,
+                name: crate::ui::scrub(&raw),
+                raw,
                 size: dir_size(&p.join("data")),
                 quota,
             });
@@ -711,6 +737,36 @@ pub(crate) fn entries() -> Vec<VolInfo> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// `kern volume ls --json`: the same scan `list()` prints, as one array on one line.
+///
+/// `quota` is `null` and not a string when no ceiling is set. The human table writes `∞` and the
+/// key/value view writes `unlimited`; a machine reader gets the absence itself, so it never has to
+/// recognise a glyph or a word. `size` and `quota` are numbers in BYTES, unformatted: `2.0G` is for
+/// eyes, and a consumer that has to parse "2.0G" back into an integer is being handed prose.
+fn list_json() -> Result<(), Error> {
+    let out = kern_common::json_array(&entries(), |v| {
+        // `json_str` on the NAME: it comes off the filesystem, so it is attacker-influenced wherever
+        // an untrusted workload can create a directory under `volumes/`, and a raw control byte in
+        // it would otherwise reach whatever terminal cats this.
+        // `usable` closes a contradiction this listing would otherwise state. A directory planted
+        // under `volumes/` by something other than kern is a real volume by every test `ls` applies,
+        // and `inspect`/`rm`/`-v` all refuse it, because `validate` enforces the CREATION charset.
+        // Loosening `validate` is the wrong direction: it is also what keeps a name from being
+        // anything other than a single path component. So the listing states which entries the other
+        // verbs will refuse instead of presenting them as ordinary.
+        format!(
+            "{{\"name\":{},\"size\":{},\"quota\":{},\"usable\":{}}}",
+            kern_common::json_str(&v.raw),
+            v.size,
+            v.quota
+                .map_or_else(|| "null".to_string(), |q| q.to_string()),
+            kern_common::valid_resource_name(&v.raw),
+        )
+    });
+    println!("{out}");
+    Ok(())
 }
 
 fn list() -> Result<(), Error> {
@@ -731,8 +787,14 @@ fn list() -> Result<(), Error> {
         // 3 bytes; `kern_common::pad_visible` right-pads to 10 COLUMNS (not `{:>10}`, which counts bytes
         // and would misalign). Same helper as the `kern top` Storage tab, so the two can't drift.
         let quota = v.quota.map_or_else(|| "∞".to_string(), human_bytes);
+        // Same fact as `usable` in the JSON.
+        let flag = if kern_common::valid_resource_name(&v.raw) {
+            ""
+        } else {
+            "  (unusable: not a kern-created name)"
+        };
         println!(
-            "{b}{c}{:<28}{z} {:>10} {d}{}{z}",
+            "{b}{c}{:<28}{z} {:>10} {d}{}{flag}{z}",
             v.name,
             human_bytes(v.size),
             kern_common::pad_visible(&quota, 10),
@@ -817,13 +879,28 @@ fn remove(names: &[String]) -> Result<(), Error> {
     }
 }
 
-fn inspect(name: Option<&String>) -> Result<(), Error> {
+fn inspect(name: Option<&String>, json: bool) -> Result<(), Error> {
     let name = name.ok_or(Error::Usage("volume inspect <name>"))?;
     validate(name)?;
     let vol = volumes_dir().join(name);
     let data = vol.join("data");
     if !data.is_dir() {
         return Err(Error::Volume(format!("no volume named '{name}'")));
+    }
+    if json {
+        // Same three facts as the human view and the same units as `volume ls --json`: bytes as
+        // numbers, absence as `null`. `path` is escaped because a volume directory is a filesystem
+        // name, and the ext4-loop note is NOT carried over: it is guidance for a reader, not a
+        // property of the volume, and a consumer that has to strip English out of a value field is
+        // parsing prose again.
+        println!(
+            "{{\"name\":{},\"path\":{},\"size\":{},\"quota\":{}}}",
+            kern_common::json_str(name),
+            kern_common::json_str(&data.to_string_lossy()),
+            dir_size(&data),
+            size_limit(name).map_or_else(|| "null".to_string(), |n| n.to_string()),
+        );
+        return Ok(());
     }
     let p = crate::ui::Palette::detect();
     let row = |k: &str, v: &str| println!("{d}{k:<8}{z} {v}", d = p.d, z = p.z);
@@ -835,7 +912,12 @@ fn inspect(name: Option<&String>) -> Result<(), Error> {
             "quota",
             &format!("{} (ext4-loop when mounted as root)", human_bytes(n)),
         ),
-        None => row("quota", "none"),
+        // "unlimited", not "none". The table two functions up already refuses a bare `-` because it
+        // "reads as unset/error", and `none` carries exactly that ambiguity: a reader cannot tell
+        // "no ceiling" from "nothing allowed", which are opposite facts about the same volume. The
+        // table keeps `∞` because a column is one glyph wide; this is a key/value line with room for
+        // the word, and the word greps. Pinned by `the_two_read_verbs_agree_about_an_unlimited_quota`.
+        None => row("quota", "unlimited"),
     }
     Ok(())
 }
@@ -919,6 +1001,41 @@ fn human_bytes(b: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The three read paths must agree that a volume with no quota has NO CEILING.
+    ///
+    /// They did not. `volume ls` printed `∞`, `volume inspect` printed `none`, and an outside
+    /// tester reported one of them as a limitation while this repo's own notes recorded the other.
+    /// `none` is the ambiguous one: it reads equally as "no ceiling" and as "nothing allowed",
+    /// which are opposite facts, and the table two functions above already refuses a bare `-` for
+    /// exactly that reason. JSON carries the absence itself, so it needs no word at all.
+    #[test]
+    fn the_read_verbs_agree_about_an_unlimited_quota() {
+        // The rendering rule of each path, pinned at its source rather than by running the binary,
+        // so this fails when someone edits the spelling and not when a volume happens to exist.
+        let src = include_str!("volume.rs");
+        assert!(
+            src.contains(concat!("row(\"quota\", \"un", "limited\")")),
+            "`volume inspect` no longer spells an absent quota as an unambiguous word"
+        );
+        assert!(
+            !src.contains(concat!("row(\"quota\", \"no", "ne\")")),
+            "`volume inspect` is back to `none`, which reads as \"nothing allowed\" as easily as \
+             it reads as \"no ceiling\""
+        );
+        assert!(
+            src.contains(concat!(
+                "v.quota.map_or_else(|| \"",
+                "\u{221e}",
+                "\".to_string()"
+            )),
+            "`volume ls` no longer renders an absent quota as the infinity glyph"
+        );
+        assert!(
+            src.contains("\"quota\\\":{}") && src.contains("|| \"null\".to_string()"),
+            "the JSON path no longer emits an absent quota as null"
+        );
+    }
+
     use super::*;
 
     // `XDG_DATA_HOME` is process-global; the CRATE-WIDE lock serializes this against every other

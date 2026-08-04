@@ -6,7 +6,14 @@
 
 use crate::error::Error;
 
-/// The top-level verbs, kept in one place so all three shells stay in sync.
+/// The top-level verbs.
+///
+/// This list and the `COMMANDS:` block of `kern --help` are two descriptions of one parser, so they
+/// drifted: nine verbs the reference documents (`commit`, `rmi`, `rename`, `update`, `wait`, `diff`,
+/// `events`, `up`, `uninstall`) could not be tab-completed, and two the parser accepts (`killall`,
+/// `logout`) appeared only here. Neither direction is harmless: the first hides working commands
+/// from the discovery path most people use, the second offers commands the reference never
+/// explains. `the_completions_and_the_reference_agree` compares the two lists now.
 const VERBS: &[&str] = &[
     "box",
     "run",
@@ -51,6 +58,17 @@ const VERBS: &[&str] = &[
     "completions",
     "version",
     "help",
+    // Documented in the reference and missing here until 0.6.39.
+    "commit",
+    "rmi",
+    "rename",
+    "update",
+    "wait",
+    "diff",
+    "events",
+    "up",
+    "down",
+    "uninstall",
 ];
 
 /// Verbs whose first argument is a running box's name (so completion can offer `kern ps` names).
