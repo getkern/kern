@@ -675,6 +675,15 @@ mod tests {
                 return;
             }
         }
+        // The word form of the ENOSYS count, for the prose that spells it out instead of writing a
+        // digit. `clone3` joining the set turned "Nine" into "Ten" in three separate paragraphs.
+        let word = match errno {
+            9 => "Nine",
+            10 => "Ten",
+            11 => "Eleven",
+            12 => "Twelve",
+            _ => "UNMAPPED-COUNT-add-the-word-here",
+        };
         let expect: [(&str, Vec<String>); 3] = [
             (
                 "SECURITY.md",
@@ -682,6 +691,14 @@ mod tests {
                     format!("**{total} syscalls denied**"),
                     format!("{kill} that hard-kill"),
                     format!("the {errno} that return"),
+                    // SECURITY.md said "**34 syscalls denied**" in one bullet and "9 plus 24 is the
+                    // 33" two paragraphs below, having been half-updated when `clone3` joined. Only
+                    // the first was covered here, so the file contradicted itself through a release.
+                    // The prose count is now pinned too.
+                    format!(
+                        "{word}, in {} families",
+                        if errno == 10 { "six" } else { "?" }
+                    ),
                 ],
             ),
             ("README.md", vec![format!("denylist of {total} syscalls")]),
@@ -689,19 +706,7 @@ mod tests {
             // joined the set: the file said "Nine denied syscalls" while the filter denied ten. It
             // was not covered here, which is exactly why nobody noticed. Word forms are checked
             // rather than digits because that is how the page is written.
-            (
-                "OPEN_ITEMS.md",
-                vec![format!(
-                    "{} denied syscalls",
-                    match errno {
-                        9 => "Nine",
-                        10 => "Ten",
-                        11 => "Eleven",
-                        12 => "Twelve",
-                        _ => "UNMAPPED-COUNT-add-the-word-here",
-                    }
-                )],
-            ),
+            ("OPEN_ITEMS.md", vec![format!("{word} denied syscalls")]),
         ];
         for (file, needles) in expect {
             let path = dir.join(file);
@@ -709,7 +714,12 @@ mod tests {
                 eprintln!("skip: cannot read {}", path.display());
                 continue;
             };
+            // Collapse whitespace before searching. These pages are hard-wrapped at 100 columns, so a
+            // needle only had to straddle a line break to stop matching, and the test would then be
+            // green because the prose was REFLOWED rather than because it was right.
+            let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
             for needle in needles {
+                let needle = needle.split_whitespace().collect::<Vec<_>>().join(" ");
                 assert!(
                     text.contains(&needle),
                     "{file} no longer contains {needle:?}. The filter denies {total} syscalls \
