@@ -139,9 +139,13 @@ backend = "cpu:0"
 cpus    = 1.5
 memory  = "512m"
 
+[[disk]]                    # a physical pool a vdisk can be placed on
+id   = "pool"
+path = "/var/lib/kern/disks"
+
 [[vdisk]]                   # a 64 MiB scratch disk   ->  attach as  vdisk:scratch
 name    = "scratch"
-backend = "ram"
+backend = "disk:pool"       # or "ram" for a RAM-backed tmpfs, with no [[disk]] block at all
 size    = "64m"
 
 [[gpio]]                    # a controller anchor
@@ -159,6 +163,10 @@ kern box train --image alpine vcpu:heavy vdisk:scratch -- ./train.sh
 kern run vcpu:heavy -- ./train.sh            # the same slice, no sandbox
 kern box iot --image alpine vgpio:sensor -- ls /dev
 ```
+
+A `vdisk:` is a RAM-backed tmpfs when kern runs rootless, whatever its backend says, and an
+ext4-on-loop image with a real disk quota when it runs privileged in the foreground. kern says which
+one you got rather than letting you assume, and the size cap is enforced either way.
 
 Profiles compose: several attach to one box, and an explicit flag beats a profile's own value. Every
 key is spelled like its CLI flag, so `cpus` is `--cpus` and `memory` is `--memory`.
