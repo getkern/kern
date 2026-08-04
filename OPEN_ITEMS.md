@@ -79,16 +79,15 @@ with cgroup caps on, which is what users run, the same span went from 4.92 ms to
 
 ## Binary size is not being reduced
 
-Read from the checksum-verified v0.6.38 release artifacts: **1926112 B x86_64 (1.84 MB)** and
+Read from the checksum-verified v0.6.43 release artifacts: **1938400 B x86_64 (1.85 MB)** and
 **1642984 B aarch64 (1.57 MB)**. The release profile is already at its limit.
 
-The x86_64 figure has not moved in three releases. The aarch64 one gained exactly 65536 B, one
-64 KiB segment, and the cause is the build environment rather than the code: cross-built here with
-`aarch64-linux-gnu-gcc` this same source is 1642984 B, the number a local build has produced since
-before the previous release, when the published artifact was 1577448. Same code, local unchanged,
-published up by the whole gap. WHICH change in the release environment closed it is not established,
-and an earlier version of this entry asserted the reverse of what is now measured, so no story is
-offered for it here.
+x86_64 grew 12288 B (12 KiB) from 0.6.38's 1926112, tracking the code added across the intervening
+releases. aarch64 has held at 1642984 across the last two, so the two arches move independently, as
+they should: different target, different linker. The aarch64 figure had jumped one 64 KiB segment
+earlier from a change in the release build environment rather than the code, and a still-earlier
+version of this entry asserted the reverse of what was then measured, so no story is offered for the
+segment beyond that it was environmental.
 
 Rebuilding the standard library on nightly reaches 1.40 MB, and adding `-Cpanic=immediate-abort`
 reaches 1.22 MB. Deliberately not applied: under that flag a panic prints no file and no line,

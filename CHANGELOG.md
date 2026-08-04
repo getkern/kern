@@ -257,10 +257,10 @@ a volume directory carrying a raw `ESC` in its name round-tripped through `volum
 ## Earlier releases
 
 0.6.34 and everything before it live in the signed tags: `git show v0.6.34`, or the
-[tag list](https://github.com/getkern/kern/tags). All 29 are signed, and 28 of them carry an
-OpenTimestamps proof ([provenance/](provenance/)), of which 28 are confirmed in a Bitcoin block:
-every proof that exists is anchored. A freshly stamped one is pending for a few hours, since a
-calendar has to reach a transaction and then six confirmations. The one tag with no proof at all is
-v0.6.8, which predates the practice; stamping it today would attest to today, not to its release.
+[tag list](https://github.com/getkern/kern/tags). All 30 are signed, and 29 of them carry an
+OpenTimestamps proof ([provenance/](provenance/)), of which 28 are confirmed in a Bitcoin block. The
+newest, v0.6.43, is stamped and pending: a calendar has to reach a transaction and then six
+confirmations, which takes a few hours. The one tag with no proof at all is v0.6.8, which predates
+the practice; stamping it today would attest to today, not to its release.
 
 [0.6.43]: https://github.com/getkern/kern/releases/tag/v0.6.43
