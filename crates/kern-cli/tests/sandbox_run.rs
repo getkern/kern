@@ -209,7 +209,11 @@ fn box_detached_appears_in_ps_then_prunes() {
         let _ = fs::remove_dir_all(&xdg);
         return;
     }
-    assert!(out.status.success(), "detached start should succeed");
+    assert!(
+        out.status.success(),
+        "detached start should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // It shows up in `ps`. Registration happens in the forked supervisor *after* the parent
     // returns, so poll briefly rather than asserting immediately (robust under parallel CI load).
@@ -286,7 +290,11 @@ fn inspect_shows_detail_then_prune_reclaims_logs() {
         let _ = fs::remove_dir_all(&xdg);
         return;
     }
-    assert!(out.status.success(), "detached start should succeed");
+    assert!(
+        out.status.success(),
+        "detached start should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // While alive, `inspect --json` reports the box's identity (pid + command).
     let mut inspected = false;
@@ -446,7 +454,11 @@ fn box_logs_capture_output_and_stats_list_the_box() {
         let _ = fs::remove_dir_all(&xdg);
         return;
     }
-    assert!(out.status.success(), "detached start should succeed");
+    assert!(
+        out.status.success(),
+        "detached start should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Give the box a moment to print, then `kern logs` must echo its output back.
     std::thread::sleep(std::time::Duration::from_millis(700));
@@ -1375,7 +1387,11 @@ fn box_exec_enters_running_box() {
         let _ = fs::remove_dir_all(&xdg);
         return;
     }
-    assert!(start.status.success(), "detached start should succeed");
+    assert!(
+        start.status.success(),
+        "detached start should succeed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // exec sees the box's hostname.
