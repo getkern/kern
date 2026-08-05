@@ -100,21 +100,62 @@ pub fn systemd_scope_mode() -> &'static str {
 /// (built from `getuid`, so it is found even when `XDG_RUNTIME_DIR` is unset or points at a scratch
 /// subdir - the exact misconfiguration that once made kern miss a running systemd and silently fall to
 /// the best-effort cap path), AND the `$XDG_RUNTIME_DIR/systemd` the env names (so a container or a host
-/// whose runtime dir is legitimately NOT `/run/user/<uid>` still resolves). Either marker present means
-/// the manager is there; neither means best-effort, which the caller now warns about rather than
-/// enforcing nothing in silence.
+/// whose runtime dir is legitimately NOT `/run/user/<uid>` still resolves). A marker present AND the
+/// session bus reachable means the manager is there; otherwise best-effort, which the caller now warns
+/// about rather than enforcing nothing in silence.
 pub fn user_systemd_present() -> bool {
     if as_root() {
         return std::path::Path::new("/run/systemd/system").exists();
     }
     // SAFETY: `getuid` is always successful and takes no arguments.
     let uid = unsafe { libc::getuid() };
-    if std::path::PathBuf::from(format!("/run/user/{uid}/systemd")).exists() {
-        return true;
+    let dir_present = std::path::PathBuf::from(format!("/run/user/{uid}/systemd")).exists()
+        || std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|d| std::path::Path::new(&d).join("systemd").exists())
+            .unwrap_or(false);
+    // The directory ALONE is not enough. It survives as a leftover on a host with no live user
+    // manager (a CI runner or a container with no login session), and there `systemd-run --user`
+    // dies with "Failed to connect to bus: No such file or directory". The scope re-exec commits to
+    // an `exec()` that cannot fall back once systemd-run is found, so a dir-only host would fail
+    // EVERY box instead of running best-effort. Also require the session bus the tool connects to.
+    dir_present && user_bus_reachable()
+}
+
+/// Is the user session D-Bus reachable, i.e. will a `systemd-run --user` find a bus to connect to?
+/// The socket it uses is `$DBUS_SESSION_BUS_ADDRESS` when that names a `unix:path=`, else the standard
+/// `/run/user/<uid>/bus`. An abstract-socket address (no filesystem path) is trusted as set - a
+/// session that exported it did so deliberately and an abstract name cannot be `stat`ed. An empty
+/// `DBUS_SESSION_BUS_ADDRESS` counts as unset (the same exported-but-blank rule as [`env_flag`]).
+fn user_bus_reachable() -> bool {
+    // SAFETY: `getuid` is always successful and takes no arguments.
+    let uid = unsafe { libc::getuid() };
+    let default_bus = PathBuf::from(format!("/run/user/{uid}/bus"));
+    let addr = std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
+        .map(|a| a.to_string_lossy().into_owned())
+        .filter(|a| !a.is_empty());
+    user_bus_reachable_at(addr.as_deref(), &default_bus)
+}
+
+/// Testable core of [`user_bus_reachable`]: resolve the bus socket from an explicit address / default
+/// and report whether it exists, so a unit test can drive it without touching the process environment.
+fn user_bus_reachable_at(dbus_addr: Option<&str>, default_bus: &std::path::Path) -> bool {
+    match dbus_addr {
+        Some(addr) => match dbus_unix_path(addr) {
+            Some(p) => std::path::Path::new(p).exists(),
+            None => true, // abstract or non-unix transport: trust the explicit configuration
+        },
+        None => default_bus.exists(),
     }
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|d| std::path::Path::new(&d).join("systemd").exists())
-        .unwrap_or(false)
+}
+
+/// The `unix:path=<P>` filesystem socket from a D-Bus address list (`;`-separated `kind:k=v,…`
+/// entries), if any entry names one. None for abstract-only (`unix:abstract=…`) or non-unix addresses.
+fn dbus_unix_path(addr: &str) -> Option<&str> {
+    addr.split(';').find_map(|entry| {
+        let rest = entry.trim().strip_prefix("unix:")?;
+        rest.split(',')
+            .find_map(|kv| kv.trim().strip_prefix("path=").filter(|p| !p.is_empty()))
+    })
 }
 
 /// Is an OUTER cgroup already enforcing this box's caps, so the direct kern.slice path must NOT be taken?
@@ -1666,5 +1707,58 @@ mod tests {
             subtree_batch("  memory   pids\tcpu  \n"),
             "+memory +pids +cpu"
         );
+    }
+
+    #[test]
+    fn dbus_unix_path_extracts_the_socket_and_ignores_abstract() {
+        // The common case: a plain filesystem socket.
+        assert_eq!(
+            dbus_unix_path("unix:path=/run/user/1000/bus"),
+            Some("/run/user/1000/bus")
+        );
+        // Extra key=val fields around the path.
+        assert_eq!(
+            dbus_unix_path("unix:path=/run/user/1000/bus,guid=deadbeef"),
+            Some("/run/user/1000/bus")
+        );
+        // A multi-transport list: the `unix:path` entry is honoured wherever it sits.
+        assert_eq!(
+            dbus_unix_path("tcp:host=localhost,port=1;unix:path=/tmp/bus"),
+            Some("/tmp/bus")
+        );
+        // Abstract socket carries no filesystem path.
+        assert_eq!(dbus_unix_path("unix:abstract=/tmp/dbus-AbCd,guid=x"), None);
+        // An empty path is not a path; a non-unix transport has none.
+        assert_eq!(dbus_unix_path("unix:path="), None);
+        assert_eq!(dbus_unix_path("tcp:host=localhost,port=1"), None);
+    }
+
+    #[test]
+    fn user_bus_reachable_requires_the_socket_or_trusts_an_abstract_address() {
+        // Drive the pure core against synthetic paths - no touching the real session bus.
+        let tmp = std::env::temp_dir().join(format!("kern-bustest-{}", unsafe { libc::getpid() }));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        let present = tmp.join("bus");
+        let absent = tmp.join("no-bus");
+        fs::write(&present, b"").expect("touch socket stand-in");
+
+        // Explicit `unix:path=` gates on that exact path's existence, ignoring the default.
+        assert!(user_bus_reachable_at(
+            Some(&format!("unix:path={}", present.display())),
+            &absent
+        ));
+        assert!(!user_bus_reachable_at(
+            Some(&format!("unix:path={}", absent.display())),
+            &present
+        ));
+        // Abstract address is trusted even when the default is missing.
+        assert!(user_bus_reachable_at(Some("unix:abstract=/tmp/x"), &absent));
+        // No address: fall back to the default bus path's existence (the CI-runner discriminant -
+        // a leftover systemd dir but no `/run/user/<uid>/bus` now reads as unreachable).
+        assert!(user_bus_reachable_at(None, &present));
+        assert!(!user_bus_reachable_at(None, &absent));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

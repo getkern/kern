@@ -19,7 +19,7 @@ Removals and deprecations are always listed under **Deprecated** / **Removed** h
 
 ## [0.6.50]
 
-Post-0.6.43 hardening. 750 Rust tests, clippy `-D warnings`, verified on x86_64 and three aarch64
+Post-0.6.43 hardening. 752 Rust tests, clippy `-D warnings`, verified on x86_64 and three aarch64
 boards (kernels 6.16 / 6.6 / 5.15).
 
 ### Security
