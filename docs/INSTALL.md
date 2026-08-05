@@ -4,25 +4,22 @@ One static binary and no daemon. Its only Rust dependency is `libc`, and a box b
 `--rootfs` needs nothing else on the host. The image path is the exception and is stated as one:
 `kern pull` and `--image` shell out to the system `curl` and `tar` rather than linking a TLS stack
 and a decompressor, which is most of why the binary is 1.86 MB. `kern doctor` reports whether both
-are present. This page is the long form; the [README](../README.md) has the one-liner most people
-need.
+are present. This page is the long form of the [README](../README.md).
 
+kern is a **pre-release work in progress with no published binaries**, so every platform builds from
+source. It needs a Rust toolchain and a Linux kernel with unprivileged user namespaces and cgroup v2.
 
-**🐧 Linux & ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q). One line; auto-detects `x86-64` / `aarch64`:
+**🐧 Linux & ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q), on `x86-64` or `aarch64`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-Served from **github.com** (read the script first if you like). It downloads the release binary for
-your arch and verifies the sha256 before installing. No Rust toolchain required. (`getkern.dev/install.sh`
-is a short alias.)
+`--locked` builds against the committed `Cargo.lock`, so you get the dependency versions the tree was
+tested with.
 
-**🪟 Windows.** One line in PowerShell (no Docker Desktop, no Ubuntu):
-
-```powershell
-irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
-```
+**🪟 Windows.** kern runs inside **WSL2**, a real Linux kernel. Install a WSL2 distro, add a Rust
+toolchain, and run the same `cargo install --git … getkern --locked` inside it.
 
 kern runs inside **WSL2**, a real Linux kernel, so the isolation (namespaces + seccomp) and `--cpus`
 cap work for real, `--memory` included: measured on a stock WSL2 kernel (6.18), a 128m box reads back

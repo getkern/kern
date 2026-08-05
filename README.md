@@ -15,11 +15,10 @@
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](docs/INSTALL.md)
-[![Release](https://img.shields.io/github/v/release/getkern/kern?label=release&color=brightgreen)](https://github.com/getkern/kern/releases/latest)
 
 ```sh
-# Linux and ARM boards. Windows (WSL2) and building from source are just below.
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+# Pre-release: build from source (needs a Rust toolchain). Linux, WSL2 and ARM boards.
+cargo install --git https://github.com/getkern/kern getkern --locked
 kern box dev --image alpine -it -- sh
 ```
 
@@ -74,30 +73,15 @@ denylist, which fleet limit is a guard rail instead of a boundary.
 
 ## Install
 
-**🐧 Linux and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q). One line; auto-detects `x86-64` / `aarch64`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-```
-
-Served from **github.com** (read the script first if you like). It downloads the release binary for
-your arch and verifies the sha256 before installing. No Rust toolchain required.
-(`getkern.dev/install.sh` is a short alias.)
-
-**🪟 Windows.** One line in PowerShell (no Docker Desktop, no Ubuntu):
-
-```powershell
-irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
-```
-
-**From source**, if you would rather build it yourself or want a target we do not publish a binary for:
+This is a pre-release work in progress with no published binaries, so kern is built from source. It
+needs a Rust toolchain, plus a Linux kernel with unprivileged user namespaces and cgroup v2 (Linux,
+WSL2 and ARM boards alike: Raspberry Pi · Jetson · Arduino UNO Q):
 
 ```sh
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-Needs a Linux kernel with unprivileged user namespaces and cgroup v2. `kern doctor` tells you
-whether boxes will run here before you try. Boards, WSL2, checksums and the long form:
+`kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Quickstart
