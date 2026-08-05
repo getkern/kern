@@ -2932,29 +2932,33 @@ fn cap_drop_mask(spec: &CapSpec) -> u64 {
 /// can't re-add them later. Needs `CAP_SETPCAP` in the *effective* set, so it must run BEFORE the
 /// effective set is cleared and BEFORE any `setuid` to a non-root user (which sheds effective caps).
 fn drop_cap_bounding(mask: u64) -> Result<(), Error> {
+    // Drop each requested capability from the bounding set and, in the SAME pass, confirm it actually
+    // went - measuring the OUTCOME per cap, not deducing it from a return code (capability bits are
+    // independent, so dropping one never disturbs another's verdict):
+    //   * `PR_CAPBSET_DROP` failing with EINVAL means the cap is past CAP_LAST_CAP (a `--cap-drop <N>`
+    //     beyond the kernel's range) - nothing to drop, not a per-call failure; any OTHER error (EPERM =
+    //     missing CAP_SETPCAP) fails closed at once.
+    //   * `PR_CAPBSET_READ` then reads the cap back: 1 = still present (a leak), 0 = gone, <0/EINVAL = no
+    //     such cap, never in `CapBnd`. A cap that EXISTS and reads back PRESENT means the drop silently
+    //     failed and we refuse a weaker boundary than `--cap-drop` promised.
+    // The per-cap `prctl` probe (a handful of microsecond calls over exactly the dropped caps) replaces
+    // reading and parsing the ~1 KiB `/proc/self/status` on the box hot path; `read_cap_bnd` survives as
+    // the unit test's whole-mask cross-check.
+    let mut leaked = 0u64;
     for c in 0..64u32 {
         if mask & (1u64 << c) == 0 {
             continue;
         }
         if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, c as libc::c_ulong, 0, 0, 0) } != 0 {
             let e = std::io::Error::last_os_error();
-            // EINVAL = capability `c` does not exist on this kernel (a `--cap-drop <N>` past
-            // CAP_LAST_CAP): there is nothing to drop, so it is not a per-call failure. Any OTHER error
-            // - EPERM above all, meaning `CAP_SETPCAP` is missing - fails closed immediately. But an
-            // errno is a per-call CLAIM, not proof of the final boundary, and treating EINVAL as
-            // always-benign is an interpretation. The AUTHORITATIVE check is the post-loop CapBnd read
-            // below, which measures the outcome instead of deducing it from return codes.
             if e.raw_os_error() != Some(libc::EINVAL) {
                 return Err(Error::Syscall("prctl(PR_CAPBSET_DROP)", e));
             }
         }
+        if unsafe { libc::prctl(libc::PR_CAPBSET_READ, c as libc::c_ulong, 0, 0, 0) } == 1 {
+            leaked |= 1u64 << c;
+        }
     }
-    // Confirm the drop actually took: re-read the bounding set and require every cap we asked to drop
-    // to be gone. A cap past CAP_LAST_CAP is never in `CapBnd`, so a `--cap-drop <N>` beyond the
-    // kernel's range can't trip this; a cap that EXISTS and is still present means the drop silently
-    // failed for some reason a per-call errno did not surface, and we refuse to run with a weaker
-    // boundary than `--cap-drop` promised.
-    let leaked = mask & read_cap_bnd()?;
     if leaked != 0 {
         return Err(Error::Spec(format!(
             "capability bounding-set drop did not take: caps {leaked:#018x} still present in CapBnd \
@@ -2964,8 +2968,11 @@ fn drop_cap_bounding(mask: u64) -> Result<(), Error> {
     Ok(())
 }
 
-/// The process bounding capability set (`CapBnd`) from `/proc/self/status`, as a u64 bitmask. Used to
-/// VERIFY that a `PR_CAPBSET_DROP` sweep took, rather than trusting the per-call return code.
+/// The process bounding capability set (`CapBnd`) from `/proc/self/status`, as a u64 bitmask. The box
+/// hot path now VERIFIES the `PR_CAPBSET_DROP` sweep per-cap with `PR_CAPBSET_READ` (no `/proc` parse),
+/// so this whole-mask reader survives only as the cross-check the unit test asserts against - hence
+/// `#[cfg(test)]`, to keep it out of the production binary rather than leave it dead there.
+#[cfg(test)]
 fn read_cap_bnd() -> Result<u64, Error> {
     let s = std::fs::read_to_string("/proc/self/status")
         .map_err(|e| Error::Syscall("read /proc/self/status", e))?;

@@ -41,9 +41,12 @@ boards (kernels 6.16 / 6.6 / 5.15).
   otherwise reach the host past its loopback netns. Closes the one place kern's default was wider than
   moby's on `socket`; verified with a discriminant (the same call succeeds outside a box and returns
   `EAFNOSUPPORT` inside one).
-- **The capability bounding-set drop is VERIFIED, not deduced.** After `PR_CAPBSET_DROP`, kern re-reads
-  `CapBnd` from `/proc/self/status` and fails closed if any capability it asked to drop is still
-  present, instead of trusting the per-call errno.
+- **The capability bounding-set drop is VERIFIED, not deduced.** After `PR_CAPBSET_DROP`, kern confirms
+  each dropped capability is actually gone with `PR_CAPBSET_READ` and fails closed if any is still
+  present, instead of trusting the per-call errno. The per-cap `prctl` probe (a handful of microsecond
+  calls over exactly the dropped caps) replaced reading and parsing the ~1 KiB `/proc/self/status` on
+  every box start, which measured as the dominant cost of the campaign's box-start overhead - removing
+  it returns cold start to the pre-campaign baseline (~20 us apart, within noise) with the SAME check.
 - **`CAP_SYS_PTRACE` is dropped by default** (14 dangerous caps, up from 13): dropping the cap closes
   the `/proc/<pid>/mem` cross-process read, not only the `ptrace` syscall the filter already killed.
 - **The seccomp mode is RECORDED and reproduced.** A box records its filter mode; `kern exec` and the
