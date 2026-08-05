@@ -93,7 +93,11 @@ boards (kernels 6.16 / 6.6 / 5.15).
   state). The log now flows through a forked pump into a single-generation ring (`<log>` + `<log>.1`),
   bounded at 32 MiB per box; a full disk (`ENOSPC`) drops output rather than blocking or killing the
   workload. `kern logs -f` may skip lines across a rotation (as Docker's does). The pump detaches its own
-  stdio to `/dev/null` so `kern box -d` still returns immediately when its stdout is a pipe.
+  stdio to `/dev/null` so `kern box -d` still returns immediately when its stdout is a pipe. It moves
+  bytes with `splice(2)` (ZERO-COPY pipe->file, no userspace `read`+`write` pair), so draining a
+  gigabyte-per-second flood costs one in-kernel copy instead of two - roughly halving the pump's CPU,
+  which runs outside the box's cgroup cap - and falls back to `read`+`write` on a filesystem that refuses
+  `splice`. Verified on x86_64 (6.8, WSL2 6.18) and aarch64 (tegra 5.15): capped, no hang, no fallback.
 - **An OOM in a box kills the WHOLE box, not one process.** kern now sets `memory.oom.group = 1` on each
   box cgroup, so when the box hits its `memory.max` the kernel kills every process in it at once instead
   of the single highest-`oom_score` task - which could leave PID 1 alive and the box half-dead but still

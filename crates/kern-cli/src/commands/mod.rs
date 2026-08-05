@@ -4595,21 +4595,43 @@ fn reexec_in_scope_if_possible(
 /// state creatable in `/run/user/<uid>`). Docker solved the same class with `--log-opt max-size`.
 const BOX_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Open `path` for log append (`O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC`, mode 0600). Returns the fd, or
-/// `-1` on any error (a NUL in the path, or `open` failing). The single opener shared by [`CappedLog`]
-/// (its initial open and each rotation) and the uncapped `open_log_direct` fallback, so the flags can't
-/// drift between them.
-fn open_log_append(path: &std::path::Path) -> i32 {
+/// Max bytes moved per `splice` in the pump: large enough to amortise the syscall across a flood, small
+/// enough that one call can't monopolise the pump or overshoot the rotation boundary by much.
+const PUMP_SPLICE_CHUNK: usize = 1 << 20;
+
+/// Open `path` for log writing (`O_WRONLY|O_CREAT|O_CLOEXEC`, mode 0600), with `O_APPEND` iff `append`.
+/// Returns the fd, or `-1` on error. The capped pump opens WITHOUT `O_APPEND` - it is the sole writer and
+/// drives the offset itself via `splice`, whose interaction with `O_APPEND` is not guaranteed across
+/// kernels - while the uncapped `open_log_direct` fallback opens WITH `O_APPEND` because the box writes
+/// to it directly and its two inherited stdio streams stay ordered only through the append flag.
+fn open_log(path: &std::path::Path, append: bool) -> i32 {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return -1;
     };
-    unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
-            0o600,
+    let flags =
+        libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | if append { libc::O_APPEND } else { 0 };
+    unsafe { libc::open(c.as_ptr(), flags, 0o600) }
+}
+
+/// Move up to `want` bytes from pipe `rd` into `sink` with `splice(2)` - a ZERO-COPY pipe->file move (no
+/// userspace buffer, no `read`+`write` pair), so draining even a gigabyte-per-second flood costs syscall
+/// overhead only. Returns bytes moved (`Ok(0)` = EOF) or `Err(errno)`.
+fn splice_once(rd: i32, sink: i32, want: usize) -> Result<usize, i32> {
+    let moved = unsafe {
+        libc::splice(
+            rd,
+            std::ptr::null_mut(),
+            sink,
+            std::ptr::null_mut(),
+            want,
+            libc::SPLICE_F_MOVE,
         )
+    };
+    if moved >= 0 {
+        Ok(moved as usize)
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
     }
 }
 
@@ -4625,18 +4647,15 @@ struct CappedLog {
 
 impl CappedLog {
     fn open(path: &std::path::Path, max: u64) -> Option<Self> {
-        let fd = open_log_append(path);
+        let fd = open_log(path, false);
         if fd < 0 {
             return None;
         }
-        // A restarted box appends to its existing log: start the counter from the current file size, not
-        // 0, so the cap bounds the FILE and a crash-looping box can't defeat it one restart at a time.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let written = if unsafe { libc::fstat(fd, &mut st) } == 0 && st.st_size > 0 {
-            st.st_size as u64
-        } else {
-            0
-        };
+        // Non-append (the pump is the sole writer and drives the offset via `splice`). Seek to end so a
+        // pre-existing log is appended to, not overwritten, and count from its size so the cap bounds the
+        // FILE, not this session's bytes. `lseek(SEEK_END)` returns the new offset (= size); 0 for fresh.
+        let end = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        let written = if end > 0 { end as u64 } else { 0 };
         Some(Self {
             fd,
             path: path.to_path_buf(),
@@ -4654,7 +4673,7 @@ impl CappedLog {
         if std::fs::rename(&self.path, &old).is_err() {
             return; // keep the old fd; never grow past the cap
         }
-        let fd = open_log_append(&self.path);
+        let fd = open_log(&self.path, false);
         if fd >= 0 {
             unsafe { libc::close(self.fd) };
             self.fd = fd;
@@ -4701,22 +4720,75 @@ impl Drop for CappedLog {
 }
 
 /// Drain the pipe `rd` into a byte-capped rotating log at `path` until EOF. Runs in the forked pump
-/// child. If the log can't be opened, the pipe is still drained (bytes discarded) so the workload never
-/// blocks on a full pipe.
+/// child. Uses `splice(2)` (ZERO-COPY pipe->file) so draining a flood costs syscall overhead only, not
+/// the two userspace memcpies of a `read`+`write` loop - the CPU that would otherwise burn OUTSIDE the
+/// box's cgroup cap. Falls back to `read`+`write` permanently if the filesystem refuses `splice`
+/// (`EINVAL`); drains to `/dev/null` (still zero-copy) when there is no log or the disk is full, so the
+/// box NEVER blocks on a full pipe.
 fn pump_capped_log(rd: i32, path: &std::path::Path) {
     let mut log = CappedLog::open(path, BOX_LOG_MAX_BYTES);
-    let mut buf = [0u8; 64 * 1024];
+    // A /dev/null sink for the no-log case and disk-full overflow: the pipe must still be drained.
+    let void = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    let mut use_splice = true;
+    let mut scratch = [0u8; 64 * 1024]; // read+write fallback buffer (splice-unsupported fs)
     loop {
-        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n > 0 {
-            if let Some(w) = log.as_mut() {
-                w.write(&buf[..n as usize]);
+        // Choose this round's sink and how much may go to it. `to_log` distinguishes the real log (count
+        // toward the cap) from the /dev/null shed (do not).
+        let (sink, want, to_log) = match log.as_mut() {
+            Some(l) => {
+                if l.written >= l.max {
+                    l.rotate();
+                }
+                let room = l.max.saturating_sub(l.written);
+                if room == 0 {
+                    (void, PUMP_SPLICE_CHUNK, false) // rotation could not free room -> shed this round
+                } else {
+                    (l.fd, room.min(PUMP_SPLICE_CHUNK as u64) as usize, true)
+                }
             }
-        } else if n == 0 {
-            break; // EOF: every write end (workload + supervisor) is closed
-        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            break; // a real read error - stop draining
+            None => (void, PUMP_SPLICE_CHUNK, false),
+        };
+        if sink < 0 {
+            break; // neither a log nor /dev/null could be opened - nothing to drain into
         }
+        if use_splice {
+            match splice_once(rd, sink, want) {
+                Ok(0) => break, // EOF: every write end (workload + supervisor) is closed
+                Ok(n) => {
+                    if to_log {
+                        if let Some(l) = log.as_mut() {
+                            l.written += n as u64;
+                        }
+                    }
+                }
+                Err(libc::EINTR) => {}
+                // Disk full: force a rotation next round (freeing `.1`'s space), shedding meanwhile.
+                Err(libc::ENOSPC) | Err(libc::EDQUOT) => {
+                    if let Some(l) = log.as_mut() {
+                        l.written = l.max;
+                    }
+                }
+                // This kernel/filesystem cannot splice this pipe->fd pair: fall back permanently.
+                Err(libc::EINVAL) => use_splice = false,
+                Err(_) => break, // an unexpected splice error - stop draining
+            }
+        } else {
+            let n = unsafe { libc::read(rd, scratch.as_mut_ptr().cast(), scratch.len()) };
+            if n > 0 {
+                match log.as_mut() {
+                    Some(l) => l.write(&scratch[..n as usize]),
+                    None => {
+                        let _ = unsafe { libc::write(void, scratch.as_ptr().cast(), n as usize) };
+                    }
+                }
+            } else if n == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+            {
+                break; // EOF (n == 0) or a real read error; EINTR falls through and retries
+            }
+        }
+    }
+    if void >= 0 {
+        unsafe { libc::close(void) };
     }
 }
 
@@ -4737,6 +4809,11 @@ unsafe fn start_log_pump(path: &std::path::Path) -> Option<i32> {
         return None;
     }
     let (rd, wr) = (fds[0], fds[1]);
+    // Enlarge the pipe buffer to `PUMP_SPLICE_CHUNK` (default is 64 KiB = 16 pages). `splice` moves at
+    // most what the pipe holds, so a bigger buffer means one `splice` drains up to 1 MiB instead of
+    // 64 KiB - ~16x fewer syscalls under a flood, and fewer `write` wake-ups for the box. Best-effort:
+    // capped by `/proc/sys/fs/pipe-max-size`, and a failure just leaves the default size (still correct).
+    libc::fcntl(rd, libc::F_SETPIPE_SZ, PUMP_SPLICE_CHUNK as libc::c_int);
     let pid = libc::fork();
     if pid < 0 {
         libc::close(rd);
@@ -4771,7 +4848,7 @@ unsafe fn start_log_pump(path: &std::path::Path) -> Option<i32> {
 
 /// Open the box log for direct (uncapped) append - the fallback when the capped pump can't start.
 fn open_log_direct(path: &std::path::Path) -> Option<i32> {
-    let fd = open_log_append(path);
+    let fd = open_log(path, true);
     (fd >= 0).then_some(fd)
 }
 
