@@ -826,29 +826,40 @@ fn clamp_cpuset(set: Option<String>) -> Result<Option<String>, Error> {
 ///  * `KERN_MAX_CONCURRENT=N`: a COOPERATIVE ceiling on the number of running boxes. Refuses the N+1th
 ///    box so a runaway (an agent spawning `box fn` in a loop) can't exhaust the host. Counts LIVE boxes
 ///    via the registry, which prunes dead entries on read, so a crashed box frees its slot. First-party
-///    and cooperative (a caller can unset the env): NOT a security boundary. It is also BEST-EFFORT under
-///    a concurrent burst: each starting box counts independently, so a batch launched in parallel
-///    (`kern compose up`, `xargs -P kern box`) can race the count and overshoot N by up to the burst size
-///    before any of them register. For a HARD, race-free bound on total fleet resources use
-///    `KERN_FLEET_PIDS_MAX` / `KERN_FLEET_MEMORY_MAX` below (cgroup-enforced on the shared slice, so the
-///    kernel caps the SUM no matter how the boxes are started).
+///    and cooperative (a caller can unset the env): NOT a security boundary. The check HERE is a fast-
+///    fail advisory; the AUTHORITATIVE count is race-free - `claim_name_capped` re-counts and refuses
+///    under the same lock it takes the name claim under (see `box_run`), so a parallel burst
+///    (`kern compose up`, `xargs -P kern box`) can no longer overshoot N. For a HARD bound on total
+///    fleet RESOURCES (not box count) use `KERN_FLEET_PIDS_MAX` / `KERN_FLEET_MEMORY_MAX` below
+///    (cgroup-enforced on the shared slice, so the kernel caps the SUM no matter how boxes are started).
 ///  * `KERN_FLEET_MEMORY_MAX` / `KERN_FLEET_PIDS_MAX`: a REAL, kernel-enforced budget on kern's shared
 ///    `kern.slice`, bounding the SUM of all boxes' memory / pids. This is the hard backstop the counter
 ///    lacks: even past the cooperative ceiling, the kernel caps total fleet memory. Best-effort (needs
 ///    systemd-user delegation); engages once the slice exists (from the first box onward).
 ///
 /// Returns an error only for the max-concurrent refusal; the budget is best-effort and never fails a box.
-fn fleet_gate_and_budget() -> Result<(), Error> {
-    if let Some(max) = std::env::var("KERN_MAX_CONCURRENT")
+/// `KERN_MAX_CONCURRENT` parsed to a ceiling, or `None` (unset/unparseable). The single reader, shared
+/// by the advisory fast-fail here and the authoritative under-lock check in `box_run`, so the env key
+/// and its parse rule live once.
+fn fleet_max() -> Option<usize> {
+    std::env::var("KERN_MAX_CONCURRENT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-    {
+}
+
+/// The one refusal message for the fleet ceiling, shared by both checks so the wording can't drift.
+fn fleet_limit_error(live: usize, max: usize) -> Error {
+    Error::Sandbox(format!(
+        "fleet limit reached: {live} box(es) already running (KERN_MAX_CONCURRENT={max}); \
+         stop one, or raise/unset the limit"
+    ))
+}
+
+fn fleet_gate_and_budget() -> Result<(), Error> {
+    if let Some(max) = fleet_max() {
         let live = registry::list().len(); // prunes dead entries as a side effect (crash-safe count)
         if live >= max {
-            return Err(Error::Sandbox(format!(
-                "fleet limit reached: {live} box(es) already running (KERN_MAX_CONCURRENT={max}); \
-                 stop one, or raise/unset the limit"
-            )));
+            return Err(fleet_limit_error(live, max));
         }
     }
     let mem = std::env::var("KERN_FLEET_MEMORY_MAX")
@@ -1097,13 +1108,22 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // running box. Two concurrent same-name starts now serialize: one wins, the other fails fast
     // here instead of both passing `name_taken` and both coming up as ambiguous twins.
     pt.mark("parent:config+volumes");
-    let name_claim = match registry::claim_name(name.as_str()) {
-        Ok(Some(c)) => Some(c),
-        Ok(None) => {
+    // The fleet ceiling is enforced HERE, atomically with the name claim, closing the count-then-start
+    // race that the advisory check in `fleet_gate_and_budget` cannot: `claim_name_capped` counts the
+    // boxes in flight and refuses UNDER THE SAME lock it takes the claim under, so two concurrent starts
+    // at `max-1` serialize instead of both passing. `KERN_MAX_CONCURRENT` is read unconditionally (not
+    // gated on `KERN_SCOPE`) because this is the single point every box - direct or scope-re-exec'd -
+    // passes exactly once. Cooperative, not a security boundary (see `fleet_gate_and_budget`).
+    let name_claim = match registry::claim_name_capped(name.as_str(), fleet_max()) {
+        Ok(registry::StartOutcome::Claimed(c)) => Some(c),
+        Ok(registry::StartOutcome::NameBusy) => {
             return Err(Error::AlreadyRunning(format!(
                 "a box named '{}' is already starting or running",
                 name.as_str()
             )))
+        }
+        Ok(registry::StartOutcome::FleetFull { live, max }) => {
+            return Err(fleet_limit_error(live, max))
         }
         // No usable runtime dir → the registry is equally unavailable; proceed unclaimed
         // (fail-open, exactly like `name_taken`).
@@ -1556,6 +1576,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
             detach_stdio(log.as_deref());
         }
+        let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
         let inst = registry::Instance {
             name: name.as_str().to_string(),
             pid,
@@ -1576,6 +1597,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             def_hash: args.def_hash.to_string(),
             memory_max: spec.memory_max,
             pids_max: spec.pids_max,
+            cap_drop_all,
+            cap_drops,
+            cap_adds,
+            // Record the box's ACTUAL posture from the spec that built it, so `exec` reproduces it
+            // instead of guessing: `seccomp_mode` is what PID 1 installs, `cap_recorded` marks this as
+            // a box whose capability profile IS known, and the record is well-formed by construction.
+            seccomp_mode: spec.seccomp_mode,
+            cap_recorded: true,
+            posture_corrupt: false,
+            // Resolved and recorded in the `on_started` callback below, once PID 1 exists and its
+            // dedicated cgroup can be read. Empty here (and for a box with no dedicated cgroup).
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         };
         let path = registry::register(&inst).ok();
         crate::runstats::record_box(); // count this box start for kern top's box-start rate
@@ -1622,6 +1657,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             feed_timeout_pid(timeout_wd, pid1);
             if let Some((inst, path)) = reg_state.as_mut() {
                 inst.pid1 = pid1;
+                // Record the box's DEDICATED cgroup PATH and its `(dev, ino)` IDENTITY now that PID 1
+                // exists: `list()` uses them to tell an ORPHANED box (supervisor dead, cgroup still
+                // populated) from an exited one WITHOUT a live pid, and to make the reap identity-safe
+                // against a recycled-pid path collision. `("", None)` (no dedicated cgroup) leaves
+                // liveness on the supervisor pid, exactly as before.
+                (inst.cgroup, inst.cgroup_id) = registry::box_cgroup_record(pid1);
                 if path.is_some() {
                     // The callback is `FnOnce(i32) -> ()`, so there is no channel to propagate on;
                     // report instead of discarding. This re-registration is what records the box's
@@ -2048,6 +2089,32 @@ fn apply_profile_list(
         return Ok(());
     }
     let cfg = crate::config::load(config).map_err(Error::Config)?;
+    // Multiple `vcpu:` profiles on one box do NOT merge: the FIRST to set each field wins (documented),
+    // so a second `vcpu:` is a silent no-op on every field the first already set. That is almost always a
+    // typo, so name it - which profile is in force, which are ignored - rather than pick one quietly.
+    // Only `vcpu:` needs this: `vgpio:`/`vdisk:` STACK (each adds its own devices/disks), so several are
+    // legitimate. Runs once, on the warning path only, so its allocations never touch a normal start.
+    let vcpu_names: Vec<&str> = profiles
+        .iter()
+        .filter_map(|t| match crate::config::classify(t) {
+            Some(ProfileRef::Vcpu(n)) => Some(n),
+            _ => None,
+        })
+        .collect();
+    if vcpu_names.len() > 1 {
+        let all = vcpu_names
+            .iter()
+            .map(|n| format!("vcpu:{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "kern: warning: {} vcpu: profiles given ({all}); only the first (vcpu:{}) sets each cap it \
+             defines - the others are ignored on any field it already set (first-wins). Merge them into \
+             one profile with `extends` if you meant to layer them.",
+            vcpu_names.len(),
+            vcpu_names[0]
+        );
+    }
     for tok in profiles {
         match crate::config::classify(tok) {
             Some(ProfileRef::Vcpu(name)) => {
@@ -2526,7 +2593,23 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         ulimits: b.ulimits,
         sysctls: b.sysctls,
         privileged: b.privileged,
+        // Resolve the seccomp filter ONCE, here, from the environment. PID 1 installs it and the
+        // instance record carries it, so `kern exec` reproduces the box's filter instead of re-reading
+        // `KERN_SECCOMP` from the exec caller's environment (which could enter an allowlist box under
+        // the wider denylist). This is the single point of resolution for the box's whole lifetime.
+        seccomp_mode: kern_isolation::SeccompFilter::from_env(),
     };
+    // Audit mode is a validation aid, deliberately LESS confined than the shipped denylist (its
+    // log-and-run default lets clone3/io_uring RUN instead of returning ENOSYS). Warn loudly, once per
+    // box, so it can never be mistaken for a production posture on an operator who set the env by habit.
+    if spec.seccomp_mode == kern_isolation::SeccompFilter::AllowlistAudit {
+        eprintln!(
+            "kern: warning: KERN_SECCOMP=allowlist-audit is a VALIDATION mode - it records the syscalls a \
+             real allowlist would refuse but LETS THEM RUN (clone3, io_uring, and every other \
+             ENOSYS-denied call), so the box is LESS confined than the default denylist. The kill set \
+             still kills; do NOT use this as a production posture."
+        );
+    }
     Ok((spec, eph))
 }
 
@@ -2586,10 +2669,23 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
         // `volume::classify` owns the name-or-path decision so this site cannot disagree with it.
         let source = match crate::volume::classify(source) {
             crate::volume::SourceKind::Named => crate::volume::resolve_named(source)?,
-            crate::volume::SourceKind::Path => std::fs::canonicalize(source)
-                .map_err(|e| Error::Sandbox(format!("-v '{s}': source {source}: {e}")))?
-                .to_string_lossy()
-                .into_owned(),
+            crate::volume::SourceKind::Path => {
+                let canon = std::fs::canonicalize(source)
+                    .map_err(|e| Error::Sandbox(format!("-v '{s}': source {source}: {e}")))?;
+                // A box that can WRITE the kern registry can forge a PEER box's recorded capability/
+                // seccomp posture and elevate that peer's `kern exec` (proven, adversarial review).
+                // Refuse to bind a trust-bearing registry dir - or a parent that contains one - into
+                // any box. Named volumes resolve in the SIBLING branch above and are unaffected.
+                if crate::registry::path_overlaps_trusted_state(&canon) {
+                    return Err(Error::Sandbox(format!(
+                        "-v '{s}': refusing to mount the kern registry ({}) into a box - a box able \
+                         to write it could forge another box's recorded capability/seccomp posture \
+                         and elevate its own `kern exec`",
+                        canon.display()
+                    )));
+                }
+                canon.to_string_lossy().into_owned()
+            }
             crate::volume::SourceKind::Neither => {
                 return Err(Error::Sandbox(format!(
                     "-v '{s}': source must be a volume name or a path (absolute, or ./ or ../)"
@@ -2890,6 +2986,10 @@ pub fn exec(
     // scope-path host the exec can't join the box's cgroup, and a default box would otherwise warn
     // on every `kern exec`. `None` caps → the user asked for nothing to enforce → stay quiet.
     let box_has_explicit_caps = inst.memory_max.is_some() || inst.pids_max.is_some();
+    // REFUSE rather than GUESS the box's capability posture: the gate lives inside `exec_posture`, which
+    // returns the box's OWN (cap spec, seccomp filter) or refuses a record that predates the posture
+    // fields / is corrupt - a caller can't rebuild a usable posture without passing that gate.
+    let (box_caps, box_seccomp) = inst.exec_posture()?;
     // With no `-w`, start where the WORKLOAD starts, not at `/`. Docker's `exec` inherits the
     // container's WorkingDir and people lean on it: a compose service with `working_dir: /app` should
     // not need `-w /app` retyped on every exec. An explicit `-w` still wins, and a box with no workdir
@@ -2904,6 +3004,8 @@ pub fn exec(
         pty.as_ref().map(|p| p.master),
         None, // `kern exec` has no timeout
         box_has_explicit_caps,
+        &box_caps,
+        box_seccomp,
     );
 
     if let Some(prev) = saved.as_ref() {
@@ -3117,9 +3219,14 @@ fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
         // `list()`. Then `find(cur)` opens ONLY this box's entry - a full `list()` per interval per
         // checker would be O(N²) steady-state across N checkers.
         let cur = registry::name_for_pid(pid).unwrap_or_else(|| name.clone());
-        let pid1 = registry::find(&cur).map(|b| b.pid1).unwrap_or(0);
+        let entry = registry::find(&cur);
+        let pid1 = entry.as_ref().map(|b| b.pid1).unwrap_or(0);
         let status = if pid1 > 0 {
-            let ok = run_probe(pid1, &probe, hc.timeout);
+            // Probe under the box's RECORDED seccomp mode, read from the same entry as `pid1`, so the
+            // probe's filter matches PID 1 by construction - not by the assumption that the checker's
+            // environment still equals the box's creation environment.
+            let mode = entry.as_ref().map(|b| b.seccomp_mode).unwrap_or_default();
+            let ok = run_probe(pid1, &probe, hc.timeout, mode);
             if ok {
                 fails = 0;
                 acted = false;
@@ -3576,12 +3683,37 @@ fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> i32 {
 /// `exec_in_box`es the probe (so the checker itself stays on the host); `timeout` > 0 is enforced
 /// inside `exec_in_box`, which SIGKILLs the whole in-box probe group on expiry (→ non-zero) so a hung
 /// check neither stalls the checker nor leaks a live process into the box each interval.
-fn run_probe(pid1: i32, probe: &[String], timeout: u64) -> bool {
+fn run_probe(
+    pid1: i32,
+    probe: &[String],
+    timeout: u64,
+    seccomp_mode: kern_isolation::SeccompFilter,
+) -> bool {
     let to = (timeout > 0).then_some(timeout);
     let probe_pid = unsafe { libc::fork() };
     if probe_pid == 0 {
-        // A health probe never warns about the scope-path cap gap (it runs every interval).
-        let code = exec_in_box(pid1, probe, &[], None, None, None, to, false).unwrap_or(1);
+        // A health probe never warns about the scope-path cap gap (it runs every interval). It keeps
+        // the dangerous BASELINE drop (`CapSpec::default()`), unchanged from before this parameter
+        // existed: a probe is not `kern exec`, and matching it to a box's `--cap-drop ALL` could break
+        // a check that needs a baseline cap. Reapplying the box's own spec to the probe is a separate,
+        // separately-validated follow-up; this increment fixes the `kern exec` contract only.
+        //
+        // The seccomp mode is the box's RECORDED mode (read from its registry entry by the caller), so
+        // the probe installs the SAME filter as PID 1 by construction - not by assuming the checker's
+        // environment still equals the box's creation environment.
+        let code = exec_in_box(
+            pid1,
+            probe,
+            &[],
+            None,
+            None,
+            None,
+            to,
+            false,
+            &kern_isolation::CapSpec::default(),
+            seccomp_mode,
+        )
+        .unwrap_or(1);
         unsafe { libc::_exit(code) };
     }
     if probe_pid <= 0 {
@@ -3758,6 +3890,15 @@ fn supervise_box(
                 ready,
                 |pid1| {
                     inst.pid1 = pid1;
+                    // Record the box's DEDICATED cgroup PATH and its `(dev, ino)` IDENTITY now that PID 1
+                    // exists: `list()` uses them to recognise an ORPHANED box (this supervisor
+                    // SIGKILL'd/OOM'd, PID 1 + `-p` forwarder still alive and holding the port) instead
+                    // of dropping it, AND to make the reap identity-safe - the path's `<pid>` leaf
+                    // recycles, so only the recorded inode tells a reap it is killing THIS box and not a
+                    // later one that took the path. `("", None)` (a scope/ambient box with no
+                    // `kern-box-*` leaf) leaves liveness on the supervisor pid, as before. Re-resolved on
+                    // every `--restart` re-register, so it never goes stale.
+                    (inst.cgroup, inst.cgroup_id) = registry::box_cgroup_record(pid1);
                     // If the box was `kern rename`d since the last (re)register, adopt its CURRENT
                     // on-disk name so a `--restart` re-register updates that entry instead of
                     // resurrecting the original name as a duplicate live entry.
@@ -3926,6 +4067,7 @@ fn run_detached(
         .ok()
         .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
     detach_stdio(log.as_deref());
+    let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
     let mut inst = registry::Instance {
         name: name.as_str().to_string(),
         pid,
@@ -3946,6 +4088,19 @@ fn run_detached(
         def_hash: def_hash.to_string(),
         memory_max: spec.memory_max,
         pids_max: spec.pids_max,
+        cap_drop_all,
+        cap_drops,
+        cap_adds,
+        // Same recorded posture as the foreground path: `exec` reproduces the box's own filter and
+        // reapplies its own caps, never a value re-derived from the exec caller's environment.
+        seccomp_mode: spec.seccomp_mode,
+        cap_recorded: true,
+        posture_corrupt: false,
+        // Resolved once PID 1 is known (in the `on_started` callback below), so `list()` can tell an
+        // orphaned box (this supervisor SIGKILL'd, PID 1 + forwarder still live) from an exited one.
+        cgroup: String::new(),
+        cgroup_id: None,
+        orphaned: false,
     };
     let path = registry::register(&inst).ok();
     crate::runstats::record_box(); // count this box start for kern top's box-start rate
@@ -4434,34 +4589,213 @@ fn reexec_in_scope_if_possible(
     let _ = cmd.exec();
 }
 
-/// Detach stdio: stdin from `/dev/null`; stdout/stderr to the box's `log` file (so `kern logs`
-/// can show it), or `/dev/null` if no log path. So a detached box neither holds nor spams the
-/// terminal, but its output is captured.
+/// Per-file cap on a box's captured log. A single-generation ring (`<log>` + `<log>.1`) keeps at most
+/// `2 * BOX_LOG_MAX_BYTES` on disk. The runtime dir is a small tmpfs (systemd default `size=` = 10% of
+/// RAM), so an unbounded writer would otherwise fill it and break the user session (no more sockets or
+/// state creatable in `/run/user/<uid>`). Docker solved the same class with `--log-opt max-size`.
+const BOX_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Open `path` for log append (`O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC`, mode 0600). Returns the fd, or
+/// `-1` on any error (a NUL in the path, or `open` failing). The single opener shared by [`CappedLog`]
+/// (its initial open and each rotation) and the uncapped `open_log_direct` fallback, so the flags can't
+/// drift between them.
+fn open_log_append(path: &std::path::Path) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return -1;
+    };
+    unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+            0o600,
+        )
+    }
+}
+
+/// A size-capped, single-generation-rotating append log. `write` never blocks the caller on a full disk
+/// (`ENOSPC` drops the chunk) and never grows the active file past `max` (rotation renames it to
+/// `<path>.1` and starts fresh), so total on-disk use is bounded at `2 * max`.
+struct CappedLog {
+    fd: i32,
+    path: std::path::PathBuf,
+    written: u64,
+    max: u64,
+}
+
+impl CappedLog {
+    fn open(path: &std::path::Path, max: u64) -> Option<Self> {
+        let fd = open_log_append(path);
+        if fd < 0 {
+            return None;
+        }
+        // A restarted box appends to its existing log: start the counter from the current file size, not
+        // 0, so the cap bounds the FILE and a crash-looping box can't defeat it one restart at a time.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let written = if unsafe { libc::fstat(fd, &mut st) } == 0 && st.st_size > 0 {
+            st.st_size as u64
+        } else {
+            0
+        };
+        Some(Self {
+            fd,
+            path: path.to_path_buf(),
+            written,
+            max,
+        })
+    }
+
+    /// Rename the active file to `<path>.1` (one generation kept, overwriting a previous `.1`) and reopen
+    /// a fresh empty file. The rename is atomic, so a reader never sees the path missing. On failure the
+    /// old fd is kept and `written` stays at the cap, so the next `write` retries rather than overflowing.
+    fn rotate(&mut self) {
+        let mut old = self.path.clone().into_os_string();
+        old.push(".1");
+        if std::fs::rename(&self.path, &old).is_err() {
+            return; // keep the old fd; never grow past the cap
+        }
+        let fd = open_log_append(&self.path);
+        if fd >= 0 {
+            unsafe { libc::close(self.fd) };
+            self.fd = fd;
+            self.written = 0;
+        }
+    }
+
+    fn write(&mut self, mut buf: &[u8]) {
+        while !buf.is_empty() {
+            if self.written >= self.max {
+                self.rotate();
+                if self.written >= self.max {
+                    return; // rotation failed (rename/open) - drop rather than spin or overflow the cap
+                }
+            }
+            let room = (self.max - self.written) as usize;
+            let chunk = &buf[..buf.len().min(room)];
+            let n = unsafe { libc::write(self.fd, chunk.as_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    // Disk full: drop the chunk and force a rotation next round (freeing `.1`'s space).
+                    // The workload must NEVER block or die because its log is full - the log is
+                    // diagnostics, not part of the workload's contract.
+                    Some(libc::ENOSPC) => {
+                        self.written = self.max;
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+            self.written += n as u64;
+            buf = &buf[n as usize..];
+        }
+    }
+}
+
+impl Drop for CappedLog {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd) };
+        }
+    }
+}
+
+/// Drain the pipe `rd` into a byte-capped rotating log at `path` until EOF. Runs in the forked pump
+/// child. If the log can't be opened, the pipe is still drained (bytes discarded) so the workload never
+/// blocks on a full pipe.
+fn pump_capped_log(rd: i32, path: &std::path::Path) {
+    let mut log = CappedLog::open(path, BOX_LOG_MAX_BYTES);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            if let Some(w) = log.as_mut() {
+                w.write(&buf[..n as usize]);
+            }
+        } else if n == 0 {
+            break; // EOF: every write end (workload + supervisor) is closed
+        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break; // a real read error - stop draining
+        }
+    }
+}
+
+/// Interpose a byte-capped pump between the workload's stdout/stderr and the on-disk log. Creates a
+/// pipe, forks a child that drains the read end into a [`CappedLog`], and returns the WRITE end for the
+/// caller to `dup2` onto fd 1/2 - so a detached box that writes without bound (`yes`, a crash loop)
+/// cannot fill the tmpfs runtime dir and break the user session. `None` if the pipe or fork fails - the
+/// caller then falls back to writing the log directly (uncapped, but never lost).
+///
+/// # Safety
+/// Runs during stdio detachment, before any namespace/seccomp setup, and forks. Single-threaded here, so
+/// running Rust code in the child (no exec) is sound. The child sheds every inherited fd except the pipe
+/// read end - crucially the readiness-pipe write end, which held here would stop the launcher from ever
+/// seeing EOF and hang `kern box -d`.
+unsafe fn start_log_pump(path: &std::path::Path) -> Option<i32> {
+    let mut fds = [0i32; 2];
+    if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+        return None;
+    }
+    let (rd, wr) = (fds[0], fds[1]);
+    let pid = libc::fork();
+    if pid < 0 {
+        libc::close(rd);
+        libc::close(wr);
+        return None;
+    }
+    if pid == 0 {
+        // DETACH the pump from the parent's stdio FIRST. The pump is forked before `detach_stdio`
+        // redirects fd 1/2 onto this pipe, so it inherits the LAUNCHER's stdout/stderr - and holding
+        // that write end open would block a `kern box -d` whose stdout is a pipe (a test harness, a
+        // script doing `$(kern box -d …)`) in `wait`/`output` until the BOX exits, breaking the
+        // "detached returns immediately" contract. Point 0/1/2 at /dev/null so the pump holds no
+        // inherited stream; it reads `rd` and writes only its own (later-opened) log fd.
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if devnull >= 0 {
+            libc::dup2(devnull, 0);
+            libc::dup2(devnull, 1);
+            libc::dup2(devnull, 2);
+            if devnull > 2 {
+                libc::close(devnull);
+            }
+        }
+        // Shed every OTHER inherited fd except the read end - most importantly the readiness-pipe write
+        // end, which held here would stop the launcher from ever seeing EOF and hang `kern box -d`.
+        kern_isolation::shed_inherited_fds(rd);
+        pump_capped_log(rd, path);
+        libc::_exit(0);
+    }
+    libc::close(rd); // the parent keeps only the write end (dup2'd onto 1/2 by the caller, then closed)
+    Some(wr)
+}
+
+/// Open the box log for direct (uncapped) append - the fallback when the capped pump can't start.
+fn open_log_direct(path: &std::path::Path) -> Option<i32> {
+    let fd = open_log_append(path);
+    (fd >= 0).then_some(fd)
+}
+
+/// Detach stdio: stdin from `/dev/null`; stdout/stderr into the box's size-capped `log` (via a pump
+/// child, so an unbounded writer can't fill the tmpfs runtime dir), or `/dev/null` if no log path. So a
+/// detached box neither holds nor spams the terminal, its output is captured, and its log cannot DoS the
+/// user session. If the pump can't start, the log is written directly (uncapped) rather than lost.
 fn detach_stdio(log: Option<&std::path::Path>) {
     unsafe {
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if null >= 0 {
             libc::dup2(null, 0);
         }
-        let out = log
-            .and_then(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).ok())
-            .map(|c| {
-                libc::open(
-                    c.as_ptr(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
-                    0o600,
-                )
-            })
-            .filter(|fd| *fd >= 0);
-        let sink = out.unwrap_or(null);
+        let sink = log
+            .and_then(|p| start_log_pump(p).or_else(|| open_log_direct(p)))
+            .unwrap_or(null);
         if sink >= 0 {
             libc::dup2(sink, 1);
             libc::dup2(sink, 2);
         }
-        if let Some(fd) = out {
-            if fd > 2 {
-                libc::close(fd);
-            }
+        // Close the source fd once it's duplicated onto 1/2 - unless it IS `null` (closed below) or a
+        // std stream.
+        if sink > 2 && sink != null {
+            libc::close(sink);
         }
         if null > 2 {
             libc::close(null);
@@ -4472,8 +4806,8 @@ fn detach_stdio(log: Option<&std::path::Path>) {
 /// `kern ps [--json]` - list running boxes. Dead entries are pruned on read.
 /// True if `b` satisfies every `--filter` (AND semantics). Keys are pre-validated by [`ps`]. `name`
 /// is a substring match (like `docker ps --filter name=`), `id` is an exact host-pid match, `status`
-/// is running/paused (a kern box is never persistently exited/created/dead/restarting, so those match
-/// nothing).
+/// is running/paused/orphaned (a kern box is never persistently exited/created/dead/restarting, so
+/// those match nothing).
 fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
     filters.iter().all(|(k, v)| match k.as_str() {
         "name" => b.name.contains(v.as_str()),
@@ -4489,9 +4823,13 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
                 || (!v.contains('=') && l.split_once('=').map(|(k, _)| k) == Some(v.as_str()))
         }),
         "id" => b.pid.to_string() == *v,
+        // Mirror `box_status`'s priority so the filter never drifts from the STATUS column: orphaned
+        // wins, and a `running`/`paused` query must therefore EXCLUDE an orphaned box (its supervisor
+        // is dead - it is not simply running).
         "status" => match v.as_str() {
-            "running" => !registry::is_paused(b.cgroup_pid()),
-            "paused" => registry::is_paused(b.cgroup_pid()),
+            "orphaned" => b.orphaned,
+            "running" => !b.orphaned && !registry::is_paused(b.cgroup_pid()),
+            "paused" => !b.orphaned && registry::is_paused(b.cgroup_pid()),
             _ => false,
         },
         _ => false, // unreachable: keys are validated in `ps` before this runs (fail closed anyway)
@@ -4502,6 +4840,12 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
 /// `empty` when no health check is configured. The single source of truth for `ps`'s HEALTH column,
 /// `ps --format {{.Status}}`, and `--filter status=` - so they never drift on what "paused" means.
 fn box_status(b: &registry::Instance, empty: &str) -> String {
+    // ORPHANED wins over every other status: the supervisor is dead but the box's PID 1 / `-p` forwarder
+    // are still running (and still holding the host port). Surfacing it is the whole point - the box used
+    // to vanish from `ps` here - and `kern stop <name>` reaps it via `cgroup.kill`.
+    if b.orphaned {
+        return "orphaned".to_string();
+    }
     if registry::is_paused(b.cgroup_pid()) {
         return "paused".to_string();
     }
@@ -4691,10 +5035,16 @@ pub fn ps(
             "status" => {
                 if !matches!(
                     v.as_str(),
-                    "running" | "paused" | "exited" | "created" | "dead" | "restarting"
+                    "running"
+                        | "paused"
+                        | "orphaned"
+                        | "exited"
+                        | "created"
+                        | "dead"
+                        | "restarting"
                 ) {
                     return Err(Error::Usage(
-                        "ps --filter status=: running | paused (kern boxes are ephemeral; \
+                        "ps --filter status=: running | paused | orphaned (kern boxes are ephemeral; \
                          exited/created/dead/restarting always match nothing)",
                     ));
                 }
@@ -5108,6 +5458,25 @@ pub fn gc(images: bool) -> Result<(), Error> {
             p.g,
             p.z,
             if waited == 1 { "" } else { "s" }
+        );
+    }
+    // Reap ORPHANED boxes: a detached box whose SUPERVISOR was SIGKILL'd/OOM'd, but whose PID 1 and
+    // `-p` forwarder outlived it - still running, still holding the host port. `list()` now surfaces
+    // these as `orphaned` (they used to vanish from the registry while alive); `gc` SIGKILLs each one's
+    // recorded cgroup at once (`cgroup.kill`) and drops its record, so a burst of crashed supervisors
+    // does not leak ports and processes until the next explicit `kern stop`.
+    let orphans = registry::list()
+        .into_iter()
+        .filter(|b| b.orphaned)
+        .filter(registry::reap_orphan)
+        .count();
+    if orphans > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}reaped{} {orphans} orphaned box{} (supervisor died, cgroup still live)",
+            p.g,
+            p.z,
+            if orphans == 1 { "" } else { "es" }
         );
     }
     // Reap orphaned box CGROUP dirs under kern.slice too (the direct-cap path leaves an empty
@@ -11533,6 +11902,29 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     }
 
     for b in &targets {
+        // ORPHANED box: its supervisor is already dead (that is what makes it orphaned), so the
+        // pid-based kill below has nothing to signal - the box's PID 1 and its `-p` forwarder are
+        // reachable ONLY through the recorded cgroup. `reap_orphan` SIGKILLs that whole cgroup at once
+        // (`cgroup.kill`), which frees the host port the forwarder was holding, and drops the record.
+        // Without this branch `kern stop <name>` answered "no running box" while the port stayed bound.
+        if b.orphaned {
+            let reaped = registry::reap_orphan(b);
+            registry::set_box_exit(b.pid, b.starttime, 137);
+            registry::clear_health(&b.name, b.pid);
+            cleanup_box_scratch(&b.rootfs);
+            if reaped {
+                println!(
+                    "stopped '{}' (was orphaned; reaped via cgroup.kill)",
+                    b.name
+                );
+            } else {
+                eprintln!(
+                    "kern: '{}' was orphaned but its cgroup could not be reaped (already gone?)",
+                    b.name
+                );
+            }
+            continue;
+        }
         // A persistent box: tell systemd to stop AND disable the unit (so it neither restarts now
         // nor comes back at reboot), then remove it. Killing the process instead would just trip
         // systemd's `Restart=always`. Otherwise kill the box's PID-namespace init directly - see
@@ -14028,6 +14420,15 @@ mod net_resource_tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: String::new(),
+            cap_drop_all: false,
+            cap_drops: String::new(),
+            cap_adds: String::new(),
+            seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            cap_recorded: true,
+            posture_corrupt: false,
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         }
     }
 
@@ -14185,6 +14586,67 @@ mod net_resource_tests {
             "a subpath like /dev/foo must be allowed"
         );
         assert!(parse_volumes(&["/tmp:/data".into()]).is_ok());
+    }
+
+    #[test]
+    fn a_volume_source_that_resolves_onto_the_registry_is_refused_in_every_form() {
+        // The anti-forgery gate canonicalizes the source BEFORE the overlap check, so every path form
+        // that RESOLVES onto a trust-bearing registry dir - trailing slash, `.`/`..`, a symlink, or the
+        // PARENT that contains it - must be refused, not just the exact literal. A test on the literal
+        // alone would leave the equivalent forms unproven (adversarial review, final round). Each must
+        // fail with the OVERLAP message, not a source-not-found error, so the dirs are materialized
+        // first.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-forgegate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Canonicalize the base so a symlinked `/tmp` (rare, but real on some systems) can't make the
+        // PARENT-form comparison inconsistent with what `parse_volumes` canonicalizes.
+        let tmp = std::fs::canonicalize(&tmp).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+
+        // Materialize instances/claims/exit so `canonicalize` of the forms below succeeds.
+        assert!(
+            !crate::registry::trusted_state_dirs().is_empty(),
+            "registry state dirs were created"
+        );
+        let kern = tmp.join("kern");
+        std::os::unix::fs::symlink(&kern, tmp.join("link")).unwrap();
+        std::fs::create_dir_all(tmp.join("kern-other")).unwrap();
+
+        let refused = |src: String| -> bool {
+            parse_volumes(&[format!("{src}:/r")])
+                .err()
+                .map(|e| {
+                    e.to_string()
+                        .contains("refusing to mount the kern registry")
+                })
+                .unwrap_or(false)
+        };
+        let t = tmp.to_string_lossy().into_owned();
+        for form in [
+            format!("{t}/kern"),              // the exact dir
+            format!("{t}/kern/"),             // trailing slash
+            format!("{t}/./kern"),            // a `.` component
+            format!("{t}/kern/../kern"),      // a `..` round-trip
+            format!("{t}/kern/instances/.."), // `..` out of a subdir
+            format!("{t}/kern/instances"),    // a trust-bearing subdir directly
+            format!("{t}/kern/claims"),       // and another
+            format!("{t}/link"),              // a symlink resolving onto the registry
+            t.clone(),                        // the PARENT that contains kern/
+        ] {
+            assert!(refused(form.clone()), "must refuse -v source {form}");
+        }
+        // A sibling that merely shares a name prefix stays mountable.
+        assert!(
+            parse_volumes(&[format!("{t}/kern-other:/r")]).is_ok(),
+            "a sibling of the registry must stay mountable"
+        );
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -15501,6 +15963,15 @@ mod label_filter_tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: String::new(),
+            cap_drop_all: false,
+            cap_drops: String::new(),
+            cap_adds: String::new(),
+            seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            cap_recorded: true,
+            posture_corrupt: false,
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         }
     }
 
@@ -15613,6 +16084,15 @@ mod drift_tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: hash.into(),
+            cap_drop_all: false,
+            cap_drops: String::new(),
+            cap_adds: String::new(),
+            seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            cap_recorded: true,
+            posture_corrupt: false,
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         }
     }
 

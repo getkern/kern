@@ -46,10 +46,12 @@ privilege-escalation bug is an escape.
 - **`pivot_root`** into the rootfs. The default root is a writable overlay whose scratch is discarded
   on exit; `--read-only` remounts it read-only, and the ordering (read-only only *after* the pivot)
   is compile-enforced by a typestate.
-- **Least-privilege capabilities**: 13 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
-  `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, and more) are dropped from the
-  effective, permitted, inheritable **and bounding** sets just before exec, so no setuid or
-  file-capability binary in the image can wield them. `--cap-drop CAP` / `--cap-drop ALL` drops more;
+- **Least-privilege capabilities**: 14 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
+  `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, and more) are dropped from
+  the effective, permitted, inheritable **and bounding** sets just before exec, so no setuid or
+  file-capability binary in the image can wield them. (`SYS_PTRACE`'s `ptrace` syscall is already
+  seccomp-killed; dropping the cap also closes the `/proc/<pid>/mem` cross-process read it would
+  otherwise allow.) `--cap-drop CAP` / `--cap-drop ALL` drops more;
   `--cap-add CAP` keeps one that would otherwise go (add wins), and an unknown cap name is a hard
   error so a typo cannot silently leave a cap in place. Even a re-added `CAP_SYS_ADMIN` is held only
   over the box's own user namespace, and the always-on filter still blocks the escape syscalls it
@@ -73,7 +75,21 @@ privilege-escalation bug is an escape.
   reads the flags out of the register they arrive in and kills only the seven `CLONE_NEW*` bits.
   `clone3` puts the same flags in a struct behind a pointer, which BPF **cannot dereference**, so it
   is refused wholesale with `ENOSYS`, the answer Docker and podman give for the same reason. Closed
-  in 0.6.34, verified on six platforms.
+  in 0.6.34, verified on six platforms. The filter inspects call ARGUMENTS in exactly two places - the
+  `clone` flags above and the `socket` domain (below) - and matches every other syscall by number
+  alone. So `ioctl` is allowed as a whole, not per-command (moby's default does the same), and
+  `personality` is left to the number-level allow: its risky flags weaken the box against ITSELF
+  (`ADDR_NO_RANDOMIZE` drops the box's own ASLR), never the host.
+- **`socket(AF_VSOCK, …)` is refused** with `EAFNOSUPPORT`, in BOTH the denylist and the allowlist -
+  the one place kern's default used to be wider than moby's, now closed. The network namespace does
+  **not** contain vsock (it is not an IP address family), so on a host with a `vsock` transport loaded -
+  **WSL2**, where `VMADDR_CID_HOST` reaches Windows-side services that never touch the box's loopback
+  netns - a box could otherwise reach the host past its netns. It is a **reachability gap, not a
+  privilege escalation** (it grants no capability the box lacks), and `EAFNOSUPPORT` is the exact errno a
+  host with no `vhost_vsock` returns, so a workload that probes vsock falls back cleanly instead of
+  dying. The rule keys on the low 32 bits of `args[0]` (the domain) and is unaffected by `--privileged`.
+  Verified with a discriminant: on a host where vsock works, the same `socket(AF_VSOCK)` SUCCEEDS
+  outside a box and returns `EAFNOSUPPORT` inside one.
 - **Device access is deny-by-default**: the box's `/dev` is a fresh box-owned tmpfs shadowing the
   image's, with only `null`, `zero`, `full`, `random` and `urandom` bound in. Any other node is
   **absent**, and one the box fabricates is **inert**: a filesystem mounted in an unprivileged user
@@ -118,12 +134,17 @@ code execution in the box is a separate and open question, recorded as unresolve
 
 ### Read-only and cgroup-mask integrity
 
-Two independent layers. The always-on filter blocks the mount-reconfiguration family, so a box cannot
-re-mount its root writable; the default capability drop removes `CAP_SYS_ADMIN`, so it cannot
-`umount` the cgroup masks to reach the host hierarchy. A box explicitly granted `CAP_SYS_ADMIN` or
-run with `--no-seccomp` waives one layer by choice. A third hardening, locking the mounts with
-`MNT_LOCKED` so the guarantees hold even in those opt-in configurations, is deferred rather than
-shipped untested: it reorders capability-sensitive setup that must be verified on real namespaces.
+Two independent layers, and neither is the default cap drop - which does **not** remove `CAP_SYS_ADMIN`
+(that cap is kept, held only over the box's own user namespace). First, the always-on filter **kills**
+the mount API - `mount`, `umount2`, `pivot_root`, `setns` and the whole reconfiguration family - so a
+box cannot re-mount its root writable OR `umount` the cgroup masks to reach the host hierarchy,
+whatever caps it holds. Second, a child user namespace's capabilities are not effective over the
+namespace that owns them, so even a kept or `--cap-add`ed `CAP_SYS_ADMIN` cannot act on the
+host-owned cgroupfs and mounts. `--no-seccomp` waives the first layer by choice; the second stands
+regardless, and `--privileged` (which relaxes `mount`/`umount2` for nesting) is honoured only when the
+box root maps to an unprivileged host uid. A third hardening, locking the mounts with `MNT_LOCKED` so
+the first layer holds even under `--no-seccomp`, is deferred rather than shipped untested: it reorders
+capability-sensitive setup that must be verified on real namespaces.
 
 ### Nested boxes (`--privileged`)
 
@@ -170,9 +191,19 @@ box's full limit, so N execs could use N times the box's memory.
   capabilities are not effective over a namespace owned by the initial one, so even with
   `--network host` it **cannot reconfigure the host's interfaces** (`EPERM`).
 - **`-v src:dst`** binds a host path in. A writable volume is a hole through the sandbox by design;
-  use `:ro`. kern rejects a non-existent source and resolves it to an absolute, symlink-free path.
-  The bind is **non-recursive**, because a recursive one would clone host submounts that a `:ro`
-  volume could then leave writable.
+  use `:ro`. The two ends are resolved differently, on purpose. The **source** (host side) is the
+  operator's own path: kern rejects a non-existent source and `canonicalize`s it to an absolute,
+  symlink-free path at parse time. The **target** (`dst`, inside the box root) is walked one component
+  at a time with `O_NOFOLLOW`, refusing `..` and confined to the new root, so a hostile **image** that
+  ships a symlink at the mount point cannot redirect the bind onto a host path. The bind is
+  **non-recursive**, because a recursive one would clone host submounts that a `:ro` volume could then
+  leave writable; the flip side is that a filesystem already mounted *under* the source keeps its own
+  flags, so a pre-existing read-write submount there is not remounted read-only. A submount beneath the
+  source that a process other than the operator can create is thus outside the `:ro` guarantee - the
+  source path is trusted as the operator's own. kern additionally **refuses to bind its own runtime
+  registry** (`$XDG_RUNTIME_DIR/kern/{instances,claims,exit}`, or any parent that contains it) into a
+  box: a box able to write those files could forge a peer box's recorded capability/seccomp posture and
+  elevate that peer's `kern exec`.
 - **`-p [ip:]host:box`** binds **`127.0.0.1` by default**. `-p 0.0.0.0:H:B` exposes the service to
   the LAN, a deliberate and warned-about choice. The forwarder runs in the host network namespace,
   the box stays in its own.

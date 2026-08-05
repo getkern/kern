@@ -63,9 +63,15 @@ fn main() -> ExitCode {
     // Detect invocation *as* `docker` / `docker-compose` (via a symlink or wrapper) and rewrite the
     // argv into kern's own dialect before dispatch. Pure argument translation - no daemon, no
     // docker.sock. When invoked normally (`kern …`), this is a couple of cheap string checks.
-    let mut raw = std::env::args();
+    // `args_os()`, NOT `args()`: `std::env::args()` PANICS on a non-UTF-8 argument, so a box name or a
+    // `-v` path carrying invalid UTF-8 bytes (a truncated multibyte char, a raw `0xFF`) crashed kern
+    // before it could reject the input. Convert lossily instead - an invalid arg becomes a string with
+    // U+FFFD replacement chars, which then fails the name/path validators cleanly with a message rather
+    // than aborting. (A workload argument that was genuinely non-UTF-8 is corrupted rather than crashing;
+    // that is an extreme edge for a containerised command, and never panicking is the harder guarantee.)
+    let mut raw = std::env::args_os();
     let arg0 = raw.next().unwrap_or_default();
-    let mut args: Vec<String> = raw.collect();
+    let mut args: Vec<String> = raw.map(|a| a.to_string_lossy().into_owned()).collect();
     let invoked = std::path::Path::new(&arg0)
         .file_name()
         .and_then(|s| s.to_str())

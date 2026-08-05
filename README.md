@@ -4,10 +4,10 @@
 
 **kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
 
-**A real, kernel-enforced container in ~3.4 ms, out of one 1.84 MB binary with no daemon.**
+**A real, kernel-enforced container in ~3.4 ms, out of one 1.86 MB binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.84 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.86 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
@@ -34,7 +34,7 @@ namespaces, an overlay or read-only root pivoted in, an always-on seccomp filter
 limits. It pulls OCI images, builds them, runs them, and gets out of the way. No daemon, one
 short-lived process per box.
 
-It is 1.84 MB because it carries only what it has to: the entire Rust dependency tree is `libc`,
+It is 1.86 MB because it carries only what it has to: the entire Rust dependency tree is `libc`,
 JSON and OCI manifests are parsed by hand, and `pull` uses the `curl` and `tar` already on the
 machine instead of linking a TLS stack and a decompressor. `kern doctor` checks for those two; a box
 from a `--rootfs` needs neither.
@@ -45,7 +45,7 @@ manages; the same model slices CPU (`vcpu:`), memory, disk (`vdisk:`) and device
 once in a `kern.toml` and attached by name. [docs/RESOURCES.md](docs/RESOURCES.md).
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one ~1.8 MB static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one 1.86 MB static binary, no daemon.">
 </p>
 
 ## What kern is not
@@ -198,7 +198,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Cold start, bare box | **~2.1 ms** | ~294 ms | ~281 ms |
 | Cold start, from an OCI image | **~3.4 ms** | ~294 ms | ~281 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
-| Footprint | **one 1.84 MB binary** | daemon stack | multi-binary install |
+| Footprint | **one 1.86 MB binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
 | `docker-compose.yml` | yes, read as-is | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
@@ -232,7 +232,7 @@ and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
-Namespaces, a `pivot_root`, 13 dangerous capabilities dropped before exec, an always-on seccomp
+Namespaces, a `pivot_root`, 14 dangerous capabilities dropped before exec, an always-on seccomp
 denylist of 34 syscalls, cgroup v2 limits, and a deny-by-default `/dev`. Where a boundary is
 cooperative rather than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
 
@@ -262,7 +262,7 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**0.6.43.** Everything above works today and is tested: 725 Rust, 72 Python and 57 Node tests,
+**0.6.50.** Everything above works today and is tested: 744 Rust, 72 Python and 57 Node tests,
 clippy-clean, `cargo-deny`-clean. Semver, pre-1.0: the CLI and config surface can still change
 between minor versions, always called out in [CHANGELOG.md](CHANGELOG.md). Releases are signed tags
 and timestamped to Bitcoin ([provenance/](provenance/)).

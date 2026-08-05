@@ -195,6 +195,11 @@ pub struct SandboxSpec {
     /// host-privilege class. Every other dangerous syscall (kexec, modules, bpf, io_uring, keyring,
     /// ptrace, the NEW mount API) stays blocked even here - stronger than Docker's `--privileged`.
     pub privileged: bool,
+    /// The seccomp filter this box runs (denylist vs opt-in allowlist), resolved ONCE by the launcher
+    /// via [`crate::SeccompFilter::from_env`]. Carried here so PID 1 installs it, and recorded in the
+    /// instance registry so `kern exec` reproduces the SAME filter instead of re-reading the
+    /// environment - which would let an exec into an allowlist box fall back to the wider denylist.
+    pub seccomp_mode: crate::SeccompFilter,
 }
 
 /// A resolved vDisk to mount in the box at `/vdisk/<name>`. When `host_dir` is set, the host prepared
@@ -801,7 +806,7 @@ fn child_setup_and_exec(
     // Replace the inherited host environment with a clean, minimal one - the host's env (secrets,
     // tokens, SSH/agent sockets, kern internals like KERN_SCOPE) must NOT leak into the workload -
     // then layer the user's `--env` on top.
-    set_clean_env(&spec.hostname, &spec.env);
+    set_clean_env(&spec.hostname, &spec.env)?;
 
     // Honor `--workdir`: chdir into it, CREATING it first if the image does not have it.
     //
@@ -870,7 +875,7 @@ fn child_setup_and_exec(
     // 1. Bounding set - needs effective `CAP_SETPCAP` (still present here); stops a file-cap binary
     //    re-adding a dropped cap. Dropping a cap from the *bounding* set does NOT block using it from
     //    the effective set, so the `setuid`/`setgid` below still work even under `--cap-drop ALL`.
-    drop_cap_bounding(cap_mask);
+    drop_cap_bounding(cap_mask)?;
     // 2. `--user UID[:GID]`: drop to the workload's uid/gid - needs `CAP_SETUID`/`CAP_SETGID` in the
     //    *effective* set, which are still present (we haven't cleared effective yet). setgid before
     //    setuid (once uid is non-root you can't change gid); setuid to a non-root uid then sheds the
@@ -879,8 +884,9 @@ fn child_setup_and_exec(
         set_user(uid, gid)?;
     }
     // 3. Clear the dropped caps from effective/permitted/inheritable. For a non-root `--user` step 2
-    //    already emptied them; this covers a root box and is otherwise a harmless no-op.
-    clear_caps_from_sets(cap_mask);
+    //    already emptied them; this covers a root box and is otherwise a harmless no-op. Fatal on a
+    //    real failure (see `clear_caps_from_sets`): the box must not run holding caps it dropped.
+    clear_caps_from_sets(cap_mask)?;
 
     // Landlock (LSM) write-allowlist, applied BEFORE seccomp (whose filter would otherwise block the
     // `landlock_*` syscalls). Defense-in-depth over the mount namespace: the box root is read+exec and
@@ -902,8 +908,18 @@ fn child_setup_and_exec(
     // only constrains the workload. Then exec (or hand off to the built-in init). `allow_nesting`
     // (a rootless `--privileged` box) leaves the namespace + classic-mount syscalls allowed so a
     // nested `kern box` can start; everything else stays blocked.
-    crate::seccomp::install(allow_nesting)?;
+    crate::seccomp::install(spec.seccomp_mode, allow_nesting)?;
     t.mark("seccomp");
+    // SECURITY (CVE-2016-9962 class): shed every inherited fd `>= 3` before handing control to the
+    // workload, keeping ONLY the readiness pipe (`ready_fd`, whose CLOEXEC close on a successful
+    // `execvp` signals the launcher). kern marks every descriptor IT opens `CLOEXEC`, but a descriptor
+    // inherited from kern's CALLER - an SDK process that spawns boxes while holding a socket or a host
+    // file open, a CI runner, a supervisor - is not kern's to mark, and would otherwise pass straight
+    // into the workload as a live handle to a host object OUTSIDE the box's rootfs. Done here, before
+    // the init/non-init split, so it also covers the `--init` reaper PID 1 (which does not itself
+    // `exec` and would otherwise keep the caller's fds readable via `/proc/1/fd`). The pty slave, if
+    // any, was already dup'd onto 0/1/2 and its high fd closed by `adopt_controlling_tty` above.
+    shed_inherited_fds(ready_fd.unwrap_or(-1));
     if spec.init {
         // `--init`: this PID-1 process forks the workload and becomes a reaping init. Never returns.
         run_init(spec, argv, ready_fd)
@@ -1074,10 +1090,18 @@ pub fn set_cpu_affinity(cpuset: Option<&str>) {
             any = true;
         }
     }
-    if any {
-        unsafe {
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-        }
+    if any
+        && unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) } != 0
+    {
+        // Best-effort (it needs no privilege, so this is rare - every requested CPU offline, or a
+        // restrictive outer affinity mask). WARN instead of dropping `--cpuset-cpus` silently, so a
+        // workload that did NOT get pinned is visible rather than quietly running across all CPUs -
+        // the same "best-effort caps announce themselves" rule the `--memory` notice follows.
+        eprintln!(
+            "kern: warning: --cpuset-cpus '{list}' could not be applied ({}); the workload runs \
+             without CPU pinning",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -1306,8 +1330,16 @@ fn open_in_root(root_fd: libc::c_int, target: &str, is_dir: bool) -> Result<libc
 }
 
 /// Wipe the inherited environment, set a small sane base, then layer the user's `--env` on top.
-fn set_clean_env(hostname: &str, extra: &[(String, String)]) {
-    unsafe { libc::clearenv() };
+///
+/// FAIL-CLOSED on the wipe: `clearenv` removes the INHERITED host environment (secrets, tokens,
+/// `SSH_AUTH_SOCK`, kern internals like `KERN_SCOPE`) before the workload's minimal env is layered on.
+/// If it could not clear, the box must NOT exec with the host env still visible - that is a silent
+/// leak of host credentials into an untrusted workload. On the shipped musl target `clearenv` cannot
+/// fail; the check pins the invariant and fails closed on any port whose libc behaves differently.
+fn set_clean_env(hostname: &str, extra: &[(String, String)]) -> Result<(), Error> {
+    if unsafe { libc::clearenv() } != 0 {
+        return Err(Error::last("clearenv"));
+    }
     set_env(
         "PATH",
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1318,6 +1350,7 @@ fn set_clean_env(hostname: &str, extra: &[(String, String)]) {
     for (k, v) in extra {
         set_env(k, v);
     }
+    Ok(())
 }
 
 fn set_env(key: &str, val: &str) {
@@ -2455,6 +2488,27 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                  but NO cgroup cap is in force - the box runs UNCAPPED. If kern did not set that variable, a \
                  caller may be bypassing the resource limits."
             );
+        } else if (spec.memory_max.is_some() || spec.pids_max.is_some() || spec.cpus.is_some())
+            && crate::cgroup::memory_cap_enforceable()
+        {
+            // The box did NOT take the direct kern.slice path, no outer enforcer claims to cap it, and
+            // `apply_limits` could not put the requested cap in force here. `memory_cap_enforceable()` is
+            // TRUE, so the once-per-process "controller absent from this tree" notice in
+            // `reexec_in_scope_if_possible` did NOT fire: the controller IS in the tree, but kern could
+            // not place the box in a cgroup that carries the cap. The usual cause is that the direct
+            // kern.slice path was declined because no systemd user manager was found - and that check is
+            // `$XDG_RUNTIME_DIR/systemd`, so a WRONG or unset `XDG_RUNTIME_DIR` silently disables it (this
+            // is how the case was first hit: pointing `XDG_RUNTIME_DIR` at a scratch subdir), as does a
+            // genuinely systemd-less host. Accepting a cap and enforcing nothing is the one thing this
+            // codebase does not do quietly; this was the last path where it still did. Warn (not refuse):
+            // the direct path already hard-refuses, and a best-effort host is a legitimate configuration.
+            eprintln!(
+                "kern: warning: requested resource cap(s) could not be enforced here - the box runs \
+                 UNCAPPED. kern could not place it in a delegated cgroup: no systemd user manager was \
+                 reachable (its marker is `$XDG_RUNTIME_DIR/systemd` - check that `XDG_RUNTIME_DIR` \
+                 points at your real runtime dir, e.g. `/run/user/$(id -u)`), or this host has none. \
+                 `kern doctor` shows the delegation state."
+            );
         }
     }
     let _cg = cg; // held for RAII: its Drop removes the box's cgroup dir after waitpid (see CgroupGuard)
@@ -2796,6 +2850,10 @@ fn write_all(fd: i32, mut data: &[u8]) {
 const DEFAULT_DROP: &[u32] = &[
     16, // SYS_MODULE     load kernel modules
     17, // SYS_RAWIO      raw I/O ports, /dev/mem, ioperm
+    19, // SYS_PTRACE     the `ptrace`/`process_vm_*` syscalls are already seccomp-killed, but the cap
+    //     ALSO bypasses the ptrace-access check on `/proc/<pid>/mem` of another process, so dropping it
+    //     closes that cross-process read too. Docker drops it by default; a debugger needs the killed
+    //     `ptrace` syscall regardless, so this removes no capability a box could actually use.
     20, // SYS_PACCT      process accounting
     22, // SYS_BOOT       reboot / kexec_load
     25, // SYS_TIME       set system / RTC clock
@@ -2813,7 +2871,7 @@ const DEFAULT_DROP: &[u32] = &[
 /// numbers (not names) - the CLI resolves names and rejects unknown ones before the fork. Default
 /// (`Default::default()`) drops exactly the dangerous set. All cap numbers are < 64 (the current
 /// `CAP_LAST_CAP` is 40), so a single `u64` bitmask covers the whole set.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct CapSpec {
     /// `--cap-drop ALL`: drop every capability up to `CAP_LAST_CAP` (minus `adds`).
     pub drop_all: bool,
@@ -2873,12 +2931,51 @@ fn cap_drop_mask(spec: &CapSpec) -> u64 {
 /// Drop the masked capabilities from the **bounding** set (`PR_CAPBSET_DROP`), so a file-cap binary
 /// can't re-add them later. Needs `CAP_SETPCAP` in the *effective* set, so it must run BEFORE the
 /// effective set is cleared and BEFORE any `setuid` to a non-root user (which sheds effective caps).
-fn drop_cap_bounding(mask: u64) {
+fn drop_cap_bounding(mask: u64) -> Result<(), Error> {
     for c in 0..64u32 {
-        if mask & (1u64 << c) != 0 {
-            unsafe { libc::prctl(libc::PR_CAPBSET_DROP, c as libc::c_ulong, 0, 0, 0) };
+        if mask & (1u64 << c) == 0 {
+            continue;
+        }
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, c as libc::c_ulong, 0, 0, 0) } != 0 {
+            let e = std::io::Error::last_os_error();
+            // EINVAL = capability `c` does not exist on this kernel (a `--cap-drop <N>` past
+            // CAP_LAST_CAP): there is nothing to drop, so it is not a per-call failure. Any OTHER error
+            // - EPERM above all, meaning `CAP_SETPCAP` is missing - fails closed immediately. But an
+            // errno is a per-call CLAIM, not proof of the final boundary, and treating EINVAL as
+            // always-benign is an interpretation. The AUTHORITATIVE check is the post-loop CapBnd read
+            // below, which measures the outcome instead of deducing it from return codes.
+            if e.raw_os_error() != Some(libc::EINVAL) {
+                return Err(Error::Syscall("prctl(PR_CAPBSET_DROP)", e));
+            }
         }
     }
+    // Confirm the drop actually took: re-read the bounding set and require every cap we asked to drop
+    // to be gone. A cap past CAP_LAST_CAP is never in `CapBnd`, so a `--cap-drop <N>` beyond the
+    // kernel's range can't trip this; a cap that EXISTS and is still present means the drop silently
+    // failed for some reason a per-call errno did not surface, and we refuse to run with a weaker
+    // boundary than `--cap-drop` promised.
+    let leaked = mask & read_cap_bnd()?;
+    if leaked != 0 {
+        return Err(Error::Spec(format!(
+            "capability bounding-set drop did not take: caps {leaked:#018x} still present in CapBnd \
+             after PR_CAPBSET_DROP (refusing a weaker boundary than --cap-drop asked)"
+        )));
+    }
+    Ok(())
+}
+
+/// The process bounding capability set (`CapBnd`) from `/proc/self/status`, as a u64 bitmask. Used to
+/// VERIFY that a `PR_CAPBSET_DROP` sweep took, rather than trusting the per-call return code.
+fn read_cap_bnd() -> Result<u64, Error> {
+    let s = std::fs::read_to_string("/proc/self/status")
+        .map_err(|e| Error::Syscall("read /proc/self/status", e))?;
+    let hex = s
+        .lines()
+        .find_map(|l| l.strip_prefix("CapBnd:"))
+        .map(str::trim)
+        .ok_or_else(|| Error::Spec("no CapBnd line in /proc/self/status".into()))?;
+    u64::from_str_radix(hex, 16)
+        .map_err(|_| Error::Spec(format!("unparsable CapBnd value '{hex}'")))
 }
 
 /// Apply `--ulimit` resource limits with `setrlimit(2)`.
@@ -2971,7 +3068,7 @@ fn apply_sysctls(sysctls: &[(String, String)]) -> Result<(), Error> {
 /// Clear the masked capabilities from the live effective/permitted/inheritable sets (the workload
 /// won't hold them after exec). For a non-root `--user`, `setuid` has already emptied these; this
 /// still matters for a root box and is a harmless no-op otherwise.
-fn clear_caps_from_sets(mask: u64) {
+fn clear_caps_from_sets(mask: u64) -> Result<(), Error> {
     let lo = (mask & 0xffff_ffff) as u32;
     let hi = (mask >> 32) as u32;
     #[repr(C)]
@@ -2995,17 +3092,27 @@ fn clear_caps_from_sets(mask: u64) {
         permitted: 0,
         inheritable: 0,
     }; 2];
+    // FAIL CLOSED on either syscall: this is what actually strips the dangerous caps from the
+    // workload's effective/permitted/inheritable sets. Swallowing an error left the workload holding
+    // caps the box promised to drop. `capget` failing (an unreadable cap header) means we cannot know
+    // what to clear; `capset` clears bits ONLY (an all-subset write, which is always permitted), so a
+    // failure there is a genuine anomaly, not a policy refusal - either way the box must not run
+    // pretending the caps are gone.
     unsafe {
-        if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) == 0 {
-            data[0].effective &= !lo;
-            data[0].permitted &= !lo;
-            data[0].inheritable &= !lo;
-            data[1].effective &= !hi;
-            data[1].permitted &= !hi;
-            data[1].inheritable &= !hi;
-            libc::syscall(libc::SYS_capset, &hdr as *const _, data.as_ptr());
+        if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) != 0 {
+            return Err(Error::last("capget"));
+        }
+        data[0].effective &= !lo;
+        data[0].permitted &= !lo;
+        data[0].inheritable &= !lo;
+        data[1].effective &= !hi;
+        data[1].permitted &= !hi;
+        data[1].inheritable &= !hi;
+        if libc::syscall(libc::SYS_capset, &hdr as *const _, data.as_ptr()) != 0 {
+            return Err(Error::last("capset"));
         }
     }
+    Ok(())
 }
 
 /// Drop capabilities for the workload: always the dangerous [`DEFAULT_DROP`] set, plus `--cap-drop`
@@ -3013,16 +3120,19 @@ fn clear_caps_from_sets(mask: u64) {
 /// inheritable sets AND the bounding set. Used where NO `--user` switch follows (e.g. `kern exec`);
 /// the box workload path splits this around `set_user` (bounding drop → setuid → effective clear) so
 /// that `--cap-drop ALL` doesn't strip `CAP_SETUID`/`SETGID` before the user switch needs them.
-fn drop_dangerous_caps(spec: &CapSpec) {
+fn drop_dangerous_caps(spec: &CapSpec) -> Result<(), Error> {
     let mask = cap_drop_mask(spec);
-    drop_cap_bounding(mask);
-    clear_caps_from_sets(mask);
+    drop_cap_bounding(mask)?;
+    clear_caps_from_sets(mask)?;
+    Ok(())
 }
 
-/// After `fork()`, close every inherited fd `>= 3` except `keep` (pass `-1` to keep none). A
-/// long-lived helper child (a `-p` forwarder, a health-checker) must shed the parent's fds - most
-/// importantly a detached box's readiness-pipe write end, whose lingering copy would stop the
-/// launcher from ever seeing EOF and hang `kern box -d`.
+/// After `fork()`, close every inherited fd `>= 3` except `keep` (pass `-1` to keep none). Two callers
+/// need it: a long-lived helper child (a `-p` forwarder, a health-checker) sheds the parent's fds -
+/// most importantly a detached box's readiness-pipe write end, whose lingering copy would stop the
+/// launcher from ever seeing EOF and hang `kern box -d`; and the box workload / `kern exec` path sheds
+/// them for ISOLATION, so a descriptor kern's caller left open (an SDK's socket, a host file) does not
+/// pass through `execvp` into the box as a handle to a host object outside the rootfs (CVE-2016-9962).
 ///
 /// One `close_range(2)` syscall replaces the old ~1021-iteration `close()` loop; to preserve `keep`
 /// we close the two ranges around it. Falls back to the per-fd loop on a kernel without close_range
@@ -3206,6 +3316,16 @@ fn wait_code(status: i32) -> i32 {
     }
 }
 
+/// Print a one-line "refusing to run" reason and `_exit(126)` - the fail-closed exit every POLICY step
+/// in the `exec_in_box` child takes when it cannot reapply the box's posture (env wipe, cap drop,
+/// seccomp install). Centralised so a new fail-closed step can't drift the code or the "refusing to
+/// run" wording, and `-> !` makes "never returns" part of the type - a caller cannot fall through past
+/// it into an unprotected exec. (A `--workdir`/exec failure exits 127 "not runnable", a different case.)
+fn exec_fail_closed(reason: &str) -> ! {
+    eprintln!("kern: exec: {reason} - refusing to run");
+    unsafe { libc::_exit(126) }
+}
+
 /// `kern exec`: run `command` inside the namespaces of an already-running box (its PID 1 is
 /// `pid1`, in the host pid namespace). Joins the box's user namespace first (to gain capabilities
 /// in it), then its mount/ipc/uts/(net)/pid namespaces, then forks so the child lands in the
@@ -3225,6 +3345,8 @@ pub fn exec_in_box(
     tty_master: Option<i32>,
     timeout_secs: Option<u64>,
     box_has_explicit_caps: bool,
+    box_caps: &CapSpec,
+    seccomp_mode: crate::SeccompFilter,
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -3382,7 +3504,11 @@ pub fn exec_in_box(
                 );
             }
         }
-        set_clean_env("", env);
+        // Fail CLOSED on the env wipe: an exec that ran with this caller's host environment still set
+        // would leak host secrets/tokens into the box, the same leak `set_clean_env` exists to prevent.
+        if set_clean_env("", env).is_err() {
+            exec_fail_closed("could not sanitise the environment");
+        }
         // `-it`: adopt the PTY slave as the controlling terminal (before seccomp - a setup syscall).
         if let Some(slave) = tty_slave {
             adopt_controlling_tty(slave);
@@ -3396,19 +3522,34 @@ pub fn exec_in_box(
                 unsafe { libc::_exit(127) };
             }
         }
-        // Parity with a box's own workload: drop the always-dropped dangerous caps here too, so an
-        // `exec`'d command isn't more privileged than the box's PID 1 (which ran `drop_dangerous_caps`
-        // + seccomp before its own exec). The box's *custom* `--cap-drop`/`--user` aren't reapplied -
-        // they aren't recorded per box - but the dangerous baseline + seccomp match.
-        drop_dangerous_caps(&CapSpec::default());
+        // Parity with a box's own workload: reapply the box's OWN capability spec, so an `exec`'d
+        // command is no MORE privileged than the box's PID 1 (which ran `drop_dangerous_caps` with the
+        // same spec + seccomp before its own exec). `box_caps` is rebuilt by the caller from the
+        // registry (`--cap-drop ALL` / `--cap-drop CAP` / `--cap-add CAP`); an older box with no
+        // recorded spec passes `CapSpec::default()`, the dangerous baseline this used unconditionally
+        // before. A `--cap-add` the box kept is preserved so exec matches PID 1 rather than being
+        // stricter (harmless if it were, but this is the faithful reconstruction).
+        // Fail CLOSED if the box's cap drop cannot be reapplied: an `exec` that kept the dangerous
+        // baseline while the box's PID 1 dropped it would be a silent privilege gap in the box.
+        if drop_dangerous_caps(box_caps).is_err() {
+            exec_fail_closed("could not drop capabilities");
+        }
         // Fail CLOSED if seccomp can't install - never run the exec'd command unfiltered (the box's
         // PID 1 fails closed on this same call; `exec` must match, not fall through unprotected).
-        // `exec` keeps the STRICT filter regardless of the box's `--privileged` (which isn't
-        // recorded per box) - an exec'd command being *more* constrained than PID 1 is always safe.
-        if crate::seccomp::install(false).is_err() {
-            eprintln!("kern: exec: seccomp filter could not be installed - refusing to run");
-            unsafe { libc::_exit(126) };
+        // `seccomp_mode` is the box's OWN recorded filter (denylist vs allowlist), so the exec'd
+        // command runs under the SAME posture as PID 1 - not one re-derived from this caller's
+        // environment (a box on the deny-by-default allowlist must not be entered by an exec that
+        // fell back to the wider denylist). Nesting stays STRICT (`allow_nesting=false`) regardless of
+        // the box's `--privileged`: an exec being MORE constrained than PID 1 is always safe, whereas
+        // relaxing it would be the dangerous direction, so this axis is deliberately not reproduced.
+        if crate::seccomp::install(seccomp_mode, false).is_err() {
+            exec_fail_closed("seccomp filter could not be installed");
         }
+        // SECURITY (CVE-2016-9962 class): same fd shed as the box workload path - a descriptor this
+        // caller left open (an SDK holding a socket, a host file) must not pass through `setns` + this
+        // `execvp` into the box. No readiness pipe on the exec path, so keep none; the pty slave was
+        // already dup'd onto 0/1/2 and its high fd closed by `adopt_controlling_tty` above.
+        shed_inherited_fds(-1);
         eprintln!("kern: exec failed: {}", exec(&argv));
         unsafe { libc::_exit(127) };
     }
@@ -3498,6 +3639,64 @@ mod ready_guard_tests {
             unsafe { libc::close(fd) };
         }
         assert_eq!(drain(rd), 0, "disarmed drop must be silent (EOF)");
+    }
+}
+
+#[cfg(test)]
+mod shed_tests {
+    use super::shed_inherited_fds;
+
+    /// SECURITY (CVE-2016-9962 class): `shed_inherited_fds` must close every inherited fd `>= 3` except
+    /// the one to keep, so a descriptor kern's caller left open does not pass through `execvp` into the
+    /// box. Exercised in a FORKED child: the function closes the WHOLE process's fds, which would nuke
+    /// the test harness's own descriptors if run inline. The child reports which fds survived through a
+    /// pipe whose write end is the fd we ask to keep.
+    #[test]
+    fn shed_closes_inherited_fds_except_keep() {
+        let mut report = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0, "pipe");
+        let (rd, wr) = (report[0], report[1]);
+
+        // Two "leaked" descriptors that shed must close, both `>= 3`.
+        let leak_a = unsafe { libc::dup(0) };
+        let leak_b = unsafe { libc::dup(0) };
+        assert!(leak_a >= 3 && leak_b >= 3, "dups must land at fd >= 3");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // CHILD: shed everything >= 3 except the report pipe write end, then report.
+            shed_inherited_fds(wr);
+            let is_open =
+                |fd: i32| -> u8 { (unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1) as u8 };
+            let out = [is_open(leak_a), is_open(leak_b), is_open(wr), is_open(1)];
+            unsafe {
+                libc::write(wr, out.as_ptr().cast(), out.len());
+                libc::_exit(0);
+            }
+        }
+        // PARENT: read the child's four verdict bytes.
+        unsafe { libc::close(wr) };
+        let mut buf = [9u8; 4];
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+        unsafe {
+            libc::close(rd);
+            libc::close(leak_a);
+            libc::close(leak_b);
+            let mut st = 0i32;
+            libc::waitpid(pid, &mut st, 0);
+        }
+        assert_eq!(n, 4, "child must report four bytes");
+        assert_eq!(buf[0], 0, "a leaked inherited fd must be CLOSED by shed");
+        assert_eq!(
+            buf[1], 0,
+            "every leaked inherited fd must be CLOSED by shed"
+        );
+        assert_eq!(
+            buf[2], 1,
+            "the kept fd must stay OPEN (it carries the readiness signal)"
+        );
+        assert_eq!(buf[3], 1, "stdio (fd 1) must be untouched");
     }
 }
 
@@ -3779,13 +3978,14 @@ mod cap_mask_tests {
     #[test]
     fn default_dropped_mask_covers_the_dangerous_set_only() {
         let m = default_dropped_cap_mask();
-        // Every DEFAULT_DROP cap is set: SYS_MODULE(16), SYS_RAWIO(17), SYS_BOOT(22), BPF(39), PERFMON(38).
-        for c in [16u32, 17, 20, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39] {
+        // Every DEFAULT_DROP cap is set: SYS_MODULE(16), SYS_RAWIO(17), SYS_PTRACE(19), SYS_BOOT(22),
+        // BPF(39), PERFMON(38).
+        for c in [16u32, 17, 19, 20, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39] {
             assert!(m & (1u64 << c) != 0, "cap {c} must be in the dropped mask");
         }
         // Kept caps are NOT in the mask (so a default box never false-flags): CHOWN(0), SETUID(7),
-        // NET_ADMIN(12), SYS_ADMIN(21), MKNOD(27), SYS_PTRACE(19).
-        for c in [0u32, 7, 12, 19, 21, 27] {
+        // NET_ADMIN(12), SYS_ADMIN(21), MKNOD(27). (SYS_PTRACE(19) is now dropped, see DEFAULT_DROP.)
+        for c in [0u32, 7, 12, 21, 27] {
             assert!(
                 m & (1u64 << c) == 0,
                 "kept cap {c} must NOT be in the dropped mask"
@@ -3810,6 +4010,20 @@ mod cap_mask_tests {
         );
         // The bounding set = full minus the drop set; cap 16 survives and would be flagged.
         assert!(default_dropped_cap_mask() & (1u64 << 16) != 0);
+    }
+
+    #[test]
+    fn read_cap_bnd_parses_the_real_bounding_set() {
+        // `drop_cap_bounding` VERIFIES its own result by re-reading CapBnd instead of trusting the
+        // per-call errno. That verification is only as good as the parse: the test process has a full
+        // bounding set, so the value must be non-zero and cover the low caps that always exist.
+        let bnd = read_cap_bnd().expect("/proc/self/status always has a CapBnd line on Linux");
+        assert!(bnd != 0, "the test runner's bounding set is not empty");
+        // CAP_CHOWN(0) and CAP_DAC_OVERRIDE(1) exist on every kernel this runs on.
+        assert!(
+            bnd & 0b11 == 0b11,
+            "low caps present in the runner's CapBnd"
+        );
     }
 }
 

@@ -2480,3 +2480,213 @@ fn volume_json_reports_names_that_exist_and_flags_the_ones_it_cannot_use() {
         "`usable` does not distinguish a kern-created name from a planted one: {text:?}"
     );
 }
+
+/// `kern exec` reapplies the box's OWN capability drop, not the always-dropped baseline.
+///
+/// A box created with `--cap-drop ALL` runs its PID 1 at `CapEff 0000000000000000`. Before this fix
+/// `kern exec` dropped only the dangerous baseline, so an exec'd process came back holding the
+/// 27-capability baseline (`CapEff 00000110bda4ffff`) inside a box whose whole point was to have
+/// none. The box's spec is recorded in the registry and rebuilt here, so exec matches PID 1.
+///
+/// Skip-graceful: no static busybox, or userns unavailable, returns early rather than failing.
+#[test]
+fn exec_reapplies_the_box_cap_drop_not_the_baseline() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "capexec");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-capexec-xdg-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    let start = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "capbox",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--cap-drop",
+            "ALL",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "5",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&start.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    if !start.status.success() {
+        eprintln!(
+            "skip: detached --cap-drop ALL box did not start here: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let capeff = |target: &str| -> String {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "exec",
+                "capbox",
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                &format!("grep CapEff /proc/{target}/status"),
+            ])
+            .output()
+            .expect("run kern");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    let pid1 = capeff("1");
+    let exec_self = capeff("self");
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "capbox"])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    // If we could not read either (an environment where exec itself is blocked), skip rather than
+    // assert on empty strings.
+    if pid1.is_empty() || exec_self.is_empty() {
+        eprintln!("skip: could not read CapEff through exec here");
+        return;
+    }
+    assert_eq!(
+        pid1, "0000000000000000",
+        "the box's PID 1 must hold no capabilities under --cap-drop ALL"
+    );
+    assert_eq!(
+        exec_self, "0000000000000000",
+        "kern exec must reapply --cap-drop ALL: an exec holding the baseline breaks the contract"
+    );
+    assert_eq!(
+        exec_self, pid1,
+        "exec's capability set must match the box's PID 1, not the always-dropped baseline"
+    );
+}
+
+/// `kern exec` must REFUSE a box whose capability posture cannot be reconstructed: a record from
+/// before the posture fields existed is UNKNOWABLE (drop-ALL and default both look empty), so guessing
+/// a baseline could enter the box MORE privileged than its PID 1. The box stays visible to `ps`/`stop`;
+/// only `exec` gates on it. This is the fail-loud half of the "posture in the registry" contract -
+/// `absent != empty`, and absent never silently becomes a default.
+///
+/// Skip-graceful: no static busybox / userns unavailable returns early rather than failing.
+#[test]
+fn exec_refuses_a_box_whose_security_profile_was_not_recorded() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "oldexec");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-oldexec-xdg-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    let start = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "oldbox",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "5",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&start.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    if !start.status.success() {
+        eprintln!(
+            "skip: detached box did not start here: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Downgrade the on-disk record to a PRE-posture entry: strip the capability + seccomp lines, as a
+    // box registered by an older kern would look. The box PROCESS is untouched and still alive, so
+    // `find_ref` still resolves it - the gate is purely on the missing posture, not on liveness.
+    let insts = xdg.join("kern").join("instances");
+    let mut downgraded = false;
+    if let Ok(rd) = fs::read_dir(&insts) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(body) = fs::read_to_string(&p) else {
+                continue;
+            };
+            if !body.contains("name=oldbox") {
+                continue;
+            }
+            let stripped: String = body
+                .lines()
+                .filter(|l| {
+                    !l.starts_with("capdropall=")
+                        && !l.starts_with("capdrops=")
+                        && !l.starts_with("capadds=")
+                        && !l.starts_with("seccompmode=")
+                })
+                .map(|l| format!("{l}\n"))
+                .collect();
+            fs::write(&p, stripped).expect("rewrite instance record");
+            downgraded = true;
+        }
+    }
+    assert!(
+        downgraded,
+        "test setup: could not find the box's instance record to downgrade"
+    );
+
+    let exec = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["exec", "oldbox", "--", "/bin/busybox", "true"])
+        .output()
+        .expect("run kern");
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "oldbox"])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert!(
+        !exec.status.success(),
+        "exec into a box with no recorded capability profile must FAIL, not silently apply a baseline"
+    );
+    let err = String::from_utf8_lossy(&exec.stderr);
+    assert!(
+        err.contains("security profile was recorded") || err.contains("cannot be reconstructed"),
+        "the refusal must name the cause; got stderr: {err}"
+    );
+}

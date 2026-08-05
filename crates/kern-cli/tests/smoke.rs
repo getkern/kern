@@ -50,7 +50,51 @@ fn lifecycle_verbs_reject_bad_input() {
     fails(&["update", "somebox"]); // needs at least one of --memory/--cpus/--pids-limit
     fails(&["update", "b", "--cpus", "-1"]); // invalid cpus
     fails(&["update", "b", "--pids-limit", "abc"]); // invalid pids
-                                                    // "no such running box" resolution errors (kern keeps no stopped boxes).
+                                                    // `--pids-limit` floor: a box needs a slot for its own PID 1 plus the workload, so 1 (and 0) are
+                                                    // refused at PARSE, by name - the reviewer's finding was that `1` reached the box's setup fork and
+                                                    // surfaced only a generic "fork failed" that never mentioned the cap. `/tmp` exists, so the sole
+                                                    // failure is the floor, and the message must name the flag.
+    let fails_naming = |args: &[&str], needle: &str| {
+        let out = kern().args(args).output().expect("run kern");
+        assert!(
+            !out.status.success(),
+            "expected failure for `kern {}`",
+            args.join(" ")
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(needle),
+            "stderr of `kern {}` must mention {needle:?}, got: {err}",
+            args.join(" ")
+        );
+    };
+    fails_naming(
+        &[
+            "box",
+            "x",
+            "--rootfs",
+            "/tmp",
+            "--pids-limit",
+            "1",
+            "--",
+            "true",
+        ],
+        "pids-limit",
+    );
+    fails_naming(
+        &[
+            "box",
+            "x",
+            "--rootfs",
+            "/tmp",
+            "--pids-limit",
+            "0",
+            "--",
+            "true",
+        ],
+        "pids-limit",
+    );
+    // "no such running box" resolution errors (kern keeps no stopped boxes).
     let ghost = "kern-smoke-no-such-box-zzz";
     fails(&["rename", ghost, "newname"]);
     fails(&["wait", ghost]);

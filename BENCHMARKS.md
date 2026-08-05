@@ -351,7 +351,7 @@ each other.
 
 | | |
 |---|---:|
-| **kern** binary | **1.84 MB** x86_64, **1.50 MB** aarch64, static and stripped, one Rust dependency (`libc`); OCI pull shells out to the system `curl`/`tar` |
+| **kern** binary | **1.86 MB** x86_64, **1.57 MB** aarch64, static and stripped, one Rust dependency (`libc`); OCI pull shells out to the system `curl`/`tar` |
 | kern resident memory at rest | **0**: no daemon |
 | kern memory per box, marginal | **0.35 MB** PSS, at 50 live boxes |
 | kern memory per box, one box alone | 1.65 MB PSS / 4.6 MB RSS |

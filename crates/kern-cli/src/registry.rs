@@ -67,6 +67,55 @@ pub struct Instance {
     /// label=` selects on and what `kern inspect` reports, so tooling can group a stack's boxes.
     /// Empty when none; absent in older entries (the decoder defaults it).
     pub labels: String,
+    /// The box's `--cap-drop ALL`: every capability up to `CAP_LAST_CAP` is dropped from the bounding
+    /// set. Recorded so `kern exec` reapplies the SAME drop the box's PID 1 got, instead of the
+    /// always-dropped baseline. Only meaningful when [`cap_recorded`](Self::cap_recorded) is true.
+    pub cap_drop_all: bool,
+    /// Extra caps DROPPED beyond the dangerous baseline (`--cap-drop CAP`), as comma-joined cap
+    /// numbers (e.g. `12,13`). Empty when none. Reapplied by `kern exec`.
+    pub cap_drops: String,
+    /// Caps KEPT that the baseline would drop (`--cap-add CAP`, add wins), as comma-joined cap
+    /// numbers. Empty when none. Reapplied by `kern exec` so an exec is no MORE dropped than PID 1.
+    pub cap_adds: String,
+    /// The seccomp filter this box runs (denylist vs the opt-in allowlist). Recorded so `kern exec`
+    /// reproduces the box's OWN posture instead of re-reading `KERN_SECCOMP` from the exec caller's
+    /// environment - which could enter an allowlist box under the wider denylist. A record with no
+    /// `seccompmode` line parses as [`SeccompFilter::Denylist`](kern_isolation::SeccompFilter): the
+    /// allowlist did not exist for such a box, so this is provable, not a guess.
+    pub seccomp_mode: kern_isolation::SeccompFilter,
+    /// Whether this record carries a capability profile at all (the `capdropall` line was present).
+    /// `false` for a box created before the cap fields existed: `exec` cannot know whether that box
+    /// dropped ALL caps or none, so it REFUSES rather than guess a baseline that could be more
+    /// privileged than the box actually is. Derived at parse time; never serialised.
+    pub cap_recorded: bool,
+    /// Set when a posture field that IS present is malformed (`capdropall` not `0`/`1`, a non-numeric
+    /// cap in `capdrops`/`capadds`, or an unrecognised `seccompmode`). `exec` refuses on a corrupt
+    /// record rather than apply a partial posture that could be less restrictive than the box's.
+    /// Derived at parse time; never serialised.
+    pub posture_corrupt: bool,
+    /// The box's DEDICATED cgroup v2 path (absolute, under `/sys/fs/cgroup`), recorded once PID 1 is
+    /// known. EMPTY for a box with no dedicated cgroup (no systemd-user: its processes share kern's own
+    /// session cgroup, which is ALWAYS populated, so it carries no orphan signal) and for older entries.
+    /// This is the STABLE identity used to decide liveness WITHOUT a live pid - a cgroup path does not
+    /// recycle the way a pid does - so a box whose supervisor died but whose cgroup is still populated is
+    /// recognised as ORPHANED (reachable + reapable), not silently dropped while it still holds its port.
+    pub cgroup: String,
+    /// The recorded cgroup dir's `(st_dev, st_ino)` IDENTITY, captured together with [`cgroup`]. The
+    /// path ALONE is not a safe reap target: its `kern-box-<name>-<pid>` leaf embeds a PID, and PIDs
+    /// recycle, so a LATER box could come to occupy the exact same path after THIS box's supervisor
+    /// died, and `cgroup.kill` on the path would then SIGKILL the wrong box (running under this box's
+    /// stale `memory.max`). The kernel assigns each cgroup a unique inode that is NOT reused for the
+    /// dir's lifetime; before trusting the path for either liveness OR a reap, kern re-`stat`s it and
+    /// refuses if the identity differs (the path was recreated as a different cgroup, so this box is
+    /// gone). `None` for a box with no dedicated cgroup or an older entry (the path is empty too, so
+    /// liveness falls back to the supervisor pid). [Self::cgroup]
+    pub cgroup_id: Option<(u64, u64)>,
+    /// Derived at LOAD time (never serialised): the supervisor pid is dead, but the recorded [`cgroup`]
+    /// is still populated - the box's PID 1 / `-p` forwarder outlived the supervisor. Such a box stays
+    /// VISIBLE in `kern ps` (marked `orphaned`) and REAPABLE by `kern stop`/`gc` via `cgroup.kill`,
+    /// instead of vanishing from the registry while it still holds a host port bound.
+    /// [Self::cgroup]
+    pub orphaned: bool,
 }
 
 impl Instance {
@@ -159,6 +208,71 @@ pub fn clear_health(name: &str, pid: i32) {
 /// namespace (verified), so a workload can't forge another service's exit.
 fn exit_dir() -> io::Result<PathBuf> {
     runtime_subdir("exit")
+}
+
+/// The registry directories `kern exec` and the fleet-count TRUST: `instances/` (per-box capability/
+/// seccomp posture records), `claims/` (fleet-count name claims), and the exit-status dir. A box that
+/// bind-mounts any of these - or a parent that contains one - can write a well-formed record for a
+/// PEER box and elevate that peer's `kern exec` (proven: forge `capdropall=0` + `capadds=21`, then the
+/// peer's `exec` runs with CAP_SYS_ADMIN re-added). `parse_volumes` refuses such a `-v`; named volumes
+/// and logs live in SIBLING trees and stay mountable. Only EXISTING dirs are returned - a fallback
+/// root the session never reached holds nothing to protect - each canonicalized so a symlinked runtime
+/// dir can't sidestep the containment comparison.
+pub fn trusted_state_dirs() -> Vec<PathBuf> {
+    [dir(), claims_dir(), exit_dir()]
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|d| fs::canonicalize(d).ok())
+        .collect()
+}
+
+/// The `(device, inode)` identity of each guarded registry location: the registry ROOT
+/// (`<runtime>/kern`, a bind of which exposes all three children) plus `instances/`, `claims/`, and the
+/// exit dir. Identity is what a bind mount CANNOT forge: `mount --bind <registry> /elsewhere` gives
+/// `/elsewhere` a different canonical path but the SAME dev+ino, so a path-only matcher would wave a
+/// `-v /elsewhere:/dst` through. Mirrors the vgpio device guard, which already denies by major/minor
+/// identity rather than by name - the same question, now answered the same way in both places.
+fn guarded_identities() -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut paths: Vec<PathBuf> = [dir(), claims_dir(), exit_dir()]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    if let Some(root) = paths
+        .first()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+    {
+        paths.push(root); // `<runtime>/kern`, the root the three trust-bearing dirs share
+    }
+    paths
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| (m.dev(), m.ino()))
+        .collect()
+}
+
+/// Would bind-mounting `src` (already canonicalized) expose a trust-bearing registry dir? True if
+/// `src` IS one, lives INSIDE one, or is an ANCESTOR that contains one (PATH check) - OR if `src`
+/// resolves, by dev+ino IDENTITY, onto a guarded dir even though its path does not overlap, which is
+/// exactly what a `mount --bind` of the registry to another location produces.
+pub fn path_overlaps_trusted_state(src: &Path) -> bool {
+    if dirs_overlap(src, &trusted_state_dirs()) {
+        return true;
+    }
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(src) {
+        Ok(m) => guarded_identities().contains(&(m.dev(), m.ino())),
+        Err(_) => false,
+    }
+}
+
+/// Does `src` overlap ANY dir in `dirs`, in either direction (src inside a dir, or a dir inside src)?
+/// Component-wise (`Path::starts_with`), so a sibling like `<root>/kern-other` is NOT a false
+/// positive. Pure, so the containment logic is unit-tested without touching the filesystem.
+fn dirs_overlap(src: &Path, dirs: &[PathBuf]) -> bool {
+    dirs.iter()
+        .any(|d| src.starts_with(d) || d.starts_with(src))
 }
 
 /// Record a completed box's final exit code under compose's stack+run-scoped `key`
@@ -348,6 +462,27 @@ pub fn box_cgroup(pid: i32) -> Option<PathBuf> {
     Some(cg)
 }
 
+/// Resolve a box's dedicated cgroup PATH and its `(dev, ino)` IDENTITY from its PID 1, for recording in
+/// the instance at start. Both come from ONE `box_cgroup_dir` resolve plus one `stat`, so the stored
+/// path and the stored identity can never disagree. `box_cgroup_dir` (unlike [`box_cgroup`]) reads PID
+/// 1's OWN `/proc/<pid1>/cgroup` and returns the `kern-box-*` leaf regardless of the CALLER's cgroup -
+/// the box-start callback runs in the runner process, itself a member of that very cgroup, so a
+/// caller-relative check would wrongly return None. `(String::new(), None)` when there is no dedicated
+/// `kern-box-*` cgroup (no systemd-user): liveness then falls back to the supervisor pid, as before.
+pub fn box_cgroup_record(pid1: i32) -> (String, Option<(u64, u64)>) {
+    let Some(path) = kern_isolation::box_cgroup_dir(pid1) else {
+        return (String::new(), None);
+    };
+    let s = path.to_string_lossy().into_owned();
+    // Identity captured at the SAME instant as the path. A transient stat error here just yields no
+    // identity (None) - liveness then falls back to the supervisor pid for this box, never reap-by-path.
+    let id = match probe_cgroup(&s) {
+        Probe::Id(id) => Some(id),
+        Probe::Gone | Probe::Unknown => None,
+    };
+    (s, id)
+}
+
 /// All per-box cgroup stats from a **single** `box_cgroup` resolve - mem / cpu / tasks / frozen. The
 /// `top` refresh reads these together per box, so this avoids re-resolving the cgroup (and re-reading
 /// `/proc/<pid>/cgroup`) four separate times per box, per frame.
@@ -437,7 +572,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\ncgroup={}\ncgroupid={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -457,13 +592,42 @@ fn encode(inst: &Instance) -> String {
         inst.stop_grace,
         one_line(&inst.def_hash),
         one_line(&inst.workdir),
+        u8::from(inst.cap_drop_all),
+        one_line(&inst.cap_drops),
+        one_line(&inst.cap_adds),
+        inst.seccomp_mode.as_str(),
+        one_line(&inst.cgroup),
+        // `<dev>:<ino>` of the recorded cgroup dir, or empty. Digits + one ':' - no `one_line` needed.
+        inst.cgroup_id
+            .map(|(d, i)| format!("{d}:{i}"))
+            .unwrap_or_default(),
     )
 }
 
-/// Write the entry. Returns the file path (so the supervisor can remove it on exit).
+/// Write the entry ATOMICALLY. Returns the file path (so the supervisor can remove it on exit).
+///
+/// A plain `fs::write` opens the final path `O_TRUNC` and then writes, so a `SIGKILL`/OOM/power loss
+/// between the truncate and the last byte would leave a TRUNCATED record on disk. The posture lines
+/// (`capdropall`/`capdrops`/`capadds`/`seccompmode`) are written LAST, so a truncated record can carry
+/// `capdropall` without the drops that follow it - and a peer's `kern exec`, reading it, would
+/// reconstruct a WEAKER capability/seccomp posture than the box actually ran. Stage the whole record in
+/// a hidden, caller-pid-keyed temp and `rename` it over the final path instead: a same-directory rename
+/// is atomic, so a reader sees either NO entry or the COMPLETE record, never a half-written one. The
+/// temp's trailing `-<pid>.tmp` is not all-digits, so `list()`/`well_formed_entry` never take it for a box.
 pub fn register(inst: &Instance) -> io::Result<PathBuf> {
-    let path = dir()?.join(format!("{}-{}", inst.name, inst.pid));
-    fs::write(&path, encode(inst))?;
+    let d = dir()?;
+    let path = d.join(format!("{}-{}", inst.name, inst.pid));
+    let tmp = d.join(format!(
+        ".{}-{}-{}.tmp",
+        inst.name,
+        inst.pid,
+        std::process::id()
+    ));
+    fs::write(&tmp, encode(inst))?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp); // never leave a staged body behind
+        return Err(e);
+    }
     Ok(path)
 }
 
@@ -684,17 +848,247 @@ pub fn list() -> Vec<Instance> {
     out
 }
 
-/// Load the registry entry at `path` if it is a LIVE box, pruning a dead/unparseable one as a side
-/// effect (never a live one). The single entry-loading rule - [`list`] and [`find`] both go through
-/// here, so the capped read, the parse, the liveness gate and the prune can't drift between them.
+/// Outcome of probing the directory at a recorded cgroup path. THREE states, never two: the crux of the
+/// fix is that "could not determine" (a transient error) must be distinguishable from "definitely gone",
+/// or a `kern ps`/`gc` under fd exhaustion would prune/reap a LIVE box's record and recreate the ghost.
+enum Probe {
+    /// Resolved to a directory with this `(dev, ino)` identity.
+    Id((u64, u64)),
+    /// Definitively ABSENT (`ENOENT`/`ENOTDIR`): the cgroup is gone; the record is safe to reap.
+    Gone,
+    /// Could NOT be determined - a transient or unmodelled error (fd exhaustion `EMFILE`/`ENFILE`,
+    /// kernel `ENOMEM`, a racing `ESTALE`, an unexpected errno). Not proof of absence: never prune or
+    /// reap on this; the caller re-evaluates on the next pass, when the pressure has cleared.
+    Unknown,
+}
+
+/// Probe the dir at `path` for its `(dev, ino)` identity, distinguishing "definitely gone" from "could
+/// not tell". `fs::metadata` opens (and closes) one fd internally, so under fd exhaustion it fails with
+/// `EMFILE` - which MUST read as [`Probe::Unknown`], not [`Probe::Gone`]. The kernel gives each cgroup a
+/// unique inode not reused for the dir's lifetime, so the identity is a stable, non-recycling key.
+fn probe_cgroup(path: &str) -> Probe {
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(path) {
+        Ok(m) => Probe::Id((m.dev(), m.ino())),
+        Err(e) => match e.raw_os_error() {
+            // The only errnos that PROVE the path is gone. Everything else (EMFILE/ENFILE/ENOMEM/
+            // ESTALE/EACCES/ELOOP/…) is transient or unmodelled - do not decide on it.
+            Some(libc::ENOENT) | Some(libc::ENOTDIR) => Probe::Gone,
+            _ => Probe::Unknown,
+        },
+    }
+}
+
+/// The `(dev, ino)` identity of the dir at `path`, or `None` if it is gone / unreadable. Test-only thin
+/// wrapper over [`probe_cgroup`] so unit tests can fabricate a record's recorded identity.
+#[cfg(test)]
+fn cgroup_identity(path: &str) -> Option<(u64, u64)> {
+    match probe_cgroup(path) {
+        Probe::Id(id) => Some(id),
+        Probe::Gone | Probe::Unknown => None,
+    }
+}
+
+/// Three-state liveness of a DEAD-supervisor box, resolved from its recorded cgroup:
+///
+///  * ORPHANED - the cgroup at the recorded path is still OURS (identity matches) AND still populated
+///    (`cgroup.events` `populated 1`): the supervisor is gone but PID 1 / the `-p` forwarder live on.
+///  * EXITED - the path is gone, empty (`populated 0`), or now a STRANGER's cgroup (identity mismatch),
+///    or there is no recorded identity to check against: the record may be pruned.
+///  * UNKNOWN - a TRANSIENT probe error (fd exhaustion, `ENOMEM`, `ESTALE`) left the state
+///    undetermined: the caller must NOT prune or reap; re-evaluate next pass.
+///
+/// Identity is checked FIRST (never read a path we cannot confirm is our own cgroup - a recycled `<pid>`
+/// leaf could hand it to another box), and a transient error at ANY step yields `Unknown` so pressure
+/// never prunes a live record. `Unknown` is a transient RETURN value only - it is never written to the
+/// record, so it self-resolves the moment the fds free up.
+enum Liveness {
+    Orphaned,
+    Exited,
+    Unknown,
+}
+
+fn cgroup_liveness(cgroup: &str, id: Option<(u64, u64)>) -> Liveness {
+    // No recorded identity (older entry / no dedicated cgroup): the path carries no trustworthy orphan
+    // signal, and the supervisor-pid liveness already ran and said dead. Fail closed - never reap-by-path.
+    let Some(want) = id else {
+        return Liveness::Exited;
+    };
+    if cgroup.is_empty() {
+        return Liveness::Exited;
+    }
+    match probe_cgroup(cgroup) {
+        Probe::Gone => Liveness::Exited,
+        Probe::Unknown => Liveness::Unknown,
+        Probe::Id(got) if got != want => Liveness::Exited, // a stranger owns our path ⇒ our box is gone
+        Probe::Id(_) => {
+            // Our cgroup. Is its subtree populated? A read error here is also transient ⇒ Unknown.
+            match fs::read_to_string(Path::new(cgroup).join("cgroup.events")) {
+                Ok(s) => {
+                    let populated = s
+                        .lines()
+                        .find_map(|l| l.strip_prefix("populated "))
+                        .map(|v| v.trim() == "1")
+                        .unwrap_or(false);
+                    if populated {
+                        Liveness::Orphaned
+                    } else {
+                        Liveness::Exited
+                    }
+                }
+                // The dir existed a moment ago; a racing removal makes the read `ENOENT` ⇒ gone.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Liveness::Exited,
+                Err(_) => Liveness::Unknown, // EMFILE/ENOMEM/… ⇒ do not decide
+            }
+        }
+    }
+}
+
+/// Load the registry entry at `path`, resolving its liveness to one of THREE states (never two):
+///
+/// * supervisor pid alive → `running` (returned as-is).
+/// * supervisor dead, recorded cgroup ours+populated → `orphaned` (returned with `orphaned = true`).
+/// * supervisor dead, cgroup gone/empty/a stranger's, or unparseable → `exited` (record pruned, `None`).
+///
+/// A TRANSIENT probe error (fd exhaustion, `ENOMEM`, `ESTALE`) is the fourth outcome and the one that
+/// must NOT prune: the record is kept UNMARKED (shown as running) and re-evaluated next pass. `is_alive`
+/// itself is fd-free (`kill(pid, 0)`, and a failed `proc_starttime` read reads as alive), so only the
+/// cgroup probe needed the transient/gone split. The middle state is the ghost fix: a box whose
+/// SUPERVISOR was SIGKILL'd used to be pruned here while its PID 1 and `-p` forwarder still held the host
+/// port, so `kern stop <name>` answered "no running box" and the port was unreclaimable. Now such a box
+/// stays VISIBLE and REAPABLE. The single entry-loading rule - [`list`] and [`find`] both go through
+/// here - so the capped read, the parse, the liveness gate and the prune can't drift between them.
 fn load_live(path: &Path) -> Option<Instance> {
-    match read_entry_capped(path).and_then(|b| parse(&b)) {
-        Some(inst) if is_alive(inst.pid, inst.starttime) => Some(inst),
-        _ => {
+    let Some(inst) = read_entry_capped(path).and_then(|b| parse(&b)) else {
+        // Unparseable/torn: a live box's body parses (it was written atomically), so this is not one.
+        unregister(path);
+        return None;
+    };
+    if is_alive(inst.pid, inst.starttime) {
+        return Some(inst); // running: supervisor alive
+    }
+    match cgroup_liveness(&inst.cgroup, inst.cgroup_id) {
+        // The supervisor is gone but the box's processes (PID 1, forwarder) live on in OUR cgroup.
+        Liveness::Orphaned => Some(Instance {
+            orphaned: true,
+            ..inst
+        }),
+        // A transient probe error (fd exhaustion, ENOMEM, ESTALE): do NOT prune a record we could not
+        // evaluate. Keep it unmarked and re-evaluate next pass - fail-safe in the non-destructive
+        // direction. Under pressure a running-looking record is far less harmful than a dropped one.
+        Liveness::Unknown => Some(inst),
+        // Gone / empty / a stranger's cgroup: the box has exited, prune the stale record.
+        Liveness::Exited => {
             unregister(path);
             None
         }
     }
+}
+
+/// Reap an ORPHANED box (supervisor dead, cgroup still populated): SIGKILL every process in its recorded
+/// cgroup at once via cgroup-v2 `cgroup.kill`, which reaches the PID 1 AND the `-p` forwarder that the
+/// dead supervisor left holding the host port - a per-pid walk would miss whichever the registry never
+/// learned. Drops the registry entry when the box is confirmed dead or killed. Returns whether the kill
+/// was ISSUED. On a TRANSIENT error (fd exhaustion, `ENOMEM`) it does NOT drop the record - a live box
+/// might still be there - and returns `false` so the next `gc`/`stop` retries.
+pub fn reap_orphan(inst: &Instance) -> bool {
+    match kill_recorded_cgroup(inst) {
+        // Killed our cgroup, or confirmed it is gone / a stranger's: either way our box is over, so drop
+        // the record and free the name.
+        ReapOutcome::Killed => {
+            unregister_entry(inst);
+            true
+        }
+        ReapOutcome::Gone => {
+            unregister_entry(inst);
+            false
+        }
+        // Could not determine (fd exhaustion / ENOMEM / ESTALE): leave the record for the next sweep.
+        ReapOutcome::Unknown => false,
+    }
+}
+
+/// Remove `inst`'s registry entry (`<name>-<pid>`). Best-effort - a box already gone is not an error.
+fn unregister_entry(inst: &Instance) {
+    if let Ok(d) = dir() {
+        unregister(&d.join(format!("{}-{}", inst.name, inst.pid)));
+    }
+}
+
+/// The outcome of an identity-checked cgroup reap. Mirrors [`Probe`]'s three states at the kill layer.
+enum ReapOutcome {
+    /// `cgroup.kill` was written to OUR cgroup.
+    Killed,
+    /// The cgroup is definitively gone, or a stranger occupies the path (identity mismatch): nothing of
+    /// ours to kill, and the record may be dropped.
+    Gone,
+    /// A transient error left the state undetermined: do NOT kill and do NOT drop the record.
+    Unknown,
+}
+
+/// SIGKILL the recorded cgroup's whole subtree via `cgroup.kill`, but ONLY the exact cgroup kern
+/// recorded, and never on a transient error. The `kern-box-<name>-<pid>` path embeds a PID that
+/// recycles, so between recording the path and reaping it a different box could have come to own it -
+/// killing by path alone would SIGKILL the WRONG workload (running under this box's stale caps). The kill
+/// is identity-safe AND TOCTOU-free by operating on a PINNED directory fd: open the path once, `fstat`
+/// that fd against the recorded `(dev, ino)`, then `openat(dirfd, "cgroup.kill")` RELATIVE to the same fd
+/// (which refers to the inode, not the path, so a concurrent swap of the path after the open cannot
+/// redirect the write). Every errno is classified: `ENOENT`/`ENOTDIR` (and a missing `cgroup.kill`) prove
+/// the cgroup is gone; an identity mismatch means a stranger owns the path; anything else
+/// (`EMFILE`/`ENFILE`/`ENOMEM`/…) is [`ReapOutcome::Unknown`] - do not kill, do not drop the record.
+fn kill_recorded_cgroup(inst: &Instance) -> ReapOutcome {
+    let Some(want) = inst.cgroup_id else {
+        return ReapOutcome::Gone; // no recorded identity ⇒ nothing to reap by cgroup
+    };
+    if inst.cgroup.is_empty() {
+        return ReapOutcome::Gone;
+    }
+    let Ok(cpath) = std::ffi::CString::new(inst.cgroup.as_bytes()) else {
+        return ReapOutcome::Gone; // an embedded NUL can never be a real cgroup path
+    };
+    // Pin the directory OBJECT. `O_PATH` is enough to `fstat` it and to anchor an `openat`, and never
+    // executes anything in the dir. `O_CLOEXEC` so a concurrent fork can't leak the fd.
+    let dirfd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_DIRECTORY | libc::O_PATH | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ENOTDIR) => ReapOutcome::Gone, // path gone ⇒ box gone
+            _ => ReapOutcome::Unknown, // EMFILE/ENFILE/ENOMEM/… ⇒ retry next pass
+        };
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dirfd, &mut st) } != 0 {
+        unsafe { libc::close(dirfd) };
+        return ReapOutcome::Unknown; // couldn't confirm identity ⇒ don't kill
+    }
+    let outcome = if (st.st_dev as u64, st.st_ino as u64) == want {
+        // Relative to the pinned dir - never re-resolves `inst.cgroup`.
+        let kfd = unsafe { libc::openat(dirfd, c"cgroup.kill".as_ptr(), libc::O_WRONLY) };
+        if kfd >= 0 {
+            let wrote = unsafe { libc::write(kfd, b"1".as_ptr().cast(), 1) } == 1;
+            unsafe { libc::close(kfd) };
+            if wrote {
+                ReapOutcome::Killed
+            } else {
+                ReapOutcome::Unknown // the write itself faulted (ENOMEM/EINTR) ⇒ retry
+            }
+        } else {
+            match io::Error::last_os_error().raw_os_error() {
+                // No `cgroup.kill` under our (identity-matched) dir ⇒ the cgroup is no longer a live
+                // cgroup (kernel < 5.14, or the dir is mid-teardown) ⇒ treat as gone.
+                Some(libc::ENOENT) => ReapOutcome::Gone,
+                _ => ReapOutcome::Unknown,
+            }
+        }
+    } else {
+        ReapOutcome::Gone // a stranger occupies our path ⇒ our box is gone (must NOT kill it)
+    };
+    unsafe { libc::close(dirfd) };
+    outcome
 }
 
 /// The LIVE box named `name`, or `None`. The targeted-lookup primitive: unlike [`list`], it opens and
@@ -886,24 +1280,82 @@ impl Drop for NameClaim {
 /// A claim is a `<pid> <starttime>` file judged by the registry's own [`is_alive`] rule, and the
 /// whole check-and-take runs under the dir-wide flock - a stale claim (starter crashed before
 /// registering) is taken over exactly once, never raced.
+/// Uncapped convenience wrapper over [`claim_name_capped`], used by the claim tests to keep their
+/// `Option<NameClaim>` shape. Production always goes through `claim_name_capped` (with the fleet max),
+/// so this is `#[cfg(test)]` rather than a second live entry point that could drift from it.
+#[cfg(test)]
 pub fn claim_name(name: &str) -> io::Result<Option<NameClaim>> {
+    match claim_name_capped(name, None)? {
+        StartOutcome::Claimed(c) => Ok(Some(c)),
+        StartOutcome::NameBusy | StartOutcome::FleetFull { .. } => Ok(None),
+    }
+}
+
+/// The verdict of an atomic start attempt: got the name, the name is busy, or the FLEET ceiling is
+/// already reached. Separate from `claim_name`'s `Option` so the fleet refusal carries its own numbers
+/// for a precise message (and can never be confused with a name collision).
+pub enum StartOutcome {
+    Claimed(NameClaim),
+    NameBusy,
+    FleetFull { live: usize, max: usize },
+}
+
+/// [`claim_name`] plus a race-free fleet ceiling. The count-then-start check in `fleet_gate_and_budget`
+/// is a pure TOCTOU: N starters at `max-1` all read the same count and all proceed, overshooting `max`
+/// by the burst size before any registers. This does the ceiling check UNDER THE SAME claim-dir lock as
+/// the name claim, so the two are one atomic step: a starter counts the boxes in flight (registered +
+/// claimed-not-yet-registered) and, if that is already `max`, refuses BEFORE writing its own claim - so
+/// the next starter, serialized on the lock, sees this one's claim and is refused in turn. `max = None`
+/// is exactly `claim_name` (no counting, no extra `readdir`). Cooperative, not a security boundary: a
+/// caller can unset the env; `KERN_FLEET_*` remains the kernel-enforced hard bound.
+pub fn claim_name_capped(name: &str, max: Option<usize>) -> io::Result<StartOutcome> {
     let d = claims_dir()?;
     let _lock = lock_claims(&d)?;
+    // Ceiling FIRST, still under the lock: this box has not claimed yet, so it is not in the count.
+    if let Some(max) = max {
+        let live = boxes_in_flight(&d);
+        if live >= max {
+            return Ok(StartOutcome::FleetFull { live, max });
+        }
+    }
     let path = d.join(name);
     if let Ok(body) = fs::read_to_string(&path) {
         if live_claim(&body) {
-            return Ok(None); // live claimant → name busy
+            return Ok(StartOutcome::NameBusy); // live claimant → name busy
         }
         // Dead claimant or malformed body → stale; fall through and take it over (we hold the lock).
     }
     // A box that REGISTERED before we locked is invisible to the claim file (its starter already
     // released the claim after registering) - the registry entry is authoritative from that point.
     if name_taken(name) {
-        return Ok(None);
+        return Ok(StartOutcome::NameBusy);
     }
     let pid = std::process::id();
     fs::write(&path, format!("{pid} {}\n", proc_starttime(pid as i32)))?;
-    Ok(Some(NameClaim { path, owner: pid }))
+    Ok(StartOutcome::Claimed(NameClaim { path, owner: pid }))
+}
+
+/// Count the boxes in flight for the fleet ceiling, run UNDER the caller's claim-dir lock: LIVE
+/// registrations ([`list`] already prunes dead ones) plus LIVE claims not yet registered, DEDUPED by
+/// name (a box briefly holds both a claim and a registration). Self-healing by the same `is_alive`
+/// rule used everywhere, so a crashed starter's slot frees itself and never permanently blocks the
+/// fleet. `list` reads the INSTANCES dir and never takes the claims lock, so calling it here cannot
+/// deadlock against the lock the caller holds.
+fn boxes_in_flight(claims_d: &Path) -> usize {
+    let mut names: std::collections::HashSet<String> = list().into_iter().map(|i| i.name).collect();
+    if let Ok(rd) = fs::read_dir(claims_d) {
+        for e in rd.flatten() {
+            let fname = e.file_name();
+            let n = fname.to_string_lossy();
+            if n.starts_with('.') {
+                continue; // the `.lock` file, never a claim
+            }
+            if fs::read_to_string(e.path()).is_ok_and(|b| live_claim(&b)) {
+                names.insert(n.into_owned());
+            }
+        }
+    }
+    names.len()
 }
 
 /// Is this claim body a LIVE claimant's? The single staleness rule - [`claim_name`]'s takeover and
@@ -1090,6 +1542,27 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
     let mut def_hash = String::new();
     let mut workdir = String::new();
+    let mut cap_drop_all = false;
+    let (mut cap_drops, mut cap_adds) = (String::new(), String::new());
+    let mut cgroup = String::new();
+    let mut cgroup_id: Option<(u64, u64)> = None;
+    // Posture-record state, DERIVED from what the file actually contains (never a stored field):
+    //   seccomp_mode  - the box's filter; absent line → Denylist (the allowlist did not exist for a
+    //                   box that recorded no mode, so this is provable, not a guess).
+    //   cap_recorded  - true once the `capdropall` line is seen; false for a pre-cap-fields box, whose
+    //                   capability posture is UNKNOWABLE, so `exec` must refuse rather than guess.
+    //   posture_corrupt - a posture field is PRESENT but malformed; `exec` refuses rather than apply a
+    //                   partial posture that could be less restrictive than the box actually is.
+    let mut seccomp_mode = kern_isolation::SeccompFilter::Denylist;
+    let mut cap_recorded = false;
+    let mut posture_corrupt = false;
+    // Completeness: `encode` writes `capdropall`, `capdrops`, `capadds` together (one feature, one era),
+    // so a record that has `capdropall` but is MISSING either list is TRUNCATED, and exec must refuse it
+    // rather than reconstruct a posture from the half that survived (drops silently lost). `seccompmode`
+    // is deliberately NOT required here: it was added later, so a box from before it legitimately omits
+    // the line and runs the provable denylist default.
+    let mut seen_capdrops = false;
+    let mut seen_capadds = false;
     for line in body.lines() {
         // Skip a malformed line (e.g. a half-written record from a crash mid-write) rather than `?`-ing
         // out, which would evaporate the WHOLE entry and silently drop a live box from the registry.
@@ -1117,8 +1590,58 @@ fn parse(body: &str) -> Option<Instance> {
             "stopgrace" => stop_grace = v.parse().unwrap_or(0),
             "defhash" => def_hash = v.to_string(),
             "workdir" => workdir = v.to_string(),
+            // The presence of `capdropall` marks a box that DID record its capability posture. A
+            // value other than `0`/`1` is corruption, not a default - flag it so `exec` refuses rather
+            // than silently reading it as `false` (the LESS restrictive direction).
+            "capdropall" => {
+                cap_recorded = true;
+                match v {
+                    "0" => cap_drop_all = false,
+                    "1" => cap_drop_all = true,
+                    _ => posture_corrupt = true,
+                }
+            }
+            // Store the raw list, but flag corruption: dropping a non-numeric token would make the box
+            // LESS dropped (more privileged) on the `drops` side, so a bad token invalidates the record.
+            "capdrops" => {
+                seen_capdrops = true;
+                cap_drops = v.to_string();
+                if !cap_csv_valid(v) {
+                    posture_corrupt = true;
+                }
+            }
+            "capadds" => {
+                seen_capadds = true;
+                cap_adds = v.to_string();
+                if !cap_csv_valid(v) {
+                    posture_corrupt = true;
+                }
+            }
+            // A PRESENT-but-unrecognised mode is corruption (refuse). An ABSENT line is a box from
+            // before this field: it stays the default Denylist, which is what that box actually ran.
+            "seccompmode" => match kern_isolation::SeccompFilter::parse(v) {
+                Some(m) => seccomp_mode = m,
+                None => posture_corrupt = true,
+            },
+            // The box's dedicated cgroup path, recorded once PID 1 was known. Absent in an older entry
+            // and empty for a box with no dedicated cgroup - both leave `cgroup` empty, which
+            // `cgroup_populated` reads as "no orphan signal" (fall back to supervisor liveness).
+            "cgroup" => cgroup = v.to_string(),
+            // `<dev>:<ino>` identity of that cgroup dir. A malformed or absent value leaves `cgroup_id`
+            // None; `cgroup_populated`/`reap_orphan` then refuse to trust the path (fail closed: an
+            // orphan we cannot IDENTIFY is treated as gone rather than reaped by path alone).
+            "cgroupid" => {
+                cgroup_id = v
+                    .split_once(':')
+                    .and_then(|(d, i)| Some((d.trim().parse().ok()?, i.trim().parse().ok()?)))
+            }
             _ => {}
         }
+    }
+    // A record with `capdropall` but missing `capdrops`/`capadds` is truncated (they are written as one
+    // block): treat it as corrupt so `exec` refuses rather than reconstruct a posture from what survived.
+    if cap_recorded && !(seen_capdrops && seen_capadds) {
+        posture_corrupt = true;
     }
     Some(Instance {
         name: name?,
@@ -1140,12 +1663,144 @@ fn parse(body: &str) -> Option<Instance> {
         def_hash,
         memory_max,
         pids_max,
+        cap_drop_all,
+        cap_drops,
+        cap_adds,
+        seccomp_mode,
+        cap_recorded,
+        posture_corrupt,
+        cgroup,
+        cgroup_id,
+        // Never serialised: this is a LIVENESS verdict, derived by `load_live` after comparing the
+        // supervisor pid against the recorded cgroup. A freshly parsed record carries no verdict yet.
+        orphaned: false,
     })
+}
+
+/// A capability CSV field is well-formed iff every non-empty comma token parses as a `u32`. The empty
+/// string (no caps) is valid. A malformed token must invalidate the whole record, not be silently
+/// dropped: on the `--cap-drop` side a dropped token leaves the box LESS dropped (more privileged).
+fn cap_csv_valid(s: &str) -> bool {
+    s.split(',')
+        .filter(|t| !t.is_empty())
+        .all(|t| t.parse::<u32>().is_ok())
+}
+
+/// The box's capability spec as the three registry fields `(cap_drop_all, cap_drops_csv,
+/// cap_adds_csv)` that [`encode`] serialises, so `kern exec` can rebuild the exact `CapSpec` the box's
+/// PID 1 got and reapply it instead of the always-dropped baseline. Cap numbers are small ints
+/// (`< CAP_LAST_CAP`), joined by commas; the empty string means none.
+pub(crate) fn cap_fields(caps: &kern_isolation::CapSpec) -> (bool, String, String) {
+    let csv = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    (caps.drop_all, csv(&caps.drops), csv(&caps.adds))
+}
+
+/// Rebuild the box's `CapSpec` from the three registry fields (the inverse of [`cap_fields`]), so
+/// `kern exec` reapplies the box's OWN drop set - not the always-dropped baseline. An unparseable
+/// cap number is dropped rather than errored: a corrupt field must never make an `exec` MORE
+/// privileged, and the baseline is still applied under it. An older entry carries no such fields, so
+/// `drop_all=false` with empty lists yields `CapSpec::default()` - exactly the pre-record behaviour.
+fn cap_spec_from_fields(drop_all: bool, drops: &str, adds: &str) -> kern_isolation::CapSpec {
+    let parse = |s: &str| {
+        s.split(',')
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<u32>().ok())
+            .collect::<Vec<u32>>()
+    };
+    kern_isolation::CapSpec {
+        drop_all,
+        drops: parse(drops),
+        adds: parse(adds),
+    }
+}
+
+impl Instance {
+    /// The capability spec and seccomp filter `kern exec` must REPRODUCE for this box, or a refusal.
+    /// The gate lives WITH the reconstruction so a caller cannot rebuild a usable posture from a record
+    /// that has none: a box predating the posture fields is unknowable (drop-ALL and default both parse
+    /// to empty), and a malformed field can't be trusted - guessing either could enter the box MORE
+    /// privileged than its PID 1, so both refuse, loudly, and restarting the box re-records. The
+    /// `cap_recorded`/`posture_corrupt` flags are private detail of this check, not the caller's to test.
+    pub(crate) fn exec_posture(
+        &self,
+    ) -> Result<(kern_isolation::CapSpec, kern_isolation::SeccompFilter), crate::error::Error> {
+        if !self.cap_recorded {
+            return Err(crate::error::Error::Sandbox(format!(
+                "box '{}' was created before its security profile was recorded; its exec profile \
+                 cannot be reconstructed safely - restart the box to record it",
+                self.name
+            )));
+        }
+        if self.posture_corrupt {
+            return Err(crate::error::Error::Sandbox(format!(
+                "box '{}' has a corrupt security-posture record; refusing to exec - restart the box",
+                self.name
+            )));
+        }
+        Ok((
+            cap_spec_from_fields(self.cap_drop_all, &self.cap_drops, &self.cap_adds),
+            self.seccomp_mode,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_spec_survives_the_registry_field_round_trip() {
+        use kern_isolation::CapSpec;
+        // The pair `cap_fields` -> `cap_spec_from_fields` must be lossless, or `kern exec` reapplies
+        // the WRONG drop set. Covers `--cap-drop ALL`, `--cap-add` (kept), a specific `--cap-drop`,
+        // and the default (empty), which must reconstruct to `CapSpec::default()`.
+        let cases = [
+            CapSpec {
+                drop_all: true,
+                drops: vec![],
+                adds: vec![10],
+            },
+            CapSpec {
+                drop_all: false,
+                drops: vec![0],
+                adds: vec![],
+            },
+            CapSpec {
+                drop_all: false,
+                drops: vec![],
+                adds: vec![],
+            },
+            CapSpec {
+                drop_all: true,
+                drops: vec![12, 13],
+                adds: vec![21],
+            },
+        ];
+        for c in &cases {
+            let (da, dr, ad) = cap_fields(c);
+            let back = cap_spec_from_fields(da, &dr, &ad);
+            assert_eq!(back.drop_all, c.drop_all, "drop_all lost for {c:?}");
+            assert_eq!(back.drops, c.drops, "drops lost for {c:?}");
+            assert_eq!(back.adds, c.adds, "adds lost for {c:?}");
+        }
+        // The empty spec round-trips to the default (the pre-record `exec` behaviour for old boxes).
+        let (da, dr, ad) = cap_fields(&CapSpec::default());
+        let back = cap_spec_from_fields(da, &dr, &ad);
+        assert_eq!(
+            back,
+            CapSpec::default(),
+            "an empty spec must rebuild CapSpec::default()"
+        );
+
+        // A corrupt field must never make an exec MORE privileged: an unparseable cap number is
+        // dropped, and the dangerous baseline still applies under whatever survives.
+        let corrupt = cap_spec_from_fields(false, "12,notanum,13", "");
+        assert_eq!(
+            corrupt.drops,
+            vec![12, 13],
+            "a garbage cap number is skipped, not fatal"
+        );
+    }
 
     #[test]
     fn rewrite_name_field_swaps_only_the_name_line() {
@@ -1228,6 +1883,15 @@ mod tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: String::new(),
+            cap_drop_all: false,
+            cap_drops: String::new(),
+            cap_adds: String::new(),
+            seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            cap_recorded: true,
+            posture_corrupt: false,
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         };
         let wire = encode(&inst);
         assert!(wire.contains("workdir=/app\n"), "encoded: {wire}");
@@ -1270,6 +1934,15 @@ mod tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: String::new(),
+            cap_drop_all: true,
+            cap_drops: "12,13".into(),
+            cap_adds: "10".into(),
+            seccomp_mode: kern_isolation::SeccompFilter::Allowlist,
+            cap_recorded: true,
+            posture_corrupt: false,
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         };
         let got = parse(&encode(&inst)).expect("parse a well-formed entry");
         assert_eq!(got.pod, "stack");
@@ -1277,6 +1950,22 @@ mod tests {
         assert_eq!(got.landlock_rw, "/tmp,/data");
         assert_eq!(got.memory_max, Some(134_217_728));
         assert_eq!(got.pids_max, Some(64));
+        // The box's capability spec round-trips: `exec` rebuilds it and must get the exact drop.
+        assert!(
+            got.cap_drop_all,
+            "--cap-drop ALL must survive the round trip"
+        );
+        assert_eq!(got.cap_drops, "12,13", "extra dropped caps must survive");
+        assert_eq!(got.cap_adds, "10", "kept (--cap-add) caps must survive");
+        // The seccomp posture round-trips, so `exec` reproduces the box's filter (not a re-read env).
+        assert_eq!(
+            got.seccomp_mode,
+            kern_isolation::SeccompFilter::Allowlist,
+            "the seccomp mode must survive the round trip"
+        );
+        // A well-formed entry is recorded and not corrupt: `exec` proceeds.
+        assert!(got.cap_recorded, "a written cap profile marks the record");
+        assert!(!got.posture_corrupt, "a well-formed record is not corrupt");
         // an uncapped box round-trips to None (empty value), never Some(0)
         let uncapped = Instance {
             memory_max: None,
@@ -1285,6 +1974,12 @@ mod tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: String::new(),
+            cap_drop_all: false,
+            cap_drops: String::new(),
+            cap_adds: String::new(),
+            seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            cap_recorded: true,
+            posture_corrupt: false,
             ..inst.clone()
         };
         let got2 = parse(&encode(&uncapped)).expect("parse");
@@ -1296,6 +1991,13 @@ mod tests {
         assert!(g.egress.is_empty() && g.landlock_rw.is_empty());
         assert_eq!(g.memory_max, None);
         assert_eq!(g.pids_max, None);
+        // No cap keys in a legacy entry: `exec` must rebuild `CapSpec::default()` (the dangerous
+        // baseline), which is exactly how it behaved before the fields existed - no behaviour change
+        // for a box started by an older kern still running across the upgrade.
+        assert!(
+            !g.cap_drop_all && g.cap_drops.is_empty() && g.cap_adds.is_empty(),
+            "a legacy entry must default its cap fields, not invent a drop set"
+        );
         // a corrupt line (e.g. a truncated write) is SKIPPED, not fatal: the box stays in the registry
         let corrupt = "name=surv\npid=9\nthis-line-has-no-equals\npod=stack\n";
         let s = parse(corrupt).expect("a corrupt line must not evaporate the whole entry");
@@ -1341,6 +2043,184 @@ mod tests {
         assert!(!well_formed_entry(OsStr::new("web-abc")));
         assert!(!well_formed_entry(OsStr::new("-42")));
         assert!(!well_formed_entry(OsStr::new("evil.tmp")));
+    }
+
+    /// The recorded cgroup path is what lets `list()` tell an ORPHANED box (supervisor dead, cgroup
+    /// still populated) from an exited one. It must survive a round trip, and an entry written by an
+    /// OLDER kern - no `cgroup=` line - must still load with an empty path (read as "no orphan signal",
+    /// so liveness falls back to the supervisor pid), never vanish from the registry.
+    #[test]
+    fn cgroup_field_roundtrips_and_an_older_entry_defaults_empty() {
+        let body = "name=cg\npid=7\npid1=8\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\ncgroup=/sys/fs/cgroup/kern.slice/kern-box-cg-9\ncgroupid=42:1337\n";
+        let got = parse(body).expect("parse");
+        assert_eq!(got.cgroup, "/sys/fs/cgroup/kern.slice/kern-box-cg-9");
+        assert_eq!(
+            got.cgroup_id,
+            Some((42, 1337)),
+            "the (dev, ino) identity must parse"
+        );
+        assert!(
+            !got.orphaned,
+            "a freshly parsed record carries no liveness verdict"
+        );
+        let wire = encode(&got);
+        assert!(
+            wire.contains("cgroup=/sys/fs/cgroup/kern.slice/kern-box-cg-9\n"),
+            "the cgroup field must survive the round trip; encoded: {wire}"
+        );
+        assert!(
+            wire.contains("cgroupid=42:1337\n"),
+            "the cgroup identity must survive the round trip; encoded: {wire}"
+        );
+        // An older entry (no cgroup/cgroupid lines) still loads, with empty path and no identity.
+        let older = "name=old\npid=3\npid1=0\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\n";
+        let g = parse(older).expect("an older entry must still load");
+        assert_eq!(
+            g.cgroup, "",
+            "a missing cgroup line reads as empty, not garbage"
+        );
+        assert_eq!(g.cgroup_id, None, "a missing identity line reads as None");
+        // A malformed identity must not panic and must read as None (fail closed: unidentifiable).
+        let bad = "name=b\npid=3\npid1=0\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\ncgroupid=not:a:number\n";
+        assert_eq!(
+            parse(bad).expect("still parses").cgroup_id,
+            None,
+            "a malformed cgroupid must be None, not a partial parse"
+        );
+    }
+
+    /// A detached box whose SUPERVISOR was SIGKILL'd but whose PID 1 / `-p` forwarder outlived it must
+    /// stay VISIBLE and reapable, not vanish from the registry while it still holds a host port bound.
+    /// `load_live` decides this from the RECORDED cgroup, so the state is FABRICATED deterministically -
+    /// a dead supervisor pid plus a `cgroup.events` file - rather than by racing a real SIGKILL. When
+    /// the cgroup later reads empty, the record is pruned (exited).
+    #[test]
+    fn an_orphaned_box_stays_visible_and_an_exited_one_is_pruned() {
+        let _g = reg_guard();
+        // A stand-in cgroup: `cgroup_populated` only reads `<dir>/cgroup.events`, so a plain file is
+        // a faithful substitute for a real cgroup with a live process in it.
+        let cg = std::env::temp_dir().join(format!("kern-orph-cg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cg);
+        fs::create_dir_all(&cg).expect("cg dir");
+        fs::write(cg.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
+        // The record must carry the dir's REAL (dev, ino): liveness now confirms identity, not just
+        // the path, so a fabricated cgroup needs its true identity or it reads as a stranger's.
+        let (dev, ino) = cgroup_identity(&cg.to_string_lossy()).expect("stat cg");
+        // A supervisor pid that CANNOT be alive (above any kernel pid_max), so `is_alive` is false.
+        let dead_pid: i32 = 0x3FFF_FFFF;
+        let name = format!("orph-{}", std::process::id());
+        let d = dir().expect("registry dir");
+        let entry = d.join(format!("{name}-{dead_pid}"));
+        let body = format!(
+            "name={name}\npid={dead_pid}\npid1=0\nrootfs=/r\ncommand=sleep\nstarted=1\nstarttime=2\ncgroup={}\ncgroupid={dev}:{ino}\n",
+            cg.display()
+        );
+        fs::write(&entry, &body).expect("write entry");
+        // POPULATED cgroup + dead supervisor ⇒ orphaned, KEPT (not pruned).
+        let got = find(&name).expect("an orphaned box must stay visible, not be pruned");
+        assert!(
+            got.orphaned,
+            "dead supervisor + populated cgroup ⇒ orphaned"
+        );
+        assert_eq!(got.cgroup, cg.to_string_lossy());
+        assert!(
+            entry.exists(),
+            "an orphaned entry must NOT be pruned from disk"
+        );
+        // Now the cgroup reads EMPTY ⇒ exited ⇒ `find` prunes the stale record.
+        fs::write(cg.join("cgroup.events"), "populated 0\nfrozen 0\n").expect("events empty");
+        assert!(
+            find(&name).is_none(),
+            "an empty-cgroup dead-supervisor box is exited and must be pruned"
+        );
+        assert!(
+            !entry.exists(),
+            "the exited record must be pruned from disk"
+        );
+        let _ = fs::remove_dir_all(&cg);
+    }
+
+    /// `probe_cgroup` must split "definitely gone" (`ENOENT`) from "resolved" - the errno classification
+    /// that keeps a transient failure (fd exhaustion) from reading as absence and pruning a live record.
+    /// The transient branch (`EMFILE`) is fabricated at the shell level (`ulimit -n`); here we pin the
+    /// two deterministic ends and that a dead-supervisor box over an ABSENT cgroup reads as `Exited`.
+    #[test]
+    fn probe_cgroup_splits_gone_from_resolved() {
+        // A path that cannot exist ⇒ Gone (never Unknown).
+        assert!(
+            matches!(
+                probe_cgroup("/sys/fs/cgroup/kern.slice/kern-box-nope-does-not-exist-999999"),
+                Probe::Gone
+            ),
+            "an absent cgroup path must classify as Gone"
+        );
+        // A real directory ⇒ Id with its (dev, ino).
+        let tmp = std::env::temp_dir();
+        assert!(
+            matches!(probe_cgroup(&tmp.to_string_lossy()), Probe::Id(_)),
+            "an existing directory must classify as Id"
+        );
+        // cgroup_liveness over a recorded-but-absent cgroup with an identity ⇒ Exited (prunable).
+        assert!(matches!(
+            cgroup_liveness(
+                "/sys/fs/cgroup/kern.slice/kern-box-nope-x-999999",
+                Some((1, 2))
+            ),
+            Liveness::Exited
+        ));
+        // No recorded identity ⇒ Exited (fail closed, never reap-by-path).
+        assert!(matches!(
+            cgroup_liveness("/some/path", None),
+            Liveness::Exited
+        ));
+    }
+
+    /// The PID-reuse collision the reviewer named: a box's `kern-box-<name>-<pid>` path is recreated -
+    /// by a LATER box after a pid recycled the leaf - as a DIFFERENT cgroup (different inode). The stale
+    /// record still points at that path, and the path IS populated (by the stranger's processes). Path
+    /// alone would read the box as orphaned and `cgroup.kill` would SIGKILL the wrong box. The `(dev,
+    /// ino)` identity closes it: a mismatched inode reads as exited (pruned, not reaped), and a direct
+    /// `reap_orphan` refuses to kill. Fabricated deterministically - a populated dir plus a record whose
+    /// recorded identity is DELIBERATELY wrong - rather than by racing a real pid recycle.
+    #[test]
+    fn a_recycled_cgroup_path_is_not_reaped_when_its_identity_changed() {
+        let _g = reg_guard();
+        let cg = std::env::temp_dir().join(format!("kern-orph-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cg);
+        fs::create_dir_all(&cg).expect("cg dir");
+        // Populated, as a stranger's live cgroup would be.
+        fs::write(cg.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
+        let (dev, real_ino) = cgroup_identity(&cg.to_string_lossy()).expect("stat cg");
+        // The record's recorded inode is DELIBERATELY wrong (what the ORIGINAL box's cgroup had).
+        let stale_ino = real_ino.wrapping_add(1);
+        let dead_pid: i32 = 0x3FFF_FFFE;
+        let name = format!("orphid-{}", std::process::id());
+        let d = dir().expect("registry dir");
+        let entry = d.join(format!("{name}-{dead_pid}"));
+        let body = format!(
+            "name={name}\npid={dead_pid}\npid1=0\nrootfs=/r\ncommand=sleep\nstarted=1\nstarttime=2\ncgroup={}\ncgroupid={dev}:{stale_ino}\n",
+            cg.display()
+        );
+        fs::write(&entry, &body).expect("write entry");
+        // Populated path, but the identity no longer matches ⇒ this box is GONE, not orphaned ⇒ pruned.
+        assert!(
+            find(&name).is_none(),
+            "a populated path with a changed identity must read as exited, never as this box orphaned"
+        );
+        // And a direct reap must REFUSE to kill (nothing of ours is there). Rebuild the instance and
+        // call `reap_orphan`: it must return false and touch no `cgroup.kill` in the stranger's dir.
+        fs::write(&entry, &body).expect("rewrite entry"); // `find` above pruned it; restore for the direct call
+        let inst = parse(&body).expect("parse");
+        assert_eq!(inst.cgroup_id, Some((dev, stale_ino)));
+        assert!(
+            !reap_orphan(&inst),
+            "reap_orphan must NOT kill a cgroup whose identity differs from the record"
+        );
+        assert!(
+            !cg.join("cgroup.kill").exists(),
+            "the identity-mismatched reap must not have created/written cgroup.kill"
+        );
+        let _ = fs::remove_dir_all(&cg);
     }
 
     #[test]
@@ -1407,6 +2287,15 @@ mod tests {
                 stop_signal: 0,
                 stop_grace: 0,
                 def_hash: String::new(),
+                cap_drop_all: false,
+                cap_drops: String::new(),
+                cap_adds: String::new(),
+                seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+                cap_recorded: true,
+                posture_corrupt: false,
+                cgroup: String::new(),
+                cgroup_id: None,
+                orphaned: false,
             })
             .unwrap()
         };
@@ -1469,6 +2358,15 @@ mod tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: String::new(),
+            cap_drop_all: false,
+            cap_drops: String::new(),
+            cap_adds: String::new(),
+            seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            cap_recorded: true,
+            posture_corrupt: false,
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         })
         .expect("register the box under its original name");
         let d = dir().expect("registry dir");
@@ -1534,6 +2432,15 @@ mod tests {
             stop_signal: 0,
             stop_grace: 0,
             def_hash: String::new(),
+            cap_drop_all: false,
+            cap_drops: String::new(),
+            cap_adds: String::new(),
+            seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            cap_recorded: true,
+            posture_corrupt: false,
+            cgroup: String::new(),
+            cgroup_id: None,
+            orphaned: false,
         })
         .unwrap();
         let got = claim_name(&name).unwrap();
@@ -1575,6 +2482,55 @@ mod tests {
     }
 
     #[test]
+    fn claim_name_capped_enforces_the_fleet_ceiling_atomically() {
+        let _g = reg_guard();
+        // The ceiling is a GLOBAL count, so unique names do not isolate it the way the other claim
+        // tests are isolated - point the runtime dir at a fresh temp so the count sees ONLY this test's
+        // claims. `reg_guard` holds `TEST_ENV_LOCK`, so no other test flips `XDG_RUNTIME_DIR` meanwhile.
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        let tmp = std::env::temp_dir().join(format!("kern-fleet-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+
+        // A binder that asserts the outcome is a live claim and hands back the guard (kept alive so its
+        // claim keeps counting). Panicking here is a TEST assertion, not production code.
+        let claim_ok = |name: &str, max: Option<usize>| -> NameClaim {
+            match claim_name_capped(name, max).expect("runtime dir is writable") {
+                StartOutcome::Claimed(c) => c,
+                StartOutcome::NameBusy => panic!("'{name}' unexpectedly busy"),
+                StartOutcome::FleetFull { live, max } => {
+                    panic!("'{name}' refused: fleet {live}/{max:?}")
+                }
+            }
+        };
+
+        // max = 2: two claims fit, the third is refused with the exact numbers, and the refusal is
+        // atomic with the count (the third could not have slipped in before the second's claim landed).
+        let c1 = claim_ok("a", Some(2));
+        let c2 = claim_ok("b", Some(2));
+        match claim_name_capped("c", Some(2)).unwrap() {
+            StartOutcome::FleetFull { live, max } => {
+                assert_eq!((live, max), (2, 2), "third claim must see the full fleet");
+            }
+            _ => panic!("third claim over the ceiling must be FleetFull"),
+        }
+        // Releasing one frees exactly one slot (the count is self-healing on the claim file's removal).
+        drop(c1);
+        let c3 = claim_ok("c", Some(2));
+        // An uncapped claim is never fleet-refused, whatever the count.
+        let c4 = claim_ok("d", None);
+
+        drop(c2);
+        drop(c3);
+        drop(c4);
+        let _ = fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
     fn parse_reads_volumes_and_tolerates_older_entries() {
         let _g = reg_guard();
         // A full entry round-trips the volumes and pod fields.
@@ -1589,5 +2545,112 @@ mod tests {
         let oi = parse(old).unwrap();
         assert_eq!(oi.volumes, "");
         assert_eq!(oi.pod, "");
+        // ...but its capability posture is UNKNOWABLE: no `capdropall` line means `exec` must refuse
+        // rather than guess a baseline. The record still parses (the box stays visible to `ps`/`stop`);
+        // only `exec` gates on `cap_recorded`. The seccomp mode defaults to the provable denylist.
+        assert!(
+            !oi.cap_recorded,
+            "an entry with no cap fields must be marked unrecorded, so exec refuses"
+        );
+        assert!(!oi.posture_corrupt, "absent is not corrupt");
+        assert_eq!(
+            oi.seccomp_mode,
+            kern_isolation::SeccompFilter::Denylist,
+            "a box that recorded no mode ran the denylist (the allowlist did not exist for it)"
+        );
+    }
+
+    #[test]
+    fn a_malformed_posture_field_is_flagged_corrupt_never_silently_defaulted() {
+        // The record is present (has `capdropall`) so it is NOT "absent", but each posture field is
+        // malformed in turn. Each must set `posture_corrupt` so `exec` refuses - a garbage token must
+        // never be dropped into a LESS restrictive posture (fewer drops, or a fallback filter mode).
+        let base = "name=b\npid=1\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\n";
+        // capdropall neither 0 nor 1
+        let bad_all = parse(&format!("{base}capdropall=2\ncapdrops=\ncapadds=\n")).unwrap();
+        assert!(
+            bad_all.cap_recorded && bad_all.posture_corrupt,
+            "capdropall=2"
+        );
+        // a non-numeric token in the DROP list (the dangerous side: dropping it → less dropped)
+        let bad_drop = parse(&format!("{base}capdropall=0\ncapdrops=12,x,13\ncapadds=\n")).unwrap();
+        assert!(bad_drop.posture_corrupt, "non-numeric cap in capdrops");
+        // a non-numeric token in the ADD list
+        let bad_add = parse(&format!("{base}capdropall=0\ncapdrops=\ncapadds=nope\n")).unwrap();
+        assert!(bad_add.posture_corrupt, "non-numeric cap in capadds");
+        // an unrecognised seccomp mode
+        let bad_mode = parse(&format!(
+            "{base}capdropall=0\ncapdrops=\ncapadds=\nseccompmode=wat\n"
+        ))
+        .unwrap();
+        assert!(bad_mode.posture_corrupt, "unknown seccompmode token");
+        // TRUNCATED after `capdropall`: the drops that follow were cut (a `SIGKILL` mid-write, or a
+        // fabricated partial record). Reconstructing a posture from `capdropall` alone would silently
+        // lose the drops, so a record with `capdropall` but MISSING `capdrops`/`capadds` is corrupt.
+        let cut_after_all = parse(&format!("{base}capdropall=0\n")).unwrap();
+        assert!(
+            cut_after_all.cap_recorded && cut_after_all.posture_corrupt,
+            "capdropall present but capdrops/capadds missing = truncated"
+        );
+        let cut_mid = parse(&format!("{base}capdropall=0\ncapdrops=12,13\n")).unwrap();
+        assert!(
+            cut_mid.posture_corrupt,
+            "capdropall+capdrops present but capadds missing = truncated"
+        );
+        // A box from BEFORE `seccompmode` existed - capdropall+capdrops+capadds, no seccompmode line - is
+        // NOT corrupt: the absent mode is the provable denylist default, and that box actually ran it.
+        let old_box = parse(&format!("{base}capdropall=1\ncapdrops=12,13\ncapadds=10\n")).unwrap();
+        assert!(
+            old_box.cap_recorded && !old_box.posture_corrupt,
+            "a pre-seccompmode box (all cap fields, no seccompmode) is valid"
+        );
+        assert_eq!(
+            old_box.seccomp_mode,
+            kern_isolation::SeccompFilter::Denylist
+        );
+        // a WELL-FORMED record with every posture field present is neither absent nor corrupt.
+        let ok = parse(&format!(
+            "{base}capdropall=1\ncapdrops=12,13\ncapadds=10\nseccompmode=allowlist\n"
+        ))
+        .unwrap();
+        assert!(ok.cap_recorded && !ok.posture_corrupt);
+        assert_eq!(ok.seccomp_mode, kern_isolation::SeccompFilter::Allowlist);
+    }
+
+    #[test]
+    fn a_volume_source_overlapping_the_registry_is_refused_in_both_directions() {
+        // A box that bind-mounts the registry can forge a peer's posture record (proven, adversarial
+        // review). The containment guard must catch the dir itself, anything inside it, AND any parent
+        // that would drag it in - while leaving a sibling and unrelated paths mountable.
+        let reg = PathBuf::from("/run/user/1000/kern/instances");
+        let claims = PathBuf::from("/run/user/1000/kern/claims");
+        let dirs = vec![reg.clone(), claims];
+        // the dir itself, a child, and a parent that CONTAINS it → all refused
+        assert!(dirs_overlap(&reg, &dirs), "the instances dir itself");
+        assert!(
+            dirs_overlap(Path::new("/run/user/1000/kern/instances/victim-9"), &dirs),
+            "a record inside the instances dir"
+        );
+        assert!(
+            dirs_overlap(Path::new("/run/user/1000/kern"), &dirs),
+            "the kern parent that contains instances/claims"
+        );
+        assert!(
+            dirs_overlap(Path::new("/run/user/1000"), &dirs),
+            "the runtime root that contains the kern tree"
+        );
+        // a SIBLING with a shared string prefix is NOT overlap (component-wise starts_with)
+        assert!(
+            !dirs_overlap(Path::new("/run/user/1000/kern-other"), &dirs),
+            "a sibling sharing a name prefix must stay mountable"
+        );
+        assert!(
+            !dirs_overlap(Path::new("/run/user/1000/kern/volumes/data"), &dirs),
+            "the volumes sibling must stay mountable"
+        );
+        // an unrelated host path is fine
+        assert!(!dirs_overlap(Path::new("/tmp/project"), &dirs));
+        // no trusted dirs (nothing created yet) → nothing is refused
+        assert!(!dirs_overlap(&reg, &[]));
     }
 }

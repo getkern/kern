@@ -29,6 +29,9 @@ mod ports;
 mod real;
 mod sandbox;
 mod seccomp;
+/// GENERATED per-arch allowlist syscall numbers (see `scripts/gen-seccomp-allowlist.py`), consumed
+/// by `seccomp::build_allowlist_filter` under the opt-in `KERN_SECCOMP=allowlist`.
+mod seccomp_allow;
 mod ssh;
 pub use cgroup::apply_limits as apply_cgroup_limits;
 /// Resolve a box's exact direct-path cgroup dir from `/proc/<pid1>/cgroup` - the immediate, targeted
@@ -61,6 +64,11 @@ pub use cgroup::warn_unenforced_caps;
 /// `env_claims_enforcer_but_none_real`) stay crate-internal - only `real.rs` reads them.
 pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
 pub use cgroup::{fleet_status, FleetStatus};
+/// The write-tested state of `--memory` enforcement on this host (`Enforced` / `PresentNotDelegated`
+/// / `Absent` / `Unknown`), by creating a throwaway child cgroup and checking a `memory.max` write
+/// binds. Stronger than [`cgroup::memory_cap_enforceable`], which reads controller PRESENCE and
+/// cannot tell "delegated" from "listed but inert". See [`cgroup::memory_cap_state`].
+pub use cgroup::{memory_cap_state, MemoryCapState};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::{preflight as preflight_ports, PortMap};
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
@@ -76,7 +84,7 @@ pub use real::{
 };
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};
-pub use seccomp::denied_syscall_count;
+pub use seccomp::{denied_syscall_count, SeccompFilter};
 pub use ssh::SshSetup;
 
 /// `MS_BIND` from `<sys/mount.h>` - bind-mount an existing tree at a new location.

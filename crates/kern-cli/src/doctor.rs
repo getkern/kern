@@ -502,6 +502,7 @@ fn check_max_userns() -> R {
 }
 
 fn check_cgroup() -> R {
+    use kern_isolation::MemoryCapState;
     if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         return R::Warn(
             "cgroup v2 not found - memory/pids caps (`--memory`, `--pids-limit`) won't be enforced".into(),
@@ -514,53 +515,76 @@ fn check_cgroup() -> R {
     // `--memory 32m` exits 137. doctor called that "best-effort" and "may not bind" on a platform kern
     // ships for, on the same machine where the runtime correctly printed no warning at all.
     //
-    // So ask the question the runtime asks. `memory_cap_enforceable()` is the predicate `box` itself
-    // gates its warning on, which is what the comment here used to claim and was not.
+    // So ask the question the runtime asks - and ask it by DOING it, not by reading a presence flag.
+    // The prior version gated on `memory_cap_enforceable()`, which reads `cgroup.controllers`: on a
+    // host where `memory` is listed there but not delegated to children (root inside a container),
+    // that returned true and doctor reported "enforced" while a real `memory.max` write never bound.
+    // `memory_cap_state()` creates a throwaway child, writes its `memory.max`, reads it back, and
+    // removes it - the exact operation a box performs - so the three states are told apart.
     if !kern_isolation::user_systemd_present() {
-        return if kern_isolation::memory_cap_enforceable() {
-            R::Ok(
+        return match kern_isolation::memory_cap_state() {
+            MemoryCapState::Enforced => R::Ok(
                 "cgroup v2, no systemd --user manager needed: caps enforced in the current cgroup"
                     .into(),
-            )
-        } else {
-            R::Warn(
-                "cgroup v2 present, no systemd --user manager, and the `memory` controller is not available in this cgroup - `--memory`/`--pids-limit` will not bind".into(),
-                "boxes still run and the isolation holds; caps need `memory` enabled in this tree's `cgroup.subtree_control`".into(),
-            )
+            ),
+            MemoryCapState::PresentNotDelegated => R::Warn(
+                "cgroup v2 present, no systemd --user manager, and the `memory` controller is listed but NOT delegated to a child cgroup - a `--memory` write is accepted and silently never bites".into(),
+                "boxes still run and the isolation holds; add `memory` to this tree's `cgroup.subtree_control`, or run kern under a delegated `systemd --user` scope".into(),
+            ),
+            MemoryCapState::Absent => R::Warn(
+                "cgroup v2 present, no systemd --user manager, and the `memory` controller is not in this cgroup's tree - `--memory`/`--pids-limit` will not bind".into(),
+                "boxes still run and the isolation holds; enable `cgroup_enable=memory` (stock Raspberry Pi OS) or use a kernel that delegates it (Microsoft's default WSL2 kernel does not)".into(),
+            ),
+            MemoryCapState::Unknown => R::Warn(
+                "cgroup v2 present but kern could not read `/proc/self/cgroup` to probe whether a `--memory` cap would bind".into(),
+                "unusual; boxes still run with namespace + seccomp isolation, only the resource cap is uncertain".into(),
+            ),
         };
     }
-    // A scope alone isn't enough: the box's `memory.max` only enforces if the **memory controller**
-    // is actually delegated to the user manager. Some distros (notably Raspberry Pi OS) delegate only
-    // `cpu`+`pids`, so `--memory` silently no-ops - check for it rather than over-claiming.
-    let ctrls = delegated_controllers();
-    if ctrls.is_empty() {
-        // Couldn't read the delegated set - don't over- or under-claim.
-        R::Ok("cgroup v2 + systemd --user scope: memory/pids/cpu caps where delegated".into())
-    } else if ctrls.iter().any(|c| c == "memory") {
-        // A DELEGATED controller is not the same as an ENFORCEABLE knob, and this row used to
-        // generalise from one to all three. On an Arduino UNO Q's Android kernel `cgroup.controllers`
-        // lists `cpu`, yet no `cpu.max` exists anywhere in the chain: the controller is there with only
-        // its *weight* interface, so `--cpus` is a share and not a ceiling. Reporting "resource caps
-        // enforced" there is the tool telling a comfortable lie about a knob it never looked at.
-        if cpu_bandwidth_interface_present() {
-            R::Ok(
-                "cgroup v2 + systemd --user scope: resource caps enforced (memory delegated)"
-                    .into(),
-            )
-        } else {
+    // A scope alone isn't enough, and neither is the controller being LISTED: the box's `memory.max`
+    // only binds if the memory controller is actually delegated to the box's cap target AND a write to
+    // it takes. Some distros (Raspberry Pi OS) delegate only `cpu`+`pids`; some list `memory` yet the
+    // write is inert (root inside a container). So WRITE-PROBE the box's real target - its delegated
+    // slice, the same one `apply_limits` writes - instead of reading the user manager's delegated set.
+    match kern_isolation::memory_cap_state() {
+        // A DELEGATED controller is not the same as an ENFORCEABLE knob. On an Arduino UNO Q's Android
+        // kernel `cgroup.controllers` lists `cpu`, yet no `cpu.max` exists anywhere in the chain: the
+        // controller is there with only its *weight* interface, so `--cpus` is a share, not a ceiling.
+        // Memory is now write-probed; cpu keeps its own bandwidth-interface check so this row never
+        // tells a comfortable lie about a knob it did not look at.
+        MemoryCapState::Enforced => {
+            if cpu_bandwidth_interface_present() {
+                R::Ok(
+                    "cgroup v2 + systemd --user scope: resource caps enforced (`--memory` write-probed to bind)"
+                        .into(),
+                )
+            } else {
+                R::Warn(
+                    "memory/pids caps are enforced, but this kernel's `cpu` controller has no bandwidth interface (`cpu.max`) - `--cpus` is a SHARE here, not a ceiling".into(),
+                    "needs CONFIG_CFS_BANDWIDTH=y; memory and pids caps are unaffected".into(),
+                )
+            }
+        }
+        // Couldn't read `/proc/self/cgroup` to resolve the target - don't over- or under-claim.
+        MemoryCapState::Unknown => {
+            R::Ok("cgroup v2 + systemd --user scope: memory/pids/cpu caps where delegated".into())
+        }
+        // The write did not bind in the box's cap target. Name the user manager's delegated set so the
+        // fix (enable `memory` delegation) is actionable.
+        MemoryCapState::PresentNotDelegated | MemoryCapState::Absent => {
+            let have = delegated_controllers();
+            let listed = if have.is_empty() {
+                "none readable".to_string()
+            } else {
+                have.join(" ")
+            };
             R::Warn(
-                "memory/pids caps are enforced, but this kernel's `cpu` controller has no bandwidth interface (`cpu.max`) - `--cpus` is a SHARE here, not a ceiling".into(),
-                "needs CONFIG_CFS_BANDWIDTH=y; memory and pids caps are unaffected".into(),
+                format!(
+                    "systemd --user scope present but a `--memory` write does not bind in the box's cap target (user manager delegates: {listed}) - `--memory` won't be enforced (`--cpus`/`--pids-limit` may still work)"
+                ),
+                "enable it: /etc/systemd/system/user@.service.d/delegate.conf → [Service] Delegate=memory pids cpu cpuset, then reboot (common on Raspberry Pi OS)".into(),
             )
         }
-    } else {
-        R::Warn(
-            format!(
-                "systemd --user scope present but the `memory` controller isn't delegated (only: {}) - `--memory` won't be enforced (`--cpus`/`--pids-limit` may still work)",
-                ctrls.join(" ")
-            ),
-            "enable it: /etc/systemd/system/user@.service.d/delegate.conf → [Service] Delegate=memory pids cpu cpuset, then reboot (common on Raspberry Pi OS)".into(),
-        )
     }
 }
 

@@ -35,6 +35,12 @@ jobs:
           python3 scripts/no-ai-slop.py
           python3 scripts/stale-numbers.py
           python3 scripts/test-count.py
+          # Diff-gate the seccomp allowlist: the allow set is DERIVED from the pinned moby profile, a
+          # source we do not control, so a profile bump could pull a new syscall into it silently. This
+          # fails if seccomp/allow-names.txt drifts from `moby_allow ∖ kern_denied`, naming the syscall
+          # that would enter. Name level needs no compiler; the x86_64 number level runs when gcc is
+          # present (aarch64 is skipped here for lack of the cross-toolchain).
+          python3 scripts/gen-seccomp-allowlist.py --check
 
   audit:
     name: cargo-audit + cargo-deny

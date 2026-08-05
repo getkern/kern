@@ -1198,8 +1198,10 @@ fn process_layer(
         // (022) and drops world-write + sticky, so a workload that drops to a non-root uid can't write
         // `/tmp` (e.g. mariadb InnoDB temp files fail EACCES). Docker/podman extract with `-p` for the same
         // reason. `--no-same-owner` still maps ownership to the extracting user (we don't want the image's
-        // raw uids on the host); the tar vetter already rejected setuid/device nodes, so preserving modes is
-        // safe (a setuid bit on a rootfs file is inert anyway - the box root mount is MS_NOSUID).
+        // raw uids on the host). `filter_layer` above already DROPPED every device node and STRIPPED the
+        // setuid/setgid bit off every file (see `clear_suid_sgid`), so the modes tar restores here are only
+        // the benign set - and a setuid bit would be doubly inert regardless (the box root mount is
+        // MS_NOSUID and rootless extraction owns every file as the caller, never root).
         // Extract with the codec detected above. gzip → tar's own `-z`; plain → no decompressor (`-xf`);
         // zstd → pipe `zstd -dc` into `tar -xf -` rather than relying on `tar --zstd`, which BusyBox/musl
         // edge builds often lack even when a standalone `zstd` is present. `--no-same-owner`
@@ -1711,8 +1713,50 @@ fn read_raw_blocks(r: &mut impl std::io::Read, size: u64) -> Result<Vec<u8>, Oci
     Ok(out)
 }
 
-/// Re-emit `r` (a decompressed tar) to `w`, DROPPING every char/block device member (`3`/`4`) and
-/// copying every other member VERBATIM. The output is then re-vetted by [`check_layer_safe`] and only
+/// Clear the setuid/setgid bits (`0o6000`) from a regular-file tar header IN PLACE, recomputing the
+/// header checksum so `tar` still accepts the block. A setuid/setgid bit on an image file is a
+/// privilege lever ONLY if the file is later executed where its owner is privileged; in kern it is not:
+/// the box root mount is `MS_NOSUID` (see `real.rs`) and rootless extraction owns every file as the
+/// unprivileged caller (`--no-same-owner`), so the bit is already inert on both paths. Stripping it at
+/// the source makes the on-disk rootfs safe-by-construction even OUTSIDE those two defenses - a `--dest`
+/// tree bind-mounted elsewhere, or a `pull` run as real root and then executed on the host. This mirrors
+/// the device drop and FIFO refusal in this same pass: an image artifact a sandbox never needs is
+/// neutralised here, not trusted to a downstream mount flag. A header whose mode field does not parse as
+/// a plain octal number is left byte-identical (nothing to strip we can reason about); the sticky bit
+/// (`0o1000`, world-writable `/tmp`) is preserved - only `0o6000` is cleared.
+fn clear_suid_sgid(header: &mut [u8; TAR_BLOCK]) {
+    // A base-256 (high-bit) mode field is not something any writer emits for a 12-bit permission word;
+    // treat it as "don't touch" rather than reason about it. `tar_num` also accepts base-256, so gate on
+    // the raw first byte to be certain we only rewrite a plain octal field.
+    if header[100] & 0x80 != 0 {
+        return;
+    }
+    let Some(mode) = tar_num(&header[100..108]) else {
+        return;
+    };
+    if mode & 0o6000 == 0 {
+        return; // no setuid/setgid bit - leave the block byte-identical (no checksum churn)
+    }
+    let stripped = mode & !0o6000;
+    // Canonical numeric field: 7 octal digits + NUL (what GNU tar writes and every mainstream reader
+    // accepts). `stripped` is <= 0o7777, so it always fits in 7 digits.
+    let m = format!("{stripped:07o}");
+    header[100..107].copy_from_slice(m.as_bytes());
+    header[107] = 0;
+    // Recompute the checksum: the chksum field (148..156) counts as 8 spaces while summing, then holds
+    // `<6 octal digits>\0<space>`. Every other byte is unchanged, so re-summing the whole block is both
+    // correct and self-contained. The sum of 512 bytes (<= 512*255) never exceeds 6 octal digits.
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|&b| b as u32).sum();
+    let chk = format!("{sum:06o}");
+    header[148..154].copy_from_slice(chk.as_bytes());
+    header[154] = 0;
+    header[155] = b' ';
+}
+
+/// Re-emit `r` (a decompressed tar) to `w`, DROPPING every char/block device member (`3`/`4`), STRIPPING
+/// the setuid/setgid bit off every regular file (see [`clear_suid_sgid`]), and copying the rest of every
+/// member VERBATIM. The output is then re-vetted by [`check_layer_safe`] and only
 /// then extracted, so this pass carries NO security guarantee of its own: a slip that leaves a device
 /// in is caught (the re-vet refuses `3`/`4`), and a slip that corrupts the stream fails the re-vet or
 /// `tar`. Its ONLY jobs are (1) drop device members so a legitimate image that ships an inert device
@@ -1805,6 +1849,15 @@ pub(crate) fn strip_device_members(
                 if !pending.is_empty() {
                     wr(w, &pending)?;
                     pending.clear();
+                }
+                // Strip setuid/setgid from image FILES (regular members only - setgid on a directory is
+                // legitimate group-inheritance, not a privilege lever). The bit is already inert in a box
+                // (root mount is `MS_NOSUID`) and on a rootless `--dest` tree (files owned by the
+                // unprivileged extractor), so this changes nothing there; it hardens the one path those
+                // two defenses don't cover - a tree used OUTSIDE a box, or a `pull` run as real root -
+                // making the artifact safe-by-construction. Same stance as the device drop above.
+                if matches!(typeflag, b'0' | 0 | b'7') {
+                    clear_suid_sgid(&mut header);
                 }
                 wr(w, &header)?;
                 pipe_data(r, size, w)?;
@@ -3122,6 +3175,89 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SECURITY: the layer re-emit pass MUST strip the setuid/setgid bit off a regular file. In a box
+    /// the bit is inert (root mount is `MS_NOSUID`) and rootless extraction owns the file, but a `--dest`
+    /// tree used OUTSIDE a box, or a `pull` run as real root, must be safe by construction. A benign file
+    /// passes through untouched, and the rewritten header keeps a VALID checksum so `tar` still accepts
+    /// it - this is a hand-built tar (no external `tar`, fully deterministic).
+    #[test]
+    fn strip_clears_setuid_and_keeps_a_valid_checksum() {
+        // Minimal USTAR block for a regular file with the given name/mode/data, correct checksum.
+        fn member(name: &str, mode: u32, data: &[u8]) -> Vec<u8> {
+            let mut h = [0u8; 512];
+            h[..name.len()].copy_from_slice(name.as_bytes());
+            h[100..107].copy_from_slice(format!("{mode:07o}").as_bytes()); // mode: 7 octal + NUL
+            h[124..135].copy_from_slice(format!("{:011o}", data.len()).as_bytes()); // size
+            h[156] = b'0'; // regular file
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            h[148..156].fill(b' ');
+            let sum: u32 = h.iter().map(|&b| b as u32).sum();
+            h[148..154].copy_from_slice(format!("{sum:06o}").as_bytes());
+            h[154] = 0;
+            h[155] = b' ';
+            let mut out = h.to_vec();
+            out.extend_from_slice(data);
+            let rem = data.len() % 512;
+            if rem != 0 {
+                out.extend(std::iter::repeat_n(0u8, 512 - rem));
+            }
+            out
+        }
+        // A 512-byte header's stored checksum equals the value recomputed over the block.
+        fn checksum_ok(block: &[u8]) -> bool {
+            let Some(stored) = tar_num(&block[148..156]) else {
+                return false;
+            };
+            let mut b = [0u8; 512];
+            b.copy_from_slice(&block[..512]);
+            b[148..156].fill(b' ');
+            let sum: u64 = b.iter().map(|&x| x as u64).sum();
+            stored == sum
+        }
+
+        let mut input = Vec::new();
+        input.extend(member("suid", 0o4755, b"x")); // setuid regular file -> must become 0755
+        input.extend(member("plain", 0o0644, b"yy")); // benign -> must pass byte-identical
+        input.extend([0u8; 1024]); // end-of-archive
+
+        let mut out = Vec::new();
+        strip_device_members(&mut &input[..], &mut out).expect("re-emit must succeed");
+
+        let mode0 = tar_num(&out[100..108]).expect("mode field parses");
+        assert_eq!(
+            mode0 & 0o7777,
+            0o0755,
+            "setuid bit must be stripped (4755 -> 0755)"
+        );
+        assert!(
+            checksum_ok(&out[..512]),
+            "rewritten header must carry a valid tar checksum, or `tar` rejects the block"
+        );
+
+        // Second member starts after the first member's header(512)+data-block(512).
+        let second = &out[1024..1536];
+        let mode1 = tar_num(&second[100..108]).expect("mode field parses");
+        assert_eq!(
+            mode1 & 0o7777,
+            0o0644,
+            "a benign file's mode must be untouched"
+        );
+        assert!(
+            checksum_ok(second),
+            "the benign header must keep its original valid checksum"
+        );
+
+        // The whole stripped stream must still pass the vetter (a valid, safe tar).
+        let tmp = std::env::temp_dir().join(format!("kern-strip-{}.tar", std::process::id()));
+        std::fs::write(&tmp, &out).unwrap();
+        assert!(
+            check_layer_safe(&tmp, Compression::Plain).is_ok(),
+            "the stripped tar must re-vet clean"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// SECURITY: merging a layer must never write THROUGH a symlink an earlier layer planted in

@@ -1558,13 +1558,22 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // `--pids-limit N`: cap the box's task count (`pids.max`) - fork-bomb containment.
                 "--pids-limit" => {
                     i += 1;
+                    // Floor of 2, not 1: the box needs one slot for its own PID 1 and at least one more
+                    // for the workload it execs. Measured, `--pids-limit 1` fails the box's setup fork
+                    // with EAGAIN and surfaces only a generic "fork failed" that never names the cap.
+                    // Reject it here, by name, before the fork. Fork-bomb containment starts at 2.
                     match rest
                         .get(i)
                         .and_then(|v| v.parse::<u64>().ok())
-                        .filter(|n| *n >= 1)
+                        .filter(|n| *n >= 2)
                     {
                         Some(n) => pids_limit = Some(n),
-                        None => return Err(Error::Usage("--pids-limit <N> (>= 1, e.g. 256)")),
+                        None => {
+                            return Err(Error::Usage(
+                                "--pids-limit <N> (>= 2: the box needs a process slot for its own PID 1 \
+                                 plus the workload; 1 cannot start the box, e.g. use 256)",
+                            ))
+                        }
                     }
                 }
                 // `--ulimit NAME=SOFT[:HARD]`: a POSIX resource limit, Docker's spelling. Resolved

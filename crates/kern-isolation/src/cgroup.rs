@@ -93,11 +93,24 @@ pub fn systemd_scope_mode() -> &'static str {
 }
 
 /// Is the systemd manager kern would use actually present? As root → the SYSTEM manager (`/run/systemd/
-/// system`, i.e. pid-1 systemd on a systemd host). Rootless → a `systemd` dir under `$XDG_RUNTIME_DIR`.
-/// The SINGLE definition - both the scope-skip decision and the fail-closed gate call it, no drift.
+/// system`, i.e. pid-1 systemd on a systemd host). Rootless → a `systemd` dir under the user's runtime
+/// dir. The SINGLE definition - both the scope-skip decision and the fail-closed gate call it, no drift.
+///
+/// MEASURED at two locations, not derived from one env var: the standard `/run/user/<uid>/systemd`
+/// (built from `getuid`, so it is found even when `XDG_RUNTIME_DIR` is unset or points at a scratch
+/// subdir - the exact misconfiguration that once made kern miss a running systemd and silently fall to
+/// the best-effort cap path), AND the `$XDG_RUNTIME_DIR/systemd` the env names (so a container or a host
+/// whose runtime dir is legitimately NOT `/run/user/<uid>` still resolves). Either marker present means
+/// the manager is there; neither means best-effort, which the caller now warns about rather than
+/// enforcing nothing in silence.
 pub fn user_systemd_present() -> bool {
     if as_root() {
         return std::path::Path::new("/run/systemd/system").exists();
+    }
+    // SAFETY: `getuid` is always successful and takes no arguments.
+    let uid = unsafe { libc::getuid() };
+    if std::path::PathBuf::from(format!("/run/user/{uid}/systemd")).exists() {
+        return true;
     }
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(|d| std::path::Path::new(&d).join("systemd").exists())
@@ -182,6 +195,112 @@ pub fn took_direct_cap_path() -> bool {
 /// these kernels for Docker/Podman; it's the environment, not the runtime.
 pub fn memory_cap_enforceable() -> bool {
     current_v2_cgroup().is_some_and(|c| controller_available_in_tree(&c, "memory"))
+}
+
+/// What actually happens when kern tries to enforce a `--memory` cap from this cgroup.
+///
+/// `memory_cap_enforceable()` above answers a WEAKER question - "is the controller listed in
+/// `cgroup.controllers` somewhere up the tree" - and collapses three distinguishable states into one
+/// bool. That is why `kern doctor` and the box notice could report "enforced" on a host where the
+/// `memory.max` write silently does not bind: a process running as root INSIDE a container whose
+/// cgroup lists `memory` in `cgroup.controllers` but does not delegate it to children (`memory`
+/// absent from `cgroup.subtree_control`). The presence check is true there; the write is inert.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemoryCapState {
+    /// A write to a freshly-created child's `memory.max` stuck and read back unchanged: a real
+    /// `--memory` cap WILL bind here.
+    Enforced,
+    /// The `memory` controller is in this tree but not delegated to a child kern can create, so a
+    /// `memory.max` write is accepted and never bites. `--memory` is silently ineffective.
+    PresentNotDelegated,
+    /// The `memory` controller is not in this cgroup's tree at all (a stock Raspberry Pi without
+    /// `cgroup_enable=memory`, Microsoft's default WSL2 kernel).
+    Absent,
+    /// Could not be determined: no cgroup v2, or `/proc/self/cgroup` was unreadable.
+    Unknown,
+}
+
+/// Probe, by a real write, whether a `--memory` cap will actually bind for a box on this host - and
+/// probe it WHERE THE BOX WILL CAP, not where this process runs.
+///
+/// A box applies `--memory` in kern's delegated slice when one is available (root's directly-created
+/// `kern.slice`, or a rootless user-systemd delegated slice), otherwise a best-effort child of the
+/// current cgroup. This resolves that SAME target via [`ensure_kern_slice`] - the identical choice
+/// `choose_direct_cap_path` makes for a real box - then creates an empty throwaway child cgroup
+/// there, writes its `memory.max`, reads it back, and removes the child. Unlike
+/// [`memory_cap_enforceable`] (a `cgroup.controllers` presence read), it performs the exact operation
+/// `apply_limits` performs in the exact place, so it cannot report success where the write will not
+/// bind. This replaces a former root-only ASSUMPTION (promoting `PresentNotDelegated` to `Enforced`
+/// by fiat) with a MEASUREMENT: root's delegated `kern.slice` now reads back the write it accepts, and
+/// a root host where the slice cannot be made reports the honest state instead of a promoted one.
+///
+/// SIDE EFFECTS: resolving the target is exactly what a box start does - it may create the persistent
+/// `kern.slice` (root: a `mkdir` + an additive `subtree_control` write on the v2 root; rootless: a
+/// one-time `systemd-run --user` that exits immediately). Then exactly one `mkdir` + `rmdir` of a
+/// `kern-capprobe-<pid>` child and one write to that child's OWN `memory.max`; the child holds no
+/// processes, so nothing is throttled, and it is removed on every return path. It never writes an
+/// existing box's or sibling's limit files.
+///
+/// NOT for the box-start hot path (a box ensures the slice itself). Its one caller, doctor, invokes it
+/// at most once; do not place it in a per-box-start or per-syscall loop.
+pub fn memory_cap_state() -> MemoryCapState {
+    let Some(target) = ensure_kern_slice().or_else(current_v2_cgroup) else {
+        return MemoryCapState::Unknown;
+    };
+    memory_cap_state_at(&target)
+}
+
+/// Testable core of [`memory_cap_state`]: the probe against an explicit cgroup directory, split out
+/// for the same reason `config::load_impl` is - a unit test can drive it against a synthetic tree
+/// without reading (or mutating) the real `/proc/self/cgroup`.
+fn memory_cap_state_at(cur: &std::path::Path) -> MemoryCapState {
+    let child = cur.join(format!("kern-capprobe-{}", unsafe { libc::getpid() }));
+    // Create the throwaway child. `AlreadyExists` is a leftover from a crashed probe: remove and
+    // retry once. Any other creation error means child cgroups cannot be created here at all, which
+    // is the not-delegated signal, refined below by whether the controller is even present.
+    match fs::create_dir(&child) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_dir(&child);
+            if fs::create_dir(&child).is_err() {
+                return classify_absent_or_not_delegated(cur);
+            }
+        }
+        Err(_) => return classify_absent_or_not_delegated(cur),
+    }
+    // From here the child EXISTS and must be removed on every path below.
+    let max = child.join("memory.max");
+    // cgroup v2 creates a controller's interface files in a child only when that controller is in the
+    // parent's `subtree_control`. No `memory.max` file therefore means `memory` is not delegated here.
+    if !max.exists() {
+        let _ = fs::remove_dir(&child);
+        return classify_absent_or_not_delegated(cur);
+    }
+    // Write a small, unmistakable, non-`max` value to the EMPTY child and read it back. Any value is
+    // safe: the cgroup holds no processes, so nothing is throttled or OOM-killed.
+    // The same write-then-verify primitive `apply_limits` uses for a real box's `memory.max`: a fresh
+    // child starts at the `max` sentinel, so "reads back a real (non-`max`) limit" is equivalent to the
+    // exact-value check here, and there is one definition of "the write bound" instead of two.
+    const PROBE_BYTES: &str = "1048576"; // 1 MiB
+    let stuck = wrote_real_limit(&max, PROBE_BYTES);
+    let _ = fs::remove_dir(&child);
+    if stuck {
+        MemoryCapState::Enforced
+    } else {
+        // The interface file existed (controller delegated) but the write did not read back. Report
+        // "not effectively enforceable" rather than claim a success the box would not get.
+        MemoryCapState::PresentNotDelegated
+    }
+}
+
+/// Distinguish "the `memory` controller is absent from this tree" from "present but not delegated to
+/// a child we can create". Reached when a child could not be created or has no `memory.max`.
+fn classify_absent_or_not_delegated(cur: &std::path::Path) -> MemoryCapState {
+    if controller_available_in_tree(cur, "memory") {
+        MemoryCapState::PresentNotDelegated
+    } else {
+        MemoryCapState::Absent
+    }
 }
 
 /// Does an env var CLAIM an outer enforcer while NO real memory cap is actually in force up-tree?
@@ -385,9 +504,29 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
             .and_then(|p| p.parse::<u32>().ok())
             .is_some_and(|pid| !PathBuf::from(format!("/proc/{pid}")).exists());
         if dead {
-            let _ = fs::remove_dir(e.path());
+            // The supervisor `<pid>` is gone. A detached box whose supervisor was SIGKILL'd/OOM-killed
+            // ran no cleanup, and its PID-ns init carries no launcher PDEATHSIG, so the whole tree
+            // (init + workload + any grandchild it forked) can still be ALIVE. `remove_dir` alone fails
+            // on that non-empty cgroup and the tree LEAKS. `cgroup.kill` SIGKILLs every member at once,
+            // then the (now-emptying) dir is `rmdir`'d - a straggler zombie's dir falls to the next
+            // sweep once the kernel reaps it. No pid-reuse hazard: a reused `<pid>` makes `/proc/<pid>`
+            // exist, so `dead` is false and the box is skipped, never killed.
+            let path = e.path();
+            let _ = kill_cgroup(&path);
+            let _ = fs::remove_dir(&path);
         }
     }
+}
+
+/// SIGKILL every process in the cgroup at `dir`, atomically, via cgroup-v2 `cgroup.kill` (kernel
+/// 5.14+): one write of `"1"` and the kernel enumerates and kills the whole subtree under its own
+/// lock. Strictly more thorough than signalling a tracked pid - it reaches grandchildren the workload
+/// forked AND any process not in the box's PID namespace (a forwarder, an egress helper) - and has no
+/// pid-reuse race. Best-effort: on a pre-5.14 kernel the file is absent, `fs::write` fails, and this
+/// returns false so the caller falls back to its `rmdir` (which is inert on a still-populated cgroup).
+/// Returns whether the kill file was written. Used only to reap a box whose supervisor is already dead.
+fn kill_cgroup(dir: &std::path::Path) -> bool {
+    fs::write(dir.join("cgroup.kill"), "1").is_ok()
 }
 
 /// The per-box-start orphan-sweep cap - bounds the hot-path cost; the tail is cleaned by later starts / gc.
@@ -733,6 +872,17 @@ pub fn apply_limits(
         child.join("memory.swap.max"),
         memory_swap_max.map_or_else(|| "0".to_string(), |b| b.to_string()),
     );
+    // `memory.oom.group = 1`: when THIS cgroup hits its memory limit, the kernel kills EVERY process in
+    // it as one unit, not just the single highest-`oom_score` task. Without it an OOM can kill a child
+    // while PID 1 survives, leaving the box half-dead but still reading `running` (the orphan detector
+    // does NOT catch this - the supervisor is alive and the cgroup is populated). Set on EVERY box (the
+    // DEFAULT_MEMORY_MAX applies even without `--memory`), written BEFORE the workload joins the cgroup
+    // below so an early OOM already kills the whole group. Best-effort and SILENT on failure: the file
+    // exists only when the `memory` controller is delegated - exactly the case the "--memory not
+    // enforced" warning below already reports, so a second message here would be noise, and kern makes
+    // no doc promise of atomic OOM termination that a warning would need to defend. Available since
+    // Linux 4.19 (all supported hosts: the oldest board is 5.15).
+    let _ = fs::write(child.join("memory.oom.group"), "1");
     if !pids_ok && !mem_ok {
         let _ = fs::remove_dir(&child);
         return None;
@@ -795,11 +945,18 @@ pub fn apply_limits(
     // check the EFFECTIVE limit up the tree, and only warn when NOTHING in the chain enforces a knob
     // the user explicitly asked for (e.g. a rootless host with the memory controller un-delegated, the
     // Pi-5 case). This never false-positives on a host where the scope enforces it.
-    if memory_max.is_some() && !capped_in_tree(&child, "memory.max") {
-        eprintln!(
-            "kern: --memory not enforced - no cgroup memory cap took effect (the `memory` controller \
-             isn't delegated to this rootless scope); the box can exceed the limit"
-        );
+    // Value-aware, not existence-aware: an ancestor's `memory.max` bounds the box, but if it sits
+    // ABOVE the requested value the request did not take effect (the box can use up to that ancestor
+    // cap, not the smaller number it asked for). `capped_in_tree` read any finite ancestor cap as
+    // "enforced" and stayed silent on a box asking 8m under a container's 8 GiB outer cap.
+    if let Some(req) = memory_max {
+        if !memory_capped_at_or_below(&child, req) {
+            eprintln!(
+                "kern: --memory not enforced - no cgroup memory cap took effect at or below the \
+                 requested value (the `memory` controller isn't delegated to this rootless scope, or \
+                 only a larger ancestor cap applies); the box can exceed the limit"
+            );
+        }
     }
     if cpus.is_some() && !capped_in_tree(&child, "cpu.max") {
         eprintln!(
@@ -902,57 +1059,53 @@ pub fn warn_unenforced_caps(memory: Option<u64>, cpus: Option<f64>, pids: Option
         return;
     };
     let dir = std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-    // `walk_up` says whether an ANCESTOR may satisfy the check. It is true for memory and cpu,
-    // because those are genuine ceilings wherever in the chain they sit: a parent `memory.max` does
-    // bound this box. It is FALSE for pids, and that difference is the whole point of this being a
-    // tuple field rather than one rule for all three.
-    //
-    // Measured on a Raspberry Pi 5, `--pids-limit 999999999`, walking up from the box's own cgroup:
-    //
-    //   run-r853…scope       pids.max=max      <- the box itself: NO limit
-    //   app.slice            pids.max=max
-    //   user@1000.service    pids.max=max
-    //   user-1000.slice      pids.max=20370    <- finite, and SESSION-WIDE
-    //   user.slice           pids.max=max
-    //
-    // The walk found 20370 and stayed quiet, so the box ran with no fork-bomb guard and nothing said
-    // so. But 20370 is systemd's `TasksMax` for the whole user, shared with every other process they
-    // run: it is not a per-box limit and it does not become one by being finite. The caller asked to
-    // bound THIS box. The same trap is already written down at the fail-closed block in
-    // `apply_caps`, which is why that one keys on the box's own read-back; the rule was applied in
-    // one place and not the other.
-    //
-    // Checking only the box's own level does not cost a false warning: on the same host, 64, 256 and
-    // 1000000 all landed in the box's own cgroup exactly, and only 999999999 did not.
-    for (asked, file, flag, walk_up, why) in [
+    // Each knob carries its OWN enforcement check, so the loop dispatches on the check, not on the
+    // file name. The three differ on purpose:
+    //   * memory - VALUE-aware (`AtOrBelow`): an ancestor `memory.max` larger than the request does not
+    //     satisfy `--memory 32m`. A finite-but-larger outer cap once masked a box that asked for less
+    //     than it got, so this compares against the request, not mere existence.
+    //   * cpu - an ancestor ceiling counts (`TreeExists`): a `cpu.max` anywhere up the chain bounds this
+    //     box wherever it sits.
+    //   * pids - the box's OWN level only (`HereExists`). Measured on a Raspberry Pi 5,
+    //     `--pids-limit 999999999`: the walk found `user-1000.slice pids.max=20370` and stayed quiet,
+    //     but 20370 is systemd's session-wide `TasksMax`, shared with every other process the user runs
+    //     - not a per-box fork-bomb guard. `apply_caps`'s fail-closed block keys on the box's own
+    //     read-back for the same reason; the rule was applied in one place and not the other. Checking
+    //     only the box's own level costs no false warning: 64/256/1000000 all landed in the box's cgroup
+    //     exactly, only 999999999 did not.
+    enum Check<'a> {
+        AtOrBelow(u64),
+        TreeExists(&'a str),
+        HereExists(&'a str),
+    }
+    for (asked, flag, check, why) in [
         (
             memory.is_some(),
-            "memory.max",
             "--memory",
-            true,
+            Check::AtOrBelow(memory.unwrap_or(0)), // req unused unless `asked` (memory.is_some())
             "the `memory` controller is not delegated to this cgroup",
         ),
         (
             cpus.is_some(),
-            "cpu.max",
             "--cpus",
-            true,
+            Check::TreeExists("cpu.max"),
             "this kernel's `cpu` controller exposes no bandwidth interface (`cpu.max`), only weights",
         ),
         (
             pids.is_some(),
-            "pids.max",
             "--pids-limit",
-            false,
+            Check::HereExists("pids.max"),
             "no per-box `pids.max` took effect (an ancestor's session-wide `TasksMax` is not a \
              per-box limit); the box has no fork-bomb guard",
         ),
     ] {
-        let capped = if walk_up {
-            capped_in_tree(&dir, file)
-        } else {
-            capped_here(&dir, file)
-        };
+        // `asked &&` short-circuits, so the file read only happens for a knob the caller actually set.
+        let capped = asked
+            && match check {
+                Check::AtOrBelow(req) => memory_capped_at_or_below(&dir, req),
+                Check::TreeExists(file) => capped_in_tree(&dir, file),
+                Check::HereExists(file) => capped_here(&dir, file),
+            };
         if asked && !capped {
             eprintln!("kern: {flag} accepted but NOT enforced here - {why}; the box can exceed it");
         }
@@ -975,6 +1128,28 @@ fn capped_here(dir: &std::path::Path, file: &str) -> bool {
 fn capped_in_tree(child: &std::path::Path, file: &str) -> bool {
     in_tree(child, |dir| {
         fs::read_to_string(dir.join(file)).is_ok_and(|v| is_real_limit(&v))
+    })
+}
+
+/// Is the box's REQUESTED `--memory` value actually in effect - i.e. does some level in the ancestry
+/// cap `memory.max` at or below `requested` bytes?
+///
+/// [`capped_in_tree`] answers the weaker "is there ANY finite `memory.max` up the tree", and that is
+/// what masked the requested cap: a box asking `--memory 8m` inside a container whose own cgroup caps
+/// at 8 GiB read "capped" (the container's outer 8 GiB is finite) and ran able to use 8 GiB, with no
+/// warning. The container bounds the box, but not at the value asked for. This compares against the
+/// request: a level capping at `requested` or tighter satisfies it (an ancestor capping BELOW the
+/// request is a stricter bound, so the box still cannot exceed what it asked for); a tree whose only
+/// finite cap is ABOVE the request does not. `max` (no cap) never parses to a number, so it is not a
+/// bound. Both enforcement paths land a cap at exactly `requested` - the systemd scope sets
+/// `MemoryMax=<requested>` and the direct path writes the inner `memory.max=<requested>` - so this
+/// does not false-warn on an enforcing host; it warns only when the request took effect nowhere.
+fn memory_capped_at_or_below(child: &std::path::Path, requested: u64) -> bool {
+    in_tree(child, |dir| {
+        fs::read_to_string(dir.join("memory.max"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .is_some_and(|v| v <= requested)
     })
 }
 
@@ -1003,6 +1178,197 @@ mod tests {
         assert!(
             controller_available_in_tree(&d, "memory"),
             "memory listed = the host can cap, even with no memory.max file here"
+        );
+    }
+
+    #[test]
+    fn kill_cgroup_writes_the_kill_file_and_never_panics() {
+        // Plumbing test (not the kernel's kill semantics, which need a real cgroupfs): `kill_cgroup`
+        // must write exactly `"1"` to `<dir>/cgroup.kill` - the payload cgroup-v2 expects - and must
+        // report a failed write (a pre-5.14 kernel where the file is absent, or an unwritable path) as
+        // `false` rather than panicking, so the orphan sweep degrades to its `rmdir` fallback.
+        let d = std::env::temp_dir().join(format!("kern-killcg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(
+            kill_cgroup(&d),
+            "writing cgroup.kill under a writable dir must succeed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("cgroup.kill"))
+                .unwrap()
+                .trim(),
+            "1",
+            "kill_cgroup must write the payload the kernel expects"
+        );
+        assert!(
+            !kill_cgroup(std::path::Path::new("/proc/kern-nonexistent-dir/x")),
+            "a write to an unwritable location must return false, not panic"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sweep_reaps_only_dead_supervisor_dirs_and_kills_their_cgroup() {
+        // `sweep_orphan_boxes` self-heals the one leak the RAII guard cannot cover: a DETACHED box whose
+        // supervisor is SIGKILL'd runs no Drop, so its cgroup - init + workload + any grandchild it forked
+        // - can survive. The sweep must (1) issue `cgroup.kill` on a `kern-box-<tag>-<pid>` whose <pid> is
+        // DEAD, so the whole subtree dies at once (a bare rmdir would leak the grandchildren); (2) NEVER
+        // touch a box whose <pid> is ALIVE (a reused pid must not be killed); (3) ignore a non-box dir.
+        // Fully deterministic - NO real cgroupfs and NO process killing: on a plain temp dir `kill_cgroup`
+        // writes a regular `cgroup.kill` file, whose presence and "1" payload prove the sweep classified
+        // the dir as an orphan and issued the kill. (On real cgroupfs that write empties the cgroup and the
+        // following `remove_dir` succeeds; here the dir persists because our file makes it non-empty, which
+        // is orthogonal to the property under test.)
+        let slice = std::env::temp_dir().join(format!("kern-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&slice);
+        std::fs::create_dir_all(&slice).unwrap();
+
+        // A pid provably NOT live right now: walk DOWN from a high value and VERIFY /proc absence rather
+        // than assume it (pid_max varies across kernels; a pid above it can never exist).
+        let dead_pid = (2u32..2_000_000)
+            .rev()
+            .find(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
+            .unwrap_or(u32::MAX);
+        let live_pid = std::process::id(); // this test process: /proc/<pid> exists, so it is ALIVE
+
+        let dead = slice.join(format!("kern-box-my-app-{dead_pid}")); // tag with '-' exercises rsplit
+        let live = slice.join(format!("kern-box-web-{live_pid}"));
+        let other = slice.join("some-unrelated-dir");
+        for d in [&dead, &live, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        sweep_orphan_boxes(&slice, 0); // 0 = unbounded, examine every entry
+
+        // (1) dead supervisor -> cgroup killed, payload "1".
+        let killed = dead.join("cgroup.kill");
+        assert!(
+            killed.is_file(),
+            "a dead-supervisor box must have its cgroup killed (reaches grandchildren a bare rmdir leaks)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&killed).unwrap().trim(),
+            "1",
+            "cgroup.kill must carry the payload cgroup-v2 expects"
+        );
+        // (2) live supervisor -> never touched (pid-reuse safety).
+        assert!(
+            !live.join("cgroup.kill").exists(),
+            "a box whose pid is ALIVE must be skipped - never kill a reused pid"
+        );
+        assert!(
+            live.is_dir(),
+            "a live box's cgroup dir must survive the sweep"
+        );
+        // (3) non-box dir -> ignored entirely.
+        assert!(
+            !other.join("cgroup.kill").exists(),
+            "a dir that is not `kern-box-*` must be ignored"
+        );
+        assert!(other.is_dir());
+
+        let _ = std::fs::remove_dir_all(&slice);
+    }
+
+    #[test]
+    fn capprobe_classifies_absent_vs_present_not_delegated() {
+        // The reach-here-when-no-child-or-no-memory.max classifier. `memory` listed in the tree =>
+        // present-but-not-delegated (a `memory.max` write would be accepted and inert); absent from
+        // the list => the controller is not in the tree at all.
+        let d = std::env::temp_dir().join(format!("kern-capcls-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup.controllers"), "cpu pids\n").unwrap();
+        assert_eq!(
+            classify_absent_or_not_delegated(&d),
+            MemoryCapState::Absent,
+            "no memory in cgroup.controllers must classify Absent"
+        );
+        std::fs::write(d.join("cgroup.controllers"), "cpuset cpu io memory pids\n").unwrap();
+        assert_eq!(
+            classify_absent_or_not_delegated(&d),
+            MemoryCapState::PresentNotDelegated,
+            "memory listed but no delegation must classify PresentNotDelegated, not a false Enforced"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn capprobe_at_a_synthetic_tree_leaves_no_child_behind() {
+        // A plain tmpfs dir is not a cgroupfs, so a created child never gets a `memory.max` file:
+        // the probe must fall through to the classifier AND remove the throwaway child it made. This
+        // pins the no-leak invariant on the create-succeeds-but-not-delegated path without needing a
+        // real delegated cgroup (the Enforced path, exercised on a delegating host / WSL2 in doctor).
+        let d = std::env::temp_dir().join(format!("kern-capleaf-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup.controllers"), "cpuset cpu io memory pids\n").unwrap();
+        let state = memory_cap_state_at(&d);
+        assert_eq!(
+            state,
+            MemoryCapState::PresentNotDelegated,
+            "a tmpfs child has no memory.max, so the probe must report PresentNotDelegated here"
+        );
+        // The child the probe created must be gone: nothing named `kern-capprobe-*` may remain.
+        let leaked: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("kern-capprobe-")
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the probe leaked a child cgroup dir: {:?}",
+            leaked.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn capprobe_on_the_real_host_is_deterministic_and_leaks_nothing() {
+        // The full probe against the process's real cgroup. Host-agnostic assertions: it must not
+        // leave a `kern-capprobe-*` cgroup behind, and two back-to-back calls must agree (the host's
+        // delegation does not change between them). SKIP-graceful: if the current cgroup dir cannot
+        // be listed (a locked-down CI sandbox), there is nothing to check, so return rather than fail.
+        let Some(cur) = current_v2_cgroup() else {
+            eprintln!("skip: no cgroup v2 to probe");
+            return;
+        };
+        let Ok(rd) = std::fs::read_dir(&cur) else {
+            eprintln!("skip: current cgroup dir not listable here");
+            return;
+        };
+        let before = rd
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("kern-capprobe-")
+            })
+            .count();
+        let a = memory_cap_state();
+        let b = memory_cap_state();
+        let after = std::fs::read_dir(&cur)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("kern-capprobe-")
+                    })
+                    .count()
+            })
+            .unwrap_or(before);
+        assert_eq!(
+            before,
+            after,
+            "the probe leaked a kern-capprobe cgroup under {}",
+            cur.display()
+        );
+        assert_eq!(
+            a, b,
+            "the probe returned two different states for one unchanged host"
         );
     }
 
@@ -1105,6 +1471,52 @@ mod tests {
         assert!(
             !capped_in_tree(&d, "does-not-exist"),
             "absent file = not capped"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn memory_cap_is_checked_against_the_requested_value_not_mere_existence() {
+        // The #1 fix. A temp dir is not under /sys/fs/cgroup, so `in_tree` evaluates only this leaf,
+        // which is exactly where the value logic lives. `capped_in_tree` (existence) would call every
+        // finite number here "capped"; `memory_capped_at_or_below` compares against the request.
+        let d = std::env::temp_dir().join(format!("kern-memreq-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let req: u64 = 8 * 1024 * 1024; // the box asked for 8 MiB
+        let set = |v: &str| std::fs::write(d.join("memory.max"), v).unwrap();
+
+        // The masking case: a cap ABOVE the request (a container's 8 GiB outer limit). Existence says
+        // "capped"; the request took no effect, so this must be false.
+        set("8589934592"); // 8 GiB
+        assert!(
+            capped_in_tree(&d, "memory.max"),
+            "existence check calls the 8 GiB ancestor 'capped' - the masking that hid the bug"
+        );
+        assert!(
+            !memory_capped_at_or_below(&d, req),
+            "a cap of 8 GiB does not enforce a request of 8 MiB: the box can exceed what it asked for"
+        );
+
+        // A cap exactly AT the request (the enforcing path: scope MemoryMax=req, or inner memory.max
+        // =req) satisfies it - this is why an enforcing systemd host does not false-warn.
+        set(&req.to_string());
+        assert!(
+            memory_capped_at_or_below(&d, req),
+            "a cap equal to the request is in effect"
+        );
+
+        // A cap BELOW the request is a stricter bound; the box still cannot exceed what it asked for.
+        set(&(req / 2).to_string());
+        assert!(
+            memory_capped_at_or_below(&d, req),
+            "an ancestor capping tighter than the request still satisfies it"
+        );
+
+        // The no-cap sentinel is never a bound.
+        set("max");
+        assert!(
+            !memory_capped_at_or_below(&d, req),
+            "`max` (uncapped) does not satisfy any request"
         );
         let _ = std::fs::remove_dir_all(&d);
     }

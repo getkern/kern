@@ -3,14 +3,50 @@
 What kern does not do yet, or does not know. Each entry says what it costs you and what would
 settle it. Resolved items live in [CHANGELOG.md](CHANGELOG.md), not here.
 
-## The seccomp filter is a denylist
+## The default seccomp filter is a denylist
 
-kern denies a named set of syscalls instead of allowing a named set. An allowlist is the stronger
-shape and is where this should end up; a wrong allowlist breaks working images silently, so the
-migration needs a corpus of real workloads to validate against first. Two of the rules match a
-syscall number, and a third reads `clone`'s flags out of the register they arrive in and refuses
-only the namespace-creating ones, since `clone` cannot be denied by number without taking `fork`
-with it. The filter is always on and cannot be turned off.
+kern's **default** filter denies a named set of syscalls instead of allowing a named set. The
+stronger allowlist shape exists now behind `KERN_SECCOMP=allowlist` (moby's default allow set minus
+kern's 34, deny-by-default with `ENOSYS`), but stays **off by default**: a wrong allowlist breaks
+working images silently, so flipping the default is gated on validating against a corpus of real
+workloads first. `KERN_SECCOMP=allowlist-audit` is the measurement for that gate - it runs the box
+under the allowlist's deny surface as `SECCOMP_RET_LOG` (log-and-run instead of `ENOSYS`), so
+`scripts/seccomp-audit.py` records exactly which syscalls a workload uses outside the allow set.
+
+The allowlist denies no syscall whose absence forces a fallback to a **less-safe** variant: every
+modern/hardened call moby allows - `openat2`, `faccessat2`, `statx`, `close_range`, `pidfd_open` and
+the rest - is in the allow set, so the one denied modern call, `clone3`, degrades only to `clone`,
+which the filter itself flag-checks (verified: no other safe/unsafe pair has the modern half denied).
+
+The filter matches by syscall number; its one exception reads `clone`'s flags out of the register
+they arrive in and refuses only the namespace-creating ones, since `clone` cannot be denied by number
+without taking `fork` with it. It is always on and cannot be turned off - the two opt-in values above
+make it STRICTER, never absent.
+
+## The default capability drop keeps some caps Docker drops
+
+kern drops 14 dangerous caps by default; Docker's default keeps a smaller set, so kern still keeps a
+few Docker drops - `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_MKNOD`. They are held only
+over the box's own user namespace, and the escape syscalls they would unlock (the mount API, `bpf`,
+`ptrace`) are seccomp-killed, so the marginal risk is small. The one clean tightening already taken is
+`CAP_SYS_PTRACE`: its syscalls were already killed, so dropping it costs nothing and closes a
+`/proc/<pid>/mem` read. Dropping the rest toward Docker's set is deferred, not because it is wrong but
+because it needs validation that it does not break a real workload - the `KERN_SECCOMP=allowlist-audit`
+harness plus a compose corpus is that validation, and it has to run first. `--cap-drop` already lets
+an operator take any of them today.
+
+## No custom per-box seccomp profile from a file
+
+Docker takes `--security-opt seccomp=<profile.json>`; kern does not. A box picks between the shipped
+denylist and the opt-in allowlist (`KERN_SECCOMP=allowlist`), not an arbitrary profile. This is a
+deliberate hold, not an oversight: an arbitrary OCI profile is a general parser (the full JSON:
+`defaultAction`, `defaultErrnoRet`, `archMap`, per-syscall `action` and per-argument `args` with
+`index`/`value`/`op`) plus a compiler from that to cBPF - which is what `libseccomp` exists to do,
+because it is hard and easy to get subtly wrong. A bug there does not crash, it silently permits a
+syscall the profile meant to deny. It earns its own validated effort - a pinned parser and an
+exhaustive `filter classifies every rule as intended` proof, the same bar the allowlist met - not a
+rushed add. Until then, `--cap-drop` narrows the capability set per box today, and
+`KERN_SECCOMP=allowlist` is the stricter posture; neither needs a hand-written profile.
 
 ## Whether a survivable denial helps an attacker is not known
 
@@ -79,11 +115,13 @@ with cgroup caps on, which is what users run, the same span went from 4.92 ms to
 
 ## Binary size is not being reduced
 
-Read from the checksum-verified v0.6.43 release artifacts: **1938400 B x86_64 (1.85 MB)** and
-**1642984 B aarch64 (1.57 MB)**. The release profile is already at its limit.
+Measured on the v0.6.50 build: **1950688 B x86_64 (1.86 MB)** and **1642984 B aarch64 (1.57 MB)**. The
+aarch64 figure is byte-identical to the checksum-verified 0.6.43 release artifact, so the build
+reproduces. The release profile is already at its limit.
 
-x86_64 grew 12288 B (12 KiB) from 0.6.38's 1926112, tracking the code added across the intervening
-releases. aarch64 has held at 1642984 across the last two, so the two arches move independently, as
+x86_64 grew 12288 B (12 KiB) from 0.6.43's 1938400, tracking the security hardening added since (the
+registry-forgery guard, the CapBnd-verify bounding drop, the AF_VSOCK socket rule). aarch64 has held at
+1642984 across the last several releases, so the two arches move independently, as
 they should: different target, different linker. The aarch64 figure had jumped one 64 KiB segment
 earlier from a change in the release build environment rather than the code, and a still-earlier
 version of this entry asserted the reverse of what was then measured, so no story is offered for the
