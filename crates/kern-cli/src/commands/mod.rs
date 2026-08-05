@@ -3765,6 +3765,28 @@ fn read_log_tail(path: &std::path::Path, max: usize) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+/// Read the box log's failure REASON, polling briefly for the asynchronous log pump to flush it.
+/// A detached box's stdout/stderr is drained by a separate pump process, so the supervisor's
+/// "kern: box failed to start: <reason>" line (printed to its pumped stderr AFTER the readiness
+/// failure byte is already on the wire) can lag the byte. A single read here races the pump and
+/// catches only the earlier lines - e.g. the benign "requested resource cap(s) could not be
+/// enforced" notice - leaving `await_box_started` to surface a warning instead of the cause. Poll
+/// up to ~1s for the supervisor's failure marker to land; fall back to whatever is there on timeout.
+/// Only ever called on the (rare) start-failure path, so the bounded wait never touches a good start.
+fn read_log_reason(path: &std::path::Path) -> Option<String> {
+    for _ in 0..50 {
+        let tail = read_log_tail(path, 1024);
+        if tail
+            .as_deref()
+            .is_some_and(|t| t.contains("box failed to start") || t.contains("user namespaces"))
+        {
+            return tail;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    read_log_tail(path, 1024)
+}
+
 /// Foreground-launcher side of a detached start: block on the readiness pipe until the box `exec`s
 /// (EOF = up) or signals failure (one byte → reap the supervisor and report why), then print the
 /// "started" line. With no pipe it just announces. Retries the read on `EINTR` so a stray signal
@@ -3800,7 +3822,7 @@ fn await_box_started(
             let reason = registry::logs_dir()
                 .ok()
                 .map(|d| d.join(format!("{n}-{child}.log")))
-                .and_then(|p| read_log_tail(&p, 1024));
+                .and_then(|p| read_log_reason(&p));
             return Err(Error::Sandbox(match reason {
                 Some(r) => format!(
                     "box '{n}' exited before starting:\n{r}\n(run `kern logs {n}` for the full log)"
