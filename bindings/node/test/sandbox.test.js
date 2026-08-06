@@ -42,7 +42,7 @@ test("version is exported", () => {
 });
 
 test("capabilities are dropped by default and the opt-out is explicit", () => {
-  // kern always drops 13 dangerous capabilities; the rest were held over the box's own user
+  // kern always drops 14 dangerous capabilities; the rest were held over the box's own user
   // namespace, on the one code path whose purpose is running code nobody has read. Measured before
   // this change: a box held CapEff 00000110bdacffff, and with the flag it holds 0000000000000000.
   const prev = process.env.KERN_BIN;

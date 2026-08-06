@@ -371,11 +371,13 @@ ps -o rss= -C dockerd -C containerd           # Docker resident, sum the KB
 
 ## Resource caps
 
-The `--image` path runs inside a transient `systemd-run --user --scope` with `MemoryMax=512M`,
-`MemorySwapMax=0`, `TasksMax=512`, verified enforced in the kernel cgroup: ~100 MB allocates fine,
-~700 MB is OOM-killed with no swap escape, a fork bomb is capped at 512 tasks. Without a systemd user
-manager, a best-effort cgroup v2 path applies where the hierarchy is delegated, else caps are skipped
-(documented in [SECURITY.md](SECURITY.md)).
+A box caps directly in kern's delegated `kern.slice` inside the systemd user-manager tree, else inside
+a transient `systemd-run --user --scope`, with `MemoryMax=512M`, `MemorySwapMax=0`, `TasksMax=512`,
+verified enforced in the kernel cgroup: ~100 MB allocates fine, ~700 MB is OOM-killed with no swap
+escape, a fork bomb is capped at 512 tasks. Without a systemd user manager, a best-effort cgroup v2
+path applies where the hierarchy is delegated, else caps are skipped (documented in
+[SECURITY.md](SECURITY.md)); `--require-limits` refuses to start rather than run uncapped there, and
+`--allow-uncapped` accepts it silently.
 
 ```sh
 kern box mem --image alpine --memory 512M -- sh -c 'tr -dc 0 </dev/zero | head -c 700M | wc -c'

@@ -66,6 +66,15 @@ pub enum Command {
         /// `--privileged`: relax the seccomp filter so a NESTED `kern box` (or docker-in-docker-style
         /// workload) can create its namespaces. Rootless-only; refused as real host root.
         privileged: bool,
+        /// `--require-limits`: refuse to start (non-zero exit) if a requested/default resource cap
+        /// cannot actually be enforced here, instead of running best-effort UNCAPPED with a warning.
+        require_limits: bool,
+        /// `--allow-uncapped`: explicitly accept running UNCAPPED on a host with no cgroup delegation,
+        /// silencing the best-effort notice. Mutually exclusive with `--require-limits`.
+        allow_uncapped: bool,
+        /// `--security-profile <untrusted>`: a bundle of opt-in hardening (seccomp allowlist +
+        /// cap-drop ALL + read-only) applied as a base that explicit flags override.
+        security_profile: Option<commands::SecurityProfile>,
         /// INTERNAL (used by `kern build`): explicit overlay lower dir(s), colon-joined, used as the
         /// read-only base instead of `--rootfs`/`--image`. Paired with `--overlay-upper`.
         overlay_lower: Option<String>,
@@ -1439,6 +1448,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut no_uid_range = false;
     let mut bind_rootfs = false;
     let mut privileged = false;
+    let mut require_limits = false;
+    let mut allow_uncapped = false;
+    let mut security_profile: Option<commands::SecurityProfile> = None;
     let mut overlay_lower: Option<String> = None;
     let mut overlay_upper: Option<String> = None;
     let mut tty = false;
@@ -1703,6 +1715,21 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--no-uid-range" => no_uid_range = true,
                 "--bind-rootfs" => bind_rootfs = true,
                 "--privileged" => privileged = true,
+                "--require-limits" => require_limits = true,
+                "--allow-uncapped" => allow_uncapped = true,
+                "--security-profile" => {
+                    i += 1;
+                    security_profile = match rest
+                        .get(i)
+                        .copied()
+                        .and_then(commands::SecurityProfile::parse)
+                    {
+                        Some(p) => Some(p),
+                        None => {
+                            return Err(Error::Usage("--security-profile: expected `untrusted`"))
+                        }
+                    };
+                }
                 // Internal build-layer flags (see the Command::BoxRun docs) - take a value.
                 "--overlay-lower" => {
                     i += 1;
@@ -2033,6 +2060,30 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             }
         }
     }
+    // NOTE: the `--require-limits` / `--allow-uncapped` contradiction is rejected in `build_spec`, on
+    // the RESOLVED values (flag || env), not here on the raw flags - so the mix with `KERN_*` env is
+    // caught too. A parse-time flag-only check would silently miss `--require-limits` + `KERN_ALLOW_UNCAPPED`.
+    //
+    // `--cap-add ALL` under `--security-profile untrusted`, by contrast, IS a parse-time flag-only
+    // check (neither has an env form): it NEGATES the profile's cap-drop, leaving a box labelled
+    // `untrusted` that holds every capability - a contradiction, not the override of a single cap that
+    // `--cap-add NET_BIND_SERVICE` is. Reject it by name, as with require/allow.
+    if security_profile.is_some() && cap_add.iter().any(|a| a.eq_ignore_ascii_case("ALL")) {
+        return Err(Error::Usage(
+            "--cap-add ALL cancels the cap-drop of --security-profile untrusted; these are \
+             contradictory. Drop the profile, or add the specific capabilities you need.",
+        ));
+    }
+    // `--privileged` under `--security-profile untrusted`: same shape as `--cap-add ALL`. `--privileged`
+    // relaxes the seccomp filter (it re-allows the namespace/mount syscalls for nesting), which negates
+    // the profile's `allowlist` constituent. A box that says `untrusted` and then relaxes seccomp is a
+    // contradiction, not the override of one setting. Reject it by name.
+    if security_profile.is_some() && privileged {
+        return Err(Error::Usage(
+            "--privileged relaxes the seccomp filter that --security-profile untrusted tightens; \
+             these are contradictory. Drop the profile, or drop --privileged.",
+        ));
+    }
     // Always route to the real command; missing name → BoxName rejects it, missing rootfs/image
     // → box_run reports it. `--plan` wins (non-destructive preview).
     let cmd = if plan {
@@ -2065,6 +2116,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             no_uid_range,
             bind_rootfs,
             privileged,
+            require_limits,
+            allow_uncapped,
+            security_profile,
             overlay_lower,
             overlay_upper,
             memory,
@@ -2152,6 +2206,9 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--cap-drop",
     "--cap-add",
     "--privileged",
+    "--require-limits",
+    "--allow-uncapped",
+    "--security-profile",
     "--secret",
     "--tmpfs",
     "--pids-limit",
@@ -2599,6 +2656,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             no_uid_range,
             bind_rootfs,
             privileged,
+            require_limits,
+            allow_uncapped,
+            security_profile,
             overlay_lower,
             overlay_upper,
             memory,
@@ -2661,6 +2721,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             no_uid_range,
             bind_rootfs,
             privileged,
+            require_limits,
+            allow_uncapped,
+            security_profile,
             overlay_lower: overlay_lower.as_deref(),
             overlay_upper: overlay_upper.as_deref(),
             memory,
@@ -3245,6 +3308,166 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn box_require_limits_and_allow_uncapped_parse_default_off() {
+        // --require-limits parses, off by default.
+        let (_, cmd) = parse(&["box".into(), "x".into(), "--require-limits".into()]).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                require_limits: true,
+                allow_uncapped: false,
+                ..
+            }
+        ));
+        // --allow-uncapped parses, off by default.
+        let (_, cmd) = parse(&["box".into(), "x".into(), "--allow-uncapped".into()]).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                allow_uncapped: true,
+                require_limits: false,
+                ..
+            }
+        ));
+        // Neither set on a bare box: current best-effort behaviour is preserved.
+        let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                require_limits: false,
+                allow_uncapped: false,
+                ..
+            }
+        ));
+        // The contradiction (both set, in any flag/env combination) is rejected in `build_spec` on the
+        // resolved values, not at parse - see `commands::limit_policy_tests`.
+    }
+
+    #[test]
+    fn box_security_profile_parses_untrusted_and_rejects_unknown() {
+        let (_, cmd) = parse(&[
+            "box".into(),
+            "x".into(),
+            "--security-profile".into(),
+            "untrusted".into(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                security_profile: Some(commands::SecurityProfile::Untrusted),
+                ..
+            }
+        ));
+        // None by default: no profile is applied unless asked.
+        let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                security_profile: None,
+                ..
+            }
+        ));
+        // A closed set: an unknown name is a usage error that names the accepted value.
+        let err = parse(&[
+            "box".into(),
+            "x".into(),
+            "--security-profile".into(),
+            "paranoid".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Usage(m) if m.contains("untrusted")),
+            "unknown profile must be a usage error naming `untrusted`, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn box_security_profile_untrusted_rejects_cap_add_all() {
+        // `--cap-add ALL` negates the profile's cap-drop: a box labelled untrusted that holds every
+        // capability is a contradiction, rejected by name (flag-only, so parse is the complete site).
+        let err = parse(&[
+            "box".into(),
+            "x".into(),
+            "--security-profile".into(),
+            "untrusted".into(),
+            "--cap-add".into(),
+            "ALL".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Usage(m) if m.contains("cancels") && m.contains("untrusted")),
+            "cap-add ALL under the profile must be a usage error, got {err:?}"
+        );
+        // Case-insensitive on the cap name.
+        assert!(parse(&[
+            "box".into(),
+            "x".into(),
+            "--security-profile".into(),
+            "untrusted".into(),
+            "--cap-add".into(),
+            "all".into(),
+        ])
+        .is_err());
+        // A SPECIFIC `--cap-add` under the profile is fine: it overrides ONE cap, not the whole drop.
+        let (_, cmd) = parse(&[
+            "box".into(),
+            "x".into(),
+            "--security-profile".into(),
+            "untrusted".into(),
+            "--cap-add".into(),
+            "NET_BIND_SERVICE".into(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                security_profile: Some(commands::SecurityProfile::Untrusted),
+                ..
+            }
+        ));
+        // `--cap-add ALL` WITHOUT the profile stays valid (no contradiction).
+        let ok = parse(&["box".into(), "x".into(), "--cap-add".into(), "ALL".into()]);
+        assert!(ok.is_ok());
+        // Evasion D1: `CAP_ALL` is NOT the special `ALL` token; it resolves as a capability NAME, which
+        // is unknown, so it is rejected downstream in `caps::resolve` (an error either way, no silent
+        // cap-add-all). `ALL,NET_ADMIN` is one unknown name, likewise rejected. Neither slips through.
+        assert!(parse(&[
+            "box".into(),
+            "x".into(),
+            "--security-profile".into(),
+            "untrusted".into(),
+            "--cap-add".into(),
+            "CAP_ALL".into(),
+        ])
+        .and_then(|(_, c)| match c {
+            Command::BoxRun { cap_add, .. } => crate::caps::resolve(&cap_add, &[]).map(|_| ()),
+            _ => Ok(()),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn box_security_profile_untrusted_rejects_privileged() {
+        // D8: `--privileged` relaxes the seccomp filter the profile tightens - a contradiction on the
+        // same axis, rejected by name like `--cap-add ALL`.
+        let err = parse(&[
+            "box".into(),
+            "x".into(),
+            "--security-profile".into(),
+            "untrusted".into(),
+            "--privileged".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Usage(m) if m.contains("privileged") && m.contains("contradictory")),
+            "privileged under the profile must be a usage error, got {err:?}"
+        );
+        // `--privileged` alone stays valid.
+        assert!(parse(&["box".into(), "x".into(), "--privileged".into()]).is_ok());
     }
 
     #[test]

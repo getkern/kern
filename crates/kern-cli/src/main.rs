@@ -60,6 +60,29 @@ fn main() -> ExitCode {
     // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Runs tab). Cheap and harmless
     // on every other subcommand.
     runstats::mark_start();
+    // Scope-readiness signal: if we are the kern re-exec'd INSIDE a transient systemd scope, reaching
+    // `main` under `KERN_SCOPE_READY_FD` proves `systemd-run` reached the user manager and re-exec'd us,
+    // so the box is NOT going to die on the exec cliff. Write one byte and close the pipe; the outer
+    // parent (see `reexec_in_scope_if_possible`) reads it to tell "scope up" from "systemd-run died
+    // before starting the box" and, on the latter, falls back to the best-effort in-process cgroup path
+    // instead of leaving the box dead. Done at the earliest point, before any subcommand can exit first,
+    // and the marker is removed so the box workload never inherits it or the closed fd number. Safe
+    // single-threaded env mutation at process entry (no other thread yet).
+    if let Some(v) = std::env::var_os("KERN_SCOPE_READY_FD") {
+        // Honour it ONLY as the genuine scope re-exec (KERN_SCOPE set) and only for a non-std fd, so a
+        // `KERN_SCOPE_READY_FD` planted in the environment cannot make kern write a stray byte to or
+        // close its own stdout/stderr or an arbitrary descriptor. See `commands::ready_fd_to_signal`.
+        if let Some(fd) =
+            commands::ready_fd_to_signal(kern_common::env_flag("KERN_SCOPE"), Some(v.as_os_str()))
+        {
+            let b = [1u8];
+            unsafe {
+                libc::write(fd, b.as_ptr().cast(), 1);
+                libc::close(fd);
+            }
+        }
+        std::env::remove_var("KERN_SCOPE_READY_FD");
+    }
     // Detect invocation *as* `docker` / `docker-compose` (via a symlink or wrapper) and rewrite the
     // argv into kern's own dialect before dispatch. Pure argument translation - no daemon, no
     // docker.sock. When invoked normally (`kern …`), this is a couple of cheap string checks.

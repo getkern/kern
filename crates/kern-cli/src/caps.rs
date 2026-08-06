@@ -130,4 +130,19 @@ mod tests {
         assert!(resolve(&[], &["FLUX_CAPACITOR".into()]).is_err());
         assert!(resolve(&["WARP_DRIVE".into()], &[]).is_err());
     }
+
+    #[test]
+    fn profile_all_plus_explicit_specific_drop_compose_without_error() {
+        // The shape `--security-profile untrusted` produces when combined with an explicit
+        // `--cap-drop NET_BIND_SERVICE`: the profile prepends `ALL`, the explicit drop is already
+        // implied. It must compose to `drop_all` with no error (a no-op explicit drop), not a defect.
+        let s = resolve(&[], &["ALL".into(), "NET_BIND_SERVICE".into()]).unwrap();
+        assert!(s.drop_all);
+        assert_eq!(s.drops, vec![10]); // recorded, but redundant under drop_all
+                                       // And the profile's `ALL` with an explicit `--cap-add`: the add survives (subtracted from the
+                                       // drop mask downstream), the drop is total. This is the C4 precedence at the resolve layer.
+        let s = resolve(&["NET_BIND_SERVICE".into()], &["ALL".into()]).unwrap();
+        assert!(s.drop_all);
+        assert_eq!(s.adds, vec![10]);
+    }
 }

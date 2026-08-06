@@ -633,13 +633,42 @@ fn check_uid_range() -> R {
         .map(|s| s.lines().any(|l| l.starts_with(&format!("{user}:"))))
         .unwrap_or(false);
     if has_helper && has_subid {
-        R::Ok("--uid-range / --user / --ssh: newuidmap + /etc/subuid present".into())
-    } else {
-        R::Warn(
-            "newuidmap/newgidmap or /etc/subuid missing - `--uid-range`, non-root `--user`, `--ssh` fall back".into(),
-            "install uidmap and add a subuid/subgid allocation for your user to enable multi-uid boxes".into(),
-        )
+        return R::Ok("--uid-range / --user / --ssh: newuidmap + /etc/subuid present".into());
     }
+    // Emit the two EXACT commands, not "install uidmap and add an allocation". kern deliberately does
+    // NOT write `/etc/subuid`/`/etc/subgid` itself: it is global state shared with shadow-utils and
+    // Podman, needs root, and a range overlapping a peer's allocation corrupts that peer's map. kern
+    // reports what an operator (or their Ansible) applies; it stays a consumer of the mapping.
+    // subuid accepts a NUMERIC uid, so when $USER is unset (a container, a uid with no /etc/passwd
+    // entry) fall back to the real uid rather than an `$(id -un)` that could itself fail in the shell.
+    let who = if user.is_empty() {
+        // SAFETY: `getuid` is infallible and takes no arguments.
+        unsafe { libc::getuid() }.to_string()
+    } else {
+        user
+    };
+    let mut steps: Vec<String> = Vec::new();
+    if !has_helper {
+        // Do NOT hardcode `apt`: the package and command differ per distro. Name the capability and
+        // give the Debian command as the example, so the hint is never wrong on Fedora/Arch/Alpine.
+        steps.push(
+            "install the `newuidmap`/`newgidmap` helpers (Debian/Ubuntu: `sudo apt install uidmap`; \
+             Fedora/Arch/openSUSE ship them in `shadow-utils`/`shadow`)"
+                .into(),
+        );
+    }
+    if !has_subid {
+        steps.push(format!(
+            "`echo {who}:100000:65536 | sudo tee -a /etc/subuid /etc/subgid`"
+        ));
+    }
+    R::Warn(
+        "newuidmap/newgidmap or /etc/subuid missing - `--uid-range`, non-root `--user` and `--ssh` \
+         fall back to a single-uid map, so an official image that chowns to a service user (redis, \
+         postgres, nginx) fails at start"
+            .into(),
+        steps.join(", then "),
+    )
 }
 
 fn check_tools() -> Vec<R> {
@@ -662,6 +691,13 @@ fn check_tools() -> Vec<R> {
             "sshfs",
             "-v sshfs:// network volumes",
             "install sshfs, or use nfs/smb",
+        ),
+        tool_opt(
+            "pasta",
+            "pod / box outbound networking (NAT + DNS)",
+            "install passt (apt install passt / dnf install passt); without it a pod is loopback-only \
+             - peers reach each other but nothing reaches the network (no apk add / pip install). kern \
+             uses pasta if present, it does not ship it",
         ),
         landlock(),
     ]

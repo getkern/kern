@@ -769,7 +769,7 @@ class Sandbox:
         enforce_limits: ``True`` (default) hard-enforces caps via a systemd scope (~6 ms start);
             ``False`` skips it for a ~3 ms start (best-effort caps).
         cap_drop: Linux capabilities dropped from every box, as kern's ``--cap-drop`` takes them.
-            Default ``("ALL",)``. kern already drops 13 dangerous capabilities unconditionally; this
+            Default ``("ALL",)``. kern already drops 14 dangerous capabilities unconditionally; this
             drops the remainder, which were otherwise held over the box's own user namespace. It is
             defence in depth, not the boundary itself, and it changes one behaviour: a workload that
             binds a port below 1024 INSIDE the box needs ``CAP_NET_BIND_SERVICE``. Pass
@@ -790,8 +790,18 @@ class Sandbox:
     env: Mapping[str, str] | None = None
     max_output_bytes: int = 64 * 1024 * 1024
     enforce_limits: bool = True
+    # `--require-limits`: refuse to start unless the memory/pids caps are ACTUALLY enforced (read back
+    # from the cgroup), rather than running best-effort uncapped. The fail-closed OOM / fork-bomb backstop
+    # for a host that may not delegate cgroup v2. Distinct from `enforce_limits`, which only picks the
+    # systemd-scope vs best-effort cap PATH; this makes an unenforceable cap fatal.
+    require_limits: bool = False
+    # `--security-profile "untrusted"`: an opt-in hardening BUNDLE (seccomp allowlist + cap-drop ALL +
+    # read-only root) for code nobody has read, applied as a base. Only "untrusted" is defined today. The
+    # root goes read-only but a bound `mounts` path (and run_code's own workspace) stays writable, so it
+    # composes with this SDK. `None` (default) leaves the box on kern's normal posture.
+    security_profile: str | None = None
     # Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
-    # The default drops the lot: kern already drops 13 dangerous capabilities unconditionally, but the
+    # The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
     # rest were still held over the box's own user namespace, and this is the one code path whose whole
     # purpose is running code nobody has read. It is defence in depth rather than the boundary itself
     # (those capabilities are namespaced, and the always-on seccomp filter refuses the escape syscalls
@@ -912,6 +922,10 @@ class Sandbox:
             argv += ["--cpus", str(self.cpus)]
         if self.pids is not None:
             argv += ["--pids-limit", str(self.pids)]
+        if self.require_limits:
+            argv.append("--require-limits")
+        if self.security_profile is not None:
+            argv += ["--security-profile", self.security_profile]
         # Network mode for THIS box. egress_allow (a domain allowlist via an isolated netns + kern's
         # filtering proxy) governs the untrusted run_code/run boxes; the setup box keeps the full network
         # it needs to install deps. egress_allow and network are mutually exclusive (checked at construct).

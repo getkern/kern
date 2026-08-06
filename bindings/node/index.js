@@ -780,9 +780,18 @@ class Sandbox {
     this.onStdout = opts.onStdout ?? null;
     this.onStderr = opts.onStderr ?? null;
     this.enforceLimits = opts.enforceLimits ?? true;
+    // `--require-limits`: refuse to start unless the memory/pids caps are ACTUALLY enforced (read back
+    // from the cgroup), rather than running best-effort uncapped - the fail-closed OOM / fork-bomb
+    // backstop. Distinct from `enforceLimits` (systemd-scope vs best-effort PATH); this makes an
+    // unenforceable cap fatal.
+    this.requireLimits = opts.requireLimits ?? false;
+    // `--security-profile "untrusted"`: an opt-in hardening BUNDLE (seccomp allowlist + cap-drop ALL +
+    // read-only root) for code nobody has read. The root goes read-only but a bound `mounts` path stays
+    // writable, so it composes with this SDK. null (default) leaves kern's normal posture.
+    this.securityProfile = opts.securityProfile ?? null;
     this.depsReadonly = opts.depsReadonly ?? false;
     // Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
-    // The default drops the lot: kern already drops 13 dangerous capabilities unconditionally, but the
+    // The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
     // rest were still held over the box's own user namespace, on the one code path whose purpose is
     // running code nobody has read. Defence in depth rather than the boundary itself, and measured to
     // cost nothing. It is NOT behaviour-free: a workload binding a port below 1024 INSIDE the box
@@ -920,6 +929,8 @@ class Sandbox {
     if (this.memoryMb !== null) argv.push("--memory", `${this.memoryMb}m`);
     if (this.cpus !== null) argv.push("--cpus", String(this.cpus));
     if (this.pids !== null) argv.push("--pids-limit", String(this.pids));
+    if (this.requireLimits) argv.push("--require-limits");
+    if (this.securityProfile !== null) argv.push("--security-profile", this.securityProfile);
     // Network mode: egressAllow (a domain allowlist via an isolated netns + kern's filtering proxy)
     // governs the untrusted runCode/run boxes; the setup box keeps the full network it needs to install
     // deps. egressAllow and network are mutually exclusive (checked at construction).

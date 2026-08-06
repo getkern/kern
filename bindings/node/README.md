@@ -135,7 +135,7 @@ new Sandbox({
   timeoutS,        // default 30, MANDATORY per-call deadline
   network,         // default false (RELAXES ISOLATION)
   capDrop,         // default ["ALL"]: capabilities dropped from every box. kern always drops
-                   // 13 dangerous ones; this drops the rest, which were held over the box's own
+                   // 14 dangerous ones; this drops the rest, which were held over the box's own
                    // user namespace. Pass [] to keep them (needed only if the workload binds a
                    // port below 1024 INSIDE the box).
   mounts,          // { hostSrc: boxTarget } or { src: [target, "ro"] }
@@ -143,6 +143,9 @@ new Sandbox({
   env,             // { KEY: "value" }
   maxOutputBytes,  // default 64 MiB
   enforceLimits,   // default true; false is best-effort and NO faster (see the Python README)
+  securityProfile, // "untrusted" = seccomp allowlist + cap-drop ALL + read-only root, one opt-in bundle
+  requireLimits,   // default false; true = FAIL-CLOSED (refuse to start unless caps enforced). NOT
+                   // enforceLimits (that picks the cap PATH); mutually exclusive with KERN_ALLOW_UNCAPPED env.
   depsReadonly,    // default false
   trackFiles,      // default true: diff the workspace each call for result.files (O(files)); false = [], O(1)
   onStdout,        // (chunk: Buffer) => void, live stdout streaming (result.stdout still captured)
@@ -218,8 +221,9 @@ clear error otherwise). The Python binding uses the stdlib `tarfile` and has no 
 kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code (CI, dev, edge, your
 agents' code). Its seccomp filter is a **denylist**: right for semi-trusted agent code, **not** a hard
 boundary against deliberately hostile multi-tenant code. For that, reach for a microVM (Firecracker /
-Kata) or gVisor. A deny-by-default allowlist mode is on the roadmap. See the project's
-[SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
+Kata) or gVisor. A deny-by-default seccomp **allowlist** ships as opt-in today: pass
+`securityProfile: "untrusted"` (or the `KERN_SECCOMP=allowlist` env); making it the default is future
+work. See the project's [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
 
 ## License
 

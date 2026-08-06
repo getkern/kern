@@ -84,6 +84,149 @@ fn build_rootfs(busybox: &Path, tag: &str) -> PathBuf {
 }
 
 #[test]
+fn box_require_limits_starts_when_caps_bind_else_refuses() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "reqlim");
+    let rootfs = root.to_str().unwrap();
+    // `--require-limits` must NOT spuriously refuse a box whose caps CAN be enforced. Where cgroup v2
+    // is delegated the box runs and exits 0. Where it cannot (WSL2 without cgroup_enable=memory, a CI
+    // sandbox) the flag CORRECTLY refuses with a non-zero exit that names itself - that IS the
+    // contract, so treat that path as a skip, not a failure.
+    let out = kern()
+        .args([
+            "box",
+            "reqlim",
+            "--rootfs",
+            rootfs,
+            "--require-limits",
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let _ = fs::remove_dir_all(&root);
+    if err.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    if err.contains("require-limits") {
+        // The OTHER half of the wiring, asserted rather than skipped: where caps CANNOT bind,
+        // `--require-limits` must REFUSE (not run uncapped). A future miswiring that passes `false` for
+        // `require_all` would run the box uncapped here and, as a bare skip, pass green - so assert the
+        // refusal is well-formed: non-zero exit, and it names the way out (`--allow-uncapped`).
+        assert!(
+            !out.status.success(),
+            "a refusing --require-limits box must exit non-zero (stderr: {err})"
+        );
+        assert!(
+            err.contains("--allow-uncapped"),
+            "the refusal must name the way out, or the message regressed (stderr: {err})"
+        );
+        eprintln!("verified: --require-limits refused where caps are unenforceable");
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "a --require-limits box must run where caps ARE enforceable; exit {:?} (stderr: {err})",
+        out.status.code()
+    );
+}
+
+#[test]
+fn box_security_profile_untrusted_forces_read_only_root() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "secprof");
+    let rootfs = root.to_str().unwrap();
+    // `--security-profile=untrusted` forces a read-only root (one of its constituents): a write under
+    // `/` must fail. It also prints its resolved constituents to stderr, so the macro is visible.
+    let out = kern()
+        .args([
+            "box",
+            "secprof",
+            "--rootfs",
+            rootfs,
+            "--security-profile",
+            "untrusted",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "if echo x > /w 2>/dev/null; then echo WRITABLE; else echo READONLY; fi",
+        ])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let outp = String::from_utf8_lossy(&out.stdout);
+    let _ = fs::remove_dir_all(&root);
+    if err.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    assert!(
+        err.contains("security-profile"),
+        "the profile must announce its resolved constituents (stderr: {err})"
+    );
+    assert!(
+        outp.contains("READONLY"),
+        "the untrusted profile must force a read-only root (stdout: {outp}, stderr: {err})"
+    );
+}
+
+#[test]
+fn box_security_profile_announcement_reflects_a_surviving_cap_add() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    // Transparency: a `--cap-add` wins over the profile's drop-all (adds are subtracted from the drop
+    // mask), so the box KEEPS that cap. The announced line must SHOW it, not read a bare `cap-drop=ALL`
+    // while the box retains a re-added cap - the same "never advertise a posture it did not get"
+    // standard the seccomp value is held to. The line is printed during setup (before the userns clone),
+    // so this asserts the honesty of the message regardless of whether the box fully starts here.
+    let root = build_rootfs(&busybox, "spcapadd");
+    let rootfs = root.to_str().unwrap();
+    let out = kern()
+        .args([
+            "box",
+            "spcapadd",
+            "--rootfs",
+            rootfs,
+            "--security-profile",
+            "untrusted",
+            "--cap-add",
+            "NET_BIND_SERVICE",
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let _ = fs::remove_dir_all(&root);
+    assert!(
+        err.contains("cap-add=NET_BIND_SERVICE"),
+        "the untrusted-profile line must reflect a surviving --cap-add, not just cap-drop=ALL \
+         (stderr: {err})"
+    );
+}
+
+#[test]
 fn box_run_isolates_and_propagates_exit_code() {
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");

@@ -361,8 +361,9 @@ SUM is currently **not** enforced there. kern does not stay silent about it: whe
 the direct-cap path is not taken, it prints a one-line warning at box start. The **per-box `--memory` /
 `--pids` caps are the reliable knob and enforce everywhere the controller is delegated** (verified on
 x86, the ARM boards, and the VPS: a box over its `--memory` is OOM-killed). For a guaranteed fleet bound
-today, run kern as root, or cap each box with `--memory` / `--pids`. A rootless shared-slice fleet cap is
-tracked as a post-launch improvement. Example:
+today, run kern as root, or cap each box with `--memory` / `--pids`; add `--require-limits` to make a box
+refuse to start rather than run uncapped where the per-box cap cannot be enforced. A rootless
+shared-slice fleet cap is tracked as a post-launch improvement. Example:
 
 ```sh
 export KERN_MAX_CONCURRENT=200        # at most 200 boxes at once

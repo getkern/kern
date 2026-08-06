@@ -62,7 +62,7 @@ pub use cgroup::warn_unenforced_caps;
 /// records itself in an in-process marker) and the scrub of an INHERITED marker (a nested kern must
 /// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,
 /// `env_claims_enforcer_but_none_real`) stay crate-internal - only `real.rs` reads them.
-pub use cgroup::{choose_direct_cap_path, scrub_direct_marker};
+pub use cgroup::{choose_direct_cap_path, choose_direct_cap_path_given, scrub_direct_marker};
 pub use cgroup::{fleet_status, FleetStatus};
 /// The write-tested state of `--memory` enforcement on this host (`Enforced` / `PresentNotDelegated`
 /// / `Absent` / `Unknown`), by creating a throwaway child cgroup and checking a `memory.max` write

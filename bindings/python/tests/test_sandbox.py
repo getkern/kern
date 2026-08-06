@@ -53,7 +53,7 @@ def test_defaults_are_fail_closed():
 def test_capabilities_are_dropped_by_default_and_the_opt_out_is_explicit():
     """The default box drops every capability, and only an explicit `cap_drop=()` keeps them.
 
-    kern always drops 13 dangerous capabilities; the rest were held over the box's own user
+    kern always drops 14 dangerous capabilities; the rest were held over the box's own user
     namespace, on the one code path whose whole purpose is running code nobody has read, while the
     README told a CLI user to write `--cap-drop ALL` for exactly that case. Measured before the
     change: a box held CapEff 00000110bdacffff, and with the flag it holds 0000000000000000.

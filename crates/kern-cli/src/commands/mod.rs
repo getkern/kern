@@ -179,6 +179,13 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         slow overlayfs, but the source is mutable & shared (no per-box isolation)
     --privileged        Relax seccomp so a NESTED `kern box` (docker-in-docker style) can start,
                         rootless-only; still blocks kexec/modules/bpf/io_uring (unlike Docker)
+    --require-limits    Refuse to start unless the memory and pids caps (incl. their defaults) are
+                        actually enforced (the OOM/fork-bomb backstop); cpu/cpuset stay best-effort,
+                        as on the scope path. Default warns and runs uncapped
+    --allow-uncapped    Accept running uncapped silently where no cgroup is delegated (nested CI);
+                        mutually exclusive with --require-limits
+    --security-profile <untrusted>  Opt-in hardening bundle (seccomp allowlist + cap-drop ALL +
+                        read-only), applied as a base explicit flags override; prints its constituents
     --plan              Preview the isolation sequence and any device grants, without running
 
 {b}OPTIONS for run:{z}
@@ -538,6 +545,64 @@ pub enum PullPolicy {
     Always,
 }
 
+/// `--security-profile <name>`: a named bundle of opt-in hardening applied as a BASE that explicit
+/// flags override. A CLOSED set (one value today); a registry stays premature until a second profile
+/// and an external request exist. The resolved constituents are printed (at start and by `--plan`), so
+/// the macro is visible and a future change to a constituent surfaces rather than shifting silently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SecurityProfile {
+    /// `untrusted`: seccomp ALLOWLIST + `--cap-drop ALL` + `--read-only`, for running code nobody has
+    /// read. Explicit flags/env override it (`--cap-add X`, `KERN_SECCOMP=...`). Deliberately does NOT
+    /// touch Landlock (a write-allowlist needs the workload's real paths, which a profile cannot guess:
+    /// build it from a `--landlock-rw` audit run) and does NOT set `--require-limits` (which would break
+    /// a host with no cgroup delegation, exactly what an opt-in hardening profile must not do).
+    Untrusted,
+}
+
+impl SecurityProfile {
+    /// Parse the flag value; `None` on an unknown name so the caller emits a usage error naming the set.
+    pub fn parse(v: &str) -> Option<Self> {
+        match v {
+            "untrusted" => Some(Self::Untrusted),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the box's seccomp mode WITHOUT touching the process environment. Precedence, explicit first:
+/// a non-empty `KERN_SECCOMP` (a valid token parses as [`kern_isolation::SeccompFilter::parse`] does),
+/// then the security profile, then the default (denylist). Pure and total: the caller passes the env
+/// value read once, so there is no `env::set_var` - which is a data race on the un-locked `environ` in a
+/// multi-threaded process and a process-global side effect that would leak into a later box in the same
+/// process. Unlike `from_env`, a SET-but-unrecognised (or non-UTF-8) value is a FAIL-LOUD usage error,
+/// not a silent fall to the default: a malformed security control must stop, never downgrade a profile
+/// silently. Only an ABSENT or EMPTY value falls through to the profile, then the default.
+fn resolve_seccomp_mode(
+    env: Option<&std::ffi::OsStr>,
+    profile: Option<SecurityProfile>,
+) -> Result<kern_isolation::SeccompFilter, Error> {
+    use kern_isolation::SeccompFilter;
+    if let Some(v) = env {
+        if !v.is_empty() {
+            // A SET-but-unrecognised value is a FAIL-LOUD usage error, not a silent fall to the
+            // default. Silently defaulting would let a typo (`allowlist-audi`) downgrade a
+            // `--security-profile untrusted` box from the allowlist to the denylist while the box
+            // still advertises `untrusted`: the label would lie. A malformed security control must stop.
+            return match v.to_str().and_then(SeccompFilter::parse) {
+                Some(f) => Ok(f),
+                None => Err(Error::Usage(
+                    "KERN_SECCOMP: unrecognised value (expected `denylist`, `allowlist`, or \
+                     `allowlist-audit`)",
+                )),
+            };
+        }
+    }
+    Ok(match profile {
+        Some(SecurityProfile::Untrusted) => SeccompFilter::Allowlist,
+        None => SeccompFilter::default(),
+    })
+}
+
 /// Arguments for [`box_run`]. A struct (not a long parameter list) keeps the call site readable
 /// as box options grow (`-v`, `--env`, `--workdir`, `--net`).
 pub struct BoxRunArgs<'a> {
@@ -571,6 +636,15 @@ pub struct BoxRunArgs<'a> {
     /// `--privileged`: relax the seccomp filter to allow a NESTED `kern box` (rootless-only; see
     /// [`kern_isolation::SandboxSpec::privileged`]).
     pub privileged: bool,
+    /// `--require-limits`: refuse to start (non-zero exit) if a resource cap cannot be enforced here,
+    /// instead of running best-effort UNCAPPED (see [`kern_isolation::SandboxSpec::require_limits`]).
+    pub require_limits: bool,
+    /// `--allow-uncapped`: accept running uncapped silently on a host with no cgroup delegation (see
+    /// [`kern_isolation::SandboxSpec::allow_uncapped`]). Mutually exclusive with `require_limits`.
+    pub allow_uncapped: bool,
+    /// `--security-profile <untrusted>`: opt-in hardening bundle applied as a base (see
+    /// [`SecurityProfile`]). `None` = no profile.
+    pub security_profile: Option<SecurityProfile>,
     /// INTERNAL (build): explicit colon-joined overlay lower dir(s), used instead of `--rootfs`/
     /// `--image` and paired with `overlay_upper` to run a build's RUN step against the base.
     pub overlay_lower: Option<&'a str>,
@@ -1084,15 +1158,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // scoped or if systemd --user isn't available - then the best-effort cgroup in run_in_sandbox
     // applies the same caps.
     if !managed && !build_step {
-        reexec_in_scope_if_possible(
+        reexec_in_scope_if_possible(ScopeReexec {
             memory,
-            args.memory_swap_max,
-            cpuset.as_deref(),
+            memory_swap_max: args.memory_swap_max,
+            cpuset: cpuset.as_deref(),
             cpus,
-            args.pids_limit,
-            true, // `kern box` has a supervisor → may take the direct kern.slice path
-            !args.detached && !args.tty, // a foreground box dies with its launcher
-        );
+            pids_max: args.pids_limit,
+            allow_direct: true, // `kern box` has a supervisor → may take the direct kern.slice path
+            die_with_parent: !args.detached && !args.tty, // a foreground box dies with its launcher
+            allow_uncapped: args.allow_uncapped || kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
+        });
     }
     // A profile's `nice` set here is inherited by the forked box workload.
     if let Some(n) = nice {
@@ -1423,9 +1498,50 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             }
         }
     }
+    // `--security-profile <untrusted>`: apply the bundle as a BASE, so explicit flags and env override
+    // it (the documented precedence). CRITICAL: seccomp is resolved into a VALUE carried in the spec,
+    // NOT via `env::set_var` - that is `unsafe` (a data race on the un-locked `environ` in a
+    // multi-threaded process) and a process-global side effect that would leak into a second box run in
+    // the same process. cap-drop and read-only mutate LOCALS only. The profile still rides the replayed
+    // argv into the scope re-exec, so the re-exec'd process re-derives the same posture from the flag.
+    let seccomp_mode = resolve_seccomp_mode(
+        std::env::var_os("KERN_SECCOMP").as_deref(),
+        args.security_profile,
+    )?;
+    let mut cap_drops = args.cap_drop.to_vec();
+    let mut read_only = args.read_only;
+    if let Some(SecurityProfile::Untrusted) = args.security_profile {
+        // cap-drop ALL as a base; an explicit `--cap-add X` is re-added by `caps::resolve` (the adds are
+        // subtracted from the drop mask, see `CapSpec`), so the profile is a floor, not a ceiling.
+        if !cap_drops.iter().any(|d| d.eq_ignore_ascii_case("ALL")) {
+            cap_drops.insert(0, "ALL".to_string());
+        }
+        read_only = true; // untrusted -> read-only root (there is no --no-read-only to override)
+                          // Print the RESOLVED constituents (the ACTUAL seccomp mode, so an explicit KERN_SECCOMP shows as
+                          // what it is): the macro is visible and never claims a posture it did not get.
+        let sec = match seccomp_mode {
+            kern_isolation::SeccompFilter::Allowlist => "allowlist",
+            kern_isolation::SeccompFilter::AllowlistAudit => "allowlist-audit",
+            kern_isolation::SeccompFilter::Denylist => "denylist",
+        };
+        // A surviving `--cap-add` wins over the profile's drop-all (adds are subtracted from the drop
+        // mask). The line must SHOW it, held to the same "never advertise a posture it did not get"
+        // standard as the seccomp value above - otherwise it reads `cap-drop=ALL` while the box keeps a
+        // cap the operator re-added. `--cap-add ALL` is already refused at parse under the profile, so
+        // these are specific caps that genuinely survive.
+        let caps_line = if args.cap_add.is_empty() {
+            "cap-drop=ALL".to_string()
+        } else {
+            format!("cap-drop=ALL, cap-add={}", args.cap_add.join(","))
+        };
+        eprintln!(
+            "kern: security-profile=untrusted: seccomp={sec}, {caps_line}, read-only=on \
+             (Landlock and --require-limits untouched)"
+        );
+    }
     // `--cap-add`/`--cap-drop`: resolve names to a CapSpec (unknown name → error) layered on the
     // always-dropped dangerous baseline.
-    let caps = crate::caps::resolve(args.cap_add, args.cap_drop)?;
+    let caps = crate::caps::resolve(args.cap_add, &cap_drops)?;
 
     // Always an overlay (image/rootfs = read-only lower, private upper takes writes).
     // `--read-only` then remounts that overlay read-only after pivot.
@@ -1433,7 +1549,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         name: &name,
         lower,
         cmd,
-        read_only: args.read_only,
+        read_only, // profile-adjusted: `--security-profile=untrusted` forces read-only on
+        seccomp_mode, // resolved above (explicit KERN_SECCOMP > profile > default), not from env here
         landlock_rw: args.landlock_rw.to_vec(),
         volumes,
         env,
@@ -1458,6 +1575,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         },
         bind_rootfs: args.bind_rootfs,
         privileged: args.privileged,
+        require_limits: args.require_limits,
+        allow_uncapped: args.allow_uncapped,
         overlay_upper: args.overlay_upper.map(str::to_string),
         memory,
         memory_swap_max: args.memory_swap_max,
@@ -1998,15 +2117,16 @@ pub fn run(
     let cpuset = clamp_cpuset(cpuset)?;
     // `kern run` exec()s in place (no supervisor to reap the cgroup) → `false`: it must use the systemd
     // `--scope --collect` path (which auto-removes the cgroup on exit), never the direct kern.slice path.
-    reexec_in_scope_if_possible(
+    reexec_in_scope_if_possible(ScopeReexec {
         memory,
         memory_swap_max,
-        cpuset.as_deref(),
+        cpuset: cpuset.as_deref(),
         cpus,
-        None,
-        false,
-        false, // `kern run` execs the workload in place - no box to tie to the launcher
-    );
+        pids_max: None,
+        allow_direct: false, // `kern run` execs the workload in place - no box to tie to the launcher
+        die_with_parent: false,
+        allow_uncapped: kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
+    });
     let cg = kern_isolation::apply_cgroup_limits(
         false, // allow_direct: `kern run` exec()s in place (no supervisor) → never relocate into kern.slice
         "run",
@@ -2014,9 +2134,10 @@ pub fn run(
         memory_swap_max,
         cpuset.as_deref(),
         cpus,
-        None, // `kern run` has no --pids-limit; box's pids cap is applied in the sandbox
-        &[],  // no vdisk io limits in `kern run`
-        None, // no --io-weight in `kern run`
+        None,  // `kern run` has no --pids-limit; box's pids cap is applied in the sandbox
+        &[],   // no vdisk io limits in `kern run`
+        None,  // no --io-weight in `kern run`
+        false, // `kern run` is a cooperative governor, never fail-closed (best-effort gate)
     );
     // `kern run` is a cooperative GOVERNOR, not an isolation boundary - so unlike `kern box` it does NOT
     // fail-closed when a cap can't be applied. But make the drop VISIBLE, not silent: if the user asked
@@ -2395,6 +2516,13 @@ struct BuildSpec<'a> {
     bind_rootfs: bool,
     /// `--privileged`: relax seccomp for a nested `kern box` (rootless-only).
     privileged: bool,
+    /// `--require-limits`: fail-closed if a resource cap cannot be enforced (else best-effort uncapped).
+    require_limits: bool,
+    /// `--allow-uncapped`: accept running uncapped silently (no best-effort notice). XOR require_limits.
+    allow_uncapped: bool,
+    /// The box's seccomp filter, RESOLVED by the caller (explicit `KERN_SECCOMP` > profile > default)
+    /// into a value, not read from the environment here - see [`resolve_seccomp_mode`].
+    seccomp_mode: kern_isolation::SeccompFilter,
     /// INTERNAL (build): a persistent overlay upper dir; overlays `lower` and keeps writes there.
     overlay_upper: Option<String>,
     memory: Option<u64>,
@@ -2436,6 +2564,31 @@ struct BuildSpec<'a> {
 ///
 /// When `--net` shares the host network, the host's `/etc/resolv.conf` is copied into the upper
 /// so DNS works out of the box.
+/// Resolve the resource-cap posture from the two flags and their env fallbacks, in ONE place, and
+/// reject the contradiction on the RESOLVED values rather than on the raw flags. This is what catches
+/// the mixed forms a flag-only parse check misses: `--require-limits` paired with `KERN_ALLOW_UNCAPPED`
+/// (or `--allow-uncapped` with `KERN_REQUIRE_LIMITS`). `require`/`allow` are `flag || env`, so an env
+/// can only ENABLE, never override an explicit flag - the safe direction for a fail-closed control.
+/// Pure and total: it reads no environment itself (the caller passes the two resolved env booleans),
+/// so it unit-tests every combination without touching the process state.
+fn resolve_limit_policy(
+    require_flag: bool,
+    require_env: bool,
+    allow_flag: bool,
+    allow_env: bool,
+) -> Result<(bool, bool), Error> {
+    let require = require_flag || require_env;
+    let allow = allow_flag || allow_env;
+    if require && allow {
+        return Err(Error::Usage(
+            "--require-limits and --allow-uncapped are mutually exclusive (one refuses an \
+             unenforceable cap, the other accepts it); this also holds when either is set through \
+             KERN_REQUIRE_LIMITS or KERN_ALLOW_UNCAPPED",
+        ));
+    }
+    Ok((require, allow))
+}
+
 fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
     // Hostname: `--hostname` wins, else the box name (the box's own UTS namespace, so it's private).
     let hostname = b
@@ -2557,6 +2710,16 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         )
     };
 
+    // Resolve the cap posture from flags + env in ONE place, and reject the contradiction on the
+    // RESOLVED values (so `--require-limits` + `KERN_ALLOW_UNCAPPED`, and every other mix, is caught -
+    // a flag-only parse check would miss the env combinations).
+    let (require_limits, allow_uncapped) = resolve_limit_policy(
+        b.require_limits,
+        kern_common::env_flag("KERN_REQUIRE_LIMITS"),
+        b.allow_uncapped,
+        kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
+    )?;
+
     let spec = SandboxSpec {
         root,
         mode,
@@ -2593,11 +2756,16 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         ulimits: b.ulimits,
         sysctls: b.sysctls,
         privileged: b.privileged,
-        // Resolve the seccomp filter ONCE, here, from the environment. PID 1 installs it and the
-        // instance record carries it, so `kern exec` reproduces the box's filter instead of re-reading
-        // `KERN_SECCOMP` from the exec caller's environment (which could enter an allowlist box under
-        // the wider denylist). This is the single point of resolution for the box's whole lifetime.
-        seccomp_mode: kern_isolation::SeccompFilter::from_env(),
+        // Resolved above (flag || env, contradiction rejected). `--require-limits`/`KERN_REQUIRE_LIMITS`
+        // fail-closed; `--allow-uncapped`/`KERN_ALLOW_UNCAPPED` accept-uncapped; mutually exclusive.
+        require_limits,
+        allow_uncapped,
+        // The seccomp filter, RESOLVED ONCE by the caller (`resolve_seccomp_mode`: explicit
+        // `KERN_SECCOMP` > `--security-profile` > default) into `b.seccomp_mode` - a value, never a
+        // re-read of the environment here. PID 1 installs it and the instance record carries it, so
+        // `kern exec` reproduces the box's filter (a profile-set allowlist reproduces as allowlist, not
+        // as the wider denylist). Single point of resolution for the box's whole lifetime.
+        seccomp_mode: b.seccomp_mode,
     };
     // Audit mode is a validation aid, deliberately LESS confined than the shipped denylist (its
     // log-and-run default lets clone3/io_uring RUN instead of returning ENOSYS). Warn loudly, once per
@@ -3774,7 +3942,12 @@ fn read_log_tail(path: &std::path::Path, max: usize) -> Option<String> {
 /// up to ~1s for the supervisor's failure marker to land; fall back to whatever is there on timeout.
 /// Only ever called on the (rare) start-failure path, so the bounded wait never touches a good start.
 fn read_log_reason(path: &std::path::Path) -> Option<String> {
-    for _ in 0..50 {
+    // Bounded post-failure poll. NOT a start timeout: the box has ALREADY failed here (the launcher
+    // received the readiness FAILURE byte, and that read itself has no deadline, so a slow board never
+    // false-fails). This only waits for the async log pump to flush the supervisor's failure REASON
+    // into the file. 3 s is generous even for a slow board's pump; on timeout we return whatever is
+    // present, so the worst case is a less-detailed message, never a wrong verdict.
+    for _ in 0..150 {
         let tail = read_log_tail(path, 1024);
         if tail
             .as_deref()
@@ -4440,16 +4613,36 @@ fn claim_notice_at(path: &std::path::Path) -> bool {
 /// the whole `kern` invocation under `systemd-run --user --scope` with cgroup caps, so the
 /// sandbox (and any fork bomb in it) is hard-limited. This replaces the process on success; on
 /// any failure it returns and the caller falls back to the best-effort cgroup path.
-fn reexec_in_scope_if_possible(
+/// Parameters for [`reexec_in_scope_if_possible`], grouped into one value (the caps plus the three
+/// posture bits) so the call is a single argument rather than an 8-wide positional list.
+struct ScopeReexec<'a> {
     memory: Option<u64>,
     memory_swap_max: Option<u64>,
-    cpuset: Option<&str>,
+    cpuset: Option<&'a str>,
     cpus: Option<f64>,
     pids_max: Option<u64>,
+    /// `kern box` (has a supervisor to hold the RAII guard) may take the direct kern.slice path;
+    /// `kern run` (execs in place) must not, so it uses the systemd `--scope --collect` path.
     allow_direct: bool,
+    /// A FOREGROUND box dies with its launcher (arm PDEATHSIG across the exec into systemd-run).
     die_with_parent: bool,
-) {
+    /// `--allow-uncapped`/`KERN_ALLOW_UNCAPPED`: suppress the once-per-host "not enforced" notice.
+    allow_uncapped: bool,
+}
+
+fn reexec_in_scope_if_possible(p: ScopeReexec) {
     use std::os::unix::process::CommandExt;
+
+    let ScopeReexec {
+        memory,
+        memory_swap_max,
+        cpuset,
+        cpus,
+        pids_max,
+        allow_direct,
+        die_with_parent,
+        allow_uncapped,
+    } = p;
 
     if kern_common::env_flag("KERN_SCOPE") {
         return; // already inside our scope
@@ -4471,7 +4664,10 @@ fn reexec_in_scope_if_possible(
     // the reader to skip it. The resolution is that this is a HOST fact and not a box fact, so it is
     // stated once per host. An explicit request keeps its per-invocation warning, because asking for
     // `--memory 256m` and silently not getting it is a different failure from starting a default box.
-    if std::env::var_os("KERN_BUILD_STEP").is_none() && !kern_isolation::memory_cap_enforceable() {
+    if !allow_uncapped
+        && std::env::var_os("KERN_BUILD_STEP").is_none()
+        && !kern_isolation::memory_cap_enforceable()
+    {
         let asked = memory.is_some() || memory_swap_max.is_some();
         if asked || claim_uncapped_host_notice() {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -4508,21 +4704,31 @@ fn reexec_in_scope_if_possible(
         kern_isolation::warn_unenforced_caps(memory, cpus, pids_max);
         return;
     }
-    // Gate on a running user manager (so the exec can't strand us in a broken systemd-run).
+    // Gate on a running user manager (so the exec can't strand us in a broken systemd-run). Probe ONCE
+    // and reuse for `choose_direct_cap_path_given` just below - the two are adjacent (no exec/fork/I/O
+    // between), so a second `connect()` on `systemd/private` could only return the same answer. The
+    // pre-exec re-probe far below stays a FRESH call: it guards a different, later instant (post arg
+    // building), which is the whole point of the TOCTOU floor.
     if !kern_isolation::user_systemd_present() {
         return;
     }
-    // FAST PATH (box only): if kern's delegated `kern.slice` is usable, SKIP the per-box `systemd-run
-    // --scope` and let `apply_limits` cap DIRECTLY under it - ~4 ms less/box, same hard kernel caps; a
-    // downstream fail-closed refuses the box if the cap doesn't bite, so it never silently runs uncapped.
-    // `choose_direct_cap_path` is THE decision site: it also rules out an outer enforcer
-    // (KERN_MANAGED/KERN_BUILD_STEP - their ancestor already caps, and `apply_limits` wouldn't use
-    // kern.slice anyway) and RECORDS the decision, so the fail-closed refusal downstream fires only
-    // when this return was actually taken - never on the `exec()`-failed fall-through below, which
-    // keeps its historical best-effort behavior. NOT for `kern run` (`allow_direct=false`): it
-    // exec()s in place with no supervisor to run the guard's Drop, so without the scope's
-    // `--collect` its `kern.slice/kern-box-run-*` cgroup would leak forever.
-    if allow_direct && kern_isolation::choose_direct_cap_path() {
+    // REUSE INVARIANT: `manager_present` is trusted below (`choose_direct_cap_path_given`) WITHOUT a
+    // second probe. That is sound ONLY because nothing between this gate and that call execs, forks, or
+    // blocks on I/O - so the manager cannot have died in between. If you add such a call here, this
+    // `true` goes stale: drop it and pass a FRESH `kern_isolation::user_systemd_present()` instead.
+    // (Nothing enforces this mechanically; the invariant lives in this comment - do not break it.)
+    let manager_present = true; // established by the gate above; reused to avoid a redundant probe
+                                // FAST PATH (box only): if kern's delegated `kern.slice` is usable, SKIP the per-box `systemd-run
+                                // --scope` and let `apply_limits` cap DIRECTLY under it - ~4 ms less/box, same hard kernel caps; a
+                                // downstream fail-closed refuses the box if the cap doesn't bite, so it never silently runs uncapped.
+                                // `choose_direct_cap_path` is THE decision site: it also rules out an outer enforcer
+                                // (KERN_MANAGED/KERN_BUILD_STEP - their ancestor already caps, and `apply_limits` wouldn't use
+                                // kern.slice anyway) and RECORDS the decision, so the fail-closed refusal downstream fires only
+                                // when this return was actually taken - never on the `exec()`-failed fall-through below, which
+                                // keeps its historical best-effort behavior. NOT for `kern run` (`allow_direct=false`): it
+                                // exec()s in place with no supervisor to run the guard's Drop, so without the scope's
+                                // `--collect` its `kern.slice/kern-box-run-*` cgroup would leak forever.
+    if allow_direct && kern_isolation::choose_direct_cap_path_given(manager_present) {
         return;
     }
     let Ok(self_exe) = std::env::current_exe() else {
@@ -4589,26 +4795,205 @@ fn reexec_in_scope_if_possible(
         // equivalent". Not folded into KERN_SCOPE: a user can set that one by hand to opt out of the
         // scope path, and it would then be claiming something about the argv that isn't true.
         .env(crate::shim::DIALECT_ENV, "1");
-    // A FOREGROUND box must die with its launcher (the SDK's per-request pattern). systemd-run
-    // interposes itself as the box supervisor's parent, so the supervisor's own launcher-PDEATHSIG
-    // would fire on systemd-run's death, not the launcher's - leaving the box orphaned until the
-    // `--timeout` backstop. Close that: arm PR_SET_PDEATHSIG(SIGKILL) HERE, before the execve. It
-    // survives the (non-setuid) exec into `systemd-run`, so a launcher kill SIGKILLs systemd-run,
-    // and the re-exec'd kern (PDEATHSIG vs systemd-run) and box PID 1 (PDEATHSIG vs kern) complete
-    // the cascade launcher→systemd-run→kern→box. Detached/-it/`kern run` pass false.
+    // Minimise the check-then-use window before the IRREVERSIBLE exec. The manager was probed earlier
+    // in this function, but `current_exe`, `trusted_helper` and the arg building since then are a
+    // gap in which the user manager could exit (a session teardown). Re-probe HERE, adjacent to the
+    // execve with no blocking I/O between: a probe-then-exec TOCTOU cannot be zero, but this is its
+    // floor. If the manager vanished, return to the best-effort in-process cgroup path rather than
+    // `exec()` into a `systemd-run` that would then fail with no fallback - which would kill the box.
+    // Building `cmd` above has no side effect (no spawn), so dropping it on this return is clean.
+    if !kern_isolation::user_systemd_present() {
+        return;
+    }
+    // A FOREGROUND box (die_with_parent) keeps the proven `exec()`. Its `PR_SET_PDEATHSIG(SIGKILL)`,
+    // armed here and surviving the execve into `systemd-run`, drives the die-with-parent cascade
+    // launcher -> systemd-run -> kern -> box that the SDK's per-request pattern relies on. The fork+proxy
+    // fallback below CANNOT be used here: a systemd scope interposes on the process tree, and inserting a
+    // proxy link between the launcher and `systemd-run` breaks that PDEATHSIG cascade (measured: the box
+    // outlives its launcher). The sub-millisecond TOCTOU residual therefore stays on the foreground scope
+    // path, where the launcher-death guarantee matters more than a race that does not occur in steady
+    // state, and where the window is already at its floor (the re-probe above is adjacent to the exec).
     if die_with_parent {
-        unsafe {
-            libc::prctl(
-                libc::PR_SET_PDEATHSIG,
-                libc::SIGKILL as libc::c_ulong,
-                0,
-                0,
-                0,
-            );
+        arm_pdeathsig();
+        let _ = cmd.exec();
+        return;
+    }
+    // DETACHED and `kern run` (no die-with-parent): FORK instead of exec, so a `systemd-run` that reaches
+    // the manager and THEN fails - the sub-millisecond TOCTOU where the manager dies between the re-probe
+    // above and here, or answers the probe but cannot create the scope - does not replace kern with no
+    // way back and kill the box. The child execs `systemd-run`; the re-exec'd kern inside the scope
+    // writes one byte to `KERN_SCOPE_READY_FD` from `main` the instant the scope is proven to exist. The
+    // parent reads that pipe:
+    //   - one byte => the scope was created and the box runs under `systemd-run` (our child) => become a
+    //     transparent proxy: forward the catchable fatal signals to it, wait, and `exit` with its code (0
+    //     for a detached box, whose re-exec'd kern forks the supervisor and returns so `systemd-run`
+    //     exits at once; the workload's code for `kern run`). One thin resident process on the (already
+    //     ~7-13 ms) scope path only, and there is no die-with-parent cascade to preserve here.
+    //   - EOF => `systemd-run` died before the box started => reap it and RETURN, so `box_run`/`run`
+    //     continue on the best-effort in-process cgroup path here instead of the box dying.
+    // kern is single-threaded at box start (the pump/supervisor threads spawn later), so the fork plus
+    // `Command::exec`'s argv/envp allocation in the child is safe here.
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        // Cannot build the readiness pipe: keep the historical `exec()` (no fallback here, but no worse
+        // than before this change). No PDEATHSIG: this path is `!die_with_parent`.
+        let _ = cmd.exec();
+        return;
+    }
+    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+    // The write end must survive the child's `execve` into `systemd-run` and reach the re-exec'd kern
+    // (which writes the ready byte). Both ends are `O_CLOEXEC` from `pipe2`; the CHILD clears the flag on
+    // the write end just before its exec (below), NOT here in the parent - so the parent never holds an
+    // inheritable copy that some other `execve` between now and the fork could leak. The read end stays
+    // CLOEXEC (the parent never execs). `systemd-run --scope` passes inherited fds through (verified).
+    cmd.env("KERN_SCOPE_READY_FD", write_fd.to_string());
+
+    // INVARIANT: kern is single-threaded here (the pump/supervisor threads spawn later, in
+    // run_in_sandbox / run_detached), so the child may run `Command::exec`'s allocation after the fork
+    // without an allocator-lock deadlock. A `thread::spawn` added before this point would break that;
+    // the assert makes a regression fail a debug build instead of hanging a box on the scope path.
+    debug_assert!(
+        single_threaded(),
+        "reexec fork must stay single-threaded (no thread spawned before it)"
+    );
+    match unsafe { libc::fork() } {
+        -1 => {
+            // Fork failed: close the pipe and keep the historical `exec()`.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            let _ = cmd.exec();
+        }
+        0 => {
+            // CHILD: exec `systemd-run`. Close the read end (only the parent reads), and clear the write
+            // end's close-on-exec HERE - the last point before the execve, so the fd is inheritable in
+            // the child alone. No PDEATHSIG on this path (`!die_with_parent`: detached / `kern run`).
+            unsafe {
+                libc::close(read_fd);
+                libc::fcntl(write_fd, libc::F_SETFD, 0);
+            }
+            let _ = cmd.exec();
+            // execve failed (systemd-run absent, etc.): close the write end so the parent reads EOF and
+            // falls back, then exit without touching the box.
+            unsafe {
+                libc::close(write_fd);
+                libc::_exit(127);
+            }
+        }
+        child => {
+            // PARENT (proxy): close the write end so our own read reaches EOF when the child chain closes
+            // it, then proxy. No die-with-parent to preserve on this path (detached / `kern run`).
+            unsafe { libc::close(write_fd) };
+            scope_reexec_proxy(child, read_fd);
         }
     }
-    // exec() only returns on failure → fall through to the best-effort path.
-    let _ = cmd.exec();
+}
+
+/// Arm `PR_SET_PDEATHSIG(SIGKILL)`: SIGKILL this process when its parent dies - the die-with-parent
+/// link for a foreground box. Survives a non-setuid `execve`.
+fn arm_pdeathsig() {
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+    }
+}
+
+/// The scope re-exec parent (proxy). Blocks on `read_fd` until the re-exec'd kern signals the scope is
+/// up (one byte) or the child chain closes the pipe (EOF = `systemd-run` failed before the box started).
+/// On a byte: forward the catchable fatal signals to `child` (`systemd-run`), wait for it, and `exit`
+/// with its code - never returns. On EOF: reap `child` and RETURN, so the caller falls back.
+fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
+    let mut byte = [0u8; 1];
+    let n = loop {
+        let r = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break r;
+    };
+    unsafe { libc::close(read_fd) };
+    if n <= 0 {
+        // `systemd-run` died before the scope existed. Reap the child, then fall back.
+        reap(child);
+        return;
+    }
+    // The scope is up and the box runs under `systemd-run` (our child). Forward the catchable fatal
+    // signals so Ctrl-C and a SIGTERM reach `systemd-run` (which relays them to the box) and the proxy
+    // does not die first and orphan the wait. This path is `!die_with_parent` (detached / `kern run`):
+    // there is no PDEATHSIG, and an uncatchable proxy SIGKILL simply leaves `systemd-run` and the box
+    // running - correct for a detached box, and matching `kern run`'s no-die-with-launcher contract.
+    SCOPE_PROXY_CHILD.store(child, std::sync::atomic::Ordering::SeqCst);
+    // Install via `sigaction` (the codebase convention, not `signal`): explicit persistent-handler
+    // semantics with no SysV one-shot reset, `SA_RESTART` so the `waitpid` below resumes instead of
+    // failing with EINTR, and an `sa_mask` blocking the sibling fatal signals so one forward cannot
+    // interrupt another mid-`kill`.
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = scope_proxy_forward as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        act.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut act.sa_mask);
+        for &sig in &[libc::SIGINT, libc::SIGTERM, libc::SIGQUIT, libc::SIGHUP] {
+            libc::sigaddset(&mut act.sa_mask, sig);
+        }
+        for &sig in &[libc::SIGINT, libc::SIGTERM, libc::SIGQUIT, libc::SIGHUP] {
+            libc::sigaction(sig, &act, std::ptr::null_mut());
+        }
+    }
+    let status = reap(child);
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    };
+    std::process::exit(code);
+}
+
+/// `waitpid` a child to completion, retrying on `EINTR`; returns the raw status (0 on a wait error, so
+/// a caller reading it as "exited 0" degrades safe).
+fn reap(child: libc::pid_t) -> libc::c_int {
+    let mut status: libc::c_int = 0;
+    loop {
+        let w = unsafe { libc::waitpid(child, &mut status, 0) };
+        if w < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break;
+    }
+    status
+}
+
+/// The `systemd-run` child pid, for the async-signal-safe forwarding handler in the scope proxy.
+static SCOPE_PROXY_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Async-signal-safe: relay a catchable fatal signal from the proxy to `systemd-run` (`kill` and an
+/// atomic load are both async-signal-safe).
+extern "C" fn scope_proxy_forward(sig: libc::c_int) {
+    let child = SCOPE_PROXY_CHILD.load(std::sync::atomic::Ordering::SeqCst);
+    if child > 0 {
+        unsafe { libc::kill(child, sig) };
+    }
+}
+
+/// The fd `main` should write the scope-readiness byte to, resolved from the environment. Returns
+/// `Some(fd)` ONLY for a legitimate scope re-exec: `KERN_SCOPE` must be set (the outer parent sets both
+/// it and `KERN_SCOPE_READY_FD` on the `systemd-run` command, so they always arrive together), AND the
+/// value must be a real, NON-STANDARD descriptor (> 2). This refuses a `KERN_SCOPE_READY_FD` planted in
+/// the environment by a caller without the matching re-exec, so kern never writes a stray byte to or
+/// closes its own std streams (0/1/2), or an arbitrary descriptor, on an env var's say-so.
+pub(crate) fn ready_fd_to_signal(scope_set: bool, val: Option<&std::ffi::OsStr>) -> Option<i32> {
+    if !scope_set {
+        return None;
+    }
+    let fd = val?.to_str()?.trim().parse::<i32>().ok()?;
+    (fd > 2).then_some(fd)
 }
 
 /// Per-file cap on a box's captured log. A single-generation ring (`<log>` + `<log>.1`) keeps at most
@@ -5053,6 +5438,195 @@ mod strip_ansi_tests {
                 "strip_ansi left a `[` behind in {got:?}: the sequence was cut at the ESC only"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod seccomp_resolution_tests {
+    use super::{resolve_seccomp_mode, SecurityProfile};
+    use crate::error::Error;
+    use kern_isolation::SeccompFilter;
+    use std::ffi::OsStr;
+
+    fn ok(env: Option<&OsStr>, p: Option<SecurityProfile>) -> SeccompFilter {
+        resolve_seccomp_mode(env, p).expect("resolve should succeed")
+    }
+
+    #[test]
+    fn explicit_env_wins_then_profile_then_default_no_env_mutation() {
+        // No env, no profile: default (denylist).
+        assert_eq!(ok(None, None), SeccompFilter::default());
+        // Profile untrusted, no env: allowlist.
+        assert_eq!(
+            ok(None, Some(SecurityProfile::Untrusted)),
+            SeccompFilter::Allowlist
+        );
+        // Explicit env WINS over the profile, even to weaken it (the documented precedence).
+        assert_eq!(
+            ok(
+                Some(OsStr::new("denylist")),
+                Some(SecurityProfile::Untrusted)
+            ),
+            SeccompFilter::Denylist
+        );
+        // Explicit `allowlist-audit` (LESS strict than the profile's allowlist: it logs-and-runs) also
+        // wins - "explicit wins" is unconditional, by design.
+        assert_eq!(
+            ok(
+                Some(OsStr::new("allowlist-audit")),
+                Some(SecurityProfile::Untrusted)
+            ),
+            SeccompFilter::AllowlistAudit
+        );
+        assert_eq!(
+            ok(Some(OsStr::new("allowlist")), None),
+            SeccompFilter::Allowlist
+        );
+        // Exported-but-blank counts as unset, so it falls through to the profile.
+        assert_eq!(
+            ok(Some(OsStr::new("")), Some(SecurityProfile::Untrusted)),
+            SeccompFilter::Allowlist
+        );
+    }
+
+    #[test]
+    fn a_malformed_explicit_value_fails_loud_it_does_not_downgrade_the_profile() {
+        // A SET-but-unrecognised `KERN_SECCOMP` is a usage error, NOT a silent fall to the default that
+        // would downgrade a `--security-profile untrusted` box from allowlist to denylist while it still
+        // advertises `untrusted`. With and without the profile, the outcome is an error naming the var.
+        for p in [None, Some(SecurityProfile::Untrusted)] {
+            let err = resolve_seccomp_mode(Some(OsStr::new("allowlist-audi")), p).unwrap_err();
+            assert!(
+                matches!(&err, Error::Usage(m) if m.contains("KERN_SECCOMP")),
+                "a typo'd KERN_SECCOMP must be a usage error naming the var, got {err:?}"
+            );
+        }
+        assert!(resolve_seccomp_mode(Some(OsStr::new("bogus")), None).is_err());
+    }
+
+    #[test]
+    fn a_non_utf8_value_fails_loud_it_does_not_silently_default() {
+        // A non-UTF-8 `KERN_SECCOMP` cannot be a valid token, so it must be a usage error, NOT a silent
+        // fall to the default that (under `--security-profile untrusted`) would downgrade the box while
+        // it still advertises `untrusted`. `to_str()` returns None for invalid UTF-8, and the fail-loud
+        // branch catches it exactly like a typo'd ASCII value - same class, verified here.
+        use std::os::unix::ffi::OsStrExt;
+        let bad = OsStr::from_bytes(b"\xff\xfe\x00nope"); // invalid UTF-8, non-empty
+        for p in [None, Some(SecurityProfile::Untrusted)] {
+            let err = resolve_seccomp_mode(Some(bad), p).unwrap_err();
+            assert!(
+                matches!(&err, Error::Usage(m) if m.contains("KERN_SECCOMP")),
+                "a non-UTF-8 KERN_SECCOMP must be a usage error, got {err:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod limit_policy_tests {
+    use super::resolve_limit_policy;
+    use crate::error::Error;
+
+    #[test]
+    fn require_and_allow_resolve_from_flag_or_env_and_conflict_on_resolved_values() {
+        // Neither: best-effort, no conflict.
+        assert_eq!(
+            resolve_limit_policy(false, false, false, false).ok(),
+            Some((false, false))
+        );
+        // require via flag; via env; both - all resolve to (true, false).
+        assert_eq!(
+            resolve_limit_policy(true, false, false, false).ok(),
+            Some((true, false))
+        );
+        assert_eq!(
+            resolve_limit_policy(false, true, false, false).ok(),
+            Some((true, false))
+        );
+        assert_eq!(
+            resolve_limit_policy(true, true, false, false).ok(),
+            Some((true, false))
+        );
+        // allow via flag; via env.
+        assert_eq!(
+            resolve_limit_policy(false, false, true, false).ok(),
+            Some((false, true))
+        );
+        assert_eq!(
+            resolve_limit_policy(false, false, false, true).ok(),
+            Some((false, true))
+        );
+
+        // The four contradictory combinations a flag-only parse check would MISS: flag+flag,
+        // flag(require)+env(allow), env(require)+flag(allow), env+env. Every one must be rejected.
+        for (rf, re, af, ae) in [
+            (true, false, true, false),
+            (true, false, false, true),
+            (false, true, true, false),
+            (false, true, false, true),
+        ] {
+            let err = resolve_limit_policy(rf, re, af, ae).unwrap_err();
+            assert!(
+                matches!(&err, Error::Usage(m)
+                    if m.contains("mutually exclusive") && m.contains("KERN_")),
+                "combination ({rf},{re},{af},{ae}) must be a usage error naming the env vars, got {err:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_ready_fd_tests {
+    use super::ready_fd_to_signal;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn honours_a_real_fd_only_as_the_genuine_scope_reexec() {
+        // A legitimate scope re-exec: KERN_SCOPE set + a real non-std fd.
+        assert_eq!(ready_fd_to_signal(true, Some(OsStr::new("7"))), Some(7));
+        assert_eq!(ready_fd_to_signal(true, Some(OsStr::new("  9 "))), Some(9));
+        // trimmed
+    }
+
+    #[test]
+    fn refuses_the_marker_without_the_scope_reexec() {
+        // KERN_SCOPE NOT set: a `KERN_SCOPE_READY_FD` planted in the environment by any caller is
+        // ignored, so kern never writes to / closes an fd on an env var's say-so alone.
+        assert_eq!(ready_fd_to_signal(false, Some(OsStr::new("7"))), None);
+        assert_eq!(ready_fd_to_signal(false, Some(OsStr::new("1"))), None);
+        assert_eq!(ready_fd_to_signal(false, None), None);
+    }
+
+    #[test]
+    fn never_touches_the_std_streams_or_a_malformed_value() {
+        // fds 0/1/2 (stdin/stdout/stderr) are refused even under a genuine re-exec: writing a stray byte
+        // to or closing kern's own std streams would corrupt its output. Malformed / out-of-range values
+        // are refused too, never defaulting to some fd.
+        for bad in [
+            "0",
+            "1",
+            "2",
+            "-1",
+            "abc",
+            "",
+            "  ",
+            "99999999999999999999",
+            "7x",
+            "0x7",
+        ] {
+            assert_eq!(
+                ready_fd_to_signal(true, Some(OsStr::new(bad))),
+                None,
+                "value {bad:?} must not resolve to a signalable fd"
+            );
+        }
+        // non-UTF-8 value: refused, not a panic.
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            ready_fd_to_signal(true, Some(OsStr::from_bytes(b"\xff\x37"))),
+            None
+        );
+        assert_eq!(ready_fd_to_signal(true, None), None);
     }
 }
 

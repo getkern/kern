@@ -17,7 +17,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](docs/INSTALL.md)
 
 ```sh
-# Pre-release: build from source (needs a Rust toolchain). Linux, WSL2 and ARM boards.
+# Build from source (needs a Rust toolchain). Linux, WSL2 and ARM boards.
 cargo install --git https://github.com/getkern/kern getkern --locked
 kern box dev --image alpine -it -- sh
 ```
@@ -73,9 +73,9 @@ denylist, which fleet limit is a guard rail instead of a boundary.
 
 ## Install
 
-This is a pre-release work in progress with no published binaries, so kern is built from source. It
-needs a Rust toolchain, plus a Linux kernel with unprivileged user namespaces and cgroup v2 (Linux,
-WSL2 and ARM boards alike: Raspberry Pi · Jetson · Arduino UNO Q):
+kern has no published binaries yet, so you build it from source. It needs a Rust toolchain, plus a
+Linux kernel with unprivileged user namespaces and cgroup v2 (Linux, WSL2 and ARM boards alike:
+Raspberry Pi · Jetson · Arduino UNO Q):
 
 ```sh
 cargo install --git https://github.com/getkern/kern getkern --locked
@@ -97,15 +97,17 @@ kern top                                           # live TUI: boxes, CPU/RAM, p
 kern compose stack.toml up                         # a multi-box stack (examples/) or a compose.yml
 ```
 
-Untrusted code, with the defaults doing the work:
+Untrusted code, one flag for the bundle:
 
 ```sh
-kern box job --image python:3.12-slim --read-only --cap-drop ALL --memory 256m \
+kern box job --image python:3.12-slim --security-profile untrusted --memory 256m \
   -v ./job:/w -- python3 /w/x.py
 ```
 
-No network unless you ask, a read-only root, dangerous capabilities dropped, seccomp always on.
-Ninety runnable examples, each doing one thing: [examples/](examples/).
+`--security-profile untrusted` is the seccomp **allowlist** + `--cap-drop ALL` + `--read-only` in one
+opt-in flag (spell them out by hand if you prefer); add `--require-limits` to refuse to start unless the
+memory/pids caps are actually enforced. No network unless you ask, dangerous capabilities dropped,
+seccomp always on. Ninety runnable examples, each doing one thing: [examples/](examples/).
 
 Every read verb also answers in JSON, so nothing has to parse a table:
 
@@ -179,7 +181,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.1 ms** | ~294 ms | ~281 ms |
+| Cold start, bare box | **~2.2 ms** | ~294 ms | ~281 ms |
 | Cold start, from an OCI image | **~3.4 ms** | ~294 ms | ~281 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.86 MB binary** | daemon stack | multi-binary install |
@@ -202,9 +204,8 @@ machine; yours will differ with your CPU, kernel and filesystem, which is why th
 A thousand simultaneous boxes take 0.61 s, all 1000 of them. One more live box costs 0.35 MB of real
 memory. `exec` into a running box is 0.79 ms against Docker's 43.3.
 
-Re-run on the released binary on 2026-08-03: 2.3 ms, 0.10 s, `exec` 0.66 ms. The whole table moved
-by that much on the day, **bubblewrap included**, which is the machine's state rather than kern's
-code.
+Re-run on 2026-08-03: 2.3 ms, 0.10 s, `exec` 0.66 ms. The whole table moved by that much on the day,
+**bubblewrap included**, which is the machine's state rather than kern's code.
 
 Nobody wins single-shot latency outright: the physical floor for `unshare` + `exec` is 1 to 2 ms, so
 the top tier sits inside its own run-to-run noise. At the same level of work kern is ahead of
@@ -217,8 +218,10 @@ and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
 ## Security
 
 Namespaces, a `pivot_root`, 14 dangerous capabilities dropped before exec, an always-on seccomp
-denylist of 34 syscalls, cgroup v2 limits, and a deny-by-default `/dev`. Where a boundary is
-cooperative rather than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
+denylist of 34 syscalls (an opt-in deny-by-default **allowlist** via `--security-profile untrusted` or
+`KERN_SECCOMP=allowlist`), cgroup v2 limits (`--require-limits` refuses to start unless they bind), and
+a deny-by-default `/dev`. Where a boundary is cooperative rather than kernel-enforced,
+[SECURITY.md](SECURITY.md) says so and names the bypass.
 
 You do not have to take it on trust: [pentest/](pentest/) holds four adversarial suites that assert
 those boundaries against the kernel rather than against kern's own reporting, and they run without a
@@ -246,10 +249,12 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**0.6.50.** Everything above works today and is tested: 752 Rust, 72 Python and 57 Node tests,
-clippy-clean, `cargo-deny`-clean. Semver, pre-1.0: the CLI and config surface can still change
-between minor versions, always called out in [CHANGELOG.md](CHANGELOG.md). Releases are signed tags
-and timestamped to Bitcoin ([provenance/](provenance/)).
+**The core is done. Everything above works today and is tested:** 765 Rust, 72 Python and 57 Node
+tests, clippy-clean, `cargo-deny`-clean. No versioned releases: you build from source, and the CLI
+and config surface can still change, always called out in [CHANGELOG.md](CHANGELOG.md). It is being
+tested hard on real hardware (Linux, WSL2, Raspberry Pi, Jetson, Arduino UNO Q) and refined ahead of
+a first publication. Commits and tags are signed and timestamped to Bitcoin
+([provenance/](provenance/)).
 
 ## Contributing
 

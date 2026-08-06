@@ -66,6 +66,7 @@ It has been run by hand (static `aarch64-musl` binary) on:
   (`/proc/sys/kernel/unprivileged_userns_clone` = 1, or the modern default), plus **cgroup v2**.
 - For hard memory/PID caps, a **systemd user manager** (`systemd-run --user`). Without it kern
   still runs and isolates; caps degrade to best-effort (see [SECURITY.md](SECURITY.md)).
+  `--require-limits` refuses to start rather than run uncapped; `--allow-uncapped` accepts it silently.
 - `curl` + GNU `tar` for `--image` pulls (or bring a rootfs with `--rootfs`).
 
 ## Install (ARM)

@@ -92,73 +92,107 @@ pub fn systemd_scope_mode() -> &'static str {
     }
 }
 
-/// Is the systemd manager kern would use actually present AND drivable? As root → the SYSTEM manager
-/// (`/run/systemd/system`, i.e. pid-1 systemd on a systemd host). Rootless → whether `systemd-run
-/// --user` can reach a session bus, which is the ONLY thing that makes the scope re-exec and the
+/// Is the systemd manager kern would use present AND drivable? As root -> the SYSTEM manager
+/// (`/run/systemd/system`, i.e. pid-1 systemd on a systemd host). Rootless -> whether `systemd-run
+/// --user` can reach the USER manager, the ONLY thing that makes the scope re-exec and the
 /// delegated-slice spawn work. The SINGLE definition - both the scope-skip decision and the
 /// fail-closed gate call it, no drift.
-///
-/// It once tested for a `systemd` DIRECTORY (`/run/user/<uid>/systemd`, `$XDG_RUNTIME_DIR/systemd`).
-/// That over-reports: the directory survives as a leftover on a host with no live, reachable user
-/// manager - a GitHub CI runner has `/run/user/<uid>/{systemd,bus}` present but `XDG_RUNTIME_DIR`
-/// UNSET, and there `systemd-run --user` dies with "Failed to connect to bus: No such file or
-/// directory" because libsystemd needs `XDG_RUNTIME_DIR` (or `DBUS_SESSION_BUS_ADDRESS`) to LOCATE
-/// the bus and never falls back to a `getuid`-derived path. The scope re-exec commits to an `exec()`
-/// with no fallback once systemd-run is found, so a dir-only host failed EVERY box. The bus check
-/// below mirrors libsystemd's own resolution exactly, so kern attempts systemd-run only where it works.
 pub fn user_systemd_present() -> bool {
     if as_root() {
         return std::path::Path::new("/run/systemd/system").exists();
     }
-    user_bus_reachable()
+    user_manager_reachable()
 }
 
-/// Will a `systemd-run --user` find a bus to connect to? Mirrors libsystemd's `sd_bus_default_user`
-/// EXACTLY, because any mismatch is what broke CI: it uses `$DBUS_SESSION_BUS_ADDRESS` when set,
-/// otherwise builds `unix:path=$XDG_RUNTIME_DIR/bus` and returns `-ENOENT` when `XDG_RUNTIME_DIR` is
-/// unset. It does NOT consult a `getuid`-derived `/run/user/<uid>/bus`, so neither may we: a runner
-/// has that socket present yet `XDG_RUNTIME_DIR` unset, and the tool fails there regardless. An
-/// abstract-socket address (no filesystem path) is trusted as set - a session that exported it did so
-/// deliberately and an abstract name cannot be `stat`ed. An empty env var counts as unset.
-fn user_bus_reachable() -> bool {
-    let dbus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
-        .map(|a| a.to_string_lossy().into_owned())
-        .filter(|a| !a.is_empty());
-    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+/// Will `systemd-run --user` reach the user manager? It connects to the manager's OWN control socket,
+/// `$XDG_RUNTIME_DIR/systemd/private`, and only falls back to the D-Bus session bus when that socket is
+/// absent (confirmed by strace: with a bogus `DBUS_SESSION_BUS_ADDRESS` it still connects to the private
+/// socket, and it fails only when NEITHER is reachable). So the accurate, cheap predictor is a LIVE
+/// private socket: a `connect()` there proves the manager process is up and will accept the transient
+/// scope.
+///
+/// This deliberately does NOT mirror `sd_bus_default_user` (the D-Bus session bus), which was the wrong
+/// primitive. On a host with a reachable D-Bus bus but NO user manager (a `dbus-launch` session without
+/// `systemd --user`, some CI images), the bus probe passes, `systemd-run` connects and THEN fails to
+/// find the manager, and the scope re-exec's `exec()` has already replaced kern with no fallback - so
+/// the box DIES. Probing the manager's own socket means kern commits to `systemd-run` only when the
+/// manager is provably present. Like systemd-run, this needs `XDG_RUNTIME_DIR` to locate the socket;
+/// unset -> unreachable -> best-effort (the box still starts, uncapped or fail-closed under
+/// `--require-limits`). The `/run/user/<uid>/{systemd,bus}`-leftover CI host that first broke this (dir
+/// present, `XDG_RUNTIME_DIR` unset) is caught by the same unset check, and a STALE private socket left
+/// by a dead manager is rejected by `connect()`, not mere existence.
+///
+/// The only residual is a sub-millisecond TOCTOU: the manager dies between this `connect()` and the
+/// `exec()` in `reexec_in_scope_if_possible`. Do NOT try to close it by tightening this probe - the
+/// window is STRUCTURAL to any check-then-use (the probe and the use are separate syscalls with a gap),
+/// not a matter of probe accuracy, so a better probe cannot shrink it to zero. `reexec_in_scope_if_possible`
+/// already re-probes IMMEDIATELY before the `exec()`, with no blocking I/O between, holding the window at
+/// its floor: the few instructions to `execve`. The only way to zero is to stop probing and handle the
+/// failure downstream - fork the `systemd-run`, watch it fail, fall back to best-effort - which is
+/// deferred because that rewires the launcher->systemd-run->kern->box PDEATHSIG cascade and signal/exit
+/// proxying of the WORKING path to close a window that does not occur in steady state (a user manager
+/// does not die during a box start); a net-negative trade against a regression to the common path.
+fn user_manager_reachable() -> bool {
+    let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .filter(|d| !d.as_os_str().is_empty());
-    user_bus_reachable_at(dbus.as_deref(), xdg.as_deref())
+        .filter(|d| !d.as_os_str().is_empty())
+    else {
+        // Without XDG_RUNTIME_DIR, `systemd-run --user` cannot locate the manager either: best-effort.
+        return false;
+    };
+    unix_socket_live(&xdg.join("systemd/private"))
 }
 
-/// Testable core of [`user_bus_reachable`]: the decision as a pure function of the two env values, so
-/// a unit test can drive every branch without touching the process environment.
-fn user_bus_reachable_at(
-    dbus_addr: Option<&str>,
-    xdg_runtime_dir: Option<&std::path::Path>,
-) -> bool {
-    if let Some(addr) = dbus_addr {
-        return match dbus_unix_path(addr) {
-            Some(p) => std::path::Path::new(p).exists(),
-            None => true, // abstract or non-unix transport: trust the explicit configuration
-        };
+/// Is a unix-domain socket at `path` LIVE - will a listener accept a connection? A `connect()` succeeds
+/// only when something is listening, so this separates a manager whose control socket is up from a STALE
+/// socket file left by a dead systemd user manager (where `systemd-run --user` would then die with
+/// ECONNREFUSED - the exact failure the caller avoids by taking best-effort instead). Non-blocking, so a
+/// busy listener's full backlog cannot hang the box-start path; closed at once, no data sent. On OUR OWN
+/// resource failure (fd exhaustion) it returns false, the safe direction - see the `fd < 0` branch.
+fn unix_socket_live(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: an all-zero `sockaddr_un` is a valid, fully-initialised value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // Need room for the path AND a terminating NUL (left by the zeroing) inside `sun_path`; and reject
+    // an EMBEDDED NUL, which would silently truncate the kernel's path and connect to a DIFFERENT socket
+    // than the one named. (The path is `$XDG_RUNTIME_DIR/systemd/private` and an env value cannot carry a
+    // NUL, so this is defence-in-depth, not reachable today, but a stat-free guarantee is cheap.)
+    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return false;
     }
-    // No explicit address: systemd builds `unix:path=$XDG_RUNTIME_DIR/bus` and needs BOTH the env set
-    // AND the socket present. Unset `XDG_RUNTIME_DIR` => `-ENOENT` ("Failed to connect to bus") - the
-    // CI-runner case, which now reads as unreachable and falls to best-effort (the box still starts).
-    match xdg_runtime_dir {
-        Some(dir) => dir.join("bus").exists(),
-        None => false,
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = src as libc::c_char;
     }
-}
-
-/// The `unix:path=<P>` filesystem socket from a D-Bus address list (`;`-separated `kind:k=v,…`
-/// entries), if any entry names one. None for abstract-only (`unix:abstract=…`) or non-unix addresses.
-fn dbus_unix_path(addr: &str) -> Option<&str> {
-    addr.split(';').find_map(|entry| {
-        let rest = entry.trim().strip_prefix("unix:")?;
-        rest.split(',')
-            .find_map(|kv| kv.trim().strip_prefix("path=").filter(|p| !p.is_empty()))
-    })
+    // SAFETY: textbook `socket`/`connect`/`close` with a well-formed pathname `AF_UNIX` address; the
+    // pointer is to a live stack value and `size_of::<sockaddr_un>()` bounds the read.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        // Could not even create the probe socket (fd exhaustion, or a sandbox that blocks `socket`).
+        // `systemd-run --user` opens its manager connection with the SAME primitive, so reporting the
+        // manager reachable here would hand the box to a `systemd-run` that fails for the identical
+        // reason, with no fallback. Report unreachable: best-effort start (uncapped with a warning, or
+        // fail-closed under `--require-limits`), the safe direction and consistent with the `connect`
+        // branch below. A false negative only loses cgroup delegation; a false positive kills every
+        // box, which is the exact regression this manager check exists to prevent.
+        return false;
+    }
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let rc = unsafe { libc::connect(fd, std::ptr::addr_of!(addr).cast(), len) };
+    // Only an accepted connect proves a live listener. AF_UNIX connect is immediate, so there is no
+    // EINPROGRESS to wait on; EAGAIN means a listener exists but its backlog is momentarily full, which
+    // is indeterminate for our purpose - fall to best-effort (uncapped start) rather than claim "live"
+    // and hand the box to a systemd-run that may itself fail with no fallback. Safe direction on doubt.
+    let live = rc == 0;
+    unsafe { libc::close(fd) };
+    live
 }
 
 /// Is an OUTER cgroup already enforcing this box's caps, so the direct kern.slice path must NOT be taken?
@@ -201,9 +235,20 @@ const DIRECT_MARKER: &str = "KERN_DIRECT_CAPS";
 /// them. Callers scrub an INHERITED marker first (see `box_run`), so a nested `kern` can't be
 /// poisoned by its parent's decision.
 pub fn choose_direct_cap_path() -> bool {
+    choose_direct_cap_path_given(user_systemd_present())
+}
+
+/// The same decision as [`choose_direct_cap_path`], but with the user-manager liveness passed IN. A
+/// caller that has just probed it in the same breath (the scope re-exec gates on `user_systemd_present()`
+/// immediately before calling this) would otherwise repeat the `connect()` on `systemd/private` on the
+/// box-start path. Reusing the value is sound: manager liveness is stable across the handful of
+/// instructions between that gate and here (no `exec`, no fork, no blocking I/O - only env reads), so the
+/// second probe could only ever return the same answer. `choose_direct_cap_path()` above supplies it for
+/// the standalone callers (doctor, the fleet-cap check) that have not already probed.
+pub fn choose_direct_cap_path_given(manager_present: bool) -> bool {
     if outer_enforcer_present()
         || crate::cgroup::env_flag("KERN_NO_SCOPE")
-        || !user_systemd_present()
+        || !manager_present
         || !direct_caps_available()
     {
         return false;
@@ -780,17 +825,27 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
 /// probe writes. Best-effort throughout: if the available set is unreadable, fall back to the old
 /// try-each-controller path; write errors (already-on, or the no-internal-process rule when the parent
 /// has members) are ignored either way.
-/// The controllers kern wants that a parent actually exports, formatted as a cgroup-v2
+/// The cgroup v2 controllers kern wants to delegate to a box, in a fixed emit order. Shared by
+/// [`subtree_batch`] (what to enable) and [`subtree_all_enabled`] (whether it is already enabled) so
+/// the two can never disagree on the set.
+const SUBTREE_WANT: [&str; 5] = ["memory", "pids", "cpu", "cpuset", "io"];
+
+/// Is `ctrl` present in a space-separated cgroup-v2 controller list (`cgroup.controllers` or
+/// `cgroup.subtree_control`)? EXACT token match, so `cpu` never matches `cpuset` (a substring test
+/// would), extra controllers the kernel exports (`hugetlb`, `rdma`, `misc`, …) are ignored, and
+/// surrounding whitespace/newlines are tolerated. Single-sourced so [`subtree_batch`] and
+/// [`subtree_all_enabled`] can never disagree on matching semantics.
+fn ctrl_listed(list: &str, ctrl: &str) -> bool {
+    list.split_whitespace().any(|c| c == ctrl)
+}
+
+/// The controllers kern wants that a parent actually exports (`available`), formatted as a cgroup-v2
 /// `subtree_control` batch (`"+memory +pids +cpu"`), in a fixed order. Empty when the parent exports
-/// none of them. Pure and unit-tested: EXACT token match against the space-separated
-/// `cgroup.controllers` contents, so `cpu` never matches `cpuset` (a substring test would), extra
-/// controllers the kernel exports (`hugetlb`, `rdma`, `misc`, …) are ignored, and surrounding
-/// whitespace/newlines are tolerated.
+/// none of them. Pure and unit-tested.
 fn subtree_batch(available: &str) -> String {
-    const WANT: [&str; 5] = ["memory", "pids", "cpu", "cpuset", "io"];
     let mut batch = String::with_capacity(32);
-    for ctrl in WANT {
-        if available.split_whitespace().any(|c| c == ctrl) {
+    for ctrl in SUBTREE_WANT {
+        if ctrl_listed(available, ctrl) {
             if !batch.is_empty() {
                 batch.push(' ');
             }
@@ -801,13 +856,39 @@ fn subtree_batch(available: &str) -> String {
     batch
 }
 
+/// True iff every controller kern wants AND the parent actually exports (`available`) is ALREADY
+/// present in the parent's `cgroup.subtree_control` (`current`, the enabled set). Lets
+/// [`enable_subtree_controllers`] SKIP the `subtree_control` write on the common shared-parent path:
+/// on `kern.slice` the controllers are enabled once and stay enabled until the slice is removed, so
+/// every box after the first would otherwise re-issue an identical write. That write is NOT free under
+/// concurrency - the kernel takes the global `cgroup_mutex` at entry, before discovering the write
+/// changes nothing, so N parallel box starts serialize on it. Reading `subtree_control` first takes no
+/// global lock. Vacuously true when the parent exports none of the wanted controllers (nothing to write).
+fn subtree_all_enabled(available: &str, current: &str) -> bool {
+    SUBTREE_WANT.iter().all(|ctrl| {
+        // A controller the parent does not export is not a candidate to enable, so it cannot block the
+        // skip; one it DOES export must already appear in the enabled set for the write to be a no-op.
+        !ctrl_listed(available, ctrl) || ctrl_listed(current, ctrl)
+    })
+}
+
 fn enable_subtree_controllers(parent: &std::path::Path) {
     let subtree = parent.join("cgroup.subtree_control");
     match fs::read_to_string(parent.join("cgroup.controllers")) {
         Ok(avail) => {
             let batch = subtree_batch(&avail);
             if !batch.is_empty() {
-                let _ = fs::write(&subtree, batch);
+                // Skip the write - which takes the kernel-global `cgroup_mutex` even as a no-op - when
+                // every wanted-and-available controller is already enabled (the common case for every
+                // box after the first under a shared `kern.slice`). Fall through to the write if the
+                // enabled set is unreadable or any wanted controller is missing (e.g. the slice was
+                // GC'd and freshly recreated mid-run). The read takes no global lock.
+                let already_on = fs::read_to_string(&subtree)
+                    .map(|current| subtree_all_enabled(&avail, &current))
+                    .unwrap_or(false);
+                if !already_on {
+                    let _ = fs::write(&subtree, batch);
+                }
             }
         }
         // Available set unreadable: fall back to the old best-effort probe (try each controller
@@ -826,6 +907,21 @@ const DEFAULT_MEMORY_MAX: u64 = 536_870_912;
 const DEFAULT_PIDS_MAX: &str = "512";
 /// cgroup v2 CPU period (µs) for `cpu.max`; the quota is `cores * PERIOD`.
 const CPU_PERIOD_US: u64 = 100_000;
+
+/// The `--require-limits` success gate, as a PURE decision. Factored out of [`apply_limits`] (whose live
+/// cgroup path is not exercised on every host, so a `mem_ok && pids_ok` -> `mem_ok || pids_ok` slip would
+/// pass CI silently and let a partially-capped box - a fork-bomb / OOM hole - start under a flag whose
+/// entire purpose is to refuse it) so the decision is guarded by a unit test on every run.
+/// `require_all` (the `--require-limits` flag): BOTH the memory and pids caps must have bound (read-back
+/// verified by the caller). Default: AT LEAST ONE bound is enough - partial protection beats none, and
+/// the caller warns about the rest.
+const fn caps_gate_satisfied(mem_ok: bool, pids_ok: bool, require_all: bool) -> bool {
+    if require_all {
+        mem_ok && pids_ok
+    } else {
+        mem_ok || pids_ok
+    }
+}
 
 /// Confine the current process in a fresh cgroup with memory + pid (+ optional swap / CPU quota /
 /// CPU pinning) caps. Returns the cgroup path on success (the workload, forked later, inherits it),
@@ -852,6 +948,11 @@ pub fn apply_limits(
     pids_max: Option<u64>,
     io_max: &[String],
     io_weight: Option<u64>,
+    // `--require-limits`: demand that EVERY mandatory cap (memory AND pids) actually bind, not just
+    // one of them. Tightens the success gate below from "at least one bound" to "both bound", so a
+    // host that delegates one controller and not the other refuses the box instead of running it with
+    // a silently-uncapped dimension. `false` keeps the historical best-effort "partial beats nothing".
+    require_all: bool,
 ) -> Option<CgroupGuard> {
     // cgroup v2 presents a unified hierarchy with this file at the root.
     if !PathBuf::from("/sys/fs/cgroup/cgroup.controllers").exists() {
@@ -927,7 +1028,15 @@ pub fn apply_limits(
     // no doc promise of atomic OOM termination that a warning would need to defend. Available since
     // Linux 4.19 (all supported hosts: the oldest board is 5.15).
     let _ = fs::write(child.join("memory.oom.group"), "1");
-    if !pids_ok && !mem_ok {
+    // Success gate. DEFAULT (`require_all = false`): keep the box if AT LEAST ONE mandatory cap bound -
+    // partial protection beats none, and the caller warns about the rest. `--require-limits`
+    // (`require_all = true`): demand that BOTH bound; a box that caps memory but not pids (or the
+    // reverse - a host that delegates one controller and not the other) is still a fork-bomb / OOM hole,
+    // and the whole point of the flag is that such a box does not start. `mem_ok`/`pids_ok` are already
+    // READ-BACK verified (see `wrote_real_limit`), so this decides on real enforcement, not on a
+    // syscall that merely didn't error.
+    let caps_ok = caps_gate_satisfied(mem_ok, pids_ok, require_all);
+    if !caps_ok {
         let _ = fs::remove_dir(&child);
         return None;
     }
@@ -1591,6 +1700,32 @@ mod tests {
     }
 
     #[test]
+    fn require_all_refuses_partial_delegation_memory_binds_but_pids_does_not() {
+        // A1 made explicit and automated: a host that delegates the `memory` controller but NOT `pids`
+        // (the exact partial case the synthetic-cgroup test would build). The two already-tested pieces
+        // compose here into the failure the gate exists to catch: `wrote_real_limit` reads memory.max
+        // back as a real cap (mem_ok) but the undelegated pids.max write does not stick (pids_ok=false),
+        // and under `--require-limits` (require_all) the gate must REFUSE - a box capped for RAM but not
+        // fork bombs is still a fork-bomb hole. This runs on EVERY host (no cgroup delegation needed),
+        // unlike a real synthetic-cgroup2 test; the live behaviour is separately proven on the boards.
+        let d = std::env::temp_dir().join(format!("kern-a1-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mem_ok = wrote_real_limit(&d.join("memory.max"), "67108864"); // delegated: binds
+        let pids_ok = wrote_real_limit(&d.join("absent/pids.max"), "30"); // undelegated: write fails
+        assert!(mem_ok, "memory bound");
+        assert!(!pids_ok, "pids did NOT bind");
+        assert!(
+            !caps_gate_satisfied(mem_ok, pids_ok, true),
+            "--require-limits must refuse when only one of the two mandatory caps bound"
+        );
+        assert!(
+            caps_gate_satisfied(mem_ok, pids_ok, false),
+            "the default keeps the box: partial protection (memory) beats none"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn cgroup_guard_removes_its_dir_on_drop() {
         // The RAII cleanup: dropping the guard `rmdir`s the (empty) cgroup dir, so a box never leaks a
         // `kern-box-*` cgroup. Use a real temp dir so `remove_dir` actually runs.
@@ -1713,58 +1848,143 @@ mod tests {
     }
 
     #[test]
-    fn dbus_unix_path_extracts_the_socket_and_ignores_abstract() {
-        // The common case: a plain filesystem socket.
-        assert_eq!(
-            dbus_unix_path("unix:path=/run/user/1000/bus"),
-            Some("/run/user/1000/bus")
-        );
-        // Extra key=val fields around the path.
-        assert_eq!(
-            dbus_unix_path("unix:path=/run/user/1000/bus,guid=deadbeef"),
-            Some("/run/user/1000/bus")
-        );
-        // A multi-transport list: the `unix:path` entry is honoured wherever it sits.
-        assert_eq!(
-            dbus_unix_path("tcp:host=localhost,port=1;unix:path=/tmp/bus"),
-            Some("/tmp/bus")
-        );
-        // Abstract socket carries no filesystem path.
-        assert_eq!(dbus_unix_path("unix:abstract=/tmp/dbus-AbCd,guid=x"), None);
-        // An empty path is not a path; a non-unix transport has none.
-        assert_eq!(dbus_unix_path("unix:path="), None);
-        assert_eq!(dbus_unix_path("tcp:host=localhost,port=1"), None);
+    fn subtree_all_enabled_skips_write_only_when_every_wanted_available_is_on() {
+        // The common shared-`kern.slice` steady state: parent exports memory/pids/cpu and all are
+        // already enabled -> the per-box write is a pure `cgroup_mutex` no-op and MUST be skipped.
+        assert!(subtree_all_enabled("memory pids cpu", "memory pids cpu"));
+        // A superset enabled set (extra controllers the kernel turned on) still counts as "all on".
+        assert!(subtree_all_enabled(
+            "memory pids cpu",
+            "cpuset memory io pids cpu"
+        ));
+        // Any wanted-and-available controller MISSING from the enabled set forces the write (correct:
+        // a freshly (re)created slice has an empty `subtree_control`).
+        assert!(!subtree_all_enabled("memory pids cpu", "memory pids")); // cpu not yet on
+        assert!(!subtree_all_enabled("memory pids cpu", "")); // nothing on: must write
+                                                              // Exact-token match, mirroring `subtree_batch`: `cpu` enabled must NOT satisfy a wanted `cpuset`
+                                                              // (a substring test would wrongly skip and leave cpuset unenabled).
+        assert!(!subtree_all_enabled("cpuset", "cpu"));
+        assert!(subtree_all_enabled("cpuset", "cpu cpuset"));
+        // A controller the parent does NOT export is not required, so it can't block the skip.
+        assert!(subtree_all_enabled("memory pids", "memory pids")); // cpu/cpuset/io unavailable: fine
+                                                                    // Whitespace/newline tolerance on both sides (same read shape as `cgroup.controllers`).
+        assert!(subtree_all_enabled("  memory\tpids \n", "pids   memory\n"));
+        // Every wanted controller present and enabled: the maximal skip case.
+        assert!(subtree_all_enabled(
+            "memory pids cpu cpuset io",
+            "io cpuset cpu pids memory"
+        ));
+        // Consistency with `subtree_batch`: if the batch is empty (nothing wanted available), the skip
+        // predicate is vacuously true, so `enable_subtree_controllers` writes nothing either way.
+        assert_eq!(subtree_batch("hugetlb rdma"), "");
+        assert!(subtree_all_enabled("hugetlb rdma", ""));
     }
 
     #[test]
-    fn user_bus_reachable_mirrors_sd_bus_default_user() {
-        // Drive the pure core against synthetic paths - no touching the real session bus.
-        let tmp = std::env::temp_dir().join(format!("kern-bustest-{}", unsafe { libc::getpid() }));
+    fn require_limits_gate_demands_both_caps_default_accepts_either() {
+        // `--require-limits` (require_all = true): ONLY both-bound passes. The three partial cases a
+        // fork-bomb / OOM hole would slip through MUST fail - that is the whole point of the flag, and
+        // a regression that swapped `&&` for `||` here (running a half-capped box the flag must refuse)
+        // is caught by exactly these three asserts, on every run, with no cgroup delegation required.
+        assert!(caps_gate_satisfied(true, true, true));
+        assert!(!caps_gate_satisfied(true, false, true)); // memory bound, pids did NOT: refuse
+        assert!(!caps_gate_satisfied(false, true, true)); // pids bound, memory did NOT: refuse
+        assert!(!caps_gate_satisfied(false, false, true));
+        // Default (require_all = false): at least one bound is enough - partial protection beats none.
+        assert!(caps_gate_satisfied(true, true, false));
+        assert!(caps_gate_satisfied(true, false, false));
+        assert!(caps_gate_satisfied(false, true, false));
+        assert!(!caps_gate_satisfied(false, false, false)); // nothing bound: nothing to keep
+    }
+
+    #[test]
+    fn unix_socket_live_separates_a_listener_from_a_stale_socket() {
+        let tmp = std::env::temp_dir().join(format!("kern-buslive-{}", unsafe { libc::getpid() }));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).expect("tmp dir");
-        let sock = tmp.join("bus"); // stands in for $XDG_RUNTIME_DIR/bus
-        fs::write(&sock, b"").expect("touch socket stand-in");
-        let empty = tmp.join("empty"); // an $XDG_RUNTIME_DIR with no bus
-        fs::create_dir_all(&empty).expect("empty xdg");
 
-        // An explicit `unix:path=` gates on that exact path, ignoring XDG entirely.
-        assert!(user_bus_reachable_at(
-            Some(&format!("unix:path={}", sock.display())),
-            None
-        ));
-        assert!(!user_bus_reachable_at(
-            Some(&format!("unix:path={}", tmp.join("no-bus").display())),
-            Some(&tmp) // XDG has a bus, but the explicit unix:path does not => unreachable
-        ));
-        // An abstract address is trusted even with no XDG.
-        assert!(user_bus_reachable_at(Some("unix:abstract=/tmp/x"), None));
-        // No explicit address: reachable iff XDG is set AND `$XDG/bus` exists.
-        assert!(user_bus_reachable_at(None, Some(&tmp)));
-        assert!(!user_bus_reachable_at(None, Some(&empty)));
-        // The CI-runner discriminant: no address AND no XDG => unreachable (best-effort), even though
-        // a `getuid`-derived `/run/user/<uid>/bus` may exist - systemd-run would not use it.
-        assert!(!user_bus_reachable_at(None, None));
+        // A LIVE listener: connect succeeds.
+        let live = tmp.join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&live).expect("bind live");
+        assert!(
+            unix_socket_live(&live),
+            "a listening socket must read as live"
+        );
 
+        // A STALE socket: the file exists, but nothing is listening (the manager died). This is the
+        // case `exists()` got WRONG and `connect()` gets right - the regression in a different form.
+        let stale = tmp.join("stale.sock");
+        {
+            let _l = std::os::unix::net::UnixListener::bind(&stale).expect("bind stale");
+        } // listener dropped here; the socket file remains, no listener
+        assert!(
+            stale.exists(),
+            "the stale socket file must still be present"
+        );
+        assert!(
+            !unix_socket_live(&stale),
+            "a stale socket with no listener must read as NOT live"
+        );
+
+        // A nonexistent path is not live.
+        assert!(!unix_socket_live(&tmp.join("nope.sock")));
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn unix_socket_live_rejects_adversarial_and_malformed_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        let tmp =
+            std::env::temp_dir().join(format!("kern-buslive-edge-{}", unsafe { libc::getpid() }));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir");
+
+        // Malformed inputs the guard must reject WITHOUT a syscall and without overflowing sun_path.
+        assert!(!unix_socket_live(std::path::Path::new("")), "empty path");
+        // Embedded NUL: would truncate the kernel's path and connect to a DIFFERENT socket. Rejected.
+        let nul = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0evil.sock"));
+        assert!(!unix_socket_live(nul), "embedded NUL must be rejected");
+        // A path >= sizeof(sun_path) (108 on Linux) must be rejected, not truncated into another socket.
+        let too_long = std::path::PathBuf::from(format!("/tmp/{}.sock", "a".repeat(200)));
+        assert!(
+            !unix_socket_live(&too_long),
+            "over-long path must be rejected"
+        );
+
+        // Wrong socket TYPE at the path: the manager's control socket is SOCK_STREAM. A SOCK_DGRAM
+        // socket bound there (an attacker planting the wrong type) must NOT read as live - a SOCK_STREAM
+        // connect() to it fails (EPROTOTYPE), so kern falls to best-effort instead of exec'ing into a
+        // systemd-run that would then fail.
+        let dgram_path = tmp.join("dgram.sock");
+        let _dg = UnixDatagram::bind(&dgram_path).expect("bind dgram");
+        assert!(
+            !unix_socket_live(&dgram_path),
+            "a SOCK_DGRAM socket must not read as a live SOCK_STREAM listener"
+        );
+
+        // A SYMLINK to a live listener follows through: connect() resolves the link, so it reads live.
+        let real = tmp.join("real.sock");
+        let listener = UnixListener::bind(&real).expect("bind real");
+        let link = tmp.join("link.sock");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(
+            unix_socket_live(&link),
+            "a symlink to a live listener must read as live"
+        );
+
+        // A regular FILE and a DIRECTORY at the path are not sockets: connect() fails, not live.
+        let file = tmp.join("plain.file");
+        fs::write(&file, b"not a socket").expect("write file");
+        assert!(
+            !unix_socket_live(&file),
+            "a regular file is not a live socket"
+        );
+        assert!(!unix_socket_live(&tmp), "a directory is not a live socket");
+
+        drop(listener);
         let _ = fs::remove_dir_all(&tmp);
     }
 }

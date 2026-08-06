@@ -31,8 +31,10 @@ state of the tree; full detail is in the git history.
 - A SIGKILL'd/OOM'd detached supervisor no longer leaves an unreachable "ghost": liveness reads
   `cgroup.events` `populated`; an orphan is visible (`--filter status=orphaned`) and reaped
   identity-safe against pid reuse.
-- systemd detection mirrors libsystemd's own bus resolution, so kern attempts `systemd-run --user`
-  only where it works (a dir-only host no longer fails every box).
+- systemd detection probes the user manager's own control socket (`$XDG_RUNTIME_DIR/systemd/private`,
+  what `systemd-run --user` actually connects to), so kern attempts the scope only where the manager is
+  provably up: a dir-only host, or one with a reachable D-Bus bus but no user manager, no longer fails
+  every box (it would connect and then die past kern's irreversible re-exec).
 - A non-UTF-8 argument fails validation instead of panicking.
 - The instance record is written atomically (temp + `rename`).
 - `kern doctor` write-probes the real cap target; an unenforceable cap warns instead of running
@@ -44,3 +46,31 @@ state of the tree; full detail is in the git history.
 
 - A CI gate fails, naming the syscall, when a new kernel `__NR_*` is neither allowed, denied, nor on
   the reviewed list (x86_64 + aarch64).
+- `--require-limits` (or `KERN_REQUIRE_LIMITS`): refuse to start with a non-zero exit unless the
+  memory and pids caps (including their defaults) are actually enforced, read back from the cgroup
+  (the OOM / fork-bomb backstop), instead of running best-effort UNCAPPED. cpu/cpuset stay
+  best-effort, as on the systemd-scope path (a QoS knob with no OOM/fork-bomb role). `--allow-uncapped`
+  (`KERN_ALLOW_UNCAPPED`) is the explicit inverse: accept uncapped silently on a host with no cgroup
+  delegation (nested CI). The two are mutually exclusive; the default is unchanged (warn once per
+  host, run uncapped).
+- `kern doctor` is more actionable: the multi-uid check names the commands to run (install the
+  `newuidmap`/`newgidmap` helpers, then the `/etc/subuid`/`/etc/subgid` allocation line for your user,
+  numeric-uid fallback when `$USER` is unset), not hardcoded to `apt`, and a new check reports whether
+  `pasta` is present for pod/box outbound networking. kern uses these when present and never writes
+  `/etc/subuid` or ships `pasta` itself.
+- `--security-profile <untrusted>`: an opt-in bundle (seccomp allowlist + `--cap-drop ALL` +
+  `--read-only`) for running code nobody has read, applied as a base that explicit flags and env
+  override (`--cap-add X`, `KERN_SECCOMP=...`). `--cap-add ALL` and `--privileged` are refused under it
+  (both would negate a constituent - all capabilities back, or a relaxed seccomp filter - leaving a box
+  labelled untrusted that is not); a SET-but-unrecognised `KERN_SECCOMP` is a usage error, never a
+  silent downgrade to the default denylist. Closed set; prints its resolved constituents so the macro
+  is visible. It does NOT touch Landlock (a write-allowlist needs
+  the workload's real paths; build it from an audit run) and does NOT set `--require-limits` (which
+  would break a cgroup-less host). The default is unchanged. It is a CLI/SDK flag; a compose service
+  sets the same posture through its individual keys and `KERN_SECCOMP`, not a `[box.NAME]` macro key.
+- The `kern-sandbox` SDKs (Python and Node) reach CLI parity for the above: `security_profile`
+  /`securityProfile` maps to `--security-profile`, and `require_limits`/`requireLimits` to
+  `--require-limits`. `security_profile="untrusted"` composes with the writable `-v` workspace (the
+  root goes read-only, a bound mount stays writable). Note `require_limits` is the fail-closed gate,
+  distinct from the pre-existing `enforce_limits` (which only picks the scope vs best-effort cap path)
+  and mutually exclusive with the `KERN_ALLOW_UNCAPPED` env the SDK forwards.

@@ -42,6 +42,14 @@ terminated afterwards, which is the 143. Android's `lmkd` is **not running** on 
 the cgroup doing the killing, not a host-level low-memory killer. `memory.max` reads back 33554432
 throughout.
 
+**Enforce, or refuse to start.** Where the `memory`/`pids` controllers are not delegated (footnote ¹),
+the default is to warn once and run uncapped. `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that
+fatal: the box refuses to start, non-zero, unless the memory and pids caps are **read back** from the
+cgroup as actually in force, so a fork-bomb / OOM-sensitive workload never runs believing it is capped
+when it is not. `--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) is the explicit inverse for a host with no
+delegation (nested CI): accept uncapped operation silently. The two are mutually exclusive; drop one to
+use the other. cpu/cpuset stay best-effort under both, as they carry no OOM/fork-bomb role.
+
 `cpu.max` reads the same way: `50000 100000` is half a core, `200000 100000` is two.
 
 `--pids-limit` counts **every task in the box**, not just the ones your workload forks, so the forks

@@ -195,6 +195,36 @@ pub struct SandboxSpec {
     /// host-privilege class. Every other dangerous syscall (kexec, modules, bpf, io_uring, keyring,
     /// ptrace, the NEW mount API) stays blocked even here - stronger than Docker's `--privileged`.
     pub privileged: bool,
+    /// `--require-limits` (or `KERN_REQUIRE_LIMITS`): make an unenforceable OOM/fork-bomb backstop FATAL
+    /// instead of a warning. By default a box on a host that cannot delegate a cgroup runs UNCAPPED with
+    /// a loud notice (best-effort is a legitimate configuration). With this set, "the cap binds or the
+    /// box does not start": if `apply_limits` cannot put BOTH the memory AND the pids cap (their
+    /// read-back-verified defaults included) in force, the box is refused with a non-zero exit. Scope is
+    /// deliberately memory + pids (the OOM and fork-bomb backstops): `cpu`/`cpuset` stay best-effort,
+    /// exactly as on the systemd-scope path, because they carry no default and no OOM/fork-bomb role -
+    /// refusing a box for an unenforceable cpu quota would be a regression versus the scope path, which
+    /// only warns. See `apply_limits`'s `require_all` gate.
+    ///
+    /// Caveat on the EFFECTIVE ceiling: the box's own cgroup is written the exact requested value and
+    /// read back, so `--require-limits` proves the cap is IN FORCE, not that it equals the request. A
+    /// stricter ancestor (cgroup v2 takes the minimum up the tree) can make the effective ceiling LOWER
+    /// than asked - the box still never exceeds what it requested, so the backstop holds; it is just
+    /// tighter, never looser.
+    ///
+    /// Second caveat, on a LYING environment: the guarantee is "written AND read back a non-`max`
+    /// value", not "the kernel will OOM-kill". Inside a container that exposes a writable `memory.max`
+    /// without actually delegating the controller (the write is accepted and the read-back shows the
+    /// value, yet nothing enforces it), the gate passes. Proving real enforcement needs a trial
+    /// allocation, too costly for box start. On a genuine host the read-back is the enforcement; a
+    /// nested runtime that fakes the interface is out of scope. `kern doctor` (`memory_cap_state`)
+    /// write-probes and reports the honest state for that case.
+    pub require_limits: bool,
+    /// `--allow-uncapped` (or `KERN_ALLOW_UNCAPPED`): explicitly accept running UNCAPPED where a cgroup
+    /// cannot be delegated, silencing the best-effort "runs UNCAPPED" notice. For nested CI and known
+    /// cgroup-less hosts where the notice is expected noise. It does NOT change whether the box runs
+    /// (best-effort already runs) and does NOT silence the outer-enforcer FORGERY warning (a security
+    /// signal, not a user preference). Mutually exclusive with `require_limits` (a contradiction).
+    pub allow_uncapped: bool,
     /// The seccomp filter this box runs (denylist vs opt-in allowlist), resolved ONCE by the launcher
     /// via [`crate::SeccompFilter::from_env`]. Carried here so PID 1 installs it, and recorded in the
     /// instance registry so `kern exec` reproduces the SAME filter instead of re-reading the
@@ -2449,6 +2479,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         spec.pids_max,
         &spec.io_max,
         spec.io_weight,
+        spec.require_limits, // demand BOTH memory and pids bind, not just one
     );
 
     // Under a systemd scope the caps were handed to `systemd-run` as `MemoryMax=`/`CPUQuota=`/
@@ -2471,6 +2502,19 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // Both checks below only matter when NO cap was applied; when `cg` is `Some` neither the (env + systemd
     // stat) `took_direct_cap_path()` nor the (cgroup-walking) `env_claims_enforcer_but_none_real()` runs.
     if cg.is_none() {
+        // `--require-limits`: the caller asked for "enforce or do not run". A missing cap is fatal on
+        // ANY path (best-effort included), BEFORE the warn-and-run fall-through below, so a workload
+        // that depends on the ceiling never starts believing it is capped when it is not.
+        if spec.require_limits {
+            return Err(Error::Unsupported(
+                "requested resource cap(s) could not be enforced here and --require-limits \
+                 (KERN_REQUIRE_LIMITS) is set: refusing to start. Ways out: run inside a systemd user \
+                 scope, or on a host that delegates the cgroup v2 memory/pids controllers (`kern \
+                 doctor` shows the state; on WSL2 or a Raspberry Pi add `cgroup_enable=memory` to the \
+                 kernel command line); or, to accept uncapped operation, drop --require-limits and pass \
+                 --allow-uncapped in its place (the two are mutually exclusive, not additive).",
+            ));
+        }
         if crate::cgroup::took_direct_cap_path() {
             return Err(Error::Unsupported(
                 "resource caps could not be enforced on the direct cgroup path (kern.slice delegation \
@@ -2488,7 +2532,8 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                  but NO cgroup cap is in force - the box runs UNCAPPED. If kern did not set that variable, a \
                  caller may be bypassing the resource limits."
             );
-        } else if (spec.memory_max.is_some() || spec.pids_max.is_some() || spec.cpus.is_some())
+        } else if !spec.allow_uncapped
+            && (spec.memory_max.is_some() || spec.pids_max.is_some() || spec.cpus.is_some())
             && crate::cgroup::memory_cap_enforceable()
         {
             // The box did NOT take the direct kern.slice path, no outer enforcer claims to cap it, and

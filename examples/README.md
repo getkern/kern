@@ -209,5 +209,6 @@ with truncation flags, wall time). Ideal for running LLM/agent-generated code or
 > killer feature on RAM-constrained boards.
 
 Every box gets: user + PID + network + UTS + IPC + mount namespaces, a pivoted root, an
-always-on seccomp denylist, and cgroup caps (via `systemd-run --user --scope` where available).
+always-on seccomp denylist, and cgroup caps (direct in kern's delegated `kern.slice`, or a transient
+`systemd-run --user --scope` as fallback).
 See [../SECURITY.md](../SECURITY.md) for the threat model.

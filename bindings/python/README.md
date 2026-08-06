@@ -134,8 +134,12 @@ Sandbox(
     max_output_bytes=64 << 20,  # cap on captured stdout/stderr EACH; overflow discarded, result.truncated set
     deps_readonly=False,        # True → run_code can't modify setup= deps (blocks cross-run poisoning)
     enforce_limits=True,        # hard-enforce caps via a systemd scope; False = best-effort, faster under load
+    security_profile=None,      # "untrusted" = seccomp allowlist + cap-drop ALL + read-only root, one opt-in
+    require_limits=False,       # True = FAIL-CLOSED: refuse to start unless memory/pids caps are enforced.
+                                # NOT enforce_limits (which only picks the cap PATH: scope vs best-effort);
+                                # mutually exclusive with the KERN_ALLOW_UNCAPPED env (forwarded to kern).
     cap_drop=("ALL","..."),  # capabilities dropped from every box; default drops ALL.
-                            # kern always drops 13 dangerous ones; this drops the rest,
+                            # kern always drops 14 dangerous ones; this drops the rest,
                             # which were held over the box's own user namespace. Pass
                             # cap_drop=() to keep them (needed only if the workload binds
                             # a port below 1024 INSIDE the box).
@@ -294,7 +298,8 @@ with `python -m kern_sandbox.mcp`.
 kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code. The seccomp filter is a
 **denylist**: suitable for semi-trusted agent code, **not** a hard boundary against deliberately
 hostile multi-tenant code. For that, use a microVM (Firecracker / Kata) or gVisor. A deny-by-default
-allowlist mode is on the roadmap. See the project
+seccomp **allowlist** ships as opt-in today: pass `security_profile="untrusted"` (or the
+`KERN_SECCOMP=allowlist` env); making it the default is future work. See the project
 [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
 
 ## Requirements

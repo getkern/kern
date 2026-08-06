@@ -24,9 +24,10 @@ and some may never ship if they would change what kern is. Recently shipped work
 
 **Deliberately out, not missing**
 
-- Network segmentation between services, `deploy.replicas`, `docker.sock` / Engine API,
-  `--privileged`. These follow from rootless + daemonless + one pod as the unit of isolation, not
-  from missing work.
+- Network segmentation between services, `deploy.replicas`, `docker.sock` / Engine API, and the compose
+  `privileged:` service key. These follow from rootless + daemonless + one pod as the unit of isolation,
+  not from missing work. (The CLI `kern box --privileged` exists, and relaxes exactly five syscalls for
+  nesting; see [SECURITY.md](SECURITY.md).)
 
 > A stack is one pod. Within that model kern is complete: what is listed above as out is a
 > consequence of the model, not a gap in it.

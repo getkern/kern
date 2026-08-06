@@ -162,11 +162,20 @@ box can read `/proc/sys` but not write it, verified against `core_pattern`.
 
 ## Resource caps
 
-With a systemd **user** manager present, `kern box` runs inside a transient scope with
-`MemoryMax`/`TasksMax`, so fork bombs and OOM are cgroup-enforced. Without it a best-effort cgroup v2
-path applies where the hierarchy is delegated, else it is skipped gracefully: on a host with
-**neither**, containment is not guaranteed. `--pids-limit N` sets `pids.max`, default 512, on the
-same terms.
+Inside the systemd **user** manager's tree, `kern box` caps directly in its delegated `kern.slice`;
+where that is out of reach it falls back to a transient `systemd-run --user --scope` with
+`MemoryMax`/`TasksMax`. Either way fork bombs and OOM are cgroup-enforced, verified by read-back.
+Without a user manager a best-effort cgroup v2 path applies where the hierarchy is delegated, else it
+is skipped gracefully: on a host with **neither**, containment is not guaranteed. `--pids-limit N`
+sets `pids.max`, default 512, on the same terms.
+
+**`--require-limits` makes the uncapped fallback fatal.** With it (or `KERN_REQUIRE_LIMITS`) a box
+refuses to start, non-zero, unless the memory and pids caps are actually in force, **read back from
+the cgroup** rather than merely written: the OOM / fork-bomb backstop, never a box that runs believing
+it is capped when it is not. cpu/cpuset stay best-effort, as they carry no containment role.
+`--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) is the explicit inverse, for a host with no cgroup
+delegation (nested CI): accept uncapped operation silently instead of the once-per-host warning. The
+two are mutually exclusive; the default is unchanged (warn once, run uncapped).
 
 **`kern exec` and the box's caps.** An exec'd command inherits them **only where the box sits in a
 delegated cgroup kern can write**. On the rootless per-box-scope path (an SSH login on an edge board,
@@ -178,6 +187,16 @@ box's full limit, so N execs could use N times the box's memory.
 
 ## Flags that change the posture
 
+- **`--security-profile untrusted`** is an opt-in bundle for code nobody has read: the seccomp
+  **allowlist** (deny-by-default: only a reviewed set of syscalls is permitted, stricter than the
+  always-on denylist), **`--cap-drop ALL`**, and **`--read-only`** root, applied as a BASE that explicit
+  flags still override. `--cap-add ALL` and `--privileged` are **refused** under it (each would negate a
+  constituent, leaving a box labelled untrusted that is not), and a SET-but-unrecognised `KERN_SECCOMP`
+  is a usage error rather than a silent downgrade. It prints its resolved constituents (the real seccomp
+  mode and any surviving `--cap-add`), so the label cannot lie. It does **not** touch Landlock (which
+  needs the workload's real write paths) or set `--require-limits` (which would break a cgroup-less
+  host). A CLI/SDK flag, not a compose key: a compose service reaches the same posture through its
+  individual keys and `KERN_SECCOMP`.
 - **`--user UID[:GID]`** drops the workload after all privileged setup and the capability drop. Only
   ids mapped into the box's user namespace work, so a non-root `--user` implies the uid/gid-range
   mapping. It **fails closed**: if the id cannot be mapped the box refuses to start rather than
