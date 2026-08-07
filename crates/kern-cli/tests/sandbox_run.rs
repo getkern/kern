@@ -396,6 +396,100 @@ fn box_detached_appears_in_ps_then_prunes() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// `kern ps -a` surfaces a box that has EXITED (from the `waitexit` breadcrumb) with its exit code,
+/// while plain `kern ps` still shows only the live ones - Docker's `ps -a`, without kern becoming a
+/// stateful container store (the breadcrumb is reaped by `gc`). Regression guard for the exit-record
+/// format: the code must round-trip through the multi-line sidecar and render as `exited (7)`.
+#[test]
+fn box_ps_dash_a_shows_an_exited_box_with_its_exit_code() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "psa");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-psa-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    // A detached box that exits promptly with a KNOWN non-zero code.
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "psadead",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "detached start should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The supervisor writes the `waitexit` breadcrumb AFTER the box exits, so poll. `ps -a --json`
+    // must show `psadead` with `exit_code 7`; the LIVE-only `ps` must NOT (it is pruned on read).
+    let mut saw_exited = false;
+    for _ in 0..80 {
+        let all = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "-a", "--json"])
+            .output()
+            .expect("run kern");
+        let s = String::from_utf8_lossy(&all.stdout);
+        if s.contains("psadead") && s.contains("\"exit_code\":7") {
+            let live = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["ps", "--json"])
+                .output()
+                .expect("run kern");
+            assert!(
+                !String::from_utf8_lossy(&live.stdout).contains("psadead"),
+                "an exited box must appear only in `ps -a`, never in plain `ps`"
+            );
+            saw_exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        saw_exited,
+        "ps -a should list the exited box with exit_code 7 within ~8s"
+    );
+
+    // The same exited row renders through `--format`, proving the exit code survived the round-trip.
+    let fmt = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["ps", "-a", "--format", "{{.Names}} {{.Status}}"])
+        .output()
+        .expect("run kern");
+    assert!(
+        String::from_utf8_lossy(&fmt.stdout).contains("psadead exited (7)"),
+        "ps -a --format should render the exited status: {}",
+        String::from_utf8_lossy(&fmt.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
 #[test]
 fn inspect_shows_detail_then_prune_reclaims_logs() {
     let Some(busybox) = static_busybox() else {
@@ -2847,5 +2941,182 @@ fn exec_refuses_a_box_whose_security_profile_was_not_recorded() {
     assert!(
         err.contains("security profile was recorded") || err.contains("cannot be reconstructed"),
         "the refusal must name the cause; got stderr: {err}"
+    );
+}
+
+/// The memory cap is a real OOM backstop, not just a number written to the cgroup: a box that
+/// allocates past `-m` is OOM-killed (exit 137). Bounded to ~128 MiB so that where the cap does NOT
+/// bind (no cgroup delegation - a CI sandbox, WSL2 without cgroup_enable=memory) the box merely
+/// allocates 128 MiB and exits 0, which we treat as a skip - never a host-OOMing runaway.
+#[test]
+fn box_memory_cap_oom_kills_an_over_allocation() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "oomcap");
+    let rootfs = root.to_str().unwrap();
+    // awk doubles a 1-char string 27 times -> ~128 MiB, well over the 64 MiB cap. Capped, the box is
+    // OOM-killed before it gets there; uncapped, it finishes and exits 0.
+    let out = kern()
+        .args([
+            "box",
+            "oomcap",
+            "--rootfs",
+            rootfs,
+            "-m",
+            "64m",
+            "--",
+            "/bin/busybox",
+            "awk",
+            "BEGIN{s=\"x\";for(i=0;i<27;i++){s=s s};print length(s)}",
+        ])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let _ = fs::remove_dir_all(&root);
+    if err.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    // `memory.oom.group=1` kills the WHOLE box cgroup, and the foreground supervisor is a member of
+    // it, so the `kern box` process is itself SIGKILL'd - `code()` is None (signal death), which the
+    // shell reports as 137 but `ExitStatus` reports as `signal()==SIGKILL`. Accept either that or a
+    // recorded 137 exit; only a clean success (0) means the cap did not bind (skip).
+    use std::os::unix::process::ExitStatusExt;
+    let oom = out.status.code() == Some(137) || out.status.signal() == Some(libc::SIGKILL);
+    match () {
+        _ if oom => eprintln!("verified: -m 64m OOM-killed the over-allocation"),
+        _ if out.status.success() => {
+            eprintln!("skip: memory cap not enforced here (box allocated ~128 MiB uncapped)")
+        }
+        _ => {
+            panic!(
+                "expected OOM (137 / SIGKILL) or 0 (uncapped skip), got code={:?} signal={:?} (stderr: {err})",
+                out.status.code(),
+                out.status.signal()
+            )
+        }
+    }
+}
+
+/// `kern cp` round-trips a file host -> box -> host byte-identically, into and out of a detached box.
+#[test]
+fn box_cp_round_trips_a_file_host_box_host() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "cprt");
+    let rootfs = root.to_str().unwrap();
+    let up = kern()
+        .args([
+            "box",
+            "cprt",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("run kern");
+    let uperr = String::from_utf8_lossy(&up.stderr);
+    if uperr.contains("user namespaces") {
+        let _ = fs::remove_dir_all(&root);
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    if !up.status.success() {
+        let _ = fs::remove_dir_all(&root);
+        eprintln!("skip: box did not start (stderr: {uperr})");
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let tmp = std::env::temp_dir().join(format!("kern-it-cp-{}", std::process::id()));
+    let _ = fs::create_dir_all(&tmp);
+    let src = tmp.join("in.bin");
+    let dst = tmp.join("out.bin");
+    let data: Vec<u8> = (0u32..4096).map(|i| i.wrapping_mul(7) as u8).collect();
+    fs::write(&src, &data).unwrap();
+    kern()
+        .args(["cp", src.to_str().unwrap(), "cprt:/in.bin"])
+        .output()
+        .ok();
+    kern()
+        .args(["cp", "cprt:/in.bin", dst.to_str().unwrap()])
+        .output()
+        .ok();
+    let round_trips = fs::read(&dst).ok().as_deref() == Some(data.as_slice());
+    kern().args(["stop", "cprt"]).output().ok();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        round_trips,
+        "kern cp host->box->host must be byte-identical"
+    );
+}
+
+/// `KERN_MAX_CONCURRENT=N` admits exactly N live boxes and refuses the overflow. `#[ignore]`d: the
+/// fleet cap is HOST-GLOBAL, so the parallel suite's other boxes would count toward it and make the
+/// tally non-deterministic. Run it alone: `cargo test -- --ignored box_fleet_cap`.
+#[test]
+#[ignore]
+fn box_fleet_cap_admits_exactly_n_refuses_the_rest() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "fleetcap");
+    let rootfs = root.to_str().unwrap();
+    let n = 2;
+    let mut admitted = 0;
+    for i in 0..(n + 2) {
+        let name = format!("fleetcap{i}");
+        let out = kern()
+            .env("KERN_MAX_CONCURRENT", n.to_string())
+            .args([
+                "box",
+                &name,
+                "--rootfs",
+                rootfs,
+                "-d",
+                "--",
+                "/bin/busybox",
+                "sleep",
+                "30",
+            ])
+            .output()
+            .expect("run kern");
+        if i == 0 && String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+            let _ = fs::remove_dir_all(&root);
+            eprintln!("skip: userns unavailable at runtime");
+            return;
+        }
+        if out.status.success() {
+            admitted += 1;
+        }
+    }
+    for i in 0..(n + 2) {
+        kern().args(["stop", &format!("fleetcap{i}")]).output().ok();
+    }
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        admitted, n,
+        "KERN_MAX_CONCURRENT={n} must admit exactly {n} live boxes, got {admitted}"
     );
 }

@@ -161,8 +161,13 @@ fn every_flag_the_parser_accepts_is_advertised_in_help() {
                 continue;
             }
             found += 1;
-            // `--quiet` is the long spelling of `-q`; help shows one of a synonym pair, which is fine.
-            let synonyms: &[(&str, &str)] = &[("--quiet", "-q"), ("-q", "--quiet")];
+            // `--quiet`/`-q` and `--all`/`-a` are synonym pairs; help shows one of the pair, which is fine.
+            let synonyms: &[(&str, &str)] = &[
+                ("--quiet", "-q"),
+                ("-q", "--quiet"),
+                ("--all", "-a"),
+                ("-a", "--all"),
+            ];
             let alt_ok = synonyms.iter().any(|(a, b)| *a == flag && line.contains(b));
             assert!(
                 line.contains(flag) || alt_ok,

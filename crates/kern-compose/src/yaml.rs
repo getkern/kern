@@ -1831,7 +1831,21 @@ fn service_to_box(
             // stack authored in YAML can use a host rootfs dir instead of an OCI image.
             "rootfs" => b.rootfs = node.scalar.as_deref().map(scalar_str),
             "bind_rootfs" => b.bind_rootfs = scalar_is_true(node),
-            "container_name" => {} // kern names the box by the service key; ignore
+            // Honour Docker's `container_name:` as the box's exact name (see `ComposeBox`), so
+            // `docker exec <name>` ports 1:1. Trimmed; an empty value falls back to the default name.
+            // VALIDATE it as a `BoxName` (like the service key at the top): it becomes `b.name` and is
+            // printed to the operator by `compose up` BEFORE the spawned `kern box` could reject it, so
+            // an unvalidated value from a third-party file (`container_name: "x\e[2J…"`) would inject
+            // terminal-control bytes into the operator's screen. Reject at parse time instead.
+            "container_name" => {
+                let cn = node.scalar.as_deref().map(scalar_str);
+                if let Some(cn) = cn.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    kern_common::BoxName::parse(cn).map_err(|e| {
+                        format!("service '{name}': invalid container_name '{cn}': {e}")
+                    })?;
+                    b.container_name = Some(cn.to_string());
+                }
+            }
             "command" => b.command = command_value(node),
             "entrypoint" => {
                 let (ep, shell_form) = entrypoint_value(node);
@@ -3893,6 +3907,32 @@ services:
         assert!(
             app.memory.is_none(),
             "a mistyped limits key must not silently map a cap"
+        );
+    }
+
+    #[test]
+    fn container_name_is_captured_and_empty_falls_back() {
+        // Docker's `container_name:` is captured (compose() then names the box this exactly, so
+        // `docker exec <name>` ports 1:1); an empty value falls back to the default project name.
+        let y = "services:\n  db:\n    image: alpine\n    container_name: usbim-postgres\n  bare:\n    image: alpine\n    container_name: \"\"\n";
+        let boxes = parse(y).unwrap();
+        assert_eq!(
+            boxes
+                .iter()
+                .find(|b| b.name == "db")
+                .unwrap()
+                .container_name
+                .as_deref(),
+            Some("usbim-postgres")
+        );
+        assert!(
+            boxes
+                .iter()
+                .find(|b| b.name == "bare")
+                .unwrap()
+                .container_name
+                .is_none(),
+            "an empty container_name must fall back to the default <project>-<service> name"
         );
     }
 

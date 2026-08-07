@@ -35,8 +35,9 @@ pub fn mark_start() {
 
 /// `$XDG_RUNTIME_DIR/kern/runstats` (falling back to `/run/user/<uid>` then `/tmp/kern-<uid>`), the
 /// same runtime-dir resolution as the box registry - so writer (`kern run`) and reader (`kern top`)
-/// agree on the file without a shared constant.
-fn path() -> std::path::PathBuf {
+/// agree on the file without a shared constant. `pub(crate)` so the volume guard can add this FILE's
+/// dev/ino to the non-mountable identity set (it is a runtime registry child, not a directory).
+pub(crate) fn path() -> std::path::PathBuf {
     if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
         return std::path::PathBuf::from(x).join("kern/runstats");
     }

@@ -210,41 +210,122 @@ fn exit_dir() -> io::Result<PathBuf> {
     runtime_subdir("exit")
 }
 
-/// The registry directories `kern exec` and the fleet-count TRUST: `instances/` (per-box capability/
-/// seccomp posture records), `claims/` (fleet-count name claims), and the exit-status dir. A box that
-/// bind-mounts any of these - or a parent that contains one - can write a well-formed record for a
-/// PEER box and elevate that peer's `kern exec` (proven: forge `capdropall=0` + `capadds=21`, then the
-/// peer's `exec` runs with CAP_SYS_ADMIN re-added). `parse_volumes` refuses such a `-v`; named volumes
-/// and logs live in SIBLING trees and stay mountable. Only EXISTING dirs are returned - a fallback
-/// root the session never reached holds nothing to protect - each canonicalized so a symlinked runtime
-/// dir can't sidestep the containment comparison.
+/// AUTHORITATIVE registry children: those whose records kern READS and ACTS ON for ANOTHER box, so a
+/// forged record steers kern against a peer - plus `ssh/`, whose per-box host keys are a cross-box
+/// SECRET. NONE may be bind-mounted into a box.
+///  * `instances` / `claims` - forge a peer's capability/seccomp posture → its `kern exec` re-adds caps.
+///  * `exit` - forge a compose completion → `depends_completed` releases a dependent early.
+///  * `waitexit` - forge an exited-box record → the operator's `kern ps -a` shows arbitrary rows.
+///  * `health` - forge a peer's health → `--health-action restart|stop` acts on that peer's process
+///    (worse than display: kern signals a box on the attacker's word).
+///  * `pods` - forge `holder`/`netns` → `kern box --pod` `setns`es into a victim's namespaces, or a
+///    teardown SIGKILLs the victim pid recorded as the holder.
+///  * `ssh` - reading a peer's generated sshd host key lets a box impersonate that peer's `--ssh` server.
+///
+/// [`trusted_state_dirs`] and [`guarded_identities`] are DERIVED from this ONE list, and
+/// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
+/// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
+/// that let `waitexit/` ship mountable.
+const AUTHORITATIVE_DIRS: [&str; 7] = [
+    "instances",
+    "claims",
+    "exit",
+    "waitexit",
+    "health",
+    "pods",
+    "ssh",
+];
+
+/// Registry children that are OPAQUE box DATA kern never interprets: mounting one is access to a peer
+/// box's own bytes - the same operator foot-gun as `-v /home/other`, not a forgeable control record.
+/// `logs` is a box's captured output; `scratch` is its overlay upper/work. (`volumes/` is a SIBLING
+/// tree under `$XDG_DATA_HOME`, not a registry child, and is mountable by design - the named-volume
+/// mechanism itself; `runstats` is a single cosmetic counter FILE `kern top` only displays.)
+///
+/// One consequence worth stating: because `scratch/` holds a box's overlay UPPER, an operator who
+/// mounts a peer's `scratch/` writable into another box AND `kern commit`s that peer while it runs lands
+/// the mounted box's bytes in the PUBLISHED image. It stays a foot-gun (an operator `-v`, never in-box
+/// code), but the effect leaves the box - a published artefact - so it is documented, not silent.
+const BOX_DATA_DIRS: [&str; 2] = ["logs", "scratch"];
+
+/// The classification CHOKEPOINT: every function that builds a `<runtime>/kern/<name>` path calls this,
+/// so a registry-root child cannot be created without being in a class. A new unclassified `name` would
+/// default to MOUNTABLE - the exact way `waitexit/` shipped as a hole - so it trips here in debug/test
+/// builds (compiled out of release: zero cost). `runtime_subdir`, `pod::pods_root` and `scratch_dir` all
+/// route through it even though they diverge on how they RESOLVE the path; the check is on the NAME, not
+/// the resolution. A static gate (`scripts/registry-classified.py`) is the compile-time backstop for a
+/// future constructor that forgets to call it.
+pub(crate) fn assert_registry_child(name: &str) {
+    debug_assert!(
+        AUTHORITATIVE_DIRS.contains(&name) || BOX_DATA_DIRS.contains(&name),
+        "unclassified registry child {name:?}: add it to AUTHORITATIVE_DIRS (kern reads and acts on it \
+         for another box, or it is a cross-box secret) or BOX_DATA_DIRS (opaque box bytes)"
+    );
+}
+
+/// The path of each AUTHORITATIVE child, asked of the function that OWNS it, never reconstructed: `pods/`
+/// comes from `pod::pods_root` (its real resolver), the rest from `existing_runtime_subdir` (the
+/// non-creating sibling of `runtime_subdir`, THEIR resolver's candidate list). Since the inverted guard
+/// now refuses the whole root minus the box-data allowlist, the DIRECT mount of every authoritative dir
+/// is caught by containment regardless of resolver; this exact path only feeds the dev/ino ALIAS check
+/// ([`guarded_identities`]), where a reconstruction that missed a divergent resolver would let a `mount
+/// --bind` of that dir slip through. A future divergent-resolver dir turned authoritative needs its real
+/// resolver added here (its DIRECT mount is already safe).
+fn authoritative_paths() -> impl Iterator<Item = PathBuf> {
+    AUTHORITATIVE_DIRS.iter().filter_map(|leaf| match *leaf {
+        "pods" => Some(crate::pod::pods_root()),
+        // NON-creating (`existing_runtime_subdir`, not `runtime_subdir`): resolving the identity set must
+        // not mkdir authoritative dirs (`ssh/`, `claims/`, …) that no box has needed yet. `pods_root`
+        // already only joins.
+        other => existing_runtime_subdir(other),
+    })
+}
+
+/// The AUTHORITATIVE dir paths, DERIVED from [`AUTHORITATIVE_DIRS`], each canonicalized. The live guard
+/// no longer enumerates these (it refuses the whole root minus the box-data allowlist - see
+/// [`path_overlaps_trusted_state`]); this survives only so the anti-forgery TESTS can assert every
+/// authoritative dir is still refused in every canonical/bind form.
+#[cfg(test)]
 pub fn trusted_state_dirs() -> Vec<PathBuf> {
-    [dir(), claims_dir(), exit_dir()]
-        .into_iter()
-        .filter_map(Result::ok)
+    authoritative_paths()
         .filter_map(|d| fs::canonicalize(d).ok())
         .collect()
 }
 
-/// The `(device, inode)` identity of each guarded registry location: the registry ROOT
-/// (`<runtime>/kern`, a bind of which exposes all three children) plus `instances/`, `claims/`, and the
-/// exit dir. Identity is what a bind mount CANNOT forge: `mount --bind <registry> /elsewhere` gives
-/// `/elsewhere` a different canonical path but the SAME dev+ino, so a path-only matcher would wave a
-/// `-v /elsewhere:/dst` through. Mirrors the vgpio device guard, which already denies by major/minor
-/// identity rather than by name - the same question, now answered the same way in both places.
+/// TEST-ONLY: CREATE every authoritative registry dir (`<root>/kern/<leaf>`). Production resolves the
+/// identity set NON-creatingly ([`existing_runtime_subdir`]), so a test that needs these dirs present -
+/// to canonicalize their forms or read their dev+ino - must materialize them explicitly rather than lean
+/// on a side effect. `runtime_subdir("pods")` creates the same path `pod::pods_root` resolves to.
+#[cfg(test)]
+pub(crate) fn materialize_authoritative_dirs_for_test() {
+    for leaf in AUTHORITATIVE_DIRS {
+        let _ = runtime_subdir(leaf);
+    }
+}
+
+/// The canonical registry ROOT `<runtime>/kern` (parent of `instances/`), or `None` if it does not
+/// resolve. Canonicalized so the containment test below matches the canonicalized `-v` source.
+fn registry_root() -> Option<PathBuf> {
+    dir()
+        .ok()
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(|r| fs::canonicalize(r).ok())
+}
+
+/// The `(device, inode)` identity of each NON-mountable registry location a `mount --bind` alias could
+/// smuggle in: the registry ROOT, every [`AUTHORITATIVE_DIRS`] child, and the `runstats` counter FILE.
+/// A bind of one of these to `/elsewhere` gives `/elsewhere` a different canonical path but the SAME
+/// dev+ino, which the PATH check in [`path_overlaps_trusted_state`] would miss and this catches - the
+/// same identity approach as the vgpio device guard. BOX_DATA children are deliberately NOT here: a bind
+/// alias of `logs/`/`scratch/` is as mountable as the dir itself.
 fn guarded_identities() -> Vec<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    let mut paths: Vec<PathBuf> = [dir(), claims_dir(), exit_dir()]
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect();
-    if let Some(root) = paths
-        .first()
-        .and_then(|p| p.parent())
-        .map(Path::to_path_buf)
-    {
-        paths.push(root); // `<runtime>/kern`, the root the three trust-bearing dirs share
+    let mut paths: Vec<PathBuf> = authoritative_paths().collect();
+    if let Some(root) = registry_root() {
+        paths.push(root);
     }
+    paths.push(crate::runstats::path()); // the cosmetic counter FILE (still non-mountable)
     paths
         .iter()
         .filter_map(|p| fs::metadata(p).ok())
@@ -252,27 +333,57 @@ fn guarded_identities() -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// Would bind-mounting `src` (already canonicalized) expose a trust-bearing registry dir? True if
-/// `src` IS one, lives INSIDE one, or is an ANCESTOR that contains one (PATH check) - OR if `src`
-/// resolves, by dev+ino IDENTITY, onto a guarded dir even though its path does not overlap, which is
-/// exactly what a `mount --bind` of the registry to another location produces.
+/// Would bind-mounting `src` (already canonicalized) into a box expose registry state it must not
+/// reach? INVERTED DEFAULT: anything resolving under the runtime registry root is refused UNLESS its
+/// top-level child is an explicitly-mountable [`BOX_DATA_DIRS`] dir. So a child added tomorrow (as
+/// `runstats` was) is non-mountable by OMISSION, not mountable by omission - the class the `waitexit/`
+/// miss lived in, closed at the root instead of one dir at a time. Three shapes are refused:
+///  * a source UNDER the root whose first component is not a box-data child (`instances/…`, `runstats`,
+///    or any unclassified future child),
+///  * the root itself OR an ANCESTOR that contains it (`-v $XDG_RUNTIME_DIR:/x` exposes it by traversal),
+///  * a `mount --bind` ALIAS whose canonical path is elsewhere but whose dev/ino is the root or a
+///    non-box-data child (identity, which the path check alone would wave through).
 pub fn path_overlaps_trusted_state(src: &Path) -> bool {
-    if dirs_overlap(src, &trusted_state_dirs()) {
-        return true;
-    }
     use std::os::unix::fs::MetadataExt;
-    match fs::metadata(src) {
-        Ok(m) => guarded_identities().contains(&(m.dev(), m.ino())),
-        Err(_) => false,
+    let Some(root) = registry_root() else {
+        return false;
+    };
+    if let Some(verdict) = mount_refused_by_path(src, &root) {
+        return verdict;
     }
+    // Not under the root by path. Only a `mount --bind` ALIAS remains (a different canonical path
+    // carrying a registry dir's dev/ino). A bind alias shares the registry FILESYSTEM's device, so a
+    // `src` on a DIFFERENT device CANNOT be one - short-circuit before building the identity set, which
+    // otherwise `metadata`s ~9 registry dirs on EVERY normal `-v`/`--rootfs` (a `/home` source, on the
+    // real disk not the runtime tmpfs, hits exactly this fall-through). `root` is resolved ONCE here and
+    // in `mount_refused_by_path` above.
+    let (Ok(sm), Ok(rm)) = (fs::metadata(src), fs::metadata(&root)) else {
+        return false;
+    };
+    if sm.dev() != rm.dev() {
+        return false;
+    }
+    guarded_identities().contains(&(sm.dev(), sm.ino()))
 }
 
-/// Does `src` overlap ANY dir in `dirs`, in either direction (src inside a dir, or a dir inside src)?
-/// Component-wise (`Path::starts_with`), so a sibling like `<root>/kern-other` is NOT a false
-/// positive. Pure, so the containment logic is unit-tested without touching the filesystem.
-fn dirs_overlap(src: &Path, dirs: &[PathBuf]) -> bool {
-    dirs.iter()
-        .any(|d| src.starts_with(d) || d.starts_with(src))
+/// The PATH half of [`path_overlaps_trusted_state`], PURE so the inversion is unit-tested without a
+/// filesystem. `Some(true)` = refuse, `Some(false)` = allow (a box-data child), `None` = no path
+/// overlap, the caller falls through to the dev/ino identity check.
+fn mount_refused_by_path(src: &Path, root: &Path) -> Option<bool> {
+    if let Ok(rel) = src.strip_prefix(root) {
+        // Under the root (or IS the root when `rel` is empty): mountable ONLY if the first component is
+        // a box-data child. Empty `rel` -> no component -> refused (the root itself).
+        return Some(
+            !rel.components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .is_some_and(|name| BOX_DATA_DIRS.contains(&name)),
+        );
+    }
+    if root.starts_with(src) {
+        return Some(true); // src is an ANCESTOR of the root - mounting it exposes the whole registry
+    }
+    None
 }
 
 /// Record a completed box's final exit code under compose's stack+run-scoped `key`
@@ -314,9 +425,20 @@ fn waitexit_dir() -> io::Result<PathBuf> {
 /// Record a completed box's exit code for `kern wait`, keyed `<pid>-<starttime>`. Written by the
 /// detached supervisor as its LAST act (before it unregisters) and by `stop`/`kill` (which SIGKILL the
 /// supervisor before it can record its own). Best-effort.
-pub fn set_box_exit(pid: i32, starttime: u64, code: i32) {
+pub fn set_box_exit(pid: i32, starttime: u64, code: i32, name: &str, pod: &str, command: &str) {
     if let Ok(d) = waitexit_dir() {
-        let _ = fs::write(d.join(format!("{pid}-{starttime}")), code.to_string());
+        // Multi-line so `kern ps -a` can render the box that exited (its name, pod, command), not only
+        // the code `kern wait` needs. Line 1 stays the BARE code, so `box_exit` - and any pre-existing
+        // bare-code sidecar from an older kern - still parses. The command is flattened to one line (the
+        // record is line-delimited) and CAPPED: it is a display string, and an unbounded argv must not
+        // set the sidecar's on-disk size - the dir is bounded by count, not by any single record.
+        let command: String = command
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .take(512)
+            .collect();
+        let body = format!("{code}\n{name}\n{pod}\n{command}");
+        let _ = fs::write(d.join(format!("{pid}-{starttime}")), body);
     }
 }
 
@@ -327,7 +449,70 @@ pub fn box_exit(pid: i32, starttime: u64) -> Option<i32> {
     waitexit_dir()
         .ok()
         .and_then(|d| fs::read_to_string(d.join(format!("{pid}-{starttime}"))).ok())
-        .and_then(|s| s.trim().parse().ok())
+        // Line 1 is the code (the record grew extra lines for `ps -a`); a bare-code sidecar is line 1
+        // alone, so both formats read here.
+        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse().ok()))
+}
+
+/// Reap the `waitexit` sidecars of a stack's boxes on `compose down`: those whose recorded pod == `pod`
+/// AND whose name is one of `names`. So `compose ps -a` is empty after a teardown (matching Docker),
+/// while `compose stop` leaves the exited services visible. Scoped to the pod AND the caller's OWN
+/// service names - the exact scoping `clear_exit_matching` uses for the compose `exit/` dir - so a
+/// foreign box's record is never touched. Two residuals remain, both a lost diagnostic record and never
+/// a misattribution, both the class `exit/` already accepts. FIRST, another run - CONCURRENT or a PRIOR
+/// one not yet `gc`ed - that shares BOTH the pod name and a service name (two checkouts of the same
+/// project reach this with no live overlap): a run token would not help, since `down` never learns the
+/// `up`'s token, exactly as `exit/` reaps every token for a name rather than a specific one. SECOND, a
+/// service RENAMED between `up` and `down`, whose old-name record is not in `names` and so is left for
+/// the `WAITEXIT_SHOW_SECS` read-reap instead of being cleared here. Best-effort; returns the count.
+pub fn clear_waitexit_pod(pod: &str, names: &[String]) -> usize {
+    let Ok(d) = waitexit_dir() else { return 0 };
+    let mut n = 0usize;
+    if let Ok(rd) = fs::read_dir(&d) {
+        for e in rd.flatten() {
+            if waitexit_split(&e.file_name()).is_none() {
+                continue; // not a `<pid>-<starttime>` sidecar
+            }
+            let Ok(body) = fs::read_to_string(e.path()) else {
+                continue;
+            };
+            let (_, rec_name, rec_pod, _) = parse_waitexit_body(&body);
+            if rec_pod == pod
+                && names.iter().any(|s| s == rec_name)
+                && fs::remove_file(e.path()).is_ok()
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Decode a `waitexit` sidecar filename `<pid>-<starttime>` (both numeric) into its key, or `None` if
+/// malformed. The SOLE parser of that grammar, so `sweep_waitexit_dead` (which reaps by it) and
+/// `list_exited` (which lists by it) can never drift on what a valid sidecar name is - the same reason
+/// [`entry_split`] is the sole decoder of the instances-tree key.
+fn waitexit_split(name: &std::ffi::OsStr) -> Option<(i32, u64)> {
+    let (pid, st) = name.to_str()?.split_once('-')?;
+    Some((pid.parse().ok()?, st.parse().ok()?))
+}
+
+/// Decode a `waitexit` sidecar BODY `code\nname\npod\ncommand` into its fields - the SOLE body parser
+/// (as [`waitexit_split`] is the sole NAME parser), so `clear_waitexit_pod` and `list_exited` never
+/// drift on the line layout [`set_box_exit`] writes. `code` defaults to 0 for a legacy bare-code / short
+/// record; `name`/`pod` are trimmed; `command` is returned RAW (it is scrubbed on human display and
+/// `\u`-escaped in JSON, so it keeps its bytes here for JSON fidelity). `box_exit` does NOT use this: it
+/// reads line 1 alone and needs `None` (not 0) when the code is unparseable, a distinct semantics.
+fn parse_waitexit_body(body: &str) -> (i32, &str, &str, &str) {
+    let mut lines = body.lines();
+    let code = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    let name = lines.next().unwrap_or("").trim();
+    let pod = lines.next().unwrap_or("").trim();
+    let command = lines.next().unwrap_or("");
+    (code, name, pod, command)
 }
 
 /// Sweep `wait` exit sidecars whose `(pid, starttime)` is no longer a live box - bounds the dir against
@@ -339,14 +524,9 @@ pub fn sweep_waitexit_dead() -> usize {
     let mut n = 0usize;
     if let Ok(rd) = fs::read_dir(&d) {
         for e in rd.flatten() {
-            let fname = e.file_name();
-            let Some(f) = fname.to_str() else { continue };
-            // `<pid>-<starttime>` (both numeric). Reap unless that exact box is still alive.
-            let dead = match f.split_once('-') {
-                Some((pid, st)) => match (pid.parse::<i32>(), st.parse::<u64>()) {
-                    (Ok(p), Ok(s)) => !is_alive(p, s),
-                    _ => true, // malformed -> orphan, safe to remove
-                },
+            // Reap unless that exact box is still alive; a malformed name is an orphan, also reaped.
+            let dead = match waitexit_split(&e.file_name()) {
+                Some((p, s)) => !is_alive(p, s),
                 None => true,
             };
             if dead && fs::remove_file(e.path()).is_ok() {
@@ -355,6 +535,90 @@ pub fn sweep_waitexit_dead() -> usize {
         }
     }
     n
+}
+
+/// One box that has exited but whose `waitexit` sidecar `gc`/`prune` has not yet reaped - the data
+/// behind `kern ps -a`. Reconstructed from the sidecar (`<pid>-<starttime>` → `code\nname\npod\n
+/// command`) plus its mtime for "how long ago". kern keeps NO durable per-container object the way
+/// podman's on-disk store does (a stopped container there survives until `podman rm`); this is a
+/// transient breadcrumb, reaped on the next `gc`, so `ps -a` shows the RECENTLY exited, not history.
+pub struct ExitedBox {
+    pub name: String,
+    pub pid: i32,
+    /// The pid's kernel start-time, so `ps -a`'s live/exited dedup keys on the FULL `(pid, starttime)`
+    /// identity - a fresh live box that recycles a within-window exited box's pid can't hide it.
+    pub starttime: u64,
+    pub code: i32,
+    pub pod: String,
+    pub command: String,
+    /// Seconds since the box exited, from the sidecar's mtime.
+    pub exited_ago: u64,
+}
+
+/// How long an exited box stays visible to `kern ps -a` before it is treated as history and reaped.
+/// `ps -a` is "RECENTLY exited", not an unbounded log: a sidecar older than this is stale, so
+/// `list_exited` removes it on read (below) - the same read-time self-heal `list()` does for a live
+/// record whose box is gone. Bounds the dir for anyone who runs `ps -a`; `gc`/`prune` still reap the
+/// rest. One hour is long enough to answer "what just died in my stack" and short enough to bound.
+const WAITEXIT_SHOW_SECS: u64 = 3600;
+
+/// Every exited box still holding a `waitexit` sidecar within the display window, NEWEST first. A
+/// sidecar whose `(pid, starttime)` is somehow still alive is skipped - it is a live box, already in
+/// [`list`], not an exited one. One older than [`WAITEXIT_SHOW_SECS`] is REAPED here (read-time
+/// self-heal, mirroring `list()`), so `ps -a` shows the recent, not history. A bare-code sidecar from
+/// an older kern has no name/pod/command; it still lists, named by its pid, rather than silently vanish.
+pub fn list_exited() -> Vec<ExitedBox> {
+    let Ok(d) = waitexit_dir() else {
+        return Vec::new();
+    };
+    let now = now_unix();
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(&d) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let Some((pid, starttime)) = waitexit_split(&e.file_name()) else {
+            continue;
+        };
+        if is_alive(pid, starttime) {
+            continue;
+        }
+        // mtime BEFORE the body read: a stale record is reaped without paying to read it.
+        let mtime = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(now, |dur| dur.as_secs());
+        let ago = now.saturating_sub(mtime);
+        if ago > WAITEXIT_SHOW_SECS {
+            let _ = fs::remove_file(e.path()); // best-effort read-time reap of history
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let (code, name, pod, command) = parse_waitexit_body(&body);
+        // name/pod come off DISK: scrub terminal-control bytes at the source so EVERY consumer (table,
+        // `-q`, `--format`, `--json`) is safe, not just the ones that remembered. A no-op on a valid
+        // `BoxName`; defence in depth if a legacy/forged record ever carried control bytes. (command is
+        // scrubbed on human display and `\u`-escaped in JSON, so it stays raw here for JSON fidelity.)
+        out.push(ExitedBox {
+            name: if name.is_empty() {
+                format!("(pid {pid})")
+            } else {
+                crate::ui::scrub(name)
+            },
+            pid,
+            starttime,
+            code,
+            pod: crate::ui::scrub(pod),
+            command: command.to_string(),
+            exited_ago: ago,
+        });
+    }
+    out.sort_by_key(|e| e.exited_ago);
+    out
 }
 
 /// The CURRENT on-disk name of the live box whose supervisor pid is `pid`, or `None`. Long-lived
@@ -410,7 +674,13 @@ fn exit_key_bracketed(name: &str, prefix: &str, suffix: &str) -> bool {
 }
 
 /// Create and return `<runtime>/kern/<leaf>`, with graceful fallbacks.
-fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
+/// The ordered candidate paths for a registry subdir, WITHOUT touching disk: `$XDG_RUNTIME_DIR/kern/<leaf>`,
+/// then `/run/user/<uid>/kern/<leaf>`, then the `/tmp/kern-<uid>/<leaf>` fallback. Shared by the CREATING
+/// resolver ([`runtime_subdir`], which mkdir's the first it can) and the NON-creating one
+/// ([`existing_runtime_subdir`], which returns the first that already exists), so the two can never drift
+/// on where a dir lives - the resolver-divergence [`authoritative_paths`] warns about.
+fn runtime_subdir_candidates(leaf: &str) -> Vec<PathBuf> {
+    assert_registry_child(leaf);
     let uid = unsafe { libc::getuid() };
     let mut candidates = Vec::new();
     if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -418,19 +688,33 @@ fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
     }
     candidates.push(PathBuf::from(format!("/run/user/{uid}/kern/{leaf}")));
     candidates.push(PathBuf::from(format!("/tmp/kern-{uid}/{leaf}")));
+    candidates
+}
+
+fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
     // Create every component we own as **0700**: `$XDG_RUNTIME_DIR`/`/run/user/<uid>` are already
     // owner-only, but the `/tmp/kern-<uid>` fallback lives under world-traversable `/tmp`, and this
     // tree can hold private material (the `--ssh` throwaway key). `DirBuilder` only sets the mode on
     // components it creates, so an existing (systemd-owned) runtime dir is left untouched.
     use std::os::unix::fs::DirBuilderExt;
     let mut last_err = io::Error::other("no writable runtime dir");
-    for d in candidates {
+    for d in runtime_subdir_candidates(leaf) {
         match fs::DirBuilder::new().recursive(true).mode(0o700).create(&d) {
             Ok(()) => return Ok(d),
             Err(e) => last_err = e,
         }
     }
     Err(last_err)
+}
+
+/// The first already-EXISTING candidate for a registry subdir, or `None` - the non-creating sibling of
+/// [`runtime_subdir`]. The identity check ([`guarded_identities`]) only STATs these dirs to fingerprint
+/// them; it must not mkdir a dir that never existed (e.g. `ssh/` when no box used `--ssh`) merely to read
+/// its dev/ino. A dir that does not exist cannot be a `mount --bind` alias source, so skipping it is safe.
+fn existing_runtime_subdir(leaf: &str) -> Option<PathBuf> {
+    runtime_subdir_candidates(leaf)
+        .into_iter()
+        .find(|d| d.exists())
 }
 
 /// The cgroup v2 directory of `pid` under `/sys/fs/cgroup`, from `/proc/<pid>/cgroup`.
@@ -1748,6 +2032,42 @@ impl Instance {
 mod tests {
     use super::*;
 
+    /// Every child of the registry root must be CLASSIFIED - `AUTHORITATIVE_DIRS` (kern reads and acts
+    /// on it, or it is a cross-box secret; never mountable) or `BOX_DATA_DIRS` (opaque box data). A
+    /// registry dir added by any code path fails here until someone classifies it, instead of shipping
+    /// mountable-by-default the way `waitexit/` did. Reads the LIVE root (populated by the suite's own
+    /// boxes) rather than mutating `XDG_RUNTIME_DIR`, so it never races the other env-setting tests.
+    #[test]
+    fn every_registry_child_is_classified() {
+        // The two classes must be disjoint - a dir cannot be both authoritative and opaque data.
+        for a in AUTHORITATIVE_DIRS {
+            assert!(!BOX_DATA_DIRS.contains(&a), "{a:?} is in BOTH classes");
+        }
+        // Materialize every authoritative child so the scan is meaningful and `trusted_state_dirs` can
+        // canonicalize all of them (`runtime_subdir` creates `<root>/kern/<leaf>`, the same path
+        // `pods_root` resolves to for `pods`).
+        materialize_authoritative_dirs_for_test();
+        let Ok(instances) = dir() else { return };
+        let Some(root) = instances.parent() else {
+            return;
+        };
+        let Ok(rd) = fs::read_dir(root) else { return };
+        for e in rd.flatten() {
+            if !e.path().is_dir() {
+                continue; // registry children are directories; a stray file is not this test's concern
+            }
+            let raw = e.file_name();
+            let name = raw.to_string_lossy();
+            assert!(
+                AUTHORITATIVE_DIRS.contains(&name.as_ref()) || BOX_DATA_DIRS.contains(&name.as_ref()),
+                "unclassified registry child {name:?}: add it to AUTHORITATIVE_DIRS (kern reads and \
+                 acts on it, or it holds a cross-box secret) or BOX_DATA_DIRS (opaque box data)"
+            );
+        }
+        // `trusted_state_dirs` is DERIVED from `AUTHORITATIVE_DIRS` - one per entry, no parallel list.
+        assert_eq!(trusted_state_dirs().len(), AUTHORITATIVE_DIRS.len());
+    }
+
     #[test]
     fn cap_spec_survives_the_registry_field_round_trip() {
         use kern_isolation::CapSpec;
@@ -2618,39 +2938,33 @@ mod tests {
     }
 
     #[test]
-    fn a_volume_source_overlapping_the_registry_is_refused_in_both_directions() {
-        // A box that bind-mounts the registry can forge a peer's posture record (proven, adversarial
-        // review). The containment guard must catch the dir itself, anything inside it, AND any parent
-        // that would drag it in - while leaving a sibling and unrelated paths mountable.
-        let reg = PathBuf::from("/run/user/1000/kern/instances");
-        let claims = PathBuf::from("/run/user/1000/kern/claims");
-        let dirs = vec![reg.clone(), claims];
-        // the dir itself, a child, and a parent that CONTAINS it → all refused
-        assert!(dirs_overlap(&reg, &dirs), "the instances dir itself");
-        assert!(
-            dirs_overlap(Path::new("/run/user/1000/kern/instances/victim-9"), &dirs),
-            "a record inside the instances dir"
+    fn the_inverted_guard_refuses_by_default_and_allows_only_box_data() {
+        // INVERTED DEFAULT (pure path half): under the registry root, refuse EVERYTHING except a
+        // box-data child, so a new child (as `runstats` was) is non-mountable by omission. Also refuse
+        // the root itself and any ancestor that drags it in; leave siblings and unrelated paths alone.
+        let root = Path::new("/run/user/1000/kern");
+        let refuse = |p: &str| mount_refused_by_path(Path::new(p), root);
+
+        // authoritative dirs, a record inside one, an UNKNOWN future child, and the runstats FILE → all
+        // refused by omission (none is a box-data child).
+        assert_eq!(refuse("/run/user/1000/kern/instances"), Some(true));
+        assert_eq!(refuse("/run/user/1000/kern/instances/victim-9"), Some(true));
+        assert_eq!(refuse("/run/user/1000/kern/health"), Some(true));
+        assert_eq!(refuse("/run/user/1000/kern/pods/shop/holder"), Some(true));
+        assert_eq!(refuse("/run/user/1000/kern/runstats"), Some(true));
+        assert_eq!(refuse("/run/user/1000/kern/some_future_child"), Some(true));
+        // the root itself, and an ANCESTOR that contains it → refused.
+        assert_eq!(refuse("/run/user/1000/kern"), Some(true));
+        assert_eq!(refuse("/run/user/1000"), Some(true));
+        assert_eq!(refuse("/run/user"), Some(true));
+        // BOX_DATA children (and paths inside them) → ALLOWED.
+        assert_eq!(refuse("/run/user/1000/kern/logs"), Some(false));
+        assert_eq!(
+            refuse("/run/user/1000/kern/scratch/box-1/upper"),
+            Some(false)
         );
-        assert!(
-            dirs_overlap(Path::new("/run/user/1000/kern"), &dirs),
-            "the kern parent that contains instances/claims"
-        );
-        assert!(
-            dirs_overlap(Path::new("/run/user/1000"), &dirs),
-            "the runtime root that contains the kern tree"
-        );
-        // a SIBLING with a shared string prefix is NOT overlap (component-wise starts_with)
-        assert!(
-            !dirs_overlap(Path::new("/run/user/1000/kern-other"), &dirs),
-            "a sibling sharing a name prefix must stay mountable"
-        );
-        assert!(
-            !dirs_overlap(Path::new("/run/user/1000/kern/volumes/data"), &dirs),
-            "the volumes sibling must stay mountable"
-        );
-        // an unrelated host path is fine
-        assert!(!dirs_overlap(Path::new("/tmp/project"), &dirs));
-        // no trusted dirs (nothing created yet) → nothing is refused
-        assert!(!dirs_overlap(&reg, &[]));
+        // a SIBLING sharing a name prefix, and unrelated paths → no path overlap (identity check next).
+        assert_eq!(refuse("/run/user/1000/kern-other"), None);
+        assert_eq!(refuse("/tmp/project"), None);
     }
 }

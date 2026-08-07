@@ -327,10 +327,14 @@ pub enum Command {
     BuildPrune {
         keep: usize,
     },
-    /// `kern ps [--json]`: list running boxes.
+    /// `kern ps [-a] [--json]`: list running boxes (`-a`/`--all` also lists recently-exited ones).
     Ps {
         json: bool,
         quiet: bool,
+        /// `-a`/`--all`: also list RECENTLY exited boxes (from the `waitexit` breadcrumb), not only the
+        /// running ones. Unlike Docker's `ps -a`, these are transient: reaped by `gc` (and past a display
+        /// window), they do NOT hold the box name, and may disappear - kern keeps no durable store.
+        all: bool,
         filters: Vec<(String, String)>,
         format: Option<String>,
     },
@@ -437,6 +441,8 @@ pub enum Command {
         tail: Option<usize>,
         /// `-f/--follow` for `logs` (one service only).
         follow: bool,
+        /// `-a/--all` for `ps`: also list the stack's recently-exited services.
+        all: bool,
         /// Optional service subset for the read-only verbs; empty = every service.
         services: Vec<String>,
         /// `-p/--project-name`: pod name override.
@@ -856,10 +862,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             reject_unknown_flags(
                 "ps",
                 &rest,
-                &["--json", "-q", "--quiet", "--filter", "--format"],
+                &[
+                    "--json", "-q", "--quiet", "--filter", "--format", "-a", "--all",
+                ],
             )?;
             let json = rest.contains(&"--json");
             let quiet = rest.iter().any(|a| *a == "-q" || *a == "--quiet");
+            let all = rest.iter().any(|a| *a == "-a" || *a == "--all");
             let mut filters = Vec::new();
             let mut format = None;
             let mut i = 1;
@@ -885,6 +894,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             Command::Ps {
                 json,
                 quiet,
+                all,
                 filters,
                 format,
             }
@@ -1130,7 +1140,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .get_or_init(|| {
                     format!(
                         "compose <file>... [{}] [-p NAME] [--env-file F] [--profile P] [--no-pod] \
-                         [--tail N] [-f] [service...]",
+                         [--tail N] [-f] [-a] [service...]",
                         crate::commands::compose_verbs_help()
                     )
                 })
@@ -1144,12 +1154,14 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut no_pod = false;
             let mut tail: Option<usize> = None;
             let mut follow = false;
+            let mut all = false;
             let mut services: Vec<String> = Vec::new();
             let mut it = rest.iter().skip(1).peekable();
             while let Some(a) = it.next() {
                 match *a {
                     "--no-pod" => no_pod = true,
                     "-f" | "--follow" => follow = true,
+                    "-a" | "--all" => all = true,
                     "-p" | "--project-name" => {
                         project = Some(
                             it.next()
@@ -1225,6 +1237,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 no_pod,
                 tail,
                 follow,
+                all,
                 services,
                 project,
                 env_file,
@@ -1252,6 +1265,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 no_pod,
                 tail: None,
                 follow: false,
+                all: false,
                 services: Vec::new(),
                 project: None,
                 env_file: None,
@@ -2862,9 +2876,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Ps {
             json,
             quiet,
+            all,
             filters,
             format,
-        } => commands::ps(json, quiet, &filters, format.as_deref()),
+        } => commands::ps(json, quiet, all, &filters, format.as_deref()),
         Command::Stats { json, names } => commands::stats(json, &names),
         Command::Logs { name, tail, follow } => commands::logs(&name, tail, follow),
         Command::Inspect { name, json } => commands::inspect(&name, json),
@@ -2902,6 +2917,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             no_pod,
             tail,
             follow,
+            all,
             services,
             project,
             env_file,
@@ -2912,6 +2928,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             no_pod,
             tail,
             follow,
+            all,
             services: &services,
             project: project.as_deref(),
             env_file: env_file.as_deref(),

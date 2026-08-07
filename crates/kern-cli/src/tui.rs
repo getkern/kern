@@ -3206,6 +3206,35 @@ fn trunc(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The sparkline reader must be TOTAL on any `f64` slice: `kern top` derives it from the daemonless
+    /// `runstats` mmap counter, and a corrupt page (a half-finished write, a truncated mmap - or, before
+    /// the volume guard's inverted default made `runstats` non-mountable, a peer's forged bytes) must
+    /// never panic an ADMIN command. The `max <= 0` guard and the `idx.min(BARS-1)` clamp are what make
+    /// it total; this pins that a forged `count`/`latency` (all-zero, all-max, mixed) yields glyphs, not
+    /// a `divide by zero` or an out-of-bounds index.
+    #[test]
+    fn spark_is_total_on_adversarial_input() {
+        assert_eq!(spark(&[]).chars().count(), 1); // empty -> one baseline glyph, no panic
+        assert_eq!(spark(&[0.0, 0.0, 0.0]), "▁▁▁"); // all zero -> `max <= 0` guard, no div-by-zero
+        for s in [
+            vec![f64::MAX, 0.0],
+            vec![f64::MAX, f64::MAX],
+            vec![1e300, 1.0, 0.0],
+            vec![u64::MAX as f64, 1.0],
+        ] {
+            let out = spark(&s);
+            assert_eq!(
+                out.chars().count(),
+                s.len(),
+                "one glyph per sample, never a panic"
+            );
+            assert!(
+                out.chars().all(|c| ('▁'..='█').contains(&c)),
+                "every glyph is in range"
+            );
+        }
+    }
+
     fn plain() -> Palette {
         Palette {
             b: "",

@@ -17,7 +17,8 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
 /// `<XDG_RUNTIME_DIR|/run/user/uid>/kern/pods`.
-fn pods_root() -> PathBuf {
+pub(crate) fn pods_root() -> PathBuf {
+    crate::registry::assert_registry_child("pods"); // classification chokepoint (see registry.rs)
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));

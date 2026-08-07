@@ -40,6 +40,11 @@ pub struct BuildDirective {
 #[derive(Default, Debug)]
 pub struct ComposeBox {
     pub name: String,
+    /// Docker's `container_name:`. When set, `kern compose` names the box this EXACTLY (not
+    /// `<project>-<service>`), so `docker exec <container_name>` ports to `kern exec <container_name>`
+    /// verbatim. The service name still resolves inside the pod (kept as a DNS alias), so peers reach
+    /// it by the compose-file name regardless. `None` = the default `<project>-<service>` name.
+    pub container_name: Option<String>,
     pub image: Option<String>,
     pub rootfs: Option<String>,
     pub command: Vec<String>,
@@ -2491,6 +2496,10 @@ mod contract_tests {
         // command line's shape, not a flag; the rest name a real call site.
         const READERS: &[(&str, &str)] = &[
             ("name", "the `kern box <name>` argument itself"),
+            (
+                "container_name",
+                "compose() names the box this exactly instead of <project>-<service>",
+            ),
             ("command", "the trailing `-- <command>`"),
             (
                 "depends_on",

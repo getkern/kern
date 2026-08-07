@@ -49,7 +49,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [-- CMD...]           Run CMD in a running box
-    {c}ps{z} [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List running boxes
+    {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     {c}logs{z} <name> [--tail N] [-f|--follow]                           Show a box's output
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
 
@@ -1048,8 +1048,17 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // Bind the pod's shared hosts over /etc/hosts. RW (not `:ro`): a read-only remount of a
             // bind is refused inside the pod's single-uid user ns (EPERM), and pod members are
             // co-trusted anyway (they already share the user+net ns).
+            // Canonicalize the source: `setup_volumes` resolves every bind source with an `O_NOFOLLOW`
+            // component walk, which fails if a component of the runtime dir is a symlink - so hand it the
+            // symlink-free path the walk expects (the file exists; kern just created it for the pod).
+            let symlink_free = |p: std::path::PathBuf| {
+                std::fs::canonicalize(&p)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            };
             volumes.push(kern_isolation::Volume {
-                source: crate::pod::hosts_path(pod).to_string_lossy().into_owned(),
+                source: symlink_free(crate::pod::hosts_path(pod)),
                 target: "/etc/hosts".to_string(),
                 read_only: false,
             });
@@ -1057,7 +1066,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             let rp = crate::pod::resolv_path(pod);
             if rp.exists() {
                 volumes.push(kern_isolation::Volume {
-                    source: rp.to_string_lossy().into_owned(),
+                    source: symlink_free(rp),
                     target: "/etc/resolv.conf".to_string(),
                     read_only: false,
                 });
@@ -1238,6 +1247,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         ));
     }
 
+    // A user `--rootfs` becomes the box's ENTIRE root (overlay lower or `--bind-rootfs`): guard it
+    // against the registry through the SAME chokepoint `--secret`/`--env-file` use, or `--rootfs
+    // <runtime>/kern` would make the registry the box's filesystem - the most privileged exposure of
+    // the lot. (An INTERNAL build lower, `overlay_lower`, is kern-generated and is not user input.)
+    if let Some(r) = args.rootfs {
+        crate::secret::guard_host_path(r, "--rootfs")?;
+    }
     // The lower/base rootfs: an explicit --rootfs, or pull --image into a local cache. An --image
     // also yields its OCI runtime config (Entrypoint/Cmd/Env/WorkingDir/User) - the defaults below.
     let (lower, image_config) = match (args.overlay_lower, args.rootfs, args.image) {
@@ -1414,8 +1430,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // forwarder fails inside its fork - whose stderr a detached box swallows - and the box would
     // print "started" while nothing actually listens.
     if let Err((hp, e)) = kern_isolation::preflight_ports(ports) {
-        // AlreadyRunning (not Sandbox): the cause is a resource already in use, so its
-        // "run `kern ps` … `kern stop`" hint fits - not the sandbox's userns/rootfs hint.
+        // Tell the two failures apart. `EACCES` on a port <1024 is NOT "in use": rootless kern lacks
+        // CAP_NET_BIND_SERVICE, so the fix is a higher port - sending the user to `kern ps`/`kern stop`
+        // would chase a phantom holder (the old message did). `EADDRINUSE` (or any other errno) IS the
+        // taken-port case, where AlreadyRunning's "run `kern ps` … `kern stop`" hint fits.
+        if e.raw_os_error() == Some(libc::EACCES) && hp < 1024 {
+            return Err(Error::Sandbox(format!(
+                "cannot publish port {hp}: a port below 1024 needs a privilege kern lacks when rootless \
+                 (CAP_NET_BIND_SERVICE) - publish it on a host port >=1024 instead (e.g. -p 8080:80)"
+            )));
+        }
         return Err(Error::AlreadyRunning(format!(
             "cannot publish host port {hp}: {e} - already in use (another box, or a non-kern process)"
         )));
@@ -1424,21 +1448,39 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // specs (blocking a tmpfs over the hardened mounts). `--user`: parse UID[:GID].
     let hostname = validate_hostname(args.hostname)?;
     let tmpfs = parse_tmpfs(args.tmpfs)?;
-    // `--user` wins; otherwise the image's `config.User` - but only if it's NUMERIC. A NAME (e.g.
-    // `USER nginx`) would need the image's `/etc/passwd`, which isn't resolved pre-pivot, so it's
-    // skipped (the box runs as its root) with an honest note rather than failing the box.
-    let image_user = match image_config.user.as_deref() {
-        Some(u) if parse_user(Some(u)).is_ok() => Some(u),
-        Some(u) if args.run_as.is_none() => {
-            eprintln!(
-                "kern: image requests user '{u}' by name - running as box root \
-                 (pass --user <uid[:gid]> to drop privilege)"
-            );
-            None
-        }
-        _ => None,
+    // `--user` wins; otherwise the image's `config.User`. Either can be NUMERIC (parses directly) or a
+    // NAME - `--user memcache`, compose `user:`, or the image's own `USER memcache` - resolved against the
+    // image's OWN `/etc/passwd`/`/etc/group`, the way Docker does (the rootfs is extracted pre-pivot). One
+    // resolver closes the whole class: kern no longer runs a by-name user as box root, which broke every
+    // image that declares a user by name and refuses to run as root (memcached, unprivileged nginx,
+    // elasticsearch). The two halves differ ONLY in the miss case: an EXPLICIT `--user`/`user:` the image
+    // can't resolve is an ERROR (the caller asked for it), while the image's OWN `USER` falls back to
+    // box-root with an honest note (so an odd image still starts).
+    // `user_or_image` is the shared half both arms need: a NUMERIC spec parses directly, a NAME resolves
+    // against the image. The arms differ ONLY in the miss handler (below), which is the whole point.
+    let user_or_image = |u: &str| match parse_user(Some(u)) {
+        Ok(parsed) => parsed, // numeric (uid or uid:gid)
+        Err(_) => resolve_image_user(u, &lower),
     };
-    let run_as = parse_user(args.run_as.or(image_user))?;
+    let run_as = match args.run_as {
+        // Explicit `--user`/compose `user:`: a name the image can't resolve is an ERROR (caller asked).
+        Some(u) => Some(user_or_image(u).ok_or_else(|| {
+            Error::Sandbox(format!(
+                "--user '{u}': not a numeric UID[:GID] and no such account in the image's /etc/passwd"
+            ))
+        })?),
+        // The image's OWN `USER`: a name it can't resolve falls back to box-root with an honest note.
+        None => match image_config.user.as_deref().filter(|u| !u.is_empty()) {
+            None => None,
+            Some(u) => user_or_image(u).or_else(|| {
+                eprintln!(
+                    "kern: image requests user '{u}' but it is not in the image's /etc/passwd - \
+                     running as box root (pass --user <uid[:gid]> to drop privilege)"
+                );
+                None
+            }),
+        },
+    };
     // COMPAT HEADS-UP (not a security check; not parsing the entrypoint - only the image's own declared
     // `User`). An OCI image that drops privilege to a non-root user (postgres/redis/nginx via `User` or
     // an entrypoint `setpriv`/`gosu`) needs uids beyond box-root. Two honest cases:
@@ -2960,6 +3002,12 @@ fn write_image_config(path: &std::path::Path, c: &kern_oci::ImageConfig) -> std:
     if let Some(u) = &c.user {
         line("user", u);
     }
+    for (port, udp) in &c.exposed_ports {
+        line(
+            "expose",
+            &format!("{port}/{}", if *udp { "udp" } else { "tcp" }),
+        );
+    }
     std::fs::write(path, s)
 }
 
@@ -2979,6 +3027,14 @@ fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig {
             "env" => c.env.push(v.to_string()),
             "workdir" => c.workdir = Some(v.to_string()),
             "user" => c.user = Some(v.to_string()),
+            "expose" => {
+                if let Some((num, proto)) = v.split_once('/') {
+                    if let Ok(port) = num.parse::<u16>() {
+                        c.exposed_ports
+                            .push((port, proto.eq_ignore_ascii_case("udp")));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3002,8 +3058,12 @@ fn parse_envs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
 fn parse_env_files(paths: &[String]) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     for p in paths {
-        let body = std::fs::read_to_string(p)
-            .map_err(|e| Error::Sandbox(format!("cannot read --env-file '{p}': {e}")))?;
+        // Route through the ONE guarded host-file reader: `--env-file` delivers a file's K=V lines into
+        // the box's env, so `--env-file <runtime>/kern/instances/<peer>` would inject a peer's posture
+        // record (`capdropall=`, `seccompmode=`, …) - the same class `--secret` and `-v` are guarded for.
+        let bytes = crate::secret::read_host_file_for_box(p, "--env-file")?;
+        let body = String::from_utf8(bytes)
+            .map_err(|_| Error::Sandbox(format!("--env-file '{p}' is not valid UTF-8")))?;
         for (n, raw) in body.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -3102,6 +3162,177 @@ fn parse_user(spec: Option<&str>) -> Result<Option<(u32, u32)>, Error> {
         }
     };
     Ok(Some((uid, gid)))
+}
+
+/// Look up `name` in a colon-line account file (`passwd`/`group`) inside the image rootfs and return the
+/// matched line's colon-separated FIELDS, read and scanned ONCE. `lower` is the box's lower spec - a
+/// single dir for a flat image, or an overlay chain `top:…:base`; the file is read from the FIRST layer
+/// that has it (top-most wins, as the merged view would). `None` if no layer has the file or it has no
+/// matching entry - the caller then keeps box-root behaviour. Returning the whole entry lets
+/// `resolve_image_user` take uid (field 2) AND primary gid (field 3) from ONE passwd read, not two.
+///
+/// CONFINED to the rootfs: this reads PRE-PIVOT, on the host, so a hostile image whose `/etc/passwd` is a
+/// symlink to a host path (`/etc/passwd`, `../../../etc/passwd`) would otherwise make kern read a host
+/// file. That leaks nothing to the box (only a uid is extracted) and grants nothing (the image controls
+/// `USER` anyway), but kern must not follow an image symlink onto host paths - the same confinement the
+/// `-v` guard enforces. Canonicalize the target and require it stays under the canonical layer; a symlink
+/// that escapes is treated as "no file in this layer" (try the next, else fall back to box-root). An
+/// in-rootfs symlink (a real distro layout) still resolves, since its target stays under the layer.
+fn image_account_entry(lower: &str, file: &str, name: &str) -> Option<Vec<String>> {
+    use std::path::Path;
+    for layer in lower.split(':') {
+        let (Ok(target), Ok(base)) = (
+            std::fs::canonicalize(Path::new(layer).join(file)),
+            std::fs::canonicalize(layer),
+        ) else {
+            continue; // no such file in this layer (or an unresolvable path); try the next
+        };
+        if !target.starts_with(&base) {
+            continue; // the image symlinked the account file OUT of the rootfs - do not read host paths
+        }
+        let Ok(text) = std::fs::read_to_string(&target) else {
+            continue;
+        };
+        for line in text.lines() {
+            if line.split(':').next() == Some(name) {
+                return Some(line.split(':').map(str::to_string).collect());
+            }
+        }
+        return None; // the file exists in this (top-most) layer but has no such entry - authoritative
+    }
+    None
+}
+
+/// Resolve an image's `config.User` spec (`user[:group]`, each a NAME or a number) to `(uid, gid)` using
+/// the image's OWN `/etc/passwd` and `/etc/group`, exactly as Docker does. The rootfs is already
+/// extracted on the host pre-pivot, so `USER memcache` no longer forces the box to run as root: it maps
+/// to that account's uid/gid. Docker's rule - a bare user takes its primary group from the passwd entry;
+/// an explicit `:group` overrides it. Returns `None` (caller keeps box-root, with a note) if the account
+/// isn't in the image, so an image referencing a host-provided name still degrades honestly.
+fn resolve_image_user(spec: &str, lower: &str) -> Option<(u32, u32)> {
+    let (user, group) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    // The user half yields both a uid and (for a bare `USER name`) the default gid from its ONE passwd
+    // line: fields are `name:x:uid:gid:…`, so index 2 is the uid and 3 the primary gid.
+    let (uid, passwd_gid) = match user.parse::<u32>() {
+        Ok(n) => (n, n),
+        Err(_) => {
+            let e = image_account_entry(lower, "etc/passwd", user)?;
+            (e.get(2)?.parse().ok()?, e.get(3)?.parse().ok()?)
+        }
+    };
+    let gid = match group {
+        None => passwd_gid,
+        // `group` fields are `name:x:gid:…`, so index 2 is the gid.
+        Some(g) => match g.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => image_account_entry(lower, "etc/group", g)?
+                .get(2)?
+                .parse()
+                .ok()?,
+        },
+    };
+    Some((uid, gid))
+}
+
+#[cfg(test)]
+mod image_user_resolution_tests {
+    use super::*;
+
+    /// A box's `config.User` given by NAME (e.g. memcached's `USER memcache`) must resolve to the image's
+    /// own uid/gid the way Docker does - reading the rootfs's `/etc/passwd`/`/etc/group` - not silently
+    /// run as box root. This is the fix for the class that killed memcached, unprivileged nginx, etc.
+    #[test]
+    fn resolves_user_name_uid_gid_group_and_numerics_from_the_image() {
+        let root = std::env::temp_dir().join(format!("kern-usr-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nmemcache:x:11211:11211:Memcached:/:/sbin/nologin\n",
+        )
+        .unwrap();
+        std::fs::write(
+            etc.join("group"),
+            "root:x:0:\nstaff:x:50:\nmemcache:x:11211:\n",
+        )
+        .unwrap();
+        let lower = root.to_string_lossy();
+
+        // bare NAME -> uid AND its passwd primary gid (Docker's rule).
+        assert_eq!(resolve_image_user("memcache", &lower), Some((11211, 11211)));
+        // NAME:groupname -> uid from passwd, gid from group (overrides the passwd gid).
+        assert_eq!(
+            resolve_image_user("memcache:staff", &lower),
+            Some((11211, 50))
+        );
+        // NAME:numericgid, and a fully-numeric spec, both parse without the files.
+        assert_eq!(resolve_image_user("memcache:99", &lower), Some((11211, 99)));
+        assert_eq!(resolve_image_user("root", &lower), Some((0, 0)));
+        assert_eq!(resolve_image_user("1000:1000", &lower), Some((1000, 1000)));
+        // A name the image does NOT define -> None, so the caller keeps box-root with an honest note.
+        assert_eq!(resolve_image_user("ghost", &lower), None);
+        assert_eq!(resolve_image_user("memcache:nogroup", &lower), None);
+        // No account files at all (a scratch image) -> None, never a wrong uid.
+        let empty = std::env::temp_dir().join(format!("kern-usr-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            resolve_image_user("memcache", &empty.to_string_lossy()),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// The lookup walks an overlay `top:…:base` chain and the TOP-most layer that carries the file wins,
+    /// the way the merged rootfs would present it.
+    #[test]
+    fn top_layer_of_an_overlay_chain_wins() {
+        let base = std::env::temp_dir().join(format!("kern-usr-base-{}", std::process::id()));
+        let top = std::env::temp_dir().join(format!("kern-usr-top-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::create_dir_all(top.join("etc")).unwrap();
+        std::fs::write(base.join("etc/passwd"), "app:x:1000:1000::/:/bin/sh\n").unwrap();
+        std::fs::write(top.join("etc/passwd"), "app:x:2000:2000::/:/bin/sh\n").unwrap();
+        // chain is "top:base"; top's entry (2000) is authoritative.
+        let chain = format!("{}:{}", top.to_string_lossy(), base.to_string_lossy());
+        assert_eq!(resolve_image_user("app", &chain), Some((2000, 2000)));
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    /// A hostile image whose account file is a symlink OUT of the rootfs must NOT resolve against host
+    /// paths - `image_account_field` reads pre-pivot on the host, so an unconfined read would follow the
+    /// link. Confinement returns `None` (caller keeps box-root), even though the escape target defines the
+    /// name.
+    #[test]
+    fn a_passwd_symlink_escaping_the_rootfs_does_not_resolve() {
+        let root = std::env::temp_dir().join(format!("kern-usr-esc-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("kern-usr-esc-target-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        // The victim account lives OUTSIDE the rootfs; the image's /etc/passwd is a symlink to it.
+        std::fs::write(&outside, "victim:x:1234:1234::/:/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("etc/passwd")).unwrap();
+        // Unconfined this would return Some((1234, 1234)); confined it must be None.
+        assert_eq!(resolve_image_user("victim", &root.to_string_lossy()), None);
+
+        // An IN-rootfs symlink (a real distro layout) still resolves - its target stays under the layer.
+        std::fs::remove_file(root.join("etc/passwd")).unwrap();
+        std::fs::write(root.join("etc/passwd.real"), "app:x:777:777::/:/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink("passwd.real", root.join("etc/passwd")).unwrap();
+        assert_eq!(
+            resolve_image_user("app", &root.to_string_lossy()),
+            Some((777, 777))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
+    }
 }
 
 /// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]` - run a command inside an
@@ -3997,9 +4228,21 @@ fn await_box_started(
                 .map(|d| d.join(format!("{n}-{child}.log")))
                 .and_then(|p| read_log_reason(&p));
             return Err(Error::Sandbox(match reason {
-                Some(r) => format!(
-                    "box '{n}' exited before starting:\n{r}\n(run `kern logs {n}` for the full log)"
-                ),
+                Some(r) => {
+                    // The tail is the box's OWN log bytes rendered to the operator - scrub control
+                    // sequences PER LINE (keep the newlines that make a multi-line tail readable, drop
+                    // ESC/CR/…) so a box that printed `\e[2J` before dying can't clear or repaint the
+                    // operator's terminal through this failure message. Same untrusted-text guard as
+                    // the `ps` command column.
+                    let safe: String = r
+                        .lines()
+                        .map(crate::ui::scrub)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "box '{n}' exited before starting:\n{safe}\n(run `kern logs {n}` for the full log)"
+                    )
+                }
                 None => {
                     format!("box '{n}' exited before starting - run `kern logs {n}` for the reason")
                 }
@@ -4155,7 +4398,14 @@ fn supervise_box(
     // keyed `<name>-<pid>` (our own pid = the registered pid). Written LAST here, and this whole call
     // returns BEFORE the caller unregisters the instance file, so a `wait` that sees the box leave
     // `list()` finds the code. If compose is also waiting, record it under its stack+run-scoped key too.
-    registry::set_box_exit(std::process::id() as i32, inst.starttime, final_code);
+    registry::set_box_exit(
+        std::process::id() as i32,
+        inst.starttime,
+        final_code,
+        &inst.name,
+        &inst.pod,
+        &inst.command,
+    );
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
     }
@@ -5287,11 +5537,10 @@ fn detach_stdio(log: Option<&std::path::Path>) {
     }
 }
 
-/// `kern ps [--json]` - list running boxes. Dead entries are pruned on read.
-/// True if `b` satisfies every `--filter` (AND semantics). Keys are pre-validated by [`ps`]. `name`
-/// is a substring match (like `docker ps --filter name=`), `id` is an exact host-pid match, `status`
-/// is running/paused/orphaned (a kern box is never persistently exited/created/dead/restarting, so
-/// those match nothing).
+/// True if the LIVE box `b` satisfies every `--filter` (AND semantics). Keys are pre-validated by
+/// [`ps`]. `name` is a substring match (like `docker ps --filter name=`), `id` is an exact host-pid
+/// match, `status` is running/paused/orphaned. `status=exited`/`dead` is answered by [`exited_matches`]
+/// against the `waitexit` breadcrumb, not here, so a live box correctly fails those.
 fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
     filters.iter().all(|(k, v)| match k.as_str() {
         "name" => b.name.contains(v.as_str()),
@@ -5317,6 +5566,21 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
             _ => false,
         },
         _ => false, // unreachable: keys are validated in `ps` before this runs (fail closed anyway)
+    })
+}
+
+/// The `ps_matches` twin for an EXITED box (`kern ps -a`). Same filter keys, but an exited box has no
+/// live cgroup to read `paused`/`orphaned` from and did not keep its `labels`: a `status=running`
+/// query therefore correctly excludes it, and `label=` matches nothing. Only `status=exited` accepts
+/// it - kern has no `dead` state, so `status=dead` matches nothing (Docker's `dead` is a failed
+/// removal kern cannot produce).
+fn exited_matches(e: &registry::ExitedBox, filters: &[(String, String)]) -> bool {
+    filters.iter().all(|(k, v)| match k.as_str() {
+        "name" => e.name.contains(v.as_str()),
+        "pod" => e.pod == *v,
+        "id" => e.pid.to_string() == *v,
+        "status" => v == "exited",
+        _ => false,
     })
 }
 
@@ -5364,13 +5628,81 @@ fn push_unescaped(out: &mut String, s: &str) {
     }
 }
 
+/// The fields `ps --format` reads, so ONE template renderer serves both a live [`registry::Instance`]
+/// and an exited [`registry::ExitedBox`] (Docker's `ps -a --format`). An exited box has no live
+/// rootfs/ports left to report; those render empty rather than as a stale value.
+trait PsRow {
+    fn ps_name(&self) -> &str;
+    fn ps_pid(&self) -> i32;
+    fn ps_image(&self) -> String;
+    fn ps_command(&self) -> String;
+    fn ps_ports(&self) -> &str;
+    fn ps_pod(&self) -> &str;
+    fn ps_running_for(&self, now: u64) -> String;
+    fn ps_status(&self) -> String;
+}
+
+impl PsRow for registry::Instance {
+    fn ps_name(&self) -> &str {
+        &self.name
+    }
+    fn ps_pid(&self) -> i32 {
+        self.pid
+    }
+    fn ps_image(&self) -> String {
+        crate::ui::scrub(&self.rootfs)
+    }
+    fn ps_command(&self) -> String {
+        crate::ui::scrub(&self.command)
+    }
+    fn ps_ports(&self) -> &str {
+        &self.ports
+    }
+    fn ps_pod(&self) -> &str {
+        &self.pod
+    }
+    fn ps_running_for(&self, now: u64) -> String {
+        fmt_uptime(now.saturating_sub(self.started))
+    }
+    fn ps_status(&self) -> String {
+        box_status(self, "running")
+    }
+}
+
+impl PsRow for registry::ExitedBox {
+    fn ps_name(&self) -> &str {
+        &self.name
+    }
+    fn ps_pid(&self) -> i32 {
+        self.pid
+    }
+    fn ps_image(&self) -> String {
+        String::new()
+    }
+    fn ps_command(&self) -> String {
+        crate::ui::scrub(&self.command)
+    }
+    fn ps_ports(&self) -> &str {
+        ""
+    }
+    fn ps_pod(&self) -> &str {
+        &self.pod
+    }
+    fn ps_running_for(&self, _now: u64) -> String {
+        format!("{} ago", fmt_uptime(self.exited_ago))
+    }
+    fn ps_status(&self) -> String {
+        format!("exited ({})", self.code)
+    }
+}
+
 /// Render one box through a `ps --format` template: the `{{.Field}}` placeholders below, plus `\t`/`\n`
 /// in literal text. A Go-template with logic (ranges/conditionals/functions) is NOT supported: an
 /// unterminated `{{` or an unknown token is a hard error (use `--json` for arbitrary shaping). Validated
 /// fields (name/pod/ports/status) are borrowed straight in; the UNTRUSTED command/rootfs are
 /// control-scrubbed first so a crafted box argv or `--rootfs` can't inject ANSI escapes into the
 /// terminal (the same guard the `ps` table, `images`, and `--json` already apply).
-fn render_ps_format(tmpl: &str, b: &registry::Instance, now: u64) -> Result<String, Error> {
+fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Error> {
     let mut out = String::with_capacity(tmpl.len());
     let mut rest = tmpl;
     while let Some(open) = rest.find("{{") {
@@ -5380,14 +5712,14 @@ fn render_ps_format(tmpl: &str, b: &registry::Instance, now: u64) -> Result<Stri
             .find("}}")
             .ok_or(Error::Usage("ps --format: unterminated `{{`"))?;
         match after[..close].trim() {
-            ".Names" | ".Name" => out.push_str(&b.name),
-            ".ID" | ".Pid" => out.push_str(&b.pid.to_string()),
-            ".Image" | ".Rootfs" => out.push_str(&crate::ui::scrub(&b.rootfs)),
-            ".Command" => out.push_str(&crate::ui::scrub(&b.command)),
-            ".Ports" => out.push_str(&b.ports),
-            ".Pod" => out.push_str(&b.pod),
-            ".RunningFor" => out.push_str(&fmt_uptime(now.saturating_sub(b.started))),
-            ".Status" => out.push_str(&box_status(b, "running")),
+            ".Names" | ".Name" => out.push_str(b.ps_name()),
+            ".ID" | ".Pid" => out.push_str(&b.ps_pid().to_string()),
+            ".Image" | ".Rootfs" => out.push_str(&b.ps_image()),
+            ".Command" => out.push_str(&b.ps_command()),
+            ".Ports" => out.push_str(b.ps_ports()),
+            ".Pod" => out.push_str(b.ps_pod()),
+            ".RunningFor" => out.push_str(&b.ps_running_for(now)),
+            ".Status" => out.push_str(&b.ps_status()),
             _ => {
                 return Err(Error::Usage(
                     "ps --format: unsupported token (supported: {{.Names}} {{.Pid}} {{.Image}} \
@@ -5438,6 +5770,63 @@ mod strip_ansi_tests {
                 "strip_ansi left a `[` behind in {got:?}: the sequence was cut at the ESC only"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ps_exited_tests {
+    use super::*;
+
+    fn dead(name: &str, code: i32, pod: &str) -> registry::ExitedBox {
+        registry::ExitedBox {
+            name: name.to_string(),
+            pid: 42,
+            starttime: 1000,
+            code,
+            pod: pod.to_string(),
+            command: "python app.py".to_string(),
+            exited_ago: 5,
+        }
+    }
+
+    /// An exited box renders through the SAME `--format` engine as a live one: `.Status` is
+    /// `exited (<code>)` and `.RunningFor` is "how long ago", so `kern ps -a --format` is complete.
+    #[test]
+    fn exited_box_renders_through_ps_format() {
+        let e = dead("web", 7, "stack");
+        assert_eq!(
+            render_ps_format("{{.Names}} {{.Status}} {{.Pod}} {{.RunningFor}}", &e, 0).unwrap(),
+            "web exited (7) stack 5s ago"
+        );
+        // No live rootfs/ports on a dead box - they render empty, not a stale value.
+        assert_eq!(
+            render_ps_format("[{{.Image}}{{.Ports}}]", &e, 0).unwrap(),
+            "[]"
+        );
+    }
+
+    /// The exited filter mirrors `ps_matches`: `status=exited|dead` accept it, `status=running`
+    /// rejects it, `name` is a substring, `pod` is exact, and `label=` (not retained) matches nothing.
+    #[test]
+    fn exited_matches_honours_the_filter_keys() {
+        let e = dead("mystack-db", 1, "mystack");
+        assert!(exited_matches(&e, &[("status".into(), "exited".into())]));
+        // kern has no `dead` state, so `status=dead` matches nothing (like `created`/`running`).
+        assert!(!exited_matches(&e, &[("status".into(), "dead".into())]));
+        assert!(!exited_matches(&e, &[("status".into(), "running".into())]));
+        assert!(exited_matches(&e, &[("pod".into(), "mystack".into())]));
+        assert!(!exited_matches(&e, &[("pod".into(), "mystac".into())]));
+        assert!(exited_matches(&e, &[("name".into(), "db".into())]));
+        assert!(exited_matches(&e, &[("id".into(), "42".into())]));
+        assert!(!exited_matches(&e, &[("label".into(), "k=v".into())]));
+        // AND semantics: one non-matching clause fails the whole filter.
+        assert!(!exited_matches(
+            &e,
+            &[
+                ("pod".into(), "mystack".into()),
+                ("name".into(), "web".into())
+            ]
+        ));
     }
 }
 
@@ -5698,6 +6087,7 @@ mod ps_format_tests {
 pub fn ps(
     json: bool,
     quiet: bool,
+    all: bool,
     filters: &[(String, String)],
     format: Option<&str>,
 ) -> Result<(), Error> {
@@ -5717,8 +6107,8 @@ pub fn ps(
                         | "restarting"
                 ) {
                     return Err(Error::Usage(
-                        "ps --filter status=: running | paused | orphaned (kern boxes are ephemeral; \
-                         exited/created/dead/restarting always match nothing)",
+                        "ps --filter status=: running | paused | orphaned | exited \
+                         (created/dead/restarting match nothing - kern has no such state)",
                     ));
                 }
             }
@@ -5733,10 +6123,43 @@ pub fn ps(
         .into_iter()
         .filter(|b| ps_matches(b, filters))
         .collect();
-    // `-q`/`--quiet`: names only, one per line - scriptable, e.g. `kern stop $(kern ps -q)`.
+    // `-a`/`--all` (or an explicit `status=exited`) also surfaces boxes that have exited but whose
+    // `waitexit` breadcrumb `gc` has not yet reaped - Docker's `ps -a`. A `status=running` query never
+    // wants them, and `exited_matches` (which honours the same status filter) excludes anything the
+    // status asked against, so this gate is only "should we even read the exited set at all". `dead`
+    // is NOT here: kern has no dead state, so `status=dead` matches nothing (like `created`).
+    let want_exited = all || filters.iter().any(|(k, v)| k == "status" && v == "exited");
+    // An exited box did not keep its labels (they lived in the pruned instance record; the breadcrumb
+    // carries only name/pod/command). Say so rather than let `label=` silently match zero exited rows -
+    // the same "no accept-and-ignore on an explicit filter" rule as `status=dead`.
+    if want_exited && filters.iter().any(|(k, _)| k == "label") {
+        eprintln!(
+            "kern: note: --filter label= does not apply to exited boxes (labels are not retained past exit)"
+        );
+    }
+    let exited: Vec<registry::ExitedBox> = if want_exited {
+        // Exclude any pid that is ALSO a live box: between a box's `waitexit` write (its last act) and
+        // its instance-record unregister there is a window where both artefacts exist; without this a
+        // box could momentarily appear in BOTH sections of one `ps -a`.
+        // Dedup on the FULL (pid, starttime) identity, not pid alone: a fresh live box that recycled a
+        // within-window exited box's pid must not hide that exited row (different starttime).
+        let live: std::collections::HashSet<(i32, u64)> =
+            boxes.iter().map(|b| (b.pid, b.starttime)).collect();
+        registry::list_exited()
+            .into_iter()
+            .filter(|e| !live.contains(&(e.pid, e.starttime)) && exited_matches(e, filters))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // `-q`/`--quiet`: names only, one per line - scriptable, e.g. `kern stop $(kern ps -q)`. An exited
+    // box's name is already scrubbed at the source (`list_exited`), so it is safe to print raw here.
     if quiet {
         for b in &boxes {
             println!("{}", b.name);
+        }
+        for e in &exited {
+            println!("{}", e.name);
         }
         return Ok(());
     }
@@ -5746,23 +6169,45 @@ pub fn ps(
         for b in &boxes {
             println!("{}", render_ps_format(tmpl, b, now)?);
         }
+        for e in &exited {
+            println!("{}", render_ps_format(tmpl, e, now)?);
+        }
         return Ok(());
     }
     if json {
-        let out = kern_common::json_array(&boxes, |b| {
-            format!(
-                "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{}}}",
-                json_str(&b.name),
-                b.pid,
-                json_str(&b.pod),
-                json_str(&b.rootfs),
-                json_str(&b.command),
-                b.started,
-                json_str(&b.ports),
-                json_str(&registry::health_of(&b.name, b.pid)),
-            )
-        });
-        println!("{out}");
+        let mut items: Vec<String> = boxes
+            .iter()
+            .map(|b| {
+                format!(
+                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{}}}",
+                    json_str(&b.name),
+                    b.pid,
+                    json_str(&b.pod),
+                    json_str(&b.rootfs),
+                    json_str(&b.command),
+                    b.started,
+                    json_str(&b.ports),
+                    json_str(&registry::health_of(&b.name, b.pid)),
+                )
+            })
+            .collect();
+        // Exited rows carry the fields a dead box still has plus `exit_code`; `started`/`ports`/`rootfs`
+        // are gone with the box, so they are simply absent rather than emitted as a lie.
+        for e in &exited {
+            items.push(format!(
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"exit_code\":{},\"exited_ago\":{},\"health\":{}}}",
+                json_str(&e.name),
+                e.pid,
+                json_str(&e.pod),
+                json_str(&e.command),
+                e.code,
+                e.exited_ago,
+                json_str("exited"),
+            ));
+        }
+        // Frame through the shared helper (the sole owner of the `[ , ]` array grammar), so a live-only
+        // listing stays byte-for-byte what it was before `-a` existed and this isn't a re-rolled array.
+        println!("{}", kern_common::json_array(&items, |s| s.clone()));
     } else {
         // Build rows first so the PORTS column can size to its widest value (a published mapping
         // like `127.0.0.1:8080->80` is wider than the "PORTS" header) - keeps COMMAND aligned.
@@ -5806,7 +6251,28 @@ pub fn ps(
             d = p.d,
             z = p.z
         );
-        // One box row. `connector` is a tree glyph ("├─ "/"└─ ") drawn INSIDE the 16-wide NAME cell
+        // The ONE column skeleton every row is emitted through - live OR exited - so a width change
+        // can't desync the two paths. Callers pass their own pre-coloured, pre-padded NAME and STATUS
+        // cells (they differ: tree connector vs raw name, health string vs `exit <code>`) and the raw
+        // COMMAND, which is UNTRUSTED argv: scrubbed of terminal-control sequences (the guard inspect/
+        // --format/--json also apply - raw would let `$'\e[2J'` clear the screen on every `kern ps`,
+        // and an exited box's stored command would re-fire until `gc`), then TTY-truncated so it never
+        // wraps.
+        let emit_row = |name_cell: &str,
+                        pid: i32,
+                        time_cell: &str,
+                        status_cell: &str,
+                        ports: &str,
+                        cmd: &str| {
+            let safe = crate::ui::scrub(cmd);
+            let cmd = if tty {
+                truncate(&safe, width.saturating_sub(prefix_w).max(8))
+            } else {
+                safe
+            };
+            println!("{name_cell} {pid:>7} {time_cell:>7}  {status_cell} {ports:<pw$} {cmd}");
+        };
+        // One LIVE box row. `connector` is a tree glyph ("├─ "/"└─ ") drawn INSIDE the 16-wide NAME cell
         // for a pod member, or "" for a standalone box - so every PID column still lines up.
         let print_row =
             |b: &registry::Instance, up: u64, health: &str, ports: &str, connector: &str| {
@@ -5831,15 +6297,14 @@ pub fn ps(
                     "unhealthy" => p.r,
                     _ => p.d,
                 };
-                let health_cell = format!("{hc}{:<9}{}", health, p.z);
-                let cmd = if tty {
-                    truncate(&b.command, width.saturating_sub(prefix_w).max(8))
-                } else {
-                    b.command.clone()
-                };
-                println!(
-                    "{name} {:>7} {:>6}s  {health_cell} {ports:<pw$} {cmd}",
-                    b.pid, up
+                let status_cell = format!("{hc}{:<9}{}", health, p.z);
+                emit_row(
+                    &name,
+                    b.pid,
+                    &format!("{up}s"),
+                    &status_cell,
+                    ports,
+                    &b.command,
                 );
             };
         // Standalone boxes (no pod) print flat, exactly like before. Pod members are grouped under a
@@ -5870,6 +6335,29 @@ pub fn ps(
             for (i, (b, up, health, ports)) in members.iter().enumerate() {
                 let connector = if i + 1 == n { "└─ " } else { "├─ " };
                 print_row(b, *up, health, ports, connector);
+            }
+        }
+        // Exited boxes (only when `-a`/`status=exited`): a flat section under a dim header, driven off
+        // the SAME `emit_row` as the live rows so they cannot desync. STATUS is `exit <code>` (green at
+        // 0, red otherwise); the time cell is how long AGO it exited. The full `<pod>-<service>` name is
+        // kept - there is no pod tree here to supply the context.
+        if !exited.is_empty() {
+            let n = exited.len();
+            let plural = if n == 1 { "box" } else { "boxes" };
+            println!("{d}exited{z} {d}({n} {plural}){z}", d = p.d, z = p.z);
+            for e in &exited {
+                let hc = if e.code == 0 { p.g } else { p.r };
+                // name is already scrubbed at the source (`list_exited`), so it is safe in the cell.
+                let name = format!("{b}{c}{:<16}{z}", e.name, b = p.b, c = p.c, z = p.z);
+                let status_cell = format!("{hc}{:<9}{}", format!("exit {}", e.code), p.z);
+                emit_row(
+                    &name,
+                    e.pid,
+                    &fmt_uptime(e.exited_ago),
+                    &status_cell,
+                    "-",
+                    &e.command,
+                );
             }
         }
     }
@@ -8433,6 +8921,11 @@ fn ensure_repo_tag(image: &str) -> String {
 }
 
 pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
+    // `-o` writes a tar to a host path: refuse a registry destination, or `save img -o <runtime>/kern/…`
+    // would clobber a peer's posture record (same WRITE class as `kern cp` box→host).
+    if let Some(o) = out {
+        crate::secret::guard_host_write_path(o, "save -o")?;
+    }
     let (rootfs, config, cleanup) = materialize_image(image)?;
     let cfg = kern_oci::ImageConfigOut {
         entrypoint: config.entrypoint,
@@ -8670,6 +9163,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         env: Vec::new(),
         workdir: None,
         user: None,
+        exposed_ports: Vec::new(),
     };
     write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
         .map_err(|e| Error::Oci(format!("commit image config: {e}")))?;
@@ -10374,11 +10868,34 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
             args.context
         )));
     }
+    // A `COPY`/`ADD` reads from the context root into the image, so `kern build <runtime>/kern` would
+    // copy a peer's ssh keys, secrets and posture records into a published image. Refuse a context that
+    // resolves onto the registry, the same inverted guard `-v`/`--secret`/`--env-file` apply.
+    if crate::registry::path_overlaps_trusted_state(&ctx) {
+        return Err(Error::Build(format!(
+            "build context '{}' resolves onto the kern registry - refusing (a COPY would read another \
+             box's secrets/state into the image)",
+            args.context
+        )));
+    }
     let dfpath = match args.file {
         Some(f) => PathBuf::from(f),
         None => ctx.join("Dockerfile"),
     };
-    let text = std::fs::read_to_string(&dfpath)
+    // `-f <path>` reads a host file whose CONTENT becomes build INSTRUCTIONS (a `RUN`/`COPY`/`ADD` run
+    // against the box) - the same host-content-reaches-the-box class as `--env-file`, in a MORE powerful
+    // form (commands, not values). Guard it against the registry (a `key=value` record parses far enough
+    // to carry a line) the same inverted way `-v`/`--secret`/`--env-file`/context do, and read the
+    // canonical path so a symlink can't redirect it after the check.
+    let dfcanon = std::fs::canonicalize(&dfpath)
+        .map_err(|e| Error::Build(format!("cannot read {}: {e}", dfpath.display())))?;
+    if crate::registry::path_overlaps_trusted_state(&dfcanon) {
+        return Err(Error::Build(format!(
+            "Dockerfile '{}' resolves onto the kern registry - refusing (its lines run as build steps)",
+            dfpath.display()
+        )));
+    }
+    let text = std::fs::read_to_string(&dfcanon)
         .map_err(|e| Error::Build(format!("cannot read {}: {e}", dfpath.display())))?;
     let mut bmap = std::collections::HashMap::new();
     for ba in args.build_args {
@@ -12399,7 +12916,8 @@ fn display_run(argv: &[String]) -> String {
 /// overlay-mount / cleanup RAM-fast and keeps the writable layer ephemeral; its pages count
 /// against the box's memory cap. Created mode 0700 by the caller.
 fn scratch_dir() -> PathBuf {
-    // An explicit XDG_RUNTIME_DIR always wins - it is the documented override.
+    crate::registry::assert_registry_child("scratch"); // classification chokepoint (see registry.rs)
+                                                       // An explicit XDG_RUNTIME_DIR always wins - it is the documented override.
     if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(x).join("kern/scratch");
     }
@@ -12547,6 +13065,12 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             format!("no running box named {listed}")
         }));
     }
+    // A target that could not actually be stopped (orphan cgroup not reaped, a SIGKILL that did not
+    // land in time) or a named ref that matched nothing is a real failure, not a note on stderr:
+    // collect the reasons and return them as ONE `Err` at the end so the command exits NON-ZERO and
+    // `kern top` (which reuses this fn with stderr muted) can show the reason. Same rule and shape as
+    // `pause`, kept identical so the partial-failure convention is not re-derived per command.
+    let mut failures: Vec<String> = Vec::new();
     // PHASE 1: send every box its stop signal BEFORE waiting on any of them, and share ONE deadline.
     // Stopping serially made each box burn its own full grace in turn, so an N-service stack of
     // workloads that ignore SIGTERM took N x grace (measured: 20 s for two `sh -c sleep` services).
@@ -12582,7 +13106,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         // Without this branch `kern stop <name>` answered "no running box" while the port stayed bound.
         if b.orphaned {
             let reaped = registry::reap_orphan(b);
-            registry::set_box_exit(b.pid, b.starttime, 137);
+            registry::set_box_exit(b.pid, b.starttime, 137, &b.name, &b.pod, &b.command);
             registry::clear_health(&b.name, b.pid);
             cleanup_box_scratch(&b.rootfs);
             if reaped {
@@ -12591,10 +13115,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                     b.name
                 );
             } else {
-                eprintln!(
-                    "kern: '{}' was orphaned but its cgroup could not be reaped (already gone?)",
+                failures.push(format!(
+                    "'{}' was orphaned but its cgroup could not be reaped (already gone?)",
                     b.name
-                );
+                ));
             }
             continue;
         }
@@ -12642,7 +13166,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         // A `stop` SIGKILLs the supervisor, which then never records its own exit code. Record 137
         // (128 + SIGKILL) here - BEFORE removing the instance file - so `kern wait` on a stopped box
         // returns 137 like Docker, instead of "no exit code recorded".
-        registry::set_box_exit(b.pid, b.starttime, 137);
+        registry::set_box_exit(b.pid, b.starttime, 137, &b.name, &b.pod, &b.command);
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
         registry::clear_health(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
@@ -12658,10 +13182,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         } else {
             // Don't report success while alive: the SIGKILL went out but the box wasn't confirmed
             // gone within the grace window. Surface it honestly instead of printing `stopped`.
-            eprintln!(
-                "kern: sent SIGKILL to '{}' (pid {}) but it did not exit in time",
+            failures.push(format!(
+                "sent SIGKILL to '{}' (pid {}) but it did not exit in time",
                 b.name, b.pid
-            );
+            ));
         }
     }
     for n in &managed_only {
@@ -12702,9 +13226,15 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         for n in names {
             let matched = targets.iter().any(|b| ref_matches(b, n, &live_names));
             if !matched && !managed_only.contains(n) {
-                eprintln!("kern: no running box '{n}'");
+                failures.push(format!("no running box '{n}'"));
             }
         }
+    }
+    if !failures.is_empty() {
+        return Err(Error::Sandbox(format!(
+            "could not stop: {}",
+            failures.join("; ")
+        )));
     }
     Ok(())
 }
@@ -12806,20 +13336,28 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
     if targets.is_empty() {
         return Err(Error::NotRunning(format!("no running box to {verb}")));
     }
+    // A box that MATCHED but could not actually be (un)frozen - it has no dedicated cgroup (freeze is
+    // a cgroup-v2 operation that needs a delegated scope), or the `cgroup.freeze` write errored - is a
+    // real failure, not a success with a note on stderr. Collect the reasons (plus any named ref that
+    // matched no live box) into ONE returned error so the command exits NON-ZERO (a scripted
+    // `kern pause X && next` must not run `next` when the freeze never happened) AND the message is
+    // self-contained: the `kern top` TUI reuses this fn with stdout/stderr muted, so a "see above"
+    // pointer would dangle - the reason must travel IN the error, which the TUI shows in its overlay.
+    // Successes still stream to stdout so an `--all` reports each box as it goes.
+    let mut failures: Vec<String> = Vec::new();
     for b in &targets {
         match registry::box_cgroup(b.cgroup_pid()) {
             Some(cg) => {
                 let path = cg.join("cgroup.freeze");
                 match std::fs::write(&path, if freeze { "1" } else { "0" }) {
                     Ok(()) => println!("{}d '{}' (pid {})", verb, b.name, b.pid),
-                    Err(e) => eprintln!("kern: cannot {verb} '{}': {e}", b.name),
+                    Err(e) => failures.push(format!("'{}': {e}", b.name)),
                 }
             }
-            None => eprintln!(
-                "kern: cannot {verb} '{}' - the box has no dedicated cgroup (needs a systemd --user \
-                 scope; pause/unpause is a cgroup-freezer operation)",
+            None => failures.push(format!(
+                "'{}' has no dedicated cgroup (freeze needs a systemd --user scope)",
                 b.name
-            ),
+            )),
         }
     }
     if !all {
@@ -12827,9 +13365,15 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
             // Same NAME-or-PID-or-POD rule as `stop`: a `kern pause <pod>` froze every member, so the
             // pod ref matched - don't then wrongly report it as "no running box".
             if !targets.iter().any(|b| ref_matches(b, n, &live_names)) {
-                eprintln!("kern: no running box named '{n}'");
+                failures.push(format!("no running box named '{n}'"));
             }
         }
+    }
+    if !failures.is_empty() {
+        return Err(Error::Sandbox(format!(
+            "could not {verb}: {}",
+            failures.join("; ")
+        )));
     }
     Ok(())
 }
@@ -13381,6 +13925,43 @@ fn check_pod_global_conflicts(
     Ok(())
 }
 
+/// Best-effort WARNING for two pod services whose IMAGES expose the same container port even though
+/// NEITHER declares it in the compose file - the implicit-EXPOSE case `check_pod_global_conflicts`
+/// cannot see (two `nginx` default to :80, two `node` apps to :3000). A pod shares one network
+/// namespace, so if both actually bind it the second dies with EADDRINUSE at runtime, with an obscure
+/// error and no compose-time hint. This is deliberately SOFT: an image's `ExposedPorts` is a hint, not
+/// a guaranteed bind (an nginx reconfigured off :80 will not collide), so it warns, never refuses.
+/// Cache-only via [`PullPolicy::Never`]: it never pulls just to warn, so an uncached service is
+/// skipped (and warned about, if it collides, once its image is present - e.g. the second `up`).
+fn warn_image_expose_collisions(boxes: &[crate::compose::ComposeBox], no_pod: bool) {
+    if no_pod || boxes.len() < 2 {
+        return;
+    }
+    let mut seen: std::collections::HashMap<(u16, bool), String> = std::collections::HashMap::new();
+    for b in boxes {
+        let Some(image) = b.image.as_deref() else {
+            continue; // a `--rootfs`/`build`-only service has no image config to read
+        };
+        let Ok((_, cfg)) = resolve_image_depth(image, 0, PullPolicy::Never) else {
+            continue; // not cached: do not pull just to warn
+        };
+        for (port, udp) in cfg.exposed_ports {
+            if let Some(other) = seen.insert((port, udp), b.name.clone()) {
+                if other != b.name {
+                    let proto = if udp { "udp" } else { "tcp" };
+                    eprintln!(
+                        "kern: warning: the images of '{other}' and '{}' both EXPOSE {port}/{proto}; a \
+                         stack shares ONE network namespace, so if both bind it the second fails at \
+                         runtime with EADDRINUSE. If they really serve the same port, give one a \
+                         different internal port (its own config, or `port:`), or run with --no-pod.",
+                        b.name
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// How long to watch a freshly-launched stack for an IMMEDIATE death. Not "how long a service takes
 /// to start": a service is not required to be READY here, only to still exist. This covers a failed
 /// `execve`, a failed bind, a permission error and a missing file, which is the entire class `up` can
@@ -13548,6 +14129,8 @@ struct TerminalOpts<'a> {
     file: &'a str,
     tail: Option<usize>,
     follow: bool,
+    /// `-a/--all` for `ps`: also list the stack's recently-exited services.
+    all: bool,
     services: &'a [String],
     /// Needed by the read-only verbs too: `config` and `systemd` answer questions ABOUT a bring-up,
     /// so they have to know whether that bring-up would share a namespace.
@@ -13565,8 +14148,8 @@ fn run_terminal_verb(
     boxes: &mut [crate::compose::ComposeBox],
     o: &TerminalOpts<'_>,
 ) -> Result<bool, Error> {
-    let (pod, file, tail, follow, services, no_pod) =
-        (o.pod, o.file, o.tail, o.follow, o.services, o.no_pod);
+    let (pod, file, tail, follow, all, services, no_pod) =
+        (o.pod, o.file, o.tail, o.follow, o.all, o.services, o.no_pod);
     let selected =
         |b: &crate::compose::ComposeBox| services.is_empty() || services.contains(&b.name);
 
@@ -13653,8 +14236,33 @@ fn run_terminal_verb(
         }
         ComposeAction::Ps => {
             // Reuse `kern ps` itself, scoped to this stack's pod - one renderer, so the compose view
-            // can never drift from `kern ps` (same columns, same status rules, same --json).
-            return ps(false, false, &[("pod".to_string(), pod.to_string())], None).map(|()| true);
+            // can never drift from `kern ps` (same columns, same status rules, same --json). `-a`
+            // threads straight through, so `compose ps -a` shows the stack's recently-exited services;
+            // the phantom worry (a PRIOR run of the same pod name) is closed at the source by `down`
+            // reaping its own boxes' sidecars precisely (see `ComposeAction::Down`).
+            let rc = ps(
+                false,
+                false,
+                all,
+                &[("pod".to_string(), pod.to_string())],
+                None,
+            );
+            // Without `-a`, a running-only view cannot answer "which service died?" - point AT the
+            // answer when the file defines more services than are up, instead of leaving the user to
+            // know that the pod name is the stack name.
+            if !all {
+                let defined = boxes.len();
+                let running = registry::list().iter().filter(|b| b.pod == pod).count();
+                if running < defined {
+                    let p = crate::ui::Palette::detect();
+                    println!(
+                        "{d}{running}/{defined} services running - exited: kern compose … ps -a{z}",
+                        d = p.d,
+                        z = p.z
+                    );
+                }
+            }
+            return rc.map(|()| true);
         }
         ComposeAction::Logs => {
             let wanted: Vec<&str> = boxes
@@ -13705,6 +14313,11 @@ fn run_terminal_verb(
         }
         ComposeAction::Down => {
             let names = stop_stack(boxes, pod);
+            // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
+            // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
+            // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
+            // not call this) leaves the exited services visible.
+            registry::clear_waitexit_pod(pod, &names);
             // Tear the pod down QUIETLY (we just stopped the members, so `pod::remove`'s "members keep
             // running" note would contradict this). Only claim it was removed if one existed - a
             // `--no-pod` stack has none.
@@ -13761,6 +14374,8 @@ pub struct ComposeOpts<'a> {
     pub no_pod: bool,
     pub tail: Option<usize>,
     pub follow: bool,
+    /// `-a/--all` for `ps`: also list the stack's recently-exited services.
+    pub all: bool,
     pub services: &'a [String],
     /// `-p/--project-name`: overrides the pod name normally derived from the file's directory.
     pub project: Option<&'a str>,
@@ -13777,6 +14392,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         no_pod,
         tail,
         follow,
+        all,
         services,
         project,
         env_file,
@@ -13851,28 +14467,42 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `db` inside the stack - the name that appears in the compose file is the name that resolves.
     let service_names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
     let scoped = |svc: &str| format!("{pod}-{svc}");
+    // Each service's BOX name: Docker's `container_name:` verbatim when set (so `docker exec <name>`
+    // ports 1:1 to `kern exec <name>`), else the project-scoped `<pod>-<service>`. Built ONCE so the
+    // box's own name and every `depends_on` edge that names a service map to the SAME box name.
+    let box_name_of: std::collections::HashMap<String, String> = boxes
+        .iter()
+        .map(|b| {
+            (
+                b.name.clone(),
+                b.container_name.clone().unwrap_or_else(|| scoped(&b.name)),
+            )
+        })
+        .collect();
+    let box_name = |svc: &str| box_name_of.get(svc).cloned().unwrap_or_else(|| scoped(svc));
     for b in boxes.iter_mut() {
-        // The service name must survive as an alias: it is what peers connect to.
+        // The service name must survive as an alias: it is what peers connect to inside the pod,
+        // regardless of what the box itself is named (a `container_name` does not change the DNS).
         let svc = b.name.clone();
         if !b.net_aliases.contains(&svc) {
-            b.net_aliases.push(svc);
+            b.net_aliases.push(svc.clone());
         }
-        b.name = scoped(&b.name);
         for d in b
             .depends_on
             .iter_mut()
             .chain(b.depends_healthy.iter_mut())
             .chain(b.depends_completed.iter_mut())
         {
-            *d = scoped(d);
+            *d = box_name(d);
         }
+        b.name = box_name(&svc);
     }
     // Selectors from the command line name SERVICES; map them onto the boxes they now identify.
     let services: Vec<String> = services
         .iter()
         .map(|s| {
             if service_names.iter().any(|n| n == s) {
-                scoped(s)
+                box_name(s)
             } else {
                 s.clone()
             }
@@ -13903,6 +14533,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             file,
             tail,
             follow,
+            all,
             services,
             no_pod,
         },
@@ -13982,6 +14613,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // Self-gated (see its doc comment): `config` and `systemd` reach the SAME rejection through the
     // same call, so the dry run can never disagree with the bring-up about what is startable.
     check_pod_global_conflicts(&boxes, no_pod)?;
+    // Softer sibling: two services whose IMAGES expose the same port without either DECLARING it (two
+    // nginx on :80, two node apps on :3000). Best-effort and cache-only (never pulls just to warn),
+    // a WARNING not an error because an image's EXPOSE is a hint, not a guaranteed bind.
+    warn_image_expose_collisions(&boxes, no_pod);
     // A pod shares ONE network namespace, so a `net.*` sysctl written on one service applies to every
     // service in the stack and the last one to start wins. The file makes it look per-service; say so
     // rather than let an operator tune one service and silently retune the others.
@@ -14000,6 +14635,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     let self_exe =
         std::env::current_exe().map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
+    // Docker's PROJECT DIRECTORY: every service's box runs with CWD = the compose file's dir, so a
+    // relative `env_file: ./x.env`, `-v ./data:/d`, or `rootfs: ./root` resolves against it (as Docker
+    // anchors them) instead of against kern's own CWD - which broke `up` from any other directory. The
+    // box reads `env_file` before the systemd-scope re-exec, and `systemd-run --scope` keeps the cwd, so
+    // both the pre- and post-re-exec resolutions land in the project dir.
+    let project_dir = compose_dir(file);
 
     // Compose `build:` - build each service's image via `kern build` BEFORE the launch loop, so a box
     // with `build:` gets a real image to run. Four hardenings the adversarial review demanded, because
@@ -14100,8 +14741,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     .iter()
                     .map(|name| {
                         let b = boxes.iter().find(|b| &b.name == name).unwrap();
-                        let (started, pod, up_token, self_exe, boxes) =
-                            (&started, &pod, &up_token, &self_exe, &boxes);
+                        let (started, pod, up_token, self_exe, boxes, project_dir) =
+                            (&started, &pod, &up_token, &self_exe, &boxes, &project_dir);
                         scope.spawn(move || -> Result<(), Error> {
                             // Conditional deps (healthy/completed) live in an earlier, already-started
                             // level; plain `depends_on` is honored by the level barrier itself.
@@ -14119,6 +14760,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                 .unwrap_or("(no source)");
                             eprintln!("→ [{n}/{total}] starting '{}'  {src}{dep}", b.name);
                             let mut cmd = std::process::Command::new(self_exe);
+                            // Anchor the box's relative paths (env_file/-v/rootfs) to the project dir.
+                            cmd.current_dir(project_dir);
                             cmd.arg("box").arg(&b.name);
                             // Record the fingerprint WITH the box, so the next `up` can compare.
                             cmd.arg("--def-hash").arg(definition_hash(b));
@@ -15280,7 +15923,9 @@ mod net_resource_tests {
         let tmp = std::fs::canonicalize(&tmp).unwrap();
         std::env::set_var("XDG_RUNTIME_DIR", &tmp);
 
-        // Materialize instances/claims/exit so `canonicalize` of the forms below succeeds.
+        // Materialize instances/claims/exit so `canonicalize` of the forms below succeeds. Production
+        // resolves the identity set non-creatingly, so the test must create the dirs explicitly.
+        crate::registry::materialize_authoritative_dirs_for_test();
         assert!(
             !crate::registry::trusted_state_dirs().is_empty(),
             "registry state dirs were created"
@@ -15307,15 +15952,88 @@ mod net_resource_tests {
             format!("{t}/kern/instances/.."), // `..` out of a subdir
             format!("{t}/kern/instances"),    // a trust-bearing subdir directly
             format!("{t}/kern/claims"),       // and another
-            format!("{t}/link"),              // a symlink resolving onto the registry
-            t.clone(),                        // the PARENT that contains kern/
+            format!("{t}/kern/waitexit"), // the `ps -a` breadcrumb dir (forgeable exited records)
+            format!("{t}/link"),          // a symlink resolving onto the registry
+            t.clone(),                    // the PARENT that contains kern/
         ] {
             assert!(refused(form.clone()), "must refuse -v source {form}");
+        }
+        // PARAMETRIZED on the production list: every dir `trusted_state_dirs()` protects must be refused
+        // directly. So a dir added there (as `waitexit/` was) is auto-covered here instead of needing a
+        // new literal above - the literal list drifting from production is the exact gap that let
+        // `waitexit/` ship unprotected.
+        for d in crate::registry::trusted_state_dirs() {
+            assert!(
+                refused(d.to_string_lossy().into_owned()),
+                "must refuse trusted state dir {d:?}"
+            );
         }
         // A sibling that merely shares a name prefix stays mountable.
         assert!(
             parse_volumes(&[format!("{t}/kern-other:/r")]).is_ok(),
             "a sibling of the registry must stay mountable"
+        );
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cp_save_write_guard_follows_a_symlink_into_the_registry() {
+        // `kern cp box:/x <dst>` / `kern save -o <dst>` write via `File::create`, which FOLLOWS a symlink
+        // at `dst`. A parent-only check let a symlink final component (in a safe dir, pointing at the
+        // registry) redirect the write onto a peer's posture record - a real forgery bypass. The guard
+        // must follow the link to where the write LANDS. Covers a direct link, a link to a not-yet-existing
+        // registry path, and a two-hop chain; a link to a safe target stays writable.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-wguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = std::fs::canonicalize(&tmp).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::registry::materialize_authoritative_dirs_for_test();
+
+        let safe = tmp.join("safe");
+        std::fs::create_dir_all(&safe).unwrap();
+        let instances = tmp.join("kern/instances");
+        std::fs::write(instances.join("rec"), b"posture").unwrap();
+
+        let g =
+            |p: &std::path::Path| crate::secret::guard_host_write_path(&p.to_string_lossy(), "cp");
+        // direct symlink onto an existing registry record
+        let l1 = safe.join("l1");
+        std::os::unix::fs::symlink(instances.join("rec"), &l1).unwrap();
+        assert!(
+            g(&l1).is_err(),
+            "symlink onto a registry record must be refused"
+        );
+        // symlink onto a NOT-yet-existing registry path (write would CREATE it)
+        let l2 = safe.join("l2");
+        std::os::unix::fs::symlink(instances.join("newrec"), &l2).unwrap();
+        assert!(
+            g(&l2).is_err(),
+            "symlink onto a new registry path must be refused"
+        );
+        // two-hop chain -> record
+        let l3 = safe.join("l3");
+        std::os::unix::fs::symlink(&l1, &l3).unwrap();
+        assert!(
+            g(&l3).is_err(),
+            "a symlink chain into the registry must be refused"
+        );
+        // a symlink onto a SAFE target stays writable (target in `safe/`, NOT the runtime dir root -
+        // that dir is an ANCESTOR of the registry and refused by design), and a plain safe path too
+        let good = safe.join("good");
+        std::os::unix::fs::symlink(safe.join("target.txt"), &good).unwrap();
+        assert!(
+            g(&good).is_ok(),
+            "a symlink to a safe target must stay writable"
+        );
+        assert!(
+            g(&safe.join("plain.txt")).is_ok(),
+            "an ordinary path must stay writable"
         );
 
         std::env::remove_var("XDG_RUNTIME_DIR");
@@ -15699,6 +16417,7 @@ mod net_resource_tests {
             env: vec!["A=1".into(), "B=2".into()],
             workdir: Some("/app".into()),
             user: Some("1000:1000".into()),
+            exposed_ports: vec![(80, false), (53, true)],
         };
         let dir = std::env::temp_dir().join(format!("kern-imgcfg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -15718,6 +16437,10 @@ mod net_resource_tests {
         assert_eq!(r.env, c.env);
         assert_eq!(r.workdir, c.workdir);
         assert_eq!(r.user, c.user);
+        assert_eq!(
+            r.exposed_ports, c.exposed_ports,
+            "the image's EXPOSE (used by the pod port-collision warning) must survive the sidecar"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

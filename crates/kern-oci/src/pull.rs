@@ -92,6 +92,11 @@ pub struct ImageConfig {
     pub workdir: Option<String>,
     /// `config.User` - default `uid[:gid]` / name.
     pub user: Option<String>,
+    /// `config.ExposedPorts` keys, as `(port, is_udp)`. The image's IMPLICIT EXPOSE (nginx's `80`,
+    /// postgres's `5432`), which the compose file need not restate. Lets a stack preflight warn when
+    /// two pod services would bind the same container port even though neither DECLARES it. Empty
+    /// when the image config omits it.
+    pub exposed_ports: Vec<(u16, bool)>,
 }
 
 /// Pull `image` into `dest` (created if needed), producing a usable rootfs, and return its OCI
@@ -312,7 +317,43 @@ fn parse_image_config(blob: &str) -> ImageConfig {
         env: str_array_after(cfg, "Env"),
         workdir: first_str(cfg, "WorkingDir").and_then(nonempty),
         user: first_str(cfg, "User").and_then(nonempty),
+        exposed_ports: exposed_ports_after(cfg),
     }
+}
+
+/// The container ports the image's `config.ExposedPorts` declares, as `(port, is_udp)`. That object is
+/// keyed `"80/tcp"` / `"53/udp"` with empty `{}` values, so the only quoted strings inside it are the
+/// keys - pull each and parse `<port>/<proto>`. Escape handling is unnecessary: a port key is ASCII
+/// digits and one slash. Deduplicated; empty when the key is absent or malformed.
+pub(crate) fn exposed_ports_after(cfg: &str) -> Vec<(u16, bool)> {
+    let Some(obj) = object_after(cfg, "ExposedPorts") else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u16, bool)> = Vec::new();
+    let mut in_str = false;
+    let mut key = String::new();
+    for c in obj.chars() {
+        if in_str {
+            if c == '"' {
+                if let Some((num, proto)) = key.split_once('/') {
+                    if let Ok(port) = num.parse::<u16>() {
+                        let udp = proto.eq_ignore_ascii_case("udp");
+                        if (udp || proto.eq_ignore_ascii_case("tcp")) && !out.contains(&(port, udp))
+                        {
+                            out.push((port, udp));
+                        }
+                    }
+                }
+                key.clear();
+                in_str = false;
+            } else {
+                key.push(c);
+            }
+        } else if c == '"' {
+            in_str = true;
+        }
+    }
+    out
 }
 
 /// The tag an untagged reference means. `alpine` is `alpine:latest`, everywhere.
@@ -3964,6 +4005,25 @@ mod tests {
             vet_tar_stream(&mut r).is_ok(),
             "absolute symlinks with no write-through must pass (the alpine regression)"
         );
+    }
+
+    #[test]
+    fn exposed_ports_parses_proto_dedups_and_skips_garbage() {
+        // The pod port-collision warning reads this. tcp/udp both, insertion order, deduplicated.
+        let c = parse_image_config(
+            r#"{"config":{"ExposedPorts":{"80/tcp":{},"443/tcp":{},"53/udp":{},"80/tcp":{}},"Cmd":["nginx"]}}"#,
+        );
+        assert_eq!(c.exposed_ports, vec![(80, false), (443, false), (53, true)]);
+        // Absent -> empty (the common no-EXPOSE image).
+        assert!(parse_image_config(r#"{"config":{"Cmd":["x"]}}"#)
+            .exposed_ports
+            .is_empty());
+        // A garbage key (no `/`, or a port past u16) is SKIPPED, never a panic - the config comes off
+        // an untrusted registry.
+        let bad = parse_image_config(
+            r#"{"config":{"ExposedPorts":{"notaport":{},"70000/tcp":{},"22/tcp":{}}}}"#,
+        );
+        assert_eq!(bad.exposed_ports, vec![(22, false)]);
     }
 
     /// SECURITY (the real escape the guard exists for): a symlink whose target escapes the rootfs

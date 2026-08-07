@@ -370,6 +370,7 @@ fn parse_image_config(json: &str) -> ImageConfig {
         env: crate::json::str_array_after(cfg, "Env"),
         workdir: str_field(cfg, "WorkingDir").filter(|s| !s.is_empty()),
         user: str_field(cfg, "User").filter(|s| !s.is_empty()),
+        exposed_ports: crate::pull::exposed_ports_after(cfg),
     }
 }
 

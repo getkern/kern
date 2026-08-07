@@ -35,6 +35,12 @@ jobs:
           python3 scripts/no-ai-slop.py
           python3 scripts/stale-numbers.py
           python3 scripts/test-count.py
+          # Every child under the runtime registry root must be CLASSIFIED (authoritative dir / box-data
+          # dir / sibling tree / cosmetic file) at COMPILE time, not just when a constructor is exercised
+          # at runtime: `runstats` builds `<runtime>/kern/runstats` WITHOUT the runtime chokepoint, the
+          # exact bypass that let `waitexit/` ship mountable. This fails the build on a new registry child
+          # that is not classified, or a chokepoint constructor that stops classifying.
+          python3 scripts/registry-classified.py
           # Diff-gate the seccomp allowlist: the allow set is DERIVED from the pinned moby profile, a
           # source we do not control, so a profile bump could pull a new syscall into it silently. This
           # fails if seccomp/allow-names.txt drifts from `moby_allow ∖ kern_denied`, naming the syscall

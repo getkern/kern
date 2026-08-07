@@ -132,6 +132,11 @@ fn copy_out(pid1: i32, box_src: &str, host_dst: &str) -> Result<(), Error> {
         )));
     }
     let dst = resolve_host_dst(host_dst, box_src);
+    // Guard the host DESTINATION: `kern cp box:/x <runtime>/kern/instances/<peer>` would let a box's
+    // contents OVERWRITE a peer's recorded posture (the WRITE the `-v` guard warns about - forging a
+    // capability/seccomp record to elevate a later `kern exec`). Shared write-guard: refuse when the
+    // dst's PARENT resolves onto a trust-bearing registry dir (box-data dirs stay writable).
+    crate::secret::guard_host_write_path(&dst, "cp destination")?;
     let mut out =
         std::fs::File::create(&dst).map_err(|e| Error::Sandbox(format!("writing {dst}: {e}")))?;
     // Stream with a fixed buffer + a hard size cap, so a multi-GB (or sparse-huge) in-box file can't
@@ -169,8 +174,14 @@ fn stream_capped(src: &mut std::fs::File, dst: &mut std::fs::File) -> std::io::R
 /// host → box. Reads the host file and writes it to the in-box `dst` (confined). The box-side parent
 /// directory must already exist.
 fn copy_in(host_src: &str, pid1: i32, box_dst: &str) -> Result<(), Error> {
+    // Guard the host SOURCE against the registry - the SAME class the `-v`/`--secret`/`--env-file` guard
+    // closes, which `kern cp` was missing: `kern cp <runtime>/kern/ssh/<key> box:/x` (or a posture record
+    // under `instances/`) would copy a peer's secret/state INTO the box. The box side is already confined
+    // (`openat2_in_root`); this closes the host side. Canonicalize + refuse, then read the CANONICAL path
+    // so a symlink can't redirect the read after the check.
+    let canon = crate::secret::guard_host_path(host_src, "cp")?;
     let meta =
-        std::fs::metadata(host_src).map_err(|e| Error::Sandbox(format!("host {host_src}: {e}")))?;
+        std::fs::metadata(&canon).map_err(|e| Error::Sandbox(format!("host {host_src}: {e}")))?;
     if !meta.file_type().is_file() {
         return Err(Error::Sandbox(format!(
             "{host_src} is not a regular file (kern cp copies single files)"
@@ -182,7 +193,7 @@ fn copy_in(host_src: &str, pid1: i32, box_dst: &str) -> Result<(), Error> {
         )));
     }
     let data =
-        std::fs::read(host_src).map_err(|e| Error::Sandbox(format!("host {host_src}: {e}")))?;
+        std::fs::read(&canon).map_err(|e| Error::Sandbox(format!("host {host_src}: {e}")))?;
     // If the box dst names an existing directory, drop the source basename into it.
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
     let box_dst = box_dst_path(root, box_dst, host_src);
@@ -290,5 +301,19 @@ mod tests {
             resolve_host_dst("/tmp/out.txt", "/etc/app.conf"),
             "/tmp/out.txt"
         );
+    }
+
+    #[test]
+    fn cp_write_guard_allows_an_ordinary_host_path() {
+        // A destination whose parent is NOT under the registry passes. The refuse case (a registry
+        // parent) is covered by `path_overlaps_trusted_state`'s own env-mutating anti-forgery tests, so
+        // this only pins that the shared write-guard does not false-positive on an ordinary path.
+        let dir = std::env::temp_dir().join(format!("kern-cpw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("out.txt");
+        assert!(
+            crate::secret::guard_host_write_path(&dst.to_string_lossy(), "cp destination").is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

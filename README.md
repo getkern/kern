@@ -60,6 +60,11 @@ once in a `kern.toml` and attached by name. [docs/RESOURCES.md](docs/RESOURCES.m
 - **Not free of the userns trade.** kern's isolation is built on an unprivileged user namespace, and
   userns has been a fertile source of kernel LPE bugs. Running untrusted code in a box hands it that
   surface to probe. [SECURITY.md](SECURITY.md) states this first, before any claim.
+- **Not a wall around what you mount in.** A `-v` bind hands the box read/write on that host path;
+  `-v $HOME:/host` gives it your home directory. A mount is a trust decision you make, not a boundary
+  kern enforces: mount only what the workload needs, and `:ro` when it only reads. (The one thing kern
+  refuses to bind is its OWN runtime registry, which would hand a box another box's secrets and state.)
+  Likewise `--net host` and `--privileged` are opt-outs of the isolation, by name.
 - **Not a Docker Engine reimplementation.** kern speaks Docker's *formats*, images and
   `docker-compose.yml` and Dockerfiles, not its API. No overlay networks, no plugin ecosystem, no
   Swarm. Full matrix: [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
@@ -115,6 +120,37 @@ Every read verb also answers in JSON, so nothing has to parse a table:
 kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
 kern volume ls --json          # ps · images · stats · inspect · builds · pod ls · config list · diff
 ```
+
+## Your Docker Compose stack, without Docker Desktop
+
+kern speaks `docker-compose.yml`. Point it at the stack you already have and `kern compose up` runs it
+with no daemon and no Docker Desktop, the same on Linux, WSL2 and ARM boards.
+
+```yaml
+# compose.yaml - a real stack, unchanged
+services:
+  db:
+    image: postgres:alpine
+    environment: { POSTGRES_PASSWORD: secret, POSTGRES_DB: app }
+  web:
+    image: adminer
+    ports: ["8080:8080"]
+    depends_on: [db]
+```
+
+```sh
+kern compose compose.yaml up
+```
+
+Both official images start, `web` reaches `db` by service name, and the port is published to the host.
+Warm (images cached) the web tier serves in **~0.3 s**, and the stack costs only what postgres and adminer
+actually use (~66 MB here) with **zero daemon** on top, where Docker Desktop is a background VM before your
+first container.
+
+Official images that drop to a non-root user (postgres, redis, ...) want `uidmap` and a `/etc/subuid`
+line, and outbound image pulls want `pasta`; both are one `apt install` on a dev box, and `kern doctor`
+names either if it is missing. This is the local dev loop, not a production orchestrator: no Swarm, no
+overlay networks.
 
 ## Resource profiles
 
@@ -249,7 +285,7 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**The core is done. Everything above works today and is tested:** 765 Rust, 72 Python and 57 Node
+**The core is done. Everything above works today and is tested:** 785 Rust, 72 Python and 57 Node
 tests, clippy-clean, `cargo-deny`-clean. No versioned releases: you build from source, and the CLI
 and config surface can still change, always called out in [CHANGELOG.md](CHANGELOG.md). It is being
 tested hard on real hardware (Linux, WSL2, Raspberry Pi, Jetson, Arduino UNO Q) and refined ahead of

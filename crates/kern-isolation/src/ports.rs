@@ -144,8 +144,11 @@ impl Drop for Forwarders {
 /// before any image, mount or cgroup work happens. It is no longer the only guard - `fork_forwarders`
 /// now binds for real and refuses the box when that fails, which closes the window between the two -
 /// but failing here is the clearer of the two failures. Returns the first conflicting
-/// `(host_port, os-error)`. Best-effort: a socket-creation failure is skipped (the real bind backs it).
-pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, String)> {
+/// `(host_port, os-error)` - the RAW [`std::io::Error`], not a string, so the caller can tell
+/// `EADDRINUSE` (already in use) from `EACCES` (a rootless bind of a privileged port <1024) and give the
+/// right remedy instead of one guess. Best-effort: a socket-creation failure is skipped (the real bind
+/// backs it).
+pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, std::io::Error)> {
     for p in ports {
         let ty = if p.udp {
             libc::SOCK_DGRAM
@@ -163,7 +166,7 @@ pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, String)> {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(s) };
         if r != 0 {
-            return Err((p.host, err.to_string()));
+            return Err((p.host, err));
         }
     }
     Ok(())

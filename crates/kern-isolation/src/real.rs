@@ -1170,10 +1170,60 @@ fn expand_cpu_list(s: &str) -> Vec<usize> {
     out
 }
 
+/// Open the volume SOURCE - an absolute, already-canonical host path - SYMLINK-FREE via an
+/// `openat(O_NOFOLLOW)` component walk from `/`, returning an `O_PATH` fd. `parse_volumes`
+/// canonicalized and registry-guarded this path as a STRING, but the kernel would RE-RESOLVE that
+/// string at `mount()` time and FOLLOW a symlink swapped into an intermediate component between the
+/// check (in the parent) and the bind (here, post-fork) - the CVE-2021-30465 symlink-exchange race.
+/// Resolving it ourselves with `O_NOFOLLOW` and mounting from the pinned fd makes a swap FAIL the walk,
+/// never redirect it: the bind is either the checked inode or an error. Symmetric with the target side.
+fn open_source_nofollow(src: &str) -> Result<libc::c_int, Error> {
+    let mut dir = unsafe {
+        libc::open(
+            cstr("/")?.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dir < 0 {
+        return Err(Error::last("open(/)"));
+    }
+    for comp in src.split('/').filter(|c| !c.is_empty()) {
+        // A canonical path has no `.`/`..`; refuse them anyway so a tampered string can't climb.
+        if comp == "." || comp == ".." {
+            unsafe { libc::close(dir) };
+            return Err(Error::Unsupported(
+                "volume source must be canonical (no '.'/'..')",
+            ));
+        }
+        let c = match cstr(comp) {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe { libc::close(dir) };
+                return Err(e);
+            }
+        };
+        let next = unsafe {
+            libc::openat(
+                dir,
+                c.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        unsafe { libc::close(dir) };
+        if next < 0 {
+            // A component that is now a symlink (swapped in after the check) lands here as ELOOP/ENOTDIR.
+            return Err(Error::last("openat(volume source, O_NOFOLLOW)"));
+        }
+        dir = next;
+    }
+    Ok(dir)
+}
+
 /// Bind each `-v` host path into the new root BEFORE pivot (while the host source is reachable at
-/// its real path). The target is resolved **symlink-free, confined to the new root** via an
-/// `openat(O_NOFOLLOW)` component walk - so a hostile image that ships a symlink at the mount
-/// point can't redirect the bind onto a host path. Read-only volumes are then remounted RO.
+/// its real path). BOTH ends are resolved **symlink-free** via an `openat(O_NOFOLLOW)` component walk
+/// and the bind runs fd-to-fd through `/proc/self/fd/<n>` - so neither a hostile image's symlink at the
+/// mount point NOR a symlink swapped into the source path between check and mount can redirect the bind
+/// onto a host path. Read-only volumes are then remounted RO.
 fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
     if vols.is_empty() {
         return Ok(());
@@ -1190,17 +1240,20 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
     }
     let mut result = Ok(());
     for v in vols {
-        let src = match cstr(&v.source) {
-            Ok(c) => c,
+        // Resolve and PIN the source symlink-free (race-close the check->mount window, see
+        // `open_source_nofollow`). `fstat` on the pinned fd gives the type without re-touching the path.
+        let src_fd = match open_source_nofollow(&v.source) {
+            Ok(fd) => fd,
             Err(e) => {
                 result = Err(e);
                 break;
             }
         };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::stat(src.as_ptr(), &mut st) } != 0 {
+        if unsafe { libc::fstat(src_fd, &mut st) } != 0 {
+            unsafe { libc::close(src_fd) };
             result = Err(Error::Syscall(
-                "stat(volume source)",
+                "fstat(volume source)",
                 std::io::Error::last_os_error(),
             ));
             break;
@@ -1209,12 +1262,14 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
         let tgt_fd = match open_in_root(root_fd, &v.target, is_dir) {
             Ok(fd) => fd,
             Err(e) => {
+                unsafe { libc::close(src_fd) };
                 result = Err(e);
                 break;
             }
         };
-        // A decimal fd can never contain a NUL, so this cannot fail - returned as an error rather than
-        // asserted, because this runs inside the box's mount setup where an abort has no message path.
+        // Both ends addressed by their pinned fd (a decimal fd can never contain a NUL, so these
+        // cannot fail - returned as an error, not asserted, since box mount-setup has no message path).
+        let src = cstr(&format!("/proc/self/fd/{src_fd}"))?;
         let tgt = cstr(&format!("/proc/self/fd/{tgt_fd}"))?;
         // Deliberately NON-recursive (`MS_BIND`, not `MS_BIND | MS_REC`) - same rationale as the bind
         // root above: if the operator's volume source has host filesystems mounted *underneath* it
@@ -1231,7 +1286,10 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
                 ptr::null(),
             )
         };
-        unsafe { libc::close(tgt_fd) };
+        unsafe {
+            libc::close(tgt_fd);
+            libc::close(src_fd);
+        }
         if r != 0 {
             result = Err(Error::last("mount(volume bind)"));
             break;

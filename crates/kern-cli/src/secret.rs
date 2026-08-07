@@ -95,11 +95,101 @@ pub fn parse_secrets(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>, Error> 
     Ok(out)
 }
 
-/// Read a secret file, refusing a world-writable one (tamperable by any local user) and warning on a
-/// group/world-readable one (a secret should be `chmod 600`).
+/// The class-closing CHECK every host-path-whose-content-reaches-a-box shares: canonicalize
+/// symlink-free and refuse anything under `<runtime>/kern` (a peer's `ssh/` key, `secret`s,
+/// `instances/` posture records - exactly the theft the `-v` guard stops), returning the CANONICAL
+/// path so a symlink can't redirect the read AFTER the check. `what` names the flag for the message.
+/// The one security primitive is the predicate [`crate::registry::path_overlaps_trusted_state`], shared
+/// by EVERY host-path entry point; this function is the SANDBOX-domain READ wrapper of it, used by
+/// `--env-file`, `--secret`, `--rootfs`, and `kern cp`'s host SOURCE (`boxcp::copy_in`). The WRITE side -
+/// `kern cp`'s host DESTINATION and `kern save -o` - uses the sibling [`guard_host_write_path`] (it
+/// checks where the write LANDS, since the target may not exist yet). The build-domain sites (the `kern
+/// build` CONTEXT and `-f` Dockerfile) call the predicate directly, raising `Error::Build`. ANY new path
+/// whose bytes cross the host/box boundary MUST run the predicate, so the class stays closed by OMISSION -
+/// `kern cp` was the one that slipped, copying a peer's `ssh/` key or posture record straight through.
+pub(crate) fn guard_host_path(path: &str, what: &str) -> Result<std::path::PathBuf, Error> {
+    let canon = std::fs::canonicalize(path)
+        .map_err(|e| Error::Sandbox(format!("{what} source '{path}': {e}")))?;
+    refuse_if_registry(&canon, path, what)?;
+    Ok(canon)
+}
+
+/// The WRITE-side sibling of [`guard_host_path`]: refuse a host destination that lands on the registry.
+/// The target may not exist yet (a to-be-created file), so the check is on the PARENT dir the write lands
+/// in - if that resolves onto a trust-bearing registry dir, the write would forge or clobber a peer's
+/// state / posture record (the danger the `-v` guard names). A `BOX_DATA` dir (`logs/`/`scratch/`) stays
+/// writable, via the same [`crate::registry::path_overlaps_trusted_state`] allowlist. Used by `kern cp`
+/// (box→host) and `kern save -o`; `what` names the flag for the message.
+///
+/// CRUCIAL: `File::create`/`open(O_CREAT)` FOLLOWS a symlink at `dst`, so a symlink FINAL component -
+/// which anyone who can write `dst`'s directory could plant pointing at `<runtime>/kern` - would redirect
+/// the write into the registry past a parent-only check. So resolve where the write ACTUALLY lands by
+/// following a symlink chain at `dst` (bounded, ELOOP-style) to the final target, THEN canonicalize that
+/// target's parent (which also resolves a symlinked parent dir). Checking only `dst`'s literal parent was
+/// a real bypass.
+pub(crate) fn guard_host_write_path(dst: &str, what: &str) -> Result<(), Error> {
+    let mut landing = std::path::PathBuf::from(dst);
+    for _ in 0..40 {
+        match std::fs::read_link(&landing) {
+            Ok(t) if t.is_absolute() => landing = t,
+            Ok(t) => landing = landing.parent().map(|p| p.join(&t)).unwrap_or(t),
+            Err(_) => break, // not a symlink (or unreadable) - this is where the write lands
+        }
+    }
+    let parent = landing
+        .parent()
+        .filter(|s| !s.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Ok(cparent) = std::fs::canonicalize(parent) {
+        if crate::registry::path_overlaps_trusted_state(&cparent) {
+            return Err(Error::Sandbox(format!(
+                "{what} '{dst}': refusing to write into the kern registry - it would forge or clobber \
+                 another box's state or posture records"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The single registry refusal shared by [`guard_host_path`] and [`read_host_file_for_box`]: `Err` if the
+/// already-canonicalized `canon` resolves onto `<runtime>/kern`, `Ok(())` if clear. One message in one
+/// place, so the two entry points cannot drift on the wording of the check that closes the theft class.
+fn refuse_if_registry(canon: &std::path::Path, path: &str, what: &str) -> Result<(), Error> {
+    if crate::registry::path_overlaps_trusted_state(canon) {
+        return Err(Error::Sandbox(format!(
+            "{what} source '{path}': refusing to expose the kern registry to a box - it holds another \
+             box's secrets (ssh host keys), state and posture records"
+        )));
+    }
+    Ok(())
+}
+
+/// Read a host file whose CONTENT is delivered into a box AS A VALUE, guarded against the registry.
+/// `--env-file` uses this. It does NOT apply secret hygiene (an env file is commonly 0644), and it
+/// tolerates a non-canonicalizable source - a FIFO, `/dev/fd/N` from process substitution
+/// (`--env-file <(...)`), `/dev/stdin` - which the old `read_to_string` accepted. Such a source is not
+/// a registry FILE (those are real paths that always `canonicalize`), so the registry guard - whose
+/// threat is a compose/operator PATH pointing at `<runtime>/kern`, and a path always canonicalizes -
+/// still holds: a canonicalizable source is checked, a non-canonicalizable one cannot be the record it
+/// protects.
+pub(crate) fn read_host_file_for_box(path: &str, what: &str) -> Result<Vec<u8>, Error> {
+    match std::fs::canonicalize(path) {
+        Ok(canon) => {
+            refuse_if_registry(&canon, path, what)?;
+            std::fs::read(&canon)
+        }
+        Err(_) => std::fs::read(path), // FIFO / /dev/fd / /dev/stdin: not a registry record, read as-is
+    }
+    .map_err(|e| Error::Sandbox(format!("{what} source '{path}': {e}")))
+}
+
+/// A `--secret` FILE: the guarded read PLUS secret hygiene - a regular file, refuse a world-writable
+/// source (anyone could swap the value), warn on a group/world-readable one. A secret earns the checks
+/// an env file does not.
 fn read_secret_file(path: &str) -> Result<Vec<u8>, Error> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)
+    let canon = guard_host_path(path, "--secret")?;
+    let meta = std::fs::metadata(&canon)
         .map_err(|e| Error::Sandbox(format!("--secret source '{path}': {e}")))?;
     if !meta.is_file() {
         return Err(Error::Sandbox(format!(
@@ -115,11 +205,11 @@ fn read_secret_file(path: &str) -> Result<Vec<u8>, Error> {
     }
     if mode & 0o044 != 0 {
         eprintln!(
-            "kern: warning: secret '{path}' is group/world-readable (mode {:04o}) - consider chmod 600",
+            "kern: warning: --secret source '{path}' is group/world-readable (mode {:04o}) - consider chmod 600",
             mode & 0o7777
         );
     }
-    std::fs::read(path).map_err(|e| Error::Sandbox(format!("--secret source '{path}': {e}")))
+    std::fs::read(&canon).map_err(|e| Error::Sandbox(format!("--secret source '{path}': {e}")))
 }
 
 #[cfg(test)]
