@@ -18,9 +18,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-CI runs the above on x86 plus `cargo-audit` / `cargo-deny`. ARM is manually validated on real
-boards (not yet in CI, tracked in the issues); hardware-dependent tests **skip gracefully** when
-the precondition is absent.
+CI runs the above on x86 **and on a native aarch64 runner**, plus `cargo-audit` / `cargo-deny`. The
+specific boards (Pi, Jetson, UNO Q) are also validated by hand; hardware-dependent tests **skip
+gracefully** when the precondition is absent.
 
 ## Tests are not optional
 

@@ -44,7 +44,8 @@ It has been run by hand (static `aarch64-musl` binary) on:
   kernels, a `:ro` bind has no overlay to remount, so kern fails it with a clear message; use a
   read-write `-v` or `--read-only` for the box root instead. (Verified on the UNO Q.)
 
-> Honest status: ARM is **manually validated**, not yet in CI (tracked in the issues). And kern
+> Honest status: ARM now **builds and runs the test suite on a native aarch64 CI runner** every push,
+> and the specific boards (Pi, Jetson, UNO Q) are also validated by hand. And kern
 > on the edge today is the **sandbox/OCI runtime**: fast, tiny, daemonless isolation. **GPU
 > slicing is on the roadmap, not shipped yet**; don't expect device-GPU virtualization
 > here yet.

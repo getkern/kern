@@ -88,6 +88,7 @@ something to describe.
 Four layers (Rust-standard): unit (inline `#[cfg(test)]`), integration (`tests/`, black-box
 binary), the characterization seam (deterministic, privilege-free), and real-syscall
 correctness tests (skip-graceful where namespaces/HW are unavailable). CI x86 stays
-always-green via skip-graceful gates; ARM is manually validated on real boards (not yet in CI,
-tracked in the issues), and the real-GPU tests land with the GPU layer (roadmap). See
+always-green via skip-graceful gates on both x86 and a native aarch64 runner; the specific boards
+(Pi, Jetson, UNO Q) are also validated by hand, and the real-GPU tests land with the GPU layer
+(roadmap). See
 `CONTRIBUTING.md`.

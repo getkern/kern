@@ -143,8 +143,9 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 | Platform | Arch | Status |
 |---|---|---|
 | x86_64 Linux | x86_64 | ✅ primary + automated CI |
+| aarch64 Linux (generic) | aarch64 | ✅ automated CI (native runner) |
 | **Windows 10/11 (via WSL2)** | x86_64 | ✅ CI-built shim + distro (`install.ps1`) |
-| NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated |
+| NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated (board) |
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
 
