@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.14";
+const VERSION = "0.1.15";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -578,6 +578,24 @@ function validateCap(name) {
   return name;
 }
 
+// An AppArmor profile name for `kern box --apparmor`. Same discipline as validateCap: handed to kern as
+// its own argv element, so it must not start with a dash (-> another flag) or carry a space. Letters,
+// digits and ._- cover ordinary profile names (docker-default, unconfined, kern-box); kern fails closed
+// if the profile is not loaded. Namespaced names with / or : are intentionally not accepted here (use
+// the CLI). Compared byte-for-byte with the Python binding's _APPARMOR_RE by a parity test - keep them
+// identical and free of chars that need escaping in a regex literal (e.g. /).
+const APPARMOR_RE = /^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,127}$/;
+
+/** Validate an AppArmor profile name for `--apparmor` before it reaches the argv. */
+function validateApparmor(name) {
+  if (typeof name !== "string" || !APPARMOR_RE.test(name))
+    throw new SandboxError(
+      `invalid AppArmor profile ${JSON.stringify(name)}: expected a loaded profile name like ` +
+        "'docker-default' or 'unconfined' (letters, digits and ._-, not starting with a dash)",
+    );
+  return name;
+}
+
 /** Map a Node close event {code, signal} to a unix-style rc (128 + signum for a signal). */
 function toRc(code, signal) {
   if (typeof code === "number") return code;
@@ -789,6 +807,10 @@ class Sandbox {
     // read-only root) for code nobody has read. The root goes read-only but a bound `mounts` path stays
     // writable, so it composes with this SDK. null (default) leaves kern's normal posture.
     this.securityProfile = opts.securityProfile ?? null;
+    // `--apparmor "<profile>"`: enter a pre-loaded AppArmor profile on the box's exec (Docker's
+    // `--security-opt apparmor=`), a kernel-enforced LSM layer over namespaces + seccomp. The profile
+    // must be loaded on the host; kern fails the box CLOSED if it is not. null (default) applies none.
+    this.apparmor = opts.apparmor ?? null;
     this.depsReadonly = opts.depsReadonly ?? false;
     // Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
     // The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
@@ -835,6 +857,7 @@ class Sandbox {
     this._capDropArgs = this.capDrop.flatMap((c) => ["--cap-drop", validateCap(c)]);
     this._profileArgs = (this.profiles || []).map(validateProfile);
     this._egressAllow = (this.egressAllow || []).map(validateDomain);
+    if (this.apparmor !== null) validateApparmor(this.apparmor);
     if (this._egressAllow.length && this.network)
       throw new SandboxError(
         "egressAllow and network:true are mutually exclusive: egressAllow gives a restricted domain " +
@@ -931,6 +954,7 @@ class Sandbox {
     if (this.pids !== null) argv.push("--pids-limit", String(this.pids));
     if (this.requireLimits) argv.push("--require-limits");
     if (this.securityProfile !== null) argv.push("--security-profile", this.securityProfile);
+    if (this.apparmor !== null) argv.push("--apparmor", this.apparmor);
     // Network mode: egressAllow (a domain allowlist via an isolated netns + kern's filtering proxy)
     // governs the untrusted runCode/run boxes; the setup box keeps the full network it needs to install
     // deps. egressAllow and network are mutually exclusive (checked at construction).

@@ -91,6 +91,40 @@ test("capabilities are dropped by default and the opt-out is explicit", () => {
   assert.throws(() => new Sandbox({ capDrop: "ALL" }), SandboxError);
 });
 
+test("apparmor profile reaches the argv and bad names are refused", () => {
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = "/bin/true";
+  try {
+    const argv = new Sandbox({ apparmor: "docker-default" })._baseArgv("n", {
+      network: false,
+      timeoutS: 30,
+    });
+    assert.ok(argv.includes("--apparmor"));
+    assert.strictEqual(argv[argv.indexOf("--apparmor") + 1], "docker-default");
+    assert.ok(argv.indexOf("--apparmor") > argv.indexOf("--image"));
+    // The default (no apparmor) adds no flag - the box keeps kern's normal posture.
+    const none = new Sandbox()._baseArgv("n", { network: false, timeoutS: 30 });
+    assert.ok(!none.includes("--apparmor"));
+    // Names that MUST work, or the flag is useless: plain profiles and the special "unconfined".
+    for (const good of ["unconfined", "kern-box", "docker-default", "lxc-container-default"]) {
+      const a = new Sandbox({ apparmor: good })._baseArgv("n", { network: false, timeoutS: 30 });
+      assert.strictEqual(a[a.indexOf("--apparmor") + 1], good);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+  // The name reaches kern's argv, so a value that could smuggle another flag, carry a space, be
+  // namespaced (`/` or `:`), empty, or too long is refused AT CONSTRUCTION.
+  for (const bad of ["--privileged", "-net", "a b", "prof;rm", "prof\n", "", "a/b", "ns:prof",
+                     "x".repeat(200)])
+    assert.throws(
+      () => new Sandbox({ apparmor: bad }),
+      SandboxError,
+      `should reject ${JSON.stringify(bad)}`,
+    );
+});
+
 test("profiles validated and placed in argv", () => {
   // valid vcpu:/vgpio:/vdisk: profiles land as positional tokens (fake kern so the ctor completes)
   const prev = process.env.KERN_BIN;

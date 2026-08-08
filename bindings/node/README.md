@@ -145,6 +145,8 @@ new Sandbox({
   maxOutputBytes,  // default 64 MiB
   enforceLimits,   // default true; false is best-effort and NO faster (see the Python README)
   securityProfile, // "untrusted" = seccomp allowlist + cap-drop ALL + read-only root, one opt-in bundle
+  apparmor,        // a PRE-LOADED AppArmor profile the box enters on exec (Docker's --security-opt
+                   // apparmor=), an LSM layer over seccomp; kern fails the box CLOSED if it isn't loaded.
   requireLimits,   // default false; true = FAIL-CLOSED (refuse to start unless caps enforced). NOT
                    // enforceLimits (that picks the cap PATH); mutually exclusive with KERN_ALLOW_UNCAPPED env.
   depsReadonly,    // default false

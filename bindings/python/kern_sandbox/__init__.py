@@ -64,7 +64,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.14"
+__version__ = "0.1.15"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -720,6 +720,26 @@ def _validate_cap(name: str) -> str:
     return name
 
 
+# An AppArmor profile name for `kern box --apparmor`. Same discipline as _validate_cap: the value is
+# handed to kern as its own argv element, so it must not be able to start with a dash (→ another flag)
+# or carry a space. Letters/digits and `._-` cover ordinary profile names (`docker-default`,
+# `unconfined`, `kern-box`); kern fails closed if the profile is not actually loaded. Namespaced names
+# with `/` or `:` are intentionally not accepted through the binding - use the CLI for those. This
+# pattern is compared byte-for-byte with the Node binding's APPARMOR_RE (a parity test), so keep them
+# identical and free of chars that would need escaping in a JS regex literal (e.g. `/`).
+_APPARMOR_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,127}$")
+
+
+def _validate_apparmor(name: str) -> str:
+    """Validate an AppArmor profile name for ``--apparmor`` before it reaches the argv."""
+    if not isinstance(name, str) or not _APPARMOR_RE.fullmatch(name):
+        raise SandboxError(
+            f"invalid AppArmor profile {name!r}: expected a loaded profile name like 'docker-default' "
+            "or 'unconfined' (letters, digits and ._-, not starting with a dash)"
+        )
+    return name
+
+
 # Signal-derived exit codes (128 + signum) we classify.
 _EXIT_SIGKILL = 137  # 128 + 9  - SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
 _EXIT_SIGSYS = 159  # 128 + 31 - SIGSYS: a seccomp-denied syscall = a blocked escape attempt
@@ -800,6 +820,11 @@ class Sandbox:
     # root goes read-only but a bound `mounts` path (and run_code's own workspace) stays writable, so it
     # composes with this SDK. `None` (default) leaves the box on kern's normal posture.
     security_profile: str | None = None
+    # `--apparmor "<profile>"`: enter a pre-loaded AppArmor profile on the box's exec (Docker's
+    # `--security-opt apparmor=`), a kernel-enforced LSM layer over namespaces + seccomp. The profile
+    # must be loaded on the host (root, once, `apparmor_parser -r`); kern fails the box CLOSED if it is
+    # not loaded. `None` (default) applies no profile. Validated at construction so it can't smuggle a flag.
+    apparmor: str | None = None
     # Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
     # The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
     # rest were still held over the box's own user namespace, and this is the one code path whose whole
@@ -851,6 +876,8 @@ class Sandbox:
                 self._mount_args += ["-v", f"{real}:{tgt}:ro" if ro else f"{real}:{tgt}"]
         self._profile_args = [_validate_profile(p) for p in (self.profiles or [])]
         self._egress_allow = [_validate_domain(d) for d in (self.egress_allow or [])]
+        if self.apparmor is not None:
+            _validate_apparmor(self.apparmor)
         # A str is a Sequence[str], so `cap_drop="ALL"` would iterate into ['A','L','L'] and produce
         # three bogus flags instead of one. Refuse it by name rather than silently doing the wrong
         # thing, and say what to write.
@@ -926,6 +953,8 @@ class Sandbox:
             argv.append("--require-limits")
         if self.security_profile is not None:
             argv += ["--security-profile", self.security_profile]
+        if self.apparmor is not None:
+            argv += ["--apparmor", self.apparmor]
         # Network mode for THIS box. egress_allow (a domain allowlist via an isolated netns + kern's
         # filtering proxy) governs the untrusted run_code/run boxes; the setup box keeps the full network
         # it needs to install deps. egress_allow and network are mutually exclusive (checked at construct).

@@ -135,6 +135,9 @@ Sandbox(
     deps_readonly=False,        # True → run_code can't modify setup= deps (blocks cross-run poisoning)
     enforce_limits=True,        # hard-enforce caps via a systemd scope; False = best-effort, faster under load
     security_profile=None,      # "untrusted" = seccomp allowlist + cap-drop ALL + read-only root, one opt-in
+    apparmor=None,              # a PRE-LOADED AppArmor profile the box enters on exec (Docker's
+                                # --security-opt apparmor=), an LSM layer over seccomp; kern fails the box
+                                # CLOSED if the profile isn't loaded on the host.
     require_limits=False,       # True = FAIL-CLOSED: refuse to start unless memory/pids caps are enforced.
                                 # NOT enforce_limits (which only picks the cap PATH: scope vs best-effort);
                                 # mutually exclusive with the KERN_ALLOW_UNCAPPED env (forwarded to kern).

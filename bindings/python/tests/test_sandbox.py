@@ -123,6 +123,45 @@ def test_a_capability_name_can_never_smuggle_another_flag():
         _cfg(cap_drop="ALL")
 
 
+def test_apparmor_profile_reaches_the_argv_and_bad_names_are_refused():
+    """`apparmor=` emits `--apparmor <profile>` (right after `--security-profile`), `None` emits nothing,
+    and a name that could turn into another flag is refused AT CONSTRUCTION. Whether the profile is
+    actually loaded is kern's fail-closed problem at box start, not the binding's."""
+    argv = _cfg(apparmor="docker-default")._base_argv("n", network=False, timeout_s=30)
+    assert "--apparmor" in argv
+    assert argv[argv.index("--apparmor") + 1] == "docker-default"
+    assert argv.index("--apparmor") > argv.index("--image")
+    # The default (None) adds no flag - the box keeps kern's normal posture.
+    assert "--apparmor" not in _cfg()._base_argv("n", network=False, timeout_s=30)
+    # Names that MUST work, or the flag is useless: plain profiles and the special `unconfined`.
+    from kern_sandbox import _validate_apparmor
+
+    for good in ("unconfined", "kern-box", "docker-default", "lxc-container-default"):
+        assert _validate_apparmor(good) == good
+    # Names that could smuggle a flag, carry a space/newline, be namespaced (`/`), empty, or too long.
+    for bad in ("-net", "--privileged", "a b", "prof;rm", "prof\n", "", "a/b", "ns:prof", "x" * 200):
+        with pytest.raises(SandboxError):
+            _cfg(apparmor=bad)
+
+
+def test_both_bindings_validate_an_apparmor_name_identically():
+    """Python and Node guard the `--apparmor` argv boundary with the SAME rule, compared literally (see
+    the capability-name parity test for why). Skips when the Node source is absent (a published wheel)."""
+    node = Path(__file__).resolve().parents[3] / "bindings" / "node" / "index.js"
+    if not node.is_file():
+        pytest.skip(f"no Node source at {node} (published wheel)")
+    src = node.read_text(encoding="utf-8")
+    m = re.search(r"const APPARMOR_RE = /(.+)/;", src)
+    assert m, "bindings/node/index.js no longer defines APPARMOR_RE"
+    from kern_sandbox import _APPARMOR_RE
+
+    assert m.group(1) == _APPARMOR_RE.pattern, (
+        f"the two bindings disagree on what an AppArmor profile name is:\n"
+        f"  node:   {m.group(1)}\n"
+        f"  python: {_APPARMOR_RE.pattern}"
+    )
+
+
 def test_profiles_validated_and_placed_in_argv():
     # valid vcpu:/vgpio:/vdisk: profiles appear as positional tokens before the `--`
     s = _cfg(profiles=["vcpu:heavy", "vgpio:leds", "vdisk:scratch"])
