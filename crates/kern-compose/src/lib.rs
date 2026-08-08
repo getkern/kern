@@ -600,7 +600,16 @@ impl ComposeBox {
         macro_rules! flag {
             ($($f:ident),* $(,)?) => { $( self.$f |= o.$f; )* };
         }
-        flag!(read_only, net, uid_range, bind_rootfs, restart, tun, init);
+        flag!(
+            read_only,
+            net,
+            uid_range,
+            bind_rootfs,
+            restart,
+            restart_always,
+            tun,
+            init
+        );
         if o.uid_range_explicit_false {
             self.uid_range_explicit_false = true;
         }
@@ -1945,6 +1954,28 @@ mod compat_field_tests {
         // `on-failure` stays on-failure (not 'always'): a bare `--restart`, no value.
         let b = one("services:\n  a:\n    image: x\n    restart: on-failure\n");
         assert!(b.restart && !b.restart_always);
+    }
+
+    #[test]
+    fn merge_preserves_an_override_introduced_restart_always() {
+        // The multi-file path (`-f base -f override`) merges each override box over the base via
+        // `merge_from`. `restart: always` set ONLY in an override must survive, or it silently degrades
+        // to on-failure and a service that exits 0 stays dead instead of being kept up. The all-fields
+        // merge test cannot catch this: it builds from TOML, whose `restart` key sets `restart` but
+        // never `restart_always` (only YAML's `apply_restart` does), so the field is false on both
+        // sides and the debug-compare is blind to it.
+        let over = one("services:\n  a:\n    image: x\n    restart: always\n");
+        assert!(
+            over.restart && over.restart_always,
+            "control: parse sets both"
+        );
+        let mut base = one("services:\n  a:\n    image: x\n    restart: \"no\"\n");
+        assert!(!base.restart_always, "control: base carries no 'always'");
+        base.merge_from(over);
+        assert!(
+            base.restart && base.restart_always,
+            "an override's `restart: always` must survive merge_from, not degrade to on-failure"
+        );
     }
 
     #[test]

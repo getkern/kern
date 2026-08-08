@@ -933,6 +933,20 @@ fn child_setup_and_exec(
         t.mark("ulimit");
     }
 
+    // `--apparmor <profile>`: request the onexec transition into a pre-loaded AppArmor profile. Done
+    // HERE, while the process is still inner-root and DUMPABLE, and BEFORE the `--user` setuid below: a
+    // setuid privilege-drop clears the dumpable flag, which flips `/proc/self/attr/*` to root-owned 0600
+    // (`task_dump_owner`), so a non-root `--user` - or an image's own `USER`, which `run_as` folds in -
+    // could no longer open the attr file to write the transition (EACCES) and the box would fail to
+    // start with a misleading "AppArmor is not available on this kernel" though the profile IS loaded.
+    // The onexec label lives in the task security context and survives setuid/cap-drop/seccomp and the
+    // `--init` reaper's fork, so requesting it first is safe and is the profile the eventual execve
+    // transitions into. Also before the seccomp install and the init/non-init split. FAIL-CLOSED: a
+    // profile that won't arm refuses the box rather than running it unconfined.
+    if let Some(profile) = &spec.apparmor {
+        apply_apparmor_onexec(profile)?;
+        t.mark("apparmor");
+    }
     // Least-privilege, in three ordered steps so `--user` + `--cap-drop ALL` (the canonical hardened
     // profile) composes correctly. All run after privileged setup (mount/pivot/loopback), so they
     // only affect the workload.
@@ -968,15 +982,6 @@ fn child_setup_and_exec(
             Err(e) => return Err(e),
         }
         t.mark("landlock");
-    }
-    // `--apparmor <profile>`: enter a pre-loaded AppArmor profile on the coming exec, layering
-    // kernel-enforced LSM confinement over namespaces + seccomp. Done BEFORE the seccomp install (a
-    // setup step) and BEFORE the init/non-init split, so the onexec transition is inherited across the
-    // `--init` reaper's fork and applies to whichever process actually execs. FAIL-CLOSED: a profile
-    // that is not loaded refuses the box rather than running it unconfined.
-    if let Some(profile) = &spec.apparmor {
-        apply_apparmor_onexec(profile)?;
-        t.mark("apparmor");
     }
     // Install the seccomp filter LAST - after all setup syscalls (mount/pivot) are done, so it
     // only constrains the workload. Then exec (or hand off to the built-in init). `allow_nesting`
@@ -3510,9 +3515,11 @@ pub fn exec_in_box(
     box_has_explicit_caps: bool,
     box_caps: &CapSpec,
     seccomp_mode: crate::SeccompFilter,
-    // The box PID 1's AppArmor profile (read from `/proc/<pid1>/attr/apparmor/current`), or `None` if
-    // it runs unconfined. Re-entered here so `kern exec` matches the box's confinement, like caps +
-    // seccomp - otherwise an exec would run OUTSIDE the box's AppArmor profile.
+    // The box's `--apparmor` profile, taken from the RECORDED exec posture (`Instance::apparmor` via
+    // `exec_posture()`), or `None` if it ran unconfined. NOT read back from `/proc/<pid1>/attr/...`:
+    // for an `--init` box PID 1 is the unconfined reaper, so that read would deduce "unconfined" and
+    // exec UNCONFINED into a confined box. Re-entered here so `kern exec` matches the box's confinement,
+    // like caps + seccomp - otherwise an exec would run OUTSIDE the box's AppArmor profile.
     apparmor: Option<&str>,
 ) -> Result<i32, Error> {
     if command.is_empty() {

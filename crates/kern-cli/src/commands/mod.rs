@@ -4144,9 +4144,14 @@ fn run_probe(
             false,
             &kern_isolation::CapSpec::default(),
             seccomp_mode,
-            // A health probe is kern's own controlled command, not the untrusted workload: keep it at
-            // the baseline (no box AppArmor), consistent with its baseline caps above, so a confining
-            // profile can't break the very check kern uses to decide health.
+            // A health probe is kern's OWN command (the `--health-cmd`), run to decide liveness, not
+            // the workload proper: keep it at the baseline (no box AppArmor), consistent with its
+            // baseline caps above, so a confining profile can't wedge the very check kern uses to
+            // decide health. Caveat, stated plainly: the probe target is a binary in the box's
+            // workload-writable rootfs, so a workload that overwrites it gets one AppArmor-unconfined
+            // (still seccomp- and namespace-confined) run per interval. A deliberate, documented
+            // tradeoff, the same one taken for the probe's baseline caps; applying the profile here is
+            // the separately-tracked follow-up.
             None,
         )
         .unwrap_or(1);
@@ -4238,6 +4243,11 @@ fn await_box_started(
     rd: i32,
     wr: i32,
     have_pipe: bool,
+    // The box is owned by a --restart supervisor (on-failure OR always) that RETRIES a failed start.
+    // A failure byte from the FIRST attempt then does NOT mean the box is dead: reaping the supervisor
+    // here would block until it gives up - FOREVER for `always` - and wedge `compose up`, which waits
+    // on this launcher. So on a supervised box a first-attempt failure is reported, not awaited.
+    supervised: bool,
 ) -> Result<(), Error> {
     if have_pipe {
         unsafe { libc::close(wr) };
@@ -4250,6 +4260,17 @@ fn await_box_started(
             break r;
         };
         unsafe { libc::close(rd) };
+        if n > 0 && supervised {
+            // Docker returns immediately for `-d --restart` on a box that trips its first start; the
+            // supervisor keeps retrying in the background. Hand back so the caller (and `compose up`)
+            // proceeds instead of hanging on a supervisor that may never exit.
+            let n = name.as_str();
+            eprintln!(
+                "kern: box '{n}' failed its first start attempt; the --restart supervisor is \
+                 retrying (see `kern logs {n}`)"
+            );
+            return Ok(());
+        }
         if n > 0 {
             let mut st = 0i32;
             crate::eintr::waitpid(child, &mut st, 0);
@@ -4574,7 +4595,7 @@ fn run_detached(
         return Err(Error::Sandbox("fork for detach failed".to_string()));
     }
     if child > 0 {
-        return await_box_started(name, child, rd, wr, have_pipe);
+        return await_box_started(name, child, rd, wr, have_pipe, restart || restart_always);
     }
     // ── Supervisor ──
     // SAFETY (fork): kern is single-threaded (std + libc only, no runtime threads), so running

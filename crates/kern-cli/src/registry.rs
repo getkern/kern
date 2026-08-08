@@ -971,6 +971,17 @@ fn atomic_rewrite(
     };
     let tmp = dir.join(format!(".{tag}-{}-{pid}.tmp", std::process::id()));
     fs::write(&tmp, f(&body))?;
+    // Re-check the target still exists right before the swap. A concurrent `rename` of THIS box could
+    // have moved its entry away since the `exists()` at the top, and `fs::rename(tmp, entry)` to a
+    // now-missing target would CREATE it - resurrecting the renamed-away entry as a DUPLICATE (two
+    // files for one pid, so `list()`/`find()` see the box twice with divergent bodies). If it's gone,
+    // honour the same "nothing to rewrite" contract as the entry-missing case above. This narrows the
+    // window to a single syscall; the residual race degrades only to a benign last-writer-wins on the
+    // body, never a duplicate.
+    if !entry.exists() {
+        let _ = fs::remove_file(&tmp);
+        return Ok(());
+    }
     if let Err(e) = fs::rename(&tmp, entry) {
         let _ = fs::remove_file(&tmp); // never leave a staged body behind
         return Err(e);
