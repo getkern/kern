@@ -1921,9 +1921,22 @@ mod tests {
             stale.exists(),
             "the stale socket file must still be present"
         );
+        // Under parallel load a just-closed AF_UNIX listener can transiently accept a `connect` for a
+        // few milliseconds (the kernel queues then resets it) before it reads as refused - a window that
+        // does NOT exist in production, where this probes systemd's long-lived manager socket, live or
+        // long-dead. Poll the settle window so the test is deterministic instead of asserting on that
+        // transient. Normal case: not-live on the first check (0 ms); the loop only spins on the rare race.
+        let mut settled = false;
+        for _ in 0..200 {
+            if !unix_socket_live(&stale) {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(
-            !unix_socket_live(&stale),
-            "a stale socket with no listener must read as NOT live"
+            settled,
+            "a stale socket with no listener must read as NOT live (within the settle window)"
         );
 
         // A nonexistent path is not live.
