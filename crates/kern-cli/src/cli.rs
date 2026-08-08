@@ -1449,6 +1449,24 @@ fn parse_ulimit(spec: &str) -> Result<(i32, u64, u64), Error> {
     Ok((resource, soft, hard))
 }
 
+/// A loadable AppArmor profile name, validated at the CLI edge with the SAME charset the SDK
+/// bindings enforce (`APPARMOR_RE`): `[A-Za-z0-9_.]` first, `[A-Za-z0-9_.-]` after, 1..=128 bytes.
+/// The CLI does NOT go through the bindings, so without this a name with a newline/space/`=` would
+/// reach the registry record's `key=value` line format (only `one_line`'s flattening keeps it from
+/// forging a field today) and, worse, a name AppArmor cannot load would start the box only to fail
+/// the transition later with a baffling EACCES. Reject it here, where the error is actionable.
+fn valid_apparmor_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > 128 {
+        return false;
+    }
+    let ok_first = b[0].is_ascii_alphanumeric() || matches!(b[0], b'_' | b'.');
+    ok_first
+        && b[1..]
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+}
+
 /// real sandbox. Without a rootfs/image it still routes to `BoxRun` (which reports the missing
 /// source); `--plan` previews instead of running.
 fn parse_box(rest: &[&str]) -> Result<Command, Error> {
@@ -1954,9 +1972,11 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 "--apparmor" => {
                     i += 1;
-                    match rest.get(i) {
-                        Some(v) if !v.trim().is_empty() => apparmor = Some(v.trim().to_string()),
-                        _ => return Err(Error::Usage("--apparmor <profile>")),
+                    match rest.get(i).map(|v| v.trim()) {
+                        Some(v) if valid_apparmor_name(v) => apparmor = Some(v.to_string()),
+                        _ => return Err(Error::Usage(
+                            "--apparmor <profile> (letters, digits, '.', '_', '-'; no leading '-')",
+                        )),
                     }
                 }
                 "-w" | "--workdir" => {
@@ -3243,6 +3263,60 @@ mod tests {
             parse(&["box".into(), "x".into(), "--cpus".into(), "0".into()]),
             Err(Error::Usage(_))
         ));
+    }
+
+    #[test]
+    fn box_apparmor_name_is_validated_at_the_cli_edge() {
+        // The CLI never passes through the SDK bindings, so it enforces the SAME charset here
+        // (mirrors `APPARMOR_RE`): a valid name reaches the parsed command trimmed and verbatim.
+        let (_, cmd) = parse(&[
+            "box".into(),
+            "x".into(),
+            "--apparmor".into(),
+            "  kern-demo.deny_1  ".into(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(cmd, Command::BoxRun { apparmor: Some(p), .. } if p == "kern-demo.deny_1"),
+            "a valid profile name is accepted, trimmed"
+        );
+
+        // The validator on the vectors that matter: letters/digits/`._-` (not leading `-`),
+        // 1..=128 bytes. A space/`=`/newline would otherwise reach the registry record's `key=value`
+        // line format; an unloadable name would start the box only to fail the transition later.
+        for ok in [
+            "a".to_string(),
+            "_x".into(),
+            ".x".into(),
+            "K3rn-d.e_m-o".into(),
+            "a".repeat(128),
+        ] {
+            assert!(valid_apparmor_name(&ok), "should accept {ok:?}");
+        }
+        for bad in [
+            "".to_string(),
+            "-x".into(),
+            "a b".into(),
+            "a=b".into(),
+            "a\nb".into(),
+            "a\tb".into(),
+            "a/b".into(),
+            "a".repeat(129),
+        ] {
+            assert!(!valid_apparmor_name(&bad), "should reject {bad:?}");
+        }
+
+        // End to end: a bad name is a usage error, never a silently-accepted profile the box would
+        // later fail to enter.
+        for bad in ["a b", ""] {
+            assert!(
+                matches!(
+                    parse(&["box".into(), "x".into(), "--apparmor".into(), bad.into()]),
+                    Err(Error::Usage(_))
+                ),
+                "parse must reject --apparmor {bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -1105,6 +1105,15 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
                  non-root --user often can't exec it - drop --user (runs as the box's \
                  root) or provide a rootfs owned by uid {uid}"
             );
+        } else if io.kind() == std::io::ErrorKind::PermissionDenied && spec.apparmor.is_some() {
+            // EACCES with a profile requested is the LSM refusing the transition - almost always the
+            // profile is not (or no longer) loaded on the host. Name it, don't blame the command.
+            let profile = spec.apparmor.as_deref().unwrap_or("?");
+            eprintln!(
+                "kern: cannot start '{cmd}' in box: {io}\n\
+                 hint: the AppArmor profile '{profile}' would not admit the exec - is it loaded on \
+                 the host? (`apparmor_parser -r <profile>` loads it; `-R` removes it)"
+            );
         } else {
             eprintln!(
                 "kern: cannot start '{cmd}' in box: {io}\n\
@@ -3717,7 +3726,26 @@ pub fn exec_in_box(
         // `execvp` into the box. No readiness pipe on the exec path, so keep none; the pty slave was
         // already dup'd onto 0/1/2 and its high fd closed by `adopt_controlling_tty` above.
         shed_inherited_fds(-1);
-        eprintln!("kern: exec failed: {}", exec(&argv));
+        let err = exec(&argv);
+        // `execve` returned, so it FAILED. ENOENT & friends = "command not found" (127). EACCES = the
+        // kernel FOUND it but refused to run it (126, the POSIX code for "found but not executable") -
+        // and with `--apparmor` in play that is almost always the LSM refusing the profile transition
+        // because the profile was UNLOADED on the host after the box started (`apparmor_parser -R`),
+        // NOT the user's command. Name that cause and fail closed rather than mimic "not found", so the
+        // operator looks at the sandbox, not at their argv.
+        if let Error::Syscall(_, io) = &err {
+            if io.raw_os_error() == Some(libc::EACCES) {
+                if apparmor.is_some() {
+                    exec_fail_closed(
+                        "exec refused (EACCES): the box's AppArmor profile would not admit it \
+                         (was the profile unloaded on the host?), or the target is not executable",
+                    );
+                }
+                eprintln!("kern: exec failed: {err}");
+                unsafe { libc::_exit(126) };
+            }
+        }
+        eprintln!("kern: exec failed: {err}");
         unsafe { libc::_exit(127) };
     }
     // `-it` parent: drop our copy of the slave so the master sees EOF when the exec'd process exits,

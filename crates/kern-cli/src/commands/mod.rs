@@ -1167,6 +1167,17 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `KERN_MANAGED=1`: skip the transient-scope re-exec (the box already lives in the unit's own
     // service cgroup) and register the foreground run so `kern ps`/`logs`/`stop` still see it.
     let managed = kern_common::env_flag("KERN_MANAGED");
+    // `--restart always`/`unless-stopped` needs a SUPERVISOR, and the only two are systemd (detached
+    // standalone, the branch below) and the in-process loop (detached, incl. a pod member) - the
+    // FOREGROUND path runs the box exactly once. Reject it here rather than start the box and silently
+    // drop the policy. `managed` is exempt: that IS the foreground re-exec systemd itself drives as the
+    // supervisor (`KERN_MANAGED=1`), so `persistent() && !detached` is expected and correct there.
+    if args.restart.persistent() && !args.detached && !managed {
+        return Err(Error::Usage(
+            "--restart always/unless-stopped needs -d: a foreground box runs once, so nothing would \
+             supervise the restarts (use -d and systemd or kern's supervisor takes over)",
+        ));
+    }
     // A `kern build` RUN step (`KERN_BUILD_STEP=1`) is a transient, first-party box run many times in
     // a row - the ~7ms transient-scope re-exec would dominate the build. Skip it (the best-effort
     // in-process cgroup in run_in_sandbox still applies caps; isolation is unchanged).
@@ -4351,6 +4362,8 @@ fn supervise_box(
         } else {
             None
         };
+        // Wall-clock this attempt so a box that stayed up counts as recovered (see the reset below).
+        let started = std::time::Instant::now();
         let runner = unsafe { libc::fork() };
         if runner == 0 {
             let code = match run_in_sandbox_with(
@@ -4413,6 +4426,14 @@ fn supervise_box(
         } else {
             1 // fork or waitpid failed - treat as a failure, don't spin
         };
+        // A box that stayed up past the stabilisation window counts as RECOVERED: clear the backoff
+        // counter so a later, unrelated exit restarts promptly (1 s) instead of inheriting the escalated
+        // 30 s from a crash loop that has long since healed - and, for `on-failure`, so the retry budget
+        // measures CONSECUTIVE rapid failures (Docker's contract), not lifetime exits. 10 s matches
+        // Docker's reset window. The `max_restarts` cap still bounds a genuine tight crash loop.
+        if started.elapsed() >= std::time::Duration::from_secs(10) {
+            attempt = 0;
+        }
         // Saturating, not `+=`: `always` restarts forever, so `attempt` is unbounded; a `+= 1` would
         // panic on overflow in a debug build (the one exception to this codebase's panic-free rule) and
         // wrap in release. At one restart / 30 s the cap is ~4000 years, but the guarantee should not
