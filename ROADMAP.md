@@ -8,14 +8,16 @@ and some may never ship if they would change what kern is. Recently shipped work
 
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped, and the
   README will describe it when it is, not before. Nothing here touches a GPU today.
-- **More governed resources.** The same profile model could extend to other cgroup or kernel-real
-  resources (I/O bandwidth, network shaping) as they prove useful.
+- **More governed resources.** I/O bandwidth and IOPS caps already ship (`vdisk:` `--bandwidth` /
+  `--iops`, box `--io-weight` → cgroup `io.max`/`io.weight`), but they bind only where the host
+  delegates the rootless `io` controller, which many do not; widening that, and other kernel-real
+  knobs like network shaping, as they prove useful.
 - **Snapshot / warm-start (CRIU).** Same-host checkpoint and restore of a *warm* box for subsecond
   restarts. Feasible but gated: rootless CRIU needs a capability and suspending the seccomp filter, so it
   would be an explicit opt-in mode, not the default, and only for same-host, non-GPU boxes. Not committed.
 - **macOS.** No native port, and it is a non-goal: a daemonless kernel + cgroup sandbox has no macOS
   equivalent. The only path considered is a thin shim over a Linux VM, the same shape as WSL2.
-- **1.0, freeze:** CLI + config under semver, threat model + architecture finalised.
+- **Freeze.** The CLI and config surface stabilise; the threat model and architecture are finalised.
 
 **In progress**
 
