@@ -48,6 +48,25 @@ jobs:
           # present (aarch64 is skipped here for lack of the cross-toolchain).
           python3 scripts/gen-seccomp-allowlist.py --check
 
+  test-arm:
+    name: build + test (aarch64)
+    # Native aarch64 hosted runner (free for public repos), not QEMU: the isolation code is
+    # architecture-neutral and validated by hand on Pi / Jetson / UNO Q, so CI now proves it
+    # compiles clippy-clean and its non-privileged tests pass on real aarch64 too, every push.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --all-targets --all-features
+      - name: test
+        run: cargo test --all
+        # The HW/privilege-gated tests skip gracefully here exactly as on x86 (the runner's
+        # userns/AppArmor posture, not the arch), so aarch64 CI stays green.
+
   audit:
     name: cargo-audit + cargo-deny
     runs-on: ubuntu-latest
