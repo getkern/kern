@@ -137,6 +137,10 @@ Multi-service stacks **are** supported: `kern compose` reads your `docker-compos
 services up in a pod, with `depends_on` ordering and healthchecks, daemonless. What needs a daemon
 does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything that attaches to it.
 
+`shm_size:` is recognised but intentionally **not** mapped: kern mounts `/dev/shm` unsized and charges
+it to the box memory cgroup, so `mem_limit` / `--memory` is the real bound (Docker's 64 MB `/dev/shm`
+default is what breaks Postgres under load). Size shared memory with `mem_limit`, not a separate cap.
+
 ## Building and publishing images
 
 

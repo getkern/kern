@@ -1998,6 +1998,16 @@ fn service_to_box(
             }
             "ulimits" => b.ulimits = collect_ulimits(node, name),
             "sysctls" => b.sysctls = collect_kv(node, '='),
+            // `shm_size` is RECOGNISED but intentionally not mapped, and that is a design decision worth
+            // stating rather than a generic "unsupported": kern mounts `/dev/shm` UNSIZED and charges it
+            // to the box memory cgroup, so `mem_limit`/`--memory` is the real bound (measured: a 32 MB
+            // box admits ~30 MB into an unsized /dev/shm before ENOSPC). A fixed `shm_size` would either
+            // be moot (below that bound) or reintroduce Docker's 64 MB default - the footgun that breaks
+            // Postgres under load. Say why, so a reader does not think a feature is missing.
+            "shm_size" => warn(&format!(
+                "service '{name}': 'shm_size:' ignored on purpose - kern bounds /dev/shm by the memory \
+                 cgroup (mem_limit / --memory), not a fixed size, so there is no 64 MB shm footgun"
+            )),
             "configs" | "logging" | "extends" | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
