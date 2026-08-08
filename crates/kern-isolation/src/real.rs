@@ -1089,14 +1089,14 @@ fn set_user(uid: u32, gid: u32) -> Result<(), Error> {
         libc::setgroups(0, std::ptr::null());
         if libc::setgid(gid as libc::gid_t) != 0 && gid != 0 {
             return Err(Error::Unsupported(
-                "--user: setgid failed - the gid isn't mapped into the box (add newuidmap/newgidmap \
-                 + an /etc/subgid allocation, or use --uid-range)",
+                "cannot drop to the target gid - it isn't mapped into the box (needed by --user or the \
+                 image's own USER; add newuidmap/newgidmap + an /etc/subgid allocation, or use --uid-range)",
             ));
         }
         if libc::setuid(uid as libc::uid_t) != 0 && uid != 0 {
             return Err(Error::Unsupported(
-                "--user: setuid failed - the uid isn't mapped into the box (add newuidmap/newgidmap \
-                 + an /etc/subuid allocation, or use --uid-range)",
+                "cannot drop to the target uid - it isn't mapped into the box (needed by --user or the \
+                 image's own USER; add newuidmap/newgidmap + an /etc/subuid allocation, or use --uid-range)",
             ));
         }
     }
