@@ -13,7 +13,7 @@ members = [
 exclude = ["fuzz", "windows/kern-win"]
 
 [workspace.package]
-version = "0.6.50"
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -37,7 +37,7 @@ strip = true
 debug = false
 incremental = false
 
-# A separate profile for distributed prebuilt binaries (roadmap 0.5): same as release.
+# A separate profile for distributed prebuilt binaries (roadmap): same as release.
 # Tweak here without touching `cargo build --release` for development.
 [profile.dist]
 inherits = "release"
