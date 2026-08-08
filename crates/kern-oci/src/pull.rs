@@ -2917,6 +2917,33 @@ mod tests {
     }
 
     #[test]
+    fn verify_digest_bytes_accepts_match_rejects_mismatch_and_bad_algo() {
+        // `verify_digest_bytes` runs on EVERY manifest-list pull (each sub-manifest is verified against
+        // the index digest), so a bug here would break real pulls that the network-less gate can't see.
+        // sha256("hello") with NO trailing newline:
+        let d = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(
+            verify_digest_bytes(b"hello", d).is_ok(),
+            "the correct digest of the exact bytes must verify"
+        );
+        assert!(
+            verify_digest_bytes(b"hello\n", d).is_err(),
+            "a one-byte difference must be caught (no stray newline slips in)"
+        );
+        assert!(
+            verify_digest_bytes(b"hello", &d.replace('a', "b")).is_err(),
+            "a wrong digest must be refused"
+        );
+        assert!(
+            verify_digest_bytes(b"hello", "md5:5d41402abc4b2a76b9719d911017c592").is_err(),
+            "a non-sha256 algorithm is not a free pass"
+        );
+        // Empty input has a known sha256 too - the stdin write of 0 bytes must not hang or misparse.
+        let empty = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(verify_digest_bytes(b"", empty).is_ok());
+    }
+
+    #[test]
     fn parse_ref_defaults_and_registries() {
         assert_eq!(
             parse_ref("alpine").unwrap(),
