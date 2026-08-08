@@ -4412,18 +4412,26 @@ fn supervise_box(
                     // in-process restart instead of snapping back to the box's original spec (Docker's
                     // `update` persists). `apply_limits` already wrote spec's caps to the new cgroup
                     // BEFORE this callback, so the override here lands last and wins; the record stays
-                    // the source of truth, keeping `kern ps` and the kernel in step. `None` (no live
-                    // record yet, i.e. the first start) leaves the original spec caps untouched. (The
-                    // systemd-managed path still rebuilds from spec - it re-execs kern from the unit.)
+                    // the source of truth, keeping `kern ps` and the kernel in step. On the FIRST start
+                    // the record already holds the spec caps (run_detached registers before this loop),
+                    // so this re-adopts and re-applies them - a no-op versus what apply_limits wrote.
+                    // (The systemd-managed path still rebuilds from spec - it re-execs kern from the unit.)
                     if let Some((mem, pids)) = registry::current_caps(inst.pid) {
                         inst.memory_max = mem;
                         inst.pids_max = pids;
-                        if let Some(cg) = registry::box_cgroup(pid1) {
+                        // Write to the box's dedicated cgroup dir ALREADY resolved on the line above
+                        // (`box_cgroup_record` uses `box_cgroup_dir`, caller-independent). NOT
+                        // `registry::box_cgroup(pid1)`: that is caller-RELATIVE and returns None PRECISELY
+                        // here, because this callback runs in the runner process that `apply_limits` moved
+                        // INTO the box's cgroup - so the write would silently never happen and the kernel
+                        // would keep the original spec cap while the record showed the update (divergence).
+                        if !inst.cgroup.is_empty() {
+                            let cg = std::path::Path::new(&inst.cgroup);
                             if let Some(m) = mem {
-                                let _ = write_cgroup(&cg, "memory.max", &m.to_string());
+                                let _ = write_cgroup(cg, "memory.max", &m.to_string());
                             }
                             if let Some(p) = pids {
-                                let _ = write_cgroup(&cg, "pids.max", &p.to_string());
+                                let _ = write_cgroup(cg, "pids.max", &p.to_string());
                             }
                         }
                     }

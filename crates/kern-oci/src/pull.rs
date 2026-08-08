@@ -114,6 +114,12 @@ pub fn pull(
     let auth = discover_auth(&registry, &repo)?;
 
     let manifest = fetch_manifest(&registry, &repo, &reference, &auth)?;
+    // A digest PIN is a content-address: verify the bytes hash to it, so a compromised registry cannot
+    // serve a DIFFERENT manifest under a pinned reference (TLS protects the transport, not a malicious
+    // or backdoored registry). Only sha256 references reach here as digests; a tag skips this.
+    if reference.starts_with("sha256:") {
+        verify_digest_bytes(manifest.as_bytes(), &reference)?;
+    }
     let manifest = if is_manifest_list(&manifest) {
         // Select the requested arch EXACTLY - no wrong-arch fallback. Under an explicit `--platform`
         // that would silently pull the wrong image; even by default it's safer to error with the list
@@ -130,7 +136,11 @@ pub fn pull(
                 )
             })
         })?;
-        fetch_manifest(&registry, &repo, &digest, &auth)?
+        // The index names the sub-manifest by digest; verify the fetched sub-manifest against it, so the
+        // chain is content-addressed end to end (index -> arch manifest -> already-verified blobs).
+        let sub = fetch_manifest(&registry, &repo, &digest, &auth)?;
+        verify_digest_bytes(sub.as_bytes(), &digest)?;
+        sub
     } else {
         manifest
     };
@@ -138,6 +148,17 @@ pub fn pull(
     let layers = layer_digests(&manifest);
     if layers.is_empty() {
         return Err(manifest_error(&manifest, &registry, &repo));
+    }
+    // Bound the layer COUNT before downloading any: a hostile manifest (limited only by the manifest
+    // body cap → tens of thousands of digests) times MAX_LAYER_BYTES each is a large disk-fill. Real
+    // images stay well under Docker's 127-layer ceiling; MAX_LAYERS is generous headroom that still
+    // refuses an absurd manifest up front rather than mid-download.
+    const MAX_LAYERS: usize = 512;
+    if layers.len() > MAX_LAYERS {
+        return Err(OciError::Registry(format!(
+            "manifest lists {} layers (max {MAX_LAYERS}) - refusing a likely resource-exhaustion image",
+            layers.len()
+        )));
     }
     let total = layers.len();
     eprintln!(
@@ -392,9 +413,20 @@ pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciErro
     if image.is_empty() {
         return Err(OciError::Ref("empty".into()));
     }
-    let (name, reference) = match split_tag(image) {
-        Some((n, t)) => (n.to_string(), t.to_string()),
-        None => (image.to_string(), DEFAULT_TAG.to_string()),
+    // A DIGEST pin (`name[:tag]@sha256:<hex>`) splits at `@`: the WHOLE `sha256:<hex>` is the manifest
+    // reference. Handle it BEFORE `split_tag`, which splits on the LAST `:` and would tear the digest
+    // into `name@sha256` + `<hex>`, yielding a nonsensical repo path so the pull never resolves - digest
+    // pinning (a supply-chain feature) would silently be broken. The digest wins over any tag, so strip
+    // a trailing `:tag` from the name too (keeping a `host:port`, which `split_tag` already distinguishes).
+    let (name, reference) = match image.split_once('@') {
+        Some((n, digest)) if !n.is_empty() && !digest.is_empty() => {
+            let base = split_tag(n).map(|(b, _)| b).unwrap_or(n);
+            (base.to_string(), digest.to_string())
+        }
+        _ => match split_tag(image) {
+            Some((n, t)) => (n.to_string(), t.to_string()),
+            None => (image.to_string(), DEFAULT_TAG.to_string()),
+        },
     };
     let (registry, repo) = match name.split_once('/') {
         Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => {
@@ -1306,6 +1338,45 @@ fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
     if !got.eq_ignore_ascii_case(expected) {
         return Err(OciError::Registry(format!(
             "blob digest mismatch (expected {expected}, got {got}) - refusing"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify in-memory bytes (a manifest) against a `sha256:<hex>` digest, mirroring [`verify_digest`]
+/// but WITHOUT a temp file - a manifest is already in memory and small. Refuses a non-sha256 algorithm
+/// (no free pass for an unverified algorithm). sha256sum reads the bytes on stdin and emits its hash
+/// only after EOF, so a blocking `write_all` of a small manifest cannot deadlock on the stdout pipe.
+fn verify_digest_bytes(bytes: &[u8], digest: &str) -> Result<(), OciError> {
+    let Some(expected) = digest.strip_prefix("sha256:") else {
+        return Err(OciError::Registry(format!(
+            "unsupported digest algorithm (only sha256 is verified): {digest}"
+        )));
+    };
+    use std::io::Write;
+    let mut child = Command::new("sha256sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| OciError::Tool("sha256sum", e.to_string()))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| OciError::Tool("sha256sum", "no stdin".into()))?
+        .write_all(bytes)
+        .map_err(|e| OciError::Tool("sha256sum", e.to_string()))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| OciError::Tool("sha256sum", e.to_string()))?;
+    if !out.status.success() {
+        return Err(OciError::Tool("sha256sum", "hashing failed".into()));
+    }
+    let got = String::from_utf8_lossy(&out.stdout);
+    let got = got.split_whitespace().next().unwrap_or("");
+    if !got.eq_ignore_ascii_case(expected) {
+        return Err(OciError::Registry(format!(
+            "manifest digest mismatch (expected {expected}, got {got}) - refusing"
         )));
     }
     Ok(())
@@ -2256,14 +2327,25 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
                 "layer member '{path}' would be written through an escaping symlink (rootfs escape)"
             )));
         }
-        // '1' HARDLINK target is resolved to a real path AT EXTRACTION → an absolute/`..` target
-        // hardlinks a HOST inode into the image (confidentiality escape) → always reject. (A '2'
-        // SYMLINK's escaping target is handled by the escaping-symlink tracking above/below, not here.)
-        if typeflag == b'1' && link.as_deref().is_some_and(unsafe_member_path) {
-            return Err(OciError::Extract(format!(
-                "layer hardlink target escapes the rootfs: {path} -> {}",
-                link.as_deref().unwrap_or_default()
-            )));
+        // '1' HARDLINK target is resolved to a real path AT EXTRACTION (root-relative), and `link(2)`
+        // follows symlinks in intermediate components → reject an absolute/`..` target (which hardlinks
+        // a HOST inode straight in) AND a target that DESCENDS an escaping symlink recorded earlier in
+        // THIS layer: `b -> a/passwd` through a prior `a -> /etc` hardlinks host `/etc/passwd` into the
+        // rootfs (read = host-file disclosure, write = host corruption). That is the same symlink-descend
+        // class the `under_escaping` check above closes for a member PATH, but here the escape is via the
+        // hardlink's TARGET, which that check does not cover. A '2' SYMLINK's escaping target is tracked
+        // below. (BusyBox tar - kern's edge/WSL/Alpine hosts - has no hardlink safety, and the vetter is
+        // deliberately the tar-flavour-independent boundary, so this must be caught here.)
+        if typeflag == b'1' {
+            if let Some(t) = link.as_deref() {
+                if unsafe_member_path(t)
+                    || under_escaping(&normalize_member_path(t), &escaping_symlinks)
+                {
+                    return Err(OciError::Extract(format!(
+                        "layer hardlink target escapes the rootfs: {path} -> {t}"
+                    )));
+                }
+            }
         }
 
         // A symlink('2'), hardlink('1') or directory('5') header carries NO data - its `size` MUST be
@@ -2859,6 +2941,27 @@ mod tests {
         assert_eq!(
             parse_ref("ghcr.io/org/app:v1").unwrap(),
             ("ghcr.io".into(), "org/app".into(), "v1".into())
+        );
+        // DIGEST pins: the whole `sha256:<hex>` is the manifest reference, and the name loses any tag
+        // (a digest pins harder than a tag). A `host:port` must survive - it is not the digest's `:`.
+        let dig = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_ref(&format!("nginx@{dig}")).unwrap(),
+            (DEFAULT_REGISTRY.into(), "library/nginx".into(), dig.into())
+        );
+        assert_eq!(
+            parse_ref(&format!("ghcr.io/org/app@{dig}")).unwrap(),
+            ("ghcr.io".into(), "org/app".into(), dig.into())
+        );
+        assert_eq!(
+            parse_ref(&format!("nginx:1.2@{dig}")).unwrap(),
+            (DEFAULT_REGISTRY.into(), "library/nginx".into(), dig.into()),
+            "a digest pin drops the tag from the repo path"
+        );
+        assert_eq!(
+            parse_ref(&format!("host:5000/img@{dig}")).unwrap(),
+            ("host:5000".into(), "img".into(), dig.into()),
+            "a host:port survives digest parsing"
         );
     }
 
@@ -3985,6 +4088,25 @@ mod tests {
         assert!(
             vet_tar_stream(&mut r).is_err(),
             "an absolute hardlink target must be refused (delimiter-in-name class stays dead)"
+        );
+    }
+
+    /// REGRESSION (hardlink-through-symlink, host-inode escape): a hardlink whose TARGET descends an
+    /// escaping symlink recorded earlier in the SAME layer (`a -> /etc`, then hardlink `b -> a/passwd`)
+    /// resolves at extraction to host `/etc/passwd` and hardlinks that inode into the rootfs (read =
+    /// host disclosure, write = host corruption). The vetter rejected an absolute/`..` hardlink target
+    /// but not one that descends an escaping symlink - the same class the member-path check closes for
+    /// symlinks, but via the hardlink's target.
+    #[test]
+    fn rejects_hardlink_through_an_escaping_symlink() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&hdr(b"a", b'2', 0, b"/etc")); // escaping symlink a -> /etc
+        stream.extend_from_slice(&hdr(b"b", b'1', 0, b"a/passwd")); // hardlink b -> a/passwd (through a)
+        stream.extend(end_marker());
+        let mut r: &[u8] = &stream;
+        assert!(
+            vet_tar_stream(&mut r).is_err(),
+            "a hardlink descending an escaping symlink must be refused (host-inode escape)"
         );
     }
 

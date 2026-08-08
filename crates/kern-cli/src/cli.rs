@@ -2098,7 +2098,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     // this impossible config here rather than let the second forwarder silently fail to bind.
     for a in 0..ports.len() {
         for b in (a + 1)..ports.len() {
-            if ports[a].bind_ip == ports[b].bind_ip && ports[a].host == ports[b].host {
+            // Keyed on protocol too: TCP and UDP are SEPARATE host ports, so `-p 53:53/tcp -p 53:53/udp`
+            // (the common DNS shape) is NOT a duplicate - only two mappings of the SAME proto+addr+port
+            // collide on one bind.
+            if ports[a].bind_ip == ports[b].bind_ip
+                && ports[a].host == ports[b].host
+                && ports[a].udp == ports[b].udp
+            {
                 return Err(Error::Usage(
                     "duplicate -p host port (one host port maps to a single box port)",
                 ));
@@ -3381,6 +3387,29 @@ mod tests {
             "0.0.0.0:19000:81".into(),
         ])
         .is_ok());
+        // …and TCP + UDP on the SAME host port is fine (the DNS shape): they are separate host ports,
+        // so the duplicate check must key on protocol, not just address+port.
+        assert!(parse(&[
+            "box".into(),
+            "x".into(),
+            "-p".into(),
+            "53:53/tcp".into(),
+            "-p".into(),
+            "53:53/udp".into(),
+        ])
+        .is_ok());
+        // Same proto twice on one host port is still a duplicate.
+        assert!(matches!(
+            parse(&[
+                "box".into(),
+                "x".into(),
+                "-p".into(),
+                "53:53/udp".into(),
+                "-p".into(),
+                "53:54/udp".into(),
+            ]),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]

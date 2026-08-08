@@ -1104,11 +1104,23 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
         let dropped = matches!(spec.run_as, Some((u, _)) if u != 0);
         if io.kind() == std::io::ErrorKind::PermissionDenied && dropped {
             let uid = spec.run_as.map(|(u, _)| u).unwrap_or(0);
+            // With BOTH --user and --apparmor an EACCES is ambiguous - the dropped uid can't traverse
+            // the rootfs, OR the profile refused the transition. Name the uid (the more common cause of
+            // the two) but point at the profile too, so a box with both flags does not mis-attribute.
+            let aa = spec
+                .apparmor
+                .as_deref()
+                .map(|p| {
+                    format!(
+                        "\n      (or the AppArmor profile '{p}' refused the exec - is it loaded on the host?)"
+                    )
+                })
+                .unwrap_or_default();
             eprintln!(
                 "kern: cannot start '{cmd}' as uid {uid} in box: {io}\n\
                  hint: a rootless box's rootfs is owned by the box's root uid, so a \
                  non-root --user often can't exec it - drop --user (runs as the box's \
-                 root) or provide a rootfs owned by uid {uid}"
+                 root) or provide a rootfs owned by uid {uid}{aa}"
             );
         } else if io.kind() == std::io::ErrorKind::PermissionDenied && spec.apparmor.is_some() {
             // EACCES with a profile requested is the LSM refusing the transition - almost always the
