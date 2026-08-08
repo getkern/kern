@@ -655,6 +655,29 @@ pub fn name_for_pid(pid: i32) -> Option<String> {
     None
 }
 
+/// The `(memory_max, pids_max)` the LIVE box with `pid` currently records, or `None` if there is no
+/// live entry for it. The registry record is the source of truth for a box's caps after a `kern
+/// update` (which writes them here), so the in-process restart supervisor reads them back on each
+/// (re)start to keep an updated limit in force instead of snapping to the box's original spec.
+pub fn current_caps(pid: i32) -> Option<(Option<u64>, Option<u64>)> {
+    let d = dir().ok()?;
+    for e in fs::read_dir(&d).ok()?.flatten() {
+        let fname = e.file_name();
+        let Some((name, p)) = entry_split(&fname) else {
+            continue;
+        };
+        if p.parse::<i32>() != Ok(pid) {
+            continue;
+        }
+        if let Some(inst) = load_live(&e.path()) {
+            if inst.name == name {
+                return Some((inst.memory_max, inst.pids_max));
+            }
+        }
+    }
+    None
+}
+
 /// Remove every exit sidecar whose filename starts with `prefix` (compose passes `<pod>-`). Used by
 /// `compose down`, which - being a separate invocation - doesn't know the `up`'s token and so can't
 /// name the exact per-run key. Reaping is scoped to BOTH ends - `<prefix>…<suffix>` - so `compose
@@ -2071,6 +2094,13 @@ impl Instance {
                 self.name
             )));
         }
+        // NB: there is deliberately NO separate `seccomp_recorded` gate. An absent `seccompmode` line
+        // parses to the weaker Denylist default, but a record old enough to lack it is also old enough
+        // to lack the `apparmor` line - `seccompmode` was added BEFORE `apparmor` (see `encode`'s field
+        // order) - so the `aa_recorded` gate above ALREADY refuses it; a present-but-malformed
+        // `seccompmode` sets `posture_corrupt`, refused above. The field-order invariant makes a seccomp
+        // gate redundant. If a future field is ever inserted AFTER `seccompmode` but BEFORE `apparmor`,
+        // revisit this - the aa gate would no longer cover a missing `seccompmode`.
         Ok((
             cap_spec_from_fields(self.cap_drop_all, &self.cap_drops, &self.cap_adds),
             self.seccomp_mode,

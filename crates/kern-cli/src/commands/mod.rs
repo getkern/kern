@@ -4407,6 +4407,26 @@ fn supervise_box(
                     if let Some(cur) = registry::name_for_pid(inst.pid) {
                         inst.name = cur;
                     }
+                    // Adopt any cap a `kern update` wrote to the record while this box was up, and
+                    // re-apply it to THIS attempt's FRESH cgroup, so the operator's change survives an
+                    // in-process restart instead of snapping back to the box's original spec (Docker's
+                    // `update` persists). `apply_limits` already wrote spec's caps to the new cgroup
+                    // BEFORE this callback, so the override here lands last and wins; the record stays
+                    // the source of truth, keeping `kern ps` and the kernel in step. `None` (no live
+                    // record yet, i.e. the first start) leaves the original spec caps untouched. (The
+                    // systemd-managed path still rebuilds from spec - it re-execs kern from the unit.)
+                    if let Some((mem, pids)) = registry::current_caps(inst.pid) {
+                        inst.memory_max = mem;
+                        inst.pids_max = pids;
+                        if let Some(cg) = registry::box_cgroup(pid1) {
+                            if let Some(m) = mem {
+                                let _ = write_cgroup(&cg, "memory.max", &m.to_string());
+                            }
+                            if let Some(p) = pids {
+                                let _ = write_cgroup(&cg, "pids.max", &p.to_string());
+                            }
+                        }
+                    }
                     // Same reason as the foreground path: no channel to propagate on, so report.
                     // A discarded failure here leaves the entry without this box's PID 1, which is
                     // what `kern exec` joins.
@@ -7094,12 +7114,16 @@ const CPU_PERIOD_US: u64 = 100_000;
 
 /// `kern update <box> [--memory M] [--cpus N] [--pids-limit P]` - change a RUNNING box's cgroup v2
 /// caps in place (Docker `update`), no restart. Writes `memory.max`/`cpu.max`/`pids.max` straight into
-/// the box's delegated cgroup; each knob is best-effort where its controller isn't delegated (the same
-/// policy as box start). At least one knob is required. Note: lowering `--memory` below live usage can
-/// trigger the OOM killer inside the box, exactly as `docker update` does. Caveat: when a box runs
-/// under a systemd scope/service (the `--restart`/managed path), an OUTER unit also caps it, so the
-/// effective limit is `min(inner, outer)` - RAISING a cap above the outer one takes no effect until a
-/// restart (which the managed path rebuilds from the original spec); LOWERING always bites.
+/// the box's delegated cgroup and records the memory/pids caps back in the registry; each knob is
+/// best-effort where its controller isn't delegated (the same policy as box start). At least one knob
+/// is required. Note: lowering `--memory` below live usage can trigger the OOM killer inside the box,
+/// exactly as `docker update` does.
+///
+/// Across a RESTART: an in-process-supervised box (`--restart on-failure`, or an `always` pod member)
+/// re-reads the recorded memory/pids caps on each restart and re-applies them, so the update PERSISTS
+/// (Docker parity). A systemd-managed box (a standalone `--restart always`/`unless-stopped`) is instead
+/// rebuilt from its original spec by the unit's re-exec, and its OUTER scope also caps it: RAISING a
+/// cap above the outer one takes effect only after that rebuild, LOWERING always bites.
 pub fn update(
     name: &str,
     memory: Option<u64>,
