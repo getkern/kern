@@ -44,6 +44,9 @@ the current state of the tree; full detail is in the git history.
   syscall form, `usable` flag); `kern <verb> --help` filters to the verb on a real terminal.
 - `kern compose` anchors a service's relative `env_file`/`-v`/`rootfs` paths to the compose file's
   own directory, not the caller's working directory, so a stack runs the same from anywhere.
+- Compose `restart: always`/`unless-stopped` is honoured on a pod member instead of being degraded to
+  on-failure: kern's per-service supervisor keeps it up on ANY exit (including a clean 0) for the
+  stack's lifetime. A standalone box's `always`/`unless-stopped` still takes the systemd path.
 - A privileged port (`-p` below 1024) reports the real cause - a missing `CAP_NET_BIND_SERVICE`, or
   the address already in use - instead of a generic bind failure.
 - A `--user`/image `USER` that cannot be mapped names the actual fix (install `newuidmap`/`newgidmap`

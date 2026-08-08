@@ -493,7 +493,9 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
 /// `on-failure` re-runs it on a non-zero exit via kern's own in-process supervisor (dies with the
 /// host); `always`/`unless-stopped` hand supervision to the user's **systemd** (a generated
 /// `~/.config/systemd/user/kern-<name>.service` + linger) so the box restarts on ANY exit AND
-/// survives reboot - all WITHOUT a kern daemon.
+/// survives reboot - all WITHOUT a kern daemon. Exception: a `--pod` MEMBER with `always`/
+/// `unless-stopped` is supervised in-process for the stack's lifetime instead (it needs the pod
+/// holder's shared namespace, which a standalone systemd unit could not re-join).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RestartPolicy {
     #[default]
@@ -1149,10 +1151,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // Validate `--health-action` up front (before any host-side mount) so a typo fails fast. A
     // `restart` action implies the on-failure restart policy (that's how it re-runs the box).
     let health_action = parse_health_action(args.health_action)?;
-    // In-process supervisor (dies with the host): only `on-failure` - or a `restart` health action.
-    // `always`/`unless-stopped` are persistent and handled by a systemd user unit below instead.
+    // In-process supervisor (dies with the host): `on-failure` - or a `restart` health action.
     let restart =
         args.restart == RestartPolicy::OnFailure || health_action == HealthAction::Restart;
+    // A POD MEMBER with `always`/`unless-stopped` is supervised IN-PROCESS for the stack's lifetime
+    // (restart on ANY exit, including 0), NOT via a per-service systemd unit: a pod member needs the
+    // pod holder's shared namespace, so a standalone unit that outlives the holder could not re-join
+    // it. A STANDALONE `always`/`unless-stopped` box still takes the systemd path below (survives reboot).
+    let restart_always = args.restart.persistent() && args.pod.is_some();
     // When systemd (re-)starts a persistent box, it runs THIS binary in the foreground with
     // `KERN_MANAGED=1`: skip the transient-scope re-exec (the box already lives in the unit's own
     // service cgroup) and register the foreground run so `kern ps`/`logs`/`stop` still see it.
@@ -1654,7 +1660,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // just did warmed the image cache, so systemd's start is fast. We tear down this launcher's
     // scratch (the managed run makes its own) and return. Not reached in the managed run itself
     // (the unit strips `-d`, so `args.detached` is false there).
-    if args.detached && args.restart.persistent() {
+    // A pod member is excluded (`args.pod.is_none()`): it takes the in-process `restart_always` path
+    // instead, because a systemd unit that outlives the pod holder could not re-join its namespace.
+    if args.detached && args.restart.persistent() && args.pod.is_none() {
         for h in &ext4_handles {
             h.teardown();
         }
@@ -1690,6 +1698,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             &mounted_vols,
             args.pod.unwrap_or(""),
             restart,
+            restart_always,
             HealthConfig {
                 cmd: args.health_cmd,
                 interval: args.health_interval,
@@ -4280,7 +4289,11 @@ fn await_box_started(
 struct Restart {
     /// `--restart` (on-failure). `false` = run once, never retry.
     on_failure: bool,
-    /// `--restart-max` / compose `on-failure:N`. 0 = kern's built-in cap.
+    /// Docker `always`/`unless-stopped` on a POD MEMBER: restart on ANY exit (including 0), uncapped,
+    /// via THIS in-process supervisor (it dies with the stack). A STANDALONE always/unless-stopped box
+    /// takes the systemd path instead; a pod member cannot, as it needs the pod holder's namespace.
+    always: bool,
+    /// `--restart-max` / compose `on-failure:N`. 0 = kern's built-in cap. Not applied when `always`.
     max: u32,
 }
 
@@ -4384,11 +4397,25 @@ fn supervise_box(
             1 // fork or waitpid failed - treat as a failure, don't spin
         };
         attempt += 1;
-        if restart.on_failure && code != 0 && attempt <= max_restarts {
-            eprintln!(
-                "kern: box '{}' exited {code}; restarting ({attempt}/{max_restarts})",
-                name.as_str()
-            );
+        // `always`/`unless-stopped`: restart on ANY exit (including 0), uncapped - Docker's contract,
+        // kept up for the stack's lifetime. `on-failure`: only a non-zero exit, capped at max_restarts.
+        let restart_now = if restart.always {
+            true
+        } else {
+            restart.on_failure && code != 0 && attempt <= max_restarts
+        };
+        if restart_now {
+            if restart.always {
+                eprintln!(
+                    "kern: box '{}' exited {code}; restarting (always)",
+                    name.as_str()
+                );
+            } else {
+                eprintln!(
+                    "kern: box '{}' exited {code}; restarting ({attempt}/{max_restarts})",
+                    name.as_str()
+                );
+            }
             unsafe { libc::sleep(1) }; // brief backoff so a crash loop can't spin
             continue;
         }
@@ -4463,6 +4490,9 @@ fn run_detached(
     volumes: &str,
     pod: &str,
     restart: bool,
+    // Docker `always`/`unless-stopped` on a pod member: in-process supervisor, restart on ANY exit
+    // (uncapped). Distinct from `restart` (on-failure). A standalone box uses the systemd path instead.
+    restart_always: bool,
     health: HealthConfig,
     timeout: u64,
     // `--label k=v` metadata, comma-joined, recorded in the registry entry (see `Instance::labels`).
@@ -4579,6 +4609,7 @@ fn run_detached(
         ports,
         Restart {
             on_failure: restart,
+            always: restart_always,
             max: restart_max,
         },
         &mut inst,

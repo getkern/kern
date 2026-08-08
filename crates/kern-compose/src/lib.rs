@@ -93,6 +93,9 @@ pub struct ComposeBox {
     pub uid_range_explicit_false: bool,
     pub bind_rootfs: bool,
     pub restart: bool,
+    /// Compose `restart: always`/`unless-stopped` → `--restart always`. kern honours it on a pod
+    /// member in-process for the stack's lifetime (restart on ANY exit), not degraded to on-failure.
+    pub restart_always: bool,
     pub tun: bool,
     pub volumes: Vec<String>,
     pub env: Vec<String>,
@@ -305,7 +308,9 @@ impl ComposeBox {
         if self.bind_rootfs {
             cmd.arg("--bind-rootfs");
         }
-        if self.restart {
+        if self.restart_always {
+            cmd.arg("--restart").arg("always");
+        } else if self.restart {
             cmd.arg("--restart");
         }
         if self.tun {
@@ -1861,6 +1866,34 @@ mod compat_field_tests {
             one("services:\n  a:\n    image: x\n    restart: \"on-failure:abc\"\n").restart_max,
             None
         );
+    }
+
+    #[test]
+    fn restart_always_is_honored_not_degraded() {
+        // `always`/`unless-stopped` are no longer flattened to on-failure: they set `restart_always`,
+        // which emits `--restart always` so a pod member is kept up on ANY exit (including a clean 0).
+        for policy in ["always", "unless-stopped"] {
+            let b = one(&format!(
+                "services:\n  a:\n    image: x\n    restart: {policy}\n"
+            ));
+            assert!(
+                b.restart && b.restart_always,
+                "'{policy}' → restart on any exit"
+            );
+            let mut cmd = std::process::Command::new("kern");
+            b.push_box_flags(&mut cmd);
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.windows(2).any(|w| w == ["--restart", "always"]),
+                "'{policy}' emits `--restart always`, got {args:?}"
+            );
+        }
+        // `on-failure` stays on-failure (not 'always'): a bare `--restart`, no value.
+        let b = one("services:\n  a:\n    image: x\n    restart: on-failure\n");
+        assert!(b.restart && !b.restart_always);
     }
 
     #[test]

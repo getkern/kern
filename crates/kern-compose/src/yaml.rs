@@ -2893,7 +2893,8 @@ fn parse_duration_secs_opt(s: &str, allow_zero: bool) -> Option<i64> {
     }
 }
 
-/// `restart`: `no`→off; `on-failure`→on; `always`/`unless-stopped`→on + warn (kern has on-failure only).
+/// `restart`: `no`→off; `on-failure`→on (retry on non-zero exit); `always`/`unless-stopped`→restart on
+/// ANY exit (kern supervises a pod member in-process for the stack's lifetime, not degraded to on-failure).
 fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
     let v = node.scalar.as_deref().map(scalar_str).unwrap_or_default();
     match v.as_str() {
@@ -2918,9 +2919,7 @@ fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
         }
         "always" | "unless-stopped" => {
             b.restart = true;
-            warn(&format!(
-                "service '{svc}': restart '{v}' → kern uses on-failure (restarts on non-zero exit, not always)"
-            ));
+            b.restart_always = true;
         }
         other => {
             warn(&format!(
@@ -3470,9 +3469,13 @@ mod tests {
     }
 
     #[test]
-    fn restart_always_maps_on_failure() {
+    fn restart_always_is_honored_on_any_exit() {
         let y = "services:\n  a:\n    image: alpine\n    restart: always\n";
-        assert!(boxes(y)[0].restart);
+        let b = &boxes(y)[0];
+        assert!(
+            b.restart && b.restart_always,
+            "`always` restarts on ANY exit (not degraded to on-failure)"
+        );
     }
 
     #[test]

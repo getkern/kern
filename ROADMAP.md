@@ -23,8 +23,11 @@ and some may never ship if they would change what kern is. Recently shipped work
 
 **In progress**
 
-- **Per-stack supervisor.** Today `up` catches a service that dies at startup; one that dies an hour
-  later is not detected. Under measurement on a Pi before it gets built.
+- **Stack-level watcher.** A service with a `restart:` policy is already restarted when it dies
+  mid-run by its own per-service supervisor (`on-failure` on a non-zero exit, `always`/`unless-stopped`
+  on any exit, for the stack's lifetime). What is not there yet is a watcher over the whole member
+  *set* that survives an individual supervisor being killed and re-applies policy across the stack;
+  lower priority now that the common case is covered.
 
 **Deliberately out, not missing**
 

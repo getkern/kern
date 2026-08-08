@@ -104,9 +104,11 @@ $ systemctl --user daemon-reload && systemctl --user enable --now kern-shop.serv
 $ loginctl enable-linger $USER        # or the unit stops when you log out
 ```
 
-**It does not supervise.** The unit brings the stack up and tears it down; a service that dies an
-hour later is not restarted, and the generated unit says so in its own comments rather than letting
-you assume otherwise. Walk-through: [compose-systemd-unit.sh](../examples/compose-systemd-unit.sh).
+**The unit adds no supervision beyond each service's own `restart:` policy.** kern's per-service
+supervisor already restarts a service that dies mid-run (`on-failure` on a non-zero exit,
+`always`/`unless-stopped` on any exit, for the stack's lifetime); what the generated unit does not do
+is re-run a stack that failed as a whole, and it says so in its own comments rather than letting you
+assume otherwise. Walk-through: [compose-systemd-unit.sh](../examples/compose-systemd-unit.sh).
 
 ### Everyday `docker` commands
 
