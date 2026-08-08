@@ -16,6 +16,9 @@ acknowledgement and a coordinated-disclosure timeline.
 - A malicious OCI image or `--rootfs` must not read or write host files outside the rootfs (path
   traversal, cross-layer symlink escape, whiteout-through-symlink, tar traversal).
 - A box must not see or affect host processes, mounts, or other boxes.
+- A box must not read or write kern's own runtime registry (a peer box's ssh host keys, secrets, and
+  recorded capability/seccomp posture) through any host-path input: `-v`, `--secret`, `--env-file`,
+  `--rootfs`, the `kern build` context/`-f` Dockerfile, or `kern cp`/`kern save -o`.
 - Resource limits must hold: fork bombs and OOM must be contained.
 - seccomp must block the dangerous syscall set unconditionally.
 
@@ -219,10 +222,16 @@ box's full limit, so N execs could use N times the box's memory.
   leave writable; the flip side is that a filesystem already mounted *under* the source keeps its own
   flags, so a pre-existing read-write submount there is not remounted read-only. A submount beneath the
   source that a process other than the operator can create is thus outside the `:ro` guarantee - the
-  source path is trusted as the operator's own. kern additionally **refuses to bind its own runtime
-  registry** (`$XDG_RUNTIME_DIR/kern/{instances,claims,exit}`, or any parent that contains it) into a
-  box: a box able to write those files could forge a peer box's recorded capability/seccomp posture and
-  elevate that peer's `kern exec`.
+  source path is trusted as the operator's own. kern additionally **refuses to expose its own runtime
+  registry** (`$XDG_RUNTIME_DIR/kern`) to a box. The rule is an **inverted default**: everything under
+  the registry root is refused except an explicit box-data allowlist (`logs/`, `scratch/`), so a
+  directory added later (as `waitexit/` was) is non-mountable by omission rather than mountable by
+  omission. A `mount --bind` alias whose path is elsewhere is caught by **device+inode identity**, not
+  path alone. This closes the class at **every** host-path entry point, not only `-v`: `--secret`,
+  `--env-file`, `--rootfs`, and the `kern build` context / `-f` Dockerfile route through the same check.
+  The registry holds a peer box's `ssh/` host keys, `secret`s, and `instances/` capability/seccomp
+  posture records: a box able to READ them steals a peer's secrets, and one able to WRITE them forges a
+  peer's recorded posture to elevate that peer's `kern exec`.
 - **`-p [ip:]host:box`** binds **`127.0.0.1` by default**. `-p 0.0.0.0:H:B` exposes the service to
   the LAN, a deliberate and warned-about choice. The forwarder runs in the host network namespace,
   the box stays in its own.
@@ -234,7 +243,12 @@ box's full limit, so N execs could use N times the box's memory.
   every symlink and `..` is reinterpreted as if the box root were `/`: a hostile image cannot plant a
   link that makes the copy touch a host file (the CVE-2019-14271 class). Nothing is executed inside
   the box to do it. Regular files only, opened `O_NONBLOCK` so a planted FIFO cannot hang the copy,
-  with a 4 GiB cap.
+  with a 4 GiB cap. The **host side** runs the same registry guard as `-v`, in both directions: a copy
+  INTO a box refuses a source that resolves onto the registry (it cannot read a peer's key or posture
+  record into the box), and a copy OUT of a box refuses a destination that lands on the registry. The
+  destination check follows a symlink final component to where the write would **actually land**, so a
+  symlink planted in a writable directory cannot redirect the write onto a peer's posture record.
+  **`kern save -o <file>`** applies the same destination guard.
 - **`kern pause`/`unpause`** write only the box's own cgroup and refuse when it has none.
   **`kern attach`** is read-only.
 
