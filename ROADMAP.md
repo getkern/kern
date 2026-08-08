@@ -9,9 +9,11 @@ and some may never ship if they would change what kern is. Recently shipped work
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped, and the
   README will describe it when it is, not before. Nothing here touches a GPU today.
 - **More governed resources.** I/O bandwidth and IOPS caps already ship (`vdisk:` `--bandwidth` /
-  `--iops`, box `--io-weight` → cgroup `io.max`/`io.weight`), but they bind only where the host
-  delegates the rootless `io` controller, which many do not; widening that, and other kernel-real
-  knobs like network shaping, as they prove useful.
+  `--iops`, box `--io-weight` → cgroup `io.max`/`io.weight`), and hold a box to the requested rate
+  exactly where the host grants both: the `io` controller delegated to the box's cgroup (systemd
+  often does not by default), and the ext4-on-loop vdisk backend (a real root, foreground box). A
+  rootless box without those falls back and the caps are reported unapplied rather than pretended.
+  Widening where they bind, and other kernel-real knobs like network shaping, as they prove useful.
 - **Snapshot / warm-start (CRIU).** Same-host checkpoint and restore of a *warm* box for subsecond
   restarts. Feasible but gated: rootless CRIU needs a capability and suspending the seccomp filter, so it
   would be an explicit opt-in mode, not the default, and only for same-host, non-GPU boxes. Not committed.
