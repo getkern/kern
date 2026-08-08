@@ -50,6 +50,9 @@ pub enum Command {
         egress_allow: Vec<String>,
         /// `--landlock-rw <path>` (repeatable): a Landlock write-allowlist (box RO except these paths).
         landlock_rw: Vec<String>,
+        /// `--apparmor <profile>`: a pre-loaded AppArmor profile the box enters on exec (Docker's
+        /// `--security-opt apparmor=`). A missing/unloaded profile fails the box closed.
+        apparmor: Option<String>,
         /// `--workdir <dir>` / `-w <dir>`: working directory inside the box.
         workdir: Option<String>,
         /// `--net`: share the host network namespace (outbound networking; no net isolation).
@@ -1511,6 +1514,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut env: Vec<String> = Vec::new();
     let mut egress_allow: Vec<String> = Vec::new();
     let mut landlock_rw: Vec<String> = Vec::new();
+    let mut apparmor: Option<String> = None;
     let mut workdir: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
     let mut profiles: Vec<String> = Vec::new();
@@ -1948,6 +1952,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         }
                     }
                 }
+                "--apparmor" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) if !v.trim().is_empty() => apparmor = Some(v.trim().to_string()),
+                        _ => return Err(Error::Usage("--apparmor <profile>")),
+                    }
+                }
                 "-w" | "--workdir" => {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
@@ -2123,6 +2134,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             env,
             egress_allow,
             landlock_rw,
+            apparmor,
             workdir,
             share_net,
             pod,
@@ -2663,6 +2675,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env,
             egress_allow,
             landlock_rw,
+            apparmor,
             workdir,
             share_net,
             pod,
@@ -2728,6 +2741,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env: &env,
             egress_allow: &egress_allow,
             landlock_rw: &landlock_rw,
+            apparmor: apparmor.as_deref(),
             workdir: workdir.as_deref(),
             share_net,
             pod: pod.as_deref(),

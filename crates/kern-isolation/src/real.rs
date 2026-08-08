@@ -89,6 +89,12 @@ pub struct SandboxSpec {
     /// dirs), enforced by the kernel and unliftable by the workload. Empty = no Landlock (namespaces +
     /// seccomp only). Best-effort: a kernel without Landlock degrades to a no-op with a warning.
     pub landlock_rw: Vec<String>,
+    /// `--apparmor <profile>`: a pre-loaded AppArmor (LSM) profile the box enters on the coming exec
+    /// (Docker's `--security-opt apparmor=`), layering kernel-enforced file/capability confinement over
+    /// namespaces + seccomp. `None` = no transition (the box keeps kern's own profile, usually
+    /// unconfined). The profile must be loaded on the host (root, once); a missing/unloadable profile
+    /// fails the box CLOSED rather than running it unconfined.
+    pub apparmor: Option<String>,
     /// argv of the command to run inside the sandbox (must be non-empty).
     pub command: Vec<String>,
     /// Hostname to set inside the (isolated) UTS namespace.
@@ -624,6 +630,35 @@ fn detach_old_root() -> Result<(), Error> {
 }
 
 /// `exec` the command, replacing this process. Returns only on failure.
+/// Transition the NEXT `exec()` of this process into a pre-loaded AppArmor profile (`--apparmor`).
+/// Writes `exec <profile>` to `/proc/self/attr/apparmor/exec` (older kernels: `/proc/self/attr/exec`),
+/// the exact interface `aa_change_onexec()` uses; the profile applies when `execvp` runs. FAIL-CLOSED:
+/// a profile that is not loaded (or AppArmor disabled) returns `Err`, and the caller refuses to exec the
+/// workload rather than run it unconfined - kern never silently drops a confinement the user asked for.
+/// The profile must be loaded on the host (root, once), exactly like Docker's `--security-opt apparmor=`.
+fn apply_apparmor_onexec(profile: &str) -> Result<(), Error> {
+    use std::io::Write;
+    let payload = format!("exec {profile}");
+    let mut last = String::from("no AppArmor interface (/proc/self/attr/apparmor/exec)");
+    for path in ["/proc/self/attr/apparmor/exec", "/proc/self/attr/exec"] {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(mut f) => {
+                return f.write_all(payload.as_bytes()).map_err(|e| {
+                    Error::Spec(format!(
+                        "--apparmor {profile}: could not enter the profile (is it loaded on the host? \
+                         `sudo apparmor_parser -r <profile>`): {e}"
+                    ))
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => last = format!("cannot open {path}: {e}"),
+        }
+    }
+    Err(Error::Spec(format!(
+        "--apparmor {profile}: {last} - AppArmor is not available on this kernel"
+    )))
+}
+
 fn exec(argv: &[CString]) -> Error {
     let mut ptrs: Vec<*const c_char> = argv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(ptr::null());
@@ -933,6 +968,15 @@ fn child_setup_and_exec(
             Err(e) => return Err(e),
         }
         t.mark("landlock");
+    }
+    // `--apparmor <profile>`: enter a pre-loaded AppArmor profile on the coming exec, layering
+    // kernel-enforced LSM confinement over namespaces + seccomp. Done BEFORE the seccomp install (a
+    // setup step) and BEFORE the init/non-init split, so the onexec transition is inherited across the
+    // `--init` reaper's fork and applies to whichever process actually execs. FAIL-CLOSED: a profile
+    // that is not loaded refuses the box rather than running it unconfined.
+    if let Some(profile) = &spec.apparmor {
+        apply_apparmor_onexec(profile)?;
+        t.mark("apparmor");
     }
     // Install the seccomp filter LAST - after all setup syscalls (mount/pivot) are done, so it
     // only constrains the workload. Then exec (or hand off to the built-in init). `allow_nesting`
@@ -3457,6 +3501,10 @@ pub fn exec_in_box(
     box_has_explicit_caps: bool,
     box_caps: &CapSpec,
     seccomp_mode: crate::SeccompFilter,
+    // The box PID 1's AppArmor profile (read from `/proc/<pid1>/attr/apparmor/current`), or `None` if
+    // it runs unconfined. Re-entered here so `kern exec` matches the box's confinement, like caps +
+    // seccomp - otherwise an exec would run OUTSIDE the box's AppArmor profile.
+    apparmor: Option<&str>,
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -3652,6 +3700,15 @@ pub fn exec_in_box(
         // fell back to the wider denylist). Nesting stays STRICT (`allow_nesting=false`) regardless of
         // the box's `--privileged`: an exec being MORE constrained than PID 1 is always safe, whereas
         // relaxing it would be the dangerous direction, so this axis is deliberately not reproduced.
+        // `--apparmor` parity: if the box's PID 1 entered an AppArmor profile, the exec'd command must
+        // re-enter it too - otherwise `kern exec` (like a lax `docker exec`) would run OUTSIDE the box's
+        // LSM confinement. Applied BEFORE seccomp, the same order PID 1 used. Fail-closed: a profile
+        // that won't re-enter refuses the exec rather than running it unconfined.
+        if let Some(profile) = apparmor {
+            if apply_apparmor_onexec(profile).is_err() {
+                exec_fail_closed("could not re-enter the box's AppArmor profile");
+            }
+        }
         if crate::seccomp::install(seccomp_mode, false).is_err() {
             exec_fail_closed("seccomp filter could not be installed");
         }

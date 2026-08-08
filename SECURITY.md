@@ -200,6 +200,13 @@ box's full limit, so N execs could use N times the box's memory.
   needs the workload's real write paths) or set `--require-limits` (which would break a cgroup-less
   host). A CLI/SDK flag, not a compose key: a compose service reaches the same posture through its
   individual keys and `KERN_SECCOMP`.
+- **`--apparmor <profile>`** enters a pre-loaded AppArmor (LSM) profile on the box's `exec`, layering
+  kernel-enforced file/capability confinement over namespaces + seccomp - Docker's `--security-opt
+  apparmor=`. The profile must be loaded on the host (root, once, `apparmor_parser -r`); a missing or
+  unloadable profile **fails the box closed** rather than running it unconfined. `kern exec` re-enters
+  the box's own profile, so an exec is no less confined than the workload (parity with the caps + seccomp
+  it already reapplies). kern applies **no** default profile: without the flag the box keeps kern's own
+  (usually unconfined) and its boundary is namespaces + seccomp + cgroups, as documented above.
 - **`--user UID[:GID]` (or a name)** drops the workload after all privileged setup and the capability
   drop. A name (`--user memcache`, compose `user:`, or the image's own `USER`) is resolved against the
   image's `/etc/passwd`/`/etc/group`. Only ids mapped into the box's user namespace work, so a non-root

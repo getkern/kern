@@ -186,6 +186,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         mutually exclusive with --require-limits
     --security-profile <untrusted>  Opt-in hardening bundle (seccomp allowlist + cap-drop ALL +
                         read-only), applied as a base explicit flags override; prints its constituents
+    --apparmor <profile>  Enter a pre-loaded AppArmor profile on exec (Docker's --security-opt
+                        apparmor=), layered over seccomp; a missing/unloaded profile fails closed
     --plan              Preview the isolation sequence and any device grants, without running
 
 {b}OPTIONS for run:{z}
@@ -627,6 +629,8 @@ pub struct BoxRunArgs<'a> {
     /// under Landlock, so the workload cannot `mkdir` a missing allowlist dir, and a path absent at start
     /// is skipped (fail-safe, so the box is only ever MORE confined, never less).
     pub landlock_rw: &'a [String],
+    /// `--apparmor <profile>`: a pre-loaded AppArmor profile the box enters on exec, or None.
+    pub apparmor: Option<&'a str>,
     pub workdir: Option<&'a str>,
     pub share_net: bool,
     /// `--pod <name>`: join this pod's shared network (created by `kern pod create`).
@@ -1600,6 +1604,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         read_only, // profile-adjusted: `--security-profile=untrusted` forces read-only on
         seccomp_mode, // resolved above (explicit KERN_SECCOMP > profile > default), not from env here
         landlock_rw: args.landlock_rw.to_vec(),
+        apparmor: args.apparmor.map(|s| s.to_string()),
         volumes,
         env,
         // `--workdir` wins; otherwise the image's `config.WorkingDir`.
@@ -2557,6 +2562,7 @@ struct BuildSpec<'a> {
     cmd: Vec<String>,
     read_only: bool,
     landlock_rw: Vec<String>,
+    apparmor: Option<String>,
     volumes: Vec<Volume>,
     env: Vec<(String, String)>,
     workdir: Option<String>,
@@ -2777,6 +2783,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         overlay,
         read_only: b.read_only,
         landlock_rw: b.landlock_rw,
+        apparmor: b.apparmor,
         command: b.cmd,
         hostname,
         volumes: b.volumes,
@@ -3250,6 +3257,24 @@ fn resolve_image_user(spec: &str, lower: &str) -> Option<(u32, u32)> {
 mod image_user_resolution_tests {
     use super::*;
 
+    #[test]
+    fn apparmor_current_is_parsed_confined_only() {
+        // A box that entered an enforce/complain profile → its name, so `kern exec` re-enters it.
+        assert_eq!(
+            parse_apparmor_current("docker-default (enforce)\n").as_deref(),
+            Some("docker-default")
+        );
+        assert_eq!(
+            parse_apparmor_current("kern-box (complain)").as_deref(),
+            Some("kern-box")
+        );
+        // Unconfined (bare, or kern's own profile in unconfined mode, or no AppArmor) → no transition.
+        assert_eq!(parse_apparmor_current("unconfined"), None);
+        assert_eq!(parse_apparmor_current("vscode (unconfined)"), None);
+        assert_eq!(parse_apparmor_current(""), None);
+        assert_eq!(parse_apparmor_current("   "), None);
+    }
+
     /// A box's `config.User` given by NAME (e.g. memcached's `USER memcache`) must resolve to the image's
     /// own uid/gid the way Docker does - reading the rootfs's `/etc/passwd`/`/etc/group` - not silently
     /// run as box root. This is the fix for the class that killed memcached, unprivileged nginx, etc.
@@ -3344,6 +3369,31 @@ mod image_user_resolution_tests {
     }
 }
 
+/// The active AppArmor profile of a box's PID 1 (`/proc/<pid1>/attr/apparmor/current`), so `kern exec`
+/// can re-enter it - matching the box's own confinement, like caps + seccomp. Returns the profile NAME
+/// only when the box is actually confined (mode `enforce`/`complain`); `unconfined` or no AppArmor
+/// yields `None`, so exec adds no transition. Best-effort: an unreadable attr file just means `None`.
+fn box_apparmor_profile(pid1: i32) -> Option<String> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid1}/attr/apparmor/current"))
+        .or_else(|_| std::fs::read_to_string(format!("/proc/{pid1}/attr/current")))
+        .ok()?;
+    parse_apparmor_current(&raw)
+}
+
+/// Parse an AppArmor `.../attr/current` value (`"<name> (<mode>)"`, or a bare `"unconfined"`). Returns
+/// the profile NAME only when it is actually confined (mode `enforce`/`complain`); anything else is
+/// `None`. Pure, so the confined / unconfined / no-AppArmor cases are unit-tested without a live task.
+fn parse_apparmor_current(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "unconfined" {
+        return None;
+    }
+    match raw.rsplit_once(' ') {
+        Some((name, "(enforce)" | "(complain)")) if !name.is_empty() => Some(name.to_string()),
+        _ => None,
+    }
+}
+
 /// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]` - run a command inside an
 /// already-running box, joining its namespaces. Defaults to `/bin/sh`. Propagates the exit code.
 pub fn exec(
@@ -3403,6 +3453,9 @@ pub fn exec(
     // not need `-w /app` retyped on every exec. An explicit `-w` still wins, and a box with no workdir
     // (or an older registry entry, which carries no such field) keeps landing at `/`.
     let effective_workdir = workdir.or(Some(inst.workdir.as_str()).filter(|w| !w.is_empty()));
+    // `--apparmor` parity: re-enter the box's own AppArmor profile so an exec is no less confined than
+    // the box's PID 1 (`None` when the box runs unconfined). Same intent as reapplying caps + seccomp.
+    let box_aa = box_apparmor_profile(pid1);
     let result = exec_in_box(
         pid1,
         &cmd,
@@ -3414,6 +3467,7 @@ pub fn exec(
         box_has_explicit_caps,
         &box_caps,
         box_seccomp,
+        box_aa.as_deref(),
     );
 
     if let Some(prev) = saved.as_ref() {
@@ -4120,6 +4174,10 @@ fn run_probe(
             false,
             &kern_isolation::CapSpec::default(),
             seccomp_mode,
+            // A health probe is kern's own controlled command, not the untrusted workload: keep it at
+            // the baseline (no box AppArmor), consistent with its baseline caps above, so a confining
+            // profile can't break the very check kern uses to decide health.
+            None,
         )
         .unwrap_or(1);
         unsafe { libc::_exit(code) };
