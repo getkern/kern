@@ -487,6 +487,24 @@ pub fn validate_runnable(boxes: &[ComposeBox]) -> Result<(), String> {
             }
         }
     }
+    // A `depends_completed` TARGET that is `restart: always`/`unless-stopped` can NEVER complete, so the
+    // dependent waits forever. Docker Compose rejects this combination at validation rather than hang;
+    // kern names both services and the two keys that contradict - the same discipline as the `port:`/
+    // `PORT=` clash above and `--cap-add ALL` under `--security-profile untrusted`. A hang is the worst
+    // outcome: the user cannot see WHAT it is waiting for.
+    for b in boxes {
+        for dep in &b.depends_completed {
+            if boxes.iter().any(|t| &t.name == dep && t.restart_always) {
+                return Err(format!(
+                    "service '{}' waits for '{dep}' to COMPLETE (depends_on condition \
+                     service_completed_successfully), but '{dep}' sets `restart: always` (or \
+                     unless-stopped) and never completes: the two contradict. Drop the restart policy on \
+                     '{dep}', or the completion dependency on it in '{}'.",
+                    b.name, b.name
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1848,6 +1866,39 @@ mod compat_field_tests {
         );
         let base = parse("services:\n  a:\n    image: alpine\n").expect("base");
         assert!(validate_runnable(&merge_stacks(base, over)).is_ok());
+    }
+
+    #[test]
+    fn depends_completed_on_an_always_service_is_refused_not_hung() {
+        // `always`/`unless-stopped` never completes; a `service_completed_successfully` dependency on it
+        // would wait forever. Docker rejects the combination at validation; kern must too, naming both.
+        let dep = |policy: &str| {
+            format!(
+                "services:\n  migrate:\n    image: x\n    restart: {policy}\n  \
+                 api:\n    image: y\n    depends_on:\n      migrate:\n        \
+                 condition: service_completed_successfully\n"
+            )
+        };
+        for policy in ["always", "unless-stopped"] {
+            // `parse` may run `validate_runnable` itself or leave it to the caller; the contradiction
+            // must be refused on either path.
+            let refused = match parse(&dep(policy)) {
+                Err(e) => e,
+                Ok(boxes) => validate_runnable(&boxes).expect_err(&format!(
+                    "must refuse depends_completed on a '{policy}' service"
+                )),
+            };
+            assert!(
+                refused.contains("migrate") && refused.contains("api"),
+                "the error names both services: {refused}"
+            );
+        }
+        // `on-failure` DOES complete (it stops on a zero exit), so the dependency is satisfiable.
+        let ok = parse(&dep("on-failure")).expect("on-failure parses");
+        assert!(
+            validate_runnable(&ok).is_ok(),
+            "on-failure completes on success, so a completion dependency on it is fine"
+        );
     }
 
     #[test]

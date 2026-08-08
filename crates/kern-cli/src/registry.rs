@@ -83,6 +83,12 @@ pub struct Instance {
     /// `seccompmode` line parses as [`SeccompFilter::Denylist`](kern_isolation::SeccompFilter): the
     /// allowlist did not exist for such a box, so this is provable, not a guess.
     pub seccomp_mode: kern_isolation::SeccompFilter,
+    /// `--apparmor <profile>` the box entered on exec (empty = none). Part of the exec POSTURE, like
+    /// `seccomp_mode`/`cap_*`: `kern exec` re-enters the RECORDED profile rather than deducing it from
+    /// `/proc/<pid1>/attr/apparmor/current`, which reads UNCONFINED for an `--init` box (PID 1 is the
+    /// reaper, which never execs into the profile) and would run the exec OUTSIDE the box's confinement.
+    /// Absent line (older record) → empty → exec adds no transition, matching a box that ran unconfined.
+    pub apparmor: String,
     /// Whether this record carries a capability profile at all (the `capdropall` line was present).
     /// `false` for a box created before the cap fields existed: `exec` cannot know whether that box
     /// dropped ALL caps or none, so it REFUSES rather than guess a baseline that could be more
@@ -856,7 +862,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\ncgroup={}\ncgroupid={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\n",
         inst.name,
         inst.pid,
         inst.pid1,
@@ -880,6 +886,7 @@ fn encode(inst: &Instance) -> String {
         one_line(&inst.cap_drops),
         one_line(&inst.cap_adds),
         inst.seccomp_mode.as_str(),
+        one_line(&inst.apparmor),
         one_line(&inst.cgroup),
         // `<dev>:<ino>` of the recorded cgroup dir, or empty. Digits + one ':' - no `one_line` needed.
         inst.cgroup_id
@@ -1828,6 +1835,7 @@ fn parse(body: &str) -> Option<Instance> {
     let mut workdir = String::new();
     let mut cap_drop_all = false;
     let (mut cap_drops, mut cap_adds) = (String::new(), String::new());
+    let mut apparmor = String::new();
     let mut cgroup = String::new();
     let mut cgroup_id: Option<(u64, u64)> = None;
     // Posture-record state, DERIVED from what the file actually contains (never a stored field):
@@ -1907,6 +1915,10 @@ fn parse(body: &str) -> Option<Instance> {
                 Some(m) => seccomp_mode = m,
                 None => posture_corrupt = true,
             },
+            // The AppArmor profile the box entered, or empty for none. Recorded so `kern exec` re-enters
+            // the SAME profile. NOT part of the corrupt/refuse gate: an empty/absent value is a valid
+            // "no profile" (the box ran unconfined), not a truncated posture.
+            "apparmor" => apparmor = v.to_string(),
             // The box's dedicated cgroup path, recorded once PID 1 was known. Absent in an older entry
             // and empty for a box with no dedicated cgroup - both leave `cgroup` empty, which
             // `cgroup_populated` reads as "no orphan signal" (fall back to supervisor liveness).
@@ -1951,6 +1963,7 @@ fn parse(body: &str) -> Option<Instance> {
         cap_drops,
         cap_adds,
         seccomp_mode,
+        apparmor,
         cap_recorded,
         posture_corrupt,
         cgroup,
@@ -2007,7 +2020,14 @@ impl Instance {
     /// `cap_recorded`/`posture_corrupt` flags are private detail of this check, not the caller's to test.
     pub(crate) fn exec_posture(
         &self,
-    ) -> Result<(kern_isolation::CapSpec, kern_isolation::SeccompFilter), crate::error::Error> {
+    ) -> Result<
+        (
+            kern_isolation::CapSpec,
+            kern_isolation::SeccompFilter,
+            Option<String>,
+        ),
+        crate::error::Error,
+    > {
         if !self.cap_recorded {
             return Err(crate::error::Error::Sandbox(format!(
                 "box '{}' was created before its security profile was recorded; its exec profile \
@@ -2024,6 +2044,10 @@ impl Instance {
         Ok((
             cap_spec_from_fields(self.cap_drop_all, &self.cap_drops, &self.cap_adds),
             self.seccomp_mode,
+            // Empty (no profile / older record) → None → `kern exec` adds no AppArmor transition, which
+            // matches a box that ran unconfined. A recorded profile is re-entered so the exec is no less
+            // confined than the box's workload - the reason this is a RECORD field, not read from /proc.
+            (!self.apparmor.is_empty()).then(|| self.apparmor.clone()),
         ))
     }
 }
@@ -2066,6 +2090,38 @@ mod tests {
         }
         // `trusted_state_dirs` is DERIVED from `AUTHORITATIVE_DIRS` - one per entry, no parallel list.
         assert_eq!(trusted_state_dirs().len(), AUTHORITATIVE_DIRS.len());
+    }
+
+    #[test]
+    fn apparmor_survives_the_record_round_trip_and_reaches_exec_posture() {
+        // The `--apparmor` profile is part of the exec POSTURE: it must survive encode->parse and come
+        // back out of `exec_posture`, so `kern exec` re-enters the SAME profile the box entered. This is
+        // why it is a RECORD field and not read from `/proc/<pid1>` - the reaper of an `--init` box reads
+        // `unconfined` there, and the exec would run OUTSIDE the box's confinement.
+        let inst =
+            parse("name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\nseccompmode=denylist\napparmor=kern-box\n")
+                .expect("parse a record carrying an apparmor line");
+        assert_eq!(inst.apparmor, "kern-box");
+        let (_caps, _sec, aa) = inst.exec_posture().expect("posture reproduces");
+        assert_eq!(
+            aa.as_deref(),
+            Some("kern-box"),
+            "exec must re-enter the recorded profile"
+        );
+        assert_eq!(
+            parse(&encode(&inst)).unwrap().apparmor,
+            "kern-box",
+            "the profile survives an encode->parse round trip"
+        );
+        // An older record with NO apparmor line → empty → exec adds no transition (matches an unconfined
+        // box), NOT a corruption that would refuse the exec.
+        let old = parse(
+            "name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\nseccompmode=denylist\n",
+        )
+        .expect("parse a pre-apparmor record");
+        assert_eq!(old.apparmor, "");
+        let (_c, _s, aa2) = old.exec_posture().expect("posture");
+        assert_eq!(aa2, None, "no recorded profile → no exec transition");
     }
 
     #[test]
@@ -2207,6 +2263,7 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
@@ -2258,6 +2315,7 @@ mod tests {
             cap_drops: "12,13".into(),
             cap_adds: "10".into(),
             seccomp_mode: kern_isolation::SeccompFilter::Allowlist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
@@ -2298,6 +2356,7 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             ..inst.clone()
@@ -2611,6 +2670,7 @@ mod tests {
                 cap_drops: String::new(),
                 cap_adds: String::new(),
                 seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+                apparmor: String::new(),
                 cap_recorded: true,
                 posture_corrupt: false,
                 cgroup: String::new(),
@@ -2682,6 +2742,7 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
@@ -2756,6 +2817,7 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),

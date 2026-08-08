@@ -1779,6 +1779,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // instead of guessing: `seccomp_mode` is what PID 1 installs, `cap_recorded` marks this as
             // a box whose capability profile IS known, and the record is well-formed by construction.
             seccomp_mode: spec.seccomp_mode,
+            apparmor: spec.apparmor.clone().unwrap_or_default(),
             cap_recorded: true,
             posture_corrupt: false,
             // Resolved and recorded in the `on_started` callback below, once PID 1 exists and its
@@ -3257,24 +3258,6 @@ fn resolve_image_user(spec: &str, lower: &str) -> Option<(u32, u32)> {
 mod image_user_resolution_tests {
     use super::*;
 
-    #[test]
-    fn apparmor_current_is_parsed_confined_only() {
-        // A box that entered an enforce/complain profile → its name, so `kern exec` re-enters it.
-        assert_eq!(
-            parse_apparmor_current("docker-default (enforce)\n").as_deref(),
-            Some("docker-default")
-        );
-        assert_eq!(
-            parse_apparmor_current("kern-box (complain)").as_deref(),
-            Some("kern-box")
-        );
-        // Unconfined (bare, or kern's own profile in unconfined mode, or no AppArmor) → no transition.
-        assert_eq!(parse_apparmor_current("unconfined"), None);
-        assert_eq!(parse_apparmor_current("vscode (unconfined)"), None);
-        assert_eq!(parse_apparmor_current(""), None);
-        assert_eq!(parse_apparmor_current("   "), None);
-    }
-
     /// A box's `config.User` given by NAME (e.g. memcached's `USER memcache`) must resolve to the image's
     /// own uid/gid the way Docker does - reading the rootfs's `/etc/passwd`/`/etc/group` - not silently
     /// run as box root. This is the fix for the class that killed memcached, unprivileged nginx, etc.
@@ -3369,31 +3352,6 @@ mod image_user_resolution_tests {
     }
 }
 
-/// The active AppArmor profile of a box's PID 1 (`/proc/<pid1>/attr/apparmor/current`), so `kern exec`
-/// can re-enter it - matching the box's own confinement, like caps + seccomp. Returns the profile NAME
-/// only when the box is actually confined (mode `enforce`/`complain`); `unconfined` or no AppArmor
-/// yields `None`, so exec adds no transition. Best-effort: an unreadable attr file just means `None`.
-fn box_apparmor_profile(pid1: i32) -> Option<String> {
-    let raw = std::fs::read_to_string(format!("/proc/{pid1}/attr/apparmor/current"))
-        .or_else(|_| std::fs::read_to_string(format!("/proc/{pid1}/attr/current")))
-        .ok()?;
-    parse_apparmor_current(&raw)
-}
-
-/// Parse an AppArmor `.../attr/current` value (`"<name> (<mode>)"`, or a bare `"unconfined"`). Returns
-/// the profile NAME only when it is actually confined (mode `enforce`/`complain`); anything else is
-/// `None`. Pure, so the confined / unconfined / no-AppArmor cases are unit-tested without a live task.
-fn parse_apparmor_current(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw == "unconfined" {
-        return None;
-    }
-    match raw.rsplit_once(' ') {
-        Some((name, "(enforce)" | "(complain)")) if !name.is_empty() => Some(name.to_string()),
-        _ => None,
-    }
-}
-
 /// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]` - run a command inside an
 /// already-running box, joining its namespaces. Defaults to `/bin/sh`. Propagates the exit code.
 pub fn exec(
@@ -3447,15 +3405,15 @@ pub fn exec(
     // REFUSE rather than GUESS the box's capability posture: the gate lives inside `exec_posture`, which
     // returns the box's OWN (cap spec, seccomp filter) or refuses a record that predates the posture
     // fields / is corrupt - a caller can't rebuild a usable posture without passing that gate.
-    let (box_caps, box_seccomp) = inst.exec_posture()?;
+    let (box_caps, box_seccomp, box_aa) = inst.exec_posture()?;
     // With no `-w`, start where the WORKLOAD starts, not at `/`. Docker's `exec` inherits the
     // container's WorkingDir and people lean on it: a compose service with `working_dir: /app` should
     // not need `-w /app` retyped on every exec. An explicit `-w` still wins, and a box with no workdir
     // (or an older registry entry, which carries no such field) keeps landing at `/`.
     let effective_workdir = workdir.or(Some(inst.workdir.as_str()).filter(|w| !w.is_empty()));
-    // `--apparmor` parity: re-enter the box's own AppArmor profile so an exec is no less confined than
-    // the box's PID 1 (`None` when the box runs unconfined). Same intent as reapplying caps + seccomp.
-    let box_aa = box_apparmor_profile(pid1);
+    // `--apparmor` parity: `box_aa` comes from the RECORDED exec posture (like caps + seccomp), NOT
+    // from `/proc/<pid1>`, so an `--init` box (whose PID 1 reaper stays unconfined) re-enters the box's
+    // ACTUAL profile instead of running the exec unconfined. `None` when the box ran with no profile.
     let result = exec_in_box(
         pid1,
         &cmd,
@@ -4474,7 +4432,13 @@ fn supervise_box(
                     name.as_str()
                 );
             }
-            unsafe { libc::sleep(1) }; // brief backoff so a crash loop can't spin
+            // Exponential backoff, capped at 30 s: a service that never comes up settles at one attempt
+            // every ~30 s instead of spinning at 1/s, bounding both the wasted work AND the restart-log
+            // line rate (the detached box log is a fixed-size ring, but a slower rate is still better -
+            // this is the same log-fill class already guarded elsewhere). Matches Docker's back-off
+            // shape. `attempt` is >= 1 here (incremented above): 1, 2, 4, 8, 16, then 30 s thereafter.
+            let backoff = (1u32 << attempt.saturating_sub(1).min(5)).min(30);
+            unsafe { libc::sleep(backoff) };
             continue;
         }
         break code;
@@ -4627,6 +4591,7 @@ fn run_detached(
         // Same recorded posture as the foreground path: `exec` reproduces the box's own filter and
         // reapplies its own caps, never a value re-derived from the exec caller's environment.
         seccomp_mode: spec.seccomp_mode,
+        apparmor: spec.apparmor.clone().unwrap_or_default(),
         cap_recorded: true,
         posture_corrupt: false,
         // Resolved once PID 1 is known (in the `on_started` callback below), so `list()` can tell an
@@ -15829,6 +15794,7 @@ mod net_resource_tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
@@ -17452,6 +17418,7 @@ mod label_filter_tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
@@ -17573,6 +17540,7 @@ mod drift_tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            apparmor: String::new(),
             cap_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
