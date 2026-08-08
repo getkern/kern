@@ -162,6 +162,55 @@ def test_both_bindings_validate_an_apparmor_name_identically():
     )
 
 
+def test_both_bindings_agree_on_every_apparmor_input_behaviourally():
+    """Beyond the literal regex comparison: run a SHARED vector of inputs through BOTH bindings'
+    construction-time validation and assert they AGREE on accept/reject for each. This catches a
+    divergence the literal test cannot - e.g. one binding adding a `.strip()`/`.lower()` before it
+    validates, while the two regexes stay byte-identical. Skips when `node` or the Node source is
+    unavailable (a published wheel / no runtime)."""
+    import json
+    import shutil
+    import subprocess
+
+    node_bin = shutil.which("node")
+    node_src = Path(__file__).resolve().parents[3] / "bindings" / "node" / "index.js"
+    if node_bin is None or not node_src.is_file():
+        pytest.skip("node runtime or Node source unavailable")
+
+    vectors = [
+        "kern-box", "unconfined", "docker-default", "lxc-container-default", "a.b_c-1", "A", "x" * 128,
+        "", " x", "x ", "x\n", "\tx", "-x", "--privileged", "a b", "a/b", "ns:profile", "a;b", "a|b",
+        "x" * 129, "café", ".", "..",
+    ]
+
+    def py_ok(v: str) -> bool:
+        # Via the Python Sandbox CONSTRUCTOR (validates in __post_init__), symmetric with Node below.
+        try:
+            _cfg(apparmor=v)
+            return True
+        except SandboxError:
+            return False
+
+    # Node: validate each input via the SAME path the SDK uses - the Sandbox constructor calls
+    # validateApparmor. KERN_BIN=/bin/true lets construction complete for an ACCEPTED value.
+    script = (
+        f"const {{Sandbox}} = require({json.dumps(str(node_src))});\n"
+        "process.env.KERN_BIN = '/bin/true';\n"
+        f"const V = {json.dumps(vectors)};\n"
+        "console.log(JSON.stringify(V.map(function (v) {"
+        " try { new Sandbox({ apparmor: v }); return true; } catch (e) { return false; } })));\n"
+    )
+    res = subprocess.run([node_bin, "-e", script], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, f"node validation harness failed: {res.stderr}"
+    node_ok = json.loads(res.stdout.strip())
+    assert len(node_ok) == len(vectors)
+    for v, n in zip(vectors, node_ok):
+        assert py_ok(v) == n, (
+            f"the bindings DISAGREE on {v!r}: python accepts={py_ok(v)}, node accepts={n} "
+            "(a normalization difference the literal regex comparison cannot catch)"
+        )
+
+
 def test_profiles_validated_and_placed_in_argv():
     # valid vcpu:/vgpio:/vdisk: profiles appear as positional tokens before the `--`
     s = _cfg(profiles=["vcpu:heavy", "vgpio:leds", "vdisk:scratch"])

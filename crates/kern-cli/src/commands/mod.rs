@@ -1781,6 +1781,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             seccomp_mode: spec.seccomp_mode,
             apparmor: spec.apparmor.clone().unwrap_or_default(),
             cap_recorded: true,
+            aa_recorded: true,
             posture_corrupt: false,
             // Resolved and recorded in the `on_started` callback below, once PID 1 exists and its
             // dedicated cgroup can be read. Empty here (and for a box with no dedicated cgroup).
@@ -4412,7 +4413,11 @@ fn supervise_box(
         } else {
             1 // fork or waitpid failed - treat as a failure, don't spin
         };
-        attempt += 1;
+        // Saturating, not `+=`: `always` restarts forever, so `attempt` is unbounded; a `+= 1` would
+        // panic on overflow in a debug build (the one exception to this codebase's panic-free rule) and
+        // wrap in release. At one restart / 30 s the cap is ~4000 years, but the guarantee should not
+        // depend on the build profile. Cost is identical.
+        attempt = attempt.saturating_add(1);
         // `always`/`unless-stopped`: restart on ANY exit (including 0), uncapped - Docker's contract,
         // kept up for the stack's lifetime. `on-failure`: only a non-zero exit, capped at max_restarts.
         let restart_now = if restart.always {
@@ -4593,6 +4598,7 @@ fn run_detached(
         seccomp_mode: spec.seccomp_mode,
         apparmor: spec.apparmor.clone().unwrap_or_default(),
         cap_recorded: true,
+        aa_recorded: true,
         posture_corrupt: false,
         // Resolved once PID 1 is known (in the `on_started` callback below), so `list()` can tell an
         // orphaned box (this supervisor SIGKILL'd, PID 1 + forwarder still live) from an exited one.
@@ -15796,6 +15802,7 @@ mod net_resource_tests {
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
             apparmor: String::new(),
             cap_recorded: true,
+            aa_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,
@@ -17420,6 +17427,7 @@ mod label_filter_tests {
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
             apparmor: String::new(),
             cap_recorded: true,
+            aa_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,
@@ -17542,6 +17550,7 @@ mod drift_tests {
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
             apparmor: String::new(),
             cap_recorded: true,
+            aa_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,

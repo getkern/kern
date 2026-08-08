@@ -205,7 +205,11 @@ box's full limit, so N execs could use N times the box's memory.
   apparmor=`. The profile must be loaded on the host (root, once, `apparmor_parser -r`); a missing or
   unloadable profile **fails the box closed** rather than running it unconfined. `kern exec` re-enters
   the box's own profile, so an exec is no less confined than the workload (parity with the caps + seccomp
-  it already reapplies). kern applies **no** default profile: without the flag the box keeps kern's own
+  it already reapplies) - and a box whose posture predates this recording is refused rather than exec'd
+  unconfined. The periodic `--health-cmd` probe is a deliberate exception: it is kern's OWN command, not
+  the workload, and runs OUTSIDE the profile (it reproduces the box's seccomp mode but not its AppArmor
+  profile) so a restrictive profile cannot make a box permanently unhealthy by denying its own check.
+  kern applies **no** default profile: without the flag the box keeps kern's own
   (usually unconfined) and its boundary is namespaces + seccomp + cgroups, as documented above.
 - **`--user UID[:GID]` (or a name)** drops the workload after all privileged setup and the capability
   drop. A name (`--user memcache`, compose `user:`, or the image's own `USER`) is resolved against the
