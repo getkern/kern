@@ -42,8 +42,7 @@ A `kern box` is one short-lived process tree: no daemon, no shared state.
 
 `kern box <name> --plan` prints the exact sequence for your invocation, without running it: that
 output is generated from the code, so it cannot drift the way a description here would.
-See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the design and **[SECURITY.md](SECURITY.md)** for
-where each boundary is real, cooperative, or opt-in.
+See **[SECURITY.md](SECURITY.md)** for where each boundary is real, cooperative, or opt-in.
 
 ## Workspace
 
@@ -55,7 +54,7 @@ crates/
   kern-isolation/  namespace / cgroup / mount primitives + the characterization seam
 ```
 
-A GPU layer is **deferred to 0.9** and is additive: nothing in the core changes to accommodate
+A GPU layer is **deferred to a later phase** and is additive: nothing in the core changes to accommodate
 it: no GPU is touched today, because there is no GPU code here. This document will describe it when there is
 something to describe.
 
@@ -69,16 +68,16 @@ something to describe.
   call list so a test asserts it byte-identical before/after a refactor, the *refactor-safety*
   net for the setup sequence. This does **not** replace the real-syscall correctness tests that
   actually mount/pivot and assert escape-blocked.
-- **Mount-ordering as a typestate (0.2).** `Rootfs<Mounted>` → `create_old_root()` →
+- **Mount-ordering as a typestate.** `Rootfs<Mounted>` → `create_old_root()` →
   `Rootfs<OldRootReady>` → `into_readonly()` makes "remount read-only before `.old_root`
   exists" a *compile error*, not a runtime bug.
-- **GPU backends as a closed enum (roadmap 0.9).** `enum Backend { Cuda, Hip, Vulkan }` with
+- **GPU backends as a closed enum (roadmap).** `enum Backend { Cuda, Hip, Vulkan }` with
   exhaustive `match`, the compiler forces every vendor to be handled; `Box<dyn>` only if/when
   third-party backends are allowed.
-- **One driver proxy (roadmap 0.9).** `GovernedDriver<D: RealDriver>` checks the quota then
+- **One driver proxy (roadmap).** `GovernedDriver<D: RealDriver>` checks the quota then
   forwards via the public API, a single, inspectable interception boundary (the auditability
   story).
-- **Errors:** `Result`-based in libraries (the 0.x target is `thiserror` enums), mapped to an
+- **Errors:** `Result`-based in libraries (the target is `thiserror` enums), mapped to an
   exit code in exactly one place in the binary. Post-fork, pre-exec child code stays
   `exit()`-based by necessity (you cannot unwind a `Result` across `fork`).
 - **Zero-heap on hot paths, opt-in only.** Where it matters (per-syscall buffers), stack

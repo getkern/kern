@@ -41,7 +41,7 @@ Time per run, total divided by 200 sequential runs.
 | podman (rootless) | 289.0 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
 | **docker run --rm** | 292.5 ms | client to daemon round-trip |
 
-**A cgroup cap costs 0.19 ms**, not a `systemd-run` round trip, because since 0.6.15 kern caps
+**A cgroup cap costs 0.19 ms**, not a `systemd-run` round trip, because kern caps
 directly in its own delegated slice. On the `--image` path `--memory 64m --cpus 1 --pids-limit 64`
 costs 0.52 ms. The cap bites: 200 MiB under `--memory 32m` exits 137.
 
@@ -242,7 +242,7 @@ request crosses it. Measured with **nginx**, once behind `-p` on an isolated net
 Publishing is close to free on this machine: within noise on request rate, 4% on bandwidth, 0.08 ms
 of p99.
 
-⚠️ **These are the numbers after a 0.6.30 fix, and before it they were not close to free.** Neither
+⚠️ **These are the numbers after the `TCP_NODELAY` fix below, and before it they were not close to free.** Neither
 side of the pump set `TCP_NODELAY`, so a response written as headers-then-body waited on the peer's
 40 ms delayed-ACK timer, and only on a REUSED connection: 59 req/s on one keep-alive connection with
 p99 pinned at 42.0 ms. Bandwidth was unaffected throughout, which is exactly why it went unnoticed. A
@@ -285,7 +285,7 @@ structural. Measured 2026-08-01, 200 runs x 3:
 | `kern run --memory 64m` with `KERN_NO_SCOPE=1` | **0.91** | `memory.max` reads `max`: no cap at all |
 | `/bin/true` with no kern | 0.29 | the floor: fork + exec |
 
-The ~4 ms is the `systemd-run --user --scope` round trip. `box` stopped paying it in 0.6.15 and `run`
+The ~4 ms is the `systemd-run --user --scope` round trip. `box` no longer pays it and `run`
 cannot: `box` leaves a supervisor alive for the box's lifetime, so it can create the cgroup directly
 and remove it from that supervisor's `Drop`, while `run` **`exec()`s in place**, so nothing of kern
 remains to do the removal and a directly created cgroup would be orphaned once per invocation,
@@ -325,7 +325,7 @@ that does handle the signal.
 |---|---:|
 | `pivot+mount_proc` | 523 us |
 | `seccomp` | 185 us |
-| `proc-mask` (the thirteen mounts that close the `core_pattern` escape) | 173 us |
+| `proc-mask` (the fourteen mounts that close the `core_pattern` escape) | 173 us |
 | `parent:image+command` | 153 us |
 | `rootfs(overlay)` | 112 us |
 | `parent:setup->spawn` | 101 us |
@@ -361,8 +361,8 @@ each other.
 
 PSS rather than RSS is the honest measure here: kern runs two processes per box and both are the same
 static binary, so summing their RSS counts the shared pages twice. The two per-architecture sizes are
-the PUBLISHED artifacts, unpacked from the release tarballs, not a local build, which is smaller and
-would understate what anyone downloads.
+from the stripped `--release` build (`cargo build --release --target …-musl`), which reproduces
+byte-for-byte, not a debug build, which is larger and would overstate the footprint.
 
 ```sh
 ls -l $(command -v kern)                      # the binary

@@ -8,6 +8,6 @@ labels: bug
 
 **Repro steps**
 
-**Environment**: kern version (`kern --version`), arch (x86_64 / aarch64), kernel, distro.
+**Environment**: kern build (`kern --version`), arch (x86_64 / aarch64), kernel, distro.
 
 > Security vulnerability? Do NOT file here, see SECURITY.md for private disclosure.

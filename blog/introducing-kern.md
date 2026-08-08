@@ -106,11 +106,11 @@ that's cooperative or opt-in, and says exactly when to use kern versus a microVM
 ## Try it
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-It downloads the static release binary for your arch and verifies the sha256, no Rust toolchain, no
-Docker, no daemon. Then:
+It builds the one static binary for your arch from source (kern's only Rust dependency is `libc`; the
+image path shells out to the system `curl`/`tar`), no Docker, no daemon. Then:
 
 ```sh
 kern box dev --image alpine -it -- sh          # a throwaway shell in a real image

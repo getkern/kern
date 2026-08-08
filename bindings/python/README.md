@@ -55,8 +55,8 @@ no KVM. The sandbox for an agent's dev loop, a CI step, or an air-gapped host.
 
 ## Performance
 
-Measured on one x86_64 desktop (Intel i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), kern
-0.6.32, `python:3.12-slim`, on 2026-08-02. p50 over 25 calls after a discarded warmup, every row from
+Measured on one x86_64 desktop (Intel i7-14700KF, Linux 7.0.0, rootless, cgroup delegated),
+`python:3.12-slim`, on 2026-08-02. p50 over 25 calls after a discarded warmup, every row from
 the same session. Not aspirational. Your hardware will differ, measure and claim your own number.
 
 **Single call, sequential** (p50):
@@ -72,7 +72,7 @@ same machine in the same session, so the 4.03 ms bare-box row is that plus **0.2
 one subprocess, two reader threads, and the flags the binding adds that the native run does not
 (`--ro`, the caps, the workspace mount).
 
-That figure was **+3.9 ms until 0.1.13**, and almost all of it was one line of CPython. The binding
+That figure was **+3.9 ms in an earlier binding**, and almost all of it was one line of CPython. The binding
 enforced its own deadline with `Popen.wait(timeout=...)`, which does not block on the child: it polls
 on an exponential backoff whose wake-ups land at 0.5, 1.5, 3.5, 7.5, 15.5 and 31.5 ms. A bare box
 finishing at 4.0 ms was therefore not noticed until 7.5, and a `run_code` finishing at 13.6 not until
@@ -82,8 +82,8 @@ readable the moment the box exits, so there is nothing left to round up to.
 
 **`enforce_limits=False` is no longer a speed knob, and the two columns above are the evidence.**
 It sets `KERN_NO_SCOPE=1`, which skips the per-box cgroup scope. That used to be a `systemd-run`
-round trip and cost several milliseconds, which is where "about twice as fast" came from. Since
-kern 0.6.15 the caps are applied directly in kern's own delegated slice, and the difference measured
+round trip and cost several milliseconds, which is where "about twice as fast" came from. kern now
+applies the caps directly in its own delegated slice, and the difference measured
 here is **0.19 ms, a ratio of 1.05×**, against giving up hard memory and PID enforcement. On a host
 where cgroups cannot be delegated at all the old cost does return, so the option stays; on a normal
 delegated host, turning it off buys nothing and costs the caps. **Leave it on.**
@@ -104,11 +104,11 @@ boxes, measured in the same session as the table above:
 The gap is **1.03× on wall clock**, with the default marginally ahead, which is to say the two are
 the same to within the noise of the measurement. The same conclusion holds under load as it does
 sequentially: turning enforcement off is not a density win any more. It was one when caps meant a
-`systemd-run` scope per call; they have not since 0.6.15. **Leave the default on.** Note that a
+`systemd-run` scope per call; they no longer do. **Leave the default on.** Note that a
 per-call p50 of 211 ms here is queueing, not latency: 100 boxes are competing for the machine, and
 the wall clock, 0.30 s for all 100, is the figure that describes it.
 
-Concurrent calls on one `Sandbox` are safe as of 0.1.12 and were not before it: every call wrote the
+Concurrent calls on one `Sandbox` are now safe and were not in an earlier binding: every call wrote the
 same host-side `--env-file` path, so two in flight at once fought over it. In Python the loser got a
 `FileExistsError` out of `run_code` (11 of 40 calls, measured); in Node one call deleted the file
 while kern was still starting for another, and that box died with

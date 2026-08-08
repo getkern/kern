@@ -7,7 +7,7 @@ matrix: what is supported, what is not, and where the differences bite.
 | From your Docker setup | kern |
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd** |
-| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
+| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|systemd]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
 | **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), **COPY globs** (`*.txt`, `src/*`, `[ab].conf`), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first, including steps before the edit |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context: keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: export/import an image tar, `docker load`-compatible |
@@ -116,7 +116,7 @@ Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same
 |---|---|---|
 | `run` / `create` | `box` | one verb; `-d` detaches, `-it` for a PTY |
 | `exec` | `exec` | joins the box's namespaces |
-| `ps` | `ps` | `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
+| `ps` | `ps` | `-a`/`--all` (also lists recently-exited boxes), `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
 | `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs) |
 | `stop` / `kill` | `stop` / `kill` | SIGKILL the box's process group |
 | `pause` / `unpause` | `pause` / `unpause` | cgroup v2 freezer |
@@ -127,7 +127,7 @@ Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same
 | `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI for every box |
 | `rename` | `rename` | in place, pid unchanged |
 | `update` | `update` | live cgroup caps, no restart (needs a delegated cgroup) |
-| `wait` | `wait` | prints the exit code (`137` after `stop`) |
+| `wait` | `wait` | prints the exit code (`137` after `stop`); also resolves a box that has already exited, via its `waitexit` breadcrumb |
 | `diff` | `diff` | overlay-upper changes: `C` changed/added, `D` deleted |
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |

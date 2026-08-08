@@ -78,7 +78,7 @@ privilege-escalation bug is an escape.
   reads the flags out of the register they arrive in and kills only the seven `CLONE_NEW*` bits.
   `clone3` puts the same flags in a struct behind a pointer, which BPF **cannot dereference**, so it
   is refused wholesale with `ENOSYS`, the answer Docker and podman give for the same reason. Closed
-  in 0.6.34, verified on six platforms. The filter inspects call ARGUMENTS in exactly two places - the
+  and verified on six platforms. The filter inspects call ARGUMENTS in exactly two places - the
   `clone` flags above and the `socket` domain (below) - and matches every other syscall by number
   alone. So `ioctl` is allowed as a whole, not per-command (moby's default does the same), and
   `personality` is left to the number-level allow: its risky flags weaken the box against ITSELF
@@ -200,9 +200,10 @@ box's full limit, so N execs could use N times the box's memory.
   needs the workload's real write paths) or set `--require-limits` (which would break a cgroup-less
   host). A CLI/SDK flag, not a compose key: a compose service reaches the same posture through its
   individual keys and `KERN_SECCOMP`.
-- **`--user UID[:GID]`** drops the workload after all privileged setup and the capability drop. Only
-  ids mapped into the box's user namespace work, so a non-root `--user` implies the uid/gid-range
-  mapping. It **fails closed**: if the id cannot be mapped the box refuses to start rather than
+- **`--user UID[:GID]` (or a name)** drops the workload after all privileged setup and the capability
+  drop. A name (`--user memcache`, compose `user:`, or the image's own `USER`) is resolved against the
+  image's `/etc/passwd`/`/etc/group`. Only ids mapped into the box's user namespace work, so a non-root
+  `--user` implies the uid/gid-range mapping. It **fails closed**: if the id cannot be mapped the box refuses to start rather than
   silently running as in-box root. Note it **sheds all capabilities**, including any `--cap-add`.
 - **`--tmpfs PATH[:size]`** mounts a fresh `NOSUID,NODEV` tmpfs. Mounting one over the sandbox's own
   hardened `/proc`, `/sys` or `/dev` is **refused**. The size is a real cap but counts against RAM.
@@ -410,6 +411,6 @@ or a network. Exit status is 0 only if every asserted property held; a host that
 question reports `SKIP` with the reason and never counts it as a pass. Measured results, and what is
 deliberately not wired into CI, are in [pentest/README.md](pentest/README.md).
 
-## Supported versions
+## What's supported
 
-Pre-1.0: only the latest 0.x is supported. Security fixes land on `main`.
+The code on `main` is what's supported; security fixes land there.

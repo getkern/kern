@@ -224,7 +224,7 @@ read_only  = true                 # --read-only
 bind_rootfs = false               # --bind-rootfs   (rootfs only; mutually excl. read_only)
 uid_range  = false                # --uid-range
 hostname   = "api"                # --hostname
-user       = "1000:1000"          # --user  (UID[:GID] inside the box)
+user       = "1000:1000"          # --user  (UID[:GID], or a name from the image's /etc/passwd)
 tmpfs      = ["/tmp:64m"]         # --tmpfs  (repeatable; PATH[:size])
 
 # resources

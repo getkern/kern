@@ -105,8 +105,9 @@ while its box keeps running would still show.
 
 ## 315 us of a bare box start are not attributed
 
-In the UNCAPPED configuration (`KERN_NO_SCOPE`, the one comparable to bubblewrap) a bare start grew
-about 500 us since 0.3.0, with bubblewrap steady as the control. Roughly 185 us of that is named:
+In the UNCAPPED configuration (`KERN_NO_SCOPE`, the one comparable to bubblewrap) a bare start has
+grown about 500 us over the project's history, with bubblewrap steady as the control. Roughly 185 us
+of that is named:
 `proc-mask` 66 us, `cgroup-view` 39, seccomp 60, `dev` 20, and together they close a container
 escape through `core_pattern`. **The remaining 315 us has no measured cause, and no story is
 offered for it.** Registry size, a benchmark rename and the benchmark's batch budget are each
@@ -115,13 +116,13 @@ with cgroup caps on, which is what users run, the same span went from 4.92 ms to
 
 ## Binary size is not being reduced
 
-Measured on the v0.6.50 build: **1950688 B x86_64 (1.86 MB)** and **1642984 B aarch64 (1.57 MB)**. The
-aarch64 figure is byte-identical to the checksum-verified 0.6.43 release artifact, so the build
-reproduces. The release profile is already at its limit.
+Measured on the current build: **1950688 B x86_64 (1.86 MB)** and **1642984 B aarch64 (1.57 MB)**. The
+aarch64 figure is byte-identical across rebuilds, so the build reproduces. The release-profile build
+is already at its limit.
 
-x86_64 grew 12288 B (12 KiB) from 0.6.43's 1938400, tracking the security hardening added since (the
+x86_64 grew 12288 B (12 KiB) from an earlier 1938400, tracking the security hardening added since (the
 registry-forgery guard, the CapBnd-verify bounding drop, the AF_VSOCK socket rule). aarch64 has held at
-1642984 across the last several releases, so the two arches move independently, as
+1642984 across the last several builds, so the two arches move independently, as
 they should: different target, different linker. The aarch64 figure had jumped one 64 KiB segment
 earlier from a change in the release build environment rather than the code, and a still-earlier
 version of this entry asserted the reverse of what was then measured, so no story is offered for the
@@ -130,4 +131,4 @@ segment beyond that it was environmental.
 Rebuilding the standard library on nightly reaches 1.40 MB, and adding `-Cpanic=immediate-abort`
 reaches 1.22 MB. Deliberately not applied: under that flag a panic prints no file and no line,
 `cargo test` cannot run under the profile so the shipped binary would stop being the tested one,
-and a contributor on stable could no longer build the published binary.
+and a contributor on stable could no longer reproduce the standard binary.

@@ -22,10 +22,10 @@ itself** without standing up an always-on engine.
 
 ## What's validated
 
-The **published** `aarch64` binary of 0.6.32 was run on all three boards on 2026-08-03, from the release asset with its sha256 checked, not from a local build. On each: a box
+A single cross-compiled static `aarch64` binary was run on all three boards on 2026-08-03: one artifact, its sha256 recorded, not rebuilt per board. On each: a box
 from a real OCI image starts, `mknod` inside it is refused (`Operation not permitted`), and the
 `--timeout` watchdog leaves nothing behind when its supervisor is SIGKILLed, which is the defect
-0.6.32 fixes and which reproduced 6 times out of 6 on x86 before it. Kernels covered: 6.6.51
+that build fixes and which reproduced 6 times out of 6 on x86 before it. Kernels covered: 6.6.51
 (Pi 5), 5.15.148-tegra (Jetson) and 6.16.7 (UNO Q), so both sides of the `pidfd_open` requirement
 that fix depends on.
 
@@ -42,11 +42,11 @@ It has been run by hand (static `aarch64-musl` binary) on:
   read-only, not a bind mount, this Android kernel denies the latter in a user namespace.)
   For the same reason, a **read-only *volume* bind** (`-v host:box:ro`) is **not** supported on such
   kernels, a `:ro` bind has no overlay to remount, so kern fails it with a clear message; use a
-  read-write `-v` or `--read-only` for the box root instead. (Verified on the UNO Q, kern 0.6.5.)
+  read-write `-v` or `--read-only` for the box root instead. (Verified on the UNO Q.)
 
 > Honest status: ARM is **manually validated**, not yet in CI (tracked in the issues). And kern
 > on the edge today is the **sandbox/OCI runtime**: fast, tiny, daemonless isolation. **GPU
-> slicing is on the roadmap (0.9), not in this release**; don't expect device-GPU virtualization
+> slicing is on the roadmap, not shipped yet**; don't expect device-GPU virtualization
 > here yet.
 >
 > **"Android kernel" ≠ "Android the OS".** kern runs on a board whose *kernel* is Android's as
@@ -72,11 +72,12 @@ It has been run by hand (static `aarch64-musl` binary) on:
 ## Install (ARM)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # picks linux-aarch64
-# or build natively on the board (e.g. Jetson L4T): cargo build --release
+cargo install --git https://github.com/getkern/kern getkern --locked   # builds for this board's arch
+# or, in a local clone (e.g. Jetson L4T): cargo build --release
 ```
 
-Prebuilt static binaries are published for `linux-aarch64` as well as `linux-x86_64`.
+kern builds to a static binary for `linux-aarch64` as well as `linux-x86_64`; no prebuilt binaries
+are published yet, so build from source on the board (or cross-compile and copy the one file over).
 
 ## Edge-shaped examples
 

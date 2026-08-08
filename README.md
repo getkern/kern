@@ -273,7 +273,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 | | |
 |---|---|
-| [docs/INSTALL.md](docs/INSTALL.md) | install on Linux, WSL2 and ARM boards, with checksums |
+| [docs/INSTALL.md](docs/INSTALL.md) | install on Linux, WSL2 and ARM boards, from source |
 | [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) | what of Docker works, what does not, and where it differs |
 | [docs/RESOURCES.md](docs/RESOURCES.md) · [docs/CONFIG.md](docs/CONFIG.md) · [docs/STORAGE.md](docs/STORAGE.md) · [docs/EGRESS.md](docs/EGRESS.md) | the two-verb model, the `kern.toml` schema, volumes and egress |
 | [SECURITY.md](SECURITY.md) · [OPEN_ITEMS.md](OPEN_ITEMS.md) | the threat model, and the known gaps |
@@ -286,11 +286,10 @@ network off by default, hard caps, and a timeout the binding enforces.
 ## Status
 
 **The core is done. Everything above works today and is tested:** 785 Rust, 72 Python and 57 Node
-tests, clippy-clean, `cargo-deny`-clean. No versioned releases: you build from source, and the CLI
+tests, clippy-clean, `cargo-deny`-clean. You build from source, and the CLI
 and config surface can still change, always called out in [CHANGELOG.md](CHANGELOG.md). It is being
 tested hard on real hardware (Linux, WSL2, Raspberry Pi, Jetson, Arduino UNO Q) and refined ahead of
-a first publication. Commits and tags are signed and timestamped to Bitcoin
-([provenance/](provenance/)).
+a first publication. Commits are signed.
 
 ## Contributing
 
@@ -299,9 +298,9 @@ gates; contributions are covered by the [CLA](CLA.md).
 
 ## Maintainer
 
-Alex, [@realexhub](https://github.com/realexhub). Commits and signed tags come from
+Alex, [@realexhub](https://github.com/realexhub). Commits come from
 [@getkerndev](https://github.com/getkerndev), the project's commit identity, so every commit has the
-same author and every tag the same key.
+same author and the same signing key.
 
 ## License
 

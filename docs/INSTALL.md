@@ -55,13 +55,13 @@ first, and it is not an executable, so the Python and Node SDKs run **from Windo
 get the exe back, allow the folder the installer names in your antivirus and re-run the installer.
 Throughout, `wsl -d kern -- kern ...` and the SDKs run inside the distro are unaffected.
 
-**From source**, if you would rather build it yourself or want a target we do not publish a binary for:
+**From source** (the only route today, since no binaries are published yet):
 
 ```sh
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-`--locked` builds against the committed `Cargo.lock`, so you get the dependency versions the release
+`--locked` builds against the committed `Cargo.lock`, so you get the dependency versions the tree
 was tested with. This is the one route that does need a Rust toolchain.
 
 **📦 Offline / air-gapped** (a board or locked-down server with no internet). kern is a single
@@ -136,9 +136,9 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 ## Platforms
 
 
-**Linux, multi-architecture.** Prebuilt static (musl) binaries for **`linux-x86_64`** and
+**Linux, multi-architecture.** kern builds to a static (musl) binary for **`linux-x86_64`** and
 **`linux-aarch64`**: one ~1.8 MB file, no Rust deps beyond `libc` (the pull path shells out to system
-`curl`/`tar`).
+`curl`/`tar`). No prebuilt binaries are published yet; every target builds from source.
 
 | Platform | Arch | Status |
 |---|---|---|

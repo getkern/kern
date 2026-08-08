@@ -33,10 +33,11 @@ import { runCode, withSandbox, Sandbox } from "kern-sandbox";
 npm install kern-sandbox
 ```
 
-You also need the `kern` binary on `PATH` (or point `$KERN_BIN` at it). One line on Linux:
+You also need the `kern` binary on `PATH` (or point `$KERN_BIN` at it). Build it on Linux (no
+prebuilt binaries are published yet):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
 kern needs a Linux kernel with unprivileged user namespaces + cgroup v2. On Windows it runs under WSL2.

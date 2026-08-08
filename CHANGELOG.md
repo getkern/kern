@@ -1,16 +1,17 @@
 # Changelog
 
-This project is pre-release and a work in progress: there are no versioned releases, and the CLI and
-config surface may change at any time. Build from source with
-`cargo install --git https://github.com/getkern/kern getkern --locked`. What follows is the current
-state of the tree; full detail is in the git history.
+This project is a work in progress: the CLI and config surface may change at any time. Build from
+source with `cargo install --git https://github.com/getkern/kern getkern --locked`. What follows is
+the current state of the tree; full detail is in the git history.
 
-## Unreleased
+## Current
 
 ### Security
 
-- Registry-posture forgery closed: `-v` refuses any source resolving onto the trust-bearing registry
-  dirs, by `(device, inode)` identity as well as path.
+- Registry-posture forgery closed: every host-path input (`-v`, `--secret`, `--env-file`, `--rootfs`,
+  build context and `-f`, `kern cp` in both directions, `save -o`) refuses any source that resolves
+  onto the trust-bearing runtime dirs, by `(device, inode)` identity as well as path. The default is
+  inverted: everything under the runtime dir is refused except the box-data `logs/` and `scratch/`.
 - `socket(AF_VSOCK, …)` refused with `EAFNOSUPPORT` in both seccomp modes.
 - The bounding-set drop is verified with `PR_CAPBSET_READ`, failing closed if any cap survives.
 - `CAP_SYS_PTRACE` dropped by default (14 caps), closing the `/proc/<pid>/mem` cross-process read.
@@ -41,6 +42,12 @@ state of the tree; full detail is in the git history.
   silently uncapped; `--pids-limit 1` is refused at parse; a second `vcpu:` profile warns.
 - `volume ls --json` no longer lists names not on disk or misdirects a delete (display vs exact
   syscall form, `usable` flag); `kern <verb> --help` filters to the verb on a real terminal.
+- `kern compose` anchors a service's relative `env_file`/`-v`/`rootfs` paths to the compose file's
+  own directory, not the caller's working directory, so a stack runs the same from anywhere.
+- A privileged port (`-p` below 1024) reports the real cause - a missing `CAP_NET_BIND_SERVICE`, or
+  the address already in use - instead of a generic bind failure.
+- A `--user`/image `USER` that cannot be mapped names the actual fix (install `newuidmap`/`newgidmap`
+  + a `/etc/subuid`/`/etc/subgid` allocation, or use `--uid-range`) instead of blaming `--user`.
 
 ### Added
 
@@ -74,3 +81,11 @@ state of the tree; full detail is in the git history.
   root goes read-only, a bound mount stays writable). Note `require_limits` is the fail-closed gate,
   distinct from the pre-existing `enforce_limits` (which only picks the scope vs best-effort cap path)
   and mutually exclusive with the `KERN_ALLOW_UNCAPPED` env the SDK forwards.
+- `kern ps -a`/`--all` lists recently-exited boxes (from their `waitexit` breadcrumbs), and
+  `kern wait` resolves a box that has already exited, not only a live one.
+- `--user` (and compose `user:`) accepts a NAME, resolved against the image's own
+  `/etc/passwd`/`/etc/group`; the image's declared `USER` is honoured the same way. It fails closed
+  on a host without `newuidmap` rather than silently running as in-box root.
+- A compose `shm_size:` is recognised and left intentionally cgroup-bounded: `/dev/shm` is charged to
+  the box memory cgroup (`mem_limit` / `--memory`), not pinned to a fixed size, so there is no 64 MB
+  `/dev/shm` footgun to size around.
