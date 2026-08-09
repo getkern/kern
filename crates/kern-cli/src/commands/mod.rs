@@ -997,6 +997,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // below cost one `getenv` when the variable is unset.
     let mut pt = kern_isolation::PhaseTimer::new();
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
+    // The caller's (an SDK's) "box started" fd: read and PROTECT it up front, BEFORE the box is forked.
+    // `started_signal_fd` sets FD_CLOEXEC so the box's execvp closes it - the workload must never
+    // inherit or write this fd, or a byte it wrote would spoof/suppress the signal. Fail-closed (a fd
+    // we cannot protect is dropped). Written once, at the terminal exit arm below.
+    let started_fd = started_signal_fd();
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
     // start chose the direct path) is meaningless here and would arm the fail-closed refusal on a
     // host that never chose it - scrub before any cap decision is read.
@@ -1948,14 +1953,24 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
         // one place a non-0/1 exit code is produced - a deliberate terminal action.
         Ok(code) => {
-            // Deterministic "the box STARTED" signal for a caller (an SDK) on a fd it passed and the
-            // WORKLOAD cannot write: kern reaches this arm only when its sandbox setup SUCCEEDED and the
-            // command ran, so a reader that gets the byte knows the exit code is the workload's own, not
-            // a box that never started - without parsing kern's stderr, which a workload can forge. The
-            // `Err` arm never writes, so its EOF is an unforgeable "did not start". Gated on `fd > 2`
-            // (never stdout/stderr) and only when the env is set, so a normal CLI run is untouched.
-            if let Some(fd) = started_signal_fd() {
-                let _ = unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+            // Deterministic "the box STARTED" signal for a caller (an SDK) on the fd read + FD_CLOEXEC'd
+            // up front: kern reaches this arm only when its sandbox setup SUCCEEDED and the command ran
+            // (including a command whose own execvp failed → 126/127, a real exit of a BUILT box), so a
+            // reader that gets the byte knows the exit code is the workload's own, not a box that never
+            // started - without parsing kern's stderr, which a workload can forge. The `Err` arm never
+            // writes, so its EOF is an unforgeable "did not start". EINTR-safe: a lost byte would read as
+            // EOF and mislabel a healthy box as startup_failed.
+            if let Some(fd) = started_fd {
+                let buf = [1u8];
+                loop {
+                    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), 1) };
+                    if n < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    break;
+                }
                 let _ = unsafe { libc::close(fd) };
             }
             std::process::exit(code)
@@ -1965,15 +1980,29 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
 }
 
 /// The `KERN_STARTED_FD` write end an SDK passes to receive the unforgeable "box started" byte, or
-/// `None`. Validated `> 2` so a planted value can never make kern scribble on stdout/stderr. Mirrors
-/// [`ready_fd_to_signal`]'s discipline; the value is read once, here, at the terminal exit arm.
+/// `None`. Validated `> 2` (never stdin/stdout/stderr), then marked **FD_CLOEXEC** so the box's execvp
+/// closes it and the workload can never inherit or write it - a byte it wrote would spoof or suppress
+/// the signal. Called ONCE, EARLY in `box_run` (before the box is forked), so the box PID 1 inherits
+/// the descriptor already CLOEXEC rather than relying on kern's general pre-exec fd shed. Fail-closed:
+/// a fd we cannot mark is dropped (`None`), since no signal beats a forgeable one. Mirrors
+/// [`ready_fd_to_signal`]'s `> 2` discipline.
 fn started_signal_fd() -> Option<i32> {
     let fd = std::env::var("KERN_STARTED_FD")
         .ok()?
         .trim()
         .parse::<i32>()
         .ok()?;
-    (fd > 2).then_some(fd)
+    if fd <= 2 {
+        return None;
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return None;
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return None;
+    }
+    Some(fd)
 }
 
 /// Print the `kern box` status panel (aligned isolation + resource posture, actionable warnings)
