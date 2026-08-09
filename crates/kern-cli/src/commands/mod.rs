@@ -4871,9 +4871,17 @@ fn install_persistent_box(
     if let Some(p) = pids_max {
         svc.push_str(&format!("TasksMax={p}\n"));
     }
+    // `StartLimitIntervalSec=0` DISABLES systemd's start-rate limiter. Without it the default
+    // (`StartLimitBurst=5` in `StartLimitIntervalSec=10s`) makes systemd give up and leave the unit in
+    // `failed` after 5 restarts in 10s - and with `RestartSec=1` a service that crashes immediately hits
+    // that in ~5s, so `--restart always` would silently STOP restarting. That contradicts the contract
+    // (`always`/`unless-stopped` = restart on ANY exit, indefinitely, Docker's semantics) and the exact
+    // "extremely reliable, up for days/weeks" case this path exists for. `on-failure`'s retry CAP is the
+    // in-process supervisor's job (this systemd unit is only ever written for a persistent policy), so
+    // disabling the limit here never removes a wanted bound - it makes "always" actually mean always.
     let unit = format!(
         "[Unit]\nDescription=kern box {name}\n{MANAGED_MARKER}={name}\n\
-         After=network-online.target\n\n\
+         After=network-online.target\nStartLimitIntervalSec=0\n\n\
          [Service]\n{svc}\n[Install]\nWantedBy=default.target\n",
         name = name.as_str(),
     );
@@ -18284,6 +18292,24 @@ mod managed_unit_ownership {
         let p = dir.join(name);
         std::fs::write(&p, body).expect("test fixture");
         p
+    }
+
+    #[test]
+    fn the_managed_systemd_unit_disables_systemds_start_rate_limit() {
+        // REGRESSION: a persistent box's generated unit sets `Restart=always` + `RestartSec=1`. It MUST
+        // also set `StartLimitIntervalSec=0`, or systemd's default (`StartLimitBurst=5` in 10s) leaves
+        // the unit `failed` after a fast crash-loop - which with `RestartSec=1` happens in ~5s - and
+        // `--restart always` then SILENTLY stops restarting, breaking the "restart on any exit,
+        // indefinitely" contract and the up-for-days reliability this path exists for. Asserted on the
+        // source because the unit is written to a FILE (a side effect), not returned, so there is no
+        // value to assert without a `systemd` on the runner. Needle built via `concat!` so this test's
+        // own text is not what it counts.
+        let src = include_str!("mod.rs");
+        let needle = concat!("StartLimitIntervalSec", "=0\\n\\n");
+        assert!(
+            src.contains(needle),
+            "the managed systemd unit must carry StartLimitIntervalSec=0 before the [Service] section"
+        );
     }
 
     #[test]
