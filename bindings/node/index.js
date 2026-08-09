@@ -465,6 +465,11 @@ class ExecutionResult {
   }
 }
 
+/** A sandbox event `{type, message}` for `result.fault`. NB: `startup_failed` is decided from an
+ * UNFORGEABLE kern signal (a byte on fd 3 / `KERN_STARTED_FD` a workload can neither write nor
+ * suppress). Against a kern too old to send it, the binding falls back to a stderr heuristic that can
+ * only OVER-report - a workload can make its own exit look like a start failure - never MISS a real
+ * one, so it fails in the safe direction. Pair this binding with the matching (or newer) kern release. */
 function sandboxFault(type, message) {
   return { type, message };
 }

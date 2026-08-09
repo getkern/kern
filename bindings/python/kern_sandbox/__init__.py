@@ -436,7 +436,13 @@ class SandboxFault:
     did nothing: any non-zero exit is the user's code. NOTE: ``startup_failed`` is the one type that is
     RAISED (:class:`SandboxError`) rather than returned - a box that never started ran no code, so the
     result would be hollow - so a fault actually seen on a result is only ``timeout``/``escape_blocked``/
-    ``killed``. The label is kept here because it is how the box-start failure is classified internally."""
+    ``killed``. The label is kept here because it is how the box-start failure is classified internally.
+
+    ``startup_failed`` is decided from an UNFORGEABLE kern signal (a byte on ``KERN_STARTED_FD`` that a
+    workload can neither write nor suppress). Against a kern too old to send it, the binding falls back
+    to a stderr heuristic that can only OVER-report - a workload can make its own exit look like a start
+    failure - never MISS a real one, so it fails in the safe direction. Pair this binding with the
+    matching (or newer) kern release for the unforgeable guarantee."""
 
     type: Literal["timeout", "escape_blocked", "killed", "startup_failed"]
     message: str
