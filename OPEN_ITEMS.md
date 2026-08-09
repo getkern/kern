@@ -7,11 +7,22 @@ settle it. Resolved items live in [CHANGELOG.md](CHANGELOG.md), not here.
 
 kern's **default** filter denies a named set of syscalls instead of allowing a named set. The
 stronger allowlist shape exists now behind `KERN_SECCOMP=allowlist` (moby's default allow set minus
-kern's 34, deny-by-default with `ENOSYS`), but stays **off by default**: a wrong allowlist breaks
-working images silently, so flipping the default is gated on validating against a corpus of real
-workloads first. `KERN_SECCOMP=allowlist-audit` is the measurement for that gate - it runs the box
-under the allowlist's deny surface as `SECCOMP_RET_LOG` (log-and-run instead of `ENOSYS`), so
-`scripts/seccomp-audit.py` records exactly which syscalls a workload uses outside the allow set.
+kern's 34, deny-by-default with `ENOSYS`) and is what `--security-profile untrusted` installs - the
+examples that run untrusted / AI-generated code use it.
+
+The default stays a denylist, and this is a CLOSED decision, not a pending validation. An allowlist
+audit (`KERN_SECCOMP=allowlist-audit`, which runs the deny surface as `SECCOMP_RET_LOG` -
+log-and-run - so `scripts/seccomp-audit.py` records exactly which syscalls fall outside the allow set)
+over 20 real workloads - Postgres, MariaDB, redis, nginx, Python/Node/JVM/Go at bring-up AND under
+load, native builds, package managers - found every one a subset of the allow set except `clone3`,
+which degrades safely to `clone` (verified for glibc, musl and Go). So the allowlist is COMPATIBLE.
+What blocks flipping the DEFAULT is not compatibility but the FAILURE MODE: a workload that does hit a
+denied syscall gets `ENOSYS` and silently falls back - exactly the silent degradation kern refuses
+everywhere else. The only mechanism that makes that observable at runtime is
+`SECCOMP_RET_USER_NOTIF`, a supervisor that logs then returns `ENOSYS`, which needs a resident process
+per box for the box's whole life: the one architectural property kern does not have (foreground boxes
+`exec` in place, no daemon). So the strong posture is opt-in per box (`--security-profile untrusted`),
+applied by the untrusted-code examples, not a global default whose failures nobody would see.
 
 The allowlist denies no syscall whose absence forces a fallback to a **less-safe** variant: every
 modern/hardened call moby allows - `openat2`, `faccessat2`, `statx`, `close_range`, `pidfd_open` and

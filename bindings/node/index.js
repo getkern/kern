@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.18";
+const VERSION = "0.1.19";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1027,20 +1027,37 @@ class Sandbox {
     const argv = [...this._baseArgv(name, { network, timeoutS, isSetup }), "--", ...command];
     const childEnv = { ...process.env };
     if (!this.enforceLimits) childEnv.KERN_NO_SCOPE = "1";
+    // Unforgeable "box started" channel: kern writes one byte to fd 3 iff its sandbox setup SUCCEEDED
+    // and the command ran. The workload never holds fd 3, so it can neither forge nor suppress it -
+    // unlike kern's stderr, which it can. A new kern makes this the authority for `startup_failed`; an
+    // OLD kern never writes it, `boxStarted` stays false, and the stderr heuristic stands (backward
+    // compatible).
+    childEnv.KERN_STARTED_FD = "3";
 
     const started = process.hrtime.bigint();
     return new Promise((resolve, reject) => {
       let child;
+      let boxStarted = false;
       try {
         // detached: own process group, so we can signal the box + kern as a unit (killpg).
+        // The 4th stdio slot is fd 3: the child (kern) writes the started byte, the parent reads it.
         child = spawn(argv[0], argv.slice(1), {
           env: childEnv,
           detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: ["ignore", "pipe", "pipe", "pipe"],
         });
       } catch (e) {
         this._removeEnvFile(name);
         return reject(new SandboxError(`could not spawn the box: ${e.message}`));
+      }
+
+      const startedCh = child.stdio[3];
+      if (startedCh) {
+        // One byte (0x01) = the box started; stream end with no byte = never started / old kern.
+        startedCh.on("data", (b) => {
+          if (b.length && b[0] === 1) boxStarted = true;
+        });
+        startedCh.on("error", () => {});
       }
 
       const out = cappedCollector(child.stdout, this.maxOutputBytes, cbOut);
@@ -1065,7 +1082,13 @@ class Sandbox {
         const stdout = out.buffer().toString("utf8");
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
-        const fault = this._classify(rc, signal, stderr, timedOut, timeoutS);
+        let fault = this._classify(rc, signal, stderr, timedOut, timeoutS);
+        if (boxStarted && fault && fault.type === "startup_failed") {
+          // kern signalled the box STARTED, so a `startup_failed` here is only the stderr heuristic
+          // matching a marker the WORKLOAD wrote (code-based faults are decided first). The box
+          // demonstrably ran: this is the workload's own non-zero exit - reclassify to a normal result.
+          fault = null;
+        }
         // A box that FAILED TO START ran no user code, so REJECT rather than resolve a hollow
         // ExecutionResult (empty stdout). Gated on `rc === 125` (kern's box-not-started code) AND the
         // startup_failed classification (which requires kern's own stderr marker): the confident pair

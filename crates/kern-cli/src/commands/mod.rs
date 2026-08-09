@@ -1947,9 +1947,33 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     match result {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
         // one place a non-0/1 exit code is produced - a deliberate terminal action.
-        Ok(code) => std::process::exit(code),
+        Ok(code) => {
+            // Deterministic "the box STARTED" signal for a caller (an SDK) on a fd it passed and the
+            // WORKLOAD cannot write: kern reaches this arm only when its sandbox setup SUCCEEDED and the
+            // command ran, so a reader that gets the byte knows the exit code is the workload's own, not
+            // a box that never started - without parsing kern's stderr, which a workload can forge. The
+            // `Err` arm never writes, so its EOF is an unforgeable "did not start". Gated on `fd > 2`
+            // (never stdout/stderr) and only when the env is set, so a normal CLI run is untouched.
+            if let Some(fd) = started_signal_fd() {
+                let _ = unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+                let _ = unsafe { libc::close(fd) };
+            }
+            std::process::exit(code)
+        }
         Err(e) => Err(Error::Setup(e.to_string())), // genuine sandbox-start failure → userns hint
     }
+}
+
+/// The `KERN_STARTED_FD` write end an SDK passes to receive the unforgeable "box started" byte, or
+/// `None`. Validated `> 2` so a planted value can never make kern scribble on stdout/stderr. Mirrors
+/// [`ready_fd_to_signal`]'s discipline; the value is read once, here, at the terminal exit arm.
+fn started_signal_fd() -> Option<i32> {
+    let fd = std::env::var("KERN_STARTED_FD")
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    (fd > 2).then_some(fd)
 }
 
 /// Print the `kern box` status panel (aligned isolation + resource posture, actionable warnings)

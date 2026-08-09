@@ -64,7 +64,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.18"
+__version__ = "0.1.19"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1045,12 +1045,20 @@ class Sandbox:
         if not self.enforce_limits:
             child_env["KERN_NO_SCOPE"] = "1"
         started = time.monotonic()
+        # An UNFORGEABLE "box started" channel: kern writes one byte to KERN_STARTED_FD's write end iff
+        # its sandbox setup SUCCEEDED and the command ran. The workload never holds this fd, so it can
+        # neither forge nor suppress the signal - unlike kern's stderr, which it can. A new kern makes
+        # this the authority for `startup_failed`; an OLD kern never writes it, so the read below sees EOF
+        # and the stderr heuristic stands (backward compatible).
+        started_r, started_w = os.pipe()
+        child_env["KERN_STARTED_FD"] = str(started_w)
+        box_started = False
         try:
             try:
                 # start_new_session so the box + kern share a process group we can signal as a unit.
                 proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
                     argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env,
-                    start_new_session=True,
+                    start_new_session=True, pass_fds=(started_w,),
                 )
             except FileNotFoundError as e:
                 raise SandboxError(f"could not execute kern: {e}") from e
@@ -1058,6 +1066,8 @@ class Sandbox:
                 # E2BIG (argv too long) and other spawn-time OS errors → a clean typed error, not a raw
                 # OSError leaking out of the binding. (run_code already routes large code via a file.)
                 raise SandboxError(f"could not spawn the box: {e}") from e
+            finally:
+                os.close(started_w)  # the parent never writes; closing lets the read side see EOF
             out = _CappedReader(proc.stdout, self.max_output_bytes, cb_out)
             err = _CappedReader(proc.stderr, self.max_output_bytes, cb_err)
             out.start()
@@ -1078,6 +1088,12 @@ class Sandbox:
             # has reaped the box by now in the timeout case). On the normal path _wait_for_exit above
             # has already reaped, and this returns immediately on the returncode check.
             _wait_for_exit(proc, 8.0)
+            # kern has exited, so its write end is closed: one byte = the box started (setup succeeded,
+            # command ran); EOF (empty) = it never started, or an old kern that does not signal.
+            try:
+                box_started = os.read(started_r, 1) == b"\x01"
+            except OSError:
+                box_started = False
         finally:
             # Every exit path, including the two SandboxErrors above: kern has read the file by the time
             # it exits, and leaving it behind would accrete one per call in a persistent workspace.
@@ -1085,11 +1101,20 @@ class Sandbox:
                 os.unlink(self._env_path(name))
             except OSError:
                 pass
+            try:
+                os.close(started_r)
+            except OSError:
+                pass
         wall_ms = int((time.monotonic() - started) * 1000)
         stdout = out.buf.decode("utf-8", "replace")
         stderr = err.buf.decode("utf-8", "replace")
         rc = proc.returncode if proc.returncode is not None else -1
         fault = self._classify(rc, stderr, we_timed_out, timeout_s)
+        if box_started and fault is not None and fault.type == "startup_failed":
+            # kern signalled the box STARTED, so a `startup_failed` here can only be the stderr heuristic
+            # matching a marker the WORKLOAD wrote (the code-based faults are decided before it). The box
+            # demonstrably ran: this is the workload's own non-zero exit - reclassify to a normal result.
+            fault = None
         # A box that FAILED TO START ran no user code, so raise rather than return a hollow
         # ExecutionResult (empty stdout). Gated on `rc == 125` (kern's Docker-convention box-not-started
         # code) AND the startup_failed classification (which requires kern's own stderr marker): this
