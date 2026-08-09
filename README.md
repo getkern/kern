@@ -152,6 +152,36 @@ line, and outbound image pulls want `pasta`; both are one `apt install` on a dev
 names either if it is missing. This is the local dev loop, not a production orchestrator: no Swarm, no
 overlay networks.
 
+## Embed it: Python & Node
+
+Run agent or LLM-generated code from your own program with
+**[`kern-sandbox`](bindings/python/README.md)**, a thin, dependency-free wrapper over the `kern`
+binary. Every call runs in a fresh isolated box: network off, memory and pid caps, capabilities
+dropped, output bounded, and a timeout the binding itself enforces.
+
+```sh
+pip install kern-sandbox        # PyPI
+npm  install kern-sandbox       # npm
+```
+
+```python
+from kern_sandbox import run_code
+
+r = run_code("import platform; print(platform.python_version())")
+print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
+```
+
+- **Fresh box per call** by default; a `Sandbox` persists a workspace across calls, and a warm
+  `kernel()` keeps one interpreter for sub-millisecond cells (weaker isolation, by choice).
+- **Faults are data, not exceptions**: a timeout, OOM-kill or blocked syscall is a field on the
+  result; only a box that failed to *start* raises.
+- **Rich results without a Jupyter kernel**: the last expression, `display()`, and matplotlib figures
+  are captured, like a notebook cell.
+- Ships an **MCP server** (`kern-mcp`) for Claude Desktop and Cursor.
+
+Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md) ·
+[bindings/node/README.md](bindings/node/README.md).
+
 ## Resource profiles
 
 A slice is declared once in `~/.config/kern/kern.toml` and attached by name, to a sandboxed box or a
@@ -279,9 +309,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [OPEN_ITEMS.md](OPEN_ITEMS.md) | the threat model (structured, then per-mechanism), and the known gaps |
 | [BENCHMARKS.md](BENCHMARKS.md) · [EDGE.md](EDGE.md) | measurements, and running on a Pi, Jetson or UNO Q |
 | [examples/](examples/) · [blog/](blog/) | ninety runnable scripts, and longer write-ups |
-
-Embed it from Python or Node with [`kern-sandbox`](bindings/python/README.md): a fresh box per call,
-network off by default, hard caps, and a timeout the binding enforces.
+| [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the `kern-sandbox` SDK: embed kern in Python or Node |
 
 ## Status
 
