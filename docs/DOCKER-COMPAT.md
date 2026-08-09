@@ -14,6 +14,7 @@ matrix: what is supported, what is not, and where the differences bite.
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
 | **Image management** (`docker images` / `rmi` / `search`) | ✅ `kern images` (list cached), `kern rmi` (remove, frees unshared layers), `kern search` (Docker Hub) |
 | **`docker commit`** (container → image) | ✅ `kern commit <box> <image>`: snapshots the box's filesystem to a reusable image (warm start); skips volumes/secrets |
+| **`docker run` security flags** (`--security-opt`, `--cap-drop`, `--read-only`, `--tmpfs`) | ✅ `kern box`: **`--apparmor <profile>`** (Docker's `--security-opt apparmor=`, opt-in, enters a pre-loaded LSM profile), `--cap-drop`/`--cap-add`, `--read-only`, `--tmpfs`, an opt-in **`--security-profile untrusted`** bundle (seccomp allowlist + `--cap-drop ALL` + `--read-only`), and `--landlock-rw`; seccomp is **always on**. What kern does **not** have: **SELinux** labelling, and a **default** AppArmor profile (Docker/Podman apply one automatically; kern applies none unless you pass `--apparmor`). Full posture: [SECURITY.md](../SECURITY.md) |
 | **Docker Engine API** / `docker.sock` | ❌: tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
 | **Swarm** (multi-host orchestration) | ❌ and there is no workaround: clustering, service replicas and rolling updates across machines are out of scope for a single-host, daemonless runtime. `kern compose` is one machine, one pod. |
 
@@ -109,6 +110,16 @@ supervisor already restarts a service that dies mid-run (`on-failure` on a non-z
 `always`/`unless-stopped` on any exit, for the stack's lifetime); what the generated unit does not do
 is re-run a stack that failed as a whole, and it says so in its own comments rather than letting you
 assume otherwise. Walk-through: [compose-systemd-unit.sh](../examples/compose-systemd-unit.sh).
+
+**A single long-running box installs its own unit, automatically** - the stack path above is manual
+because where a stack's unit belongs is a per-machine decision, but one service is not. `kern box
+<name> -d --restart always` (or `unless-stopped`, standalone, not a pod member) does more than set a
+policy: it writes and `systemctl --user enable --now`s a `~/.config/systemd/user/kern-<name>.service`
+(`Restart=always`, `RestartSec=1`) and turns on `enable-linger`, so the box is restarted on any exit
+by systemd itself and **survives a reboot and a logout** with no further step. This is real
+long-running supervision, delegated to systemd, for the single-box case; `kern stop <name>` removes
+the unit. (The one still-maturing piece is the in-process supervisor for `always` **pod members**,
+which lives and dies with the stack rather than with systemd.)
 
 ### Everyday `docker` commands
 
