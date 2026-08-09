@@ -11,6 +11,10 @@ acknowledgement and a coordinated-disclosure timeline.
 
 ## Threat model
 
+The structured view - assets, entry points, and the two trust levels (a kernel-enforced boundary
+versus a cooperative governor) as tables - is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md). This
+section is the summary; the rest of this file is the per-mechanism detail behind it.
+
 **In scope. Kernel-enforced isolation must hold:**
 
 - A malicious OCI image or `--rootfs` must not read or write host files outside the rootfs (path
