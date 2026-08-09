@@ -971,6 +971,26 @@ fn fleet_gate_and_budget() -> Result<(), Error> {
     Ok(())
 }
 
+/// The supervision decision for a detached box: `(use_systemd_unit, in_process_restart_always)`, from
+/// its flags and whether a `systemd --user` manager exists. A STANDALONE persistent box
+/// (`always`/`unless-stopped`, detached, no pod) is supervised by a systemd unit where a manager exists
+/// (survives reboot), and FALLS BACK to the in-process supervisor where none does (restart on any exit
+/// for this process's lifetime, no reboot-survival) - without which a systemd-less host (WSL2 without
+/// systemd, a minimal container) could not run `--restart always` at all. A pod member ALWAYS uses the
+/// in-process supervisor (it needs the holder's namespace, which a standalone unit could not re-join).
+/// Pure, so the systemd-absent fallback is testable without a live systemd.
+fn persistent_supervision(
+    detached: bool,
+    persistent: bool,
+    has_pod: bool,
+    systemd_present: bool,
+) -> (bool, bool) {
+    let standalone = detached && persistent && !has_pod;
+    let use_systemd = standalone && systemd_present;
+    let restart_always = persistent && (has_pod || (standalone && !use_systemd));
+    (use_systemd, restart_always)
+}
+
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The PARENT was not instrumented: `KERN_TIMING` covered only the child's setup, so the time
     // spent here was invisible and nobody could optimise it, because nobody could see it. The marks
@@ -1160,9 +1180,22 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         args.restart == RestartPolicy::OnFailure || health_action == HealthAction::Restart;
     // A POD MEMBER with `always`/`unless-stopped` is supervised IN-PROCESS for the stack's lifetime
     // (restart on ANY exit, including 0), NOT via a per-service systemd unit: a pod member needs the
-    // pod holder's shared namespace, so a standalone unit that outlives the holder could not re-join
-    // it. A STANDALONE `always`/`unless-stopped` box still takes the systemd path below (survives reboot).
-    let restart_always = args.restart.persistent() && args.pod.is_some();
+    // pod holder's shared namespace, so a standalone unit that outlives the holder could not re-join it.
+    // A STANDALONE persistent box normally takes the systemd path below (survives reboot) - but ONLY
+    // where a `systemd --user` manager actually exists. Where none does (WSL2 without systemd, a minimal
+    // container, no user manager) it FALLS BACK to the same in-process supervisor: restart on any exit
+    // for this process's lifetime, no reboot-survival. Without this fallback a systemd-less host could
+    // not run `--restart always` AT ALL - the unit install just errored and the box never started.
+    let standalone_persistent = args.detached && args.restart.persistent() && args.pod.is_none();
+    // Probe `systemd --user` ONLY for a standalone persistent box (avoid a socket connect on every box
+    // start). `persistent_supervision` decides systemd-unit vs in-process from that single bool.
+    let systemd_present = standalone_persistent && kern_isolation::user_systemd_present();
+    let (systemd_supervises, restart_always) = persistent_supervision(
+        args.detached,
+        args.restart.persistent(),
+        args.pod.is_some(),
+        systemd_present,
+    );
     // When systemd (re-)starts a persistent box, it runs THIS binary in the foreground with
     // `KERN_MANAGED=1`: skip the transient-scope re-exec (the box already lives in the unit's own
     // service cgroup) and register the foreground run so `kern ps`/`logs`/`stop` still see it.
@@ -1677,8 +1710,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // scratch (the managed run makes its own) and return. Not reached in the managed run itself
     // (the unit strips `-d`, so `args.detached` is false there).
     // A pod member is excluded (`args.pod.is_none()`): it takes the in-process `restart_always` path
-    // instead, because a systemd unit that outlives the pod holder could not re-join its namespace.
-    if args.detached && args.restart.persistent() && args.pod.is_none() {
+    // instead, because a systemd unit that outlives the pod holder could not re-join its namespace. And
+    // a systemd-LESS host (`!user_systemd_present()`) also falls through, to the in-process supervisor
+    // below - so `--restart always` works there too, just without reboot-survival.
+    if systemd_supervises {
         for h in &ext4_handles {
             h.teardown();
         }
@@ -1705,6 +1740,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `kern volume rm` sees an in-use volume and refuses - race-free without holding an fd open on the
     // volume dir (which would disturb the sandbox's mount setup).
     let mounted_vols = mounted_named_volumes(args.volumes);
+    if standalone_persistent && !systemd_supervises {
+        // Fell through the systemd branch above because no `systemd --user` manager is reachable. The
+        // box still runs and restarts on any exit (in-process, via `restart_always` above); it just does
+        // not survive a reboot. Say so once, and name the way to get reboot-survival.
+        eprintln!(
+            "kern: note: no `systemd --user` manager here, so --restart is supervised in-process \
+             (restarts on any exit while kern runs, but does NOT survive a reboot). For reboot-survival, \
+             enable a systemd --user manager, or generate a unit with `kern compose <file> systemd`."
+        );
+    }
     if args.detached {
         return run_detached(
             &name,
@@ -18309,6 +18354,42 @@ mod managed_unit_ownership {
         assert!(
             src.contains(needle),
             "the managed systemd unit must carry StartLimitIntervalSec=0 before the [Service] section"
+        );
+    }
+
+    #[test]
+    fn persistent_supervision_falls_back_to_in_process_without_systemd() {
+        use super::persistent_supervision;
+        // (detached, persistent, has_pod, systemd_present) -> (use_systemd_unit, in_process_restart_always)
+        // Standalone persistent + a systemd --user manager: systemd supervises (reboot-survival).
+        assert_eq!(
+            persistent_supervision(true, true, false, true),
+            (true, false)
+        );
+        // Standalone persistent + NO systemd: THE FIX - fall back to the in-process supervisor so the box
+        // still runs and restarts on any exit. Before this it errored on the unit install and never ran.
+        assert_eq!(
+            persistent_supervision(true, true, false, false),
+            (false, true)
+        );
+        // A pod member is ALWAYS in-process, regardless of systemd (it needs the holder's namespace).
+        assert_eq!(
+            persistent_supervision(true, true, true, true),
+            (false, true)
+        );
+        assert_eq!(
+            persistent_supervision(true, true, true, false),
+            (false, true)
+        );
+        // Not persistent (`on-failure`/`no`): neither always-path (on-failure is its own capped loop).
+        assert_eq!(
+            persistent_supervision(true, false, false, false),
+            (false, false)
+        );
+        // Foreground persistent (rejected upstream): no systemd unit, no in-process always here either.
+        assert_eq!(
+            persistent_supervision(false, true, false, true),
+            (false, false)
         );
     }
 
