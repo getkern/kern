@@ -64,7 +64,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.16"
+__version__ = "0.1.17"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1090,11 +1090,14 @@ class Sandbox:
         stderr = err.buf.decode("utf-8", "replace")
         rc = proc.returncode if proc.returncode is not None else -1
         fault = self._classify(rc, stderr, we_timed_out, timeout_s)
-        # A box that FAILED TO START (kern exits 125) ran no user code, so raise rather than return a
-        # hollow ExecutionResult (empty stdout, exit 125) that reads like "your code ran and exited 125".
-        # Mirrors the mount/config errors this SDK already raises up front; runtime events where the code
-        # DID run (timeout, OOM-kill, blocked escape) stay as DATA on `.fault`.
-        if fault is not None and fault.type == "startup_failed":
+        # A box that FAILED TO START ran no user code, so raise rather than return a hollow
+        # ExecutionResult (empty stdout). Gated on `rc == 125` (kern's Docker-convention box-not-started
+        # code) AND the startup_failed classification (which requires kern's own stderr marker): this
+        # confident pair is what tells a genuine box-not-started apart from a workload that itself exited
+        # 125 (that has no kern marker -> fault is None -> a normal result). An older kern that exits 127
+        # keeps the old behavior (returned as a data fault, not raised). Runtime events where the code DID
+        # run (timeout, OOM-kill, blocked escape) stay as DATA on `.fault`, unchanged.
+        if rc == 125 and fault is not None and fault.type == "startup_failed":
             raise SandboxError(fault.message or "the box failed to start")
         files = self._diff(before) if before is not None else []
         return ExecutionResult(
@@ -1159,17 +1162,15 @@ class Sandbox:
         if rc == -signal.SIGKILL:
             # Negative == killed by signal N (subprocess convention) - SIGKILL surfaced as -9.
             return SandboxFault("killed", "the box was killed (SIGKILL), likely out of memory")
-        # DETERMINISTIC box-not-started: kern exits 125 (Docker's convention) when it could not BUILD
-        # the box - a mount refused, an unmappable `--user`, a seccomp/AppArmor/cgroup setup error - so
-        # the workload never ran. Decided by exit code, so no stderr content can mask it, and it needs
-        # no heuristic. The caller RAISES on this (see `_spawn`): the code did not run.
-        if rc == 125:
-            return SandboxFault("startup_failed", stderr.strip()[:500] or "the box failed to start")
-        # LAST resort, heuristic (also catches an OLDER kern that still exits 127 for a setup failure): a
-        # non-zero exit that is none of the deterministic classes above, whose stderr carries kern's OWN
-        # setup-diagnostic markers (printed by the parent before the box runs). Heuristic because stderr
-        # is workload-influenceable - but it can only ever mislabel an ordinary non-zero user exit as
-        # startup_failed, never mask an escape/timeout/kill (those were decided above by exit code).
+        # Box-not-started: a non-zero exit whose stderr carries kern's OWN setup-diagnostic markers
+        # (printed by the PARENT before the box runs). kern's box-not-started paths BOTH exit 125 (see
+        # `box_start_exit_code`) AND print a `kern:` marker, so `rc == 125 && marker` is the reliable
+        # signal - and the marker is REQUIRED so a workload that merely exits 125 ITSELF (the code ran and
+        # chose 125) is NOT mislabeled as a startup failure. Heuristic because stderr is workload-
+        # influenceable, but it can only ever mislabel an ordinary non-zero user exit, never mask an
+        # escape/timeout/kill (those were decided above by exit code). `_spawn` RAISES only on the 125
+        # case (the caller then knows the code never ran); an older kern that exits 127 with a marker
+        # still classifies startup_failed but is returned as DATA, not raised.
         if rc != 0 and _looks_like_startup_failure(stderr):
             return SandboxFault("startup_failed", stderr.strip()[:500])
         # exit 139 (SIGSEGV) and any other non-zero exit are the USER's code failing - a normal Result.

@@ -359,18 +359,20 @@ def test_classify_order_escape_not_masked_by_stderr_marker():
     assert s._classify(1, "boom\n", False) is None  # non-zero, no marker: user code, no fault
 
 
-def test_exit_125_is_startup_failed_deterministically():
-    # kern exits 125 (Docker's convention) when it could not BUILD the box - a mount refused at runtime,
-    # an unmappable --user, a seccomp/AppArmor/cgroup setup error. Classified startup_failed by the EXIT
-    # CODE, with NO stderr marker needed (the old path relied on a stderr heuristic), and the caller
-    # RAISES on startup_failed (the workload never ran) rather than returning a hollow result.
+def test_exit_125_startup_failure_requires_the_kern_marker_not_a_bare_125():
+    # kern's box-not-started paths exit 125 (Docker's convention) AND print a `kern:` marker. The marker
+    # is REQUIRED: a workload that ITSELF exits 125 (the code ran and chose 125) has no kern marker and
+    # must stay a NORMAL result - else the SDK would raise "box failed to start" on the user's own exit
+    # code. This is the false-positive the raise-on-125 must not have.
     s = _cfg()
-    assert s._classify(125, "", False).type == "startup_failed"  # deterministic, no marker
-    assert s._classify(125, "no kern marker here\n", False).type == "startup_failed"
-    # The deterministic security classes are decided first, so a signal-derived code is unaffected.
-    assert s._classify(159, "", False).type == "escape_blocked"  # SIGSYS
-    # Any OTHER non-zero exit with no marker is the user's code, not a startup failure.
-    assert s._classify(3, "", False) is None
+    marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n"
+    assert s._classify(125, marker, False).type == "startup_failed"  # 125 + kern marker = box not started
+    assert s._classify(125, "", False) is None  # bare 125 = the WORKLOAD's own exit, a normal result
+    assert s._classify(125, "my app exited 125\n", False) is None  # no marker = the workload's own exit
+    assert s._classify(159, marker, False).type == "escape_blocked"  # SIGSYS decided first, marker ignored
+    # A non-125 exit with a marker still classifies startup_failed, but `_spawn` raises ONLY on rc==125,
+    # so a 127-class (older kern) or a forged-marker exit is returned as DATA, never raised.
+    assert s._classify(3, marker, False).type == "startup_failed"
 
 
 def test_pull_network_failure_is_startup_failed():

@@ -451,15 +451,18 @@ test("pull network failure classifies as startup_failed (curl marker)", () => {
   assert.strictEqual(s._classify(1, null, "boom\n", false), null); // plain user error stays null
 });
 
-test("exit 125 is startup_failed deterministically (box not started)", () => {
-  // kern exits 125 (Docker's convention) when it could not BUILD the box (a mount refused at runtime,
-  // an unmappable --user, a seccomp/AppArmor/cgroup setup error). Classified startup_failed by the EXIT
-  // CODE, no stderr marker needed; the caller REJECTS on it (the workload never ran).
+test("exit 125 startup failure requires the kern marker, not a bare 125", () => {
+  // kern's box-not-started exits 125 AND prints a `kern:` marker. The marker is REQUIRED: a workload
+  // that ITSELF exits 125 (the code ran and chose 125) has no marker and must stay a NORMAL result -
+  // else the SDK would reject "box failed to start" on the user's own exit code.
   const s = new Sandbox({ timeoutS: 30 });
-  assert.strictEqual(s._classify(125, null, "", false).type, "startup_failed"); // deterministic, no marker
-  assert.strictEqual(s._classify(125, null, "no kern marker\n", false).type, "startup_failed");
-  assert.strictEqual(s._classify(159, null, "", false).type, "escape_blocked"); // SIGSYS decided first
-  assert.strictEqual(s._classify(3, null, "", false), null); // other non-zero, no marker: user's code
+  const marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n";
+  assert.strictEqual(s._classify(125, null, marker, false).type, "startup_failed"); // 125 + kern marker
+  assert.strictEqual(s._classify(125, null, "", false), null); // bare 125 = the WORKLOAD's own exit
+  assert.strictEqual(s._classify(125, null, "app exited 125\n", false), null); // no marker = workload's
+  assert.strictEqual(s._classify(159, null, marker, false).type, "escape_blocked"); // SIGSYS decided first
+  // Non-125 with a marker still classifies startup_failed, but `finish` rejects ONLY on rc===125.
+  assert.strictEqual(s._classify(3, null, marker, false).type, "startup_failed");
 });
 
 test("sensitive mount source is refused", () => {

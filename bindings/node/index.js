@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.16";
+const VERSION = "0.1.17";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1060,11 +1060,13 @@ class Sandbox {
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
         const fault = this._classify(rc, signal, stderr, timedOut, timeoutS);
-        // A box that FAILED TO START (kern exits 125) ran no user code, so REJECT rather than resolve a
-        // hollow ExecutionResult (empty stdout, exit 125). Mirrors the mount/config errors this SDK
-        // already throws up front; runtime events where the code DID run (timeout, OOM, escape) stay as
-        // data on `.fault`.
-        if (fault && fault.type === "startup_failed") {
+        // A box that FAILED TO START ran no user code, so REJECT rather than resolve a hollow
+        // ExecutionResult (empty stdout). Gated on `rc === 125` (kern's box-not-started code) AND the
+        // startup_failed classification (which requires kern's own stderr marker): the confident pair
+        // that tells a genuine box-not-started apart from a workload that itself exited 125 (no marker ->
+        // fault null -> a normal result). An older kern (127) is returned as a data fault, not thrown.
+        // Runtime events where the code DID run (timeout, OOM, escape) stay as data on `.fault`.
+        if (rc === 125 && fault && fault.type === "startup_failed") {
           return reject(new SandboxError(fault.message || "the box failed to start"));
         }
         const files = before ? this._diff(before) : [];
@@ -1139,11 +1141,11 @@ class Sandbox {
       return sandboxFault("killed", "the box was killed (SIGKILL) - likely out of memory (exit 137)");
     if (rc === EXIT_SIGTERM || signal === "SIGTERM")
       return sandboxFault("timeout", "the box exceeded its time limit (reaped by kern's timeout backstop)");
-    // DETERMINISTIC box-not-started: kern exits 125 (Docker's convention) when it could not BUILD the
-    // box (a mount refused at runtime, an unmappable --user, a seccomp/AppArmor/cgroup setup error), so
-    // the workload never ran. Decided by exit code, no stderr marker needed; the caller REJECTS on it.
-    if (rc === 125) return sandboxFault("startup_failed", stderr.trim().slice(0, 500) || "the box failed to start");
-    // LAST resort heuristic (also catches an OLDER kern that still exits 127 for a setup failure).
+    // Box-not-started: a non-zero exit whose stderr carries kern's OWN setup markers (printed by the
+    // PARENT before the box runs). kern's box-not-started paths BOTH exit 125 AND print a `kern:` marker,
+    // so `rc === 125 && marker` is the reliable signal - the marker is REQUIRED so a workload that merely
+    // exits 125 ITSELF (the code ran and chose 125) is NOT mislabeled. `finish` REJECTS only on rc===125;
+    // a non-125 startup_failed (an older kern's 127, or a forged marker) is returned as DATA, not thrown.
     if (rc !== 0 && looksLikeStartupFailure(stderr))
       return sandboxFault("startup_failed", stderr.trim().slice(0, 500));
     // Any other non-zero exit (incl. 139 SIGSEGV) is the USER's code failing - a normal Result.
