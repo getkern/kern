@@ -1316,6 +1316,20 @@ fn process_layer(
     unpack
 }
 
+/// Compare the hex in `sha256sum`'s stdout (its first whitespace field) against `expected_hex`,
+/// case-insensitively; `noun` names the object in the mismatch error. Shared by [`verify_digest`] and
+/// [`verify_digest_bytes`] so the two paths cannot drift into one accepting a hash the other rejects.
+fn sha256_stdout_matches(stdout: &[u8], expected_hex: &str, noun: &str) -> Result<(), OciError> {
+    let got = String::from_utf8_lossy(stdout);
+    let got = got.split_whitespace().next().unwrap_or("");
+    if !got.eq_ignore_ascii_case(expected_hex) {
+        return Err(OciError::Registry(format!(
+            "{noun} digest mismatch (expected {expected_hex}, got {got}) - refusing"
+        )));
+    }
+    Ok(())
+}
+
 /// Verify `file` hashes to `digest` (`sha256:HEX`). Uses `sha256sum` (coreutils). An unknown
 /// algorithm is skipped (not failed); a mismatch is a hard error.
 fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
@@ -1333,14 +1347,7 @@ fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
     if !out.status.success() {
         return Err(OciError::Tool("sha256sum", "hashing failed".into()));
     }
-    let got = String::from_utf8_lossy(&out.stdout);
-    let got = got.split_whitespace().next().unwrap_or("");
-    if !got.eq_ignore_ascii_case(expected) {
-        return Err(OciError::Registry(format!(
-            "blob digest mismatch (expected {expected}, got {got}) - refusing"
-        )));
-    }
-    Ok(())
+    sha256_stdout_matches(&out.stdout, expected, "blob")
 }
 
 /// Verify in-memory bytes (a manifest) against a `sha256:<hex>` digest, mirroring [`verify_digest`]
@@ -1372,14 +1379,7 @@ fn verify_digest_bytes(bytes: &[u8], digest: &str) -> Result<(), OciError> {
     if !out.status.success() {
         return Err(OciError::Tool("sha256sum", "hashing failed".into()));
     }
-    let got = String::from_utf8_lossy(&out.stdout);
-    let got = got.split_whitespace().next().unwrap_or("");
-    if !got.eq_ignore_ascii_case(expected) {
-        return Err(OciError::Registry(format!(
-            "manifest digest mismatch (expected {expected}, got {got}) - refusing"
-        )));
-    }
-    Ok(())
+    sha256_stdout_matches(&out.stdout, expected, "manifest")
 }
 
 /// A tar member path that would escape the rootfs: absolute, `..`-traversing, or NUL-bearing.

@@ -10,7 +10,7 @@ runs in a fresh isolated `kern box` on your machine.
 
 ```sh
 pip install kern-sandbox          # ships the `kern-mcp` command
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # the kern binary
+cargo install --git https://github.com/getkern/kern getkern --locked   # the kern binary
 ```
 
 ## Wire it into the client

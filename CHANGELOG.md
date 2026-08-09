@@ -22,6 +22,11 @@ the current state of the tree; full detail is in the git history.
 - An inherited caller fd no longer leaks into the box: `shed_inherited_fds` before `execvp`
   (CVE-2016-9962 class).
 - A pulled layer's setuid/setgid bit is stripped at extraction.
+- OCI supply-chain hardening: a digest-pinned pull (`img@sha256:<hex>`) is content-addressed - the
+  fetched manifest and the selected arch sub-manifest are sha256-verified, so a compromised registry
+  cannot serve different bytes under a pin. The tar vetter also rejects a hardlink whose target
+  descends an escaping symlink (a host-inode disclosure/corruption class), and an aggregate layer-count
+  cap bounds a resource-exhaustion manifest.
 
 ### Fixed
 
@@ -92,3 +97,8 @@ the current state of the tree; full detail is in the git history.
 - A compose `shm_size:` is recognised and left intentionally cgroup-bounded: `/dev/shm` is charged to
   the box memory cgroup (`mem_limit` / `--memory`), not pinned to a fixed size, so there is no 64 MB
   `/dev/shm` footgun to size around.
+- `--apparmor <profile>` (CLI + the `kern-sandbox` Python/Node SDKs): enter a pre-loaded AppArmor
+  (LSM) profile on the box's exec, layered over namespaces + seccomp (Docker's `--security-opt
+  apparmor=`). A missing or unloadable profile fails the box CLOSED; `kern exec` re-enters the box's
+  recorded profile so an exec is no less confined than the workload; a box whose posture predates this
+  recording is refused rather than exec'd unconfined. kern applies no default profile.

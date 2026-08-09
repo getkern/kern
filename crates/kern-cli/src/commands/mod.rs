@@ -4407,31 +4407,35 @@ fn supervise_box(
                     if let Some(cur) = registry::name_for_pid(inst.pid) {
                         inst.name = cur;
                     }
-                    // Adopt any cap a `kern update` wrote to the record while this box was up, and
-                    // re-apply it to THIS attempt's FRESH cgroup, so the operator's change survives an
-                    // in-process restart instead of snapping back to the box's original spec (Docker's
-                    // `update` persists). `apply_limits` already wrote spec's caps to the new cgroup
-                    // BEFORE this callback, so the override here lands last and wins; the record stays
-                    // the source of truth, keeping `kern ps` and the kernel in step. On the FIRST start
-                    // the record already holds the spec caps (run_detached registers before this loop),
-                    // so this re-adopts and re-applies them - a no-op versus what apply_limits wrote.
-                    // (The systemd-managed path still rebuilds from spec - it re-execs kern from the unit.)
-                    if let Some((mem, pids)) = registry::current_caps(inst.pid) {
-                        inst.memory_max = mem;
-                        inst.pids_max = pids;
-                        // Write to the box's dedicated cgroup dir ALREADY resolved on the line above
-                        // (`box_cgroup_record` uses `box_cgroup_dir`, caller-independent). NOT
-                        // `registry::box_cgroup(pid1)`: that is caller-RELATIVE and returns None PRECISELY
-                        // here, because this callback runs in the runner process that `apply_limits` moved
-                        // INTO the box's cgroup - so the write would silently never happen and the kernel
-                        // would keep the original spec cap while the record showed the update (divergence).
-                        if !inst.cgroup.is_empty() {
-                            let cg = std::path::Path::new(&inst.cgroup);
-                            if let Some(m) = mem {
-                                let _ = write_cgroup(cg, "memory.max", &m.to_string());
-                            }
-                            if let Some(p) = pids {
-                                let _ = write_cgroup(cg, "pids.max", &p.to_string());
+                    // On a RESTART (attempt > 0), adopt any memory/pids cap a `kern update` wrote to the
+                    // record while this box was up, and re-apply it to THIS attempt's FRESH cgroup, so the
+                    // operator's change survives an in-process restart instead of snapping back to the
+                    // box's original spec (Docker's `update` persists). `apply_limits` already wrote spec's
+                    // caps to the new cgroup BEFORE this callback, so the override here lands last and
+                    // wins; the record stays the source of truth, keeping `kern ps` and the kernel in step.
+                    // Skipped on the FIRST start: an operator `kern update` cannot have run before the box
+                    // exists, so the record can only hold the spec caps `apply_limits` just wrote - reading
+                    // them back would be a wasted dir-scan per launch (an M-service `compose up` pays it M
+                    // times). NB `--cpus` is applied live by `update` but NOT recorded, so it does not
+                    // persist here; only memory/pids do. (The systemd-managed path rebuilds from spec.)
+                    if attempt > 0 {
+                        if let Some((mem, pids)) = registry::current_caps(inst.pid) {
+                            inst.memory_max = mem;
+                            inst.pids_max = pids;
+                            // Write to the box's dedicated cgroup dir ALREADY resolved on the line above
+                            // (`box_cgroup_record` uses `box_cgroup_dir`, caller-independent). NOT
+                            // `registry::box_cgroup(pid1)`: that is caller-RELATIVE and returns None here,
+                            // because this callback runs in the runner process that `apply_limits` moved
+                            // INTO the box's cgroup - so the write would silently never happen and the
+                            // kernel would keep the spec cap while the record showed the update (divergence).
+                            if !inst.cgroup.is_empty() {
+                                let cg = std::path::Path::new(&inst.cgroup);
+                                if let Some(m) = mem {
+                                    let _ = write_cgroup(cg, "memory.max", &m.to_string());
+                                }
+                                if let Some(p) = pids {
+                                    let _ = write_cgroup(cg, "pids.max", &p.to_string());
+                                }
                             }
                         }
                     }
@@ -7128,10 +7132,12 @@ const CPU_PERIOD_US: u64 = 100_000;
 /// exactly as `docker update` does.
 ///
 /// Across a RESTART: an in-process-supervised box (`--restart on-failure`, or an `always` pod member)
-/// re-reads the recorded memory/pids caps on each restart and re-applies them, so the update PERSISTS
-/// (Docker parity). A systemd-managed box (a standalone `--restart always`/`unless-stopped`) is instead
-/// rebuilt from its original spec by the unit's re-exec, and its OUTER scope also caps it: RAISING a
-/// cap above the outer one takes effect only after that rebuild, LOWERING always bites.
+/// re-reads the recorded **memory/pids** caps on each restart and re-applies them, so those PERSIST
+/// (Docker parity). `--cpus` is applied live but is NOT recorded (the `Instance` has no cpu field), so a
+/// cpu change does NOT survive an in-process restart - the box comes back on the spec's cpu quota. A
+/// systemd-managed box (a standalone `--restart always`/`unless-stopped`) is instead rebuilt from its
+/// original spec by the unit's re-exec, and its OUTER scope also caps it: RAISING a cap above the outer
+/// one takes effect only after that rebuild, LOWERING always bites.
 pub fn update(
     name: &str,
     memory: Option<u64>,

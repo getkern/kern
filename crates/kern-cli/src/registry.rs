@@ -633,33 +633,12 @@ pub fn list_exited() -> Vec<ExitedBox> {
     out
 }
 
-/// The CURRENT on-disk name of the live box whose supervisor pid is `pid`, or `None`. Long-lived
-/// writers (the supervisor's restart re-register, the health checker, `update_caps`) call this so a
-/// `kern rename` is honoured instead of resurrecting the box's ORIGINAL name. Only an entry whose body
-/// `name=` AGREES with its filename AND that is a live box is trusted, so a planted, inconsistent, or
-/// stale `<x>-<pid>` file can't steer a box's identity. O(n) scan of the (small) instances dir.
-pub fn name_for_pid(pid: i32) -> Option<String> {
-    let d = dir().ok()?;
-    for e in fs::read_dir(&d).ok()?.flatten() {
-        let fname = e.file_name();
-        let Some((name, p)) = entry_split(&fname) else {
-            continue;
-        };
-        if p.parse::<i32>() != Ok(pid) {
-            continue;
-        }
-        if load_live(&e.path()).is_some_and(|inst| inst.name == name) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
-
-/// The `(memory_max, pids_max)` the LIVE box with `pid` currently records, or `None` if there is no
-/// live entry for it. The registry record is the source of truth for a box's caps after a `kern
-/// update` (which writes them here), so the in-process restart supervisor reads them back on each
-/// (re)start to keep an updated limit in force instead of snapping to the box's original spec.
-pub fn current_caps(pid: i32) -> Option<(Option<u64>, Option<u64>)> {
+/// The LIVE box whose supervisor pid is `pid`, or `None`. The single anti-spoof scan behind
+/// [`name_for_pid`] and [`current_caps`]: only an entry whose body `name=` AGREES with its filename AND
+/// that is a live box is trusted, so a planted, inconsistent, or stale `<x>-<pid>` file can't steer a
+/// box's identity. O(n) scan of the (small) instances dir. (`find_ref` is a DIFFERENT scan, keyed on
+/// the body `pid=` and opening every entry, so it stays separate.)
+fn live_by_pid(pid: i32) -> Option<Instance> {
     let d = dir().ok()?;
     for e in fs::read_dir(&d).ok()?.flatten() {
         let fname = e.file_name();
@@ -671,11 +650,26 @@ pub fn current_caps(pid: i32) -> Option<(Option<u64>, Option<u64>)> {
         }
         if let Some(inst) = load_live(&e.path()) {
             if inst.name == name {
-                return Some((inst.memory_max, inst.pids_max));
+                return Some(inst);
             }
         }
     }
     None
+}
+
+/// The CURRENT on-disk name of the live box whose supervisor pid is `pid`, or `None`. Long-lived
+/// writers (the supervisor's restart re-register, the health checker, `update_caps`) call this so a
+/// `kern rename` is honoured instead of resurrecting the box's ORIGINAL name.
+pub fn name_for_pid(pid: i32) -> Option<String> {
+    live_by_pid(pid).map(|inst| inst.name)
+}
+
+/// The `(memory_max, pids_max)` the LIVE box with `pid` currently records, or `None` if there is no
+/// live entry for it. The registry record is the source of truth for a box's caps after a `kern
+/// update` (which writes them here), so the in-process restart supervisor reads them back on each
+/// (re)start to keep an updated limit in force instead of snapping to the box's original spec.
+pub fn current_caps(pid: i32) -> Option<(Option<u64>, Option<u64>)> {
+    live_by_pid(pid).map(|inst| (inst.memory_max, inst.pids_max))
 }
 
 /// Remove every exit sidecar whose filename starts with `prefix` (compose passes `<pod>-`). Used by

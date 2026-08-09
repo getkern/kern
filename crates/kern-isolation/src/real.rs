@@ -3752,20 +3752,16 @@ pub fn exec_in_box(
         // because the profile was UNLOADED on the host after the box started (`apparmor_parser -R`),
         // NOT the user's command. Name that cause and fail closed rather than mimic "not found", so the
         // operator looks at the sandbox, not at their argv.
-        if let Error::Syscall(_, io) = &err {
-            if io.raw_os_error() == Some(libc::EACCES) {
-                if apparmor.is_some() {
-                    exec_fail_closed(
-                        "exec refused (EACCES): the box's AppArmor profile would not admit it \
-                         (was the profile unloaded on the host?), or the target is not executable",
-                    );
-                }
-                eprintln!("kern: exec failed: {err}");
-                unsafe { libc::_exit(126) };
-            }
+        let eacces =
+            matches!(&err, Error::Syscall(_, io) if io.raw_os_error() == Some(libc::EACCES));
+        if eacces && apparmor.is_some() {
+            exec_fail_closed(
+                "exec refused (EACCES): the box's AppArmor profile would not admit it (was the \
+                 profile unloaded on the host?), or the target is not executable",
+            );
         }
         eprintln!("kern: exec failed: {err}");
-        unsafe { libc::_exit(127) };
+        unsafe { libc::_exit(if eacces { 126 } else { 127 }) };
     }
     // `-it` parent: drop our copy of the slave so the master sees EOF when the exec'd process exits,
     // then pump host stdio <-> master until then (single-threaded, like the box path).

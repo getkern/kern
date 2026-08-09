@@ -15,7 +15,7 @@ wsl --install -d Ubuntu           # or import a rootfs you already have
 
 # 3. inside the distro, install kern and use it exactly as on Linux
 wsl
-  curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+  cargo install --git https://github.com/getkern/kern getkern --locked
   kern box demo --image alpine -- echo "hello from a kern box on Windows"
 ```
 

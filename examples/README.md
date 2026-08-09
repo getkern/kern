@@ -3,7 +3,7 @@
 Real, runnable use-cases. Install kern first:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
 <details><summary>…or build from source</summary>
