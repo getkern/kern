@@ -1630,6 +1630,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         } else {
             format!("cap-drop=ALL, cap-add={}", args.cap_add.join(","))
         };
+        // Announced on stderr (not TTY-gated): this is an HONESTY confirmation of the resolved posture
+        // - "never advertise a posture it did not get" - and is asserted by the sandbox_run tests. An
+        // SDK capturing the box's stderr must not mistake it for a box-start failure: the classifier
+        // skips benign `kern:` banner/warning/note lines before its startup-failure heuristic.
         eprintln!(
             "kern: security-profile=untrusted: seccomp={sec}, {caps_line}, read-only=on \
              (Landlock and --require-limits untouched)"

@@ -17,9 +17,11 @@ Why faults-as-data (not exceptions) is the whole point here:
 
     KERN_BIN=./target/release/kern python3 examples/agent-tool-runner.py
 
-Honest threat model: a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED (agent-authored) code.
-seccomp is a denylist - right for agent code, NOT a hard wall against deliberately hostile multi-tenant
-code (use a microVM / gVisor for that). See bindings/python/README.md.
+This tool runs model code under `security_profile="untrusted"`: kern's strongest bundle - a seccomp
+ALLOWLIST (deny-by-default with ENOSYS), every capability dropped, and a read-only root (run_code's own
+workspace stays writable, so file state still works). Honest threat model: a KERNEL-boundary sandbox
+for agent-authored / AI-generated code, NOT a hard wall against a deliberate kernel attacker (use a
+microVM / gVisor for that). See bindings/python/README.md.
 """
 import json
 
@@ -29,12 +31,15 @@ import kern_sandbox as kern
 def run_python_tool(code: str, *, timeout_s: int = 5) -> dict:
     """Execute model-generated `code` in a fresh, isolated box and return a JSON-able tool result.
 
-    Network is OFF and resource caps are on: the model's code can compute, but it cannot phone home,
-    fork-bomb the host, or eat all its RAM. NOTHING here raises on a misbehaving payload - a runaway
-    loop or a blocked syscall comes back in the `fault` field, which is exactly what you want to show
-    the model on the next turn.
+    Network is OFF, resource caps are on, and `security_profile="untrusted"` applies the strongest
+    bundle (seccomp allowlist + cap-drop ALL + read-only root): the model's code can compute, but it
+    cannot phone home, fork-bomb the host, eat all its RAM, or write outside its workspace. NOTHING
+    here raises on a misbehaving payload - a runaway loop or a blocked syscall comes back in the
+    `fault` field, which is exactly what you want to show the model on the next turn.
     """
-    r = kern.run_code(code, memory_mb=256, cpus=0.5, timeout_s=timeout_s)
+    r = kern.run_code(
+        code, memory_mb=256, cpus=0.5, timeout_s=timeout_s, security_profile="untrusted"
+    )
     return {
         "success": r.success,               # True iff exit 0 AND no sandbox fault
         "stdout": r.stdout.strip(),

@@ -8,16 +8,19 @@
 # (e.g. `--image node ... node -e "<snippet>"`) - the isolation is identical.
 #
 # The lockdown on every eval:
-#   --read-only    whole root read-only (writes fail)
+#   --security-profile untrusted  the hardening bundle for code nobody has read: seccomp ALLOWLIST
+#                  (deny-by-default with ENOSYS, stricter than the on-by-default denylist) + cap-drop
+#                  ALL + read-only root, in one flag.
 #   --network none  no network at all (isolated netns, loopback only) - the model can't phone home
 #   --memory/--cpus/--pids-limit   resource caps (RAM ceiling, CPU share, fork-bomb containment)
 #   --timeout      wall-clock kill switch, so a runaway snippet can't hang the agent
-# On top of that a box always has an always-on seccomp denylist (mount/ptrace/kexec/... -> SIGSYS) and
-# a private PID namespace. We CAPTURE the exit code (never let it abort the script) - that code is the
-# result the agent reacts to.
+# A box always has an always-on seccomp filter and a private PID namespace; `untrusted` upgrades the
+# default denylist to the allowlist. We CAPTURE the exit code (never let it abort the script) - that
+# code is the result the agent reacts to.
 #
-# Honest threat model: a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED (agent-authored) code.
-# seccomp is a denylist - right for agent code, not a hard multi-tenant wall (use a microVM for that).
+# Honest threat model: a KERNEL-boundary sandbox for agent-authored / AI-generated code. `untrusted`
+# is the strongest posture kern ships; it is not a hard multi-tenant wall against a deliberate kernel
+# attacker (use a microVM for that).
 set -eu
 kern="${KERN:-kern}"
 n=0
@@ -29,7 +32,7 @@ eval_untrusted() {
   printf '%s\n  snippet: %s\n' "$label" "$snippet"
   # Disable errexit around the eval so a non-zero exit is DATA we capture, not a script abort.
   set +e
-  "$kern" box "eval-$$-$n" --image alpine --read-only --network none \
+  "$kern" box "eval-$$-$n" --image alpine --security-profile untrusted --network none \
     --memory 128m --cpus 0.5 --pids-limit 64 --timeout 5 -- \
     sh -c "$snippet"
   code=$?

@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.17";
+const VERSION = "0.1.18";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -621,8 +621,14 @@ function looksLikeStartupFailure(stderr) {
     "error: oci:",
     "error: image:",
   ];
+  // kern also writes BENIGN `kern:` diagnostics that are NOT a box-start failure: the
+  // `--security-profile` posture banner, and `warning:`/`note:` lines. They start with `kern:` too, so
+  // without this skip a workload that merely exits non-zero WHILE one is on stderr (e.g. code run under
+  // securityProfile: "untrusted" that hits a network error) would be mislabeled `startup_failed`.
+  const benign = ["kern: security-profile=", "kern: warning:", "kern: note:"];
   for (const line of stderr.split("\n")) {
     const s = line.replace(/^\s+/, "");
+    if (benign.some((b) => s.startsWith(b))) continue;
     if (s.includes("sandbox setup failed") || markers.some((m) => s.startsWith(m))) return true;
   }
   return false;

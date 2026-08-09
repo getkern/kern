@@ -64,7 +64,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1814,8 +1814,15 @@ def _looks_like_startup_failure(stderr: str) -> bool:
         "error: oci:",
         "error: image:",
     )
+    # kern also writes BENIGN `kern:` diagnostics to stderr that are NOT a box-start failure: the
+    # `--security-profile` posture banner, and `warning:`/`note:` lines. They start with `kern:` too, so
+    # without this skip a workload that merely exits non-zero WHILE one is on stderr (e.g. code run under
+    # `security_profile="untrusted"` that hits a network error) would be mislabeled `startup_failed`.
+    benign = ("kern: security-profile=", "kern: warning:", "kern: note:")
     for line in stderr.splitlines():
         s = line.lstrip()
+        if s.startswith(benign):
+            continue
         if "sandbox setup failed" in s or any(s.startswith(m) for m in markers):
             return True
     return False

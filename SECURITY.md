@@ -225,6 +225,10 @@ box's full limit, so N execs could use N times the box's memory.
 - **`--net`** (`--network host`) shares the host network namespace: there is then **no network
   isolation**. The box can reach host `localhost` services, the host's networks, and **every
   abstract-namespace UNIX socket** (X11, some D-Bus sockets), and can bind host-visible addresses.
+  It **cannot** sniff or spoof that network, though: the box keeps `CAP_NET_RAW`/`CAP_NET_ADMIN` but
+  only over its OWN user namespace, and a child namespace's capabilities are not effective over a
+  namespace the initial one owns, so an `AF_PACKET`/raw socket on the host netns is `EPERM` (verified) -
+  the same scoping that stops `--tun`+`--net host` from reconfiguring host interfaces.
 - **`--tun`** binds `/dev/net/tun` in. The box holds `CAP_NET_ADMIN`, but a child user namespace's
   capabilities are not effective over a namespace owned by the initial one, so even with
   `--network host` it **cannot reconfigure the host's interfaces** (`EPERM`).
