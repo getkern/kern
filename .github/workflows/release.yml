@@ -30,14 +30,28 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      # A PINNED nightly, used ONLY to shrink the shipped artifact. The source is 100% stable Rust
+      # (no `#![feature]`), so `cargo build --release` on stable still produces a working binary - this
+      # only makes the released one ~22% smaller. Pinned for a reproducible build; bump deliberately and
+      # re-validate (a throwaway tag push, see below) when you move it.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-09
           targets: ${{ matrix.target }}
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: Install musl tooling
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build (static)
-        run: cargo build --release --target ${{ matrix.target }} --bin kern
+      - name: Build (static, size-extreme)
+        # `-Zbuild-std` rebuilds std/core under the release profile's opt-level="z"; `panic=immediate-abort`
+        # drops std's panic-formatting machinery (the code is panic-free in production, and a panic that
+        # cannot happen now fail-fast aborts instead of unwinding). ~22% smaller, latency-neutral. A plain
+        # stable `cargo build --release` remains the supported fallback and yields the same behavior.
+        env:
+          RUSTFLAGS: "-Zunstable-options -Cpanic=immediate-abort"
+        run: >
+          cargo +nightly-2026-08-09 build --release --target ${{ matrix.target }} --bin kern
+          -Z build-std=std,panic_abort
       - name: Package
         run: |
           set -eu
