@@ -109,7 +109,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 **Requires:**
 - A **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**. On Windows it runs under
   WSL2; there is no native macOS/Windows port ([Roadmap](../ROADMAP.md)).
-- Hard `--memory`/`--cpus`/`--pids` caps need a **delegated cgroup** (a systemd user manager, or root);
+- Hard `--memory`/`--cpus`/`--pids-limit` caps need a **delegated cgroup** (a systemd user manager, or root);
   without one they degrade to best-effort and kern says so. Pass `--require-limits` (`KERN_REQUIRE_LIMITS`)
   to refuse to start instead of running uncapped, or `--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) to accept
   it silently in a nested CI. Microsoft's default WSL2 kernel and a stock
@@ -130,7 +130,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
   shares one) and no Docker plugin ecosystem.
 - **`kern exec` caps** are inherited only where kern can join the box's cgroup (root, or a delegated
   `kern.slice`); on a rootless per-box-scope host the exec'd command runs outside the box's
-  `--memory`/`--pids` (namespaces + seccomp still isolate it), and kern warns.
+  `--memory`/`--pids-limit` (namespaces + seccomp still isolate it), and kern warns.
 - **GPU** slices are on the [Roadmap](../ROADMAP.md), not shipped.
 
 ## Platforms

@@ -28,7 +28,8 @@ Design, the "middle way" (validated with review):
 
 Threat model (honest): kern is a KERNEL-BOUNDARY sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp
 is a DENYLIST - suitable for semi-trusted agent code, NOT a hard boundary against deliberately hostile
-multi-tenant code (for that: a microVM / gVisor). A deny-by-default allowlist mode is on the roadmap.
+multi-tenant code (for that: a microVM / gVisor). A deny-by-default seccomp allowlist ships opt-in:
+pass security_profile="untrusted" (or KERN_SECCOMP=allowlist).
 """
 
 from __future__ import annotations

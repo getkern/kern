@@ -82,7 +82,7 @@ box's network.
 |---|---|---|
 | Escape via a crafted image | in-process vetter + no-follow merge + digest verify | an exotic-but-safe image is refused rather than extracted (fail-closed) |
 | Nested-namespace escape | `clone`/`clone3` flag filter; mount API denied | the userns surface itself is kernel attack surface (below) |
-| Remount root writable / unmask cgroup | seccomp kills the mount API; child-userns caps ineffective over host-owned mounts | `--no-seccomp` waives the first layer by choice; the second stands |
+| Remount root writable / unmask cgroup | seccomp kills the mount API; child-userns caps ineffective over host-owned mounts | `--privileged` re-gains the classic `mount` syscalls, but caps ineffective over host-owned mounts keep root/cgroup unchanged, the new mount API stays blocked, and seccomp itself cannot be turned off |
 | Registry poisoning | sha256 on blobs and pinned manifests; TLS + realm pinning | trust in the host kernel's TLS stack via `curl` |
 | Peer secret / posture theft | inverted-default registry guard at **every** host-path entry, by device+inode identity | the operator's own trusted source paths are trusted as such |
 | Secret disclosure | `/run/secrets` tmpfs mode 0400, off argv, `O_EXCL\|O_NOFOLLOW` | inline `NAME=value` is visible in the host `ps`, and is warned about |

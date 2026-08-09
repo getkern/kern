@@ -31,7 +31,8 @@ therefore to the whole stack.
 **Outbound needs `pasta`, and kern says so when it is missing.** Reaching the internet
 from a rootless network namespace needs a userspace network stack, so `kern compose up`
 attaches `pasta` (the `passt` package) to the pod for NAT'd egress and DNS. It is on by
-default; `--no-outbound` turns it off. If `pasta` is not installed the pod comes up
+default whenever `pasta` is installed; a compose stack has no flag to turn egress off
+(`--no-outbound` is a `kern pod create` option, not a compose one). If `pasta` is not installed the pod comes up
 **loopback-only** and the bring-up line says which of the two you got, rather than
 leaving you to discover it when a `pip install` inside a service times out:
 

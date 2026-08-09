@@ -359,9 +359,9 @@ path** (kern as root, or a host where a delegated `kern.slice` is ensured). In t
 kern puts each box in its OWN per-box systemd scope (under `app.slice`, NOT `kern.slice`), so the fleet
 SUM is currently **not** enforced there. kern does not stay silent about it: when a fleet cap is set but
 the direct-cap path is not taken, it prints a one-line warning at box start. The **per-box `--memory` /
-`--pids` caps are the reliable knob and enforce everywhere the controller is delegated** (verified on
+`--pids-limit` caps are the reliable knob and enforce everywhere the controller is delegated** (verified on
 x86, the ARM boards, and the VPS: a box over its `--memory` is OOM-killed). For a guaranteed fleet bound
-today, run kern as root, or cap each box with `--memory` / `--pids`; add `--require-limits` to make a box
+today, run kern as root, or cap each box with `--memory` / `--pids-limit`; add `--require-limits` to make a box
 refuse to start rather than run uncapped where the per-box cap cannot be enforced. A rootless
 shared-slice fleet cap is tracked as a post-launch improvement. Example:
 

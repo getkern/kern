@@ -60,6 +60,11 @@ the current state of the tree; full detail is in the git history.
   written into a `docker-compose.yml` names the docker-compose equivalent (a `healthcheck:` block, or
   `depends_on: {SERVICE: {condition: service_healthy}}`) instead of a dead-end "unsupported", so a
   file that mixed the two spellings gets the fix rather than a silently missing health gate.
+- The `kern-sandbox` SDKs decide `startup_failed` from an unforgeable channel: kern writes a "box
+  started" byte to a caller-supplied `KERN_STARTED_FD` (CLOEXEC, so it never reaches the workload)
+  only on the started path, so a workload can no longer forge the startup-failure marker on its own
+  stderr to make the SDK raise. An older kern without the signal falls back to the stderr heuristic,
+  which only ever over-reports a failure, never masks a real one.
 
 ### Added
 
@@ -106,3 +111,8 @@ the current state of the tree; full detail is in the git history.
   apparmor=`). A missing or unloadable profile fails the box CLOSED; `kern exec` re-enters the box's
   recorded profile so an exec is no less confined than the workload; a box whose posture predates this
   recording is refused rather than exec'd unconfined. kern applies no default profile.
+- The published Linux release binaries are size-optimized with a pinned-nightly `build-std` +
+  `-Cpanic=immediate-abort` build (~22% smaller than a plain stable `--release`), reproducible
+  byte-for-byte with the pinned toolchain. The source stays 100% stable Rust, so `cargo test` runs on
+  the same source the release ships. The exact sizes and the panic-diagnostics tradeoff this buys are
+  in [OPEN_ITEMS.md](OPEN_ITEMS.md).
