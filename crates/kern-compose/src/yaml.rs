@@ -2011,6 +2011,24 @@ fn service_to_box(
             "configs" | "logging" | "extends" | "stdin_open" | "tty" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
+            // kern's own TOML config spells these `health_cmd:` / `depends_healthy:`; a
+            // docker-compose.yml has DIRECT equivalents. Name them rather than fall through to a
+            // dead-end "unsupported": a dropped health/ordering directive is not cosmetic, so a user
+            // who mixed the two syntaxes would otherwise bring a stack up with no health gate and only
+            // a vague warning to explain why.
+            "health_cmd" | "health_interval" | "health_retries" | "health_timeout"
+            | "health_start_period" | "health_action" => warn(&format!(
+                "service '{name}': '{key}:' is kern's TOML spelling - in a docker-compose.yml declare \
+                 a `healthcheck:` block (test / interval / retries / timeout / start_period)"
+            )),
+            "depends_healthy" => warn(&format!(
+                "service '{name}': 'depends_healthy:' is kern's TOML spelling - in a docker-compose.yml \
+                 use `depends_on: {{ SERVICE: {{ condition: service_healthy }} }}`"
+            )),
+            "depends_completed" => warn(&format!(
+                "service '{name}': 'depends_completed:' is kern's TOML spelling - in a docker-compose.yml \
+                 use `depends_on: {{ SERVICE: {{ condition: service_completed_successfully }} }}`"
+            )),
             // Service-level extension field: defined by the spec, ignored on purpose, silently.
             other if other.starts_with("x-") => {}
             other => warn(&format!(
@@ -3236,6 +3254,35 @@ mod tests {
         assert!(b.env.contains(&"BAZ=qux".to_string()));
         assert_eq!(b.health_cmd.as_deref(), Some("true"));
         assert_eq!(b.health_interval, Some(2));
+    }
+
+    #[test]
+    fn kern_toml_health_keys_in_yaml_are_ignored_not_applied() {
+        // A user who copies kern's TOML spelling (`health_cmd:` / `depends_healthy:`) into a
+        // docker-compose.yml gets a GUIDED warning pointing at the docker equivalent - and, critically,
+        // the key stays IGNORED, not applied: the box gets no health gate or ordering edge from it (the
+        // docker spellings `healthcheck:` / `depends_on: {condition: service_healthy}` are the supported
+        // ones). Locks that the guidance arm never starts honoring the TOML key on the YAML path.
+        let y = concat!(
+            "services:\n",
+            "  cache:\n",
+            "    image: alpine\n",
+            "    health_cmd: \"true\"\n",
+            "    health_interval: 2\n",
+            "  web:\n",
+            "    image: alpine\n",
+            "    depends_healthy: [\"cache\"]\n",
+            "    depends_completed: [\"cache\"]\n",
+        );
+        let bs = boxes(y);
+        let cache = bs.iter().find(|b| b.name == "cache").expect("cache box");
+        let web = bs.iter().find(|b| b.name == "web").expect("web box");
+        // The kern-TOML health keys did NOT populate the box (docker `healthcheck:` is the way in YAML):
+        assert_eq!(cache.health_cmd, None);
+        assert_eq!(cache.health_interval, None);
+        // The kern-TOML dependency conditions created NO ordering/health edge:
+        assert!(web.depends_healthy.is_empty());
+        assert!(web.depends_completed.is_empty());
     }
 
     #[test]
