@@ -285,7 +285,7 @@ network off by default, hard caps, and a timeout the binding enforces.
 
 ## Status
 
-**The core is done. Everything above works today and is tested:** 792 Rust, 75 Python and 58 Node
+**The core is done. Everything above works today and is tested:** 795 Rust, 75 Python and 58 Node
 tests, clippy-clean, `cargo-deny`-clean. You build from source, and the CLI
 and config surface can still change, always called out in [CHANGELOG.md](CHANGELOG.md). It is being
 tested hard on real hardware (Linux, WSL2, Raspberry Pi, Jetson, Arduino UNO Q) and refined ahead of

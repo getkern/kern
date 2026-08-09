@@ -1031,7 +1031,7 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
             let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
         }
         eprintln!("kern: --init: fork failed");
-        unsafe { libc::_exit(127) };
+        unsafe { libc::_exit(125) }; // setup failure: the box could not start its workload
     }
     if child == 0 {
         // WORKLOAD child: inherits the CLOEXEC ready_fd - a successful exec closes it (→ launcher EOF).
@@ -1043,7 +1043,9 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
             let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
         }
         report_exec_failure(spec, &e);
-        unsafe { libc::_exit(127) };
+        // Always an `execvp` failure here (`exec` only returns on failure): 126 (EACCES) / 127 (not
+        // found), never 125 - a 125 setup failure cannot reach this WORKLOAD child.
+        unsafe { libc::_exit(box_start_exit_code(&e)) };
     }
 
     // PID 1 (init). Close our own copy of the ready fd NOW, so the workload's exec is the last holder
@@ -1089,6 +1091,25 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
             1
         })
     };
+}
+
+/// The `_exit` code for a box that could not run its workload, aligned with Docker's convention so the
+/// caller (and an SDK relaying the code) can tell a kern/setup failure apart from the workload's own
+/// command failure:
+/// - **125**: kern could not START the box - any setup step failed (mount, uid map, seccomp, AppArmor,
+///   cgroup). This is NOT a "command not found"; the operator must look at the sandbox, not their argv.
+/// - **126**: the command was FOUND but the kernel refused to exec it (`EACCES`: not executable, or an
+///   LSM transition denied).
+/// - **127**: the command was not found (`ENOENT` and friends).
+///
+/// Only an `execvp` error is the workload's own command; every other `Error` is kern's setup, so it
+/// maps to 125. Matches `child_setup_and_exec`, whose non-init tail is exactly `Err(exec(argv))`.
+fn box_start_exit_code(e: &Error) -> i32 {
+    match e {
+        Error::Syscall("execvp", io) if io.raw_os_error() == Some(libc::EACCES) => 126,
+        Error::Syscall("execvp", _) => 127,
+        _ => 125,
+    }
 }
 
 /// Print the actionable "cannot start the box command" diagnostic for a failed `execvp` (command not
@@ -2660,27 +2681,29 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                  but NO cgroup cap is in force - the box runs UNCAPPED. If kern did not set that variable, a \
                  caller may be bypassing the resource limits."
             );
-        } else if !spec.allow_uncapped
-            && (spec.memory_max.is_some() || spec.pids_max.is_some() || spec.cpus.is_some())
-            && crate::cgroup::memory_cap_enforceable()
-        {
+        } else if !spec.allow_uncapped && crate::cgroup::memory_cap_enforceable() {
             // The box did NOT take the direct kern.slice path, no outer enforcer claims to cap it, and
-            // `apply_limits` could not put the requested cap in force here. `memory_cap_enforceable()` is
-            // TRUE, so the once-per-process "controller absent from this tree" notice in
-            // `reexec_in_scope_if_possible` did NOT fire: the controller IS in the tree, but kern could
-            // not place the box in a cgroup that carries the cap. The usual cause is that the direct
-            // kern.slice path was declined because no systemd user manager was found - and that check is
-            // `$XDG_RUNTIME_DIR/systemd`, so a WRONG or unset `XDG_RUNTIME_DIR` silently disables it (this
-            // is how the case was first hit: pointing `XDG_RUNTIME_DIR` at a scratch subdir), as does a
-            // genuinely systemd-less host. Accepting a cap and enforcing nothing is the one thing this
-            // codebase does not do quietly; this was the last path where it still did. Warn (not refuse):
-            // the direct path already hard-refuses, and a best-effort host is a legitimate configuration.
+            // `apply_limits` could not put a cap in force here. `memory_cap_enforceable()` is TRUE, so the
+            // once-per-process "controller absent from this tree" notice in `reexec_in_scope_if_possible`
+            // did NOT fire: the controller IS in the tree, but kern could not place the box in a cgroup
+            // that carries the cap. The usual cause is that the direct kern.slice path was declined
+            // because no systemd user manager was found - and that check is `$XDG_RUNTIME_DIR/systemd`, so
+            // a WRONG or unset `XDG_RUNTIME_DIR` silently disables it (this is how the case was first hit:
+            // pointing `XDG_RUNTIME_DIR` at a scratch subdir), as does a genuinely systemd-less host.
+            //
+            // NOT gated on an EXPLICIT `--memory`/`--pids-limit`/`--cpus`: memory and pids ALWAYS carry a
+            // DEFAULT cap (the OOM / fork-bomb backstop), so a plain `kern box` with no cap flags is
+            // equally UNCAPPED here and equally silent - the exact gap Grok flagged (a default Redis on a
+            // best-effort host with no backstop). Accepting a cap - default or requested - and enforcing
+            // nothing is the one thing this codebase does not do quietly. Warn (not refuse): the direct
+            // path already hard-refuses, and a best-effort host is a legitimate configuration.
             eprintln!(
-                "kern: warning: requested resource cap(s) could not be enforced here - the box runs \
-                 UNCAPPED. kern could not place it in a delegated cgroup: no systemd user manager was \
-                 reachable (its marker is `$XDG_RUNTIME_DIR/systemd` - check that `XDG_RUNTIME_DIR` \
-                 points at your real runtime dir, e.g. `/run/user/$(id -u)`), or this host has none. \
-                 `kern doctor` shows the delegation state."
+                "kern: warning: resource caps could not be enforced here (memory + pids, INCLUDING their \
+                 defaults) - the box runs UNCAPPED, with no OOM / fork-bomb backstop. kern could not place \
+                 it in a delegated cgroup: no systemd user manager was reachable (its marker is \
+                 `$XDG_RUNTIME_DIR/systemd` - check that `XDG_RUNTIME_DIR` points at your real runtime dir, \
+                 e.g. `/run/user/$(id -u)`), or this host has none. `kern doctor` shows the delegation \
+                 state; `--require-limits` refuses to start uncapped, `--allow-uncapped` silences this."
             );
         }
     }
@@ -2842,10 +2865,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                 if let Some(fd) = ready_fd {
                     let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
                 }
-                // A failed `execvp` is the common, confusing case (command not found, not executable,
-                // or a missing loader). Name the command and hint, rather than a bare os-error leak.
+                // `e` is EITHER a failed `execvp` (command not found/not executable - the common,
+                // confusing case) OR a setup failure (mount, uid map, seccomp, AppArmor: the box could
+                // not be built). `box_start_exit_code` maps the first to 126/127 and the second to 125
+                // (Docker's "container failed to start"), so a setup failure is no longer mis-reported as
+                // a "command not found" (127) the operator would chase in their own argv.
                 report_exec_failure(spec, &e);
-                unsafe { libc::_exit(127) };
+                unsafe { libc::_exit(box_start_exit_code(&e)) };
             }
         }
     }
@@ -4355,6 +4381,77 @@ mod uid_range_hint_fires_only_when_it_is_information {
             calls, 2,
             "run_in_sandbox_with has two returns that carry an exit code, the PTY one and the \
              waitpid one, and both must report. Found {calls} call sites."
+        );
+    }
+}
+
+#[cfg(test)]
+mod box_start_exit_code_is_docker_aligned {
+    use super::box_start_exit_code;
+    use crate::Error;
+
+    #[test]
+    fn a_setup_failure_is_125_not_a_command_error() {
+        // A setup failure (mount, uid map, seccomp, AppArmor, cgroup) means the BOX could not start:
+        // Docker's 125, NOT a "command not found" (127) the operator would chase in their own argv.
+        // This is the Grok #5 / deferred FIX-5 class - an unloaded `--apparmor` used to exit 127.
+        assert_eq!(
+            box_start_exit_code(&Error::Spec("--apparmor: profile not loaded".into())),
+            125
+        );
+        assert_eq!(box_start_exit_code(&Error::Unsupported("no userns")), 125);
+        assert_eq!(
+            box_start_exit_code(&Error::Syscall(
+                "mount",
+                std::io::Error::from_raw_os_error(libc::EPERM)
+            )),
+            125,
+            "a NON-execvp syscall failure is kern's setup, not the workload's command"
+        );
+    }
+
+    #[test]
+    fn the_workloads_own_command_failure_keeps_126_or_127() {
+        // Only an `execvp` error is the workload's own command.
+        assert_eq!(
+            box_start_exit_code(&Error::Syscall(
+                "execvp",
+                std::io::Error::from_raw_os_error(libc::ENOENT)
+            )),
+            127,
+            "ENOENT = command not found"
+        );
+        assert_eq!(
+            box_start_exit_code(&Error::Syscall(
+                "execvp",
+                std::io::Error::from_raw_os_error(libc::EACCES)
+            )),
+            126,
+            "EACCES = found but not executable (or an LSM transition denied)"
+        );
+        assert_eq!(
+            box_start_exit_code(&Error::Syscall(
+                "execvp",
+                std::io::Error::from_raw_os_error(libc::ELOOP)
+            )),
+            127,
+            "any other execvp errno falls back to not-found (127)"
+        );
+    }
+
+    /// Both box-start error `_exit`s must route through the helper, not a hardcoded `_exit(127)` (the
+    /// exact regression Grok #5 named). Asserted on the source, like the uid-hint call-site count,
+    /// because the two exits live in forked children that cannot be funnelled into one.
+    #[test]
+    fn both_box_start_error_exits_use_the_helper_not_a_hardcoded_127() {
+        let src = include_str!("real.rs");
+        // Built via concat so the needle is not present verbatim in this test (else `include_str!`
+        // counts its own search string, a test that measures itself).
+        let needle = concat!("_exit(box_start_exit_code", "(&e))");
+        assert_eq!(
+            src.matches(needle).count(),
+            2,
+            "the run_init workload child and the direct box path must both use box_start_exit_code"
         );
     }
 }
