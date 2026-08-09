@@ -56,6 +56,10 @@ the current state of the tree; full detail is in the git history.
   the address already in use - instead of a generic bind failure.
 - A `--user`/image `USER` that cannot be mapped names the actual fix (install `newuidmap`/`newgidmap`
   + a `/etc/subuid`/`/etc/subgid` allocation, or use `--uid-range`) instead of blaming `--user`.
+- A kern-TOML key (`health_cmd:`, `health_interval:`, `depends_healthy:`, `depends_completed:`, ...)
+  written into a `docker-compose.yml` names the docker-compose equivalent (a `healthcheck:` block, or
+  `depends_on: {SERVICE: {condition: service_healthy}}`) instead of a dead-end "unsupported", so a
+  file that mixed the two spellings gets the fix rather than a silently missing health gate.
 
 ### Added
 
