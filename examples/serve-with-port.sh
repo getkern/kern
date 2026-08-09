@@ -1,5 +1,5 @@
 #!/bin/sh
-# Publish a box's port to the host and keep the service healthy - without a daemon. New in 0.4:
+# Publish a box's port to the host and keep the service healthy - without a daemon:
 #   -p [ip:]host:box   publish a port (binds 127.0.0.1 by default; 0.0.0.0 only if you ask for it)
 #   --restart          restart the box if it exits non-zero (on-failure policy)
 #   --health-cmd       probe the box periodically; `kern ps` shows HEALTH

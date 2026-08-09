@@ -11,9 +11,10 @@
 #                   the package's lifecycle scripts. They run, but with the wire cut they cannot
 #                   exfiltrate anything, and there are no host files to steal.
 #
-# HONEST LIMITATION: kern's network is all-or-nothing per box (`--net` = share host net; default =
-# none). There is no built-in per-host egress allowlist/firewall. The two-box split above is exactly
-# how you get "fetch is allowed to reach the registry, execution is allowed to reach nothing."
+# NETWORK OPTIONS: a box's network is off by default; `--net` shares the host net. For a middle ground,
+# `--egress-allow registry.npmjs.org,...` confines a (foreground) box to a DOMAIN ALLOWLIST through kern's
+# filtering proxy - the fetch reaches the index and nothing else. The two-box split above is the strongest
+# form: the RUN box has NO network at all, so a lifecycle script cannot exfiltrate even to an allowed host.
 set -eu
 kern="${KERN:-kern}"
 

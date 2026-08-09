@@ -19,7 +19,7 @@ config_version = 1
 #   nice   = scheduling priority (-20 high .. 19 low) - the CLI flag is --nice
 [[vcpu]]
 name = "slim"
-# `backend` names the host resource this profile slices, and is REQUIRED since 0.6.10: a profile
+# `backend` names the host resource this profile slices, and is REQUIRED: a profile
 # that does not say what it carves up is refused rather than guessed. "host" means the whole host;
 # otherwise name a declared [[cpu]] id.
 backend = "host"
@@ -42,7 +42,7 @@ memory = "512 MB"
 # upgrades it to an ext4-on-loop image (disk-backed, honouring persistent/iops/bandwidth).
 [[vdisk]]
 name = "scratch"
-backend = "ram"        # REQUIRED since 0.6.10. "ram" = a size-capped tmpfs, no [[disk]] block needed.
+backend = "ram"        # REQUIRED. "ram" = a size-capped tmpfs, no [[disk]] block needed.
                        # Use `disk:<id>` to place the image on a declared [[disk]] pool instead.
 size = "32m"
 # persistent = false   # (default) don't survive box removal

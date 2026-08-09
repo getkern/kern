@@ -20,7 +20,7 @@ echo "running boxes:"
 
 echo
 echo "tearing down:"
-# Box names are scoped to the PROJECT since 0.6.19 (`<project>-<hash>-<service>`), so two stacks
+# Box names are scoped to the PROJECT (`<project>-<hash>-<service>`), so two stacks
 # with a `db` can coexist. That means a bare `kern stop db` no longer finds it: tear the stack down
 # with the verb that knows the project, which also removes the shared pod.
 "$kern" compose "$here/stack.toml" down

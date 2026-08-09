@@ -31,7 +31,7 @@ webport="${WEBPORT:-8080}"
 sshport="${SSHPORT:-2222}"
 keep="${KEEP:-1}"
 
-cleanup() { $kern stop "$name" >/dev/null 2>&1 || true; $kern rm "$name" >/dev/null 2>&1 || true; }
+cleanup() { $kern stop "$name" >/dev/null 2>&1 || true; }
 
 echo "== 0. will a detached box survive your logout here?"
 if [ -n "${USER:-$(id -un)}" ] && [ ! -e "/var/lib/systemd/linger/${USER:-$(id -un)}" ]; then
@@ -45,7 +45,6 @@ fi
 echo
 echo "== 1. build the image: --net for outbound, NO published ports"
 $kern stop imgbuild >/dev/null 2>&1 || true
-$kern rm imgbuild >/dev/null 2>&1 || true
 $kern box imgbuild --net --image alpine --detach -- sh -c '
   apk add --no-cache busybox-extras openssh >/dev/null 2>&1
   ssh-keygen -A >/dev/null 2>&1
@@ -60,7 +59,6 @@ while [ "$i" -lt 60 ]; do
 done
 $kern commit imgbuild "$img"
 $kern stop imgbuild >/dev/null 2>&1 || true
-$kern rm imgbuild >/dev/null 2>&1 || true
 
 echo
 echo "== 2. serve it: isolated network, port published to the LAN, ssh on loopback"

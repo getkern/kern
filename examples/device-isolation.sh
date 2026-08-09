@@ -35,7 +35,7 @@ cfg="$(mktemp -d)/kern.toml"
 cat > "$cfg" <<EOF
 [[vgpio]]
 name = "sensor"
-# Required since 0.6.10: the host resource this profile slices.
+# Required: the host resource this profile slices.
 backend = "host"
 $field = ["$dev"]
 EOF

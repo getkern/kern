@@ -22,7 +22,7 @@ cat > "$work/kern.toml" <<'EOF'
 # `vdisk:scratch` -> a 10 MiB scratch disk mounted at /vdisk/scratch
 [[vdisk]]
 name = "scratch"
-# `backend` names the host resource the profile slices. Required since 0.6.10: a profile that
+# `backend` names the host resource the profile slices. Required: a profile that
 # does not say what it carves up is refused, not guessed. For a vdisk, "ram" is a size-capped tmpfs.
 backend = "ram"
 size = "10m"

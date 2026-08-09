@@ -197,6 +197,7 @@ with truncation flags, wall time). Ideal for running LLM/agent-generated code or
 | Example | What it shows |
 |---|---|
 | [embed-python.py](embed-python.py) | The `kern_sandbox` Python package: a fresh box per `run_code`, file-state on disk, sandbox faults (timeout/OOM/blocked-escape) as data, not exceptions |
+| [embed-node.js](embed-node.js) | The `kern-sandbox` npm package (mirror of the Python one): `runCode`/`withSandbox`, file-state on disk, faults as data on `result.fault`, not thrown |
 | [embed-rust.rs](embed-rust.rs) | The `kern-isolation` crate's fluent `Sandbox::builder()…build()?.run(...)` → a structured `Outcome` |
 
 ## Windows

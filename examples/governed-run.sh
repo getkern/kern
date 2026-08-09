@@ -1,5 +1,5 @@
 #!/bin/sh
-# Govern *resources* (CPU + memory), with or without a sandbox. New in 0.4:
+# Govern *resources* (CPU + memory), with or without a sandbox:
 #   kern run --memory M --cpus N -- CMD    run a HOST command under cgroup caps - no namespaces, no
 #                                          seccomp, no overlay; the leanest path (a capped exec).
 #   kern box --memory M --cpus N           the same hard caps on a sandboxed box; a workload over the
@@ -22,3 +22,7 @@ else
   echo "  -> killed at the cap (exit $?), as expected: the 256 MB limit was enforced."
 fi
 echo "done."
+
+# Fail-closed variant: add `--require-limits` and the box REFUSES to start unless the memory/pids caps
+# are actually enforced (read back from the cgroup) - no silent best-effort fallback on a host that
+# doesn't delegate cgroup v2. Use it when an unenforced cap must be a hard error, not a warning.

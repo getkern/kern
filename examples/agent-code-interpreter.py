@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A realistic LLM/agent code interpreter on kern, exercising the 0.6.7 / 0.6.8 features at their edges.
+"""A realistic LLM/agent code interpreter on kern, exercising the agent-harness features at their edges.
 
 What it shows, each an actual agent-harness need:
   1. Egress allowlist    : the agent may `pip install` from PyPI but CANNOT exfiltrate to anywhere else.
