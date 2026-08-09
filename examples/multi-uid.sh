@@ -3,12 +3,14 @@
 # specific non-root uid with --user.
 #
 # kern is rootless: the box's root (uid 0) always maps to YOUR unprivileged host uid - the box
-# gains no privilege on the host. By DEFAULT only that one id is mapped ("single-uid": fastest,
-# smallest attack surface). Two flags change the mapping:
+# gains no privilege on the host. How many OTHER ids are mapped depends on the source: a `--rootfs`
+# box maps that one id only ("single-uid": fastest, smallest attack surface), while an `--image` box
+# maps a whole subordinate uid/gid RANGE BY DEFAULT when the host allows it, because an OCI image
+# carries files owned by many uids. Three flags pin the mapping:
 #
-#   --uid-range        map a whole subordinate uid/gid RANGE (~65k ids) into the box, so a
-#                      workload can use ids other than 0 - apt/dpkg, an image that runs as
-#                      www-data/postgres, or a `chown` to a service uid.
+#   --uid-range        force the full RANGE (~65k ids), so a workload can use ids other than 0 -
+#                      apt/dpkg, an image that runs as www-data/postgres, a `chown` to a service uid.
+#   --no-uid-range     force the single-uid map even on an --image box (smallest attack surface).
 #   --user UID[:GID]   drop to this uid/gid inside the box before the command runs (like Docker's
 #                      -u / USER). A non-root --user needs the range mapping, so kern turns it on
 #                      for you automatically.
@@ -31,16 +33,16 @@ fi
 echo "==> host has newuidmap + an /etc/subuid range for $(id -un)? ...  $have_range"
 echo
 
-echo "── 1. DEFAULT box: single-uid map - box root (uid 0) == your host uid"
+echo "── 1. Box root (uid 0) always == your unprivileged host uid - no privilege on the host"
 "$kern" box mu-single --image "$img" -- id
-echo "   (uid=0 inside, but it's YOUR unprivileged uid on the host - no privilege gained)"
+echo "   (uid=0 inside is YOUR host uid; an --image box also maps a sub-uid range for the image's files)"
 
 echo
 echo "── 2. --uid-range: a whole subordinate id range is mapped in"
 echo "   Proof: chown a file to a NON-zero uid inside the box. Only the range makes uid 100 exist."
-echo "   • single-uid box (expected: chown fails - uid 100 isn't mapped):"
+echo "   • single-uid box (--no-uid-range; expected: chown fails - only uid 0 is mapped):"
 set +e
-"$kern" box mu-nomap --image "$img" -- \
+"$kern" box mu-nomap --image "$img" --no-uid-range -- \
   sh -c ': > /tmp/f && chown 100:100 /tmp/f && echo "     chowned to 100 (unexpected here)" \
          || echo "     chown 100 refused - only uid 0 is mapped, as expected"'
 echo "   • --uid-range box (expected: chown succeeds - uid 100 is in the mapped range):"
