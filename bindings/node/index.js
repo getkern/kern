@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.15";
+const VERSION = "0.1.16";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -387,8 +387,11 @@ const REFUSED_MOUNT_SOURCES = new Set([
   "/run/docker.sock",
 ]);
 
-/** A PROGRAMMER/config error, THROWN: bad argument, illegal mount, or `kern` not installed. Runtime
- * sandbox events (timeout, blocked escape, OOM-kill) are NOT thrown - they are data in result.fault. */
+/** A PROGRAMMER/config error, THROWN: bad argument, illegal mount, `kern` not installed, or the box
+ * FAILED TO START (kern exits 125 - a mount refused at runtime, an unmappable `--user`, a seccomp or
+ * AppArmor setup error). A box that never started ran no user code, so it rejects rather than resolve a
+ * hollow result. Runtime sandbox events where the code DID run (timeout, blocked escape, OOM-kill) are
+ * NOT thrown - they are data on `result.fault`. */
 class SandboxError extends Error {
   constructor(message) {
     super(message);
@@ -1057,6 +1060,13 @@ class Sandbox {
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
         const fault = this._classify(rc, signal, stderr, timedOut, timeoutS);
+        // A box that FAILED TO START (kern exits 125) ran no user code, so REJECT rather than resolve a
+        // hollow ExecutionResult (empty stdout, exit 125). Mirrors the mount/config errors this SDK
+        // already throws up front; runtime events where the code DID run (timeout, OOM, escape) stay as
+        // data on `.fault`.
+        if (fault && fault.type === "startup_failed") {
+          return reject(new SandboxError(fault.message || "the box failed to start"));
+        }
         const files = before ? this._diff(before) : [];
         resolve(
           new ExecutionResult({
@@ -1129,6 +1139,11 @@ class Sandbox {
       return sandboxFault("killed", "the box was killed (SIGKILL) - likely out of memory (exit 137)");
     if (rc === EXIT_SIGTERM || signal === "SIGTERM")
       return sandboxFault("timeout", "the box exceeded its time limit (reaped by kern's timeout backstop)");
+    // DETERMINISTIC box-not-started: kern exits 125 (Docker's convention) when it could not BUILD the
+    // box (a mount refused at runtime, an unmappable --user, a seccomp/AppArmor/cgroup setup error), so
+    // the workload never ran. Decided by exit code, no stderr marker needed; the caller REJECTS on it.
+    if (rc === 125) return sandboxFault("startup_failed", stderr.trim().slice(0, 500) || "the box failed to start");
+    // LAST resort heuristic (also catches an OLDER kern that still exits 127 for a setup failure).
     if (rc !== 0 && looksLikeStartupFailure(stderr))
       return sandboxFault("startup_failed", stderr.trim().slice(0, 500));
     // Any other non-zero exit (incl. 139 SIGSEGV) is the USER's code failing - a normal Result.
@@ -1752,6 +1767,9 @@ class Kernel {
 
   _teardownResult(type, message, started) {
     this._kill();
+    // Same rule as the one-shot path: a box that never STARTED (the kernel failed to boot) throws, it
+    // does not return a hollow result. timeout/killed stay as data on the returned result.
+    if (type === "startup_failed") throw new SandboxError(message || "the box failed to start");
     return new ExecutionResult({
       stdout: "",
       stderr: "",

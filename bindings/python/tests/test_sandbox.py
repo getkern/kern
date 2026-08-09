@@ -359,6 +359,20 @@ def test_classify_order_escape_not_masked_by_stderr_marker():
     assert s._classify(1, "boom\n", False) is None  # non-zero, no marker: user code, no fault
 
 
+def test_exit_125_is_startup_failed_deterministically():
+    # kern exits 125 (Docker's convention) when it could not BUILD the box - a mount refused at runtime,
+    # an unmappable --user, a seccomp/AppArmor/cgroup setup error. Classified startup_failed by the EXIT
+    # CODE, with NO stderr marker needed (the old path relied on a stderr heuristic), and the caller
+    # RAISES on startup_failed (the workload never ran) rather than returning a hollow result.
+    s = _cfg()
+    assert s._classify(125, "", False).type == "startup_failed"  # deterministic, no marker
+    assert s._classify(125, "no kern marker here\n", False).type == "startup_failed"
+    # The deterministic security classes are decided first, so a signal-derived code is unaffected.
+    assert s._classify(159, "", False).type == "escape_blocked"  # SIGSYS
+    # Any OTHER non-zero exit with no marker is the user's code, not a startup failure.
+    assert s._classify(3, "", False) is None
+
+
 def test_pull_network_failure_is_startup_failed():
     # A box that never started because the PULL failed (network/DNS down) prints kern's
     # "error: curl failed:" prefix. That is a startup failure, not the user's code failing.

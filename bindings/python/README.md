@@ -205,7 +205,10 @@ class ExecutionResult:
 - `escape_blocked`, a syscall was blocked by the seccomp filter (SIGSYS).
 - `killed`, the box was SIGKILLed, not by our deadline (message notes it's *likely* OOM; the binding
   can't read the box cgroup to confirm, so it won't claim `oom` as the type).
-- `startup_failed`, kern couldn't start the box (best-effort, from kern's own diagnostics).
+
+A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
+seccomp/AppArmor/cgroup setup error, or a pull/image error) is **raised** as a `SandboxError`, not
+returned as a fault, because the code never ran.
 
 ## API
 

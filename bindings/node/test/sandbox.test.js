@@ -451,6 +451,17 @@ test("pull network failure classifies as startup_failed (curl marker)", () => {
   assert.strictEqual(s._classify(1, null, "boom\n", false), null); // plain user error stays null
 });
 
+test("exit 125 is startup_failed deterministically (box not started)", () => {
+  // kern exits 125 (Docker's convention) when it could not BUILD the box (a mount refused at runtime,
+  // an unmappable --user, a seccomp/AppArmor/cgroup setup error). Classified startup_failed by the EXIT
+  // CODE, no stderr marker needed; the caller REJECTS on it (the workload never ran).
+  const s = new Sandbox({ timeoutS: 30 });
+  assert.strictEqual(s._classify(125, null, "", false).type, "startup_failed"); // deterministic, no marker
+  assert.strictEqual(s._classify(125, null, "no kern marker\n", false).type, "startup_failed");
+  assert.strictEqual(s._classify(159, null, "", false).type, "escape_blocked"); // SIGSYS decided first
+  assert.strictEqual(s._classify(3, null, "", false), null); // other non-zero, no marker: user's code
+});
+
 test("sensitive mount source is refused", () => {
   assert.throws(() => new Sandbox({ mounts: { "/etc": "/host-etc" } }), MountRefused);
   assert.throws(() => new Sandbox({ mounts: { "/": "/root-fs" } }), MountRefused);
