@@ -89,11 +89,13 @@ observed on any host tested, and no predicate for it exists yet; it is written h
 guessed at, because the fix is a second controller check and the cost of getting it wrong is a
 warning that fires on healthy hosts.
 
-## `KERN_MAX_CONCURRENT` is best-effort
+## `KERN_MAX_CONCURRENT` is a guard rail, not a resource boundary
 
-The fleet gate counts live boxes and then starts one, so two launches racing can both pass.
-`KERN_FLEET_MEMORY_MAX` and `KERN_FLEET_PIDS_MAX` are real cgroup limits and do not have this
-property. The concurrency count is a guard rail, not a boundary.
+The count-and-claim runs under the claims-dir `flock` - the ceiling is read while the lock is held,
+before the claim is written - so the earlier TOCTOU is closed and a racing burst can no longer
+overshoot `N`. What remains is scope, by design: it bounds the NUMBER of live boxes a cooperating
+starter admits (a caller can unset it), not their resource use, whereas `KERN_FLEET_MEMORY_MAX` and
+`KERN_FLEET_PIDS_MAX` are real cgroup limits. The concurrency count is a guard rail, not a boundary.
 
 ## `kern ps` prints the mapping recorded at start, not a live probe
 

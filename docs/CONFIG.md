@@ -349,7 +349,7 @@ profile:
 
 | Variable | Effect | Kind |
 |---|---|---|
-| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative, best-effort.** First-party governor, NOT a security boundary (a caller can unset it). The count is crash-safe (a dead box's slot frees automatically). It is checked per box start, so a **concurrent burst** (`kern compose up`, `xargs -P kern box`) can race the count and overshoot `N` by the burst size. |
+| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative.** First-party governor, NOT a security boundary (a caller can unset it). The count is crash-safe (a dead box's slot frees automatically). The count-and-claim runs under a `flock` (the ceiling is read while the lock is held), so a **concurrent burst** (`kern compose up`, `xargs -P kern box`) serializes on the claim and cannot overshoot `N`. |
 | `KERN_FLEET_MEMORY_MAX` | A `memory.max` on kern's shared `kern.slice`, bounding the SUM of all boxes' memory. Accepts `512m`, `4g`, or bare bytes. | **Kernel-enforced ONLY when boxes share `kern.slice`** (see below). |
 | `KERN_FLEET_PIDS_MAX` | A `pids.max` on `kern.slice`, bounding total tasks across all boxes. | Same condition as above. |
 
