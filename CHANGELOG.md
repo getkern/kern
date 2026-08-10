@@ -1,8 +1,11 @@
 # Changelog
 
-This project is a work in progress: the CLI and config surface may change at any time. Build from
-source with `cargo install --git https://github.com/getkern/kern getkern --locked`. What follows is
-the current state of the tree; full detail is in the git history.
+**CLI stability.** As of v0.7.0 the command surface is stable: the verbs, their flags, and the
+`--json` output shapes will not change incompatibly without a version bump and an entry here. The
+project is still pre-release in the sense that binaries are not published yet (build from source) and
+internal config-file keys may still evolve, but scripts and SDKs written against the CLI can rely on
+it. Build from source with `cargo install --git https://github.com/getkern/kern getkern --locked`.
+What follows is the current state of the tree; full detail is in the git history.
 
 ## Current
 
