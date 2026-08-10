@@ -479,6 +479,12 @@ test("SIGKILL is oom only when a memory cap was set", () => {
   const uncapped = new Sandbox({ memoryMb: null });
   assert.strictEqual(uncapped._classify(137, null, "", false).type, "killed");
   assert.strictEqual(uncapped._classify(null, "SIGKILL", "", false).type, "killed");
+  // PRECEDENCE (locks the check ORDER): even with a cap set, the more specific deterministic classes
+  // win over oom. OUR deadline (timedOut) is a known kill -> timeout. A SIGSYS is a blocked escape ->
+  // escape_blocked. A backstop SIGTERM is still a timeout.
+  assert.strictEqual(capped._classify(137, null, "", true).type, "timeout"); // our deadline beats oom
+  assert.strictEqual(capped._classify(159, null, "", false).type, "escape_blocked"); // SIGSYS beats oom
+  assert.strictEqual(capped._classify(143, null, "", false).type, "timeout"); // kern's backstop, not oom
 });
 
 test("sensitive mount source is refused", () => {

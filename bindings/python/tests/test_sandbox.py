@@ -374,6 +374,12 @@ def test_classify_sigkill_is_oom_only_when_a_memory_cap_was_set():
     uncapped = _cfg(memory_mb=None)
     assert uncapped._classify(137, "", False).type == "killed"
     assert uncapped._classify(-signal.SIGKILL, "", False).type == "killed"
+    # PRECEDENCE (locks the check ORDER): even with a cap set, the more specific deterministic classes
+    # win over oom. OUR deadline (we_timed_out) is a known kill -> timeout, never oom. A SIGSYS is a
+    # blocked escape -> escape_blocked, never oom. A backstop SIGTERM is still a timeout.
+    assert capped._classify(137, "", True).type == "timeout"  # our deadline beats oom
+    assert capped._classify(159, "", False).type == "escape_blocked"  # SIGSYS beats oom
+    assert capped._classify(143, "", False).type == "timeout"  # kern's --timeout backstop, not oom
 
 
 def test_exit_125_startup_failure_requires_the_kern_marker_not_a_bare_125():
