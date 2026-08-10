@@ -3894,6 +3894,109 @@ fn box_memory_cap_oom_kills_an_over_allocation() {
     }
 }
 
+/// `memory.oom.group = 1` is the design promise that an OOM takes the WHOLE box, not one process:
+/// kern sets it, and a group-kill leaves no survivor. Two boxes: the first reads the cgroup back and
+/// skips where the `memory` controller is not delegated (a CI sandbox, WSL2 without
+/// `cgroup_enable=memory`) - there is no backstop to test there; the second races a sleeper child
+/// against a parent that allocates past the cap, and proves neither task outlives the kill. Guards
+/// the CHANGELOG claim "An OOM kills the whole box (memory.oom.group = 1), not one process" as a
+/// test, not prose. The exit is 137 / SIGKILL (the OOM signal); a 143 seen on some boards is the box
+/// init being torn down AFTER, a lifecycle artifact, never the OOM itself.
+#[test]
+fn box_oom_group_kills_the_whole_box_atomically() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "oomgrp");
+    let rootfs = root.to_str().unwrap();
+
+    // 1. Read the cgroup back. Where memory IS delegated, kern must have set oom.group=1 and a real
+    //    ceiling; where it is NOT, memory.max reads `max` and there is nothing to test - skip.
+    let read = kern()
+        .args([
+            "box",
+            "oomgrpread",
+            "--rootfs",
+            rootfs,
+            "-m",
+            "64m",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "echo GRP=$(cat /sys/fs/cgroup/memory.oom.group 2>/dev/null) \
+             MAX=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)",
+        ])
+        .output()
+        .expect("run kern");
+    let read_out = String::from_utf8_lossy(&read.stdout);
+    if read_out.contains("MAX=max") || !read_out.contains("MAX=") {
+        let _ = fs::remove_dir_all(&root);
+        eprintln!(
+            "skip: memory controller not delegated here ({})",
+            read_out.trim()
+        );
+        return;
+    }
+    assert!(
+        read_out.contains("GRP=1"),
+        "kern must set memory.oom.group=1 on a capped box (the whole-box OOM promise): {}",
+        read_out.trim()
+    );
+
+    // 2. Atomic group-kill: a sleeper child and a post-allocation marker must BOTH vanish when the
+    //    parent trips the OOM. With oom.group=1 the kernel SIGKILLs every task in the cgroup at once,
+    //    so neither marker is ever printed; with oom.group=0 the sleeper (or the parent line) would
+    //    outlive the single-process kill and leak a "SURVIVED" line.
+    let out = kern()
+        .args([
+            "box",
+            "oomgrpkill",
+            "--rootfs",
+            rootfs,
+            "-m",
+            "64m",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "( /bin/busybox sleep 3; echo SURVIVED-CHILD ) & \
+             /bin/busybox awk 'BEGIN{s=\"x\";for(i=0;i<27;i++){s=s s};print length(s)}'; \
+             echo SURVIVED-PARENT; wait",
+        ])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let _ = fs::remove_dir_all(&root);
+    if err.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    use std::os::unix::process::ExitStatusExt;
+    if out.status.success() {
+        eprintln!("skip: memory cap not enforced here (box allocated uncapped)");
+        return;
+    }
+    let oom = out.status.code() == Some(137) || out.status.signal() == Some(libc::SIGKILL);
+    assert!(
+        oom,
+        "expected OOM (137 / SIGKILL), got code={:?} signal={:?} (stderr: {err})",
+        out.status.code(),
+        out.status.signal()
+    );
+    assert!(
+        !stdout.contains("SURVIVED"),
+        "oom.group=1 must take the whole box: no task may outlive the kill, but saw: {}",
+        stdout.trim()
+    );
+}
+
 /// `kern cp` round-trips a file host -> box -> host byte-identically, into and out of a detached box.
 #[test]
 fn box_cp_round_trips_a_file_host_box_host() {

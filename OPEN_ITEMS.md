@@ -33,8 +33,9 @@ deliberate hold, not an oversight: an arbitrary OCI profile is a general parser 
 because it is hard and easy to get subtly wrong. A bug there does not crash, it silently permits a
 syscall the profile meant to deny. It earns its own validated effort - a pinned parser and an
 exhaustive `filter classifies every rule as intended` proof, the same bar the allowlist met - not a
-rushed add. Until then, `--cap-drop` narrows the capability set per box today, and
-`KERN_SECCOMP=allowlist` is the stricter posture; neither needs a hand-written profile.
+rushed add. Until then, `--cap-drop` narrows the capability set per box today, and the shipped
+allowlist - the default posture, not something you opt into - is already the stricter of the two
+filters (`KERN_SECCOMP=denylist` opts *down* to the wider set); neither needs a hand-written profile.
 
 ## Whether a survivable denial helps an attacker is not known
 
