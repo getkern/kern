@@ -1325,9 +1325,74 @@ fn memory_capped_at_or_below(child: &std::path::Path, requested: u64) -> bool {
     })
 }
 
+/// Whether THIS box's requested `--memory` cap is actually being enforced, recorded for the second byte
+/// of the `KERN_STARTED_FD` signal so an SDK can tell an OOM against a real ceiling from a plain kill
+/// where the cap never bound. `0` = undetermined (no `--memory` requested, or `/proc/self/cgroup`
+/// unreadable); `1` = enforced (a real ceiling at or below the request bounds the box); `2` = requested
+/// but NOT enforced (no cgroup delegation here). Set ONCE at box start by [`record_memory_cap_signal`]
+/// and read ONCE by the box_run teardown. Process-static because that write and this read live in
+/// different crates but the SAME process (the direct supervisor, or the `KERN_SCOPE` re-exec - both run
+/// `apply_limits` and reach the signal write). `Release`/`Acquire` pair the two.
+static MEMORY_CAP_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Record, for the started-fd's enforcement byte, whether the box's `--memory` cap actually binds. Call
+/// EXACTLY ONCE, at box start, AFTER `apply_limits` has moved the supervisor into the box's cgroup (so
+/// `/proc/self/cgroup` is the box's own - the `kern-box-*` child on the direct path, the systemd scope
+/// on the scope path) and BEFORE the box forks. The value-aware [`memory_capped_at_or_below`] check
+/// mirrors `warn_unenforced_caps`, so the signal and the warning cannot disagree. No `--memory` leaves
+/// it `0` (undetermined): nothing to attribute an OOM to.
+pub fn record_memory_cap_signal(memory: Option<u64>) {
+    use std::sync::atomic::Ordering;
+    let signal = match memory {
+        None => 0,
+        Some(req) => match current_v2_cgroup() {
+            Some(dir) if memory_capped_at_or_below(&dir, req) => 1,
+            Some(_) => 2,
+            None => 0, // cgroup layout we do not model: stay undetermined rather than claim either way
+        },
+    };
+    MEMORY_CAP_SIGNAL.store(signal, Ordering::Release);
+}
+
+/// The enforcement byte recorded by [`record_memory_cap_signal`], for the second byte of the
+/// `KERN_STARTED_FD` signal. `0` undetermined, `1` enforced, `2` requested-but-not-enforced.
+pub fn memory_cap_signal() -> u8 {
+    MEMORY_CAP_SIGNAL.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_cap_signal_is_a_determined_verdict_only_for_a_request() {
+        // No `--memory` requested -> undetermined (0): a SIGKILL cannot be attributed to a cap that was
+        // never asked for. This holds on every host, so it anchors the round-trip through the atomic.
+        record_memory_cap_signal(None);
+        assert_eq!(memory_cap_signal(), 0, "no request => undetermined");
+        // A 1-byte request is satisfiable by NO real ancestor cap, so where cgroup v2 is present it must
+        // read NOT-enforced (2), never enforced(1). Where /proc/self/cgroup has no `0::` line (an unusual
+        // test host) the check cannot model the layout and stays undetermined (0). Anything else is a bug
+        // in the value-aware comparison. This is the positive control that the signal compares against
+        // the request, not mere `memory.max` existence.
+        record_memory_cap_signal(Some(1));
+        match memory_cap_signal() {
+            0 => {} // no cgroup v2 layout to inspect on this host
+            2 => {
+                // v2 present: a real request now resolves to a definite verdict (enforced or not),
+                // never back to undetermined.
+                record_memory_cap_signal(Some(64 * 1024 * 1024));
+                let s = memory_cap_signal();
+                assert!(
+                    s == 1 || s == 2,
+                    "a request must resolve to 1 or 2, got {s}"
+                );
+            }
+            other => {
+                panic!("a 1-byte cap can only read undetermined(0) or not-enforced(2), got {other}")
+            }
+        }
+    }
 
     #[test]
     fn controller_availability_reads_cgroup_controllers() {

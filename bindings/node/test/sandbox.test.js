@@ -485,6 +485,13 @@ test("SIGKILL is oom only when a memory cap was set", () => {
   assert.strictEqual(capped._classify(137, null, "", true).type, "timeout"); // our deadline beats oom
   assert.strictEqual(capped._classify(159, null, "", false).type, "escape_blocked"); // SIGSYS beats oom
   assert.strictEqual(capped._classify(143, null, "", false).type, "timeout"); // kern's backstop, not oom
+  // capSignal (kern's unforgeable enforcement byte) refines the SIGKILL verdict: 1 = enforced -> oom, 2
+  // = requested-but-not-enforced -> killed (no overclaim), 0 = undetermined (old kern) -> heuristic.
+  // NB: capSignal is the 6th arg (timeoutS is the 5th) - pass null for timeoutS.
+  assert.strictEqual(capped._classify(137, null, "", false, null, 1).type, "oom"); // enforced: certain OOM
+  assert.strictEqual(capped._classify(137, null, "", false, null, 2).type, "killed"); // not enforced: no overclaim
+  assert.strictEqual(capped._classify(137, null, "", false, null, 0).type, "oom"); // undetermined: heuristic
+  assert.strictEqual(capped._classify(null, "SIGKILL", "", false, null, 2).type, "killed");
 });
 
 test("sensitive mount source is refused", () => {
@@ -926,6 +933,12 @@ test("kernel death is oom only when a memory cap was set", () => {
   assert.strictEqual(capped._kernelDeathFault(marker)[0], "startup_failed");
   const uncapped = new kern.Kernel(new Sandbox({ memoryMb: null }), 5);
   assert.strictEqual(uncapped._kernelDeathFault("")[0], "killed");
+  // capSignal refines it, same as the one-shot path: enforced (1) -> oom, not-enforced (2) -> killed
+  // (no overclaim), undetermined (0) -> heuristic. A startup marker still wins over the byte.
+  assert.strictEqual(capped._kernelDeathFault("", 1)[0], "oom");
+  assert.strictEqual(capped._kernelDeathFault("", 2)[0], "killed");
+  assert.strictEqual(capped._kernelDeathFault("", 0)[0], "oom");
+  assert.strictEqual(capped._kernelDeathFault(marker, 2)[0], "startup_failed");
 });
 
 test("concurrent calls on one Sandbox do not fight over the env file", exec, async () => {

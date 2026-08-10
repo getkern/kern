@@ -98,8 +98,8 @@ A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it i
 |---|---|
 | `timeout` | the call exceeded `timeoutS`; the binding killed the box |
 | `escape_blocked` | a syscall was blocked by the seccomp filter (SIGSYS) |
-| `oom` | the box was SIGKILLed with a `memoryMb` cap in effect: a breached `memory.max` is the cgroup OOM-killer (`memory.oom.group=1` kills the whole box) |
-| `killed` | the box was SIGKILLed with **no** memory cap set, so the cause is ambiguous (host pressure, an external kill) and is not attributed to OOM |
+| `oom` | the box was SIGKILLed and a `memoryMb` cap was **in force**: a breached `memory.max` is the cgroup OOM-killer (`memory.oom.group=1` kills the whole box). kern reports whether the cap actually bound on an unforgeable per-box channel (2nd byte of `KERN_STARTED_FD`), so this is an *enforced-cap* OOM |
+| `killed` | a SIGKILL **not** attributed to a cgroup OOM: no `memoryMb` cap was set, or kern reported the cap did not bind here (no cgroup delegation), so it is host pressure / an external kill. Older kern (no enforcement byte) falls back to `oom` when a cap was set |
 
 A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
 seccomp/AppArmor/cgroup setup error, or a pull/image error) is **thrown** as a `SandboxError`, not

@@ -380,6 +380,13 @@ def test_classify_sigkill_is_oom_only_when_a_memory_cap_was_set():
     assert capped._classify(137, "", True).type == "timeout"  # our deadline beats oom
     assert capped._classify(159, "", False).type == "escape_blocked"  # SIGSYS beats oom
     assert capped._classify(143, "", False).type == "timeout"  # kern's --timeout backstop, not oom
+    # cap_signal (kern's UNFORGEABLE enforcement byte) refines the SIGKILL verdict: 1 = enforced -> a
+    # certain cgroup OOM; 2 = requested-but-not-enforced -> not attributable to the box's cgroup, so we
+    # do NOT overclaim oom (honest `killed`); 0 = undetermined (older kern) -> the memory_mb heuristic.
+    assert capped._classify(137, "", False, cap_signal=1).type == "oom"  # enforced: certain OOM
+    assert capped._classify(137, "", False, cap_signal=2).type == "killed"  # not enforced: no overclaim
+    assert capped._classify(137, "", False, cap_signal=0).type == "oom"  # undetermined: heuristic stands
+    assert capped._classify(-signal.SIGKILL, "", False, cap_signal=2).type == "killed"
 
 
 def test_exit_125_startup_failure_requires_the_kern_marker_not_a_bare_125():
@@ -907,6 +914,13 @@ def test_kernel_death_is_oom_only_when_a_memory_cap_was_set():
     assert capped._kernel_death_fault(marker)[0] == "startup_failed"  # a box that never really started
     uncapped = Kernel(_cfg(memory_mb=None), timeout_s=5)
     assert uncapped._kernel_death_fault("")[0] == "killed"
+    # cap_signal (kern's unforgeable enforcement byte) refines it, same as the one-shot path: enforced
+    # (1) -> oom, requested-but-not-enforced (2) -> killed (no overclaim), undetermined (0) -> heuristic.
+    assert capped._kernel_death_fault("", cap_signal=1)[0] == "oom"
+    assert capped._kernel_death_fault("", cap_signal=2)[0] == "killed"
+    assert capped._kernel_death_fault("", cap_signal=0)[0] == "oom"
+    # A startup marker still wins over the enforcement byte (the box never came up).
+    assert capped._kernel_death_fault(marker, cap_signal=2)[0] == "startup_failed"
 
 
 @integration

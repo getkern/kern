@@ -1965,9 +1965,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // writes, so its EOF is an unforgeable "did not start". EINTR-safe: a lost byte would read as
             // EOF and mislabel a healthy box as startup_failed.
             if let Some(fd) = started_fd {
-                let buf = [1u8];
+                // TWO bytes, written atomically (a pipe write of <= PIPE_BUF is all-or-nothing):
+                //   byte 0 = `1`, the unchanged "box started" signal - an SDK that reads only ONE byte
+                //           (every 0.1.x binding) still sees exactly `0x01` and is unaffected;
+                //   byte 1 = the memory-cap ENFORCEMENT signal (0 undetermined, 1 enforced, 2 requested
+                //           but not enforced), so a NEWER SDK can tell an OOM against a real ceiling from
+                //           a plain kill where the cap never bound. An OLDER kern wrote one byte, so a
+                //           newer SDK reads EOF for byte 1 and treats enforcement as undetermined.
+                let buf = [1u8, kern_isolation::memory_cap_signal()];
                 loop {
-                    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), 1) };
+                    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
                     if n < 0
                         && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
                     {

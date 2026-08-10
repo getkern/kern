@@ -2653,6 +2653,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         crate::cgroup::warn_unenforced_caps(spec.memory_max, spec.cpus, spec.pids_max);
     }
 
+    // Record whether the memory cap actually binds, for the `KERN_STARTED_FD` enforcement byte. HERE is
+    // the one correct point: `apply_limits` above has moved the supervisor into the box's own cgroup
+    // (`/proc/self/cgroup` is the `kern-box-*` child on the direct path, or the systemd scope on the
+    // scope path), and the box has not yet forked, so the value-aware check sees exactly the ceiling the
+    // box will run under. Read once by the box_run teardown that writes the started byte. All paths.
+    crate::cgroup::record_memory_cap_signal(spec.memory_max);
+
     // FAIL-CLOSED on the direct fast path. When we DELIBERATELY skipped the per-box systemd scope
     // (`took_direct_cap_path()` - the SAME canonical predicate `reexec` used, so they can't diverge), the
     // box's OWN cgroup is the sole enforcer. `apply_limits` returns `None` iff a MANDATORY cap didn't bite

@@ -41,6 +41,7 @@ import queue
 import re
 import select
 import shutil
+import select
 import signal
 import stat
 import subprocess
@@ -1061,6 +1062,7 @@ class Sandbox:
         started_r, started_w = os.pipe()
         child_env["KERN_STARTED_FD"] = str(started_w)
         box_started = False
+        cap_signal = 0  # 2nd started byte: 0 undetermined/old-kern, 1 memory cap enforced, 2 not enforced
         try:
             try:
                 # start_new_session so the box + kern share a process group we can signal as a unit.
@@ -1096,12 +1098,15 @@ class Sandbox:
             # has reaped the box by now in the timeout case). On the normal path _wait_for_exit above
             # has already reaped, and this returns immediately on the returncode check.
             _wait_for_exit(proc, 8.0)
-            # kern has exited, so its write end is closed: one byte = the box started (setup succeeded,
-            # command ran); EOF (empty) = it never started, or an old kern that does not signal.
+            # kern has exited, so its write end is closed. Byte 0 = the box started (setup succeeded,
+            # command ran); EOF (empty) = it never started, or an old kern that does not signal. Byte 1
+            # (a NEWER kern only) = the memory-cap enforcement signal; absent (EOF) = undetermined.
             try:
-                box_started = os.read(started_r, 1) == b"\x01"
+                sig = os.read(started_r, 2)
             except OSError:
-                box_started = False
+                sig = b""
+            box_started = len(sig) >= 1 and sig[0] == 1
+            cap_signal = sig[1] if len(sig) >= 2 else 0
         finally:
             # Every exit path, including the two SandboxErrors above: kern has read the file by the time
             # it exits, and leaving it behind would accrete one per call in a persistent workspace.
@@ -1117,7 +1122,7 @@ class Sandbox:
         stdout = out.buf.decode("utf-8", "replace")
         stderr = err.buf.decode("utf-8", "replace")
         rc = proc.returncode if proc.returncode is not None else -1
-        fault = self._classify(rc, stderr, we_timed_out, timeout_s)
+        fault = self._classify(rc, stderr, we_timed_out, timeout_s, cap_signal)
         if box_started and fault is not None and fault.type == "startup_failed":
             # kern signalled the box STARTED, so a `startup_failed` here can only be the stderr heuristic
             # matching a marker the WORKLOAD wrote (the code-based faults are decided before it). The box
@@ -1165,7 +1170,12 @@ class Sandbox:
             pass
 
     def _classify(
-        self, rc: int, stderr: str, we_timed_out: bool, timeout_s: "int | float | None" = None
+        self,
+        rc: int,
+        stderr: str,
+        we_timed_out: bool,
+        timeout_s: "int | float | None" = None,
+        cap_signal: int = 0,
     ) -> SandboxFault | None:
         # ORDER IS A SECURITY PROPERTY. The classes that are DETERMINISTIC by exit code are decided
         # FIRST, BEFORE we ever look at stderr - because stderr is a channel the workload controls, and
@@ -1186,13 +1196,22 @@ class Sandbox:
             # SIGKILL not from our deadline: exit 137 (128+9), or subprocess's -9 if kern itself was
             # signalled. A memory-capped box SIGKILLed is the cgroup OOM-killer - precisely what a
             # breached `memory.max` does (kern sets `memory.oom.group=1`, so the whole box dies at once).
-            # We claim `oom` when a `--memory` cap was in effect: a fact WE set on the argv, NOT a
-            # workload-controlled channel, so the order-is-a-security-property discipline is preserved
-            # (the deterministic timeout/SIGSYS classes are already decided above, and we never read the
-            # adversary's stderr here). Uncapped, the cause is ambiguous (host pressure, an external
-            # kill) and we keep the honest `killed`.
-            if self.memory_mb is not None:
+            # `cap_signal` is kern's UNFORGEABLE per-box enforcement byte (2nd byte of KERN_STARTED_FD, so
+            # not the workload's stderr - the order-is-a-security-property discipline holds): 1 = the cap
+            # was enforced, 2 = requested but NOT enforced here (no cgroup delegation), 0 = undetermined
+            # (an older kern, or no `--memory`). We claim `oom` when a `--memory` cap was set AND kern did
+            # not report it unenforced (`cap_signal != 2`): enforced (1) is a certain cgroup OOM, and
+            # undetermined (0) keeps the pre-signal heuristic for older kerns. When kern reports the cap
+            # did NOT bind (2), a SIGKILL cannot be attributed to the box's cgroup - it is host memory
+            # pressure or an external kill - so we do not overclaim `oom` and keep the honest `killed`.
+            if self.memory_mb is not None and cap_signal != 2:
                 return SandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL)")
+            if cap_signal == 2:
+                return SandboxFault(
+                    "killed",
+                    "the box was SIGKILLed, but its memory cap was not enforced here (no cgroup "
+                    "delegation), so it is not attributed to a cgroup OOM",
+                )
             return SandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM")
         if rc in (_EXIT_SIGTERM, -signal.SIGTERM):
             # SIGTERM without our deadline firing = kern's OWN --timeout backstop reaped the box (it
@@ -1654,6 +1673,10 @@ class Kernel:
         self._q: "queue.Queue" = queue.Queue()
         self._err: "_CappedReader | None" = None
         self._dead = False
+        # Read end of kern's KERN_STARTED_FD channel. For a RESIDENT box kern writes it only at box
+        # teardown (the box exits), i.e. when a cell kills the kernel - so it is read ONCE, bounded, on
+        # death (see `_read_cap_signal`), never while the box is live (that would block).
+        self._started_r = -1
 
     def __enter__(self) -> "Kernel":
         sbx = self._sbx
@@ -1671,14 +1694,23 @@ class Kernel:
         child_env = dict(os.environ)
         if not sbx.enforce_limits:
             child_env["KERN_NO_SCOPE"] = "1"
-        self._proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            start_new_session=True,
-        )
+        # Same unforgeable channel as the one-shot path; here it carries the memory-cap enforcement byte
+        # we consume only on kernel death (`_read_cap_signal`). The workload never holds the write end.
+        started_r, started_w = os.pipe()
+        child_env["KERN_STARTED_FD"] = str(started_w)
+        try:
+            self._proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                start_new_session=True,
+                pass_fds=(started_w,),
+            )
+        finally:
+            os.close(started_w)  # the parent never writes; the box holds the only write end now
+        self._started_r = started_r
         _FrameReader(self._proc.stdout, self._q, sbx.max_output_bytes).start()
         # Drain stderr so the box never blocks on a full stderr pipe; the control protocol is on stdout,
         # so stderr only carries kern setup errors / stray driver noise.
@@ -1706,7 +1738,7 @@ class Kernel:
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            fault, default = self._kernel_death_fault(err)
+            fault, default = self._kernel_death_fault(err, self._read_cap_signal())
             return self._teardown_result(fault, err.strip() or default, started)
         try:
             reply = self._q.get(timeout=eff)
@@ -1718,22 +1750,47 @@ class Kernel:
             )
         if reply is None:
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            fault, default = self._kernel_death_fault(err)
+            fault, default = self._kernel_death_fault(err, self._read_cap_signal())
             return self._teardown_result(fault, err.strip() or default, started)
         return self._result_from_reply(reply, started)
 
-    def _kernel_death_fault(self, err: str) -> "tuple[str, str]":
+    def _read_cap_signal(self) -> int:
+        """kern's memory-cap enforcement byte for the resident box, read ONCE on kernel death. kern
+        writes the two-byte KERN_STARTED_FD signal only at the box's teardown (a resident box exits when
+        a cell kills it), so this is called from the death paths above and NEVER while the box is live
+        (that read would block). Bounded: `select` waits up to 2 s for kern to reap the box and close the
+        fd, then reads. Returns 0 (undetermined -> the memory_mb heuristic stands) on EOF (an older kern),
+        timeout, or any error, so a missing signal only ever falls back, never blocks or raises."""
+        if self._started_r < 0:
+            return 0
+        try:
+            ready, _, _ = select.select([self._started_r], [], [], 2.0)
+            if not ready:
+                return 0
+            sig = os.read(self._started_r, 2)
+        except OSError:
+            return 0
+        return sig[1] if len(sig) >= 2 else 0
+
+    def _kernel_death_fault(self, err: str, cap_signal: int = 0) -> "tuple[str, str]":
         """Why the resident kernel box died mid-cell, and a default message. A kern setup marker on
-        stderr means it never came up (``startup_failed``). Otherwise, with a ``--memory`` cap in force,
-        the cgroup OOM-killer is the dominant cause of a kernel that vanishes while running a cell - the
-        SAME attribution, from the same non-workload signal (the ``--memory`` flag WE set), as the
-        one-shot :meth:`_classify` SIGKILL path. Uncapped, the cause is ambiguous -> ``killed``. This is
-        the ``run_code`` counterpart of that path: a kernel death does NOT flow through ``_classify``
-        (there is no per-cell exit code - the kernel is resident), so the OOM attribution lives here too."""
+        stderr means it never came up (``startup_failed``). Otherwise this is the ``run_code`` counterpart
+        of the one-shot :meth:`_classify` SIGKILL branch - a kernel death has no per-cell exit code, so
+        the OOM attribution lives here. ``cap_signal`` is kern's UNFORGEABLE enforcement byte (0 = old
+        kern / undetermined, 1 = memory cap enforced, 2 = requested but NOT enforced): with a ``--memory``
+        cap in force AND not-reported-unenforced (``!= 2``), the cgroup OOM-killer is the cause -> ``oom``;
+        when kern reports the cap did not bind (``2``) the kill cannot be attributed to the box's cgroup
+        -> ``killed``; uncapped is also ``killed``."""
         if _looks_like_startup_failure(err):
             return "startup_failed", "the kernel box failed to start"
-        if self._sbx.memory_mb is not None:
+        if self._sbx.memory_mb is not None and cap_signal != 2:
             return "oom", "the kernel box was OOM-killed (it exceeded its memory cap)"
+        if cap_signal == 2:
+            return (
+                "killed",
+                "the kernel box was SIGKILLed, but its memory cap was not enforced here (no cgroup "
+                "delegation), so it is not attributed to a cgroup OOM",
+            )
         return "killed", "the kernel box exited"
 
     def _result_from_reply(self, reply: bytes, started: float) -> ExecutionResult:
@@ -1841,6 +1898,12 @@ class Kernel:
                 self._kill()
         elif proc is not None:
             self._kill()
+        if self._started_r >= 0:
+            try:
+                os.close(self._started_r)  # read once on death; closed here on every context exit
+            except OSError:
+                pass
+            self._started_r = -1
         try:
             os.unlink(os.path.join(self._sbx._ws, self._driver))
         except OSError:
