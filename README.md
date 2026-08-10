@@ -285,7 +285,7 @@ and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
 ## Security
 
 Namespaces, a `pivot_root`, 14 dangerous capabilities dropped before exec, an always-on seccomp
-**allowlist** by default (moby's own default filter minus kern's 34 escape syscalls, which stay
+**allowlist** by default (moby's own default filter minus kern's 35 escape syscalls, which stay
 hard-killed; a syscall outside the vetted set returns `ENOSYS`, and the wider denylist is the opt-out
 via `KERN_SECCOMP=denylist`), cgroup v2 limits (`--require-limits` refuses to start unless they bind),
 and a deny-by-default `/dev`. Where a boundary is cooperative rather than kernel-enforced,

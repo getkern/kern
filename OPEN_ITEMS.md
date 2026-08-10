@@ -30,14 +30,14 @@ rushed add. Until then, `--cap-drop` narrows the capability set per box today, a
 
 ## Whether a survivable denial helps an attacker is not known
 
-Ten denied syscalls return `ENOSYS` instead of killing the caller, so software probing for an
+Eleven denied syscalls return `ENOSYS` instead of killing the caller, so software probing for an
 optional fast path falls back rather than dying. [SECURITY.md](SECURITY.md) has the set.
 
 Measured: the errno leaks nothing, because a denied `io_uring_setup` and a syscall number no kernel
 implements are both `-1 ENOSYS` from inside the box. Not measured: whether a cheaper map of the
 filter is worth anything to an attacker who already has code execution in the box. Mapping is not
 bypassing, and there is no evidence either way. If it turns out to matter, the lever is to move
-those ten to `SIGSYS` and lose the fallback behaviour.
+those eleven to `SIGSYS` and lose the fallback behaviour.
 
 ## Landlock is gated on the kernel ABI
 

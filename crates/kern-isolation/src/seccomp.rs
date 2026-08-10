@@ -219,7 +219,7 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
 /// while letting the fallback path (epoll/threads/no-op) take over. Not affected by `allow_nesting` -
 /// none of these are nesting syscalls. True escape vectors (kexec, modules, the mount API, bpf,
 /// ptrace, the nesting set) stay in [`denylist`] and still KILL.
-fn errno_syscalls() -> [libc::c_long; 10] {
+fn errno_syscalls() -> [libc::c_long; 11] {
     [
         // `clone3(2)`: the ONLY entry here that is not a deny-but-degrade capability probe, and the
         // reason it is here rather than in `denylist` is a hard limit of seccomp-BPF, not a policy
@@ -250,6 +250,15 @@ fn errno_syscalls() -> [libc::c_long; 10] {
         // syslog(2)/klogctl reads the kernel ring buffer (dmesg) - an info leak; a prober just gets
         // nothing. (The libc `syslog()` LOGGING function uses /dev/log, not this syscall - unaffected.)
         libc::SYS_syslog,
+        // `open_by_handle_at(2)`: opens a file by an OPAQUE handle, bypassing the path + mount-namespace
+        // view - the classic container-escape primitive with `CAP_DAC_READ_SEARCH` (a box keeps it,
+        // userns-scoped). Already neutered here (`pivot_root` detaches the host mounts, the box overlay
+        // returns EOPNOTSUPP to `name_to_handle_at`, and the cap is not effective over host-owned inodes,
+        // verified), but denied at the FILTER too so the primitive is closed at the layer rather than
+        // left to the cap model - the posture Docker's default reaches by gating it on the dropped cap. A
+        // handle-based tool degrades to a path-based open on `ENOSYS`; ordinary workloads never call it.
+        // `name_to_handle_at` stays allowed: it only mints a handle, inert without this call to open it.
+        libc::SYS_open_by_handle_at,
     ]
 }
 
@@ -1272,7 +1281,11 @@ mod tests {
                     // The prose count is now pinned too.
                     format!(
                         "{word}, in {} families",
-                        if errno == 10 { "six" } else { "?" }
+                        match errno {
+                            10 => "six",
+                            11 => "seven",
+                            _ => "?",
+                        }
                     ),
                 ],
             ),

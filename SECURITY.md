@@ -64,16 +64,17 @@ privilege-escalation bug is an escape.
   over the box's own user namespace, and the always-on filter still blocks the escape syscalls it
   would unlock, so `--cap-add` cannot breach the host.
 - **Always-on seccomp, allowlist by default**: the shipped default is moby's own default filter
-  minus kern's 34 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
-  opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **34 escape syscalls** below:
-  24 that hard-kill plus the 10 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do not take the number from
+  minus kern's 35 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
+  opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **35 escape syscalls** below:
+  24 that hard-kill plus the 11 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do not take the number from
   this file, ask the binary: `kern box <name> --image <ref> --show-config` prints
   `seccomp_denied_syscalls` from the live lists. The set: kexec (+`_file_load`), module
   load/unload, `ptrace` + `process_vm_readv`/`writev`, reboot, swap, the classic **and** new mount
   API including the whole reconfiguration family (`mount_setattr`, `fspick`,
   `fsopen`/`fsconfig`/`fsmount`, `open_tree`/`move_mount`), so a box cannot re-mount its own root
   writable, plus `pivot_root`, `setns`, `unshare`, `bpf`, `clone3`, io_uring's three, `userfaultfd`,
-  `perf_event_open`, the keyring's three and `syslog`. Wrong-arch syscalls are killed, and on x86_64
+  `perf_event_open`, the keyring's three, `syslog`, and `open_by_handle_at` (the file-handle escape
+  primitive Docker gates on the dropped `CAP_DAC_READ_SEARCH`). Wrong-arch syscalls are killed, and on x86_64
   so is every **x32-ABI** syscall, closing the bypass where the x32 alias of a denied number slips
   past a number-only filter.
 - **`clone(2)` is filtered on its ARGUMENTS**, and it is the only rule of that shape. Denying
@@ -119,9 +120,10 @@ privilege-escalation bug is an escape.
 ### What a denied syscall returns
 
 The filter has two verdicts. Real escape vectors (kexec, module load/unload, the mount API, `bpf`,
-`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Ten, in six
-families that software merely probes for an optional fast path (io_uring's three, `userfaultfd`,
-`perf_event_open`, the keyring's three, `syslog`, and `clone3`), return **`ENOSYS`**. They are
+`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Eleven, in seven
+families - the ten software probes for an optional fast path, plus the file-handle escape primitive -
+(io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog`, `clone3`, and
+`open_by_handle_at`), return **`ENOSYS`**. They are
 equally denied; the difference is only what the caller sees, and it is the difference between Redis
 falling back to its epoll path and Redis dying. The two sets are asserted disjoint by a test.
 
