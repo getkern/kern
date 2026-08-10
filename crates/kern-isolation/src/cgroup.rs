@@ -961,6 +961,23 @@ pub fn apply_limits(
     // Where the supervisor is RIGHT NOW - captured BEFORE we move it into the box cgroup, so the guard can
     // move it back and remove the (then-empty) box cgroup on the direct path (no systemd `--collect` there).
     let origin = current_v2_cgroup();
+    // Whole-box OOM on the scope / managed-unit path. When an OUTER systemd enforcer is present
+    // (`KERN_SCOPE` re-exec, `KERN_MANAGED` --restart unit, `KERN_BUILD_STEP`) the box runs directly in
+    // that ancestor's cgroup: systemd caps it via `MemoryMax`, but the ancestor's `memory.oom.group`
+    // is 0, so an OOM would kill ONE process and leave the box half-dead - exactly what the child write
+    // below prevents on the direct path. And the per-box `systemd-run --scope` is not `Delegate=yes`, so
+    // the capped `kern-box-*` child below often cannot be built under the scope (`apply_limits` returns
+    // `None`) and the box stays in `origin`. Set `oom.group=1` on `origin` so the whole-box kill holds
+    // here too. Gated on `outer_enforcer_present()`: on the direct and best-effort paths `origin` is the
+    // caller's OWN (shell) cgroup, which must not be touched. Best-effort and idempotent (verified
+    // writable from inside a scope on an Arduino UNO Q, whose non-delegated scope is exactly this case);
+    // a failure loses only the whole-box guarantee, never a cap. Runs before the box's mount namespace
+    // remounts `/sys/fs/cgroup` read-only.
+    if outer_enforcer_present() {
+        if let Some(o) = &origin {
+            let _ = fs::write(o.join("memory.oom.group"), "1");
+        }
+    }
     // The single direct-path decision, computed ONCE and reused at the parent-select and fail-closed sites
     // so they can't drift: the caller must AUTHORISE it (`allow_direct`) AND the canonical env/systemd
     // predicate must hold (`took_direct_cap_path()`). `kern run` passes `allow_direct=false`, so it can
@@ -1022,11 +1039,13 @@ pub fn apply_limits(
     // while PID 1 survives, leaving the box half-dead but still reading `running` (the orphan detector
     // does NOT catch this - the supervisor is alive and the cgroup is populated). Set on EVERY box (the
     // DEFAULT_MEMORY_MAX applies even without `--memory`), written BEFORE the workload joins the cgroup
-    // below so an early OOM already kills the whole group. Best-effort and SILENT on failure: the file
-    // exists only when the `memory` controller is delegated - exactly the case the "--memory not
-    // enforced" warning below already reports, so a second message here would be noise, and kern makes
-    // no doc promise of atomic OOM termination that a warning would need to defend. Available since
-    // Linux 4.19 (all supported hosts: the oldest board is 5.15).
+    // below so an early OOM already kills the whole group. This is the DIRECT-path write, to the
+    // `kern-box-*` child; the scope / managed-unit path is covered by the `origin` write above (the
+    // box runs in the ancestor there). CHANGELOG promises "an OOM kills the whole box", so BOTH paths
+    // set it. Best-effort and SILENT on failure: the file exists only when the `memory` controller is
+    // delegated - exactly the case the "--memory not enforced" warning below already reports, so a
+    // second message here would be noise. Available since Linux 4.19 (all supported hosts: the oldest
+    // board is 5.15).
     let _ = fs::write(child.join("memory.oom.group"), "1");
     // Success gate. DEFAULT (`require_all = false`): keep the box if AT LEAST ONE mandatory cap bound -
     // partial protection beats none, and the caller warns about the rest. `--require-limits`
