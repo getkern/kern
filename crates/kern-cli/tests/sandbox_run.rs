@@ -2080,6 +2080,124 @@ fn dropped_caps_are_cleared_from_every_set_including_ambient() {
     }
 }
 
+/// **Red-team regression: the DEFAULT box (no `--cap-drop`) drops the 14 dangerous caps.**
+///
+/// The `--cap-drop ALL` test proves the extreme profile; this proves the SHIPPED default. Each cap in
+/// the always-dropped set (`SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_PACCT`, `SYS_BOOT`, `SYS_TIME`,
+/// `AUDIT_CONTROL`, `MAC_OVERRIDE`, `MAC_ADMIN`, `SYSLOG`, `WAKE_ALARM`, `AUDIT_READ`, `PERFMON`, `BPF`)
+/// must be cleared from BOTH the bounding and the effective set of a plain box, read back from its own
+/// `/proc/self/status`. A cap kept by default (e.g. `SYS_ADMIN`, bit 21) is deliberately NOT asserted
+/// gone - it is held, but only over the box's own user namespace, which is a separate claim.
+#[test]
+fn default_box_drops_the_dangerous_caps() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // The always-dropped cap numbers (kern's DEFAULT_DROP set); never re-added on a default box.
+    const DROPPED: [u32; 14] = [16, 17, 19, 20, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39];
+    let root = build_rootfs(&busybox, "defcaps");
+    let rootfs = root.to_str().unwrap();
+    let out = kern_out(&[
+        "box",
+        "defcaps",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "grep -E '^Cap(Eff|Bnd):' /proc/self/status",
+    ]);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = fs::remove_dir_all(&root);
+    for cap in ["CapEff", "CapBnd"] {
+        let line = s
+            .lines()
+            .find(|l| l.starts_with(cap))
+            .unwrap_or_else(|| panic!("{cap} missing from /proc/self/status: {s:?}"));
+        let hex = line.split_whitespace().last().unwrap_or("");
+        let mask = u64::from_str_radix(hex, 16)
+            .unwrap_or_else(|_| panic!("{cap} value not hex: {line:?}"));
+        for bit in DROPPED {
+            assert_eq!(
+                (mask >> bit) & 1,
+                0,
+                "cap bit {bit} must be cleared from {cap} on a default box (got {hex}): {line:?}"
+            );
+        }
+    }
+}
+
+/// **Red-team regression: a box can neither SEE nor RAISE a cgroup above its own.**
+///
+/// The box runs in a cgroup namespace, so `/proc/self/cgroup` reads `0::/` - its own delegated cgroup
+/// AS the root, every ancestor invisible - where the same read on the host shows the full slice path.
+/// And the box's `/sys/fs/cgroup` is mounted read-only, so it cannot raise its own `memory.max` (or any
+/// controller) above the delegated cap. Discriminant: the host read shows a real ancestor path; the box
+/// read shows `0::/`, and the raise is refused. Skip-graceful where the box is not placed in a cgroup ns.
+#[test]
+fn box_cannot_see_or_raise_a_parent_cgroup() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // Positive control: on the host the same read is NOT `0::/` (else `0::/` in the box would be
+    // meaningless - it must be the box's namespacing, not a universal value).
+    let host_cg = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    if host_cg.trim() == "0::/" || host_cg.trim().is_empty() {
+        eprintln!("skip: host is already at the cgroup-ns root (no discriminant): {host_cg:?}");
+        return;
+    }
+    let root = build_rootfs(&busybox, "cgiso");
+    let rootfs = root.to_str().unwrap();
+    let out = kern_out(&[
+        "box", "cgiso", "--rootfs", rootfs, "--memory", "64m", "--", "/bin/busybox", "sh", "-c",
+        "echo CG=$(cat /proc/self/cgroup); \
+         echo HASMAX=$([ -e /sys/fs/cgroup/memory.max ] && echo yes || echo no); \
+         echo RAISE=$( (echo max > /sys/fs/cgroup/memory.max) 2>/dev/null && echo WROTE || echo blocked); \
+         echo PROCS=$( (echo 0 > /sys/fs/cgroup/cgroup.procs) 2>/dev/null && echo WROTE || echo blocked)",
+    ]);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = fs::remove_dir_all(&root);
+    // The box sees only its own cgroup as root - every ancestor is outside the namespace.
+    assert!(
+        s.contains("CG=0::/\n") || s.trim_end().ends_with("CG=0::/") || s.contains("CG=0::/ "),
+        "box /proc/self/cgroup must be the cgroup-ns root 0::/ (ancestors invisible): {s:?}"
+    );
+    // Where the memory controller is delegated, the box cannot raise its own cap (cgroupfs read-only),
+    // and it cannot move a PID between cgroups (`cgroup.procs` read-only) - so it cannot restructure the
+    // hierarchy to escape a limit set on a node above its own delegated subtree either.
+    if s.contains("HASMAX=yes") {
+        assert!(
+            s.contains("RAISE=blocked"),
+            "box must NOT be able to raise its own memory.max (cgroupfs is read-only): {s:?}"
+        );
+        assert!(
+            s.contains("PROCS=blocked"),
+            "box must NOT be able to write cgroup.procs (no PID moves out of the delegated subtree): {s:?}"
+        );
+    }
+}
+
 /// `-v` round-trips data across the boundary: a read-write volume's writes appear on the host,
 /// and a `:ro` volume rejects writes. The only sanctioned way data enters/leaves a box.
 #[test]

@@ -67,8 +67,11 @@ privilege-escalation bug is an escape.
   `PR_CAPBSET_READ`, and under `--cap-drop ALL` every set (`CapEff`/`CapPrm`/`CapInh`/`CapAmb`/`CapBnd`)
   is asserted all-zero from the box's own `/proc/self/status` (ambient matters: it survives `execve`
   and `NO_NEW_PRIVS` does not clear it). (`SYS_PTRACE`'s `ptrace` syscall is already
-  seccomp-killed; dropping the cap also closes the `/proc/<pid>/mem` cross-process read it would
-  otherwise allow.) `--cap-drop CAP` / `--cap-drop ALL` drops more;
+  seccomp-killed; dropping the cap also closes the **cross-UID** `/proc/<pid>/mem` read - one uid
+  reading another uid's memory in a multi-uid box. A **same-uid** sibling read inside one box stays
+  possible and is not a boundary: a box is a single trust domain, and a host or peer-box process's
+  memory is unreachable regardless because its pid is not in the box's pid namespace.) `--cap-drop
+  CAP` / `--cap-drop ALL` drops more;
   `--cap-add CAP` keeps one that would otherwise go (add wins), and an unknown cap name is a hard
   error so a typo cannot silently leave a cap in place. Even a re-added `CAP_SYS_ADMIN` is held only
   over the box's own user namespace, and the always-on filter still blocks the escape syscalls it

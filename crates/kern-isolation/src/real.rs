@@ -3063,8 +3063,11 @@ const DEFAULT_DROP: &[u32] = &[
     16, // SYS_MODULE     load kernel modules
     17, // SYS_RAWIO      raw I/O ports, /dev/mem, ioperm
     19, // SYS_PTRACE     the `ptrace`/`process_vm_*` syscalls are already seccomp-killed, but the cap
-    //     ALSO bypasses the ptrace-access check on `/proc/<pid>/mem` of another process, so dropping it
-    //     closes that cross-process read too. Docker drops it by default; a debugger needs the killed
+    //     ALSO bypasses the ptrace-access UID check on `/proc/<pid>/mem`, so dropping it closes a
+    //     CROSS-UID read (one uid reading a different uid's memory in a multi-uid box). A SAME-uid
+    //     sibling read stays possible - that is standard Linux and not a sandbox boundary, since a box
+    //     is one trust domain; a host or peer-box process's memory is unreachable regardless, its pid
+    //     not being in the box's pid namespace. Docker drops it by default; a debugger needs the killed
     //     `ptrace` syscall regardless, so this removes no capability a box could actually use.
     20, // SYS_PACCT      process accounting
     22, // SYS_BOOT       reboot / kexec_load

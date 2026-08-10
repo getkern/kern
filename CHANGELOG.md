@@ -22,8 +22,12 @@ the current state of the tree; full detail is in the git history.
   onto the trust-bearing runtime dirs, by `(device, inode)` identity as well as path. The default is
   inverted: everything under the runtime dir is refused except the box-data `logs/` and `scratch/`.
 - `socket(AF_VSOCK, …)` refused with `EAFNOSUPPORT` in both seccomp modes.
-- The bounding-set drop is verified with `PR_CAPBSET_READ`, failing closed if any cap survives.
-- `CAP_SYS_PTRACE` dropped by default (14 caps), closing the `/proc/<pid>/mem` cross-process read.
+- The bounding-set drop is verified with `PR_CAPBSET_READ`, and under `--cap-drop ALL` every set
+  (`CapEff`/`CapPrm`/`CapInh`/`CapAmb`/`CapBnd`) is read back all-zero from `/proc/self/status` -
+  ambient included, since it survives `execve` and `NO_NEW_PRIVS` does not clear it.
+- `CAP_SYS_PTRACE` dropped by default (14 caps), closing the **cross-UID** `/proc/<pid>/mem` read.
+  (A same-uid sibling read inside one box is standard Linux and not a boundary; a host or peer-box
+  pid is not visible in the box's pid namespace, so its memory is unreachable regardless.)
 - The seccomp mode is recorded and reproduced by `kern exec` and the health probe, not re-derived
   from the caller's env; an absent or corrupt record makes `exec` fail-loud.
 - `KERN_MAX_CONCURRENT` enforced atomically under a `flock`, closing the fleet-cap TOCTOU.
