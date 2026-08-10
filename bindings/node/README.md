@@ -98,7 +98,8 @@ A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it i
 |---|---|
 | `timeout` | the call exceeded `timeoutS`; the binding killed the box |
 | `escape_blocked` | a syscall was blocked by the seccomp filter (SIGSYS) |
-| `killed` | the box was SIGKILLed, most often the cgroup OOM-killer |
+| `oom` | the box was SIGKILLed with a `memoryMb` cap in effect: a breached `memory.max` is the cgroup OOM-killer (`memory.oom.group=1` kills the whole box) |
+| `killed` | the box was SIGKILLed with **no** memory cap set, so the cause is ambiguous (host pressure, an external kill) and is not attributed to OOM |
 
 A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
 seccomp/AppArmor/cgroup setup error, or a pull/image error) is **thrown** as a `SandboxError`, not

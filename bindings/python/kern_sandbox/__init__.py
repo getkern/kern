@@ -436,8 +436,9 @@ class SandboxFault:
     """A SANDBOX-level event, reported as DATA on ``ExecutionResult.fault``. ``None`` means the sandbox
     did nothing: any non-zero exit is the user's code. NOTE: ``startup_failed`` is the one type that is
     RAISED (:class:`SandboxError`) rather than returned - a box that never started ran no code, so the
-    result would be hollow - so a fault actually seen on a result is only ``timeout``/``escape_blocked``/
-    ``killed``. The label is kept here because it is how the box-start failure is classified internally.
+    result would be hollow - so a fault actually seen on a result is only ``timeout``/``oom``/
+    ``escape_blocked``/``killed``. The label is kept here because it is how the box-start failure is
+    classified internally.
 
     ``startup_failed`` is decided from an UNFORGEABLE kern signal (a byte on ``KERN_STARTED_FD`` that a
     workload can neither write nor suppress). Against a kern too old to send it, the binding falls back
@@ -445,7 +446,7 @@ class SandboxFault:
     failure - never MISS a real one, so it fails in the safe direction. Pair this binding with the
     matching (or newer) kern release for the unforgeable guarantee."""
 
-    type: Literal["timeout", "escape_blocked", "killed", "startup_failed"]
+    type: Literal["timeout", "oom", "escape_blocked", "killed", "startup_failed"]
     message: str
 
 
@@ -1182,18 +1183,26 @@ class Sandbox:
             # A seccomp-denied syscall. Decided by exit code, so no stderr content can mask it.
             return SandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)")
         if rc == _EXIT_SIGKILL:
-            # SIGKILL not from our deadline: almost always the cgroup OOM-killer, but the binding can't
-            # read the box's memory.events (kern doesn't expose the cgroup path - verified), so we do
-            # NOT claim "oom" as the type. Honest: type=killed, message carries the likely cause.
-            return SandboxFault("killed", "the box was killed (SIGKILL), likely out of memory (exit 137)")
+            # SIGKILL not from our deadline. A memory-capped box SIGKILLed is the cgroup OOM-killer -
+            # precisely what a breached `memory.max` does (kern sets `memory.oom.group=1`, so the whole
+            # box dies at once). We claim `oom` when a `--memory` cap was in effect: that is a fact WE
+            # set on the argv, NOT a workload-controlled channel, so the order-is-a-security-property
+            # discipline above is preserved (we do not read the adversary's stderr to decide it).
+            # Uncapped, the cause is ambiguous (host pressure, an external kill) and we keep `killed`.
+            if self.memory_mb is not None:
+                return SandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL, exit 137)")
+            return SandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM")
         if rc in (_EXIT_SIGTERM, -signal.SIGTERM):
             # SIGTERM without our deadline firing = kern's OWN --timeout backstop reaped the box (it
             # SIGTERMs, then SIGKILLs after a grace). The box exceeded its time limit; label it timeout,
             # noting the backstop caught it rather than our own wait.
             return SandboxFault("timeout", "the box exceeded its time limit (reaped by kern's timeout backstop)")
         if rc == -signal.SIGKILL:
-            # Negative == killed by signal N (subprocess convention) - SIGKILL surfaced as -9.
-            return SandboxFault("killed", "the box was killed (SIGKILL), likely out of memory")
+            # Negative == killed by signal N (subprocess convention) - SIGKILL surfaced as -9. Same
+            # attribution as exit 137 above: a capped box SIGKILLed is the cgroup OOM.
+            if self.memory_mb is not None:
+                return SandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL)")
+            return SandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM")
         # Box-not-started: a non-zero exit whose stderr carries kern's OWN setup-diagnostic markers
         # (printed by the PARENT before the box runs). kern's box-not-started paths BOTH exit 125 (see
         # `box_start_exit_code`) AND print a `kern:` marker, so `rc == 125 && marker` is the reliable

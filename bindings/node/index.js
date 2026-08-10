@@ -1171,8 +1171,15 @@ class Sandbox {
       );
     if (rc === EXIT_SIGSYS || signal === "SIGSYS")
       return sandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)");
-    if (rc === EXIT_SIGKILL || signal === "SIGKILL")
-      return sandboxFault("killed", "the box was killed (SIGKILL) - likely out of memory (exit 137)");
+    if (rc === EXIT_SIGKILL || signal === "SIGKILL") {
+      // A memory-capped box SIGKILLed is the cgroup OOM-killer - what a breached memory.max does (kern
+      // sets memory.oom.group=1, so the whole box dies at once). Claim `oom` when a --memory cap was in
+      // effect: that is a fact WE set on the argv, not the workload's stderr, so it costs no security
+      // discipline. Uncapped, the cause is ambiguous (host pressure, an external kill) - keep `killed`.
+      if (this.memoryMb !== null)
+        return sandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL, exit 137)");
+      return sandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM");
+    }
     if (rc === EXIT_SIGTERM || signal === "SIGTERM")
       return sandboxFault("timeout", "the box exceeded its time limit (reaped by kern's timeout backstop)");
     // Box-not-started: a non-zero exit whose stderr carries kern's OWN setup markers (printed by the

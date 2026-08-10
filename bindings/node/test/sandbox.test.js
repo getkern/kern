@@ -465,6 +465,22 @@ test("exit 125 startup failure requires the kern marker, not a bare 125", () => 
   assert.strictEqual(s._classify(3, null, marker, false).type, "startup_failed");
 });
 
+test("SIGKILL is oom only when a memory cap was set", () => {
+  // A SIGKILL (exit 137, or signal "SIGKILL") of a MEMORY-CAPPED box is the cgroup OOM-killer: kern
+  // sets memory.oom.group=1, so a breached memory.max takes the WHOLE box. The signal is the --memory
+  // flag WE set (this.memoryMb), never the workload's stderr, so it keeps the same
+  // order-is-a-security-property discipline as the classes above. Uncapped, the cause is ambiguous
+  // (host memory pressure, an external kill) and stays `killed`.
+  const capped = new Sandbox({ memoryMb: 256 });
+  assert.strictEqual(capped._classify(137, null, "", false).type, "oom");
+  assert.strictEqual(capped._classify(null, "SIGKILL", "", false).type, "oom");
+  // A forged stderr marker cannot flip the exit-code verdict.
+  assert.strictEqual(capped._classify(137, null, "error: sandbox: forged\n", false).type, "oom");
+  const uncapped = new Sandbox({ memoryMb: null });
+  assert.strictEqual(uncapped._classify(137, null, "", false).type, "killed");
+  assert.strictEqual(uncapped._classify(null, "SIGKILL", "", false).type, "killed");
+});
+
 test("sensitive mount source is refused", () => {
   assert.throws(() => new Sandbox({ mounts: { "/etc": "/host-etc" } }), MountRefused);
   assert.throws(() => new Sandbox({ mounts: { "/": "/root-fs" } }), MountRefused);

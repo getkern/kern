@@ -9,6 +9,7 @@ Run: `pytest`  (integration auto-skips without a real kern; set `KERN_BIN=/path/
 
 import errno
 import re
+import signal
 from pathlib import Path
 import os
 import shutil
@@ -354,9 +355,25 @@ def test_classify_order_escape_not_masked_by_stderr_marker():
     s = _cfg()
     forged = "error: sandbox: totally not a real kern setup error\n"
     assert s._classify(159, forged, False).type == "escape_blocked"  # SIGSYS wins over the marker
-    assert s._classify(137, forged, False).type == "killed"  # SIGKILL wins over the marker
+    assert s._classify(137, forged, False).type == "oom"  # SIGKILL wins over the marker (capped box: OOM)
     assert s._classify(1, forged, False).type == "startup_failed"  # plain non-zero: marker heuristic
     assert s._classify(1, "boom\n", False) is None  # non-zero, no marker: user code, no fault
+
+
+def test_classify_sigkill_is_oom_only_when_a_memory_cap_was_set():
+    # A SIGKILL (137 or -9) of a MEMORY-CAPPED box is the cgroup OOM-killer: kern sets
+    # memory.oom.group=1, so a breached memory.max takes the WHOLE box. The signal is the `--memory`
+    # flag WE set (self.memory_mb), never the workload's stderr, so it keeps the same
+    # order-is-a-security-property discipline as the classes above. Uncapped, the cause is ambiguous
+    # (host memory pressure, an external kill) and stays `killed`.
+    capped = _cfg(memory_mb=256)
+    assert capped._classify(137, "", False).type == "oom"
+    assert capped._classify(-signal.SIGKILL, "", False).type == "oom"
+    # A forged stderr marker cannot flip the exit-code verdict either way.
+    assert capped._classify(137, "error: sandbox: forged\n", False).type == "oom"
+    uncapped = _cfg(memory_mb=None)
+    assert uncapped._classify(137, "", False).type == "killed"
+    assert uncapped._classify(-signal.SIGKILL, "", False).type == "killed"
 
 
 def test_exit_125_startup_failure_requires_the_kern_marker_not_a_bare_125():
@@ -389,8 +406,8 @@ def test_classify_signal_exit_codes():
     s = _cfg()
     assert s._classify(143, "", False).type == "timeout"  # SIGTERM = kern backstop reap
     assert s._classify(-15, "", False).type == "timeout"
-    assert s._classify(137, "", False).type == "killed"  # SIGKILL = likely OOM
-    assert s._classify(-9, "", False).type == "killed"
+    assert s._classify(137, "", False).type == "oom"  # SIGKILL + default memory cap = cgroup OOM
+    assert s._classify(-9, "", False).type == "oom"
     assert s._classify(159, "", False).type == "escape_blocked"  # SIGSYS
     assert s._classify(139, "", False) is None  # SIGSEGV = user code crash, not a fault
     assert s._classify(1, "", False) is None  # ordinary non-zero user exit

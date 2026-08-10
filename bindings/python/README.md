@@ -203,8 +203,11 @@ class ExecutionResult:
 
 - `timeout`, the call exceeded `timeout_s` (the binding owns and enforces this deadline).
 - `escape_blocked`, a syscall was blocked by the seccomp filter (SIGSYS).
-- `killed`, the box was SIGKILLed, not by our deadline (message notes it's *likely* OOM; the binding
-  can't read the box cgroup to confirm, so it won't claim `oom` as the type).
+- `oom`, the box was SIGKILLed and a `memory_mb` cap was in effect: a breached `memory.max` is the
+  cgroup OOM-killer (kern sets `memory.oom.group=1`, so the whole box dies at once). The signal is the
+  `--memory` flag *we* set, not the workload's stderr, so it costs no security discipline to claim it.
+- `killed`, the box was SIGKILLed with **no** memory cap set, so the cause is ambiguous (host memory
+  pressure, an external kill) and the binding will not attribute it to OOM.
 
 A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
 seccomp/AppArmor/cgroup setup error, or a pull/image error) is **raised** as a `SandboxError`, not

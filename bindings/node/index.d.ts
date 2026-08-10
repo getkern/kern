@@ -2,7 +2,7 @@
 // Run LLM/agent-generated code in a fast, local, daemonless kernel sandbox.
 
 /** What stopped the code at the SANDBOX level. Reported as data on a result, never thrown. */
-export type SandboxFaultType = "timeout" | "escape_blocked" | "killed" | "startup_failed";
+export type SandboxFaultType = "timeout" | "oom" | "escape_blocked" | "killed" | "startup_failed";
 
 export interface SandboxFault {
   type: SandboxFaultType;
