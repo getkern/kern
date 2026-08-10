@@ -1815,6 +1815,80 @@ _start:
     let _ = fs::remove_dir_all(&root);
 }
 
+/// **Red-team regression: an x32-ABI syscall (the `0x40000000` bit) is hard-killed, not number-matched.**
+///
+/// On x86_64 the x32 ABI reuses the x86_64 `AUDIT_ARCH` but ORs `X32_SYSCALL_BIT` (`0x40000000`) into
+/// the syscall number, so a number-only filter would let the x32 alias of a denied syscall slip
+/// through. kern's kill prologue (shared by both filters) kills any number with that bit set. This is
+/// the executed twin of the i386 arch test: the SAME binary runs `getpid` (nr 39) to a clean exit
+/// inside a box, but the x32-flagged form (`0x40000027`) is `SIGSYS`-killed.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn x32_abi_syscall_is_hard_killed() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // Invoke one syscall by number (`strtol` base 0, so `0x...` hex works). A KILL vector never
+    // returns; a benign one returns and the process exits 0.
+    const SRC: &str = r#"
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    syscall(strtol(argv[1], 0, 0), 0, 0, 0, 0, 0, 0);
+    return 0;
+}
+"#;
+    let Some(helper) = compile_static_helper(SRC, "x32") else {
+        eprintln!("skip: no static C compiler available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "x32");
+    fs::copy(&helper, root.join("x32probe")).unwrap();
+    let rootfs = root.to_str().unwrap();
+    // Positive control: the same syscall WITHOUT the x32 bit (getpid, nr 39) is allowed - exit 0.
+    let ok = kern()
+        .args(["box", "x32ctl", "--rootfs", rootfs, "--", "/x32probe", "39"])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&ok.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "plain getpid (no x32 bit) must be allowed - positive control: {ok:?}"
+    );
+    // The x32-flagged form (0x40000000 | 39) must be SIGSYS-killed by the kill prologue's x32 arm.
+    let killed = kern()
+        .args([
+            "box",
+            "x32t",
+            "--rootfs",
+            rootfs,
+            "--",
+            "/x32probe",
+            "0x40000027",
+        ])
+        .output()
+        .expect("run kern");
+    assert_eq!(
+        killed.status.code(),
+        Some(159),
+        "an x32-ABI syscall (0x40000000 bit set) must SIGSYS, not be matched as its bare number: {killed:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// **Red-team regression: the shared overlay lower is isolating across boxes.**
 ///
 /// An image root uses an overlay whose `lowerdir` (the content-addressed image cache) is shared
