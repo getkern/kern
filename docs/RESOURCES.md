@@ -35,11 +35,13 @@ kern box oom   --image alpine --memory 256m -- \
   sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=512' ; echo "exit=$?"       # exit=137, OOM-killed
 ```
 
-The cap binds on every host tested. On the Arduino UNO Q the BOX exits 143 rather than 137, and the
-reason is measurable rather than a platform quirk: the workload itself is SIGKILLed by the cgroup
-(`dd` exits **137** there, captured to a file before the shell dies), and the box's own init is
-terminated afterwards, which is the 143. Android's `lmkd` is **not running** on that board, so it is
-the cgroup doing the killing, not a host-level low-memory killer. `memory.max` reads back 33554432
+The cap binds on every host tested. On the Arduino UNO Q - whose rootless boxes take the
+`systemd-run --scope` path, not the direct `kern.slice` one - an over-allocation is OOM-killed as a
+WHOLE box (exit **137**), the same as the direct path: the per-box scope is not `Delegate=yes`, so
+kern writes `memory.oom.group=1` onto the scope's own cgroup and the kernel SIGKILLs every task at
+once rather than one victim (measured: a sleeper child and the parent both vanish, no task survives,
+and `kern ps` shows no stale box afterwards). Android's `lmkd` is **not running** on that board, so it
+is the cgroup doing the killing, not a host-level low-memory killer. `memory.max` reads back 33554432
 throughout.
 
 **Enforce, or refuse to start.** Where the `memory`/`pids` controllers are not delegated (footnote ¹),
