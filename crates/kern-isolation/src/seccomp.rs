@@ -767,33 +767,42 @@ mod tests {
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
-            // `audit` only swaps the default terminal action (ENOSYS vs LOG), never the instruction count.
-            let allow_expected = if nesting { 173 } else { 178 };
             for &audit in &[false, true] {
+                // `audit` only swaps the default terminal action (ENOSYS vs LOG), never the count.
                 let len = build_allowlist_filter(nesting, audit).len();
                 assert!(
                     len < 4096,
                     "allowlist filter (nesting={nesting} audit={audit}) is {len} instructions, over BPF_MAXINSNS"
                 );
-                assert_eq!(
-                    len, allow_expected,
-                    "allowlist instruction count changed (nesting={nesting}): {len} vs {allow_expected}. \
-                     If intentional, update the count in OPEN_ITEMS.md (cites 178) and this doc-comment."
-                );
+                // The EXACT count is arch-specific (x86_64 has the x32 kill and a 317-number ALLOW set;
+                // aarch64 has 274 and no x32), so the pinned figures - the ones the docs cite - are gated
+                // to x86_64. aarch64 still gets the fit check above.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let allow_expected = if nesting { 173 } else { 178 };
+                    assert_eq!(
+                        len, allow_expected,
+                        "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
+                         {allow_expected}. If intentional, update OPEN_ITEMS.md (cites 178) + the doc-comment."
+                    );
+                }
             }
             // The denylist counts are cited in the same OPEN_ITEMS note (86 / 72), so pin them too - the
             // reviewer's point: the number the docs cite for the denylist had no guard, same drift class.
             let deny = build_filter(nesting).len();
-            let deny_expected = if nesting { 72 } else { 86 };
             assert!(
                 deny < 4096,
                 "denylist filter is {deny} instructions, over BPF_MAXINSNS"
             );
-            assert_eq!(
-                deny, deny_expected,
-                "denylist instruction count changed (nesting={nesting}): {deny} vs {deny_expected}. \
-                 If intentional, update OPEN_ITEMS.md (cites 86)."
-            );
+            #[cfg(target_arch = "x86_64")]
+            {
+                let deny_expected = if nesting { 72 } else { 86 };
+                assert_eq!(
+                    deny, deny_expected,
+                    "x86_64 denylist instruction count changed (nesting={nesting}): {deny} vs \
+                     {deny_expected}. If intentional, update OPEN_ITEMS.md (cites 86)."
+                );
+            }
         }
     }
 
