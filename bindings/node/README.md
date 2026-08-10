@@ -225,11 +225,12 @@ clear error otherwise). The Python binding uses the stdlib `tarfile` and has no 
 ## Honest threat model
 
 kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code (CI, dev, edge, your
-agents' code). Its seccomp filter is a **denylist**: right for semi-trusted agent code, **not** a hard
-boundary against deliberately hostile multi-tenant code. For that, reach for a microVM (Firecracker /
-Kata) or gVisor. A deny-by-default seccomp **allowlist** ships as opt-in today: pass
-`securityProfile: "untrusted"` (or the `KERN_SECCOMP=allowlist` env); making it the default is future
-work. See the project's [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
+agents' code). Its default seccomp filter is a **deny-by-default allowlist** (moby's own default
+filter minus kern's 35 escape syscalls): right for semi-trusted agent code, **not** a hard boundary
+against deliberately hostile multi-tenant code. For that, reach for a microVM (Firecracker / Kata) or
+gVisor. The wider denylist is the opt-out (`KERN_SECCOMP=denylist`), and `securityProfile: "untrusted"`
+bundles the allowlist with `--cap-drop ALL` + `--read-only`. See the project's
+[SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
 
 ## License
 

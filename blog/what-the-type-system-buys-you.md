@@ -151,6 +151,6 @@ and every future contributor, doesn't have to.
 ---
 
 *kern is a fast, rootless sandbox and virtual resource runtime for any workload, including untrusted
-and AI-generated code: one ~1.8 MB static binary, one Rust dependency (`libc`), no daemon. The
+and AI-generated code: one 1.58 MB static binary, one Rust dependency (`libc`), no daemon. The
 mount-ordering typestate is `Rootfs<S>` in the `kern-isolation` crate. Code, benchmarks, and an honest account of the security boundary:
 [github.com/getkern/kern](https://github.com/getkern/kern).*

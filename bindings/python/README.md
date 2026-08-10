@@ -2,7 +2,7 @@
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless sandbox and virtual resource
 runtime for any workload, including untrusted and AI-generated code: a real, kernel-enforced box
-that starts in **3.4 ms** from an OCI image, out of one **~1.8 MB** binary, with no daemon.
+that starts in **3.4 ms** from an OCI image, out of one **1.58 MB** binary, with no daemon.
 **kern-sandbox**
 is its Python binding: run untrusted or agent-generated code in a fresh, isolated box, straight from Python.
 
@@ -301,11 +301,12 @@ with `python -m kern_sandbox.mcp`.
 
 ## Threat model (honest)
 
-kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code. The seccomp filter is a
-**denylist**: suitable for semi-trusted agent code, **not** a hard boundary against deliberately
-hostile multi-tenant code. For that, use a microVM (Firecracker / Kata) or gVisor. A deny-by-default
-seccomp **allowlist** ships as opt-in today: pass `security_profile="untrusted"` (or the
-`KERN_SECCOMP=allowlist` env); making it the default is future work. See the project
+kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code. Its default seccomp
+filter is a **deny-by-default allowlist** (moby's own default filter minus kern's 35 escape syscalls):
+suitable for semi-trusted agent code, **not** a hard boundary against deliberately hostile
+multi-tenant code. For that, use a microVM (Firecracker / Kata) or gVisor. The wider denylist is the
+opt-out (`KERN_SECCOMP=denylist`), and `security_profile="untrusted"` bundles the allowlist with
+`--cap-drop ALL` + `--read-only`. See the project
 [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
 
 ## Requirements
