@@ -2,7 +2,7 @@
 //!
 //! Blocks the syscalls a sandboxed workload must never make - kexec, kernel-module
 //! (un)loading, ptrace, reboot, swap on/off, and further mount/namespace manipulation. The shipped
-//! default is a deny-by-default *allowlist* (moby's own default filter minus kern's 34 escape
+//! default is a deny-by-default *allowlist* (moby's own default filter minus kern's 35 escape
 //! syscalls); the wider allow-by-default *denylist* is the opt-out via `KERN_SECCOMP=denylist`. The
 //! filter is installed last, after kern's own setup syscalls, so it only constrains the workload.
 //! Wrong-arch syscalls are killed, closing the foreign-ABI number-confusion bypass.
@@ -462,7 +462,7 @@ fn emit_allow_ranges_into(out: &mut Vec<libc::sock_filter>, ranges: &[(u32, u32)
     }
 }
 
-/// The ALLOWLIST filter: deny every syscall except a vetted set (OCI/moby's default MINUS kern's 34),
+/// The ALLOWLIST filter: deny every syscall except a vetted set (OCI/moby's default MINUS kern's 35),
 /// the inverse of [`build_filter`]. Structure: arch/x32 guard, the dangerous set KILLED explicitly,
 /// the `clone` flag check, then a BINARY SEARCH over the allowed number RANGES - matched → ALLOW, anything
 /// else → ENOSYS (a survivable denial, so software probing an unknown/new syscall falls back rather
@@ -550,8 +550,8 @@ pub enum SeccompFilter {
     /// The WIDER, more permissive posture. Opt-OUT via `KERN_SECCOMP=denylist`, for a workload that
     /// needs a syscall outside moby's allow set (the shipped default is now the allowlist below).
     Denylist,
-    /// Deny everything except a vetted allow set (OCI/moby default minus kern's 34); the rest → ENOSYS,
-    /// while the 34 escape syscalls STILL HARD-KILL (`emit_kill_prologue`, verified: mount/unshare/a
+    /// Deny everything except a vetted allow set (OCI/moby default minus kern's 35); the rest → ENOSYS,
+    /// while the escape vectors STILL HARD-KILL (`emit_kill_prologue`, verified: mount/unshare/a
     /// namespace-flagged clone all SIGSYS). This is moby's own default filter - validated by billions of
     /// container starts - MINUS the 34 kern denies for being rootless, so it is at least as compatible
     /// as Docker's default while being strictly narrower. **The shipped default**: deny-by-default, so a

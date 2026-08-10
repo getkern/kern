@@ -9,8 +9,8 @@ the current state of the tree; full detail is in the git history.
 ### Security
 
 - The default seccomp filter is now a deny-by-default **allowlist** (moby's own default filter minus
-  kern's 34 escape syscalls), not the wider denylist: a syscall outside the vetted set returns
-  `ENOSYS`, and the 34 escape syscalls still hard-kill (`mount`/`unshare`/a namespace-flagged `clone`
+  kern's 35 escape syscalls), not the wider denylist: a syscall outside the vetted set returns
+  `ENOSYS`, and the escape vectors still hard-kill (`mount`/`unshare`/a namespace-flagged `clone`
   all SIGSYS, verified on a default box). This is Docker's own default posture minus 34, so it is at
   least as compatible while being strictly narrower - the whole future syscall surface is closed by
   default rather than reached. The wider denylist is the opt-out via `KERN_SECCOMP=denylist`;
