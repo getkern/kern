@@ -111,8 +111,8 @@ the current state of the tree; full detail is in the git history.
   apparmor=`). A missing or unloadable profile fails the box CLOSED; `kern exec` re-enters the box's
   recorded profile so an exec is no less confined than the workload; a box whose posture predates this
   recording is refused rather than exec'd unconfined. kern applies no default profile.
-- The published Linux release binaries are size-optimized with a pinned-nightly `build-std` +
-  `-Cpanic=immediate-abort` build (~22% smaller than a plain stable `--release`), reproducible
-  byte-for-byte with the pinned toolchain. The source stays 100% stable Rust, so `cargo test` runs on
-  the same source the release ships. The exact sizes and the panic-diagnostics tradeoff this buys are
-  in [OPEN_ITEMS.md](OPEN_ITEMS.md).
+- The Linux release build produces a size-optimized binary with a pinned-nightly `build-std` +
+  `-Cpanic=immediate-abort` (~22% smaller than a plain stable `--release`, which a from-source
+  `cargo install` still yields), reproducible byte-for-byte with the pinned toolchain. The source
+  stays 100% stable Rust, so `cargo test` runs on the same source a release would ship. The exact
+  sizes and the panic-diagnostics tradeoff this buys are in [OPEN_ITEMS.md](OPEN_ITEMS.md).

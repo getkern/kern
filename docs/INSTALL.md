@@ -3,7 +3,8 @@
 One static binary and no daemon. Its only Rust dependency is `libc`, and a box built from a
 `--rootfs` needs nothing else on the host. The image path is the exception and is stated as one:
 `kern pull` and `--image` shell out to the system `curl` and `tar` rather than linking a TLS stack
-and a decompressor, which is most of why the binary is 1.86 MB. `kern doctor` reports whether both
+and a decompressor, which is most of why the release binary is 1.58 MB (a from-source build is
+~2 MB; the size optimization is release-only). `kern doctor` reports whether both
 are present. This page is the long form of the [README](../README.md).
 
 kern is a **pre-release work in progress with no published binaries**, so every platform builds from
