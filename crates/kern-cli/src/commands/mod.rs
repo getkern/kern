@@ -575,7 +575,7 @@ impl SecurityProfile {
 
 /// Resolve the box's seccomp mode WITHOUT touching the process environment. Precedence, explicit first:
 /// a non-empty `KERN_SECCOMP` (a valid token parses as [`kern_isolation::SeccompFilter::parse`] does),
-/// then the security profile, then the default (denylist). Pure and total: the caller passes the env
+/// then the security profile, then the default (allowlist). Pure and total: the caller passes the env
 /// value read once, so there is no `env::set_var` - which is a data race on the un-locked `environ` in a
 /// multi-threaded process and a process-global side effect that would leak into a later box in the same
 /// process. Unlike `from_env`, a SET-but-unrecognised (or non-UTF-8) value is a FAIL-LOUD usage error,
@@ -2971,7 +2971,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         eprintln!(
             "kern: warning: KERN_SECCOMP=allowlist-audit is a VALIDATION mode - it records the syscalls a \
              real allowlist would refuse but LETS THEM RUN (clone3, io_uring, and every other \
-             ENOSYS-denied call), so the box is LESS confined than the default denylist. The kill set \
+             ENOSYS-denied call), so the box is LESS confined than the default allowlist. The kill set \
              still kills; do NOT use this as a production posture."
         );
     }
@@ -6111,8 +6111,10 @@ mod seccomp_resolution_tests {
 
     #[test]
     fn explicit_env_wins_then_profile_then_default_no_env_mutation() {
-        // No env, no profile: default (denylist).
-        assert_eq!(ok(None, None), SeccompFilter::default());
+        // No env, no profile: the shipped default is the ALLOWLIST (deny-by-default). Pinned to the
+        // concrete variant, not `SeccompFilter::default()`, so an accidental flip of the default is
+        // caught here instead of passing tautologically.
+        assert_eq!(ok(None, None), SeccompFilter::Allowlist);
         // Profile untrusted, no env: allowlist.
         assert_eq!(
             ok(None, Some(SecurityProfile::Untrusted)),
@@ -16152,6 +16154,12 @@ mod net_resource_tests {
 
     #[test]
     fn parse_volumes_guards_targets() {
+        // `parse_volumes` resolves the registry root from the process-global `XDG_RUNTIME_DIR`; hold
+        // `TEST_ENV_LOCK` so a sibling test flipping that var under /tmp can't make `/tmp` look like an
+        // ancestor of the (relocated) registry root and spuriously refuse a valid `-v`.
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Bad targets are rejected before any mount.
         for bad in [
             "data:mnt",        // relative

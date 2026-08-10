@@ -63,8 +63,10 @@ privilege-escalation bug is an escape.
   error so a typo cannot silently leave a cap in place. Even a re-added `CAP_SYS_ADMIN` is held only
   over the box's own user namespace, and the always-on filter still blocks the escape syscalls it
   would unlock, so `--cap-add` cannot breach the host.
-- **Always-on seccomp**, **34 syscalls denied**: 24 that hard-kill plus the 10 that return `ENOSYS`,
-  split described below; a rootless `--privileged` box denies 5 fewer. Do not take the number from
+- **Always-on seccomp, allowlist by default**: the shipped default is moby's own default filter
+  minus kern's 34 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
+  opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **34 escape syscalls** below:
+  24 that hard-kill plus the 10 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do not take the number from
   this file, ask the binary: `kern box <name> --image <ref> --show-config` prints
   `seccomp_denied_syscalls` from the live lists. The set: kexec (+`_file_load`), module
   load/unload, `ptrace` + `process_vm_readv`/`writev`, reboot, swap, the classic **and** new mount
@@ -73,7 +75,7 @@ privilege-escalation bug is an escape.
   writable, plus `pivot_root`, `setns`, `unshare`, `bpf`, `clone3`, io_uring's three, `userfaultfd`,
   `perf_event_open`, the keyring's three and `syslog`. Wrong-arch syscalls are killed, and on x86_64
   so is every **x32-ABI** syscall, closing the bypass where the x32 alias of a denied number slips
-  past a number-only denylist.
+  past a number-only filter.
 - **`clone(2)` is filtered on its ARGUMENTS**, and it is the only rule of that shape. Denying
   `unshare` and `setns` does not stop a workload making a namespace, because `clone` takes the same
   `CLONE_NEW*` flags, and a process that creates a nested user namespace is handed a full capability
@@ -195,8 +197,8 @@ box's full limit, so N execs could use N times the box's memory.
 ## Flags that change the posture
 
 - **`--security-profile untrusted`** is an opt-in bundle for code nobody has read: the seccomp
-  **allowlist** (deny-by-default: only a reviewed set of syscalls is permitted, stricter than the
-  always-on denylist), **`--cap-drop ALL`**, and **`--read-only`** root, applied as a BASE that explicit
+  **allowlist** (deny-by-default, the same posture the default now installs), **`--cap-drop ALL`**,
+  and **`--read-only`** root, applied as a BASE that explicit
   flags still override. `--cap-add ALL` and `--privileged` are **refused** under it (each would negate a
   constituent, leaving a box labelled untrusted that is not), and a SET-but-unrecognised `KERN_SECCOMP`
   is a usage error rather than a silent downgrade. It prints its resolved constituents (the real seccomp

@@ -1,10 +1,11 @@
-//! Always-on seccomp denylist.
+//! Always-on seccomp: a deny-by-default allowlist by default, a wider denylist as an opt-out.
 //!
 //! Blocks the syscalls a sandboxed workload must never make - kexec, kernel-module
-//! (un)loading, ptrace, reboot, swap on/off, and further mount/namespace manipulation. It is an
-//! allow-by-default *denylist* (kern's "always-on" baseline); a stricter allowlist mode can land
-//! later. The filter is installed last, after kern's own setup syscalls, so it only constrains
-//! the workload. Wrong-arch syscalls are killed, closing the foreign-ABI number-confusion bypass.
+//! (un)loading, ptrace, reboot, swap on/off, and further mount/namespace manipulation. The shipped
+//! default is a deny-by-default *allowlist* (moby's own default filter minus kern's 34 escape
+//! syscalls); the wider allow-by-default *denylist* is the opt-out via `KERN_SECCOMP=denylist`. The
+//! filter is installed last, after kern's own setup syscalls, so it only constrains the workload.
+//! Wrong-arch syscalls are killed, closing the foreign-ABI number-confusion bypass.
 //!
 //! Three shapes of rule, and the difference matters when reading the program:
 //!
@@ -422,8 +423,8 @@ fn emit_allow_search_into(out: &mut Vec<libc::sock_filter>, slice: &[u32]) {
 /// the inverse of [`build_filter`]. Structure: arch/x32 guard, the dangerous set KILLED explicitly,
 /// the `clone` flag check, then a BINARY SEARCH over the allowed numbers - matched → ALLOW, anything
 /// else → ENOSYS (a survivable denial, so software probing an unknown/new syscall falls back rather
-/// than dying, and the whole future syscall surface is closed by default). Opt-in via
-/// `KERN_SECCOMP=allowlist`; the denylist remains the default until a workload corpus validates this.
+/// than dying, and the whole future syscall surface is closed by default). This is the SHIPPED
+/// DEFAULT (a real-workload corpus validated it); the wider denylist is the opt-out `KERN_SECCOMP=denylist`.
 fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_filter> {
     let allow: &[u32] = crate::seccomp_allow::ALLOW;
     // Same security prologue as the denylist: arch guard, load nr, x32 kill, and the hard-kill set.
@@ -499,11 +500,16 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SeccompFilter {
     /// Allow everything except the always-denied set (kill) and the deny-but-degrade set (ENOSYS).
-    /// The shipped default.
-    #[default]
+    /// The WIDER, more permissive posture. Opt-OUT via `KERN_SECCOMP=denylist`, for a workload that
+    /// needs a syscall outside moby's allow set (the shipped default is now the allowlist below).
     Denylist,
-    /// Deny everything except a vetted allow set (OCI/moby default minus kern's 34); the rest → ENOSYS.
-    /// Opt-in via `KERN_SECCOMP=allowlist`.
+    /// Deny everything except a vetted allow set (OCI/moby default minus kern's 34); the rest → ENOSYS,
+    /// while the 34 escape syscalls STILL HARD-KILL (`emit_kill_prologue`, verified: mount/unshare/a
+    /// namespace-flagged clone all SIGSYS). This is moby's own default filter - validated by billions of
+    /// container starts - MINUS the 34 kern denies for being rootless, so it is at least as compatible
+    /// as Docker's default while being strictly narrower. **The shipped default**: deny-by-default, so a
+    /// syscall nobody vetted is refused rather than reached. Opt-out with `KERN_SECCOMP=denylist`.
+    #[default]
     Allowlist,
     /// Like [`Allowlist`], but the would-be-denied branch LOGS the syscall (`SECCOMP_RET_LOG`) and lets
     /// it RUN instead of returning `ENOSYS`. A VALIDATION aid, NOT a shipped posture, and MORE permissive
@@ -524,7 +530,7 @@ impl SeccompFilter {
     /// recorded so PID 1 and the exec agree by construction.
     pub fn from_env() -> Self {
         // Delegate the token→variant mapping to `parse` (single source of truth); an unset or
-        // unrecognised value falls to the `Default` (denylist).
+        // unrecognised value falls to the `Default` (allowlist).
         std::env::var_os("KERN_SECCOMP")
             .as_deref()
             .and_then(|v| v.to_str())

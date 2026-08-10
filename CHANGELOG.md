@@ -8,6 +8,15 @@ the current state of the tree; full detail is in the git history.
 
 ### Security
 
+- The default seccomp filter is now a deny-by-default **allowlist** (moby's own default filter minus
+  kern's 34 escape syscalls), not the wider denylist: a syscall outside the vetted set returns
+  `ENOSYS`, and the 34 escape syscalls still hard-kill (`mount`/`unshare`/a namespace-flagged `clone`
+  all SIGSYS, verified on a default box). This is Docker's own default posture minus 34, so it is at
+  least as compatible while being strictly narrower - the whole future syscall surface is closed by
+  default rather than reached. The wider denylist is the opt-out via `KERN_SECCOMP=denylist`;
+  `--security-profile untrusted` is unchanged (allowlist + `--cap-drop ALL` + `--read-only`), and an
+  `exec` reproduces the box's own recorded filter. Validated: a default box runs common workloads
+  (shell, `ls`, `cat`, `id`) and 435 unit tests pass.
 - Registry-posture forgery closed: every host-path input (`-v`, `--secret`, `--env-file`, `--rootfs`,
   build context and `-f`, `kern cp` in both directions, `save -o`) refuses any source that resolves
   onto the trust-bearing runtime dirs, by `(device, inode)` identity as well as path. The default is
@@ -87,7 +96,7 @@ the current state of the tree; full detail is in the git history.
   override (`--cap-add X`, `KERN_SECCOMP=...`). `--cap-add ALL` and `--privileged` are refused under it
   (both would negate a constituent - all capabilities back, or a relaxed seccomp filter - leaving a box
   labelled untrusted that is not); a SET-but-unrecognised `KERN_SECCOMP` is a usage error, never a
-  silent downgrade to the default denylist. Closed set; prints its resolved constituents so the macro
+  silent downgrade to the default filter. Closed set; prints its resolved constituents so the macro
   is visible. It does NOT touch Landlock (a write-allowlist needs
   the workload's real paths; build it from an audit run) and does NOT set `--require-limits` (which
   would break a cgroup-less host). The default is unchanged. It is a CLI/SDK flag; a compose service

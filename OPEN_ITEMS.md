@@ -3,37 +3,6 @@
 What kern does not do yet, or does not know. Each entry says what it costs you and what would
 settle it. Resolved items live in [CHANGELOG.md](CHANGELOG.md), not here.
 
-## The default seccomp filter is a denylist
-
-kern's **default** filter denies a named set of syscalls instead of allowing a named set. The
-stronger allowlist shape exists now behind `KERN_SECCOMP=allowlist` (moby's default allow set minus
-kern's 34, deny-by-default with `ENOSYS`) and is what `--security-profile untrusted` installs - the
-examples that run untrusted / AI-generated code use it.
-
-The default stays a denylist, and this is a CLOSED decision, not a pending validation. An allowlist
-audit (`KERN_SECCOMP=allowlist-audit`, which runs the deny surface as `SECCOMP_RET_LOG` -
-log-and-run - so `scripts/seccomp-audit.py` records exactly which syscalls fall outside the allow set)
-over 20 real workloads - Postgres, MariaDB, redis, nginx, Python/Node/JVM/Go at bring-up AND under
-load, native builds, package managers - found every one a subset of the allow set except `clone3`,
-which degrades safely to `clone` (verified for glibc, musl and Go). So the allowlist is COMPATIBLE.
-What blocks flipping the DEFAULT is not compatibility but the FAILURE MODE: a workload that does hit a
-denied syscall gets `ENOSYS` and silently falls back - exactly the silent degradation kern refuses
-everywhere else. The only mechanism that makes that observable at runtime is
-`SECCOMP_RET_USER_NOTIF`, a supervisor that logs then returns `ENOSYS`, which needs a resident process
-per box for the box's whole life: the one architectural property kern does not have (foreground boxes
-`exec` in place, no daemon). So the strong posture is opt-in per box (`--security-profile untrusted`),
-applied by the untrusted-code examples, not a global default whose failures nobody would see.
-
-The allowlist denies no syscall whose absence forces a fallback to a **less-safe** variant: every
-modern/hardened call moby allows - `openat2`, `faccessat2`, `statx`, `close_range`, `pidfd_open` and
-the rest - is in the allow set, so the one denied modern call, `clone3`, degrades only to `clone`,
-which the filter itself flag-checks (verified: no other safe/unsafe pair has the modern half denied).
-
-The filter matches by syscall number; its one exception reads `clone`'s flags out of the register
-they arrive in and refuses only the namespace-creating ones, since `clone` cannot be denied by number
-without taking `fork` with it. It is always on and cannot be turned off - the two opt-in values above
-make it STRICTER, never absent.
-
 ## The default capability drop keeps some caps Docker drops
 
 kern drops 14 dangerous caps by default; Docker's default keeps a smaller set, so kern still keeps a
@@ -49,7 +18,7 @@ an operator take any of them today.
 ## No custom per-box seccomp profile from a file
 
 Docker takes `--security-opt seccomp=<profile.json>`; kern does not. A box picks between the shipped
-denylist and the opt-in allowlist (`KERN_SECCOMP=allowlist`), not an arbitrary profile. This is a
+allowlist and the opt-out denylist (`KERN_SECCOMP=denylist`), not an arbitrary profile. This is a
 deliberate hold, not an oversight: an arbitrary OCI profile is a general parser (the full JSON:
 `defaultAction`, `defaultErrnoRet`, `archMap`, per-syscall `action` and per-argument `args` with
 `index`/`value`/`op`) plus a compiler from that to cBPF - which is what `libseccomp` exists to do,

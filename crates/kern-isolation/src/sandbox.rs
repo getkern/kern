@@ -166,16 +166,17 @@ pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
 /// The public `kern box` installs its hardened **denylist** filter
 /// unconditionally (it cannot be turned off from the SDK). This enum is kept so
 /// an embedding's intent stays explicit in caller code, and so the shape is
-/// explicit in caller code, but on the public runtime:
-/// - [`Self::DenylistHardened`] is what actually runs (the default).
-/// - [`Self::DenylistHardenedStrict`] and [`Self::Disabled`] are **not honored**
-///   - the always-on hardened denylist applies regardless.
+/// explicit in caller code, but on the public runtime this field is ADVISORY: the filter that
+/// actually installs is a fine-grained [`crate::SeccompFilter`] (a deny-by-default allowlist by
+/// default, a wider denylist via `KERN_SECCOMP=denylist`). A kernel seccomp filter is ALWAYS on
+/// regardless - `Disabled` cannot turn it off, and this coarse mode never selects the allowlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SeccompMode {
     /// No filter requested. **Not honored on the public runtime** - the
     /// built-in filter stays on.
     Disabled,
-    /// Hardened denylist (the default, and what the public runtime always runs).
+    /// The always-on hardened floor. On the public runtime the effective filter is the resolved
+    /// [`crate::SeccompFilter`] (a deny-by-default allowlist by default); this coarse mode is advisory.
     #[default]
     DenylistHardened,
     /// Denylist with kill-on-violation. **Not honored on the public runtime** -
@@ -666,7 +667,7 @@ impl SandboxBuilder {
     }
 
     /// Select the seccomp policy. **Advisory on the public runtime** - see
-    /// [`SeccompMode`]. The hardened denylist is always on regardless.
+    /// [`SeccompMode`]. A kernel seccomp filter is always on regardless (the effective filter is the resolved `SeccompFilter`).
     pub fn seccomp(mut self, mode: SeccompMode) -> Self {
         self.inner.seccomp = mode;
         self

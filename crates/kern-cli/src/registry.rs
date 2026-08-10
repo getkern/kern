@@ -2113,10 +2113,15 @@ mod tests {
     /// Every child of the registry root must be CLASSIFIED - `AUTHORITATIVE_DIRS` (kern reads and acts
     /// on it, or it is a cross-box secret; never mountable) or `BOX_DATA_DIRS` (opaque box data). A
     /// registry dir added by any code path fails here until someone classifies it, instead of shipping
-    /// mountable-by-default the way `waitexit/` did. Reads the LIVE root (populated by the suite's own
-    /// boxes) rather than mutating `XDG_RUNTIME_DIR`, so it never races the other env-setting tests.
+    /// mountable-by-default the way `waitexit/` did. The registry root derives from the process-global
+    /// `XDG_RUNTIME_DIR`, so this test holds `TEST_ENV_LOCK` while it materializes, resolves and counts:
+    /// the env-setting tests flip that var, and a flip landing between materialize and the count would
+    /// drop leaves that `canonicalize` can then no longer find, failing the 1:1 count spuriously.
     #[test]
     fn every_registry_child_is_classified() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The two classes must be disjoint - a dir cannot be both authoritative and opaque data.
         for a in AUTHORITATIVE_DIRS {
             assert!(!BOX_DATA_DIRS.contains(&a), "{a:?} is in BOTH classes");
