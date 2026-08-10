@@ -83,13 +83,20 @@ fn build_rootfs(busybox: &Path, tag: &str) -> PathBuf {
     root
 }
 
-/// Compile a tiny **static** C helper into a throwaway binary we can drop into a rootfs, or `None`
-/// if no C compiler (or no static libc) is available - in which case the caller SKIPs. It must be
-/// static so it runs in an otherwise-empty rootfs with no shared libraries. `tag` keeps the output
-/// path unique under this suite's parallelism. Used where busybox cannot express the probe (e.g. it
-/// has no `AF_PACKET` applet).
-fn compile_static_helper(src: &str, tag: &str) -> Option<PathBuf> {
-    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+/// Compile `src` (written as `srcname`) into a throwaway static binary with the first working
+/// compiler in `cands` plus `flags`, or `None` if no compiler works or the build fails (the caller
+/// SKIPs). The binary lands in a per-`tag` temp dir the CALLER removes once it has copied the binary
+/// out (`remove_dir_all(returned.parent())`), so a successful build leaves nothing behind. Shared body
+/// for both the C and the freestanding-asm builders - they differ only in candidates, flags and the
+/// source extension.
+fn compile_helper(
+    cands: &[&str],
+    flags: &[&str],
+    src: &str,
+    srcname: &str,
+    tag: &str,
+) -> Option<PathBuf> {
+    let cc = cands.iter().copied().find(|c| {
         Command::new(c)
             .arg("--version")
             .output()
@@ -99,45 +106,12 @@ fn compile_static_helper(src: &str, tag: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join(format!("kern-it-cc-{}-{tag}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).ok()?;
-    let cpath = dir.join("h.c");
-    let opath = dir.join("h");
-    fs::write(&cpath, src).ok()?;
+    let spath = dir.join(srcname);
+    let opath = dir.join("out");
+    fs::write(&spath, src).ok()?;
     let ok = Command::new(cc)
-        .args(["-static", "-O2", "-o"])
-        .arg(&opath)
-        .arg(&cpath)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if ok && opath.exists() {
-        Some(opath)
-    } else {
-        let _ = fs::remove_dir_all(&dir);
-        None
-    }
-}
-
-/// Assemble a **freestanding 32-bit (i386) static** binary from GAS source, or `None`. `-nostdlib`
-/// means no 32-bit libc/crt is needed (the source provides `_start`), so it builds on a plain `cc`
-/// without `gcc-multilib`. Used to fire a raw `int 0x80` from a real i386 process - the foreign-ABI
-/// path a number-confusion bypass of the x86_64 seccomp filter would take.
-#[cfg(target_arch = "x86_64")]
-fn compile_i386_freestanding(asm: &str, tag: &str) -> Option<PathBuf> {
-    let cc = ["cc", "gcc"].into_iter().find(|c| {
-        Command::new(c)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })?;
-    let dir = std::env::temp_dir().join(format!("kern-it-i386-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).ok()?;
-    let spath = dir.join("p.s");
-    let opath = dir.join("p");
-    fs::write(&spath, asm).ok()?;
-    let ok = Command::new(cc)
-        .args(["-m32", "-nostdlib", "-static", "-o"])
+        .args(flags)
+        .arg("-o")
         .arg(&opath)
         .arg(&spath)
         .output()
@@ -149,6 +123,66 @@ fn compile_i386_freestanding(asm: &str, tag: &str) -> Option<PathBuf> {
         let _ = fs::remove_dir_all(&dir);
         None
     }
+}
+
+/// A static C helper we can drop into an otherwise-empty rootfs (no shared libraries). Used where
+/// busybox cannot express the probe (e.g. it has no `AF_PACKET` applet).
+fn compile_static_helper(src: &str, tag: &str) -> Option<PathBuf> {
+    compile_helper(
+        &["cc", "gcc", "clang"],
+        &["-static", "-O2"],
+        src,
+        "h.c",
+        tag,
+    )
+}
+
+/// A **freestanding 32-bit (i386)** static binary from GAS source. `-nostdlib` means no 32-bit
+/// libc/crt is needed (the source provides `_start`), so it builds on a plain `cc` without
+/// `gcc-multilib`. Used to fire a raw `int 0x80` from a real i386 process - the foreign-ABI path a
+/// number-confusion bypass of the x86_64 seccomp filter would take.
+#[cfg(target_arch = "x86_64")]
+fn compile_i386_freestanding(asm: &str, tag: &str) -> Option<PathBuf> {
+    compile_helper(
+        &["cc", "gcc"],
+        &["-m32", "-nostdlib", "-static"],
+        asm,
+        "p.s",
+        tag,
+    )
+}
+
+/// Copy a just-built helper binary into `rootfs_root/name`, then remove its now-garbage build dir so a
+/// successful compile leaves no `/tmp` residue. Call after any host-side use of the binary.
+fn place_helper(helper: &Path, rootfs_root: &Path, name: &str) {
+    fs::copy(helper, rootfs_root.join(name)).unwrap();
+    if let Some(dir) = helper.parent() {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// Source for a helper that invokes one syscall BY NUMBER (argv[1], `strtol` base 0 so both decimal
+/// and `0x..` hex parse) with benign zero args, then exits 0. A KILL vector never returns (SIGSYS
+/// reaps it); a benign one returns and exits 0. Shared by the mount-family and x32 tests - the filter
+/// decides on the number alone, so zero args are fine (refused before the kernel reads them).
+const SYSCALL_BY_NR_SRC: &str = r#"
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    syscall(strtol(argv[1], 0, 0), 0, 0, 0, 0, 0, 0);
+    return 0;
+}
+"#;
+
+/// Pull the hex value of a `CapXxx:` line out of `/proc/self/status` text (the last whitespace field).
+fn cap_hex<'a>(status: &'a str, cap: &str) -> Option<&'a str> {
+    status
+        .lines()
+        .find(|l| l.starts_with(cap))?
+        .split_whitespace()
+        .last()
 }
 
 #[test]
@@ -1443,10 +1477,20 @@ fn box_run_hardening_uts_net_seccomp() {
         "/proc/net/dev",
     ]);
     let net = String::from_utf8_lossy(&net.stdout);
-    assert!(net.contains("lo"), "loopback present");
-    assert!(
-        !net.contains("eth") && !net.contains("wlan") && !net.contains("enp"),
-        "no host interfaces should be visible: {net}"
+    // Whitelist, not blocklist: the netns must expose EXACTLY loopback (a blocklist of eth/wlan/enp
+    // misses eno/ens/br/docker names). Parse the interface names out of /proc/net/dev (the token
+    // before `:` on each device line; the two header lines carry no `:`).
+    let ifaces: Vec<&str> = net
+        .lines()
+        .filter(|l| l.contains(':'))
+        .filter_map(|l| l.split(':').next())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    assert_eq!(
+        ifaces,
+        ["lo"],
+        "the box network namespace must expose ONLY loopback: {net}"
     );
 
     // SECCOMP: a denied syscall (mount) kills the workload with SIGSYS (signal 31).
@@ -1520,25 +1564,29 @@ fn box_run_hardening_uts_net_seccomp() {
 
     // /proc/kcore is MASKED (bound over `/dev/null`): a read yields NOTHING, so a box cannot page host
     // kernel memory out (KASLR defeat / secret disclosure). Same masking class as `/proc/sys` above.
-    // `kern()` directly, not `kern_out` (which retries on empty stdout - here empty IS the success).
-    let kcore = kern()
-        .args([
-            "box",
-            "isobox",
-            "--rootfs",
-            rootfs,
-            "--",
-            "/bin/busybox",
-            "cat",
-            "/proc/kcore",
-        ])
-        .output()
-        .expect("run kern");
+    // A byte-count + a CONTROL line dodge the empty-pipe race that a bare "stdout is empty" would let
+    // pass vacuously: `CONTROL=ok` is always non-empty (so `kern_out`'s retry sees real output and the
+    // box provably ran), while `KCORE` must be 0 - an UNMASKED kcore streams gigabytes, so a non-zero
+    // count would fail. Empty-because-masked is now distinguished from empty-because-dead-pipe.
+    let kcore = kern_out(&[
+        "box",
+        "isobox",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "echo CONTROL=ok; echo KCORE=$(head -c 4096 /proc/kcore 2>/dev/null | wc -c)",
+    ]);
+    let kcore = String::from_utf8_lossy(&kcore.stdout);
     assert!(
-        kcore.status.success() && kcore.stdout.is_empty(),
-        "/proc/kcore must read empty in the box (kernel-memory leak guard): success={}, {} bytes",
-        kcore.status.success(),
-        kcore.stdout.len()
+        kcore.contains("CONTROL=ok"),
+        "the kcore probe must run to completion (control line present): {kcore:?}"
+    );
+    assert!(
+        kcore.contains("KCORE=0"),
+        "/proc/kcore must read empty in the box (kernel-memory leak guard): {kcore:?}"
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1587,7 +1635,7 @@ int main(void) {
         return;
     };
     let root = build_rootfs(&busybox, "rawsock");
-    fs::copy(&helper, root.join("rawsock")).unwrap();
+    place_helper(&helper, &root, "rawsock");
     let rootfs = root.to_str().unwrap();
 
     // Pull the `(fd, errno)` pair for a given `KEY fd=.. errno=..` line out of the helper's stdout.
@@ -1671,22 +1719,12 @@ fn mount_api_family_is_hard_killed() {
     // A helper that invokes one syscall by number with benign zero args. A KILL vector never
     // returns (SIGSYS reaps it); a benign one returns and the process exits 0. The filter decides on
     // the number alone, so zero args are fine - it is refused before the kernel reads them.
-    const SRC: &str = r#"
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <stdlib.h>
-int main(int argc, char **argv) {
-    if (argc < 2) return 2;
-    syscall(atol(argv[1]), 0, 0, 0, 0, 0, 0);
-    return 0;
-}
-"#;
-    let Some(helper) = compile_static_helper(SRC, "mountfam") else {
+    let Some(helper) = compile_static_helper(SYSCALL_BY_NR_SRC, "mountfam") else {
         eprintln!("skip: no static C compiler available");
         return;
     };
     let root = build_rootfs(&busybox, "mountfam");
-    fs::copy(&helper, root.join("syscall1")).unwrap();
+    place_helper(&helper, &root, "syscall1");
     let rootfs = root.to_str().unwrap();
 
     // The whole mount API, classic + fd-based, by arch-correct number.
@@ -1794,7 +1832,7 @@ _start:
         return;
     }
     let root = build_rootfs(&busybox, "i386");
-    fs::copy(&bin, root.join("i386mount")).unwrap();
+    place_helper(&bin, &root, "i386mount");
     let rootfs = root.to_str().unwrap();
     let out = kern()
         .args(["box", "i386t", "--rootfs", rootfs, "--", "/i386mount"])
@@ -1833,24 +1871,12 @@ fn x32_abi_syscall_is_hard_killed() {
         eprintln!("skip: unprivileged user namespaces disabled");
         return;
     }
-    // Invoke one syscall by number (`strtol` base 0, so `0x...` hex works). A KILL vector never
-    // returns; a benign one returns and the process exits 0.
-    const SRC: &str = r#"
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <stdlib.h>
-int main(int argc, char **argv) {
-    if (argc < 2) return 2;
-    syscall(strtol(argv[1], 0, 0), 0, 0, 0, 0, 0, 0);
-    return 0;
-}
-"#;
-    let Some(helper) = compile_static_helper(SRC, "x32") else {
+    let Some(helper) = compile_static_helper(SYSCALL_BY_NR_SRC, "x32") else {
         eprintln!("skip: no static C compiler available");
         return;
     };
     let root = build_rootfs(&busybox, "x32");
-    fs::copy(&helper, root.join("x32probe")).unwrap();
+    place_helper(&helper, &root, "x32probe");
     let rootfs = root.to_str().unwrap();
     // Positive control: the same syscall WITHOUT the x32 bit (getpid, nr 39) is allowed - exit 0.
     let ok = kern()
@@ -1961,20 +1987,20 @@ fn overlay_lower_is_shared_ro_across_boxes() {
     }
 
     // Box A: write a distinctive marker and tamper the seed - both must land in A's ephemeral upper.
-    let a = kern()
-        .args([
-            "box",
-            "ovl-a",
-            "--image",
-            &img,
-            "--",
-            "/bin/busybox",
-            "sh",
-            "-c",
-            "echo MARKER_A > /marker; echo tampered_by_A > /seed; cat /marker; grep -m1 ' / ' /proc/self/mountinfo",
-        ])
-        .output()
-        .expect("run kern");
+    // Its stdout is load-bearing (the MARKER_A control + the mountinfo identity), so use `kern_out`,
+    // which retries on the empty-pipe race exactly as box B does. A's ops are idempotent (echo > file),
+    // so a retry runs a fresh box with the same result.
+    let a = kern_out(&[
+        "box",
+        "ovl-a",
+        "--image",
+        &img,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "echo MARKER_A > /marker; echo tampered_by_A > /seed; cat /marker; grep -m1 ' / ' /proc/self/mountinfo",
+    ]);
     let a_out = String::from_utf8_lossy(&a.stdout).to_string();
 
     // Box B: a FRESH box from the SAME image must see neither A's marker nor A's tamper.
@@ -2142,14 +2168,11 @@ fn dropped_caps_are_cleared_from_every_set_including_ambient() {
     let s = String::from_utf8_lossy(&out.stdout).to_string();
     let _ = fs::remove_dir_all(&root);
     for cap in ["CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd"] {
-        let line = s
-            .lines()
-            .find(|l| l.starts_with(cap))
+        let val = cap_hex(&s, cap)
             .unwrap_or_else(|| panic!("{cap} missing from /proc/self/status: {s:?}"));
-        let val = line.split_whitespace().last().unwrap_or("");
         assert_eq!(
             val, "0000000000000000",
-            "{cap} must be all-zero under --cap-drop ALL (dropped caps cleared from every set): {line:?}"
+            "{cap} must be all-zero under --cap-drop ALL (dropped caps cleared from every set): {s:?}"
         );
     }
 }
@@ -2195,21 +2218,28 @@ fn default_box_drops_the_dangerous_caps() {
     let s = String::from_utf8_lossy(&out.stdout).to_string();
     let _ = fs::remove_dir_all(&root);
     for cap in ["CapEff", "CapBnd"] {
-        let line = s
-            .lines()
-            .find(|l| l.starts_with(cap))
+        let hex = cap_hex(&s, cap)
             .unwrap_or_else(|| panic!("{cap} missing from /proc/self/status: {s:?}"));
-        let hex = line.split_whitespace().last().unwrap_or("");
-        let mask = u64::from_str_radix(hex, 16)
-            .unwrap_or_else(|_| panic!("{cap} value not hex: {line:?}"));
+        let mask =
+            u64::from_str_radix(hex, 16).unwrap_or_else(|_| panic!("{cap} value not hex: {hex:?}"));
         for bit in DROPPED {
             assert_eq!(
                 (mask >> bit) & 1,
                 0,
-                "cap bit {bit} must be cleared from {cap} on a default box (got {hex}): {line:?}"
+                "cap bit {bit} must be cleared from {cap} on a default box (got {hex}): {s:?}"
             );
         }
     }
+    // Positive control: a cap KEPT by default (SYS_ADMIN, bit 21, not in DEFAULT_DROP) must be SET in
+    // the bounding set - otherwise an all-zero CapBnd would pass the drop-check vacuously.
+    let bnd_hex = cap_hex(&s, "CapBnd").unwrap_or("");
+    let bnd = u64::from_str_radix(bnd_hex, 16).unwrap_or(0);
+    assert_eq!(
+        (bnd >> 21) & 1,
+        1,
+        "SYS_ADMIN (bit 21) must be retained in CapBnd by default - proves the cap mask is populated, \
+         not vacuously empty: {s:?}"
+    );
 }
 
 /// **Red-team regression: a box can neither SEE nor RAISE a cgroup above its own.**

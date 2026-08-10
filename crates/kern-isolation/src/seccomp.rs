@@ -396,8 +396,8 @@ const JA_ALLOW: u32 = 0xFFFF_FFFF;
 const JA_ENOSYS: u32 = 0xFFFF_FFFE;
 
 /// Collapse a SORTED, deduplicated slice of allowed syscall numbers into its contiguous runs
-/// `[(lo, hi), ...]`. moby's allow set is densely contiguous (x86_64: 318 numbers -> 26 runs; aarch64:
-/// 275 -> 20), so a binary search over the RUNS emits ~5x fewer cBPF instructions than one over the
+/// `[(lo, hi), ...]`. moby's allow set is densely contiguous (x86_64: 317 numbers -> 27 runs; aarch64:
+/// 274 -> 21), so a binary search over the RUNS emits ~5x fewer cBPF instructions than one over the
 /// individual numbers - and the kernel's per-install cost (the cBPF->eBPF JIT and the constant-action
 /// bitmap prepare, both O(instructions)) drops with it. A run `[lo, hi]` contains EXACTLY `lo..=hi`,
 /// every one of which is in `allow` because the run only extends on a contiguous number, so the
@@ -476,7 +476,7 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
     // are excluded from the allow set, so without the explicit kill they would merely ENOSYS.
     let mut prog = emit_kill_prologue(allow_nesting);
     // A rootless `--privileged` box runs a NESTED runtime that must create namespaces, so the five
-    // nesting syscalls are re-permitted here (they are NOT in the allow numbers, which exclude all 34
+    // nesting syscalls are re-permitted here (they are NOT in the allow numbers, which exclude all 35
     // kern-denied). Mirrors the denylist's `allow_nesting`, which lets them fall to the default ALLOW.
     if allow_nesting {
         for nr in nesting_syscalls() {
@@ -553,7 +553,7 @@ pub enum SeccompFilter {
     /// Deny everything except a vetted allow set (OCI/moby default minus kern's 35); the rest → ENOSYS,
     /// while the escape vectors STILL HARD-KILL (`emit_kill_prologue`, verified: mount/unshare/a
     /// namespace-flagged clone all SIGSYS). This is moby's own default filter - validated by billions of
-    /// container starts - MINUS the 34 kern denies for being rootless, so it is at least as compatible
+    /// container starts - MINUS the 35 kern denies for being rootless, so it is at least as compatible
     /// as Docker's default while being strictly narrower. **The shipped default**: deny-by-default, so a
     /// syscall nobody vetted is refused rather than reached. Opt-out with `KERN_SECCOMP=denylist`.
     #[default]

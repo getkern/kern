@@ -66,7 +66,8 @@ cargo install --git https://github.com/getkern/kern getkern --locked
 was tested with. This is the one route that does need a Rust toolchain.
 
 **📦 Offline / air-gapped** (a board or locked-down server with no internet). kern is a single
-~1.8 MB static binary, so copying that one file *is* the install:
+static binary (~2 MB from a source build; 1.58 MB x86_64 / 1.31 MB aarch64 in the size-optimized
+release build), so copying that one file *is* the install:
 
 ```sh
 scp kern pi@raspberrypi:~/          # then:  ssh pi@raspberrypi kern box dev --image alpine -- sh
@@ -138,8 +139,9 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 
 **Linux, multi-architecture.** kern builds to a static (musl) binary for **`linux-x86_64`** and
-**`linux-aarch64`**: one ~1.8 MB file, no Rust deps beyond `libc` (the pull path shells out to system
-`curl`/`tar`). No prebuilt binaries are published yet; every target builds from source.
+**`linux-aarch64`**: one file per arch (~2.0 MB x86_64 / ~1.6 MB aarch64 from a source build; the
+size-optimized release build is 1.58 MB / 1.31 MB), no Rust deps beyond `libc` (the pull path shells
+out to system `curl`/`tar`). No prebuilt binaries are published yet; every target builds from source.
 
 | Platform | Arch | Status |
 |---|---|---|

@@ -14,7 +14,7 @@ designed project, not a script.
      ├─ rootfs       OCI overlay → pivot_root   (typestate: Mounted → OldRootReady → ReadOnly)
      ├─ devices      fresh /dev · vgpio passthrough · -v volumes (symlink-safe)
      ├─ cgroups v2   MemoryMax · CPUQuota · TasksMax
-     ├─ seccomp      always-on denylist (+ wrong-arch / x32)
+     ├─ seccomp      always-on deny-by-default allowlist (+ wrong-arch / x32)
      └─ supervisor   fork → PID 1 → reap → exec / stats / stop
      │
      ▼
@@ -36,9 +36,9 @@ A `kern box` is one short-lived process tree: no daemon, no shared state.
    `-v` volumes bound in with targets resolved **symlink-safely**, confined to the new root; secrets
    on a RAM `/run/secrets` (`0400`); `vdisk:`/`vgpio:` mounting exactly their declared disk/peripherals.
 4. **Lockdown.** A clean env (no host secrets leak in), capabilities stripped to least-privilege, an
-   optional `--user` drop, an always-on **seccomp** denylist (incl. wrong-arch + x32; an opt-in
-   deny-by-default **allowlist** via `--security-profile untrusted` / `KERN_SECCOMP=allowlist`), and
-   cgroup caps:
+   optional `--user` drop, an always-on deny-by-default **seccomp allowlist** (moby's own default
+   filter minus kern's 35 escape syscalls; incl. wrong-arch + x32 kills; the wider **denylist** is the
+   opt-out via `KERN_SECCOMP=denylist`), and cgroup caps:
 
 `kern box <name> --plan` prints the exact sequence for your invocation, without running it: that
 output is generated from the code, so it cannot drift the way a description here would.

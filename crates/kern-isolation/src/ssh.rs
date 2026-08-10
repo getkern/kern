@@ -17,9 +17,11 @@
 //! the box execs its PID 1, so it dies with the box's PID namespace.
 //!
 //! Honest scope: the box must ship `sshd` + `ssh-keygen` (openssh-server). The forked sshd - and the
-//! shells it spawns per session - run **without** the box's seccomp filter (they're forked before it
-//! is installed); the namespace/pivot/cgroup isolation still holds. Grant `--ssh` to workloads you'd
-//! trust with an interactive shell in the box.
+//! shells it spawns per session - run **without** the box's seccomp filter AND keep the box's
+//! pre-drop capabilities (they're forked before both the filter install and the capability drop), so
+//! an ssh session is less confined than the box's own PID 1. The namespace/pivot/cgroup isolation
+//! still holds, and the caps are userns-scoped (no host privilege). Grant `--ssh` only to workloads
+//! you'd trust with an interactive shell in the box.
 
 use std::ffi::CString;
 use std::io::Write;

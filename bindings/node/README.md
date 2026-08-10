@@ -2,7 +2,7 @@
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless sandbox and virtual resource
 runtime for any workload, including untrusted and AI-generated code: a real, kernel-enforced box
-that starts in **3.4 ms** from an OCI image, out of one **~1.8 MB** binary, with no daemon.
+that starts in **3.4 ms** from an OCI image, out of one **1.58 MB** binary, with no daemon.
 **kern-sandbox**
 is its Node / TypeScript binding: run untrusted or agent-generated code in a fresh, isolated box, from Node.
 
@@ -11,7 +11,7 @@ package is on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/).
 
 It is a thin, dependency-free wrapper around the [`kern`](https://github.com/getkern/kern) binary:
 a fresh, isolated box per call, network off by default, hard resource caps, and a timeout the binding
-itself enforces. Kernel-enforced isolation (namespaces, cgroups v2, seccomp), local, about 1.8 MB, with no cloud, no account, no VM.
+itself enforces. Kernel-enforced isolation (namespaces, cgroups v2, seccomp), local, about 1.58 MB, with no cloud, no account, no VM.
 
 ```js
 const kern = require("kern-sandbox");
