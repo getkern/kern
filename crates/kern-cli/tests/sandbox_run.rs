@@ -1428,6 +1428,51 @@ fn box_run_hardening_uts_net_seccomp() {
         "/proc/sys must be mounted read-only (core_pattern escape guard):\n{mounts}"
     );
 
+    // NO_NEW_PRIVS (regression for a red-team finding): PID 1 and every child run with `NoNewPrivs=1`,
+    // so a setuid binary in the image cannot REGAIN privilege - without it the default cap-drop is a
+    // paper wall. Read it back from the box's own `/proc/self/status`.
+    let status = kern_out(&[
+        "box",
+        "isobox",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "cat",
+        "/proc/self/status",
+    ]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.lines().any(|l| {
+            let l = l.replace('\t', " ");
+            l.starts_with("NoNewPrivs:") && l.trim_end().ends_with('1')
+        }),
+        "the box must run with NoNewPrivs=1 (a setuid binary must not regain privilege):\n{status}"
+    );
+
+    // /proc/kcore is MASKED (bound over `/dev/null`): a read yields NOTHING, so a box cannot page host
+    // kernel memory out (KASLR defeat / secret disclosure). Same masking class as `/proc/sys` above.
+    // `kern()` directly, not `kern_out` (which retries on empty stdout - here empty IS the success).
+    let kcore = kern()
+        .args([
+            "box",
+            "isobox",
+            "--rootfs",
+            rootfs,
+            "--",
+            "/bin/busybox",
+            "cat",
+            "/proc/kcore",
+        ])
+        .output()
+        .expect("run kern");
+    assert!(
+        kcore.status.success() && kcore.stdout.is_empty(),
+        "/proc/kcore must read empty in the box (kernel-memory leak guard): success={}, {} bytes",
+        kcore.status.success(),
+        kcore.stdout.len()
+    );
+
     let _ = fs::remove_dir_all(&root);
 }
 
