@@ -5,10 +5,14 @@ settle it. Resolved items live in [CHANGELOG.md](CHANGELOG.md), not here.
 
 ## The default capability drop keeps some caps Docker drops
 
-kern drops 14 dangerous caps by default; Docker's default keeps a smaller set, so kern still keeps a
-few Docker drops - `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_MKNOD`. They are held only
-over the box's own user namespace, and the escape syscalls they would unlock (the mount API, `bpf`,
-`ptrace`) are seccomp-killed, so the marginal risk is small. The one clean tightening already taken is
+kern drops 14 dangerous caps by default. Docker's own default set keeps `CAP_NET_RAW` and `CAP_MKNOD`,
+and so does kern - they match, and `MKNOD` is inert anyway (a fabricated node is `MS_NODEV`/`SB_I_NODEV`).
+The caps kern keeps that Docker's default DROPS are exactly two: `CAP_SYS_ADMIN` and `CAP_NET_ADMIN`.
+They are held only over the box's own user namespace, and the escape syscalls they would unlock (the
+mount API, `bpf`, `ptrace`) are seccomp-killed, so the marginal risk is small - measured: dropping both
+does not break common workloads (a real alpine box runs shell/ls/cat/write unchanged), but `--tun` and
+an in-box `sethostname` legitimately use `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`, so a default drop needs the
+compose-corpus validation below before it can ship without regressing them. The one clean tightening already taken is
 `CAP_SYS_PTRACE`: its syscalls were already killed, so dropping it costs nothing and closes a
 **cross-UID** `/proc/<pid>/mem` read (a same-uid sibling read inside one box stays possible and is not
 a boundary; a host or peer pid is unreachable via the pid namespace regardless). Dropping the rest
