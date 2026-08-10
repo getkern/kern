@@ -759,15 +759,25 @@ mod tests {
     }
 
     /// The generated allowlist filter must fit the kernel's `BPF_MAXINSNS` (4096) with headroom, or a
-    /// future profile bump would fail to load at box start. Measured 178 on x86_64 after the range-merge.
+    /// future profile bump would fail to load at box start. Its exact size is also PINNED here (178 on
+    /// x86_64 after the range-merge, 173 for a nesting box), so a change to the emitter or the ALLOW set
+    /// that moves the count fails this test and forces the OPEN_ITEMS/seccomp docs that cite it to be
+    /// updated in the same change - the gate that keeps that instruction count from silently drifting.
     #[test]
     fn the_allowlist_filter_fits_bpf_maxinsns() {
         for &nesting in &[false, true] {
+            // `audit` only swaps the default terminal action (ENOSYS vs LOG), never the instruction count.
+            let expected = if nesting { 173 } else { 178 };
             for &audit in &[false, true] {
                 let len = build_allowlist_filter(nesting, audit).len();
                 assert!(
                     len < 4096,
                     "allowlist filter (nesting={nesting} audit={audit}) is {len} instructions, over BPF_MAXINSNS"
+                );
+                assert_eq!(
+                    len, expected,
+                    "allowlist instruction count changed (nesting={nesting}): {len} vs {expected}. If \
+                     intentional, update the count in OPEN_ITEMS.md and this doc-comment (both cite 178)."
                 );
             }
         }

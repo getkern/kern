@@ -99,8 +99,9 @@ privilege-escalation bug is an escape.
   `vfork`, `posix_spawn` and `pthread_create` are all `clone` with no namespace bit, so the filter
   reads the flags out of the register they arrive in and kills only the seven `CLONE_NEW*` bits.
   `clone3` puts the same flags in a struct behind a pointer, which BPF **cannot dereference**, so it
-  is refused wholesale with `ENOSYS`, the answer Docker and podman give for the same reason. Closed
-  and verified on six platforms. The filter inspects call ARGUMENTS in exactly two places - the
+  is refused wholesale with `ENOSYS` rather than `SIGSYS` - the errno makes glibc fall back to plain
+  `clone` (which IS flag-filtered), where a kill would take down a benign `fork`; it is the answer
+  Docker and podman give for the same reason. Closed and verified on six platforms. The filter inspects call ARGUMENTS in exactly two places - the
   `clone` flags above and the `socket` domain (below) - and matches every other syscall by number
   alone. So `ioctl` is allowed as a whole, not per-command (moby's default does the same), and
   `personality` is left to the number-level allow: its risky flags weaken the box against ITSELF

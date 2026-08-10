@@ -1,11 +1,15 @@
 # Changelog
 
 **CLI stability.** As of v0.7.0 the command surface is stable: the verbs, their flags, and the
-`--json` output shapes will not change incompatibly without a version bump and an entry here. The
-project is still pre-release in the sense that binaries are not published yet (build from source) and
-internal config-file keys may still evolve, but scripts and SDKs written against the CLI can rely on
-it. Build from source with `cargo install --git https://github.com/getkern/kern getkern --locked`.
-What follows is the current state of the tree; full detail is in the git history.
+`--json` output shapes change incompatibly only on a **minor bump** (`0.8.0`+, since kern is `0.x`),
+never on a patch, and only after a deprecation entry here at least one release earlier. `--json`
+output is additive: new fields may appear, so consumers must **ignore unknown fields**; removing or
+renaming one is the breaking change the minor-bump rule covers. A `cli_surface_is_frozen` test
+snapshots the surface and fails the build on any undocumented change. The project is still pre-release
+in the sense that binaries are not published yet (build from source) and internal config-file keys may
+still evolve, but scripts and SDKs written against the CLI can rely on it. Build from source with
+`cargo install --git https://github.com/getkern/kern getkern --locked`. What follows is the current
+state of the tree; full detail is in the git history.
 
 ## Current
 

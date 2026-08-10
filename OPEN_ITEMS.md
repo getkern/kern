@@ -15,11 +15,13 @@ an in-box `sethostname` legitimately use `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`, so a d
 compose-corpus validation below before it can ship without regressing them. The one clean tightening already taken is
 `CAP_SYS_PTRACE`: its syscalls were already killed, so dropping it costs nothing and closes a
 **cross-UID** `/proc/<pid>/mem` read (a same-uid sibling read inside one box stays possible and is not
-a boundary; a host or peer pid is unreachable via the pid namespace regardless). Dropping the rest
-toward Docker's set is deferred, not because it is wrong but
-because it needs validation that it does not break a real workload - the `KERN_SECCOMP=allowlist-audit`
-harness plus a compose corpus is that validation, and it has to run first. `--cap-drop` already lets
-an operator take any of them today.
+a boundary; a host or peer pid is unreachable via the pid namespace regardless). Converging the
+default onto Docker's set means dropping `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` too, and the lever is
+**conditional, not an unconditional drop** (which would break `--tun` and an in-box `sethostname`):
+grant `CAP_NET_ADMIN` only when `--tun` is present, keep `CAP_SYS_ADMIN` only for a box that needs an
+in-box `sethostname`, and drop both otherwise. The compose corpus is the validation that no other
+common workload reaches for them; against Podman (which drops both by default) the same change closes
+the gap entirely, against moby it matches. `--cap-drop` already lets an operator take either today.
 
 ## No custom per-box seccomp profile from a file
 
@@ -142,8 +144,9 @@ Making the deny-by-default allowlist the shipped default (it replaced the wider 
 measured ~0.2 ms to box start, back when it compiled one comparison per allowed number. The range-merge
 (a binary search over the ALLOW set's contiguous RUNS, not its individual numbers) cut that program from
 ~1273 instructions to **178** on x86_64 - against the denylist's **86** - so the kernel now spends only
-marginally more loading it at `PR_SET_SECCOMP`: the `seccomp` phase measures ~20 us longer for the
-allowlist than the denylist, far below the box-start run-to-run noise (a clean run puts both at ~3.3 ms
+marginally more loading it at `PR_SET_SECCOMP`: the whole `seccomp`-install phase is **~186 us** (down
+from ~385 us before the range-merge), of which the 178-instruction allowlist is only **~20 us more**
+than the 86-instruction denylist - far below the box-start run-to-run noise (a clean run puts both at ~3.3 ms
 p50). The per-syscall cost is neutral (a log2 binary search over 27 runs, a handful of extra compares).
 The compiled program is cached per `(mode, allow_nesting)`, so it is built once per process, not per box.
 The stronger default posture is now essentially free; `KERN_SECCOMP=denylist` restores the marginally

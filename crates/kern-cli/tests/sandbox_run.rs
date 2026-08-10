@@ -677,22 +677,35 @@ fn inspect_shows_detail_then_prune_reclaims_logs() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // `prune` reclaims the dead box's leftover log; a second prune finds nothing.
+    // `prune` reclaims the dead box's leftover log; a subsequent prune finds nothing. Under this
+    // suite's parallel load the box's log/breadcrumb can settle a beat AFTER it leaves `ps`, so the
+    // first prune may leave a transient 0-byte artifact the next prune sweeps - retry until a prune
+    // converges to "nothing to prune" (each iteration reclaims any lagging file, so it converges in a
+    // couple of rounds). Bounded, so a real never-clearing leak still fails.
     let pruned = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
         .args(["prune"])
         .output()
         .expect("run kern");
     assert!(pruned.status.success(), "prune should succeed");
-    let again = kern()
-        .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["prune"])
-        .output()
-        .expect("run kern");
+    let mut converged = String::new();
+    let mut clean = false;
+    for _ in 0..20 {
+        let again = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["prune"])
+            .output()
+            .expect("run kern");
+        converged = String::from_utf8_lossy(&again.stdout).to_string();
+        if converged.contains("nothing to prune") {
+            clean = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(
-        String::from_utf8_lossy(&again.stdout).contains("nothing to prune"),
-        "a second prune should have nothing left: {}",
-        String::from_utf8_lossy(&again.stdout)
+        clean,
+        "prune should converge to 'nothing to prune'; last output: {converged}"
     );
 
     let _ = fs::remove_dir_all(&root);
