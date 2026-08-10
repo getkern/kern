@@ -1266,6 +1266,39 @@ mod tests {
         }
     }
 
+    /// The `OnceLock` cache in `install` must serve the SAME bytes a fresh build would, for every
+    /// `(mode, allow_nesting)` - a drift would install a filter different from the one every other test
+    /// in this file validates, silently.
+    #[test]
+    fn cached_program_is_byte_identical_to_a_fresh_build() {
+        for mode in [
+            super::SeccompFilter::Denylist,
+            super::SeccompFilter::Allowlist,
+            super::SeccompFilter::AllowlistAudit,
+        ] {
+            for nesting in [false, true] {
+                let fresh = match mode {
+                    super::SeccompFilter::Allowlist => build_allowlist_filter(nesting, false),
+                    super::SeccompFilter::AllowlistAudit => build_allowlist_filter(nesting, true),
+                    super::SeccompFilter::Denylist => build_filter(nesting),
+                };
+                let cached = super::cached_program(mode, nesting);
+                assert_eq!(
+                    cached.len(),
+                    fresh.len(),
+                    "{mode:?} nesting={nesting}: cached program length differs from a fresh build"
+                );
+                // `libc::sock_filter` is a POD without `PartialEq`, so compare its four fields.
+                for (i, (c, f)) in cached.iter().zip(fresh.iter()).enumerate() {
+                    assert!(
+                        c.code == f.code && c.jt == f.jt && c.jf == f.jf && c.k == f.k,
+                        "{mode:?} nesting={nesting}: cBPF instruction {i} differs from a fresh build"
+                    );
+                }
+            }
+        }
+    }
+
     /// The KILL set and the ENOSYS set must stay DISJOINT, and - critically - the ENOSYS demotion must
     /// only ever apply to deny-but-degrade syscalls. A real escape vector (kexec, bpf, ptrace, the
     /// mount API) demoted to a mere ENOSYS would let a hostile payload keep probing instead of dying,

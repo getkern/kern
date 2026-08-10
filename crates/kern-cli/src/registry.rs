@@ -100,6 +100,12 @@ pub struct Instance {
     /// fail-closed as `cap_recorded`. PRESENT-but-empty means the box ran with no profile (exec adds no
     /// transition). Derived at parse time from the line's presence; never serialised.
     pub aa_recorded: bool,
+    /// Whether the record carried a `seccompmode=` line. Mirrors `aa_recorded`/`cap_recorded`: ABSENT
+    /// means the box predates seccomp-posture recording, so `exec` REFUSES rather than reproduce the
+    /// weaker `Denylist` default a missing line parses to. Makes the exec gate MECHANICAL instead of
+    /// relying on the field-order coincidence that a missing `seccompmode` also implies a missing
+    /// `apparmor`. Derived at parse time from the line's presence; never serialised.
+    pub seccomp_recorded: bool,
     /// Set when a posture field that IS present is malformed (`capdropall` not `0`/`1`, a non-numeric
     /// cap in `capdrops`/`capadds`, or an unrecognised `seccompmode`). `exec` refuses on a corrupt
     /// record rather than apply a partial posture that could be less restrictive than the box's.
@@ -1882,6 +1888,7 @@ fn parse(body: &str) -> Option<Instance> {
     let mut seccomp_mode = kern_isolation::SeccompFilter::Denylist;
     let mut cap_recorded = false;
     let mut aa_recorded = false;
+    let mut seccomp_recorded = false;
     let mut posture_corrupt = false;
     // Completeness: `encode` writes `capdropall`, `capdrops`, `capadds` together (one feature, one era),
     // so a record that has `capdropall` but is MISSING either list is TRUNCATED, and exec must refuse it
@@ -1946,10 +1953,13 @@ fn parse(body: &str) -> Option<Instance> {
             }
             // A PRESENT-but-unrecognised mode is corruption (refuse). An ABSENT line is a box from
             // before this field: it stays the default Denylist, which is what that box actually ran.
-            "seccompmode" => match kern_isolation::SeccompFilter::parse(v) {
-                Some(m) => seccomp_mode = m,
-                None => posture_corrupt = true,
-            },
+            "seccompmode" => {
+                seccomp_recorded = true;
+                match kern_isolation::SeccompFilter::parse(v) {
+                    Some(m) => seccomp_mode = m,
+                    None => posture_corrupt = true,
+                }
+            }
             // The AppArmor profile the box entered, or empty for none. Recorded so `kern exec` re-enters
             // the SAME profile. NOT part of the corrupt/refuse gate: an empty/absent value is a valid
             // "no profile" (the box ran unconfined), not a truncated posture.
@@ -2004,6 +2014,7 @@ fn parse(body: &str) -> Option<Instance> {
         apparmor,
         cap_recorded,
         aa_recorded,
+        seccomp_recorded,
         posture_corrupt,
         cgroup,
         cgroup_id,
@@ -2082,19 +2093,24 @@ impl Instance {
                 self.name
             )));
         }
+        if !self.seccomp_recorded {
+            return Err(crate::error::Error::Sandbox(format!(
+                "box '{}' predates seccomp-posture recording; its exec filter cannot be reconstructed \
+                 safely (a missing `seccompmode` parses to the weaker denylist default, which could run \
+                 the exec under a WIDER filter than the box's PID 1) - restart the box to record it",
+                self.name
+            )));
+        }
         if self.posture_corrupt {
             return Err(crate::error::Error::Sandbox(format!(
                 "box '{}' has a corrupt security-posture record; refusing to exec - restart the box",
                 self.name
             )));
         }
-        // NB: there is deliberately NO separate `seccomp_recorded` gate. An absent `seccompmode` line
-        // parses to the weaker Denylist default, but a record old enough to lack it is also old enough
-        // to lack the `apparmor` line - `seccompmode` was added BEFORE `apparmor` (see `encode`'s field
-        // order) - so the `aa_recorded` gate above ALREADY refuses it; a present-but-malformed
-        // `seccompmode` sets `posture_corrupt`, refused above. The field-order invariant makes a seccomp
-        // gate redundant. If a future field is ever inserted AFTER `seccompmode` but BEFORE `apparmor`,
-        // revisit this - the aa gate would no longer cover a missing `seccompmode`.
+        // Each posture dimension has its OWN `*_recorded` gate (cap/aa/seccomp): exec refuses a box that
+        // predates ANY of them, WITHOUT relying on the field-order coincidence that a missing
+        // `seccompmode` also implies a missing `apparmor`. A present-but-malformed field sets
+        // `posture_corrupt`, refused above.
         Ok((
             cap_spec_from_fields(self.cap_drop_all, &self.cap_drops, &self.cap_adds),
             self.seccomp_mode,
@@ -2149,6 +2165,30 @@ mod tests {
         }
         // `trusted_state_dirs` is DERIVED from `AUTHORITATIVE_DIRS` - one per entry, no parallel list.
         assert_eq!(trusted_state_dirs().len(), AUTHORITATIVE_DIRS.len());
+    }
+
+    #[test]
+    fn exec_refuses_a_record_with_apparmor_but_no_seccompmode() {
+        // The `seccomp_recorded` gate is MECHANICAL, not a side effect of the field-order invariant
+        // (encode writes `seccompmode` before `apparmor`, so a real record cannot carry apparmor without
+        // seccommode). A hand-built record with an apparmor line but NO seccommode line is refused BY THE
+        // SECCOMP GATE - never silently run under the weaker denylist default a missing `seccompmode`
+        // parses to, which could exec into a WIDER filter than the box's PID 1 installed.
+        let inst =
+            parse("name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\napparmor=kern-box\n")
+                .expect("parse a record with apparmor but no seccommode line");
+        assert!(inst.aa_recorded, "the apparmor line marks aa recorded");
+        assert!(
+            !inst.seccomp_recorded,
+            "no seccompmode line means the seccomp posture is NOT recorded"
+        );
+        let err = inst
+            .exec_posture()
+            .expect_err("exec must refuse a record whose seccomp posture is unrecorded");
+        assert!(
+            format!("{err}").contains("seccomp-posture recording"),
+            "the refusal must name the seccomp gate, got: {err}"
+        );
     }
 
     #[test]
@@ -2342,6 +2382,7 @@ mod tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,
@@ -2395,6 +2436,7 @@ mod tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,
@@ -2437,6 +2479,7 @@ mod tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             ..inst.clone()
         };
@@ -2752,6 +2795,7 @@ mod tests {
                 apparmor: String::new(),
                 cap_recorded: true,
                 aa_recorded: true,
+                seccomp_recorded: true,
                 posture_corrupt: false,
                 cgroup: String::new(),
                 cgroup_id: None,
@@ -2825,6 +2869,7 @@ mod tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,
@@ -2901,6 +2946,7 @@ mod tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,

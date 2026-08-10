@@ -1850,6 +1850,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             apparmor: spec.apparmor.clone().unwrap_or_default(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             // Resolved and recorded in the `on_started` callback below, once PID 1 exists and its
             // dedicated cgroup can be read. Empty here (and for a box with no dedicated cgroup).
@@ -4792,6 +4793,7 @@ fn run_detached(
         apparmor: spec.apparmor.clone().unwrap_or_default(),
         cap_recorded: true,
         aa_recorded: true,
+        seccomp_recorded: true,
         posture_corrupt: false,
         // Resolved once PID 1 is known (in the `on_started` callback below), so `list()` can tell an
         // orphaned box (this supervisor SIGKILL'd, PID 1 + forwarder still live) from an exited one.
@@ -16012,6 +16014,7 @@ mod net_resource_tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,
@@ -17643,6 +17646,7 @@ mod label_filter_tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,
@@ -17766,6 +17770,7 @@ mod drift_tests {
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
+            seccomp_recorded: true,
             posture_corrupt: false,
             cgroup: String::new(),
             cgroup_id: None,

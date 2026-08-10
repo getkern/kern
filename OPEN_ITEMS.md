@@ -113,3 +113,14 @@ panic-free (audited, and no abort surfaced across the extreme + four-kernel cros
 the source stays 100% stable Rust so `cargo test` runs on the SAME source the release ships (a
 contributor on stable reproduces a standard, panic-message binary), and the pinned nightly needs a
 deliberate bump + re-validation when it moves.
+
+## The allowlist default costs about 0.2 ms of box start
+
+Making the deny-by-default allowlist the shipped default (it replaced the wider denylist) added a
+measured ~0.2 ms to box start - median 3.3 ms vs 3.1 ms for `KERN_SECCOMP=denylist` on the same host,
+inside the run-to-run noise but real. The allowlist is a ~1273-instruction cBPF program against the
+denylist's ~84, so the kernel spends more loading and verifying it at `PR_SET_SECCOMP`; the per-syscall
+cost is neutral (a log2 binary search, at most ~7 extra compares for a common syscall, cheaper for
+deep-tree ones). The compiled program is cached per `(mode, allow_nesting)`, so it is built once per
+process, not per box. The cost buys the stronger default posture and is not on any opt-out path
+(`KERN_SECCOMP=denylist` restores the cheaper filter).
