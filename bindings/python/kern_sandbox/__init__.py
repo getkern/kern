@@ -1705,7 +1705,9 @@ class Kernel:
             self._proc.stdin.write(payload)
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            return self._teardown_result("killed", "the kernel process exited", started)
+            err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
+            fault, default = self._kernel_death_fault(err)
+            return self._teardown_result(fault, err.strip() or default, started)
         try:
             reply = self._q.get(timeout=eff)
         except queue.Empty:
@@ -1716,9 +1718,23 @@ class Kernel:
             )
         if reply is None:
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            fault = "startup_failed" if _looks_like_startup_failure(err) else "killed"
-            return self._teardown_result(fault, err.strip() or "the kernel box exited", started)
+            fault, default = self._kernel_death_fault(err)
+            return self._teardown_result(fault, err.strip() or default, started)
         return self._result_from_reply(reply, started)
+
+    def _kernel_death_fault(self, err: str) -> "tuple[str, str]":
+        """Why the resident kernel box died mid-cell, and a default message. A kern setup marker on
+        stderr means it never came up (``startup_failed``). Otherwise, with a ``--memory`` cap in force,
+        the cgroup OOM-killer is the dominant cause of a kernel that vanishes while running a cell - the
+        SAME attribution, from the same non-workload signal (the ``--memory`` flag WE set), as the
+        one-shot :meth:`_classify` SIGKILL path. Uncapped, the cause is ambiguous -> ``killed``. This is
+        the ``run_code`` counterpart of that path: a kernel death does NOT flow through ``_classify``
+        (there is no per-cell exit code - the kernel is resident), so the OOM attribution lives here too."""
+        if _looks_like_startup_failure(err):
+            return "startup_failed", "the kernel box failed to start"
+        if self._sbx.memory_mb is not None:
+            return "oom", "the kernel box was OOM-killed (it exceeded its memory cap)"
+        return "killed", "the kernel box exited"
 
     def _result_from_reply(self, reply: bytes, started: float) -> ExecutionResult:
         """Turn one kernel reply into an :class:`ExecutionResult`.

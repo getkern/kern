@@ -894,6 +894,21 @@ def test_a_reply_without_a_usable_exit_code_is_a_fault_not_a_success():
     assert not bad.success and bad.exit_code == 3 and bad.fault is None
 
 
+def test_kernel_death_is_oom_only_when_a_memory_cap_was_set():
+    # A resident kernel that dies mid-cell (an OOM-killed cell, a crash) does NOT flow through
+    # `_classify` - it has no per-cell exit code - so its OOM attribution lives in `_kernel_death_fault`,
+    # the run_code counterpart of the one-shot SIGKILL branch. Capped -> oom (the cgroup OOM-killer took
+    # the kernel), uncapped -> killed (ambiguous), a kern setup marker on stderr -> startup_failed. The
+    # signal is the --memory flag WE set, not the box's (workload-influenceable) stderr.
+    capped = Kernel(_cfg(memory_mb=256), timeout_s=5)
+    assert capped._kernel_death_fault("")[0] == "oom"
+    assert capped._kernel_death_fault("some traceback\n")[0] == "oom"  # workload stderr does not flip it
+    marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n"
+    assert capped._kernel_death_fault(marker)[0] == "startup_failed"  # a box that never really started
+    uncapped = Kernel(_cfg(memory_mb=None), timeout_s=5)
+    assert uncapped._kernel_death_fault("")[0] == "killed"
+
+
 @integration
 def test_concurrent_calls_on_one_sandbox_do_not_fight_over_the_env_file():
     """Two calls on the SAME Sandbox must not race for one host-side `--env-file` path.

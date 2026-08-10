@@ -914,6 +914,20 @@ test("a reply without a usable exit code is a fault, not a success", () => {
   assert.equal(bad.fault, null);
 });
 
+test("kernel death is oom only when a memory cap was set", () => {
+  // A resident kernel that dies mid-cell has no per-cell exit code, so it does NOT flow through
+  // _classify; its OOM attribution lives in _kernelDeathFault, the runCode counterpart of the one-shot
+  // SIGKILL branch. Capped -> oom, uncapped -> killed, a kern setup marker -> startup_failed. The
+  // signal is the --memory flag WE set, not the box's (workload-influenceable) stderr.
+  const capped = new kern.Kernel(new Sandbox({ memoryMb: 256 }), 5);
+  assert.strictEqual(capped._kernelDeathFault("")[0], "oom");
+  assert.strictEqual(capped._kernelDeathFault("some traceback\n")[0], "oom"); // stderr does not flip it
+  const marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n";
+  assert.strictEqual(capped._kernelDeathFault(marker)[0], "startup_failed");
+  const uncapped = new kern.Kernel(new Sandbox({ memoryMb: null }), 5);
+  assert.strictEqual(uncapped._kernelDeathFault("")[0], "killed");
+});
+
 test("concurrent calls on one Sandbox do not fight over the env file", exec, async () => {
   // The env file used to be a single fixed `.kern-env` in the workspace, unlinked and re-created with
   // O_EXCL|O_NOFOLLOW on every call (a deliberate refusal to write through a symlink the box may have

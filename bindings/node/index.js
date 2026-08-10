@@ -1761,8 +1761,8 @@ class Kernel {
       return this._teardownResult("killed", `the kernel reply exceeded the ${this._cap}-byte cap`, started);
     if (reply === null) {
       const err = this._stderr.toString("utf8");
-      const kind = looksLikeStartupFailure(err) ? "startup_failed" : "killed";
-      return this._teardownResult(kind, err.trim() || "the kernel box exited", started);
+      const [kind, dflt] = this._kernelDeathFault(err);
+      return this._teardownResult(kind, err.trim() || dflt, started);
     }
     return this._resultFromReply(reply, started);
   }
@@ -1806,6 +1806,19 @@ class Kernel {
       truncated: false,
       results,
     });
+  }
+
+  /** Why the resident kernel box died mid-cell, as `[type, defaultMessage]`. A kern setup marker on
+   * stderr means it never came up (startup_failed). Otherwise, with a memoryMb cap in force, the cgroup
+   * OOM-killer is the dominant cause of a kernel that disappears while running a cell - the SAME
+   * attribution (from the same non-workload signal, the --memory flag WE set) as the one-shot _classify
+   * SIGKILL path. A kernel death has no per-cell exit code to route through _classify, so the OOM
+   * attribution lives here too. Uncapped, the cause is ambiguous -> `killed`. */
+  _kernelDeathFault(err) {
+    if (looksLikeStartupFailure(err)) return ["startup_failed", "the kernel box failed to start"];
+    if (this._sbx.memoryMb !== null)
+      return ["oom", "the kernel box was OOM-killed (it exceeded its memory cap)"];
+    return ["killed", "the kernel box exited"];
   }
 
   _teardownResult(type, message, started) {
