@@ -52,7 +52,13 @@ privilege-escalation bug is an escape.
 - **Namespaces**: user, PID, network (loopback-only), UTS, IPC and mount.
 - **`pivot_root`** into the rootfs. The default root is a writable overlay whose scratch is discarded
   on exit; `--read-only` remounts it read-only, and the ordering (read-only only *after* the pivot)
-  is compile-enforced by a typestate.
+  is compile-enforced by a typestate. The overlay `lowerdir` is the content-addressed image cache,
+  **shared read-only** across boxes; every write lands in a **per-box ephemeral upper**. Verified on a
+  live overlay (two boxes, one image): a box that rewrites `/etc/os-release` and drops a marker leaves
+  the shared host lower byte-identical (sha256 unchanged, marker absent), a second box from the same
+  image sees neither, and after the pivot neither box can reach the lower's host path (`/proc/kcore`
+  and `open_by_handle_at` are the two ways to escape a pivoted root to a host inode; the first is
+  masked, the second `ENOSYS`, so a leaked file handle cannot be opened).
 - **Least-privilege capabilities**: 14 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
   `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, and more) are dropped from
   the effective, permitted, inheritable **and bounding** sets just before exec, so no setuid or

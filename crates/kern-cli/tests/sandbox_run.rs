@@ -1615,6 +1615,94 @@ int main(void) {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// **Red-team regression: the ENTIRE mount API - classic AND the new fd-based family - hard-kills.**
+///
+/// `mount(2)` is the obvious one, but the fd-based mount API (`fsopen`/`fsconfig`/`fsmount`/
+/// `move_mount`/`open_tree`/`fspick`/`mount_setattr`) can remount a box's root writable or unmask a
+/// masked `/proc` path just as well. "Denied by the deny-by-default allowlist" would make them
+/// `ENOSYS` (safe by construction, but not killed); kern instead puts every one in the seccomp
+/// KILL prologue, so an attempt is `SIGSYS`, not a survivable `ENOSYS` the workload can branch on.
+/// This asserts each by its ARCH-CORRECT number (`libc::SYS_*`, so it holds on x86_64 and aarch64
+/// where the numbers differ), closing the "safe by construction != killed" gap for the whole family.
+#[test]
+fn mount_api_family_is_hard_killed() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // A helper that invokes one syscall by number with benign zero args. A KILL vector never
+    // returns (SIGSYS reaps it); a benign one returns and the process exits 0. The filter decides on
+    // the number alone, so zero args are fine - it is refused before the kernel reads them.
+    const SRC: &str = r#"
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    syscall(atol(argv[1]), 0, 0, 0, 0, 0, 0);
+    return 0;
+}
+"#;
+    let Some(helper) = compile_static_helper(SRC, "mountfam") else {
+        eprintln!("skip: no static C compiler available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "mountfam");
+    fs::copy(&helper, root.join("syscall1")).unwrap();
+    let rootfs = root.to_str().unwrap();
+
+    // The whole mount API, classic + fd-based, by arch-correct number.
+    let family: [(&str, libc::c_long); 10] = [
+        ("mount", libc::SYS_mount),
+        ("umount2", libc::SYS_umount2),
+        ("pivot_root", libc::SYS_pivot_root),
+        ("open_tree", libc::SYS_open_tree),
+        ("move_mount", libc::SYS_move_mount),
+        ("fsopen", libc::SYS_fsopen),
+        ("fsconfig", libc::SYS_fsconfig),
+        ("fsmount", libc::SYS_fsmount),
+        ("fspick", libc::SYS_fspick),
+        ("mount_setattr", libc::SYS_mount_setattr),
+    ];
+
+    // Positive control: a benign syscall (getpid) must let the box exit 0 - proving the helper runs
+    // and it is the mount family SPECIFICALLY that is killed, not every syscall the helper makes.
+    let nr = libc::SYS_getpid.to_string();
+    let ok = kern()
+        .args(["box", "mf-ctl", "--rootfs", rootfs, "--", "/syscall1", &nr])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&ok.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "positive control (getpid) must exit 0, else the helper itself is being killed: {ok:?}"
+    );
+
+    for (name, nr) in family {
+        let nr = nr.to_string();
+        let killed = kern()
+            .args(["box", "mf", "--rootfs", rootfs, "--", "/syscall1", &nr])
+            .output()
+            .expect("run kern");
+        assert_eq!(
+            killed.status.code(),
+            Some(159),
+            "{name} (nr {nr}) must SIGSYS-kill (128+31), not survive: {killed:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// `-v` round-trips data across the boundary: a read-write volume's writes appear on the host,
 /// and a `:ro` volume rejects writes. The only sanctioned way data enters/leaves a box.
 #[test]
