@@ -3983,10 +3983,16 @@ fn box_oom_group_kills_the_whole_box_atomically() {
         eprintln!("skip: memory cap not enforced here (box allocated uncapped)");
         return;
     }
-    let oom = out.status.code() == Some(137) || out.status.signal() == Some(libc::SIGKILL);
+    // The box did not survive: on a modern kernel the group-kill is SIGKILL (137); on some boards
+    // (Arduino UNO Q) the reported code is 143, the box init being torn down AFTER the kill. Either
+    // way the box is gone - the promise we actually pin is the ATOMICITY below (no task outlived),
+    // not the exact signal. A clean error code (1/2) would mean the workload failed for another
+    // reason, so it is not accepted here.
+    let killed =
+        out.status.signal() == Some(libc::SIGKILL) || matches!(out.status.code(), Some(137 | 143));
     assert!(
-        oom,
-        "expected OOM (137 / SIGKILL), got code={:?} signal={:?} (stderr: {err})",
+        killed,
+        "expected the box to be OOM-killed (137 / SIGKILL / 143), got code={:?} signal={:?} (stderr: {err})",
         out.status.code(),
         out.status.signal()
     );
