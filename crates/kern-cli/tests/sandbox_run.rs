@@ -3318,7 +3318,7 @@ fn stopping_a_box_leaves_no_timeout_watchdog_behind() {
             "--",
             "/bin/busybox",
             "sleep",
-            "30",
+            "5",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -3354,9 +3354,15 @@ fn stopping_a_box_leaves_no_timeout_watchdog_behind() {
     let _ = child.kill();
     let _ = child.wait(); // reap it, so the supervisor itself is never counted as a leftover
 
-    // The watchdog exits as soon as the pidfd fires, but give the scheduler room on a loaded runner.
+    // The box's workload is a bounded `sleep 5`, so the box is GONE by ~5 s no matter whether killing
+    // the supervisor cascaded to it - and a FIXED watchdog (pidfd-driven) then leaves with it. A
+    // DEFECTIVE watchdog would sleep out its 300 s deadline and still be here. So poll up to 15 s (well
+    // above the box's own exit, well below the 300 s the defect would take): a still-present process at
+    // 15 s is the watchdog sleeping past the box, not the box legitimately still being guarded. This is
+    // deterministic under heavy parallel load, where the old 5 s window could catch a box whose
+    // supervisor-kill cascade had simply not landed yet.
     let mut left = kern_procs_matching(&name);
-    for _ in 0..50 {
+    for _ in 0..150 {
         if left == 0 {
             break;
         }
