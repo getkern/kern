@@ -997,10 +997,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // below cost one `getenv` when the variable is unset.
     let mut pt = kern_isolation::PhaseTimer::new();
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
-    // The caller's (an SDK's) "box started" fd: read and PROTECT it up front, BEFORE the box is forked.
-    // `started_signal_fd` sets FD_CLOEXEC so the box's execvp closes it - the workload must never
-    // inherit or write this fd, or a byte it wrote would spoof/suppress the signal. Fail-closed (a fd
-    // we cannot protect is dropped). Written once, at the terminal exit arm below.
+    // The caller's (an SDK's) "box started" fd: read and VALIDATE it up front, BEFORE the box is forked.
+    // `started_signal_fd` does NOT set FD_CLOEXEC yet: the `systemd-run --scope` re-exec below inherits
+    // a plain fd but DROPS a CLOEXEC one, so marking it here would lose the channel on every host that
+    // takes the scope path (measured on a Pi with a user manager but no cgroup delegation - the byte
+    // never arrived and the SDK silently fell back to its stderr heuristic). `cloexec_started_fd` marks
+    // it CLOEXEC AFTER that re-exec, in the final process, so the box's execvp still closes it and the
+    // workload can never inherit or write it. Written once, at the terminal exit arm below.
     let started_fd = started_signal_fd();
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
     // start chose the direct path) is meaningless here and would arm the fail-closed refusal on a
@@ -1237,6 +1240,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             allow_uncapped: args.allow_uncapped || kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
         });
     }
+    // Protect the started-fd HERE, in the FINAL process: the scope re-exec above, if it was taken,
+    // execve'd (and this is its inner, `KERN_SCOPE`-marked process); otherwise no re-exec happened.
+    // Deferring the CLOEXEC past that point is what lets the "box started" byte survive a
+    // `systemd-run --scope` (which inherits a plain fd). Fail-closed: a fd we cannot protect is dropped
+    // (the SDK then reads EOF and falls back to its stderr heuristic, which only ever over-reports).
+    // From here the box's execvp closes it, so the workload still cannot forge or suppress the signal.
+    let started_fd = cloexec_started_fd(started_fd);
     // A profile's `nice` set here is inherited by the forked box workload.
     if let Some(n) = nice {
         unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) };
@@ -1980,12 +1990,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
 }
 
 /// The `KERN_STARTED_FD` write end an SDK passes to receive the unforgeable "box started" byte, or
-/// `None`. Validated `> 2` (never stdin/stdout/stderr), then marked **FD_CLOEXEC** so the box's execvp
-/// closes it and the workload can never inherit or write it - a byte it wrote would spoof or suppress
-/// the signal. Called ONCE, EARLY in `box_run` (before the box is forked), so the box PID 1 inherits
-/// the descriptor already CLOEXEC rather than relying on kern's general pre-exec fd shed. Fail-closed:
-/// a fd we cannot mark is dropped (`None`), since no signal beats a forgeable one. Mirrors
-/// [`ready_fd_to_signal`]'s `> 2` discipline.
+/// `None`. VALIDATES the fd (`> 2`, never stdin/stdout/stderr, and a live descriptor) but does NOT set
+/// FD_CLOEXEC - that is deferred to [`cloexec_started_fd`], called AFTER the `systemd-run --scope`
+/// re-exec. A CLOEXEC fd is DROPPED by that re-exec (a plain one is inherited), so marking it here
+/// would lose the channel on every host that takes the scope path. Called ONCE, EARLY in `box_run`
+/// (before the box is forked). Fail-closed: a fd we cannot even stat is dropped (`None`), since no
+/// signal beats a forgeable one. Mirrors [`ready_fd_to_signal`]'s `> 2` discipline.
 fn started_signal_fd() -> Option<i32> {
     let fd = std::env::var("KERN_STARTED_FD")
         .ok()?
@@ -1995,6 +2005,20 @@ fn started_signal_fd() -> Option<i32> {
     if fd <= 2 {
         return None;
     }
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return None;
+    }
+    Some(fd)
+}
+
+/// Mark the started-fd **FD_CLOEXEC** in the FINAL process - after the `systemd-run --scope` re-exec,
+/// which inherits a plain fd but drops a CLOEXEC one. From here the box's execvp closes it, so the
+/// workload can never inherit or write it (a byte it wrote would spoof or suppress the signal).
+/// Fail-closed: a fd we cannot protect is dropped (`None`), so the SDK reads EOF and falls back to its
+/// stderr heuristic (which only ever over-reports a failure, never masks one) rather than trusting a
+/// descriptor the workload might reach.
+fn cloexec_started_fd(fd: Option<i32>) -> Option<i32> {
+    let fd = fd?;
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         return None;
