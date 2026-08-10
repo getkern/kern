@@ -1703,6 +1703,130 @@ int main(int argc, char **argv) {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// **Red-team regression: the shared overlay lower is isolating across boxes.**
+///
+/// An image root uses an overlay whose `lowerdir` (the content-addressed image cache) is shared
+/// read-only across boxes; every write lands in a per-box ephemeral upper. This asserts that property
+/// end to end on a REAL overlay, offline: build a throwaway local image (a detached `--rootfs` box +
+/// `kern commit`, so no registry or network), then run two boxes from it. Box A writes a marker and
+/// rewrites a seed file; box B - a fresh box from the SAME image - must see NEITHER, proving A's
+/// writes went to its own ephemeral upper and never reached the shared lower or a peer box. The
+/// discriminant: the same read (`cat /marker`, `cat /seed`) that returns A's data inside A returns the
+/// pristine image inside B. Skip-graceful where a detached box or `kern commit` is unavailable.
+#[test]
+fn overlay_lower_is_shared_ro_across_boxes() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "ovl");
+    // A seed whose ORIGINAL content box B must still see after box A rewrites its own copy.
+    fs::write(root.join("seed"), b"original").unwrap();
+    let rootfs = root.to_str().unwrap();
+    let img = format!("kern-ovl-test-{}:local", std::process::id());
+
+    // Build a local image OFFLINE: a detached box we can commit. Clear any stale name first.
+    let _ = kern().args(["rmi", &img]).output();
+    let started = kern()
+        .args([
+            "box",
+            "ovl-src",
+            "--rootfs",
+            rootfs,
+            "--detach",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&started.stderr).contains("user namespaces")
+        || !started.status.success()
+    {
+        eprintln!(
+            "skip: cannot start a detached box here ({})",
+            String::from_utf8_lossy(&started.stderr).trim()
+        );
+        let _ = kern().args(["stop", "ovl-src"]).output();
+        let _ = kern().args(["rm", "ovl-src"]).output();
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let committed = kern()
+        .args(["commit", "ovl-src", &img])
+        .output()
+        .expect("run kern");
+    // The detached source box has served its purpose regardless of the commit result.
+    let _ = kern().args(["stop", "ovl-src"]).output();
+    let _ = kern().args(["rm", "ovl-src"]).output();
+    if !committed.status.success() {
+        eprintln!(
+            "skip: kern commit unavailable here ({})",
+            String::from_utf8_lossy(&committed.stderr).trim()
+        );
+        let _ = kern().args(["rmi", &img]).output();
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+
+    // Box A: write a distinctive marker and tamper the seed - both must land in A's ephemeral upper.
+    let a = kern()
+        .args([
+            "box",
+            "ovl-a",
+            "--image",
+            &img,
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "echo MARKER_A > /marker; echo tampered_by_A > /seed; cat /marker",
+        ])
+        .output()
+        .expect("run kern");
+    let a_out = String::from_utf8_lossy(&a.stdout).to_string();
+
+    // Box B: a FRESH box from the SAME image must see neither A's marker nor A's tamper.
+    let b = kern_out(&[
+        "box",
+        "ovl-b",
+        "--image",
+        &img,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "if [ -e /marker ]; then echo SEES_MARKER; fi; cat /seed",
+    ]);
+    let b_out = String::from_utf8_lossy(&b.stdout).to_string();
+
+    // Clean up BEFORE asserting, so a failed assertion still leaves no box or image behind.
+    let _ = kern().args(["rm", "ovl-a"]).output();
+    let _ = kern().args(["rm", "ovl-b"]).output();
+    let _ = kern().args(["rmi", &img]).output();
+    let _ = fs::remove_dir_all(&root);
+
+    // Positive control: box A actually wrote and read its own marker (else "B sees nothing" is vacuous).
+    assert!(
+        a_out.contains("MARKER_A"),
+        "box A must write and read its own marker (positive control): {a_out:?}"
+    );
+    // The isolation: none of A's writes crossed the shared lower into a peer box.
+    assert!(
+        !b_out.contains("SEES_MARKER"),
+        "box B must NOT see box A's marker (per-box ephemeral upper): {b_out:?}"
+    );
+    assert!(
+        b_out.contains("original") && !b_out.contains("tampered_by_A"),
+        "box B must see the image's pristine seed, not box A's tamper: {b_out:?}"
+    );
+}
+
 /// `-v` round-trips data across the boundary: a read-write volume's writes appear on the host,
 /// and a `:ro` volume rejects writes. The only sanctioned way data enters/leaves a box.
 #[test]

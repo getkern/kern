@@ -3937,6 +3937,70 @@ mod shed_tests {
 }
 
 #[cfg(test)]
+mod setup_window_sequence_tests {
+    /// SECURITY (TOCTOU / setup-window regression): the seccomp filter and the capability drop are the
+    /// LAST setup steps before the workload's `execvp`, so nothing untrusted runs in the window between
+    /// entering the user namespace and the filter being in force. A hand grep proved that once; this
+    /// makes it a permanent guard. A future edit that forks or execs a process in the setup window -
+    /// before `crate::seccomp::install(...)` - FAILS the build instead of silently opening the window
+    /// (the exact gap a reviewer flagged as having no automated cancello).
+    ///
+    /// The test reads its own source and asserts no process-launching token appears inside
+    /// `child_setup_and_exec` BEFORE the install call: the CALL SYNTAX (with a `(`) for the ways a
+    /// new/foreign program starts (`execvp(`/`execve(`/`execv(`/`posix_spawn(`/`Command::new(`/
+    /// `.spawn(`) or a new task forks (`libc::fork(`/`libc::clone(`/`run_init(`). `//` line comments
+    /// are stripped first, so prose that merely NAMES a syscall (the apparmor comment mentions "the
+    /// eventual execve") cannot trip the scan - only real call syntax does. `aa_change_onexec`/
+    /// `apply_apparmor_onexec` only ARM a transition that fires at the eventual execve, launching
+    /// nothing, and by their spelling match none of the tokens anyway.
+    #[test]
+    fn no_untrusted_exec_before_the_seccomp_filter() {
+        const SRC: &str = include_str!("real.rs");
+        let fn_start = SRC
+            .find("fn child_setup_and_exec")
+            .expect("child_setup_and_exec must exist");
+        let after_fn = &SRC[fn_start..];
+        // The FIRST seccomp install after the function signature is the barrier (line ~990); the test
+        // module's own token list sits far below it, so it is never scanned.
+        let install = after_fn
+            .find("crate::seccomp::install(")
+            .expect("child_setup_and_exec must install the seccomp filter");
+        // Strip `//` line comments so prose naming a syscall cannot false-positive; scan only code.
+        let setup_window: String = after_fn[..install]
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for tok in [
+            "execvp(",
+            "execve(",
+            "execv(",
+            "posix_spawn(",
+            "Command::new(",
+            ".spawn(",
+            "libc::fork(",
+            "libc::clone(",
+            "run_init(",
+        ] {
+            assert!(
+                !setup_window.contains(tok),
+                "'{tok}' appears in child_setup_and_exec BEFORE seccomp::install: the setup window \
+                 must run no untrusted code before the filter and cap drop are in force (TOCTOU guard)"
+            );
+        }
+        // Guard against a barrier matched too early: the workload's own exec (`exec(argv)`) must exist
+        // AFTER the install, confirming `install` is the true last-lockdown-before-exec barrier.
+        assert!(
+            after_fn[install..].contains("exec(argv)"),
+            "exec(argv) must come AFTER seccomp::install in child_setup_and_exec"
+        );
+    }
+}
+
+#[cfg(test)]
 mod pdeathsig_cascade_tests {
     // Reproduces the OS mechanism the orphan-on-launcher-death fix relies on: a "box PID 1" (G)
     // that arms `PR_SET_PDEATHSIG(SIGKILL)` relative to its "supervisor" (A) is SIGKILLed the moment

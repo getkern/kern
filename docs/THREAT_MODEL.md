@@ -112,16 +112,19 @@ The claims are checked by asking the kernel what is true, not by asking kern to 
   never a false pass.
 - The tar byte-parser is fuzzed. Production code is panic-free (no `unwrap`/`expect`/`panic!` on any
   reachable path). The boundaries have been exercised on x86_64, three ARM boards, WSL2, and a VPS.
-- Three sequence/coverage properties are asserted, not assumed: (1) the WHOLE mount API, classic and
-  the fd-based family (`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/`fspick`/`mount_setattr`),
-  hard-kills with `SIGSYS` - not merely `ENOSYS`-by-allowlist - checked by arch-correct number
-  (x86_64 + aarch64) in a regression test, so "safe by construction" never stands in for "killed". (2)
-  The setup window carries no attacker code: between `unshare(userns)` and the filter, only kern's own
-  trusted setup syscalls run; the cap drop (bounding + effective, read-back verified), Landlock and the
-  seccomp filter are all in force **before** the workload's `execvp`, and the only untrusted binary
-  forked before the filter is `--ssh`'s sshd, declared cooperative above. (3) The shared overlay lower
-  is isolating: a write from one box never reaches the read-only host lower or a peer box, and the
-  lower's host path is unreachable after the pivot (verified live on two boxes from one image).
+- Three sequence/coverage properties are asserted by a test, not assumed: (1) the WHOLE mount API,
+  classic and the fd-based family (`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/`fspick`/
+  `mount_setattr`), hard-kills with `SIGSYS` - not merely `ENOSYS`-by-allowlist - checked by
+  arch-correct number (x86_64 + aarch64) in `mount_api_family_is_hard_killed`, so "safe by
+  construction" never stands in for "killed". (2) The setup window carries no attacker code: the cap
+  drop (bounding + effective, read-back verified), Landlock and the seccomp filter are all in force
+  **before** the workload's `execvp`, and a source-level regression
+  (`no_untrusted_exec_before_the_seccomp_filter`) fails the build if any process-launch or fork is
+  introduced into `child_setup_and_exec` before the filter install - so the only untrusted binary
+  forked before the filter stays `--ssh`'s sshd, declared cooperative above. (3) The shared overlay
+  lower is isolating: `overlay_lower_is_shared_ro_across_boxes` builds a local image and asserts a
+  marker + seed rewrite in one box is invisible to a fresh box from the same image, and the lower's
+  host path is unreachable after the pivot.
 - The discriminant is the standard: a claim is confirmed only when the same operation succeeds
   outside a box and is refused inside one, or the reverse, so a green result cannot come from the
   feature simply being absent.
