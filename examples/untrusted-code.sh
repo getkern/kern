@@ -2,7 +2,7 @@
 # Run code you do NOT trust, locked down hard.
 #
 # `--read-only` makes the whole root read-only (writes fail). On top of that every box already
-# has: no network (isolated net namespace, loopback only), an always-on seccomp denylist
+# has: no network (isolated net namespace, loopback only), an always-on seccomp allowlist
 # (mount, ptrace, kexec, module load, reboot, ... are killed with SIGSYS), a private PID
 # namespace, and cgroup memory/task caps. The workload sees none of the host.
 set -eu

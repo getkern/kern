@@ -21,7 +21,7 @@ Note: `setup="pip install ..."` reaches the network to fetch the package. If you
 will fail at __enter__ (raised as SandboxError - a setup/config failure, not a normal run outcome).
 
 Honest threat model: a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp is a
-denylist, not a hard multi-tenant wall. See bindings/python/README.md.
+deny-by-default allowlist, not a hard multi-tenant wall. See bindings/python/README.md.
 """
 import kern_sandbox as kern
 

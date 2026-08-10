@@ -16,7 +16,7 @@
  *     KERN_BIN=./target/release/kern node examples/embed-node.js
  *
  * Honest threat model: this is a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp is
- * a denylist - good for agent/CI code, NOT a hard boundary against deliberately hostile multi-tenant
+ * a deny-by-default allowlist - good for agent/CI code, NOT a hard boundary against deliberately hostile multi-tenant
  * code (for that use a microVM / gVisor). See bindings/node/README.md.
  */
 "use strict";

@@ -997,13 +997,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // below cost one `getenv` when the variable is unset.
     let mut pt = kern_isolation::PhaseTimer::new();
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
-    // The caller's (an SDK's) "box started" fd: read and VALIDATE it up front, BEFORE the box is forked.
-    // `started_signal_fd` does NOT set FD_CLOEXEC yet: the `systemd-run --scope` re-exec below inherits
-    // a plain fd but DROPS a CLOEXEC one, so marking it here would lose the channel on every host that
-    // takes the scope path (measured on a Pi with a user manager but no cgroup delegation - the byte
-    // never arrived and the SDK silently fell back to its stderr heuristic). `cloexec_started_fd` marks
-    // it CLOEXEC AFTER that re-exec, in the final process, so the box's execvp still closes it and the
-    // workload can never inherit or write it. Written once, at the terminal exit arm below.
+    // The caller's (an SDK's) "box started" fd, read and VALIDATED up front, BEFORE the box is forked.
+    // CLOEXEC is deferred past the scope re-exec by `cloexec_started_fd` below (see both docstrings for
+    // why the systemd-run re-exec forces the split); written once, at the terminal exit arm below.
     let started_fd = started_signal_fd();
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
     // start chose the direct path) is meaningless here and would arm the fail-closed refusal on a
@@ -1240,12 +1236,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             allow_uncapped: args.allow_uncapped || kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
         });
     }
-    // Protect the started-fd HERE, in the FINAL process: the scope re-exec above, if it was taken,
-    // execve'd (and this is its inner, `KERN_SCOPE`-marked process); otherwise no re-exec happened.
-    // Deferring the CLOEXEC past that point is what lets the "box started" byte survive a
-    // `systemd-run --scope` (which inherits a plain fd). Fail-closed: a fd we cannot protect is dropped
-    // (the SDK then reads EOF and falls back to its stderr heuristic, which only ever over-reports).
-    // From here the box's execvp closes it, so the workload still cannot forge or suppress the signal.
+    // Now in the FINAL process (the scope re-exec above, if taken, has already execve'd): mark the
+    // started-fd CLOEXEC so the workload's execvp closes it. Fail-closed (a fd we cannot protect is
+    // dropped, and the SDK falls back to its over-reporting heuristic); see `cloexec_started_fd`.
     let started_fd = cloexec_started_fd(started_fd);
     // A profile's `nice` set here is inherited by the forked box workload.
     if let Some(n) = nice {

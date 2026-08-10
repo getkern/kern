@@ -9,13 +9,13 @@
 #
 # The lockdown on every eval:
 #   --security-profile untrusted  the hardening bundle for code nobody has read: seccomp ALLOWLIST
-#                  (deny-by-default with ENOSYS, stricter than the on-by-default denylist) + cap-drop
+#                  (deny-by-default with ENOSYS, the same allowlist the default now ships) + cap-drop
 #                  ALL + read-only root, in one flag.
 #   --network none  no network at all (isolated netns, loopback only) - the model can't phone home
 #   --memory/--cpus/--pids-limit   resource caps (RAM ceiling, CPU share, fork-bomb containment)
 #   --timeout      wall-clock kill switch, so a runaway snippet can't hang the agent
-# A box always has an always-on seccomp filter and a private PID namespace; `untrusted` upgrades the
-# default denylist to the allowlist. We CAPTURE the exit code (never let it abort the script) - that
+# A box always has an always-on seccomp allowlist and a private PID namespace; `untrusted` adds
+# cap-drop ALL + a read-only root on top. We CAPTURE the exit code (never let it abort the script) - that
 # code is the result the agent reacts to.
 #
 # Honest threat model: a KERNEL-boundary sandbox for agent-authored / AI-generated code. `untrusted`

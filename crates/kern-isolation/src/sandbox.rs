@@ -163,10 +163,9 @@ pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
 /// Selects the seccomp policy for the sandbox.
 ///
 /// # Advisory on the public runtime
-/// The public `kern box` installs its hardened **denylist** filter
-/// unconditionally (it cannot be turned off from the SDK). This enum is kept so
-/// an embedding's intent stays explicit in caller code, and so the shape is
-/// explicit in caller code, but on the public runtime this field is ADVISORY: the filter that
+/// The public `kern box` always installs a hardened seccomp filter (it cannot be turned off from
+/// the SDK) - a deny-by-default allowlist by default. This enum is kept so an embedding's intent
+/// stays explicit in caller code, but on the public runtime this field is ADVISORY: the filter that
 /// actually installs is a fine-grained [`crate::SeccompFilter`] (a deny-by-default allowlist by
 /// default, a wider denylist via `KERN_SECCOMP=denylist`). A kernel seccomp filter is ALWAYS on
 /// regardless - `Disabled` cannot turn it off, and this coarse mode never selects the allowlist.

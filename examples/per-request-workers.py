@@ -14,7 +14,7 @@ concurrency; the ISOLATION is the box (a `kern.run_code` throwaway session per r
     KERN_BIN=./target/release/kern python3 examples/per-request-workers.py
 
 Honest threat model: a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp is a
-denylist, not a hard multi-tenant wall. See bindings/python/README.md.
+deny-by-default allowlist, not a hard multi-tenant wall. See bindings/python/README.md.
 """
 from concurrent.futures import ThreadPoolExecutor
 

@@ -572,14 +572,15 @@ pub fn install(mode: SeccompFilter, allow_nesting: bool) -> Result<(), Error> {
         return Err(Error::last("prctl(NO_NEW_PRIVS)"));
     }
 
-    let mut prog = match mode {
-        SeccompFilter::Allowlist => build_allowlist_filter(allow_nesting, false),
-        SeccompFilter::AllowlistAudit => build_allowlist_filter(allow_nesting, true),
-        SeccompFilter::Denylist => build_filter(allow_nesting),
-    };
+    // The compiled program is a pure function of `(mode, allow_nesting)` and byte-identical for every
+    // box, so it is built ONCE per combination and reused (see `cached_program`) instead of rebuilding a
+    // multi-KiB `Vec` + a backpatch loop on every box start and every `exec`.
+    let prog = cached_program(mode, allow_nesting);
     let fprog = libc::sock_fprog {
         len: prog.len() as u16,
-        filter: prog.as_mut_ptr(),
+        // The kernel COPIES the program at `PR_SET_SECCOMP` and never writes through this pointer, so a
+        // shared `&'static` view cast to `*mut` is sound.
+        filter: prog.as_ptr() as *mut libc::sock_filter,
     };
     let r = unsafe {
         libc::prctl(
@@ -594,6 +595,36 @@ pub fn install(mode: SeccompFilter, allow_nesting: bool) -> Result<(), Error> {
         return Err(Error::last("prctl(SET_SECCOMP)"));
     }
     Ok(())
+}
+
+/// The compiled BPF program for `(mode, allow_nesting)`, built once per combination and memoized. The
+/// program is a pure function of its inputs and byte-identical for every box, so rebuilding a multi-KiB
+/// `Vec` (the allowlist is ~10 KiB) plus its relative-backpatch loop on every box start and every `exec`
+/// is wasted work. Six combinations exist (3 modes x 2 nesting); each slot fills on first use, thread-safe
+/// via `OnceLock` (a single `Acquire` load once warm, no lock on the steady-state path). The returned
+/// slice is read-only to the kernel, which copies the program into its own storage at `PR_SET_SECCOMP`.
+fn cached_program(mode: SeccompFilter, allow_nesting: bool) -> &'static [libc::sock_filter] {
+    use std::sync::OnceLock;
+    static SLOTS: [OnceLock<Vec<libc::sock_filter>>; 6] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    let mode_idx = match mode {
+        SeccompFilter::Denylist => 0,
+        SeccompFilter::Allowlist => 1,
+        SeccompFilter::AllowlistAudit => 2,
+    };
+    SLOTS[mode_idx * 2 + allow_nesting as usize]
+        .get_or_init(|| match mode {
+            SeccompFilter::Allowlist => build_allowlist_filter(allow_nesting, false),
+            SeccompFilter::AllowlistAudit => build_allowlist_filter(allow_nesting, true),
+            SeccompFilter::Denylist => build_filter(allow_nesting),
+        })
+        .as_slice()
 }
 
 #[cfg(test)]
@@ -1193,7 +1224,7 @@ mod tests {
             (
                 "SECURITY.md",
                 vec![
-                    format!("**{total} syscalls denied**"),
+                    format!("**{total} escape syscalls**"),
                     format!("{kill} that hard-kill"),
                     format!("the {errno} that return"),
                     // SECURITY.md said "**34 syscalls denied**" in one bullet and "9 plus 24 is the
@@ -1206,7 +1237,7 @@ mod tests {
                     ),
                 ],
             ),
-            ("README.md", vec![format!("denylist of {total} syscalls")]),
+            ("README.md", vec![format!("kern's {total} escape syscalls")]),
             // OPEN_ITEMS.md states the ENOSYS count in words, and it went stale the moment `clone3`
             // joined the set: the file said "Nine denied syscalls" while the filter denied ten. It
             // was not covered here, which is exactly why nobody noticed. Word forms are checked
