@@ -660,6 +660,19 @@ fn apply_apparmor_onexec(profile: &str) -> Result<(), Error> {
 }
 
 fn exec(argv: &[CString]) -> Error {
+    // FAIL-CLOSED setup-window choke point (TOCTOU): every workload exec funnels through here, and here
+    // refuses to hand control over unless a seccomp filter is provably in force in THIS process. All
+    // real paths install it just above their exec (`child_setup_and_exec`, the built-in init's workload
+    // child, and the `kern exec` path). This catches a FUTURE exec added through indirection or aliasing
+    // that the lexical `no_untrusted_exec_before_the_seccomp_filter` source guard - one stack frame -
+    // cannot see. One `Acquire` load on a path that already forks+execs is free; the cost of being wrong
+    // is a workload running unfiltered. Panic-free: it returns fail-closed, the caller reports and exits.
+    if !crate::seccomp::is_installed() {
+        return Error::Unsupported(
+            "refusing to exec the workload: no seccomp filter is installed in this process \
+             (setup-window guard)",
+        );
+    }
     let mut ptrs: Vec<*const c_char> = argv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(ptr::null());
     unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };

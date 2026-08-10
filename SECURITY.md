@@ -62,8 +62,11 @@ privilege-escalation bug is an escape.
   the second `ENOSYS`, so a leaked file handle cannot be opened).
 - **Least-privilege capabilities**: 14 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
   `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, and more) are dropped from
-  the effective, permitted, inheritable **and bounding** sets just before exec, so no setuid or
-  file-capability binary in the image can wield them. (`SYS_PTRACE`'s `ptrace` syscall is already
+  the effective, permitted, inheritable, **ambient and bounding** sets just before exec, so no setuid or
+  file-capability binary in the image can wield them - the bounding drop is read back with
+  `PR_CAPBSET_READ`, and under `--cap-drop ALL` every set (`CapEff`/`CapPrm`/`CapInh`/`CapAmb`/`CapBnd`)
+  is asserted all-zero from the box's own `/proc/self/status` (ambient matters: it survives `execve`
+  and `NO_NEW_PRIVS` does not clear it). (`SYS_PTRACE`'s `ptrace` syscall is already
   seccomp-killed; dropping the cap also closes the `/proc/<pid>/mem` cross-process read it would
   otherwise allow.) `--cap-drop CAP` / `--cap-drop ALL` drops more;
   `--cap-add CAP` keeps one that would otherwise go (add wins), and an unknown cap name is a hard
@@ -83,7 +86,9 @@ privilege-escalation bug is an escape.
   `perf_event_open`, the keyring's three, `syslog`, and `open_by_handle_at` (the file-handle escape
   primitive Docker gates on the dropped `CAP_DAC_READ_SEARCH`). Wrong-arch syscalls are killed, and on x86_64
   so is every **x32-ABI** syscall, closing the bypass where the x32 alias of a denied number slips
-  past a number-only filter.
+  past a number-only filter. This is verified end to end: an i386 `int 0x80` with `eax=21` (i386
+  `mount`, whose number is `access` on x86_64, which the allowlist permits) is `SIGSYS`-killed by the
+  arch guard, not silently reinterpreted against the x86_64 table.
 - **`clone(2)` is filtered on its ARGUMENTS**, and it is the only rule of that shape. Denying
   `unshare` and `setns` does not stop a workload making a namespace, because `clone` takes the same
   `CLONE_NEW*` flags, and a process that creates a nested user namespace is handed a full capability
@@ -112,7 +117,10 @@ privilege-escalation bug is an escape.
   **absent**, and one the box fabricates is **inert**: a filesystem mounted in an unprivileged user
   namespace is flagged `SB_I_NODEV`, so a `mknod`'d node cannot be opened to reach a host device. The
   root, `/dev` and every extra mount also carry `MS_NODEV`, so this does not rely on that implicit
-  userns behaviour.
+  userns behaviour. Verified in a default box: `/dev/mem` and `/dev/kmem` are absent (no host RAM
+  window), `/sys/kernel/uevent_helper` is absent (no host `call_usermodehelper` as root),
+  `/proc/sysrq-trigger` and `/proc/sys/kernel/core_pattern` are read-only, and `/proc/kallsyms`
+  exposes no non-zero symbol address (KASLR-defeat guard).
 - **Landlock write-allowlist** (`--landlock-rw <path>`, opt-in, needs Linux 5.13+): a kernel LSM
   confines the box's writes to the named paths while the root stays read+exec, with symlinks opened
   `O_NOFOLLOW`. **A real boundary**, verified: a box with `--landlock-rw /tmp` writes `/tmp` and is

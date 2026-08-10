@@ -614,6 +614,21 @@ impl SeccompFilter {
 /// the identical filter. `allow_nesting` (a rootless `--privileged` box) leaves the namespace +
 /// classic-mount syscalls allowed so a nested `kern box` can start; every other dangerous syscall
 /// stays blocked.
+/// Set once [`install`] has applied a seccomp filter to the CURRENT process (`PR_SET_SECCOMP`
+/// returned success). The workload exec path reads it through [`is_installed`] and REFUSES to exec
+/// while it is false, a RUNTIME choke point for the setup window: it catches an exec reached through
+/// indirection or aliasing (a helper that spawns, `Command as C`, a fn pointer to `libc::fork`) that
+/// the lexical `no_untrusted_exec_before_the_seccomp_filter` source guard - one stack frame - cannot
+/// see. Per-process and never reset: a `fork` after `install` copies it as `true`, which is correct
+/// because that child also inherits the actual kernel filter (seccomp survives fork and exec).
+static SECCOMP_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a seccomp filter has been installed in THIS process. The workload exec path fails closed
+/// unless this is true, so no code path can reach `execvp` before the filter is in force.
+pub fn is_installed() -> bool {
+    SECCOMP_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn install(mode: SeccompFilter, allow_nesting: bool) -> Result<(), Error> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(Error::last("prctl(NO_NEW_PRIVS)"));
@@ -641,6 +656,9 @@ pub fn install(mode: SeccompFilter, allow_nesting: bool) -> Result<(), Error> {
     if r != 0 {
         return Err(Error::last("prctl(SET_SECCOMP)"));
     }
+    // The filter is now in force in this process; the exec choke point may proceed. `Release` pairs
+    // with the `Acquire` in `is_installed` so a reader that observes `true` also observes the filter.
+    SECCOMP_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 

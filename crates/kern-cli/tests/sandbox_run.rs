@@ -117,6 +117,40 @@ fn compile_static_helper(src: &str, tag: &str) -> Option<PathBuf> {
     }
 }
 
+/// Assemble a **freestanding 32-bit (i386) static** binary from GAS source, or `None`. `-nostdlib`
+/// means no 32-bit libc/crt is needed (the source provides `_start`), so it builds on a plain `cc`
+/// without `gcc-multilib`. Used to fire a raw `int 0x80` from a real i386 process - the foreign-ABI
+/// path a number-confusion bypass of the x86_64 seccomp filter would take.
+#[cfg(target_arch = "x86_64")]
+fn compile_i386_freestanding(asm: &str, tag: &str) -> Option<PathBuf> {
+    let cc = ["cc", "gcc"].into_iter().find(|c| {
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })?;
+    let dir = std::env::temp_dir().join(format!("kern-it-i386-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).ok()?;
+    let spath = dir.join("p.s");
+    let opath = dir.join("p");
+    fs::write(&spath, asm).ok()?;
+    let ok = Command::new(cc)
+        .args(["-m32", "-nostdlib", "-static", "-o"])
+        .arg(&opath)
+        .arg(&spath)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok && opath.exists() {
+        Some(opath)
+    } else {
+        let _ = fs::remove_dir_all(&dir);
+        None
+    }
+}
+
 #[test]
 fn box_require_limits_starts_when_caps_bind_else_refuses() {
     let Some(busybox) = static_busybox() else {
@@ -1703,6 +1737,84 @@ int main(int argc, char **argv) {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// **Red-team regression: a foreign-ABI (i386 `int 0x80`) call cannot bypass the seccomp filter.**
+///
+/// The exhaustive classifier covers x86_64 syscall NUMBERS, but a 32-bit process entering via
+/// `int 0x80` runs under `AUDIT_ARCH_I386`, where the numbers differ: i386 `__NR_mount` is 21, and
+/// x86_64 nr 21 is `access` (which the allowlist permits). Without an architecture guard, an i386
+/// `int 0x80` with `eax=21` would match the filter as `access` and execute `mount` - a full escape on
+/// any host with `CONFIG_IA32_EMULATION`. kern's filter validates `AUDIT_ARCH` FIRST and hard-kills
+/// any mismatch, so the i386 call is `SIGSYS`, never reinterpreted against the x86_64 table.
+///
+/// Discriminant: the SAME i386 binary runs to a normal exit on the host (IA32 emulation present, the
+/// `mount` merely `EPERM`s) but is SIGSYS-killed inside a box. If the host run does not survive, this
+/// kernel has no usable IA32 emulation - the attack precondition is absent - and the test skips.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn foreign_abi_i386_int80_cannot_bypass_the_seccomp_filter() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // i386 __NR_mount = 21 via `int 0x80` (x86_64 nr 21 = access, which the allowlist permits), then
+    // i386 __NR_exit = 1 with status 0. If the arch guard is present the process dies at the first
+    // `int 0x80`; if it is absent the mount is reinterpreted as access, returns, and the process exits 0.
+    const ASM: &str = r#"
+.code32
+.global _start
+.text
+_start:
+    movl $21, %eax
+    xorl %ebx, %ebx
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    int $0x80
+    movl $1, %eax
+    xorl %ebx, %ebx
+    int $0x80
+"#;
+    let Some(bin) = compile_i386_freestanding(ASM, "i386mount") else {
+        eprintln!("skip: cannot assemble a 32-bit binary (no -m32 cc)");
+        return;
+    };
+    // Positive control: the i386 binary must RUN and survive on the host (IA32 emulation usable).
+    let host = match Command::new(&bin).output() {
+        Ok(o) => o,
+        Err(_) => {
+            eprintln!("skip: host cannot exec a 32-bit binary (no IA32 emulation)");
+            return;
+        }
+    };
+    if !host.status.success() {
+        eprintln!("skip: no usable IA32 emulation (i386 probe did not exit 0 on the host)");
+        return;
+    }
+    let root = build_rootfs(&busybox, "i386");
+    fs::copy(&bin, root.join("i386mount")).unwrap();
+    let rootfs = root.to_str().unwrap();
+    let out = kern()
+        .args(["box", "i386t", "--rootfs", rootfs, "--", "/i386mount"])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(159),
+        "an i386 int 0x80 syscall must be SIGSYS-killed by the arch guard (128+31), never \
+         reinterpreted against the x86_64 syscall table: {out:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// **Red-team regression: the shared overlay lower is isolating across boxes.**
 ///
 /// An image root uses an overlay whose `lowerdir` (the content-addressed image cache) is shared
@@ -1785,7 +1897,7 @@ fn overlay_lower_is_shared_ro_across_boxes() {
             "/bin/busybox",
             "sh",
             "-c",
-            "echo MARKER_A > /marker; echo tampered_by_A > /seed; cat /marker",
+            "echo MARKER_A > /marker; echo tampered_by_A > /seed; cat /marker; grep -m1 ' / ' /proc/self/mountinfo",
         ])
         .output()
         .expect("run kern");
@@ -1801,7 +1913,7 @@ fn overlay_lower_is_shared_ro_across_boxes() {
         "/bin/busybox",
         "sh",
         "-c",
-        "if [ -e /marker ]; then echo SEES_MARKER; fi; cat /seed",
+        "if [ -e /marker ]; then echo SEES_MARKER; fi; cat /seed; grep -m1 ' / ' /proc/self/mountinfo",
     ]);
     let b_out = String::from_utf8_lossy(&b.stdout).to_string();
 
@@ -1825,6 +1937,147 @@ fn overlay_lower_is_shared_ro_across_boxes() {
         b_out.contains("original") && !b_out.contains("tampered_by_A"),
         "box B must see the image's pristine seed, not box A's tamper: {b_out:?}"
     );
+
+    // POSITIVE identity of sharing: "B sees nothing" is ALSO true if each box got a private full copy,
+    // so the shared-lower claim needs the lowerdir to be the SAME object across boxes while the upperdir
+    // differs. Pull `lowerdir=`/`upperdir=` out of each box's own overlay mount line.
+    fn field<'a>(mountline: &'a str, key: &str) -> Option<&'a str> {
+        mountline
+            .split_once(key)
+            .map(|(_, rest)| rest.split([',', ' ']).next().unwrap_or(""))
+    }
+    let (a_lower, b_lower) = (field(&a_out, "lowerdir="), field(&b_out, "lowerdir="));
+    let (a_upper, b_upper) = (field(&a_out, "upperdir="), field(&b_out, "upperdir="));
+    assert!(
+        a_lower.is_some() && a_lower == b_lower,
+        "both boxes must overlay the SAME shared lowerdir - one shared RO image store, not a private \
+         copy each (a={a_lower:?}, b={b_lower:?})"
+    );
+    assert!(
+        a_upper.is_some() && b_upper.is_some() && a_upper != b_upper,
+        "each box must have its OWN ephemeral upperdir (a={a_upper:?}, b={b_upper:?})"
+    );
+}
+
+/// **Red-team regression: `/dev`, `/sys` and the dangerous `/proc` paths are neutered.**
+///
+/// Coverage for the "devices" and sysfs half of the /proc-and-devices boundary that the /proc/sys +
+/// /proc/kcore assertions do not reach. In a default box: the physical-memory device nodes
+/// (`/dev/mem`, `/dev/kmem`) are absent (no host RAM window); `/proc/sysrq-trigger` and
+/// `/proc/sys/kernel/core_pattern` are read-only (no host SysRq, no `|/handler` root-on-host core-dump
+/// escape); `/sys/kernel/uevent_helper` is absent (no host `call_usermodehelper` as root); and
+/// `/proc/kallsyms` exposes no non-zero symbol address (no KASLR defeat).
+#[test]
+fn box_masks_devices_sysfs_and_sensitive_proc() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "masks");
+    let rootfs = root.to_str().unwrap();
+    // Each probe prints a `KEY=value` line; a write that SUCCEEDS prints `WROTE`, a refused one `blocked`.
+    let script = "\
+        echo MEM=$([ -e /dev/mem ] && echo PRESENT || echo absent); \
+        echo KMEM=$([ -e /dev/kmem ] && echo PRESENT || echo absent); \
+        echo SYSRQ=$( (echo 0 > /proc/sysrq-trigger) 2>/dev/null && echo WROTE || echo blocked); \
+        echo COREPAT=$( (echo x > /proc/sys/kernel/core_pattern) 2>/dev/null && echo WROTE || echo blocked); \
+        echo UEVENT=$([ -e /sys/kernel/uevent_helper ] && echo PRESENT || echo absent); \
+        echo KALLSYMS=$(grep -cE '^[1-9a-f]' /proc/kallsyms 2>/dev/null); \
+        echo DONE";
+    let out = kern_out(&[
+        "box",
+        "masks",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        script,
+    ]);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = fs::remove_dir_all(&root);
+    assert!(s.contains("DONE"), "probe did not run to completion: {s:?}");
+    for (needle, why) in [
+        ("MEM=absent", "/dev/mem must be absent (no host RAM window)"),
+        ("KMEM=absent", "/dev/kmem must be absent"),
+        ("SYSRQ=blocked", "/proc/sysrq-trigger must be read-only (no host SysRq)"),
+        (
+            "COREPAT=blocked",
+            "/proc/sys/kernel/core_pattern must be read-only (core_pattern root-on-host escape guard)",
+        ),
+        (
+            "UEVENT=absent",
+            "/sys/kernel/uevent_helper must be absent (no host call_usermodehelper)",
+        ),
+        (
+            "KALLSYMS=0",
+            "/proc/kallsyms must expose no non-zero symbol address (KASLR-defeat guard)",
+        ),
+    ] {
+        assert!(s.contains(needle), "{why}: got {s:?}");
+    }
+}
+
+/// **Red-team regression: dropped capabilities are cleared from EVERY set, not just the bounding one.**
+///
+/// The bounding-set drop is read back with `PR_CAPBSET_READ`, but the claim is that a dropped cap is
+/// gone from the effective/permitted/inheritable AND ambient sets too - ambient matters because it
+/// survives `execve` by promoting permitted+effective, and `NO_NEW_PRIVS` does not clear it. Under
+/// `--cap-drop ALL` every one of `CapEff`/`CapPrm`/`CapInh`/`CapAmb`/`CapBnd` in the box's own
+/// `/proc/self/status` must read all-zero. This reads back the sets `PR_CAPBSET_READ` cannot see.
+#[test]
+fn dropped_caps_are_cleared_from_every_set_including_ambient() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "caps");
+    let rootfs = root.to_str().unwrap();
+    let out = kern_out(&[
+        "box",
+        "capsx",
+        "--rootfs",
+        rootfs,
+        "--cap-drop",
+        "ALL",
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "grep -E '^Cap(Eff|Prm|Inh|Amb|Bnd):' /proc/self/status",
+    ]);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = fs::remove_dir_all(&root);
+    for cap in ["CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd"] {
+        let line = s
+            .lines()
+            .find(|l| l.starts_with(cap))
+            .unwrap_or_else(|| panic!("{cap} missing from /proc/self/status: {s:?}"));
+        let val = line.split_whitespace().last().unwrap_or("");
+        assert_eq!(
+            val, "0000000000000000",
+            "{cap} must be all-zero under --cap-drop ALL (dropped caps cleared from every set): {line:?}"
+        );
+    }
 }
 
 /// `-v` round-trips data across the boundary: a read-write volume's writes appear on the host,
