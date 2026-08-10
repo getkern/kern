@@ -56,7 +56,7 @@ box's network.
 |---|---|---|
 | Process / mount / UTS / IPC isolation | `unshare` + `pivot_root`, root remounted read-only **last** (compile-enforced by a typestate) | a box sees no host process, mount, or peer box |
 | Rootless privilege | user namespace; box-root maps to an unprivileged host uid | no host uid 0 unless the caller is real root, where `--privileged` is refused |
-| Dangerous syscalls | **always-on seccomp, allowlist by default** (moby's own default filter minus kern's 35): a syscall outside the allow set returns `ENOSYS` so honest software degrades instead of dying, while the mount/namespace/module/ptrace escape vectors hard-kill (`SIGSYS`); the wider denylist is the opt-out (`KERN_SECCOMP=denylist`) | the new **and** classic mount API is denied, so a box cannot remount its root writable or unmask the cgroup; `clone`/`clone3` are filtered on their namespace flags so a nested-userns escape is closed; verified across platforms |
+| Dangerous syscalls | **always-on seccomp, allowlist by default** (moby's own default filter minus kern's 35): a syscall outside the allow set returns `ENOSYS` so honest software degrades instead of dying, while the mount/namespace/module/ptrace escape vectors hard-kill (`SIGSYS`); the wider denylist is the opt-out (`KERN_SECCOMP=denylist`) | the new **and** classic mount API is denied, so a box cannot remount its root writable or unmask the cgroup; `clone` is filtered on its namespace flags and `clone3` is refused wholesale (`ENOSYS`, since its flags sit behind a pointer BPF cannot read), so a nested-userns escape is closed either way; verified across platforms |
 | Capabilities | bounding + effective/permitted/inheritable drop before exec, **verified by read-back** | a re-added cap is effective only over the box's own user namespace, never the host-owned cgroupfs or mounts |
 | `/proc` and devices | sensitive `/proc` paths masked (`/proc/sys` read-only is fatal); `/dev` is a box-owned tmpfs with a deny-by-default node set; `MS_NODEV` + userns `SB_I_NODEV` make a fabricated node inert | core_pattern and the sysrq/kcore class stay closed for a root-mapped box |
 | Fresh-fd hygiene | inherited descriptors shed before exec (CVE-2016-9962 class) | an SDK or CI fd cannot pass into the workload |
@@ -81,7 +81,7 @@ box's network.
 | Surface | Mitigation | Residual |
 |---|---|---|
 | Escape via a crafted image | in-process vetter + no-follow merge + digest verify | an exotic-but-safe image is refused rather than extracted (fail-closed) |
-| Nested-namespace escape | `clone`/`clone3` flag filter; mount API denied | the userns surface itself is kernel attack surface (below) |
+| Nested-namespace escape | `clone` flag filter + `clone3` refused wholesale (`ENOSYS`); mount API denied | the userns surface itself is kernel attack surface (below) |
 | Remount root writable / unmask cgroup | seccomp kills the mount API; child-userns caps ineffective over host-owned mounts | `--privileged` re-gains the classic `mount` syscalls, but caps ineffective over host-owned mounts keep root/cgroup unchanged, the new mount API stays blocked, and seccomp itself cannot be turned off |
 | Registry poisoning | sha256 on blobs and pinned manifests; TLS + realm pinning | trust in the host kernel's TLS stack via `curl` |
 | Peer secret / posture theft | inverted-default registry guard at **every** host-path entry, by device+inode identity | the operator's own trusted source paths are trusted as such |

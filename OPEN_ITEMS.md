@@ -10,7 +10,9 @@ few Docker drops - `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_MKNOD`.
 over the box's own user namespace, and the escape syscalls they would unlock (the mount API, `bpf`,
 `ptrace`) are seccomp-killed, so the marginal risk is small. The one clean tightening already taken is
 `CAP_SYS_PTRACE`: its syscalls were already killed, so dropping it costs nothing and closes a
-`/proc/<pid>/mem` read. Dropping the rest toward Docker's set is deferred, not because it is wrong but
+**cross-UID** `/proc/<pid>/mem` read (a same-uid sibling read inside one box stays possible and is not
+a boundary; a host or peer pid is unreachable via the pid namespace regardless). Dropping the rest
+toward Docker's set is deferred, not because it is wrong but
 because it needs validation that it does not break a real workload - the `KERN_SECCOMP=allowlist-audit`
 harness plus a compose corpus is that validation, and it has to run first. `--cap-drop` already lets
 an operator take any of them today.
@@ -130,13 +132,15 @@ the source stays 100% stable Rust so `cargo test` runs on the SAME source the re
 contributor on stable reproduces a standard, panic-message binary), and the pinned nightly needs a
 deliberate bump + re-validation when it moves.
 
-## The allowlist default costs about 0.2 ms of box start
+## The allowlist default is effectively free after the range-merge
 
-Making the deny-by-default allowlist the shipped default (it replaced the wider denylist) added a
-measured ~0.2 ms to box start - median 3.3 ms vs 3.1 ms for `KERN_SECCOMP=denylist` on the same host,
-inside the run-to-run noise but real. The allowlist is a ~1273-instruction cBPF program against the
-denylist's ~84, so the kernel spends more loading and verifying it at `PR_SET_SECCOMP`; the per-syscall
-cost is neutral (a log2 binary search, at most ~7 extra compares for a common syscall, cheaper for
-deep-tree ones). The compiled program is cached per `(mode, allow_nesting)`, so it is built once per
-process, not per box. The cost buys the stronger default posture and is not on any opt-out path
-(`KERN_SECCOMP=denylist` restores the cheaper filter).
+Making the deny-by-default allowlist the shipped default (it replaced the wider denylist) once added a
+measured ~0.2 ms to box start, back when it compiled one comparison per allowed number. The range-merge
+(a binary search over the ALLOW set's contiguous RUNS, not its individual numbers) cut that program from
+~1273 instructions to **178** on x86_64 - against the denylist's **86** - so the kernel now spends only
+marginally more loading it at `PR_SET_SECCOMP`: the `seccomp` phase measures ~20 us longer for the
+allowlist than the denylist, far below the box-start run-to-run noise (a clean run puts both at ~3.3 ms
+p50). The per-syscall cost is neutral (a log2 binary search over 27 runs, a handful of extra compares).
+The compiled program is cached per `(mode, allow_nesting)`, so it is built once per process, not per box.
+The stronger default posture is now essentially free; `KERN_SECCOMP=denylist` restores the marginally
+cheaper filter.

@@ -759,7 +759,7 @@ mod tests {
     }
 
     /// The generated allowlist filter must fit the kernel's `BPF_MAXINSNS` (4096) with headroom, or a
-    /// future profile bump would fail to load at box start. Measured ~1174 on x86_64.
+    /// future profile bump would fail to load at box start. Measured 178 on x86_64 after the range-merge.
     #[test]
     fn the_allowlist_filter_fits_bpf_maxinsns() {
         for &nesting in &[false, true] {
