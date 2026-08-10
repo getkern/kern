@@ -16,7 +16,7 @@ the current state of the tree; full detail is in the git history.
   default rather than reached. The wider denylist is the opt-out via `KERN_SECCOMP=denylist`;
   `--security-profile untrusted` is unchanged (allowlist + `--cap-drop ALL` + `--read-only`), and an
   `exec` reproduces the box's own recorded filter. Validated: a default box runs common workloads
-  (shell, `ls`, `cat`, `id`) and 435 unit tests pass.
+  (shell, `ls`, `cat`, `id`) and 436 unit tests pass.
 - Registry-posture forgery closed: every host-path input (`-v`, `--secret`, `--env-file`, `--rootfs`,
   build context and `-f`, `kern cp` in both directions, `save -o`) refuses any source that resolves
   onto the trust-bearing runtime dirs, by `(device, inode)` identity as well as path. The default is

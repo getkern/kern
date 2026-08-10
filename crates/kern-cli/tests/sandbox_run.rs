@@ -83,6 +83,40 @@ fn build_rootfs(busybox: &Path, tag: &str) -> PathBuf {
     root
 }
 
+/// Compile a tiny **static** C helper into a throwaway binary we can drop into a rootfs, or `None`
+/// if no C compiler (or no static libc) is available - in which case the caller SKIPs. It must be
+/// static so it runs in an otherwise-empty rootfs with no shared libraries. `tag` keeps the output
+/// path unique under this suite's parallelism. Used where busybox cannot express the probe (e.g. it
+/// has no `AF_PACKET` applet).
+fn compile_static_helper(src: &str, tag: &str) -> Option<PathBuf> {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })?;
+    let dir = std::env::temp_dir().join(format!("kern-it-cc-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).ok()?;
+    let cpath = dir.join("h.c");
+    let opath = dir.join("h");
+    fs::write(&cpath, src).ok()?;
+    let ok = Command::new(cc)
+        .args(["-static", "-O2", "-o"])
+        .arg(&opath)
+        .arg(&cpath)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok && opath.exists() {
+        Some(opath)
+    } else {
+        let _ = fs::remove_dir_all(&dir);
+        None
+    }
+}
+
 #[test]
 fn box_require_limits_starts_when_caps_bind_else_refuses() {
     let Some(busybox) = static_busybox() else {
@@ -1471,6 +1505,111 @@ fn box_run_hardening_uts_net_seccomp() {
         "/proc/kcore must read empty in the box (kernel-memory leak guard): success={}, {} bytes",
         kcore.status.success(),
         kcore.stdout.len()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// **Red-team regression: a raw/packet socket on the HOST netns is refused, even under `--net host`.**
+///
+/// Under `--net host` a box shares the host network namespace. kern re-adds `CAP_NET_RAW`/
+/// `CAP_NET_ADMIN` only over the box's OWN user namespace, so those caps are ineffective against the
+/// host-owned netns: opening `AF_PACKET`/`SOCK_RAW` (link-layer sniff/inject) or `AF_INET`/`SOCK_RAW`
+/// (raw IP) against host interfaces must fail with `EPERM`. If it did not, a box on the host netns
+/// could sniff or spoof every packet the host sees. busybox has no `AF_PACKET` applet, so a static C
+/// helper opens the sockets and reports each `errno`.
+///
+/// The discriminant is built in, so a green can't come from the socket simply being universally
+/// blocked or the helper failing to run: in the DEFAULT (private empty netns) the same binary must
+/// SUCCEED - the userns-scoped cap IS effective over the box's OWN netns, there is just nothing to
+/// sniff there. Only against that positive control is the `--net host` refusal meaningful. If even the
+/// private-netns open is refused, the runner grants no `CAP_NET_RAW` at all and the test SKIPs.
+#[test]
+fn net_host_raw_and_packet_sockets_are_eperm() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    const SRC: &str = r#"
+#include <sys/socket.h>
+#include <linux/if_packet.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <stdio.h>
+int main(void) {
+    int a = socket(AF_PACKET, SOCK_RAW, 0);
+    printf("AF_PACKET fd=%d errno=%d\n", a, a < 0 ? errno : 0);
+    int b = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    printf("AF_INET_RAW fd=%d errno=%d\n", b, b < 0 ? errno : 0);
+    return 0;
+}
+"#;
+    let Some(helper) = compile_static_helper(SRC, "rawsock") else {
+        eprintln!("skip: no static C compiler available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "rawsock");
+    fs::copy(&helper, root.join("rawsock")).unwrap();
+    let rootfs = root.to_str().unwrap();
+
+    // Pull the `(fd, errno)` pair for a given `KEY fd=.. errno=..` line out of the helper's stdout.
+    fn probe(out: &str, key: &str) -> Option<(i32, i32)> {
+        let line = out.lines().find(|l| l.starts_with(key))?;
+        let fd = line
+            .split("fd=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        let errno = line
+            .split("errno=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some((fd, errno))
+    }
+
+    // Positive control: in the DEFAULT private netns the raw socket must OPEN (fd >= 0). If it does
+    // not, this runner grants no CAP_NET_RAW even in a private userns+netns, so the discriminant
+    // cannot be established here - skip rather than assert.
+    let priv_out = kern_out(&["box", "rspriv", "--rootfs", rootfs, "--", "/rawsock"]);
+    if String::from_utf8_lossy(&priv_out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let priv_s = String::from_utf8_lossy(&priv_out.stdout);
+    match probe(&priv_s, "AF_PACKET") {
+        Some((fd, _)) if fd >= 0 => {}
+        other => {
+            eprintln!("skip: no CAP_NET_RAW even in a private netns on this runner ({other:?})");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+    }
+
+    // The boundary: under `--net host` the SAME binary must be refused with EPERM on BOTH socket
+    // families - the host netns is not the box's to sniff.
+    let host_out = kern_out(&[
+        "box", "rshost", "--rootfs", rootfs, "--net", "host", "--", "/rawsock",
+    ]);
+    let host_s = String::from_utf8_lossy(&host_out.stdout);
+    let pkt = probe(&host_s, "AF_PACKET");
+    let raw = probe(&host_s, "AF_INET_RAW");
+    assert!(
+        matches!(pkt, Some((fd, e)) if fd < 0 && e == libc::EPERM),
+        "AF_PACKET/SOCK_RAW on the host netns must be EPERM, got {pkt:?} from {host_s:?}"
+    );
+    assert!(
+        matches!(raw, Some((fd, e)) if fd < 0 && e == libc::EPERM),
+        "AF_INET/SOCK_RAW on the host netns must be EPERM, got {raw:?} from {host_s:?}"
     );
 
     let _ = fs::remove_dir_all(&root);
