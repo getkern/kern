@@ -2320,6 +2320,31 @@ fn tun_keeps_net_admin_and_privileged_keeps_sys_admin_on_a_real_box() {
         0,
         "--privileged must NOT keep NET_ADMIN (bit 12): {privd:#x}"
     );
+    // SECURITY-CRITICAL end-to-end: `--security-profile untrusted` (which is `--cap-drop ALL`) plus
+    // `--tun` must leave the bounding set with EXACTLY one cap, NET_ADMIN - not a hole that widens the
+    // profile. The single kept cap is over the box's own isolated netns, the same shape as a single
+    // `--cap-add` the profile already permits.
+    let out = kern_out(&[
+        "box",
+        "conduntrust",
+        "--rootfs",
+        rootfs,
+        "--security-profile",
+        "untrusted",
+        "--tun",
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "grep CapBnd /proc/self/status",
+    ]);
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let ut = u64::from_str_radix(cap_hex(&s, "CapBnd").unwrap_or("0"), 16).unwrap_or(0);
+    assert_eq!(
+        ut,
+        1u64 << 12,
+        "untrusted + --tun must leave EXACTLY NET_ADMIN in CapBnd, nothing else: {ut:#x}"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 

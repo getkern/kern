@@ -3074,11 +3074,18 @@ fn write_all(fd: i32, mut data: &[u8]) {
 /// The default set of never-needed dangerous caps kern always drops (kernel-stable numbers, used
 /// directly so we don't depend on newer libc constants). NET_ADMIN and SYS_ADMIN are listed here so
 /// the default drops them; the two condition flags re-KEEP them in [`cap_drop_mask`].
+/// `CAP_NET_ADMIN` (network interface / routing / netfilter admin) and `CAP_SYS_ADMIN` (the broad
+/// mount/sethostname/keyctl cap) - the two conditionally-kept caps. Named once here because each number
+/// appears in BOTH [`DEFAULT_DROP`] (the default drops them) AND [`cap_drop_mask`] (a flag re-keeps
+/// them); a literal in two places is the derived-condition trap this codebase keeps closing.
+const CAP_NET_ADMIN: u32 = 12;
+const CAP_SYS_ADMIN: u32 = 21;
+
 const DEFAULT_DROP: &[u32] = &[
-    12, // NET_ADMIN      network interface / routing / netfilter admin. KEPT for `--tun` (the box needs
-    //     it to bring its tunnel interface up) or `--cap-add NET_ADMIN`. kern brings the box's `lo` up
-    //     itself, before the drop, so 127.0.0.1 works without it. Docker's default drops it; kern now
-    //     matches, closing the gap against Podman (which also drops it).
+    CAP_NET_ADMIN, // (12) network admin. KEPT for `--tun` (the box needs it to bring its tunnel
+    //     interface up) or `--cap-add NET_ADMIN`. kern brings the box's `lo` up itself, before the
+    //     drop, so 127.0.0.1 works without it. Docker's default drops it; kern now matches, closing the
+    //     gap against Podman (which also drops it).
     16, // SYS_MODULE     load kernel modules
     17, // SYS_RAWIO      raw I/O ports, /dev/mem, ioperm
     19, // SYS_PTRACE     the `ptrace`/`process_vm_*` syscalls are already seccomp-killed, but the cap
@@ -3088,8 +3095,8 @@ const DEFAULT_DROP: &[u32] = &[
     //     is one trust domain; a host or peer-box process's memory is unreachable regardless, its pid
     //     not being in the box's pid namespace. Docker drops it by default; a debugger needs the killed
     //     `ptrace` syscall regardless, so this removes no capability a box could actually use.
-    20, // SYS_PACCT      process accounting
-    21, // SYS_ADMIN      the broadest cap (mount, sethostname, keyctl, …). KEPT for `--privileged` (a
+    20,            // SYS_PACCT      process accounting
+    CAP_SYS_ADMIN, // (21) the broadest cap (mount, sethostname, keyctl, …). KEPT for `--privileged` (a
     //     nested runtime / in-namespace `mount` needs it) or `--cap-add SYS_ADMIN` (e.g. a workload that
     //     calls `sethostname` itself; kern applies `--hostname` before the drop). Its escape syscalls
     //     (the mount API) are seccomp-killed on a non-privileged box regardless, so the drop is
@@ -3168,17 +3175,17 @@ fn cap_drop_mask(spec: &CapSpec, tun: bool, privileged: bool) -> u64 {
             mask &= !(1u64 << c);
         }
     }
-    // `--tun` KEEPS CAP_NET_ADMIN (12): the box brings its own tunnel interface up in its netns. kern's
-    // own `lo` is already up before the drop, so loopback never depended on this. Applied last so the
-    // tunnel is never left without the cap it needs, even under `--cap-drop ALL`.
+    // `--tun` KEEPS CAP_NET_ADMIN: the box brings its own tunnel interface up in its netns. kern's own
+    // `lo` is already up before the drop, so loopback never depended on this. Applied last so the tunnel
+    // is never left without the cap it needs, even under `--cap-drop ALL`.
     if tun {
-        mask &= !(1u64 << 12);
+        mask &= !(1u64 << CAP_NET_ADMIN);
     }
-    // `--privileged` KEEPS CAP_SYS_ADMIN (21): its seccomp relaxation lets a nested runtime / in-box
-    // `mount` run, and those need the cap in the box's OWN user namespace. A non-privileged box has the
-    // mount API seccomp-killed, so the cap is inert there and the drop costs it nothing.
+    // `--privileged` KEEPS CAP_SYS_ADMIN: its seccomp relaxation lets a nested runtime / in-box `mount`
+    // run, and those need the cap in the box's OWN user namespace. A non-privileged box has the mount
+    // API seccomp-killed, so the cap is inert there and the drop costs it nothing.
     if privileged {
-        mask &= !(1u64 << 21);
+        mask &= !(1u64 << CAP_SYS_ADMIN);
     }
     mask
 }
@@ -4380,18 +4387,41 @@ mod cap_mask_tests {
 
         // A conditional keep wins over a contradictory explicit `--cap-drop` (same "keep wins" rule as
         // `--cap-add`), so `--tun`/`--privileged` never silently lose the cap the feature needs - even
-        // under `--cap-drop ALL`.
+        // under `--cap-drop ALL`. SECURITY-CRITICAL: under `--cap-drop ALL` (what `--security-profile
+        // untrusted` installs) a single feature flag re-keeps ONLY its own cap - the whole rest of the
+        // 64-bit space stays dropped, so `untrusted --tun` is one cap over an isolated netns, not a hole.
         let drop_all = CapSpec {
             drop_all: true,
             ..Default::default()
         };
-        assert!(
-            cap_drop_mask(&drop_all, true, true) & (1u64 << 12) == 0,
-            "--tun keeps NET_ADMIN even under --cap-drop ALL"
+        // Diff against the pure ALL mask (no flags): the XOR is EXACTLY the feature's bit and nothing
+        // else - the precise "no cross-leak, no extra cap" property. (count_zeros on the full u64 would
+        // count the always-zero high bits above CAP_LAST_CAP, so it is the wrong tool here.)
+        let base_all = cap_drop_mask(&drop_all, false, false);
+        let all_tun = cap_drop_mask(&drop_all, true, false);
+        assert_eq!(
+            base_all ^ all_tun,
+            1u64 << 12,
+            "under ALL, --tun un-drops EXACTLY NET_ADMIN (bit 12), nothing else: {all_tun:#x}"
         );
         assert!(
-            cap_drop_mask(&drop_all, true, true) & (1u64 << 21) == 0,
-            "--privileged keeps SYS_ADMIN even under --cap-drop ALL"
+            all_tun & (1u64 << 21) != 0,
+            "SYS_ADMIN stays dropped under ALL+--tun"
+        );
+        let all_priv = cap_drop_mask(&drop_all, false, true);
+        assert_eq!(
+            base_all ^ all_priv,
+            1u64 << 21,
+            "under ALL, --privileged un-drops EXACTLY SYS_ADMIN (bit 21), nothing else: {all_priv:#x}"
+        );
+        assert!(
+            all_priv & (1u64 << 12) != 0,
+            "NET_ADMIN stays dropped under ALL+--privileged"
+        );
+        // Both flags under ALL un-drop exactly the two feature caps, nothing more.
+        assert_eq!(
+            base_all ^ cap_drop_mask(&drop_all, true, true),
+            (1u64 << 12) | (1u64 << 21)
         );
         // `--cap-add` still works for a box that is neither --tun nor --privileged.
         let add_na = CapSpec {
