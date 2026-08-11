@@ -74,8 +74,8 @@ once in a `kern.toml` and attached by name. [docs/RESOURCES.md](docs/RESOURCES.m
   edition, so there is nothing here to trust or to attack yet.
 
 What it does not know or does not do yet is in [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than left for
-you to find: an unattributed gap in a startup measurement, and which fleet limit is a guard rail
-instead of a boundary.
+you to find: whether a mapped seccomp filter helps an attacker who already runs code, and which fleet
+limit is a guard rail instead of a boundary.
 
 ## Install
 

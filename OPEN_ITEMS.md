@@ -91,16 +91,12 @@ serves. What `ps` prints afterwards is the registry entry. A forwarder is a chil
 supervisor and dies with it, so the gap is narrow: a forwarder killed by hand or by the OOM killer
 while its box keeps running would still show.
 
-## 315 us of a bare box start are not attributed
+## The uncapped synthetic path costs more than the capped path users run
 
-In the UNCAPPED configuration (`KERN_NO_SCOPE`, the one comparable to bubblewrap) a bare start has
-grown about 500 us over the project's history, with bubblewrap steady as the control. Roughly 185 us
-of that is named:
-`proc-mask` 66 us, `cgroup-view` 39, seccomp 60, `dev` 20, and together they close a container
-escape through `core_pattern`. **The remaining 315 us has no measured cause, and no story is
-offered for it.** Registry size, a benchmark rename and the benchmark's batch budget are each
-excluded by measurement. It has not been bisected because that configuration is the synthetic one:
-with cgroup caps on, which is what users run, the same span went from 4.92 ms to 2.45 ms.
+`KERN_TIMING` attributes a bare start phase by phase. The largest phase is the deny-by-default
+allowlist seccomp install (~0.2-0.3 ms, up from ~60 us under the old denylist, a wider filter). This
+is the UNCAPPED path (`KERN_NO_SCOPE`, comparable to bubblewrap); with cgroup caps on, which is what
+users run, the same span is ~2.45 ms.
 
 ## The release binary trades panic diagnostics for size
 
