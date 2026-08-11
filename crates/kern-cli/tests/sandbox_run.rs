@@ -2190,14 +2190,15 @@ fn dropped_caps_are_cleared_from_every_set_including_ambient() {
     }
 }
 
-/// **Red-team regression: the DEFAULT box (no `--cap-drop`) drops the 14 dangerous caps.**
+/// **Red-team regression: the DEFAULT box (no `--cap-drop`) drops the 16 dangerous caps.**
 ///
 /// The `--cap-drop ALL` test proves the extreme profile; this proves the SHIPPED default. Each cap in
-/// the always-dropped set (`SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_PACCT`, `SYS_BOOT`, `SYS_TIME`,
-/// `AUDIT_CONTROL`, `MAC_OVERRIDE`, `MAC_ADMIN`, `SYSLOG`, `WAKE_ALARM`, `AUDIT_READ`, `PERFMON`, `BPF`)
-/// must be cleared from BOTH the bounding and the effective set of a plain box, read back from its own
-/// `/proc/self/status`. A cap kept by default (e.g. `SYS_ADMIN`, bit 21) is deliberately NOT asserted
-/// gone - it is held, but only over the box's own user namespace, which is a separate claim.
+/// the always-dropped set (`NET_ADMIN`, `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_PACCT`,
+/// `SYS_ADMIN`, `SYS_BOOT`, `SYS_TIME`, `AUDIT_CONTROL`, `MAC_OVERRIDE`, `MAC_ADMIN`, `SYSLOG`,
+/// `WAKE_ALARM`, `AUDIT_READ`, `PERFMON`, `BPF`) must be cleared from BOTH the bounding and the
+/// effective set of a plain box, read back from its own `/proc/self/status`. `NET_ADMIN` (12) and
+/// `SYS_ADMIN` (21) are now in this default set (converged onto Docker's/Podman's default); they are
+/// KEPT only for `--tun`/`--privileged`/`--cap-add`, verified by the sibling tests.
 #[test]
 fn default_box_drops_the_dangerous_caps() {
     let Some(busybox) = static_busybox() else {
@@ -2209,7 +2210,9 @@ fn default_box_drops_the_dangerous_caps() {
         return;
     }
     // The always-dropped cap numbers (kern's DEFAULT_DROP set); never re-added on a default box.
-    const DROPPED: [u32; 14] = [16, 17, 19, 20, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39];
+    const DROPPED: [u32; 16] = [
+        12, 16, 17, 19, 20, 21, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39,
+    ];
     let root = build_rootfs(&busybox, "defcaps");
     let rootfs = root.to_str().unwrap();
     let out = kern_out(&[
@@ -2243,16 +2246,81 @@ fn default_box_drops_the_dangerous_caps() {
             );
         }
     }
-    // Positive control: a cap KEPT by default (SYS_ADMIN, bit 21, not in DEFAULT_DROP) must be SET in
-    // the bounding set - otherwise an all-zero CapBnd would pass the drop-check vacuously.
+    // Positive control: a cap KEPT by default (CHOWN, bit 0, not in DEFAULT_DROP - needed for apt/apk
+    // and chown) must be SET in the bounding set, else an all-zero CapBnd would pass the drop-check
+    // vacuously. (SYS_ADMIN/NET_ADMIN can no longer serve as the control: they are dropped by default
+    // now, which is the change under test.)
     let bnd_hex = cap_hex(&s, "CapBnd").unwrap_or("");
     let bnd = u64::from_str_radix(bnd_hex, 16).unwrap_or(0);
     assert_eq!(
-        (bnd >> 21) & 1,
+        bnd & 1,
         1,
-        "SYS_ADMIN (bit 21) must be retained in CapBnd by default - proves the cap mask is populated, \
+        "CHOWN (bit 0) must be retained in CapBnd by default - proves the cap mask is populated, \
          not vacuously empty: {s:?}"
     );
+}
+
+/// **The two CONDITIONAL cap keeps hold on a real box.** `--tun` keeps `CAP_NET_ADMIN` (12) so the box
+/// can bring its own tunnel interface up (kern brings `lo` up before the drop, so loopback never needed
+/// it); `--privileged` keeps `CAP_SYS_ADMIN` (21) for in-namespace `mount`. Each keeps ONLY its own cap
+/// (the other stays dropped), so neither flag widens the set beyond what its feature needs. Read back
+/// from the box's own `CapBnd`, the bounding set kern imposes.
+#[test]
+fn tun_keeps_net_admin_and_privileged_keeps_sys_admin_on_a_real_box() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "condcaps");
+    let rootfs = root.to_str().unwrap();
+    let capbnd = |name: &str, flag: &str| -> u64 {
+        let out = kern_out(&[
+            "box",
+            name,
+            "--rootfs",
+            rootfs,
+            flag,
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "grep CapBnd /proc/self/status",
+        ]);
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        u64::from_str_radix(cap_hex(&s, "CapBnd").unwrap_or("0"), 16).unwrap_or(0)
+    };
+    let tun = capbnd("condtun", "--tun");
+    if tun == 0 {
+        eprintln!("skip: box did not start (CapBnd empty - userns unavailable at runtime)");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    assert_eq!(
+        (tun >> 12) & 1,
+        1,
+        "--tun must KEEP NET_ADMIN (bit 12): {tun:#x}"
+    );
+    assert_eq!(
+        (tun >> 21) & 1,
+        0,
+        "--tun must NOT keep SYS_ADMIN (bit 21): {tun:#x}"
+    );
+    let privd = capbnd("condprv", "--privileged");
+    assert_eq!(
+        (privd >> 21) & 1,
+        1,
+        "--privileged must KEEP SYS_ADMIN (bit 21): {privd:#x}"
+    );
+    assert_eq!(
+        (privd >> 12) & 1,
+        0,
+        "--privileged must NOT keep NET_ADMIN (bit 12): {privd:#x}"
+    );
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// **Red-team regression: a box can neither SEE nor RAISE a cgroup above its own.**

@@ -32,9 +32,16 @@ state of the tree; full detail is in the git history.
 - The bounding-set drop is verified with `PR_CAPBSET_READ`, and under `--cap-drop ALL` every set
   (`CapEff`/`CapPrm`/`CapInh`/`CapAmb`/`CapBnd`) is read back all-zero from `/proc/self/status` -
   ambient included, since it survives `execve` and `NO_NEW_PRIVS` does not clear it.
-- `CAP_SYS_PTRACE` dropped by default (14 caps), closing the **cross-UID** `/proc/<pid>/mem` read.
+- `CAP_SYS_PTRACE` dropped by default (16 caps), closing the **cross-UID** `/proc/<pid>/mem` read.
   (A same-uid sibling read inside one box is standard Linux and not a boundary; a host or peer-box
   pid is not visible in the box's pid namespace, so its memory is unreachable regardless.)
+- `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` dropped by default too, converging kern's default capability
+  set onto Docker's/Podman's. They are re-kept CONDITIONALLY: `NET_ADMIN` for `--tun` (the box brings
+  its own tunnel interface up; kern brings `lo` up before the drop, so loopback is unaffected) and
+  `SYS_ADMIN` for `--privileged` (in-namespace `mount`), or either via `--cap-add`. `kern exec` stays
+  strict and re-keeps neither, staying no more privileged than the box's PID 1. Their escape syscalls
+  (the mount API, `bpf`) are seccomp-killed on a non-privileged box regardless, so this is
+  defense-in-depth, not a boundary change.
 - The seccomp mode is recorded and reproduced by `kern exec` and the health probe, not re-derived
   from the caller's env; an absent or corrupt record makes `exec` fail-loud.
 - `KERN_MAX_CONCURRENT` enforced atomically under a `flock`, closing the fleet-cap TOCTOU.

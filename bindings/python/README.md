@@ -142,7 +142,7 @@ Sandbox(
                                 # NOT enforce_limits (which only picks the cap PATH: scope vs best-effort);
                                 # mutually exclusive with the KERN_ALLOW_UNCAPPED env (forwarded to kern).
     cap_drop=("ALL","..."),  # capabilities dropped from every box; default drops ALL.
-                            # kern always drops 14 dangerous ones; this drops the rest,
+                            # kern always drops 16 dangerous ones; this drops the rest,
                             # which were held over the box's own user namespace. Pass
                             # cap_drop=() to keep them (needed only if the workload binds
                             # a port below 1024 INSIDE the box).

@@ -284,7 +284,7 @@ and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
-Namespaces, a `pivot_root`, 14 dangerous capabilities dropped before exec, an always-on seccomp
+Namespaces, a `pivot_root`, 16 dangerous capabilities dropped before exec, an always-on seccomp
 **allowlist** by default (moby's own default filter minus kern's 35 escape syscalls, which stay
 hard-killed; a syscall outside the vetted set returns `ENOSYS`, and the wider denylist is the opt-out
 via `KERN_SECCOMP=denylist`), cgroup v2 limits (`--require-limits` refuses to start unless they bind),
@@ -315,7 +315,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today and is tested:** 814 Rust, 78 Python and 61 Node
+**The core is done. Everything above works today and is tested:** 816 Rust, 78 Python and 61 Node
 tests, clippy-clean, `cargo-deny`-clean. You build from source, and the CLI
 and config surface can still change, always called out in [CHANGELOG.md](CHANGELOG.md). It is being
 tested hard on real hardware (Linux, WSL2, Raspberry Pi, Jetson, Arduino UNO Q) and refined ahead of

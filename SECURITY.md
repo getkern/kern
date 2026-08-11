@@ -60,8 +60,9 @@ privilege-escalation bug is an escape.
   peer box. After the pivot neither box can reach the lower's host path either (`/proc/kcore` and
   `open_by_handle_at` are the two ways to escape a pivoted root to a host inode; the first is masked,
   the second `ENOSYS`, so a leaked file handle cannot be opened).
-- **Least-privilege capabilities**: 14 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
-  `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, and more) are dropped from
+- **Least-privilege capabilities**: 16 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
+  `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, and - converging onto the
+  Docker/Podman default set - `NET_ADMIN` and `SYS_ADMIN`) are dropped from
   the effective, permitted, inheritable, **ambient and bounding** sets just before exec, so no setuid or
   file-capability binary in the image can wield them - the bounding drop is read back with
   `PR_CAPBSET_READ`, and under `--cap-drop ALL` every set (`CapEff`/`CapPrm`/`CapInh`/`CapAmb`/`CapBnd`)
@@ -73,9 +74,12 @@ privilege-escalation bug is an escape.
   memory is unreachable regardless because its pid is not in the box's pid namespace.) `--cap-drop
   CAP` / `--cap-drop ALL` drops more;
   `--cap-add CAP` keeps one that would otherwise go (add wins), and an unknown cap name is a hard
-  error so a typo cannot silently leave a cap in place. Even a re-added `CAP_SYS_ADMIN` is held only
-  over the box's own user namespace, and the always-on filter still blocks the escape syscalls it
-  would unlock, so `--cap-add` cannot breach the host.
+  error so a typo cannot silently leave a cap in place. `NET_ADMIN` and `SYS_ADMIN` are in the dropped
+  set but CONDITIONALLY re-kept: `NET_ADMIN` for `--tun` (the box brings its own tunnel interface up;
+  kern brings `lo` up before the drop, so loopback never needed it) and `SYS_ADMIN` for `--privileged`
+  (in-namespace `mount`). Even a re-kept `CAP_SYS_ADMIN` is held only over the box's own user
+  namespace, and the always-on filter still blocks the escape syscalls it would unlock, so re-keeping
+  it cannot breach the host.
 - **Always-on seccomp, allowlist by default**: the shipped default is moby's own default filter
   minus kern's 35 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
   opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **35 escape syscalls** below:
@@ -248,9 +252,10 @@ box's full limit, so N execs could use N times the box's memory.
 - **`--net`** (`--network host`) shares the host network namespace: there is then **no network
   isolation**. The box can reach host `localhost` services, the host's networks, and **every
   abstract-namespace UNIX socket** (X11, some D-Bus sockets), and can bind host-visible addresses.
-  It **cannot** sniff or spoof that network, though: the box keeps `CAP_NET_RAW`/`CAP_NET_ADMIN` but
-  only over its OWN user namespace, and a child namespace's capabilities are not effective over a
-  namespace the initial one owns, so an `AF_PACKET`/raw socket on the host netns is `EPERM` (a CI
+  It **cannot** sniff or spoof that network, though: the box keeps `CAP_NET_RAW` (`NET_ADMIN` is now
+  dropped by default) but only over its OWN user namespace, and a child namespace's capabilities are
+  not effective over a namespace the initial one owns, so an `AF_PACKET`/raw socket on the host netns
+  is `EPERM` (a CI
   regression test opens both `AF_PACKET` and `AF_INET`/`SOCK_RAW` under `--net host` and asserts the
   refusal, with the box's own private netns as the positive control) - the same scoping that stops
   `--tun`+`--net host` from reconfiguring host interfaces.

@@ -963,7 +963,7 @@ fn child_setup_and_exec(
     // Least-privilege, in three ordered steps so `--user` + `--cap-drop ALL` (the canonical hardened
     // profile) composes correctly. All run after privileged setup (mount/pivot/loopback), so they
     // only affect the workload.
-    let cap_mask = cap_drop_mask(&spec.caps);
+    let cap_mask = cap_drop_mask(&spec.caps, spec.tun, spec.privileged);
     // 1. Bounding set - needs effective `CAP_SETPCAP` (still present here); stops a file-cap binary
     //    re-adding a dropped cap. Dropping a cap from the *bounding* set does NOT block using it from
     //    the effective set, so the `setuid`/`setgid` below still work even under `--cap-drop ALL`.
@@ -3061,12 +3061,24 @@ fn write_all(fd: i32, mut data: &[u8]) {
 /// grant no power over host-owned resources - verified) and several are already seccomp-blocked;
 /// dropping them shrinks the attack surface against kernel bugs reachable only with the cap.
 /// KEPT (so apt/apk, chown, and privilege-drop to non-root keep working): CHOWN, DAC_*, FOWNER,
-/// FSETID, KILL, SETUID, SETGID, SETPCAP, NET_BIND_SERVICE, NET_RAW, NET_ADMIN (also used for `lo`),
-/// SYS_CHROOT, MKNOD, SETFCAP, IPC_*, SYS_NICE/RESOURCE/PTRACE, … Best-effort; an unknown cap number
-/// on an older kernel just fails harmlessly.
+/// FSETID, KILL, SETUID, SETGID, SETPCAP, NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, MKNOD, SETFCAP,
+/// IPC_*, SYS_NICE/RESOURCE, … Best-effort; an unknown cap number on an older kernel just fails
+/// harmlessly.
+/// `NET_ADMIN` (12) and `SYS_ADMIN` (21) are dropped too - this converges kern's default onto the
+/// Docker/Podman default set - but CONDITIONALLY (see [`cap_drop_mask`]): `NET_ADMIN` is KEPT for
+/// `--tun` (the box brings its own tunnel interface up; kern itself brings `lo` up BEFORE the drop, so
+/// loopback is unaffected either way), and `SYS_ADMIN` for `--privileged` (in-namespace `mount`), and
+/// either via `--cap-add`. Held only over the box's own user namespace regardless, and the escape
+/// syscalls they would unlock (the mount API, `bpf`, `ptrace`) are seccomp-killed, so the drop closes a
+/// residual against kernel bugs reachable only with the cap, not a live boundary hole.
 /// The default set of never-needed dangerous caps kern always drops (kernel-stable numbers, used
-/// directly so we don't depend on newer libc constants).
+/// directly so we don't depend on newer libc constants). NET_ADMIN and SYS_ADMIN are listed here so
+/// the default drops them; the two condition flags re-KEEP them in [`cap_drop_mask`].
 const DEFAULT_DROP: &[u32] = &[
+    12, // NET_ADMIN      network interface / routing / netfilter admin. KEPT for `--tun` (the box needs
+    //     it to bring its tunnel interface up) or `--cap-add NET_ADMIN`. kern brings the box's `lo` up
+    //     itself, before the drop, so 127.0.0.1 works without it. Docker's default drops it; kern now
+    //     matches, closing the gap against Podman (which also drops it).
     16, // SYS_MODULE     load kernel modules
     17, // SYS_RAWIO      raw I/O ports, /dev/mem, ioperm
     19, // SYS_PTRACE     the `ptrace`/`process_vm_*` syscalls are already seccomp-killed, but the cap
@@ -3077,6 +3089,11 @@ const DEFAULT_DROP: &[u32] = &[
     //     not being in the box's pid namespace. Docker drops it by default; a debugger needs the killed
     //     `ptrace` syscall regardless, so this removes no capability a box could actually use.
     20, // SYS_PACCT      process accounting
+    21, // SYS_ADMIN      the broadest cap (mount, sethostname, keyctl, …). KEPT for `--privileged` (a
+    //     nested runtime / in-namespace `mount` needs it) or `--cap-add SYS_ADMIN` (e.g. a workload that
+    //     calls `sethostname` itself; kern applies `--hostname` before the drop). Its escape syscalls
+    //     (the mount API) are seccomp-killed on a non-privileged box regardless, so the drop is
+    //     defense-in-depth, matching Docker's/Podman's default which also drops it.
     22, // SYS_BOOT       reboot / kexec_load
     25, // SYS_TIME       set system / RTC clock
     30, // AUDIT_CONTROL
@@ -3123,8 +3140,12 @@ fn cap_last_cap() -> u32 {
 
 /// The capability drop set as a u64 bitmask (every cap number is < 64): always the dangerous
 /// [`DEFAULT_DROP`] set, plus whatever `--cap-drop` adds (or *everything* for `--cap-drop ALL`),
-/// minus whatever `--cap-add` keeps.
-fn cap_drop_mask(spec: &CapSpec) -> u64 {
+/// minus whatever `--cap-add` keeps, minus the two CONDITIONAL keeps: `NET_ADMIN` (12) for `--tun`
+/// and `SYS_ADMIN` (21) for `--privileged`. The conditional keeps are applied LAST so they win over a
+/// contradictory explicit `--cap-drop` (the same "a keep wins over a drop" rule `--cap-add` follows),
+/// which is what keeps `--tun`/`--privileged` from silently losing the cap the feature needs even under
+/// `--cap-drop ALL`.
+fn cap_drop_mask(spec: &CapSpec, tun: bool, privileged: bool) -> u64 {
     let mut mask: u64 = if spec.drop_all {
         let last = cap_last_cap();
         // bits 0..=last
@@ -3146,6 +3167,18 @@ fn cap_drop_mask(spec: &CapSpec) -> u64 {
         if c < 64 {
             mask &= !(1u64 << c);
         }
+    }
+    // `--tun` KEEPS CAP_NET_ADMIN (12): the box brings its own tunnel interface up in its netns. kern's
+    // own `lo` is already up before the drop, so loopback never depended on this. Applied last so the
+    // tunnel is never left without the cap it needs, even under `--cap-drop ALL`.
+    if tun {
+        mask &= !(1u64 << 12);
+    }
+    // `--privileged` KEEPS CAP_SYS_ADMIN (21): its seccomp relaxation lets a nested runtime / in-box
+    // `mount` run, and those need the cap in the box's OWN user namespace. A non-privileged box has the
+    // mount API seccomp-killed, so the cap is inert there and the drop costs it nothing.
+    if privileged {
+        mask &= !(1u64 << 21);
     }
     mask
 }
@@ -3349,8 +3382,11 @@ fn clear_caps_from_sets(mask: u64) -> Result<(), Error> {
 /// inheritable sets AND the bounding set. Used where NO `--user` switch follows (e.g. `kern exec`);
 /// the box workload path splits this around `set_user` (bounding drop → setuid → effective clear) so
 /// that `--cap-drop ALL` doesn't strip `CAP_SETUID`/`SETGID` before the user switch needs them.
+/// `tun`/`privileged` are passed FALSE here on purpose: `kern exec` reproduces the box's explicit
+/// `--cap-add`/`--cap-drop` (via `spec`) but NOT the implicit `--tun`/`--privileged` keeps, staying
+/// MORE constrained than the box's PID 1 - the same deliberate "exec stays strict" axis as nesting.
 fn drop_dangerous_caps(spec: &CapSpec) -> Result<(), Error> {
-    let mask = cap_drop_mask(spec);
+    let mask = cap_drop_mask(spec, false, false);
     drop_cap_bounding(mask)?;
     clear_caps_from_sets(mask)?;
     Ok(())
@@ -4301,21 +4337,68 @@ mod cap_mask_tests {
     #[test]
     fn default_dropped_mask_covers_the_dangerous_set_only() {
         let m = default_dropped_cap_mask();
-        // Every DEFAULT_DROP cap is set: SYS_MODULE(16), SYS_RAWIO(17), SYS_PTRACE(19), SYS_BOOT(22),
-        // BPF(39), PERFMON(38).
-        for c in [16u32, 17, 19, 20, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39] {
+        // Every DEFAULT_DROP cap is set: NET_ADMIN(12), SYS_MODULE(16), SYS_RAWIO(17), SYS_PTRACE(19),
+        // SYS_ADMIN(21), SYS_BOOT(22), PERFMON(38), BPF(39). NET_ADMIN and SYS_ADMIN are in the default
+        // set now (converged onto Docker's/Podman's default); the two condition flags re-keep them.
+        for c in [
+            12u32, 16, 17, 19, 20, 21, 22, 25, 30, 32, 33, 34, 35, 37, 38, 39,
+        ] {
             assert!(m & (1u64 << c) != 0, "cap {c} must be in the dropped mask");
         }
         // Kept caps are NOT in the mask (so a default box never false-flags): CHOWN(0), SETUID(7),
-        // NET_ADMIN(12), SYS_ADMIN(21), MKNOD(27). (SYS_PTRACE(19) is now dropped, see DEFAULT_DROP.)
-        for c in [0u32, 7, 12, 21, 27] {
+        // MKNOD(27). (SYS_PTRACE(19), NET_ADMIN(12) and SYS_ADMIN(21) are now dropped by default.)
+        for c in [0u32, 7, 27] {
             assert!(
                 m & (1u64 << c) == 0,
                 "kept cap {c} must NOT be in the dropped mask"
             );
         }
         // The mask is exactly the default drop of an unmodified spec (the bounding set kern imposes).
-        assert_eq!(m, cap_drop_mask(&CapSpec::default()));
+        assert_eq!(m, cap_drop_mask(&CapSpec::default(), false, false));
+    }
+
+    #[test]
+    fn tun_keeps_net_admin_and_privileged_keeps_sys_admin() {
+        // The two CONDITIONAL keeps, verified against the default spec. Bit 12 = CAP_NET_ADMIN, bit 21 =
+        // CAP_SYS_ADMIN. Default (no flag) drops BOTH; `--tun` keeps NET_ADMIN; `--privileged` keeps
+        // SYS_ADMIN; each keep touches ONLY its own cap (no cross-leak).
+        let d = CapSpec::default();
+        let base = cap_drop_mask(&d, false, false);
+        assert!(base & (1u64 << 12) != 0, "default drops NET_ADMIN");
+        assert!(base & (1u64 << 21) != 0, "default drops SYS_ADMIN");
+
+        let tun = cap_drop_mask(&d, true, false);
+        assert!(tun & (1u64 << 12) == 0, "--tun keeps NET_ADMIN");
+        assert!(tun & (1u64 << 21) != 0, "--tun does NOT keep SYS_ADMIN");
+
+        let priv_ = cap_drop_mask(&d, false, true);
+        assert!(priv_ & (1u64 << 21) == 0, "--privileged keeps SYS_ADMIN");
+        assert!(
+            priv_ & (1u64 << 12) != 0,
+            "--privileged does NOT keep NET_ADMIN"
+        );
+
+        // A conditional keep wins over a contradictory explicit `--cap-drop` (same "keep wins" rule as
+        // `--cap-add`), so `--tun`/`--privileged` never silently lose the cap the feature needs - even
+        // under `--cap-drop ALL`.
+        let drop_all = CapSpec {
+            drop_all: true,
+            ..Default::default()
+        };
+        assert!(
+            cap_drop_mask(&drop_all, true, true) & (1u64 << 12) == 0,
+            "--tun keeps NET_ADMIN even under --cap-drop ALL"
+        );
+        assert!(
+            cap_drop_mask(&drop_all, true, true) & (1u64 << 21) == 0,
+            "--privileged keeps SYS_ADMIN even under --cap-drop ALL"
+        );
+        // `--cap-add` still works for a box that is neither --tun nor --privileged.
+        let add_na = CapSpec {
+            adds: vec![12],
+            ..Default::default()
+        };
+        assert!(cap_drop_mask(&add_na, false, false) & (1u64 << 12) == 0);
     }
 
     #[test]
@@ -4326,7 +4409,7 @@ mod cap_mask_tests {
             adds: vec![16],
             ..Default::default()
         };
-        let dropped = cap_drop_mask(&spec);
+        let dropped = cap_drop_mask(&spec, false, false);
         assert!(
             dropped & (1u64 << 16) == 0,
             "--cap-add SYS_MODULE must NOT drop cap 16"
