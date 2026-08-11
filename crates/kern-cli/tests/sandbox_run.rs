@@ -2310,6 +2310,11 @@ fn tun_keeps_net_admin_and_privileged_keeps_sys_admin_on_a_real_box() {
         "--tun must NOT keep SYS_ADMIN (bit 21): {tun:#x}"
     );
     let privd = capbnd("condprv", "--privileged");
+    if privd == 0 {
+        eprintln!("skip: --privileged box did not start (CapBnd empty)");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
     assert_eq!(
         (privd >> 21) & 1,
         1,
@@ -2346,6 +2351,76 @@ fn tun_keeps_net_admin_and_privileged_keeps_sys_admin_on_a_real_box() {
         "untrusted + --tun must leave EXACTLY NET_ADMIN in CapBnd, nothing else: {ut:#x}"
     );
     let _ = fs::remove_dir_all(&root);
+}
+
+/// **Regression (0ab88a1): a `kern build` RUN step must NOT flip the CALLER's own cgroup to
+/// group-OOM-kill.** The scope/managed-unit `memory.oom.group=1` write targets the box's OWN scope;
+/// a build step (`KERN_BUILD_STEP`) is a best-effort PASSTHROUGH that runs in `kern build`'s inherited
+/// cgroup, so writing there would enlarge the whole session's OOM blast radius and never revert. Runs a
+/// box with `KERN_BUILD_STEP=1` and asserts THIS process's `memory.oom.group` is untouched. Skip-graceful
+/// where the caller's cgroup file is absent/unwritable or not a clean `0` (a pre-existing `1` can't be
+/// told from a flip); self-heals so a failing run never leaves the test process in group-kill.
+#[test]
+fn build_step_box_does_not_touch_the_callers_own_cgroup_oom_group() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Ok(cg) = fs::read_to_string("/proc/self/cgroup") else {
+        eprintln!("skip: /proc/self/cgroup unreadable");
+        return;
+    };
+    let Some(rel) = cg.lines().find_map(|l| l.strip_prefix("0::")) else {
+        eprintln!("skip: no cgroup v2 line");
+        return;
+    };
+    let oomg = std::path::Path::new("/sys/fs/cgroup")
+        .join(rel.trim().trim_start_matches('/'))
+        .join("memory.oom.group");
+    // Only meaningful from a clean, writable `0`: writing it back proves any later `1` is the box's doing.
+    match fs::read_to_string(&oomg) {
+        Ok(s) if s.trim() == "0" && fs::write(&oomg, "0").is_ok() => {}
+        _ => {
+            eprintln!("skip: caller cgroup memory.oom.group not a writable clean 0");
+            return;
+        }
+    }
+    let root = build_rootfs(&busybox, "buildstep");
+    let rootfs = root.to_str().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+        .args([
+            "box",
+            "buildstep",
+            "--rootfs",
+            rootfs,
+            "--memory",
+            "64m",
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .env("KERN_BUILD_STEP", "1")
+        .output();
+    let after = fs::read_to_string(&oomg)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let _ = fs::remove_dir_all(&root);
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+        .args(["rm", "buildstep"])
+        .output();
+    // Self-heal BEFORE asserting, so a regression never leaves this test process in group-OOM-kill.
+    if after != "0" {
+        let _ = fs::write(&oomg, "0");
+    }
+    assert!(out.is_ok(), "kern box (build step) failed to spawn");
+    assert_eq!(
+        after, "0",
+        "a KERN_BUILD_STEP box must NOT set the caller's own memory.oom.group (now {after})"
+    );
 }
 
 /// **Red-team regression: a box can neither SEE nor RAISE a cgroup above its own.**

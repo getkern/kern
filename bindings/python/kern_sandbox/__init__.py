@@ -41,7 +41,6 @@ import queue
 import re
 import select
 import shutil
-import select
 import signal
 import stat
 import subprocess

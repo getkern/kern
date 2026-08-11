@@ -1832,9 +1832,11 @@ fn box_isolation(pid: i32) -> String {
         }
     }
     // Extra caps: a box whose BOUNDING set (`CapBnd`) contains a cap kern always drops by default
-    // (DEFAULT_DROP - module load, raw I/O, BPF, …) was handed it back via `--cap-add`, so it is less
-    // confined than default. The bounding set is the honest signal: a rootless box's `CapEff` is full
-    // but namespaced (grants no host power) and would false-positive; `CapBnd` reflects what kern kept.
+    // (DEFAULT_DROP - module load, raw I/O, BPF, …) kept one it would normally drop, so it is less
+    // confined than default. That happens via `--cap-add`, or via `--tun` (keeps `NET_ADMIN`) or
+    // `--privileged` (keeps `SYS_ADMIN`) - all correctly flagged here. The bounding set is the honest
+    // signal: a rootless box's `CapEff` is full but namespaced (grants no host power) and would
+    // false-positive; `CapBnd` reflects what kern actually kept.
     if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
         if let Some(bnd) = status.lines().find_map(|l| l.strip_prefix("CapBnd:")) {
             if let Ok(bits) = u64::from_str_radix(bnd.trim(), 16) {

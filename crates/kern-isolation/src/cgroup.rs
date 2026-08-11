@@ -961,19 +961,22 @@ pub fn apply_limits(
     // Where the supervisor is RIGHT NOW - captured BEFORE we move it into the box cgroup, so the guard can
     // move it back and remove the (then-empty) box cgroup on the direct path (no systemd `--collect` there).
     let origin = current_v2_cgroup();
-    // Whole-box OOM on the scope / managed-unit path. When an OUTER systemd enforcer is present
-    // (`KERN_SCOPE` re-exec, `KERN_MANAGED` --restart unit, `KERN_BUILD_STEP`) the box runs directly in
-    // that ancestor's cgroup: systemd caps it via `MemoryMax`, but the ancestor's `memory.oom.group`
-    // is 0, so an OOM would kill ONE process and leave the box half-dead - exactly what the child write
-    // below prevents on the direct path. And the per-box `systemd-run --scope` is not `Delegate=yes`, so
-    // the capped `kern-box-*` child below often cannot be built under the scope (`apply_limits` returns
-    // `None`) and the box stays in `origin`. Set `oom.group=1` on `origin` so the whole-box kill holds
-    // here too. Gated on `outer_enforcer_present()`: on the direct and best-effort paths `origin` is the
-    // caller's OWN (shell) cgroup, which must not be touched. Best-effort and idempotent (verified
-    // writable from inside a scope on an Arduino UNO Q, whose non-delegated scope is exactly this case);
-    // a failure loses only the whole-box guarantee, never a cap. Runs before the box's mount namespace
-    // remounts `/sys/fs/cgroup` read-only.
-    if outer_enforcer_present() {
+    // Whole-box OOM on the scope / managed-unit path. When the box runs directly in its OWN systemd
+    // scope (`KERN_SCOPE` re-exec) or `--restart` unit (`KERN_MANAGED`), systemd caps that cgroup via
+    // `MemoryMax` but leaves its `memory.oom.group` at 0, so an OOM would kill ONE process and leave the
+    // box half-dead - exactly what the child write below prevents on the direct path. The per-box
+    // `systemd-run --scope` is not `Delegate=yes`, so the capped `kern-box-*` child below often cannot be
+    // built under the scope (`apply_limits` returns `None`) and the box stays in `origin`, which IS its
+    // own scope. Set `oom.group=1` there so the whole-box kill holds. Gated on KERN_SCOPE/KERN_MANAGED
+    // ONLY, deliberately NOT the full `outer_enforcer_present()`: `KERN_BUILD_STEP` is also an
+    // outer-enforcer marker, but a `kern build` RUN step is a best-effort PASSTHROUGH that runs in the
+    // CALLER's own cgroup (no per-box scope), so there `origin` is `kern build`'s inherited shell/session
+    // cgroup - writing to it would flip the whole session to group-OOM-kill and never revert. The direct
+    // and best-effort paths carry neither marker and are excluded for the same reason (`origin` = the
+    // caller's cgroup). The build box still gets whole-box OOM via the `kern-box-*` child write below
+    // where the controller is delegated. Best-effort and idempotent; runs before the box's mount
+    // namespace remounts `/sys/fs/cgroup` read-only.
+    if env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED") {
         if let Some(o) = &origin {
             let _ = fs::write(o.join("memory.oom.group"), "1");
         }
