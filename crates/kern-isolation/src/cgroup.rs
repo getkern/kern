@@ -1220,6 +1220,12 @@ fn is_real_limit(raw: &str) -> bool {
 /// effective one. Read-only and best-effort: an unreadable `/proc/self/cgroup` means we cannot tell,
 /// and a warning we cannot justify is worse than none, so it stays quiet.
 pub fn warn_unenforced_caps(memory: Option<u64>, cpus: Option<f64>, pids: Option<u64>) {
+    // KERN_QUIET drops this human-readable warning for embedders (e.g. the MCP server) whose channel
+    // is a machine one: they read the enforcement verdict off the unforgeable started-fd signal, which
+    // this does NOT touch, so `oom` vs `killed` classification still holds. Only the prose is silenced.
+    if env_flag("KERN_QUIET") {
+        return;
+    }
     let Ok(raw) = fs::read_to_string("/proc/self/cgroup") else {
         return;
     };

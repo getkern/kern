@@ -2701,7 +2701,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                  but NO cgroup cap is in force - the box runs UNCAPPED. If kern did not set that variable, a \
                  caller may be bypassing the resource limits."
             );
-        } else if !spec.allow_uncapped && crate::cgroup::memory_cap_enforceable() {
+        } else if !spec.allow_uncapped
+            && !crate::cgroup::env_flag("KERN_QUIET")
+            && crate::cgroup::memory_cap_enforceable()
+        {
+            // KERN_QUIET drops this human-readable notice for embedders (the MCP server) that read the
+            // uncapped verdict off the machine signal instead; it does NOT change the allow/refuse
+            // behaviour (that stays on `--allow-uncapped`/`--require-limits`), only the prose.
             // The box did NOT take the direct kern.slice path, no outer enforcer claims to cap it, and
             // `apply_limits` could not put a cap in force here. `memory_cap_enforceable()` is TRUE, so the
             // once-per-process "controller absent from this tree" notice in `reexec_in_scope_if_possible`

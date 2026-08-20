@@ -42,6 +42,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install musl tooling
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Stamp the release version from the tag
+        # The source is de-versioned (Cargo.toml pins 0.0.0, so no stale number lives in git); the
+        # SHIPPED binary should still report the tag - `kern --version` on a release build says the
+        # tag's version, not 0.0.0. Runs ONLY in CI, on the tag; the committed source is never touched.
+        run: sed -i "s/^version = \"0.0.0\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
       - name: Build (static, size-extreme)
         # `-Zbuild-std` rebuilds std/core under the release profile's opt-level="z"; `panic=immediate-abort`
         # drops std's panic-formatting machinery (the code is panic-free in production, and a panic that
@@ -102,6 +107,10 @@ jobs:
       - name: The release tag to attach to
         id: tag
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Stamp the release version from the tag
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          sed -i "s/^version = \"0.0.0\"/version = \"${TAG#v}\"/" Cargo.toml
       - name: Build the kern.exe shim (mingw cross)
         # --target-dir target: the shim is its OWN (workspace-excluded) crate, so by default it would
         # build into windows/kern-win/target; pin it to the repo-root target dir the Package step reads.

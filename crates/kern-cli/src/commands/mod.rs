@@ -13216,7 +13216,7 @@ fn scratch_dir() -> PathBuf {
     cands.push((PathBuf::from(format!("/dev/shm/kern-{uid}/scratch")), "shm"));
     for (cand, kind) in &cands {
         if fs_magic_of(cand) != Some(OVERLAYFS_SUPER_MAGIC) {
-            if *kind == "shm" {
+            if *kind == "shm" && !kern_common::env_flag("KERN_QUIET") {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     eprintln!(

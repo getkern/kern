@@ -24,7 +24,9 @@ Environment knobs (all optional): ``KERN_MCP_IMAGE`` (default python:3.12-slim),
 ``KERN_MCP_PROFILES`` (comma-separated kern.toml profiles, e.g. ``vcpu:heavy,vgpio:sensors``),
 ``KERN_MCP_KERNEL`` (set to ``1`` to route python run_code through ONE persistent WARM interpreter:
 in-memory state persists across calls and each call is sub-ms instead of a ~10 ms interpreter boot; still
-NEVER-NET; a runaway cell that times out respawns the kernel, it never dooms the session), ``KERN_BIN``.
+NEVER-NET; a runaway cell that times out respawns the kernel, it never dooms the session),
+``KERN_MCP_QUIET`` (default on: suppress kern's non-fatal notes so a tools/call returns only the cell's
+own output; set to ``0`` to restore them), ``KERN_BIN``.
 """
 from __future__ import annotations
 
@@ -410,6 +412,13 @@ class _Server:
 
 
 def main() -> None:
+    # Non-fatal kern notes (the uncapped-caps warning, the overlayfs-scratch note) are diagnostics for a
+    # human at a terminal; on the MCP channel they would land in the model's run_code output as if the
+    # cell had printed them. Default them off (KERN_QUIET) so tools/call returns only the cell's own
+    # stdout/stderr. The unforgeable machine signal the SDK reads for oom/killed is untouched, so fault
+    # classification still holds. Set KERN_MCP_QUIET=0 to restore the notes.
+    if os.environ.get("KERN_MCP_QUIET", "1").strip().lower() not in ("0", "false", "no", ""):
+        os.environ["KERN_QUIET"] = "1"
     server = _Server()
     # Deterministic stdio encoding regardless of the operator's locale: UTF-8 out (so ensure_ascii=False
     # is safe and never raises), and tolerant in, so a bad byte can't crash the transport.
