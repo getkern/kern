@@ -242,9 +242,7 @@ impl Field {
             .filter(|s| !s.is_empty())
             .map(|s| canon_pick_token(label, s))
             .collect();
-        for s in &mut self.sel {
-            *s = false;
-        }
+        self.sel.fill(false);
         for tok in want {
             match self
                 .options
