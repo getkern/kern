@@ -264,6 +264,49 @@ def provenance_counts_agree() -> list[str]:
     return bad
 
 
+def size_claims_agree() -> list[str]:
+    """The binary size claimed OUTSIDE the .md set must equal the one the README states.
+
+    This gate defaults to tracked `.md`, so a number baked into an asset is invisible to it, and on
+    2026-08-20 that is exactly what happened: the front-page GIF said 1.84 MB and the demo SVG said
+    ~1.8 MB while the README three lines away said 1.58. Nobody lied; the generator's constant simply
+    had no gate on it. The GIF is pixels, but the three files that PRODUCE the claim are text.
+
+    Deliberately an AGREEMENT check, not a STALE rule: the note above records that a blacklist on the
+    size fired on true statements (a bare "1.7 MB" is also an RSS in BENCHMARKS.md) and a gate with
+    false positives gets switched off. Comparing a claim against the canonical one cannot cry wolf,
+    because there is exactly one right answer and the README holds it.
+    """
+    readme = re.search(
+        r"out of one\s+([\d.]+)\s*MB binary", open("README.md", encoding="utf-8").read()
+    )
+    if not readme:
+        return ["README.md no longer states the binary size in its headline, so nothing can be "
+                "checked against it. Restore the claim or drop this check."]
+    canonical = readme.group(1)
+    # Only a size sitting NEXT TO the word it measures counts, so the generator's own history note
+    # ("the GIF kept claiming ~2 ms and 1.6 MB") is not a claim about today's binary and is skipped.
+    claim = re.compile(
+        r'BINARY_SIZE\s*=\s*"~?([\d.]+)\s*MB"'
+        r'|~?([\d.]+)\s*MB(?=[^\n]{0,24}\bbinary\b)'
+        r'|\bbinary\b[^\n]{0,24}~?([\d.]+)\s*MB'
+    )
+    bad = []
+    for path in ("assets/demo.svg", "assets/make-demo-gif.py"):
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue  # a claimant that no longer exists is not a disagreement
+        for lineno, line in enumerate(text.split("\n"), 1):
+            for m in claim.finditer(line):
+                said = next(g for g in m.groups() if g)
+                if said != canonical:
+                    bad.append(
+                        f"{path}:{lineno} claims a {said} MB binary, README.md says {canonical} MB"
+                    )
+    return bad
+
+
 def scan(path: str) -> list[tuple[int, str, str, str, str]]:
     try:
         text = open(path, encoding="utf-8").read()
@@ -328,6 +371,12 @@ def main(argv: list[str]) -> int:
         print(f"\n{problem}")
         print("       the signed-tag and timestamp counts are a trust claim, and both are "
               "countable from this repository. Count them.")
+    for problem in size_claims_agree():
+        total += 1
+        print(f"\n{problem}")
+        print("       the front page states the size in an asset as well as in prose, and this "
+              "gate reads only .md, so the asset drifts silently. Edit the generator, then "
+              "re-run it: python3 assets/make-demo-gif.py")
     n = len(files)
     print(f"\n{total} stale figure{'' if total == 1 else 's'} in {n} file{'' if n == 1 else 's'}")
     return 1 if total else 0
