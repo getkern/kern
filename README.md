@@ -17,8 +17,8 @@
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](docs/INSTALL.md)
 
 ```sh
-# Linux · WSL2 · ARM boards (Raspberry Pi, Jetson). No native Windows.
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+# Linux · WSL2 · ARM boards (Raspberry Pi, Jetson). No native Windows. Needs a Rust toolchain.
+cargo install --git https://github.com/getkern/kern getkern --locked
 kern box dev --image alpine -it -- sh
 ```
 
@@ -83,17 +83,14 @@ kern needs a Linux kernel with unprivileged user namespaces and cgroup v2. It ru
 and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q); there is **no native Windows** build, use
 WSL2 (kern ships a pre-baked WSL rootfs).
 
-The one-liner downloads the signed release binary for your architecture and verifies its SHA256:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-```
-
-Or build it from source with a Rust toolchain (no binary download):
+There are no published binaries yet, so you build it from source with a Rust toolchain:
 
 ```sh
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
+
+Once a release is published, [`install.sh`](install.sh) fetches the binary for your architecture and
+verifies its SHA256 (`curl -fsSL .../install.sh | sh`); until then it has nothing to download.
 
 `kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the
