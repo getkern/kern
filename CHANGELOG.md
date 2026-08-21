@@ -96,7 +96,10 @@ state of the tree; full detail is in the git history.
   which makes it 30 out of 30. The hold is taken before any signal goes out (the group signal would
   otherwise kill the reaper first), released by a `Drop` on every path, and only ever applied to a
   process the box owns - never the user's systemd manager, which inherits an orphaned init, and never
-  a FOREGROUND box's own process, which would print `Stopped` in the user's terminal. Cost measured:
+  a FOREGROUND box's own process, which would print `Stopped` in the user's terminal. It is also
+  taken only for a box with a dedicated cgroup, the case where a `stop` killed mid-hold is
+  recoverable: `kern ps` then shows the box ORPHANED and the next `kern stop` reaps its cgroup whole.
+  A box without one keeps the unguarded read rather than risking a stopped runner nothing can clear. Cost measured:
   none. A single stop is 16.20 ms against a 16.23 ms baseline and `stop --all` of 50 boxes is 110 ms
   against 119 ms, because consolidating the `/proc` readers onto one `stat_field` (reading `stat`
   rather than the much more expensive `status`) paid for the two extra signals.

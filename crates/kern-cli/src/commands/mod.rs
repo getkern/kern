@@ -4183,6 +4183,13 @@ fn zombie_exit_code(pid: i32) -> Option<i32> {
 /// hold would leave that box frozen and looking alive - a worse outcome than the exit code this
 /// buys, and a foreground box reports its code directly to its caller anyway. Both cases fall back
 /// to the unguarded read.
+///
+/// The release is a `Drop`, which a SIGKILL of `kern stop` itself skips, so the caller takes this
+/// hold only for a box whose dedicated cgroup makes that survivable - see the call site. VERIFIED in
+/// both directions: with a cgroup, `kern stop` killed mid-grace leaves the box ORPHANED in `kern ps`
+/// and the next `kern stop` reaps it whole ("reaped via cgroup.kill", no stopped process and no
+/// stray left); with no cgroup and no hold, the runner dies with the group and the init reparents
+/// and reaps itself, which is the behaviour that existed before this type and is left intact.
 struct ReaperHold(Option<i32>);
 
 impl ReaperHold {
@@ -13563,7 +13570,16 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     let _holds: Vec<ReaperHold> = targets
         .iter()
         .map(|b| {
-            if b.stop_grace > 0 && !b.orphaned {
+            // Only where an interrupted `stop` is RECOVERABLE. A held reaper is resumed by `Drop`,
+            // which a SIGKILL of this process skips, and a box with a dedicated cgroup survives that:
+            // its supervisor is gone, so `kern ps` shows it ORPHANED and the next `kern stop` reaps
+            // the whole cgroup (verified: `stopped 'victim2' (was orphaned; reaped via cgroup.kill)`,
+            // no stopped process and no stray left). A box with NO dedicated cgroup - `cgroup` is
+            // empty exactly there - has no such handle: it would vanish from `ps` with its runner
+            // stopped for good, where before this hold existed the runner simply died and the init
+            // reparented and reaped itself. An exit code is not worth turning a self-healing case
+            // into a leak, so those boxes keep the unguarded read.
+            if b.stop_grace > 0 && !b.orphaned && !b.cgroup.is_empty() {
                 ReaperHold::new(b.pid, b.pid1)
             } else {
                 ReaperHold(None)
@@ -17722,25 +17738,40 @@ mod image_rm_tests {
     ///
     /// The live-process case is the discriminant: it proves the function reads a real status rather
     /// than answering from the pid, and that a not-yet-dead init can never be recorded as exited.
+    /// The child is held on a pipe until that check has run - asserting it against a child racing us
+    /// to `_exit` made THIS TEST flaky (seen once in five full-suite runs), which is the same defect
+    /// class it was written to catch, just on the test's side of the line.
     #[test]
     fn zombie_exit_code_tells_a_clean_exit_from_a_kill() {
         // (what the child does, what `waitpid` semantics say the code is)
         for (want, kill_self) in [(7, false), (0, false), (128 + libc::SIGKILL, true)] {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            let (rd, wr) = (fds[0], fds[1]);
             let child = unsafe { libc::fork() };
             assert!(child >= 0, "fork");
             if child == 0 {
                 // Async-signal-safe only: no allocation, no Rust runtime, between fork and _exit.
+                unsafe { libc::close(wr) };
+                let mut byte = 0u8;
+                // Block until the parent has taken its live reading. EOF (parent died) releases too,
+                // so a failing test cannot leave this child behind.
+                while unsafe { libc::read(rd, std::ptr::addr_of_mut!(byte).cast(), 1) } < 0 {}
                 if kill_self {
                     unsafe { libc::raise(libc::SIGKILL) };
                 }
                 unsafe { libc::_exit(want) };
             }
+            unsafe { libc::close(rd) };
             // Live, not yet dead: there is no status to read and none must be invented.
             assert_eq!(
                 zombie_exit_code(child),
                 None,
                 "a live process has no exit status to report"
             );
+            // Let it go, and drop our end so an early failure above still releases it.
+            unsafe { libc::write(wr, b"g".as_ptr().cast(), 1) };
+            unsafe { libc::close(wr) };
             // Wait for the zombie WITHOUT reaping it - that is the window `stop` reads in.
             let mut seen = None;
             for _ in 0..2000 {
