@@ -69,6 +69,14 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- `kern gc` reaps orphaned box cgroups wherever a box was created, not only under kern.slice. A box
+  that the OOM killer or a SIGKILL takes down leaves its `kern-box-*` cgroup dir behind (the RAII Drop
+  that removes it cannot run on SIGKILL), and gc looked in one place while `apply_limits` creates in
+  two: kern.slice on the direct path, the CALLER'S own cgroup on every other path. Measured on WSL2 as
+  uid 0, where no kern.slice exists and boxes land at the cgroup root: three OOM-killed boxes left
+  three dirs, a later box start did not reap them, and gc reported "nothing to prune" with them in
+  place. After the fix the same sequence reports "reaped 3 orphaned box cgroups" and leaves none, while
+  a live box's cgroup is untouched.
 - kern no longer calls a box uncapped when the kernel is capping it. The uncapped notice and the
   `--require-limits` refusal keyed off "kern wrote no cap of its own", which is not the same question:
   on the systemd-scope path the scope carries `MemoryMax`/`TasksMax` and the backstops bind without

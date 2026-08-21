@@ -621,28 +621,55 @@ fn kill_cgroup(dir: &std::path::Path) -> bool {
 /// The per-box-start orphan-sweep cap - bounds the hot-path cost; the tail is cleaned by later starts / gc.
 const SWEEP_LIMIT: usize = 128;
 
-/// `kern gc`: reap orphaned box cgroup dirs under kern.slice and return how many were removed. A
-/// direct-path box that `killall`/`stop` SIGKILLs leaves its now-empty `kern-box-*` cgroup dir behind
-/// (the next box start's sweep clears it, but a user may `gc` between bursts). No-op when kern.slice
-/// isn't in use (a rootless scope host never populates it).
+/// `kern gc`: reap orphaned box cgroup dirs and return how many were removed. A box that `killall`,
+/// `stop` or the OOM killer SIGKILLs leaves its now-empty `kern-box-*` dir behind, because the RAII
+/// Drop that removes it does not run on SIGKILL.
+///
+/// Where the per-box-start sweep reaches, this is only a convenience between bursts. Where it does
+/// NOT, this is the only reaper there is: the start-time sweep lives in `ensure_kern_slice_uncached`
+/// and therefore only ever touches kern.slice, while a scope / managed / best-effort box is created in
+/// the CALLER'S cgroup and is never swept by a later start. That is why this walks both directories
+/// rather than the slice alone.
 pub fn gc_orphan_box_cgroups() -> usize {
-    let Some(slice) = kern_slice_path() else {
-        return 0;
-    };
-    if !slice.is_dir() {
-        return 0;
+    // Boxes are not all created in one place, so sweeping one place cannot find them all. `apply_limits`
+    // puts a DIRECT-path box under kern.slice and EVERY other box (scope, managed, best-effort) under the
+    // CALLER'S own cgroup, and this used to look only at the slice. Measured on WSL2 as uid 0, where no
+    // kern.slice exists and boxes land at the cgroup root: two OOM-killed boxes left
+    // `/sys/fs/cgroup/kern-box-*` behind, a following box start did not reap them, and `kern gc` reported
+    // "nothing to prune" while they sat there. Normal boxes were unaffected (their RAII Drop removes the
+    // dir); it is the SIGKILLed ones, whose Drop never runs, that accumulated. So sweep both places the
+    // creator can choose, deduped when they are the same directory.
+    gc_orphan_box_cgroups_in(&[kern_slice_path(), current_v2_cgroup()])
+}
+
+/// Testable core of [`gc_orphan_box_cgroups`]: sweep every directory a box can be created in, skipping
+/// the absent ones and the duplicates (both resolve to the same path whenever the caller already runs
+/// inside kern.slice). Split out for the same reason `memory_cap_state_at` is: a unit test can drive it
+/// against synthetic directories instead of the host's real cgroup tree, on any machine.
+fn gc_orphan_box_cgroups_in(dirs: &[Option<PathBuf>]) -> usize {
+    let mut reaped = 0;
+    let mut done: Vec<&PathBuf> = Vec::new();
+    for dir in dirs.iter().flatten() {
+        if !dir.is_dir() || done.contains(&dir) {
+            continue;
+        }
+        let before = count_box_cgroups(dir);
+        sweep_orphan_boxes(dir, 0); // gc is cold → unbounded, reap ALL orphans
+        reaped += before.saturating_sub(count_box_cgroups(dir));
+        done.push(dir);
     }
-    let count = || {
-        fs::read_dir(&slice)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("kern-box-"))
-            .count()
-    };
-    let before = count();
-    sweep_orphan_boxes(&slice, 0); // gc is cold → unbounded, reap ALL orphans
-    before.saturating_sub(count())
+    reaped
+}
+
+/// How many `kern-box-*` dirs sit directly in `dir`. Split out because [`gc_orphan_box_cgroups`] now
+/// measures more than one directory and a closure over a single captured path no longer fits.
+fn count_box_cgroups(dir: &std::path::Path) -> usize {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("kern-box-"))
+        .count()
 }
 
 /// The box cgroup dir that host-pid `pid` belongs to RIGHT NOW, read from `/proc/<pid>/cgroup` - so
@@ -1786,6 +1813,73 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn gc_sweeps_every_directory_a_box_can_be_created_in() {
+        // The WSL2 defect, automated. `apply_limits` creates a box under kern.slice on the direct path
+        // and under the CALLER'S cgroup on every other path (scope, managed, best-effort), and gc used
+        // to sweep only the first. Measured there: three OOM-killed boxes left three
+        // `/sys/fs/cgroup/kern-box-*` dirs, and gc reported "nothing to prune" with them in place.
+        //
+        // Asserted on `cgroup.kill`, not on the dir being gone, for the same reason
+        // `sweep_orphan_boxes_reaps_only_dead_supervisors` is: on a REAL cgroupfs `cgroup.kill` already
+        // exists and writing it is what empties the cgroup, but in a temp dir the write CREATES the
+        // file, so the following `remove_dir` (which needs an empty dir) cannot succeed. The write is
+        // the observable proof that the sweep reached that directory at all, which is the whole
+        // question here; the removal half is exercised on real hosts.
+        let base = std::env::temp_dir().join(format!("kern-gcdirs-{}", std::process::id()));
+        let slice = base.join("slice");
+        let origin = base.join("origin");
+        let _ = fs::remove_dir_all(&base);
+        for d in [&slice, &origin] {
+            fs::create_dir_all(d).expect("temp dir");
+        }
+        // A pid that cannot be alive, so `/proc/<pid>` is absent and the entry reads as an orphan.
+        let dead: u32 = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map_or(u32::MAX, |m| m.saturating_sub(1));
+        let live = std::process::id();
+
+        let dead_in_slice = slice.join(format!("kern-box-a-{dead}"));
+        let dead_in_origin = origin.join(format!("kern-box-b-{dead}"));
+        let live_in_origin = origin.join(format!("kern-box-c-{live}"));
+        let unrelated = origin.join("not-a-box");
+        for d in [&dead_in_slice, &dead_in_origin, &live_in_origin, &unrelated] {
+            fs::create_dir_all(d).expect("case dir");
+        }
+
+        gc_orphan_box_cgroups_in(&[Some(slice.clone()), Some(origin.clone())]);
+
+        assert!(
+            dead_in_slice.join("cgroup.kill").is_file(),
+            "the dead-supervisor box under kern.slice must be swept (it always was)"
+        );
+        assert!(
+            dead_in_origin.join("cgroup.kill").is_file(),
+            "the dead-supervisor box under the CALLER'S cgroup must be swept too: this is the \
+             directory gc never looked at, where an OOM-killed box left one dir behind every time"
+        );
+        assert!(
+            !live_in_origin.join("cgroup.kill").exists(),
+            "a LIVE box must never be killed by gc - a reused pid would cost a running box its \
+             processes"
+        );
+        assert!(live_in_origin.is_dir(), "a live box's cgroup dir survives");
+        assert!(
+            unrelated.is_dir() && !unrelated.join("cgroup.kill").exists(),
+            "a dir that is not a box is never touched"
+        );
+
+        // Absent directories and `None` entries are skipped rather than panicked on: on most hosts one
+        // of the two resolvers returns nothing.
+        assert_eq!(
+            gc_orphan_box_cgroups_in(&[Some(base.join("nope")), None]),
+            0,
+            "absent and None entries contribute nothing"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
