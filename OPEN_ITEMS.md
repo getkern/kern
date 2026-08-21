@@ -75,31 +75,6 @@ observed on any host tested, and no predicate for it exists yet; it is written h
 guessed at, because the fix is a second controller check and the cost of getting it wrong is a
 warning that fires on healthy hosts.
 
-## On a Raspberry Pi over ssh, kern says the box is uncapped while the kernel is capping it
-
-Measured on a Pi 5 (Raspberry Pi OS bookworm, kernel 6.6.51, aarch64) from an ordinary ssh session:
-`kern box --image alpine --memory 64m` prints the uncapped notice, and `--require-limits` REFUSES to
-start. Both are wrong there. The box that does start lands in
-`user.slice/user-1000.slice/user@1000.service/app.slice/run-<id>.scope` carrying `memory.max`
-67108864, `memory.oom.group` 1 and `pids.max` 512, and a 300 MB write into it is killed with 137 on
-three runs out of three. `dmesg` names the killer: `Memory cgroup out of memory: Killed process
-... (kern-rel) ... (sh) ... (dd)`, three processes at once, which is the whole-box kill `oom.group=1`
-exists to produce. The cap is real; only kern's report of it is not.
-
-The two disagree because they resolve DIFFERENT targets. `memory_cap_state()` probes
-`ensure_kern_slice()`, the direct `kern.slice` path, and on that host the probe write does not bind
-(the ssh session's own scope carries an empty `cgroup.subtree_control`, though its parent delegates
-`cpuset cpu memory pids`). The box, meanwhile, takes the systemd-run SCOPE path, where systemd
-applies `MemoryMax` and the cap does bind. So the probe answers honestly about a place the box does
-not use.
-
-It is recorded rather than patched, for now, and deliberately: the error is in the SAFE direction
-(kern under-claims enforcement and refuses rather than promising a cap it cannot verify), the fix
-touches the resource-enforcement path, and the message kern already prints names the remedy that
-works. Verified: run the same command inside a user scope
-(`systemd-run --user --scope kern box ... --memory 64m --require-limits`) and the notice is gone and
-`--require-limits` starts normally.
-
 ## `KERN_MAX_CONCURRENT` is a guard rail, not a resource boundary
 
 The count-and-claim runs under the claims-dir `flock` - the ceiling is read while the lock is held,

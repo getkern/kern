@@ -57,6 +57,18 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- kern no longer calls a box uncapped when the kernel is capping it. The uncapped notice and the
+  `--require-limits` refusal keyed off "kern wrote no cap of its own", which is not the same question:
+  on the systemd-scope path the scope carries `MemoryMax`/`TasksMax` and the backstops bind without
+  kern writing a byte. Measured on a Raspberry Pi 5 over ssh, the box ran with `memory.max` 67108864,
+  `memory.oom.group` 1 and `pids.max` 512 and was OOM-killed as a whole three times out of three
+  (`dmesg`: `Memory cgroup out of memory`, three processes at once), while kern printed the notice and
+  `--require-limits` refused to start. Both now ask the kernel what is in force: a memory ceiling that
+  bounds the request anywhere up the tree, and a task ceiling at the box's own level (an ancestor's
+  `pids.max` is shared with the session, so it does not count). The direct-path refusal is deliberately
+  unchanged, since there the box's own cgroup is the sole enforcer by design. Verified both ways: on
+  the Pi the notice is gone, `--require-limits` starts, and a 300 MB write is still killed 137; on a
+  host with no delegation the notice and the refusal both still fire.
 - A detached box's captured log is size-capped (two-file 32 MiB ring, zero-copy `splice`), so a
   runaway writer can't fill the session tmpfs.
 - An OOM kills the whole box (`memory.oom.group = 1`), not one process.

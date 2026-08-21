@@ -1334,6 +1334,42 @@ fn memory_capped_at_or_below(child: &std::path::Path, requested: u64) -> bool {
     })
 }
 
+/// Are the MANDATORY backstops - a memory ceiling that bounds this box, and a task ceiling at the
+/// box's OWN level - already in force for this process's cgroup, whoever established them?
+///
+/// `apply_limits` returning `None` means KERN wrote no cap of its own. It does NOT mean the box runs
+/// uncapped, and treating the two as the same thing is a measured defect: on the systemd-scope path
+/// the SCOPE carries `MemoryMax`/`TasksMax`, so the caps bind without kern writing a byte. Measured on
+/// a Raspberry Pi 5 (Raspberry Pi OS bookworm, kernel 6.6.51) from an ordinary ssh session: the box
+/// landed in `user@.service/app.slice/run-<id>.scope` with `memory.max` 67108864, `memory.oom.group` 1
+/// and `pids.max` 512, a 300 MB write was killed 3 times out of 3, and `dmesg` recorded
+/// `Memory cgroup out of memory: Killed process ...` for three processes at once - the whole-box kill.
+/// kern nevertheless printed the uncapped notice and `--require-limits` REFUSED to start, because both
+/// keyed off `cg.is_none()` instead of asking the kernel. This asks the kernel.
+///
+/// The two knobs are checked differently, for the reason recorded on [`capped_here`]: a memory ceiling
+/// ANYWHERE up the tree bounds the box (`capped_in_tree`, or [`memory_capped_at_or_below`] when a
+/// value was requested, so an ancestor larger than the request does not count), while a `pids.max`
+/// above the box is shared with every other task in that slice and bounds the session rather than this
+/// box, so only the box's OWN level counts.
+pub fn mandatory_caps_in_force(requested_memory: Option<u64>) -> bool {
+    current_v2_cgroup().is_some_and(|cur| mandatory_caps_in_force_at(&cur, requested_memory))
+}
+
+/// Testable core of [`mandatory_caps_in_force`], split out for the same reason `memory_cap_state_at`
+/// is: a unit test drives it against a synthetic directory instead of the real `/proc/self/cgroup`.
+fn mandatory_caps_in_force_at(cur: &std::path::Path, requested_memory: Option<u64>) -> bool {
+    let memory = match requested_memory {
+        // A request must be BOUNDED by the ceiling, not merely accompanied by one: an ancestor cap of
+        // 8 GiB does not enforce `--memory 8m`.
+        Some(req) => memory_capped_at_or_below(cur, req),
+        // No explicit request: the mandatory DEFAULT cap is what must be in force, and any real
+        // ceiling in the tree bounds it.
+        None => capped_in_tree(cur, "memory.max"),
+    };
+    memory && capped_here(cur, "pids.max")
+}
+
 /// Whether THIS box's requested `--memory` cap is actually being enforced, recorded for the second byte
 /// of the `KERN_STARTED_FD` signal so an SDK can tell an OOM against a real ceiling from a plain kill
 /// where the cap never bound. `0` = undetermined (no `--memory` requested, or `/proc/self/cgroup`
@@ -1696,6 +1732,60 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mandatory_caps_in_force_reads_the_cgroup_not_whether_kern_wrote_it() {
+        // The Pi 5 defect, automated. A temp dir is not under /sys/fs/cgroup, so `in_tree` evaluates
+        // this leaf only - which is the whole point here: the caps were established by a systemd scope,
+        // not by kern, and the predicate must still see them.
+        let d = std::env::temp_dir().join(format!("kern-mand-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("temp dir");
+        let set = |f: &str, v: &str| std::fs::write(d.join(f), v).expect("write");
+        let req: u64 = 64 * 1024 * 1024; // 64 MiB, the value measured on the board
+
+        // Exactly the state measured inside the scope on the Pi: both backstops real.
+        set("memory.max", "67108864");
+        set("pids.max", "512");
+        assert!(
+            mandatory_caps_in_force_at(&d, Some(req)),
+            "a scope carrying memory.max and pids.max IS capped, whoever wrote them"
+        );
+        assert!(
+            mandatory_caps_in_force_at(&d, None),
+            "with no explicit request the mandatory default ceiling is what must bind"
+        );
+
+        // A memory ceiling with NO task ceiling is a fork-bomb hole: the box is not fully backstopped,
+        // so the notice and the `--require-limits` refusal must still fire.
+        set("pids.max", "max");
+        assert!(
+            !mandatory_caps_in_force_at(&d, Some(req)),
+            "memory bound but pids unbound must NOT read as capped"
+        );
+
+        // A task ceiling with no memory ceiling is the mirror hole.
+        set("pids.max", "512");
+        set("memory.max", "max");
+        assert!(
+            !mandatory_caps_in_force_at(&d, Some(req)),
+            "pids bound but memory unbound must NOT read as capped"
+        );
+
+        // The masking case this must not regress into: an ancestor ceiling LARGER than the request
+        // does not enforce the request, so it is not "in force" for this box.
+        set("memory.max", "8589934592"); // 8 GiB against a 64 MiB request
+        assert!(
+            !mandatory_caps_in_force_at(&d, Some(req)),
+            "a ceiling above the request does not enforce it"
+        );
+        // ...while the same 8 GiB IS the real default ceiling when nothing narrower was asked for.
+        assert!(
+            mandatory_caps_in_force_at(&d, None),
+            "with no request, any real ceiling bounds the default"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

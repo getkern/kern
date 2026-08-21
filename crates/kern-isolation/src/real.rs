@@ -2671,10 +2671,20 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // Both checks below only matter when NO cap was applied; when `cg` is `Some` neither the (env + systemd
     // stat) `took_direct_cap_path()` nor the (cgroup-walking) `env_claims_enforcer_but_none_real()` runs.
     if cg.is_none() {
+        // `cg.is_none()` says KERN wrote no cap of its own. It does NOT say the box is uncapped, and
+        // conflating the two was a measured defect: on the systemd-scope path the SCOPE carries
+        // `MemoryMax`/`TasksMax`, so the backstops bind without kern writing a byte. On a Raspberry Pi 5
+        // over ssh the box ran with `memory.max` 67108864, `memory.oom.group` 1 and `pids.max` 512, was
+        // OOM-killed as a whole 3 times out of 3 (`dmesg`: `Memory cgroup out of memory`), and kern
+        // still printed the uncapped notice while `--require-limits` refused to start - on a host where
+        // the caps demonstrably worked. So ask the kernel what is in force before refusing or warning.
+        // Deliberately NOT applied to the direct-path refusal below: there the box's own cgroup is the
+        // sole enforcer by design, and accepting an ancestor's ceiling would loosen a fail-closed rule.
+        let caps_already_bound = crate::cgroup::mandatory_caps_in_force(spec.memory_max);
         // `--require-limits`: the caller asked for "enforce or do not run". A missing cap is fatal on
         // ANY path (best-effort included), BEFORE the warn-and-run fall-through below, so a workload
         // that depends on the ceiling never starts believing it is capped when it is not.
-        if spec.require_limits {
+        if spec.require_limits && !caps_already_bound {
             return Err(Error::Unsupported(
                 "requested resource cap(s) could not be enforced here and --require-limits \
                  (KERN_REQUIRE_LIMITS) is set: refusing to start. Ways out: run inside a systemd user \
@@ -2702,6 +2712,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                  caller may be bypassing the resource limits."
             );
         } else if !spec.allow_uncapped
+            && !caps_already_bound
             && !crate::cgroup::env_flag("KERN_QUIET")
             && crate::cgroup::memory_cap_enforceable()
         {
