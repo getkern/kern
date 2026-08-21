@@ -69,6 +69,17 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- **`--stop-timeout`'s help says when the grace is skipped.** The flag read "Seconds the workload
+  gets to exit on its own before the SIGKILL (default 10)", which promises a wait kern deliberately
+  does not take when the box's init has no handler for the signal: a namespace PID 1 DISCARDS a
+  signal it has no handler for, so the workload cannot die of it and the grace is a guaranteed wait
+  for an event that can never happen (Docker and Podman sit it out anyway, measured at 10 278 and
+  10 287 ms against kern's 21.9). The behaviour is unchanged and was already in BENCHMARKS.md and
+  docs/DOCKER-COMPAT.md; what was missing is the one line a surprised reader looks at first. An
+  external audit read `trap "" TERM` stopping in 4 ms as a defect, comparing it against the 3009 ms
+  this project had published for `trap "sleep 60" TERM` - a handler that CATCHES the signal and never
+  returns, which does spend the whole grace. Both numbers were right; the flag's own help did not say
+  so. The two shapes are now an end-to-end test each, side by side, rather than prose.
 - **An orphaned box is recoverable on the systemd-scope path too**, not only on the direct one. kern
   reaps a box whose supervisor was killed by remembering that box's own cgroup, and the path is
   recorded only when it names a `kern-box-*` dir - deliberately, because on the scope path a box's

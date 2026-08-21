@@ -592,6 +592,34 @@ fn box_ps_dash_a_shows_an_exited_box_with_its_exit_code() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// Remove a runtime dir ONLY if this test created it. [`runtime_dir_for_capped_box`] can hand back
+/// the session's REAL `/run/user/<uid>`, and a blind `remove_dir_all` on that would walk the user's
+/// live session sockets - dbus, pipewire, the compositor - deleting whatever it reached before the
+/// first FUSE mount aborted it. This is the guard for that, not a tidiness helper.
+fn drop_runtime_dir_if_ours(dir: &Path) {
+    if dir.starts_with(std::env::temp_dir()) {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// The runtime dir for a test whose box needs its OWN cgroup: the REAL one when this session has a
+/// systemd user manager, because that is how kern reaches the manager and how a box gets a dedicated
+/// cgroup instead of landing in the caller's ambient one. Measured while chasing a flaky test: under
+/// a private `$XDG_RUNTIME_DIR` the box joined the terminal's own scope
+/// (`app-org.chromium.Chromium-3640.scope`), so nothing was recorded for it and the behaviour that
+/// depends on that record could not hold. Falls back to a private dir, where such a box refuses to
+/// start under `--require-limits` and the caller skips with kern's own reason.
+fn runtime_dir_for_capped_box(tag: &str) -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    let real = PathBuf::from(format!("/run/user/{uid}"));
+    if real.join("systemd").is_dir() {
+        return real;
+    }
+    let d = std::env::temp_dir().join(format!("kern-it-xdg-{tag}-{}", std::process::id()));
+    let _ = fs::create_dir_all(&d);
+    d
+}
+
 /// `kern stop` on a workload that traps the signal and exits cleanly must record THAT exit code, not
 /// the SIGKILL it never sent. The 137 was hardcoded when a stop was always a SIGKILL; the graceful
 /// phase arrived later and the constant did not follow it in, so every clean shutdown of a real
@@ -612,16 +640,21 @@ fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
     }
     let root = build_rootfs(&busybox, "stopcode");
     let rootfs = root.to_str().unwrap();
-    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-stopcode-{}", std::process::id()));
-    let _ = fs::create_dir_all(&xdg);
+    // Reading the init's status without racing its reaper needs the box to have its OWN cgroup, and
+    // `--require-limits` is that precondition in kern's own vocabulary: it refuses to start where the
+    // caps do not bind, which is exactly where no cgroup is recorded. A host that cannot provide one
+    // therefore SKIPS here, with kern's refusal as the reason, instead of failing intermittently.
+    let xdg = runtime_dir_for_capped_box("stopcode");
+    let pid = std::process::id();
 
     // (box name, what its init does with SIGTERM, the code that must be recorded)
     let cases = [
-        ("stopclean", "trap 'exit 7' TERM", 7),
-        ("stopign", "trap '' TERM", 137),
+        (format!("stopclean-{pid}"), "trap 'exit 7' TERM", 7),
+        (format!("stopign-{pid}"), "trap '' TERM", 137),
     ];
     let mut ran = false;
     for (name, trap, want) in cases {
+        let name = name.as_str();
         let out = kern()
             .env("XDG_RUNTIME_DIR", &xdg)
             .args([
@@ -630,6 +663,7 @@ fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
                 "--rootfs",
                 rootfs,
                 "-d",
+                "--require-limits",
                 "--stop-timeout",
                 "3",
                 "--",
@@ -714,7 +748,7 @@ fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
     }
 
     let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&xdg);
+    drop_runtime_dir_if_ours(&xdg);
 }
 
 /// The grace is what the caller asked for, not that minus up to a second. `stop` waits the time LEFT
@@ -823,6 +857,118 @@ fn stop_grace_is_not_rounded_down_to_whole_seconds() {
         got,
         Some(137),
         "a handler that never returns is SIGKILLed at the end of the grace; ps -a said {last}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
+/// The other half of the grace contract, and the half that reads like a bug until you know the
+/// kernel rule: a grace the signal CANNOT end is skipped, not sat out.
+///
+/// A namespace PID 1 is special - the kernel DISCARDS a signal it has no handler for - so a box
+/// whose init ignores SIGTERM cannot die of it, and waiting is a guaranteed wait for an event that
+/// can never happen. kern reads `SigCgt` and goes straight to the SIGKILL; Docker and Podman sit out
+/// the full grace and reach the same place later (MEASURED at 10 278 and 10 287 ms against 21.9).
+///
+/// Paired with `stop_grace_is_not_rounded_down_to_whole_seconds` deliberately, because the two shapes
+/// look identical in a shell and behave oppositely: `trap "" TERM` is IGNORED (fast), while
+/// `trap "sleep 60" TERM` is CAUGHT and never returns (the full grace). An audit that measures one
+/// and compares it against the other's number reports a defect that is not there, so both numbers
+/// live in tests rather than in prose.
+#[test]
+fn stop_skips_a_grace_the_kernel_would_make_pointless() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "skipgrace");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-skipgrace-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "ignoresterm",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--stop-timeout",
+            "3",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "trap '' TERM; while :; do sleep 0.2; done",
+        ])
+        .output()
+        .expect("run kern");
+    if !out.status.success() {
+        eprintln!(
+            "skip: detached box did not start here: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    // Let the shell install the disposition before the signal arrives.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let started = std::time::Instant::now();
+    let stop = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "ignoresterm"])
+        .output()
+        .expect("run kern");
+    let waited = started.elapsed();
+    assert!(
+        stop.status.success(),
+        "stop should succeed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    // Expected in single-digit milliseconds; a regression that waits it out returns at ~3000. The
+    // bound is two orders of magnitude above the measurement and far below the grace, so a slow or
+    // loaded machine cannot reach it.
+    assert!(
+        waited < std::time::Duration::from_millis(1000),
+        "a grace the init cannot act on must be skipped, not waited out: stop took {} ms",
+        waited.as_millis()
+    );
+
+    let mut got = None;
+    let mut last = String::new();
+    for _ in 0..40 {
+        let all = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "-a", "--json"])
+            .output()
+            .expect("run kern");
+        let s = String::from_utf8_lossy(&all.stdout);
+        last = s.to_string();
+        if let Some(row) = s.split("ignoresterm").nth(1) {
+            if let Some(code) = row.split("\"exit_code\":").nth(1) {
+                got = code
+                    .split(|c: char| !c.is_ascii_digit() && c != '-')
+                    .find(|t| !t.is_empty())
+                    .and_then(|t| t.parse::<i32>().ok());
+                if got.is_some() {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // 137 is the truth here, not a fallback: this box really was SIGKILLed.
+    assert_eq!(
+        got,
+        Some(137),
+        "an init that ignores the signal is SIGKILLed, and that is what must be recorded; ps -a said {last}"
     );
 
     let _ = fs::remove_dir_all(&root);

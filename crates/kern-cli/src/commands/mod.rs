@@ -166,7 +166,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
     --no-uid-range      Use the single-uid map (an --image box maps a uid RANGE by default)
     --stop-signal <s>   Signal sent before the SIGKILL on stop (name or number; default SIGTERM)
-    --stop-timeout <n>  Seconds the workload gets to exit on its own before the SIGKILL (default 10)
+    --stop-timeout <n>  Seconds the workload gets to exit before the SIGKILL (default 10; skipped if its init has no handler for the signal)
     --timeout <n>       Auto-stop: SIGTERM at n seconds, SIGKILL 2 seconds later (so n+2 worst case)
     --restart-max <n>   How many times --restart retries before giving up (default 10)
     --ulimit <n=s[:h]>  Set a resource limit (e.g. nofile=1024:2048); rootless can only LOWER; repeatable
@@ -19016,7 +19016,7 @@ mod stop_does_not_wait_for_the_impossible {
             assert_eq!(
                 init_catches_signal(me, sig),
                 expected,
-                "il verdetto per il segnale {sig} non corrisponde a SigCgt di /proc"
+                "the verdict for signal {sig} must match SigCgt in /proc"
             );
         }
     }
