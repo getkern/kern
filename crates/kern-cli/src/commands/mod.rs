@@ -4283,6 +4283,25 @@ impl Teardown {
     }
 }
 
+/// How long `stop` may still wait on one box: the time LEFT until the deadline the whole stack
+/// shares, in MILLISECONDS.
+///
+/// Milliseconds, not seconds. The signal went out in phase 1, so every box counts down against the
+/// same deadline and the stack converges instead of queueing - but rounding that remainder down to a
+/// whole second silently spent up to 999 ms of a grace the caller asked for. MEASURED before the fix:
+/// `--stop-timeout 3` gave a 2.5 s flush only 2019 ms and SIGKILLed it mid-write, where Docker's
+/// `stop -t 3` let the same workload finish in 2799 ms and exit 5.
+///
+/// `has_grace` boxes whose deadline has ALREADY passed keep one more second on the graceful path
+/// rather than dropping to the SIGKILL: the deadline is there to bound a stack, not to punish the
+/// box that happens to be last in the loop. A box configured with no grace at all still gets zero.
+fn remaining_grace_ms(left: std::time::Duration, has_grace: bool) -> u64 {
+    let floor = if has_grace { 1000 } else { 0 };
+    u64::try_from(left.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(floor)
+}
+
 fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_ms: u64) -> Teardown {
     // The init may ALREADY be gone: `stop` signals the supervisor's process group before it reaches
     // here, and a box init that sits in that group takes that signal too, so it can be an unreaped
@@ -13670,19 +13689,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                 } else {
                     libc::SIGTERM
                 },
-                // MILLISECONDS left until the shared deadline, not this box's full grace: the
-                // signal already went out in phase 1, so the stack converges instead of queueing.
-                // Truncating this to whole seconds silently spent up to 999 ms of the caller's
-                // grace - see `kill_box_graceful`. The floor keeps a box whose deadline has already
-                // passed on the graceful path for one more second rather than skipping straight to
-                // the SIGKILL, which is what the shared deadline is for.
-                u64::try_from(
-                    stop_deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .as_millis(),
-                )
-                .unwrap_or(u64::MAX)
-                .max(if b.stop_grace > 0 { 1000 } else { 0 }),
+                remaining_grace_ms(
+                    stop_deadline.saturating_duration_since(std::time::Instant::now()),
+                    b.stop_grace > 0,
+                ),
             )
         };
         // A `stop` signals the supervisor's group, so the supervisor never records its own exit code.
@@ -17788,6 +17798,33 @@ mod image_rm_tests {
                 "the zombie's recorded status must decode to the code the child really exited with"
             );
         }
+    }
+
+    /// The grace a box is left with, as an arithmetic fact rather than a race between two timers.
+    ///
+    /// The end-to-end version of this - a workload flushing for 1.5 s under a 2 s timeout - proves
+    /// the number reaches the poll, but it can only ever have a sub-second margin, because a
+    /// sub-second truncation is only visible to a flush that falls between `floor(T)` and `T`. On
+    /// WSL2 that margin is gone: the same 1.5 s flush MEASURED 1723 ms there, and a 0.5 s one 1007 ms,
+    /// so the platform's own overhead eats it. This test is the invariant; that one is the wiring.
+    #[test]
+    fn remaining_grace_keeps_the_milliseconds_it_was_given() {
+        use std::time::Duration;
+        // The defect: 2999 ms left used to be spent as 2000.
+        assert_eq!(
+            remaining_grace_ms(Duration::from_millis(2999), true),
+            2999,
+            "a remainder must not be rounded down to a whole second"
+        );
+        assert_eq!(remaining_grace_ms(Duration::from_millis(1), true), 1000);
+        assert_eq!(remaining_grace_ms(Duration::from_millis(1500), true), 1500);
+        // Deadline already passed: a box that wants a grace keeps the one-second floor...
+        assert_eq!(remaining_grace_ms(Duration::ZERO, true), 1000);
+        // ...and one configured without a grace still goes straight to the SIGKILL.
+        assert_eq!(remaining_grace_ms(Duration::ZERO, false), 0);
+        assert_eq!(remaining_grace_ms(Duration::from_millis(900), false), 900);
+        // A degenerate deadline saturates instead of wrapping into a short wait.
+        assert_eq!(remaining_grace_ms(Duration::MAX, true), u64::MAX);
     }
 
     /// The mapping from a teardown to the recorded code: only a status we actually READ is reported

@@ -722,13 +722,15 @@ fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
 /// seconds: `--stop-timeout 3` gave a workload 2 s. Measured before the fix at 2019 ms and a SIGKILL
 /// mid-flush, where Docker's `stop -t 3` let the same workload finish in 2799 ms and exit 5.
 ///
-/// The workload flushes for 1.5 s under a 2 s timeout: half a second inside what was asked for, and
-/// half a second outside the 1 s the truncation left - the widest margin this defect allows, since a
-/// sub-second error can only be caught by a flush that falls between `floor(T)` and `T`.
+/// The workload's handler never returns, so `stop` is forced to spend the WHOLE grace and the
+/// measurement is the grace itself: ~3 s fixed against ~2 s truncated. That shape is one-sided under
+/// load - a busy machine can only make the wait LONGER, never shorter - which the obvious test (a
+/// timed flush that must finish inside the grace) is not: there, load inflates the workload and
+/// reports a defect that is really the platform. MEASURED under WSL2, a 1.5 s flush takes 1723 ms
+/// and a 0.5 s one 1007 ms, which is exactly how much margin that shape has to give away.
 ///
-/// The recorded code is the whole discriminant: 5 means the workload reached its own `exit`, and a
-/// grace that ended early could only have produced 137. A wall-clock assertion on top of that would
-/// add nothing but flakiness - it fired once here while the machine was busy compiling.
+/// The arithmetic itself is `remaining_grace_keeps_the_milliseconds_it_was_given`; this is the
+/// wiring, that the millisecond value actually reaches the poll.
 #[test]
 fn stop_grace_is_not_rounded_down_to_whole_seconds() {
     let Some(busybox) = static_busybox() else {
@@ -753,12 +755,12 @@ fn stop_grace_is_not_rounded_down_to_whole_seconds() {
             rootfs,
             "-d",
             "--stop-timeout",
-            "2",
+            "3",
             "--",
             "/bin/busybox",
             "sh",
             "-c",
-            "trap 'sleep 1.5; exit 5' TERM; while :; do sleep 0.2; done",
+            "trap 'sleep 60' TERM; while :; do sleep 0.2; done",
         ])
         .output()
         .expect("run kern");
@@ -773,17 +775,27 @@ fn stop_grace_is_not_rounded_down_to_whole_seconds() {
     }
     // Let the trap be installed before the signal arrives.
     std::thread::sleep(std::time::Duration::from_millis(700));
+    let started = std::time::Instant::now();
     let stop = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
         .args(["stop", "graceflush"])
         .output()
         .expect("run kern");
+    let waited = started.elapsed();
     assert!(
         stop.status.success(),
         "stop should succeed: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
+    // Truncated, this returns at ~2 s. The bound sits between the two, far enough from the fixed
+    // value that only a regression - not a slow machine - can reach it.
+    assert!(
+        waited >= std::time::Duration::from_millis(2600),
+        "a 3 s grace must be spent as 3 s, not floored to 2: stop returned after {} ms",
+        waited.as_millis()
+    );
 
+    // And the handler that never returned really was SIGKILLed at the end of it.
     let mut got = None;
     let mut last = String::new();
     for _ in 0..40 {
@@ -809,8 +821,8 @@ fn stop_grace_is_not_rounded_down_to_whole_seconds() {
     }
     assert_eq!(
         got,
-        Some(5),
-        "a 1.5 s flush must finish inside a 2 s grace; ps -a said {last}"
+        Some(137),
+        "a handler that never returns is SIGKILLed at the end of the grace; ps -a said {last}"
     );
 
     let _ = fs::remove_dir_all(&root);
