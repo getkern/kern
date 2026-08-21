@@ -15,6 +15,18 @@ state of the tree; full detail is in the git history.
 
 ### Security
 
+- **`--landlock-rw` is now fail-closed** (behaviour change, and the only one to a flag's meaning in
+  this release). On a kernel without the Landlock LSM it used to warn and start the box with no path
+  allowlist; it now refuses to start. kern already had an enforce-or-do-not-run family
+  (`--require-limits` for cgroup caps, `--apparmor` for the LSM profile) and this was the one member
+  that degraded, so the same script confined writes on a laptop and confined nothing on a board. The
+  refusal names the flag, both reasons the LSM can be absent (not built in, or switched off with
+  `lsm=`), and the way out. **Boxes that do not pass the flag are unaffected.** The cost is deliberate:
+  a script that hard-codes `--landlock-rw` across a mixed fleet now fails on the boards rather than
+  running unconfined there, and `kern doctor` reports the ABI so it can be gated. Verified on a
+  Raspberry Pi 5 whose only LSM is `capability` (refused, message names the flag; without the flag the
+  box starts) and on a Landlock ABI v8 host (write inside the allowlist succeeds, write outside is
+  denied).
 - The default seccomp filter is now a deny-by-default **allowlist** (moby's own default filter minus
   kern's 35 escape syscalls), not the wider denylist: a syscall outside the vetted set returns
   `ENOSYS`, and the escape vectors still hard-kill (`mount`/`unshare`/a namespace-flagged `clone`
