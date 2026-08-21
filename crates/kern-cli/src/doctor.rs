@@ -716,10 +716,15 @@ fn landlock() -> R {
         Some(v) => R::Ok(format!(
             "Landlock: ABI v{v} (--landlock-rw enforces a write allowlist)"
         )),
+        // The wording tracks the runtime, which is FAIL-CLOSED: a box that passes `--landlock-rw`
+        // here is REFUSED, not run unconfined. Saying "accepted" would put doctor and the box on
+        // opposite sides of the same question, which is the defect class this project keeps paying
+        // for: a message that describes behaviour the code no longer has.
         None => R::Warn(
-            "Landlock: absent - --landlock-rw is accepted but CANNOT confine writes here".into(),
-            "the box still gets namespaces + seccomp; a kernel with CONFIG_SECURITY_LANDLOCK=y \
-             (and `lsm=...,landlock` if your distro gates it) is needed for the path allowlist"
+            "Landlock: absent - --landlock-rw REFUSES to start a box here (fail-closed)".into(),
+            "boxes WITHOUT that flag are unaffected and still get namespaces + seccomp + cgroups; \
+             for the path allowlist you need a kernel with CONFIG_SECURITY_LANDLOCK=y (and \
+             `lsm=...,landlock` if your distro gates it)"
                 .into(),
         ),
     }

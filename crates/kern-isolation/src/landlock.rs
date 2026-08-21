@@ -181,9 +181,13 @@ fn add_path(ruleset_fd: i32, path: &str, access: u64) -> Result<(), Error> {
 
 /// Apply a Landlock write-allowlist to the current thread (and, via `execve`, the workload): the box
 /// root is read+exec, and full access is granted only under `rw` (plus the box scratch dirs). Returns
-/// `Ok(true)` when enforced, `Ok(false)` when Landlock is unavailable (degrade to namespaces+seccomp),
-/// and `Err` on a real failure to build/enforce a ruleset that WAS available (fail closed: never run a
-/// box that asked for Landlock but silently got none because of a mid-setup error).
+/// `Ok(true)` when enforced, `Ok(false)` when Landlock is unavailable on this kernel, and `Err` on a
+/// real failure to build or enforce a ruleset that WAS available.
+///
+/// This function reports; it does not decide. Both `Ok(false)` and `Err` are refusals at the call site
+/// in `real.rs` (a box that asked to be confined does not run unconfined), and the distinction is kept
+/// here because the two need different messages: one names a missing LSM the operator can check with
+/// `kern doctor`, the other names the syscall that failed.
 pub fn apply_rw_allowlist(rw: &[String]) -> Result<bool, Error> {
     let Some(abi) = abi_version() else {
         return Ok(false);

@@ -132,8 +132,10 @@ privilege-escalation bug is an escape.
 - **Landlock write-allowlist** (`--landlock-rw <path>`, opt-in, needs Linux 5.13+): a kernel LSM
   confines the box's writes to the named paths while the root stays read+exec, with symlinks opened
   `O_NOFOLLOW`. **A real boundary**, verified: a box with `--landlock-rw /tmp` writes `/tmp` and is
-  denied `/etc` and `/root`. Where the kernel lacks it, the box still runs with the namespace,
-  seccomp and cgroup boundary.
+  denied `/etc` and `/root`. **Fail-closed**: where the kernel lacks Landlock, a box that passes the
+  flag is refused rather than run unconfined (verified on a Raspberry Pi 5, whose only LSM is
+  `capability`), so the flag cannot silently mean less on one host than on another. A box that does
+  not pass it is unaffected and keeps the namespace, seccomp and cgroup boundary.
 - **Egress allowlist** (`--egress-allow`, opt-in, foreground): the box reaches the internet only
   through a kern-run filtering proxy. **SSRF-guarded**: a domain resolving to any non-public address
   is refused at connect time even if allow-listed. Honest residual: a domain sharing a CDN IP and SNI

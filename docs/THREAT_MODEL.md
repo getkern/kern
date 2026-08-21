@@ -62,7 +62,7 @@ box's network.
 | Fresh-fd hygiene | inherited descriptors shed before exec (CVE-2016-9962 class) | an SDK or CI fd cannot pass into the workload |
 | Untrusted-image extraction | a tar-flavour-independent vetter (path/symlink/hardlink/whiteout/desync/bomb) + isolated staging + no-follow merge; every blob and every pinned manifest is sha256-verified before use | the cross-layer and host-inode escape classes are closed structurally, not by trusting `tar` |
 | Registry integrity | TLS-pinned on every hop and redirect; realm pinning (CVE-2020-15157 class); credentials off argv | a hostile registry cannot downgrade the transport or steal the token |
-| Optional LSM / write confinement | `--apparmor <profile>` (onexec, fail-closed) and `--landlock-rw` (opt-in, verified) | layered over namespaces + seccomp when requested; absent by default |
+| Optional LSM / write confinement | `--apparmor <profile>` (onexec, fail-closed) and `--landlock-rw` (opt-in, fail-closed: no Landlock on this kernel refuses the box rather than running it unconfined) | layered over namespaces + seccomp when requested; absent by default |
 | Resource caps **where the controller is delegated** | cgroup v2 `memory.max` / `pids.max`, read back to confirm | REAL on a delegating host; see the governor row for the rest |
 
 ### COOPERATIVE - shapes an honest workload, not a boundary

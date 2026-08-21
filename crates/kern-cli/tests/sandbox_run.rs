@@ -4287,3 +4287,81 @@ fn box_fleet_cap_admits_exactly_n_refuses_the_rest() {
         "KERN_MAX_CONCURRENT={n} must admit exactly {n} live boxes, got {admitted}"
     );
 }
+
+/// `--landlock-rw` means the same thing on every host: either the kernel enforces the write allowlist,
+/// or the box does not start. It is the third member of kern's "enforce or do not run" family
+/// (`--require-limits` for cgroup caps, `--apparmor` for the LSM profile) and used to be the only one
+/// that degraded silently, handing an operator who wrote it into a script an unconfined box on exactly
+/// the hosts whose kernel they were least sure of.
+///
+/// Both halves of that contract are asserted, and which half runs is decided by the host rather than
+/// assumed, so the test is meaningful on a kernel with Landlock AND on one without:
+///   * Landlock present  -> a write OUTSIDE the allowlist is denied while one INSIDE it succeeds. The
+///     inside-write is the positive control: without it, a box that failed to start for an unrelated
+///     reason would look exactly like a box that enforced the rule.
+///   * Landlock absent   -> the box is REFUSED, and the message names the flag rather than failing with
+///     something generic the operator has to guess at.
+#[test]
+fn landlock_rw_enforces_the_allowlist_or_refuses_the_box() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "landlock");
+    // Two sibling dirs INSIDE the box root: one named in the allowlist, one deliberately not.
+    fs::create_dir_all(root.join("allowed")).unwrap();
+    fs::create_dir_all(root.join("denied")).unwrap();
+    let rootfs = root.to_str().unwrap();
+
+    let script = "/bin/busybox touch /allowed/in 2>/dev/null && echo IN-OK; \
+                  /bin/busybox touch /denied/out 2>/dev/null && echo OUT-WROTE";
+    let out = kern_out(&[
+        "box",
+        "landlock",
+        "--rootfs",
+        rootfs,
+        "--landlock-rw",
+        "/allowed",
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        script,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+        .args(["rm", "-f", "landlock"])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+
+    // Ask the same question kern asks, so the expectation is derived from the host, never guessed.
+    let landlock_here = kern_isolation::landlock_abi().is_some();
+    if landlock_here {
+        assert!(
+            stdout.contains("IN-OK"),
+            "positive control: a write INSIDE the allowlist must succeed, so a denial elsewhere is \
+             the rule and not a box that never ran. stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("OUT-WROTE"),
+            "a write OUTSIDE the --landlock-rw allowlist must be denied by the LSM. \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+    } else {
+        assert!(
+            !out.status.success(),
+            "with no Landlock on this kernel the box must be REFUSED, not run unconfined. \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("--landlock-rw"),
+            "the refusal must name the flag that caused it, so the operator is not left guessing. \
+             stderr={stderr:?}"
+        );
+    }
+}

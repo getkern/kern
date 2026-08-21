@@ -87,7 +87,9 @@ pub struct SandboxSpec {
     /// `--landlock-rw <path>` (repeatable): apply a Landlock (LSM) write-allowlist. When non-empty the
     /// box root is read+exec only and writes are permitted ONLY under these paths (plus the box scratch
     /// dirs), enforced by the kernel and unliftable by the workload. Empty = no Landlock (namespaces +
-    /// seccomp only). Best-effort: a kernel without Landlock degrades to a no-op with a warning.
+    /// seccomp only). FAIL-CLOSED when non-empty: a kernel without Landlock, or a ruleset that cannot
+    /// be built or enforced, REFUSES the box rather than degrading to a no-op, so the flag means the
+    /// same thing on every host. Leave it empty to run without the LSM.
     pub landlock_rw: Vec<String>,
     /// `--apparmor <profile>`: a pre-loaded AppArmor (LSM) profile the box enters on the coming exec
     /// (Docker's `--security-opt apparmor=`), layering kernel-enforced file/capability confinement over
@@ -983,15 +985,30 @@ fn child_setup_and_exec(
     // Landlock (LSM) write-allowlist, applied BEFORE seccomp (whose filter would otherwise block the
     // `landlock_*` syscalls). Defense-in-depth over the mount namespace: the box root is read+exec and
     // writes are confined to `--landlock-rw` paths + the box scratch dirs, enforced by the kernel and
-    // unliftable by the workload. Best-effort on a kernel without Landlock (warn, keep namespaces +
-    // seccomp); fail CLOSED on a real ruleset error so a box that asked for it never runs unprotected.
+    // unliftable by the workload.
+    //
+    // FAIL-CLOSED, on BOTH failure shapes. A ruleset that could not be built or enforced was always
+    // fatal; a kernel with no Landlock at all used to warn and run the box unconfined, which made this
+    // the only "enforce or do not run" flag in the CLI that did not. `--require-limits` refuses when the
+    // cgroup caps cannot bind and `--apparmor` refuses when the profile cannot be entered; a flag whose
+    // entire purpose is to confine writes must refuse for the same reason, or an operator who wrote it
+    // into a script gets a box that silently has no path allowlist on exactly the hosts where they were
+    // least sure of the kernel. The cost is stated and deliberate: a script that passes this flag and
+    // runs on a board without `CONFIG_SECURITY_LANDLOCK` now fails instead of degrading, so the operator
+    // decides (drop the flag, or gate it on `kern doctor`) rather than kern deciding for them.
     if !spec.landlock_rw.is_empty() {
         match crate::landlock::apply_rw_allowlist(&spec.landlock_rw) {
             Ok(true) => {}
-            Ok(false) => eprintln!(
-                "kern: warning: --landlock-rw requested but this kernel has no Landlock; the box runs \
-                 with namespaces + seccomp only (no path write-allowlist)"
-            ),
+            Ok(false) => {
+                return Err(Error::Unsupported(
+                    "--landlock-rw was requested but this kernel has no Landlock (not built in, or \
+                     switched off at boot with `lsm=`), so the path write-allowlist cannot be \
+                     enforced: refusing to start rather than running a box that asked to be confined \
+                     and would not be. `kern doctor` reports the Landlock ABI on this host. Drop \
+                     --landlock-rw to run with namespaces, seccomp and cgroups, which is the default \
+                     posture and does not depend on this LSM.",
+                ))
+            }
             Err(e) => return Err(e),
         }
         t.mark("landlock");

@@ -44,10 +44,16 @@ the box must be reaped, not left running unmediated. Scoped to the eleven `ENOSY
 kernel >= 5.9 with a fall-back to today's `ENOSYS` filter on older edge kernels, it is a designed
 post-v0.7 path, not a pre-tag add.
 
-## Landlock is gated on the kernel ABI
+## Landlock is gated on the kernel, and the flag is fail-closed
 
-`--landlock-rw` needs Landlock ABI 2+. On an older kernel kern says so and continues without it
-rather than pretending the restriction is in place. None of the three ARM boards tested ships it.
+`--landlock-rw` needs the Landlock LSM. Where the kernel does not have it, a box that passes the flag
+is REFUSED rather than run unconfined, so the flag means the same thing on every host and joins
+`--require-limits` and `--apparmor` in the enforce-or-do-not-run family. Boxes that do not pass it are
+unaffected. The open part is availability, not behaviour: measured absent on all three ARM boards
+(Raspberry Pi OS 6.6 reports `capability` as its only LSM, Jetson 5.15-tegra, Arduino UNO Q 6.16), so
+on the edge hardware kern is aimed at, a script that hard-codes the flag will not run until the kernel
+ships `CONFIG_SECURITY_LANDLOCK=y`. `kern doctor` reports the ABI, and gating on it is the way to keep
+one script working across a mixed fleet.
 
 ## `--ssh` needs `newuidmap`, and a fresh board does not ship it
 
