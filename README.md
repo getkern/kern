@@ -16,13 +16,14 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](docs/INSTALL.md)
 
+</div>
+
 ```sh
-# Linux · WSL2 · ARM boards (Raspberry Pi, Jetson). No native Windows. Needs a Rust toolchain.
 cargo install --git https://github.com/getkern/kern getkern --locked
 kern box dev --image alpine -it -- sh
 ```
 
-</div>
+<sub>Built from source: no published binaries yet, and it needs a Rust toolchain. No native Windows, use WSL2. [Install](#install).</sub>
 
 ---
 
