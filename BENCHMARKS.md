@@ -309,8 +309,14 @@ machine, same images, real commands, timed with the shell.
 | stop nginx (the same image on all three) | **48.5 ms** | 187.2 ms | 256.9 ms |
 | bring a 2-service stack up | **188 ms** | 292 ms | 1022 ms |
 | stop that stack | **77 ms** | 263 ms | 496 ms |
+| take it down (stop + remove) | **68.8 ms** | 402.3 ms | 515.5 ms |
 
 Reproduce any row with `time`, on both sides. No script of ours is involved.
+
+The `take it down` row is `compose down` on a RUNNING stack, so it includes stopping both services;
+run against an already-stopped one it is 9 ms on kern, which is the removal alone and not a fair
+column. Podman's compose cells need `podman.socket` enabled - without it `podman compose` fails
+without starting anything and "measures" 28.7 ms, which is what a cell reads when nothing ran.
 
 **The stop rows need two caveats, and both cut against the headline.**
 
