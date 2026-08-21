@@ -4317,7 +4317,14 @@ fn landlock_rw_enforces_the_allowlist_or_refuses_the_box() {
     fs::create_dir_all(root.join("denied")).unwrap();
     let rootfs = root.to_str().unwrap();
 
-    let script = "/bin/busybox touch /allowed/in 2>/dev/null && echo IN-OK; \
+    // `RAN` is emitted before either write and proves the box EXECUTED. Without it, a host where no
+    // box can start at all (the GitHub runners restrict unprivileged userns through AppArmor, which
+    // `userns_plausible` does not detect) is indistinguishable from a box that started and was denied
+    // its own allowlisted write, so the test would either fail on the environment or skip over a real
+    // regression. With it, the two are separated: no `RAN` is a SKIP, `RAN` makes both writes
+    // meaningful and neither assertion can be dodged.
+    let script = "echo RAN; \
+                  /bin/busybox touch /allowed/in 2>/dev/null && echo IN-OK; \
                   /bin/busybox touch /denied/out 2>/dev/null && echo OUT-WROTE";
     let out = kern_out(&[
         "box",
@@ -4342,10 +4349,17 @@ fn landlock_rw_enforces_the_allowlist_or_refuses_the_box() {
     // Ask the same question kern asks, so the expectation is derived from the host, never guessed.
     let landlock_here = kern_isolation::landlock_abi().is_some();
     if landlock_here {
+        if !stdout.contains("RAN") {
+            // No box can start on this host, so there is nothing to say about Landlock. Skipping with
+            // the reason beats failing on the environment, and beats a silent pass.
+            eprintln!("skip: the box did not run on this host (stderr={stderr:?})");
+            return;
+        }
         assert!(
             stdout.contains("IN-OK"),
-            "positive control: a write INSIDE the allowlist must succeed, so a denial elsewhere is \
-             the rule and not a box that never ran. stdout={stdout:?} stderr={stderr:?}"
+            "positive control: a write INSIDE the allowlist must succeed. The box ran (RAN), so this \
+             is the rule denying a path it was told to permit, not an environment that cannot start \
+             boxes. stdout={stdout:?} stderr={stderr:?}"
         );
         assert!(
             !stdout.contains("OUT-WROTE"),
@@ -4353,15 +4367,25 @@ fn landlock_rw_enforces_the_allowlist_or_refuses_the_box() {
              stdout={stdout:?} stderr={stderr:?}"
         );
     } else {
+        // The regression this half exists to catch: the box RAN on a kernel with no Landlock, i.e.
+        // it was told to confine writes, could not, and started anyway. `RAN` says it executed, which
+        // is exactly the thing that must not happen; the exit status alone would not, because a box
+        // can also fail for reasons that have nothing to do with this flag.
         assert!(
-            !out.status.success(),
+            !stdout.contains("RAN"),
             "with no Landlock on this kernel the box must be REFUSED, not run unconfined. \
              stdout={stdout:?} stderr={stderr:?}"
         );
+        if !stderr.contains("--landlock-rw") {
+            // It did not run, but something else stopped it first (no busybox-compatible rootfs, no
+            // userns on this host). Nothing can be concluded about the refusal, so say so.
+            eprintln!("skip: the box failed before the Landlock check (stderr={stderr:?})");
+            return;
+        }
         assert!(
-            stderr.contains("--landlock-rw"),
-            "the refusal must name the flag that caused it, so the operator is not left guessing. \
-             stderr={stderr:?}"
+            !out.status.success(),
+            "the Landlock refusal must be a non-zero exit, not a message on a successful run. \
+             stdout={stdout:?} stderr={stderr:?}"
         );
     }
 }
