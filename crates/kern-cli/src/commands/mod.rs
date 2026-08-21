@@ -13552,7 +13552,7 @@ fn ref_matches(
 pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     let dir = registry::dir().map_err(|e| Error::Sandbox(format!("registry: {e}")))?;
     let running = registry::list();
-    let targets: Vec<_> = if all {
+    let mut targets: Vec<_> = if all {
         running.clone()
     } else {
         boxes_matching_refs(running.clone(), names)
@@ -13606,6 +13606,15 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     // `kern top` (which reuses this fn with stderr muted) can show the reason. Same rule and shape as
     // `pause`, kept identical so the partial-failure convention is not re-derived per command.
     let mut failures: Vec<String> = Vec::new();
+    // Wait on the SHORTEST grace first. Phase 1 signals every box at once, so this reorders no
+    // shutdown - what it reorders is which confirmation kern waits for first, and that is what
+    // decides when each box is SIGKILLed. The loop is sequential, so a member whose turn comes after
+    // a longer-lived one has already spent its own grace and is killed at once: MEASURED on a
+    // four-service stack asking 1, 2, 4 and 6 s, all hanging in their handler, the 1 s service was
+    // killed at 6201 ms and the 4 s one at 6201. Ascending, each waits only the difference from the
+    // one before it, so every member is killed on its own grace and the stack still finishes in
+    // max(grace). `sort_by_key` is stable, so boxes asking the same grace keep the caller's order.
+    targets.sort_by_key(|b| b.stop_grace);
     // PHASE 1: send every box its stop signal BEFORE waiting on any of them, and share ONE deadline.
     // Stopping serially made each box burn its own full grace in turn, so an N-service stack of
     // workloads that ignore SIGTERM took N x grace (measured: 20 s for two `sh -c sleep` services).

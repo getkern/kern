@@ -78,8 +78,14 @@ state of the tree; full detail is in the git history.
   4008 ms, which is max(grace) - the convergence the shared deadline existed for, without overriding
   what each service asked for. The bound stays one-sided by design: a member is never killed BEFORE
   its own grace, and can be killed later if a longer-grace member is torn down first, because the
-  loop is sequential. Found by an external stress run of a mixed compose stack, in its own numbers:
-  a service measured at 2005 ms alone took 3010 ms inside the stack.
+  loop is sequential - and `stop` now waits on the SHORTEST grace first, which makes that loop
+  optimal: each member waits only the difference from the one before it. MEASURED on a four-service
+  stack asking 1, 2, 4 and 6 s, all hanging in their handler: before, the 1 s service was killed at
+  6201 ms and the 4 s one at 6201; after, they die at 1195, 2196, 4200 and 6196, each on its own
+  second, with the stack still finishing in 6008 ms. Reordering the waits reorders no shutdown -
+  phase 1 signals every box at once - only which confirmation kern waits for first. Found by an
+  external stress run of a mixed compose stack, in its own numbers: a service measured at 2005 ms
+  alone took 3010 ms inside the stack.
 - **Four lines of help and docs that no longer matched the code.** Found by re-reading the text
   against measured behaviour rather than against itself. `kern wait`'s help still said "Wait for
   RUNNING box(es)" after it learned to answer for one that already exited. `prune`'s said it removes

@@ -863,6 +863,126 @@ fn stop_grace_is_not_rounded_down_to_whole_seconds() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// A member's own `--stop-timeout` is when IT is killed, not when the longest-lived member of the
+/// same teardown is. Phase 1 signals every box at once and the loop then waits on them one at a time,
+/// so a box whose turn comes after a longer-lived one has already spent its grace and dies with it -
+/// MEASURED on a four-service stack asking 1, 2, 4 and 6 s, all hanging in their handler: the 1 s
+/// service was killed at 6201 ms, six times what it asked for, and the 4 s one at 6201 as well.
+/// Waiting on the SHORTEST grace first makes the sequential loop optimal: each member waits only the
+/// difference from the one before it, so all four now die on their own second (1195, 2196, 4200,
+/// 6196) and the stack still finishes in max(grace).
+///
+/// Both boxes hang in their handler, so neither can exit early and the only thing under test is when
+/// kern gives up on each. The bound is generous in both directions - the short box is expected at
+/// ~1.2 s and the regression puts it at ~5.2 s - so a loaded machine cannot reach it.
+#[test]
+fn a_short_stop_timeout_is_not_held_to_a_longer_one_in_the_same_teardown() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "gracemix");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-gracemix-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let hang = "trap 'sleep 60' TERM; while :; do sleep 0.2; done";
+
+    // (name, its own grace in seconds)
+    let mut started = Vec::new();
+    for (name, grace) in [("gracelong", "5"), ("graceshort", "1")] {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                rootfs,
+                "-d",
+                "--stop-timeout",
+                grace,
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                hang,
+            ])
+            .output()
+            .expect("run kern");
+        if !out.status.success() {
+            eprintln!(
+                "skip: detached box did not start here: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let _ = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["stop", "--all"])
+                .output();
+            let _ = fs::remove_dir_all(&root);
+            drop_runtime_dir_if_ours(&xdg);
+            return;
+        }
+        started.push(name);
+    }
+    // The short box's PID-namespace init: watching /proc for it is how we see WHEN kern gave up on
+    // that box specifically, which a wall-clock on the whole `stop` cannot show.
+    let inspect = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["inspect", "graceshort", "--json"])
+        .output()
+        .expect("run kern");
+    let pid1: Option<i32> = String::from_utf8_lossy(&inspect.stdout)
+        .split("\"pid1\":")
+        .nth(1)
+        .and_then(|t| {
+            t.split(|c: char| !c.is_ascii_digit())
+                .find(|x| !x.is_empty())
+                .and_then(|x| x.parse().ok())
+        });
+    let Some(pid1) = pid1.filter(|p| *p > 0) else {
+        eprintln!("skip: could not read the short box's pid1");
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", "--all"])
+            .output();
+        let _ = fs::remove_dir_all(&root);
+        drop_runtime_dir_if_ours(&xdg);
+        return;
+    };
+    // Let both shells install their handler before the signal arrives.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    let started_at = std::time::Instant::now();
+    let mut stop = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "gracelong", "graceshort"])
+        .spawn()
+        .expect("spawn kern stop");
+    let mut short_died = None;
+    while started_at.elapsed() < std::time::Duration::from_secs(10) {
+        if !Path::new(&format!("/proc/{pid1}")).exists() {
+            short_died = Some(started_at.elapsed());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = stop.wait();
+
+    let died = short_died.expect("the 1 s box must be gone well inside the 5 s one's grace");
+    assert!(
+        died < std::time::Duration::from_millis(3000),
+        "a box asking 1 s must be killed on its own grace, not held to the 5 s one it was stopped \
+         with: it died {} ms in",
+        died.as_millis()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    drop_runtime_dir_if_ours(&xdg);
+}
+
 /// The other half of the grace contract, and the half that reads like a bug until you know the
 /// kernel rule: a grace the signal CANNOT end is skipped, not sat out.
 ///
