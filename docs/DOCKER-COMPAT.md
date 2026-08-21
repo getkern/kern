@@ -132,7 +132,7 @@ Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same
 | `exec` | `exec` | joins the box's namespaces |
 | `ps` | `ps` | `-a`/`--all` (also lists recently-exited boxes), `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
 | `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs) |
-| `stop` / `kill` | `stop` / `kill` | `stop` sends `--stop-signal` (SIGTERM), waits `--stop-timeout` (10 s) for the workload to flush and exit, then SIGKILLs what is left; `kill` skips the wait. A grace that provably cannot end is skipped, not sat out: an init with no handler for the signal is one the kernel would discard it for |
+| `stop` / `kill` | `stop` / `kill` | `stop` sends `--stop-signal` (SIGTERM), waits `--stop-timeout` (10 s) for the workload to flush and exit, then SIGKILLs what is left. `kill` is an ALIAS of it, not Docker's immediate kill: MEASURED at 3019 ms against stop's 3013 on the same three-second grace, so a script that reaches for `kill` to skip the wait wants `--stop-timeout 0`. A grace that provably cannot end is skipped, not sat out: an init with no handler for the signal is one the kernel would discard it for |
 | `pause` / `unpause` | `pause` / `unpause` | cgroup v2 freezer |
 | `attach` | `attach` | Ctrl-C detaches, box keeps running |
 | `cp` | `cp` | host↔box, symlinks can't escape the box root |

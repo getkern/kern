@@ -69,6 +69,15 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- **Four lines of help and docs that no longer matched the code.** Found by re-reading the text
+  against measured behaviour rather than against itself. `kern wait`'s help still said "Wait for
+  RUNNING box(es)" after it learned to answer for one that already exited. `prune`'s said it removes
+  "logs/health" while it also drops the exit record `wait` and `ps -a` read - which is the very thing
+  that makes `wait` fail right after a `prune`, and that failure then blamed the one-hour window:
+  measured, the box had exited two seconds earlier. And docs/DOCKER-COMPAT.md claimed `kill` "skips
+  the wait": MEASURED at 3019 ms against `stop`'s 3013 on the same three-second grace, so it is a
+  plain alias and a script that wants Docker's immediate kill wants `--stop-timeout 0`. That last one
+  was written in this same release and was wrong when written.
 - **`--stop-timeout`'s help says when the grace is skipped.** The flag read "Seconds the workload
   gets to exit on its own before the SIGKILL (default 10)", which promises a wait kern deliberately
   does not take when the box's init has no handler for the signal: a namespace PID 1 DISCARDS a

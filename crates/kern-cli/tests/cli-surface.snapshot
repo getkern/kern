@@ -37,10 +37,10 @@ COMMANDS:
     kill <name>... | killall                                       Stop box(es) (alias of stop)
     rename <old> <new>                                             Give a running box a new name
     update <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
-    wait <box>...                                                  Wait for running box(es) to exit; print exit code
+    wait <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
     diff <box> [--json]                                            List filesystem changes vs the image (C/D)
     events                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
-    prune                                                          Remove stopped-box sidecar files (logs/health)
+    prune                                                          Remove a stopped box's leftovers: logs, health, and the recorded exit code
     gc [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
     recover                                                        Reclaim orphaned scratch of dead boxes (also done by gc)
     history [-n N]                                                 Recently-run boxes

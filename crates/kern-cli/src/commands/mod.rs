@@ -79,10 +79,10 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
     {c}rename{z} <old> <new>                                             Give a running box a new name
     {c}update{z} <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
-    {c}wait{z} <box>...                                                  Wait for running box(es) to exit; print exit code
+    {c}wait{z} <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
     {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D)
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
-    {c}prune{z}                                                          Remove stopped-box sidecar files (logs/health)
+    {c}prune{z}                                                          Remove a stopped box's leftovers: logs, health, and the recorded exit code
     {c}gc{z} [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
     {c}recover{z}                                                        Reclaim orphaned scratch of dead boxes (also done by gc)
     {c}history{z} [-n N]                                                 Recently-run boxes
@@ -7637,7 +7637,7 @@ pub fn wait(names: &[String]) -> Result<(), Error> {
                 continue;
             }
             return Err(Error::NotRunning(format!(
-                "no running box named '{name}' and no exit record for one (kern keeps no stopped boxes; a box that exited over an hour ago is history)"
+                "no running box named '{name}' and no exit record for one (kern keeps no stopped boxes; the record is dropped by `prune`/`gc`, and an hour after the box exited)"
             )));
         };
         // Block on the EXACT (name,pid) pair leaving the registry, so a reused pid or name can't make
