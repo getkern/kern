@@ -65,6 +65,26 @@ subuid allocation, or use `kern exec`), but it cannot install the helper for you
 ssh CLIENT then prints (`kex_exchange_identification: Connection closed by remote host`) says nothing
 about uid maps. Installing `uidmap` was enough to make it work on a Pi 5.
 
+## An orphaned box is only recoverable on the direct cgroup path, not the systemd-scope one
+
+kern reaps a box whose supervisor was killed by remembering the box's own cgroup: `kern ps` then
+shows it `orphaned` and the next `kern stop` SIGKILLs that cgroup whole. The path recorded for this
+is deliberately narrow - only kern's own `kern-box-*` leaf, never a shared parent - so on the
+**rootless systemd-scope path**, where the box lives in a transient `run-*.scope` that systemd owns,
+nothing is recorded and the recovery does not happen.
+
+MEASURED on an Arduino UNO Q (aarch64, rootless, user systemd): SIGKILL the supervisor of a running
+box and it disappears from `kern ps` entirely while four of its processes keep running; `kern stop
+<name>` answers "no running box". On a host taking the direct path the same box stays visible and
+`kern stop` reports "reaped via cgroup.kill".
+
+Widening the recorded path is not a one-line change, and that is the reason it is written here rather
+than done: on that path the box's cgroup can be a scope kern did NOT create. `kern doctor` itself
+suggests `systemd-run --user --scope bash` to pay the scope cost once, and every box started in that
+shell shares the shell's scope - recording it would let a later reap `cgroup.kill` the user's own
+session. A correct fix records the scope kern created, by unit name, and refuses any other. Until
+then the leak is visible with `ps`, and `pkill -f` on the box command clears it.
+
 ## `pasta` refuses to start on WSL2
 
 A pod there comes up loopback-only, and kern reports why: `Couldn't open user namespace
