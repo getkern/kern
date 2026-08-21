@@ -592,6 +592,219 @@ fn box_ps_dash_a_shows_an_exited_box_with_its_exit_code() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// `kern stop` on a workload that traps the signal and exits cleanly must record THAT exit code, not
+/// the SIGKILL it never sent. The 137 was hardcoded when a stop was always a SIGKILL; the graceful
+/// phase arrived later and the constant did not follow it in, so every clean shutdown of a real
+/// service (nginx, redis, postgres - the ones that trap and flush) reported as killed.
+///
+/// The SIGTERM-IGNORING box is the discriminant: there 137 is the truth (kern really does SIGKILL an
+/// init the kernel would never deliver the signal to), so a fix that simply stopped writing 137 would
+/// fail this half. Both halves in one test, because only the pair distinguishes them.
+#[test]
+fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "stopcode");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-stopcode-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    // (box name, what its init does with SIGTERM, the code that must be recorded)
+    let cases = [
+        ("stopclean", "trap 'exit 7' TERM", 7),
+        ("stopign", "trap '' TERM", 137),
+    ];
+    let mut ran = false;
+    for (name, trap, want) in cases {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                rootfs,
+                "-d",
+                "--stop-timeout",
+                "3",
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                &format!("{trap}; while :; do sleep 0.2; done"),
+            ])
+            .output()
+            .expect("run kern");
+        if !out.status.success() {
+            eprintln!(
+                "skip: detached box did not start here: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            continue;
+        }
+        // Let the shell install its trap before the signal arrives: signalling first would test the
+        // startup race, not the shutdown contract.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let stop = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", name])
+            .output()
+            .expect("run kern");
+        assert!(
+            stop.status.success(),
+            "stop should succeed: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        ran = true;
+
+        let mut got = None;
+        let mut last = String::new();
+        for _ in 0..40 {
+            let all = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["ps", "-a", "--json"])
+                .output()
+                .expect("run kern");
+            let s = String::from_utf8_lossy(&all.stdout);
+            last = s.to_string();
+            if let Some(row) = s.split(name).nth(1) {
+                if let Some(code) = row.split("\"exit_code\":").nth(1) {
+                    got = code
+                        .split(|c: char| !c.is_ascii_digit() && c != '-')
+                        .find(|t| !t.is_empty())
+                        .and_then(|t| t.parse::<i32>().ok());
+                    if got.is_some() {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(
+            got,
+            Some(want),
+            "`kern stop` on a box whose init does `{trap}` must record exit {want}; ps -a said {last}"
+        );
+    }
+    if !ran {
+        eprintln!("skip: no box started in this environment");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
+/// The grace is what the caller asked for, not that minus up to a second. `stop` waits the time LEFT
+/// until a deadline shared by the whole stack, and that remainder used to be rounded DOWN to whole
+/// seconds: `--stop-timeout 3` gave a workload 2 s. Measured before the fix at 2019 ms and a SIGKILL
+/// mid-flush, where Docker's `stop -t 3` let the same workload finish in 2799 ms and exit 5.
+///
+/// The workload flushes for 1.2 s under a 2 s timeout: comfortably inside what was asked for, and
+/// comfortably outside the 1 s the truncation left. The recorded code is the discriminant - 5 means
+/// it finished, 137 means it was cut short.
+#[test]
+fn stop_grace_is_not_rounded_down_to_whole_seconds() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "grace");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-grace-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "graceflush",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--stop-timeout",
+            "2",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "trap 'sleep 1.2; exit 5' TERM; while :; do sleep 0.2; done",
+        ])
+        .output()
+        .expect("run kern");
+    if !out.status.success() {
+        eprintln!(
+            "skip: detached box did not start here: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    // Let the trap be installed before the signal arrives.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let started = std::time::Instant::now();
+    let stop = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "graceflush"])
+        .output()
+        .expect("run kern");
+    let waited = started.elapsed();
+    assert!(
+        stop.status.success(),
+        "stop should succeed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    let mut got = None;
+    let mut last = String::new();
+    for _ in 0..40 {
+        let all = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "-a", "--json"])
+            .output()
+            .expect("run kern");
+        let s = String::from_utf8_lossy(&all.stdout);
+        last = s.to_string();
+        if let Some(row) = s.split("graceflush").nth(1) {
+            if let Some(code) = row.split("\"exit_code\":").nth(1) {
+                got = code
+                    .split(|c: char| !c.is_ascii_digit() && c != '-')
+                    .find(|t| !t.is_empty())
+                    .and_then(|t| t.parse::<i32>().ok());
+                if got.is_some() {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        got,
+        Some(5),
+        "a 1.2 s flush must finish inside a 2 s grace (stop waited {} ms); ps -a said {last}",
+        waited.as_millis()
+    );
+    // And the wait really was the flush, not the whole grace: a `stop` that sat out the full 2 s
+    // would pass the assertion above for the wrong reason.
+    assert!(
+        waited < std::time::Duration::from_millis(1900),
+        "stop should return when the workload exits ({} ms), not at the end of the grace",
+        waited.as_millis()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
 #[test]
 fn inspect_shows_detail_then_prune_reclaims_logs() {
     let Some(busybox) = static_busybox() else {

@@ -4060,15 +4060,20 @@ unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
 /// reuse-proof: a `pidfd` polls readable precisely when its process terminates (even before it's
 /// reaped), which side-steps the zombie window a bare `kill(pid, 0)` probe would trip on.
 /// Docker's shutdown contract: send `stop_signal` first, give the workload
-/// `grace_secs` to exit on its own, then SIGKILL whatever is left.
+/// `grace_ms` to exit on its own, then SIGKILL whatever is left.
+///
+/// MILLISECONDS, not seconds. What reaches here is the time LEFT until a deadline shared by the
+/// whole stack, and rounding that down to a whole second threw away up to 999 ms of a grace the
+/// caller asked for: MEASURED, `--stop-timeout 3` gave a 2.5 s flush only 2019 ms and SIGKILLed it
+/// (Docker's `stop -t 3` let the same workload finish in 2799 ms and exit 5).
 ///
 /// This is not politeness. A hard SIGKILL means redis loses everything since its last save and
 /// postgres does crash recovery on the NEXT start, on every single `stop`. The graceful phase is what
-/// lets a stateful service flush and close. `grace_secs == 0` keeps the old behaviour (straight to
+/// lets a stateful service flush and close. `grace_ms == 0` keeps the old behaviour (straight to
 /// SIGKILL) for callers that want the box gone now.
 ///
 /// The wait is a bounded poll on the pidfd, so a workload that exits immediately costs one syscall,
-/// not the whole grace. A workload that IGNORES the signal costs exactly `grace_secs` and then dies:
+/// not the whole grace. A workload that IGNORES the signal costs exactly `grace_ms` and then dies:
 /// the kernel tears down the pid namespace with its PID 1, so nothing survives the SIGKILL.
 /// Can `sig` actually terminate this box's init, or would the grace period be a guaranteed wait for
 /// nothing?
@@ -4104,13 +4109,186 @@ fn init_catches_signal(pid1: i32, sig: i32) -> bool {
     mask & (1u64 << (sig - 1)) != 0
 }
 
-fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_secs: u64) -> bool {
+/// The `/proc/<pid>/stat` line, or `None` if the process is gone (or was never a pid).
+fn proc_stat(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+}
+
+/// A pid's single-letter run state (`R`, `S`, `T`, `Z`, ...), or `None` if it is gone.
+fn proc_state(pid: i32) -> Option<char> {
+    let stat = proc_stat(pid)?;
+    registry::stat_field(&stat, 3)?.chars().next()
+}
+
+/// A pid's parent, or `None` when it cannot be read (already reaped, or a process we may not look
+/// at).
+fn parent_of(pid: i32) -> Option<i32> {
+    let stat = proc_stat(pid)?;
+    registry::stat_field(&stat, 4)?.parse().ok()
+}
+
+/// The exit status of a **zombie we are not the parent of**, decoded the way `waitpid(2)` reports it.
+///
+/// `stop` needs the box init's real exit code and cannot `wait4` for it: that init's parent is the
+/// supervisor, not us. Field 52 of `/proc/<pid>/stat` (`exit_code`, since Linux 3.5) carries exactly
+/// the status `waitpid` would return, and it is populated for the whole zombie window - between the
+/// init's death and the supervisor reaping it.
+///
+/// The window is NARROW and it is a real race: the init's parent is woken by the same event our
+/// pidfd poll waits on, and reading this unguarded was right in 15 runs out of 20. `ReaperHold` is
+/// what makes the window ours; this function only reads what is there.
+///
+/// Anything unexpected - not a zombie yet, unreadable, a status that is neither an exit nor a
+/// signal - returns `None`, so the caller falls back instead of recording a guess.
+fn zombie_exit_code(pid: i32) -> Option<i32> {
+    let stat = proc_stat(pid)?;
+    if registry::stat_field(&stat, 3) != Some("Z") {
+        return None;
+    }
+    let status: i32 = registry::stat_field(&stat, 52)?.parse().ok()?;
+    if libc::WIFEXITED(status) {
+        Some(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        Some(128 + libc::WTERMSIG(status))
+    } else {
+        None
+    }
+}
+
+/// Hold the box init's REAPER still, so the init's exit status survives long enough to be read.
+///
+/// MEASURED: without this, `kern stop` on a workload that traps the signal and exits 7 recorded the
+/// real code in 15 runs out of 20 and fell back to 137 in the other 5. The init's parent is woken by
+/// the very event our pidfd poll waits on, and when it reaps first the status is gone from /proc
+/// before we can read it. A 75%-correct exit code is a worse contract than a consistently wrong one,
+/// so the race is removed rather than won: SIGSTOP cannot be caught, and a stopped parent cannot
+/// `wait4`.
+///
+/// TAKE IT BEFORE SIGNALLING. `stop` signals the box's process GROUP, which the runner is in, and a
+/// dead runner is not a reaper we can hold - the init reparents to the user's systemd, which reaps
+/// it at once. Held first, the runner takes that signal as PENDING (SIGSTOP wins) and dies from it
+/// the moment we let go, so the end state is the same as if it had never been held.
+///
+/// The init itself is never stopped - it is a different process - so its shutdown handler runs
+/// normally and the grace means what it says.
+///
+/// ONLY the box's RUNNER is ever held - the intermediate the supervisor forks, which no shell has a
+/// job for. Two other things can be an init's parent and neither may be touched. The user's systemd
+/// manager inherits an orphaned init, and trusting `PPid` blindly would SIGSTOP the process manager
+/// of the whole session. A FOREGROUND box's parent is the user's own `kern box` process: stopping it
+/// would print `Stopped` in their terminal for the length of the grace, and a `stop` interrupted mid
+/// hold would leave that box frozen and looking alive - a worse outcome than the exit code this
+/// buys, and a foreground box reports its code directly to its caller anyway. Both cases fall back
+/// to the unguarded read.
+struct ReaperHold(Option<i32>);
+
+impl ReaperHold {
+    /// Hold this box's reaper, or hold nothing when it is not ours to hold.
+    ///
+    /// Returning before the target is ACTUALLY stopped would lose the race it exists to remove:
+    /// `kill` only queues the signal, and the group SIGTERM that follows is number 15 against
+    /// SIGSTOP's 19 - the kernel delivers the lower-numbered one first, so a reaper still running
+    /// with both pending dies instead of stopping. MEASURED at 25 correct out of 30 without this
+    /// wait, and 30 out of 30 with it. The wait is a few tens of microseconds (the target is blocked
+    /// in `wait4`, so it stops as soon as it is scheduled) and bounded, because a hold that never
+    /// lands must not turn a stop into a hang.
+    fn new(supervisor: i32, pid1: i32) -> Self {
+        let Some(reaper) = parent_of(pid1) else {
+            return Self(None);
+        };
+        if reaper <= 1 || parent_of(reaper) != Some(supervisor) {
+            return Self(None);
+        }
+        if unsafe { libc::kill(reaper, libc::SIGSTOP) } != 0 {
+            return Self(None);
+        }
+        let held = Self(Some(reaper));
+        for _ in 0..200 {
+            match proc_state(reaper) {
+                Some('T') => break,
+                // Gone while we waited: nothing to hold, and nothing to release.
+                None => return Self(None),
+                _ => {
+                    unsafe { libc::usleep(50) };
+                }
+            }
+        }
+        // Re-check the relationship now that the target cannot run: between reading `PPid` and the
+        // signal landing, that pid could have died and been reused by an unrelated process of this
+        // user, and the check above would have cleared a process we then stopped. It is a narrow
+        // window and the damage would be small (a stop-and-continue), but it is closed for free -
+        // a reused pid is no longer the init's parent, and dropping `held` here resumes it at once.
+        if parent_of(pid1) != Some(reaper) {
+            return Self(None);
+        }
+        held
+    }
+}
+
+impl Drop for ReaperHold {
+    /// Let it go, on every path. It resumes into whatever arrived while it was stopped - `stop`
+    /// signals the box's process group, which it is in - so it finishes exactly as it would have
+    /// without the hold. A reaper left stopped would never tear its cgroup, forwarders and scratch
+    /// dir down, so this is a `Drop` and not a call at the end of the happy path.
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+        }
+    }
+}
+
+/// What a teardown did, and the box's real exit code when it could be observed.
+///
+/// `stop` is the box's LAST owner: its group signal kills the supervisor, which therefore never
+/// reaches the `set_box_exit` it writes on a normal exit. Whatever this carries is the only exit code
+/// the box will ever have. A flat `bool` here is what made every clean `kern stop` record `exit 137`:
+/// the constant was written when the teardown was ALWAYS a SIGKILL, and it did not follow the
+/// graceful phase in.
+///
+/// The distinction is deliberately NOT "which branch ran" but "what did we read". A box can reach
+/// any branch already dead - `stop` signals the group before it gets here - so branch identity is a
+/// bad witness, while the unreaped status is the fact itself: it reads 137 exactly when the init
+/// really was SIGKILLed, and 7 when the workload trapped the signal and exited 7.
+enum Teardown {
+    /// The box is gone. `Some(code)` is the init's real status, read from its unreaped zombie;
+    /// `None` means we tore it down without ever observing one.
+    Gone(Option<i32>),
+    /// The signal went out, the box was not confirmed gone in time.
+    Unconfirmed,
+}
+
+impl Teardown {
+    /// Whether the box is confirmed gone.
+    fn confirmed(&self) -> bool {
+        matches!(self, Teardown::Gone(_))
+    }
+
+    /// The code to record for `kern wait` / `kern ps -a`. A teardown whose status we could not read
+    /// falls back to 137, the historical value, rather than inventing a `0` nobody measured.
+    fn exit_code(&self) -> i32 {
+        match self {
+            Teardown::Gone(Some(code)) => *code,
+            _ => 137,
+        }
+    }
+}
+
+fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_ms: u64) -> Teardown {
+    // The init may ALREADY be gone: `stop` signals the supervisor's process group before it reaches
+    // here, and a box init that sits in that group takes that signal too, so it can be an unreaped
+    // zombie on arrival. Read its status now, while /proc still has it. Without this the graceful
+    // phase is skipped for a reason that looks right and is not: a zombie's `SigCgt` is cleared, so
+    // `init_catches_signal` reports "cannot catch it" for a workload that caught it and exited 7.
+    let already = zombie_exit_code(pid1);
     let pidfd = if pid1 > 0 {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
         // Skip the graceful phase entirely when the init provably cannot receive the signal: see
         // `init_catches_signal`. This is the difference between `kern stop` returning in 2 ms and in
-        // 9 s for the most ordinary box there is.
-        let graceful = grace_secs > 0 && init_catches_signal(pid1, stop_signal);
+        // 9 s for the most ordinary box there is. Already dead is the same case: nothing to wait for.
+        let graceful = grace_ms > 0 && already.is_none() && init_catches_signal(pid1, stop_signal);
         if graceful {
             // Graceful phase: the configured signal to the box init, and to the supervisor's group so
             // a foreground box's helpers hear it too.
@@ -4125,21 +4303,21 @@ fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_secs: u64) -> 
                     revents: 0,
                 };
                 // Exited within the grace: nothing left to kill, and we say so without the SIGKILL.
-                let ms = grace_secs.saturating_mul(1000).min(i32::MAX as u64) as i32;
+                let ms = grace_ms.min(i32::MAX as u64) as i32;
                 if crate::eintr::poll(std::slice::from_mut(&mut pfd), ms) > 0 {
                     unsafe { libc::close(fd) };
-                    return true;
+                    // Read the status HERE, first thing, while the reaper is still held: once it is
+                    // released and reaps, the box's real exit code is gone for good.
+                    return Teardown::Gone(zombie_exit_code(pid1));
                 }
             }
         }
         unsafe { signal_box(fd, pid1, libc::SIGKILL) };
         fd
     } else {
-        if grace_secs > 0 && pid > 1 {
+        if grace_ms > 0 && pid > 1 {
             unsafe { libc::kill(-pid, stop_signal) };
-            std::thread::sleep(std::time::Duration::from_millis(
-                grace_secs.saturating_mul(1000).min(60_000),
-            ));
+            std::thread::sleep(std::time::Duration::from_millis(grace_ms.min(60_000)));
         }
         -1
     };
@@ -4157,18 +4335,26 @@ fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_secs: u64) -> 
         };
         let ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), 1000);
         unsafe { libc::close(pidfd) };
-        ready > 0
+        if ready > 0 {
+            // Read it again now that it is definitely dead: our SIGKILL leaves a status of 137, and
+            // an init that had already exited on its own leaves the code it chose. `already` wins -
+            // it was read before we signalled, so it cannot be our own SIGKILL overwriting a real
+            // exit code (a zombie's status is fixed, but the pre-signal read needs no reasoning).
+            Teardown::Gone(already.or_else(|| zombie_exit_code(pid1)))
+        } else {
+            Teardown::Unconfirmed
+        }
     } else {
         // No pidfd (pid1 unrecorded, or a kernel < 5.3): best-effort probe on the recorded pids. The
         // signal still went out via `signal_box`/the group sweep; we just can't confirm as precisely.
         let probe = if pid1 > 0 { pid1 } else { pid };
         for _ in 0..100 {
             if unsafe { libc::kill(probe, 0) } != 0 {
-                return true; // ESRCH - the target is gone
+                return Teardown::Gone(already); // ESRCH - the target is gone
             }
             unsafe { libc::usleep(10_000) };
         }
-        false
+        Teardown::Unconfirmed
     }
 }
 
@@ -13356,6 +13542,19 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     // have already been signalled and, for the ones that exit, returns at once.
     let stop_deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(targets.iter().map(|b| b.stop_grace).max().unwrap_or(0));
+    // Hold every target's reaper BEFORE a single signal goes out, so each box's exit status is still
+    // readable when its wait returns. Kept alive to the end of the teardown loop and released by
+    // `Drop`; a box with no grace has nothing to observe and holds nothing. See `ReaperHold`.
+    let _holds: Vec<ReaperHold> = targets
+        .iter()
+        .map(|b| {
+            if b.stop_grace > 0 && !b.orphaned {
+                ReaperHold::new(b.pid, b.pid1)
+            } else {
+                ReaperHold(None)
+            }
+        })
+        .collect();
     for b in &targets {
         if b.stop_grace > 0 {
             let sig = if b.stop_signal > 0 {
@@ -13370,6 +13569,11 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                     unsafe { libc::close(fd) };
                 }
             }
+            // The group carries the signal to the box's OTHER processes, not just its init: they
+            // inherit the supervisor's process group, so a shell blocked in `sleep` wakes now
+            // instead of when its child happens to finish. MEASURED: dropping this turned a 3 ms
+            // stop into 65 ms for exactly that shape of workload. The box's own runner is in that
+            // group too and would die here - which is why `stop` holds it first, see `ReaperHold`.
             if b.pid > 1 {
                 unsafe { libc::kill(-b.pid, sig) };
             }
@@ -13419,8 +13623,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         if let Some(cg) = &box_cgroup {
             let _ = std::fs::write(cg.join("cgroup.freeze"), "0");
         }
-        let killed = if stop_managed_unit(&b.name) {
-            true // systemd owns the lifecycle and has torn the unit down
+        let outcome = if stop_managed_unit(&b.name) {
+            // systemd owns the lifecycle and has torn the unit down: gone, but its exit code went to
+            // the journal, not to us, so it records like any teardown we did not observe.
+            Teardown::Gone(None)
         } else {
             // Honour the shutdown contract the box was STARTED with: the registry carries it, so a
             // later `kern stop` (a different process) sends the same signal and waits the same grace.
@@ -13433,22 +13639,38 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                 } else {
                     libc::SIGTERM
                 },
-                // Seconds LEFT until the shared deadline, not this box's full grace: the signal
-                // already went out in phase 1, so the stack converges instead of queueing.
-                stop_deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_secs()
-                    .max(u64::from(b.stop_grace > 0)),
+                // MILLISECONDS left until the shared deadline, not this box's full grace: the
+                // signal already went out in phase 1, so the stack converges instead of queueing.
+                // Truncating this to whole seconds silently spent up to 999 ms of the caller's
+                // grace - see `kill_box_graceful`. The floor keeps a box whose deadline has already
+                // passed on the graceful path for one more second rather than skipping straight to
+                // the SIGKILL, which is what the shared deadline is for.
+                u64::try_from(
+                    stop_deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX)
+                .max(if b.stop_grace > 0 { 1000 } else { 0 }),
             )
         };
-        // A `stop` SIGKILLs the supervisor, which then never records its own exit code. Record 137
-        // (128 + SIGKILL) here - BEFORE removing the instance file - so `kern wait` on a stopped box
-        // returns 137 like Docker, instead of "no exit code recorded".
-        registry::set_box_exit(b.pid, b.starttime, 137, &b.name, &b.pod, &b.command);
+        // A `stop` signals the supervisor's group, so the supervisor never records its own exit code.
+        // We record it here - BEFORE removing the instance file - so `kern wait` on a stopped box
+        // answers like Docker instead of "no exit code recorded". The code is the box's REAL one when
+        // it shut itself down inside the grace: a workload that traps the signal and exits 0 has to
+        // read as `exited (0)`, not as the SIGKILL we never sent it. See `Teardown`.
+        registry::set_box_exit(
+            b.pid,
+            b.starttime,
+            outcome.exit_code(),
+            &b.name,
+            &b.pod,
+            &b.command,
+        );
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
         registry::clear_health(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
-        if killed {
+        if outcome.confirmed() {
             // Eagerly rmdir the box's now-empty cgroup dir (captured above) - the SIGKILL skipped the
             // supervisor's RAII guard, so it would otherwise linger until `gc`/the next box start. rmdir is
             // empty-only, so a (vanishingly unlikely) reused-pid live box is safe. Covers `compose down`
@@ -17466,7 +17688,7 @@ mod image_rm_tests {
 
         // The fix: `kill_box` signals pid1 directly and confirms the exit before returning.
         assert!(
-            kill_box_graceful(child, child, libc::SIGTERM, 0),
+            kill_box_graceful(child, child, libc::SIGTERM, 0).confirmed(),
             "kill_box must confirm the foreground box is gone"
         );
         // Reap the zombie (kill_box confirms via the pidfd BEFORE the process is reaped).
@@ -17476,6 +17698,63 @@ mod image_rm_tests {
             0,
             "child must be dead after kill_box"
         );
+    }
+
+    /// `stop` records what the box's exit code REALLY was, and the only place that fact survives is
+    /// the unreaped zombie: `/proc/<pid>/stat` field 52. A clean shutdown (`trap ... exit 0`) and a
+    /// SIGKILL are the two shapes this has to tell apart - reading them as the same 137 is exactly
+    /// the bug this exists to prevent.
+    ///
+    /// The live-process case is the discriminant: it proves the function reads a real status rather
+    /// than answering from the pid, and that a not-yet-dead init can never be recorded as exited.
+    #[test]
+    fn zombie_exit_code_tells_a_clean_exit_from_a_kill() {
+        // (what the child does, what `waitpid` semantics say the code is)
+        for (want, kill_self) in [(7, false), (0, false), (128 + libc::SIGKILL, true)] {
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork");
+            if child == 0 {
+                // Async-signal-safe only: no allocation, no Rust runtime, between fork and _exit.
+                if kill_self {
+                    unsafe { libc::raise(libc::SIGKILL) };
+                }
+                unsafe { libc::_exit(want) };
+            }
+            // Live, not yet dead: there is no status to read and none must be invented.
+            assert_eq!(
+                zombie_exit_code(child),
+                None,
+                "a live process has no exit status to report"
+            );
+            // Wait for the zombie WITHOUT reaping it - that is the window `stop` reads in.
+            let mut seen = None;
+            for _ in 0..2000 {
+                if let Some(code) = zombie_exit_code(child) {
+                    seen = Some(code);
+                    break;
+                }
+                unsafe { libc::usleep(1_000) };
+            }
+            crate::eintr::reap(child);
+            assert_eq!(
+                seen,
+                Some(want),
+                "the zombie's recorded status must decode to the code the child really exited with"
+            );
+        }
+    }
+
+    /// The mapping from a teardown to the recorded code: only a status we actually READ is reported
+    /// as the box's own. Everything else stays 137, the historical "we tore it down" value.
+    #[test]
+    fn teardown_reports_a_read_status_and_falls_back_to_137() {
+        assert_eq!(Teardown::Gone(Some(0)).exit_code(), 0);
+        assert_eq!(Teardown::Gone(Some(7)).exit_code(), 7);
+        assert_eq!(Teardown::Gone(Some(137)).exit_code(), 137);
+        assert_eq!(Teardown::Gone(None).exit_code(), 137);
+        assert_eq!(Teardown::Unconfirmed.exit_code(), 137);
+        assert!(Teardown::Gone(None).confirmed());
+        assert!(!Teardown::Unconfirmed.confirmed());
     }
 }
 

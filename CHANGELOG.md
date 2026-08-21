@@ -69,6 +69,26 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- **`--stop-timeout` is honoured in full, not rounded down to whole seconds.** `stop` waits the time
+  LEFT until a deadline shared by the whole stack, and that remainder was truncated to seconds, so a
+  box asked for 3 s got 2. Measured: a workload that flushes for 2.5 s under `--stop-timeout 3` was
+  SIGKILLed at 2019 ms and recorded 137, where Docker's `stop -t 3` let the same workload finish in
+  2799 ms and exit 5. kern now finishes it in 2526 ms with exit 5. A workload that exits at once
+  still returns in ~16 ms, and one whose handler never finishes now consumes the whole 3 s rather
+  than two thirds of it.
+- **`kern stop` records the workload's own exit code, not a blanket 137.** A service that traps the
+  stop signal and shuts down cleanly was reported as `exited (137)` - killed - by `kern ps -a` and
+  `kern wait`, because the 137 was written when a stop was always a SIGKILL and the graceful phase
+  arrived later without it following. Now the init's real status is read from its unreaped zombie and
+  recorded, and 137 is kept for the case where it is the truth: an init that ignores the signal and is
+  SIGKILLed. Measured against Docker on the same four-service stack (nginx, redis, and two shells that
+  trap and exit 0 and 3): both runtimes now report 0, 0, 0 and 3, where kern previously reported 137
+  four times. Reading that status is a race against whoever reaps the init - correct in 15 runs out of
+  20 on its own - so `stop` holds the box's own reaper with SIGSTOP for the microseconds it takes,
+  which makes it 30 out of 30. The hold is taken before any signal goes out (the group signal would
+  otherwise kill the reaper first), released by a `Drop` on every path, and only ever applied to a
+  process the box owns. Cost measured at +0.6 ms on a single stop and +12% on `stop --all` of 50
+  boxes (101 ms to 116 ms).
 - `kern gc` reaps orphaned box cgroups wherever a box was created, not only under kern.slice. A box
   that the OOM killer or a SIGKILL takes down leaves its `kern-box-*` cgroup dir behind (the RAII Drop
   that removes it cannot run on SIGKILL), and gc looked in one place while `apply_limits` creates in

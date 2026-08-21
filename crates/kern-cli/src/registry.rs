@@ -1730,6 +1730,20 @@ fn stat_after_comm(stat: &str) -> Option<&str> {
     stat.rfind(')').map(|rp| &stat[rp + 1..])
 }
 
+/// Field `n` of a `/proc/<pid>/stat` line, numbered as proc(5) numbers them: (3) `state`,
+/// (4) `ppid`, (22) `starttime`, ... (52) `exit_code`.
+///
+/// Callers name the field they mean instead of an index computed by hand at each site, which is how
+/// an off-by-one here reads a plausible neighbouring number rather than failing. Fields 1 and 2 are
+/// deliberately unreachable: they are before the split point that makes a hostile `comm` safe.
+/// Missing field, unparsable line, or a `/proc` we may not read (fields 44-52 need ptrace-read
+/// credentials) all return `None`.
+pub(crate) fn stat_field(stat: &str, n: usize) -> Option<&str> {
+    stat_after_comm(stat)?
+        .split_whitespace()
+        .nth(n.checked_sub(3)?)
+}
+
 /// The sole child of `ppid` (a box supervisor forks exactly one child - PID 1 of the box), found
 /// by scanning `/proc/*/stat` for a process whose parent is `ppid`. Fallback for `kern exec` when
 /// the supervisor hadn't yet recorded PID 1. `None` if no such process exists.
@@ -1745,7 +1759,7 @@ pub fn child_of(ppid: i32) -> Option<i32> {
             continue;
         };
         // Post-')' fields: state ppid ... → ppid is the 2nd token (field 4).
-        if stat_after_comm(&stat).and_then(|s| s.split_whitespace().nth(1)) == Some(want.as_str()) {
+        if stat_field(&stat, 4) == Some(want.as_str()) {
             return Some(pid);
         }
     }
@@ -1757,11 +1771,7 @@ pub fn proc_starttime(pid: i32) -> u64 {
     let Ok(s) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return 0;
     };
-    // starttime is field 22 → the 20th post-')' token (index 19).
-    stat_after_comm(&s)
-        .and_then(|s| s.split_whitespace().nth(19))
-        .and_then(|t| t.parse().ok())
-        .unwrap_or(0)
+    stat_field(&s, 22).and_then(|t| t.parse().ok()).unwrap_or(0)
 }
 
 /// Collapse newlines so one entry stays on its own lines.
@@ -2125,6 +2135,43 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `comm` is the workload's own executable name, so it is hostile input to every reader of
+    /// `/proc/<pid>/stat`: it can hold spaces and parentheses and is not quoted or escaped. A reader
+    /// that splits on whitespace from the start reads the wrong field for the rest of the line -
+    /// here, a forged "state" and a forged exit code.
+    #[test]
+    fn stat_field_is_not_shifted_by_a_hostile_comm() {
+        // Fields 3..=52, built by NUMBER so the test cannot silently miscount them, behind a comm
+        // that contains spaces, parentheses and decoy values.
+        let tail: Vec<&str> = (3..=52)
+            .map(|n| match n {
+                3 => "S",
+                4 => "7",
+                52 => "1792",
+                _ => "0",
+            })
+            .collect();
+        let hostile = format!("42 (evil ) Z 1 2 3 4 5) {}\n", tail.join(" "));
+        let hostile = hostile.as_str();
+        assert_eq!(stat_field(hostile, 3), Some("S"), "state is field 3");
+        assert_eq!(stat_field(hostile, 4), Some("7"), "ppid is field 4");
+        assert_eq!(
+            stat_field(hostile, 52),
+            Some("1792"),
+            "exit_code is field 52"
+        );
+        // The decoys inside comm must not be reachable as fields.
+        assert_ne!(stat_field(hostile, 3), Some("Z"));
+        // A line with no `)` at all, or too few fields, yields nothing rather than a wrong answer.
+        assert_eq!(stat_field("42 evil S 7", 3), None);
+        assert_eq!(stat_field("42 (x) S 7", 52), None);
+        assert_eq!(
+            stat_field("42 (x) S 7", 2),
+            None,
+            "comm is deliberately unreachable"
+        );
+    }
 
     /// Every child of the registry root must be CLASSIFIED - `AUTHORITATIVE_DIRS` (kern reads and acts
     /// on it, or it is a cross-box secret; never mountable) or `BOX_DATA_DIRS` (opaque box data). A
