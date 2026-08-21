@@ -314,17 +314,17 @@ Reproduce any row with `time`, on both sides. No script of ours is involved.
 
 **The stop rows need two caveats, and both cut against the headline.**
 
-FIRST, an init that does *not* handle SIGTERM: 10 278 ms on Docker, 10 287 ms on Podman, 21.9 ms on
+FIRST, an init that does *not* handle SIGTERM: 10 165 ms on Docker, 10 203 ms on Podman, 5.1 ms on
 kern. That is **not** Docker being slow. A PID-namespace init discards signals it has no handler for,
 so the container genuinely cannot die of SIGTERM, and waiting the full grace before `SIGKILL` is
 correct, documented behaviour. kern reads `SigCgt` from `/proc/<pid>/status` first and skips a wait
-that provably cannot end. Publishing that as a 470x win would be dishonest, which is why the table
+that provably cannot end. Publishing that as a 2000x win would be dishonest, which is why the table
 measures an init that *does* handle the signal.
 
 SECOND, the two runtimes do not signal the same set of processes. Docker and Podman send the stop
 signal to PID 1 only; kern also signals the box's process group, so a shell blocked in `sleep 0.5`
 wakes at once instead of when its child happens to finish. On that shape of workload the same table
-row reads 7.7 ms against 310.8 and 397.1 - a 40x that is mostly the sleeping child, not the runtime.
+row reads 4.9 ms against 346.7 and 364.5 - a 70x that is mostly the sleeping child, not the runtime.
 The rows above therefore use an init that handles SIGTERM in a handler and returns immediately (a
 static C binary, `signal(SIGTERM)` + `pause()`, the same binary bind-mounted into all three), which
 is the comparison where only the runtime differs.
