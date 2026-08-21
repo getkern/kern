@@ -997,19 +997,18 @@ fn child_setup_and_exec(
     // runs on a board without `CONFIG_SECURITY_LANDLOCK` now fails instead of degrading, so the operator
     // decides (drop the flag, or gate it on `kern doctor`) rather than kern deciding for them.
     if !spec.landlock_rw.is_empty() {
-        match crate::landlock::apply_rw_allowlist(&spec.landlock_rw) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(Error::Unsupported(
-                    "--landlock-rw was requested but this kernel has no Landlock (not built in, or \
-                     switched off at boot with `lsm=`), so the path write-allowlist cannot be \
-                     enforced: refusing to start rather than running a box that asked to be confined \
-                     and would not be. `kern doctor` reports the Landlock ABI on this host. Drop \
-                     --landlock-rw to run with namespaces, seccomp and cgroups, which is the default \
-                     posture and does not depend on this LSM.",
-                ))
-            }
-            Err(e) => return Err(e),
+        // `?` carries the "a ruleset that WAS available failed" case with the syscall's own message;
+        // `false` is the one shape that needs a message written here, because the kernel returned no
+        // error at all - there is simply no LSM to ask.
+        if !crate::landlock::apply_rw_allowlist(&spec.landlock_rw)? {
+            return Err(Error::Unsupported(
+                "--landlock-rw was requested but this kernel has no Landlock (not built in, or \
+                 switched off at boot with `lsm=`), so the path write-allowlist cannot be enforced: \
+                 refusing to start rather than running a box that asked to be confined and would \
+                 not be. `kern doctor` reports the Landlock ABI on this host. Drop --landlock-rw to \
+                 run with namespaces, seccomp and cgroups, which is the default posture and does \
+                 not depend on this LSM.",
+            ));
         }
         t.mark("landlock");
     }

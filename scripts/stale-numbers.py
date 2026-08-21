@@ -69,12 +69,15 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         "cold start from an OCI image; the README table and BENCHMARKS.md both measure 3.4.",
         set(),
     ),
-    # No rule for the binary size. It was tried and removed: a bare "1.7 MB" also names the RSS of
-    # three processes in BENCHMARKS.md, and "1.81 MB" is the recorded measurement of an earlier
+    # No STALE rule for the binary size. It was tried and removed: a bare "1.7 MB" also names the RSS
+    # of three processes in BENCHMARKS.md, and "1.81 MB" is the recorded measurement of an earlier
     # release in the binary-size entry of OPEN_ITEMS.md. Both are correct where they stand, so the
     # rule fired on true statements. A gate with false positives is switched off, which is worse
-    # than no gate: the size is checked instead against the release asset at publish time, where
-    # there is exactly one right answer.
+    # than no gate.
+    # The size is not unchecked, though: `size_claims_agree()` below compares the claim in the two
+    # files that PRODUCE the front page (the demo SVG and the GIF's generator, neither of them a `.md`
+    # and so invisible to the scan above) against the README's headline. An agreement check cannot
+    # fire on a true statement, which is exactly why the size gets one and not a blacklist.
     (
         r"\bENOSYS[^.\n]{0,80}\bfive\b|\bfive [a-z]* ?syscalls? [^.\n]{0,40}ENOSYS",
         "nine",
@@ -286,10 +289,14 @@ def size_claims_agree() -> list[str]:
     canonical = readme.group(1)
     # Only a size sitting NEXT TO the word it measures counts, so the generator's own history note
     # ("the GIF kept claiming ~2 ms and 1.6 MB") is not a claim about today's binary and is skipped.
+    # The gap in the third alternative forbids DIGITS, not just newlines. With `[^\n]{0,24}` it was
+    # greedy enough to eat into the number itself: "binary is 1.58 MB" captured `8`, and the gate would
+    # then have reported a disagreement against a file that agreed. A rule that invents a mismatch is
+    # the same failure as one that misses a real one, so the gap may not cross a digit.
     claim = re.compile(
         r'BINARY_SIZE\s*=\s*"~?([\d.]+)\s*MB"'
         r'|~?([\d.]+)\s*MB(?=[^\n]{0,24}\bbinary\b)'
-        r'|\bbinary\b[^\n]{0,24}~?([\d.]+)\s*MB'
+        r'|\bbinary\b[^\d\n]{0,24}([\d.]+)\s*MB'
     )
     bad = []
     for path in ("assets/demo.svg", "assets/make-demo-gif.py"):
