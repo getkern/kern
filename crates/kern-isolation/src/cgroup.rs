@@ -695,6 +695,14 @@ pub fn box_cgroup_dir(pid: i32) -> Option<PathBuf> {
 
 /// Parse a cgroup-v2 `/proc/<pid>/cgroup` body (`0::<path>`) into kern's own box-cgroup dir, or `None`.
 /// Split out from [`box_cgroup_dir`] so the parse + kern-box gate is unit-testable without a live box.
+///
+/// TWO leaf shapes are kern's own, and both are named by kern rather than inferred:
+/// `kern-box-<tag>-<pid>` is the dir `apply_limits` creates on the direct path, and
+/// `kern-box-<pid>.scope` is the transient unit kern asks systemd for on the per-box scope path.
+/// Everything else is refused, which is the point of the gate rather than an omission: on the scope
+/// path a box's cgroup can be a scope kern did NOT create (a user's own `systemd-run --user --scope
+/// bash`, which `kern doctor` recommends), and recording that would let a later reap `cgroup.kill`
+/// the user's whole session. The `kern-box-` prefix is the proof of ownership.
 fn parse_box_cgroup_line(raw: &str) -> Option<PathBuf> {
     let rel = raw.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
     let leaf = rel.rsplit('/').next()?;
@@ -1543,7 +1551,13 @@ mod tests {
         let dead = slice.join(format!("kern-box-my-app-{dead_pid}")); // tag with '-' exercises rsplit
         let live = slice.join(format!("kern-box-web-{live_pid}"));
         let other = slice.join("some-unrelated-dir");
-        for d in [&dead, &live, &other] {
+        // kern's own per-box transient SCOPE, named after a pid that is provably gone. systemd owns
+        // that dir and removes it with the unit, so this sweep must leave it alone even though it
+        // carries the `kern-box-` prefix - the `.scope` suffix is what stops the last field parsing
+        // as a pid. Asserted, not left to a comment, because the failure mode is kern rmdir'ing a
+        // live systemd unit's cgroup out from under the manager.
+        let scope = slice.join(format!("kern-box-{dead_pid}.scope"));
+        for d in [&dead, &live, &other, &scope] {
             std::fs::create_dir_all(d).unwrap();
         }
 
@@ -1575,6 +1589,15 @@ mod tests {
             "a dir that is not `kern-box-*` must be ignored"
         );
         assert!(other.is_dir());
+        // (4) a transient scope -> never killed and never removed, whatever its pid says.
+        assert!(
+            !scope.join("cgroup.kill").exists(),
+            "a systemd scope must never be killed by this sweep - the manager owns that unit"
+        );
+        assert!(
+            scope.is_dir(),
+            "a systemd scope's dir must survive the sweep"
+        );
 
         let _ = std::fs::remove_dir_all(&slice);
     }
@@ -2036,6 +2059,29 @@ mod tests {
         assert_eq!(
             parse_box_cgroup_line("0::/kern.slice/kern-box-web-1-42\n"),
             Some(PathBuf::from("/sys/fs/cgroup/kern.slice/kern-box-web-1-42"))
+        );
+        // The per-box TRANSIENT SCOPE kern asks systemd for is kern's own too, and is what makes a
+        // box on that path recoverable when its supervisor is killed.
+        assert_eq!(
+            parse_box_cgroup_line(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kern-box-1815.scope\n"
+            ),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/kern-box-1815.scope"
+            ))
+        );
+        // An AMBIENT scope kern did not create stays unrecorded, whatever it holds. This is the case
+        // `kern doctor` tells users to create (`systemd-run --user --scope bash`): recording it would
+        // let a later reap `cgroup.kill` their whole session.
+        assert_eq!(
+            parse_box_cgroup_line(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-p1815-i1816.scope\n"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_box_cgroup_line("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            None
         );
         // NOT a box leaf → never reaped.
         assert_eq!(parse_box_cgroup_line("0::/kern.slice\n"), None);

@@ -69,6 +69,21 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- **An orphaned box is recoverable on the systemd-scope path too**, not only on the direct one. kern
+  reaps a box whose supervisor was killed by remembering that box's own cgroup, and the path is
+  recorded only when it names a `kern-box-*` dir - deliberately, because on the scope path a box's
+  cgroup can be a scope kern did NOT create (`kern doctor` suggests `systemd-run --user --scope bash`
+  to pay the scope cost once, and every box in that shell shares the shell's scope, so recording it
+  would let a later reap `cgroup.kill` the user's whole session). The transient scope kern asks
+  systemd for is now NAMED `kern-box-<pid>.scope`, which settles ownership by construction: an
+  ambient scope is `run-*` and stays unrecorded. MEASURED on an Arduino UNO Q (aarch64, rootless,
+  user systemd) before: SIGKILL a box's supervisor and the box vanished from `kern ps` while four of
+  its processes kept running, with `kern stop` answering "no running box". After: `kern ps` shows it
+  `orphaned`, `kern stop` reports "reaped via cgroup.kill", and no process is left. The recorded
+  cgroup also lets the reaper hold engage there, so that board's exit codes went from 7 correct out
+  of 10 under a bulk stop to 30 out of 30. The `.scope` suffix keeps the start-time orphan sweep off
+  the dir (it reads the last `-` field as a pid, which never parses), and `stop` no longer rmdirs a
+  cgroup that is a systemd unit - `--collect` removes it with the unit.
 - **`kern wait` answers for a box that has already exited**, from the same exit record `kern ps -a`
   reads, for as long as `ps -a` still lists it (an hour). It used to refuse - "kern keeps no stopped
   boxes" - which was an inconsistency in kern's own surface rather than ephemerality: `ps -a` listed

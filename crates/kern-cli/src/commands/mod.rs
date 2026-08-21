@@ -5513,9 +5513,29 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     // trusted-bin policy as the id-map helpers.)
     let systemd_run = kern_isolation::trusted_helper("systemd-run")
         .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
+    // NAME the transient scope with kern's own prefix, instead of letting systemd pick
+    // `run-p<pid>-i<id>.scope`. This is what makes a box on THIS path recoverable when its supervisor
+    // is killed: the registry records a box's cgroup only when the path names a `kern-box-*` dir (see
+    // `box_cgroup_dir`), deliberately, because on the scope path the box's cgroup can be a scope kern
+    // did NOT create - `kern doctor` itself suggests `systemd-run --user --scope bash` to pay the
+    // scope cost once, and every box started in that shell would share the shell's scope, so
+    // recording it would let a later reap `cgroup.kill` the user's own session. Naming the scope
+    // kern creates settles that by construction: an ambient scope is `run-*` and stays unrecorded, a
+    // scope kern created is `kern-box-*` and is recorded with its `(dev, ino)` identity.
+    //
+    // MEASURED before this, on an Arduino UNO Q (rootless, user systemd, the scope path): SIGKILL a
+    // box's supervisor and the box vanished from `kern ps` while four of its processes kept running,
+    // with `kern stop <name>` answering "no running box". The direct-path host reaped the same box.
+    //
+    // The pid makes the unit unique per invocation, so a stale scope cannot make a later start fail
+    // with "unit already exists"; `--collect` reaps the unit on exit regardless. The `.scope` suffix
+    // is explicit rather than left to systemd, and it is also what keeps `sweep_orphan_boxes` off
+    // this dir: that sweep reads the last `-` field as a pid, which `<pid>.scope` never parses as.
+    let unit = format!("--unit=kern-box-{}.scope", std::process::id());
     let mut cmd = std::process::Command::new(systemd_run);
     cmd.arg(kern_isolation::systemd_scope_mode()) // `--system` as root, else `--user`
         .args(["--scope", "--quiet", "--collect"])
+        .arg(&unit)
         .args(&props)
         .arg("--")
         .arg(self_exe)
@@ -13716,8 +13736,19 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             // supervisor's RAII guard, so it would otherwise linger until `gc`/the next box start. rmdir is
             // empty-only, so a (vanishingly unlikely) reused-pid live box is safe. Covers `compose down`
             // too - it tears the stack down via this same `stop`.
+            //
+            // EXCEPT a `.scope`: on the systemd-scope path the box's cgroup IS a transient unit, and
+            // that dir belongs to systemd's bookkeeping, not to ours. `--collect` removes the unit
+            // (and its cgroup) when its last process exits, so racing it here would win nothing and
+            // could leave the manager tearing down a cgroup that is already gone.
             if let Some(cg) = &box_cgroup {
-                let _ = std::fs::remove_dir(cg);
+                let is_unit = cg
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".scope"));
+                if !is_unit {
+                    let _ = std::fs::remove_dir(cg);
+                }
             }
             println!("stopped '{}' (pid {})", b.name, b.pid);
         } else {
