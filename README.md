@@ -83,11 +83,19 @@ kern needs a Linux kernel with unprivileged user namespaces and cgroup v2. It ru
 and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q); there is **no native Windows** build, use
 WSL2 (kern ships a pre-baked WSL rootfs).
 
-There are no published binaries yet, so you build it from source with a Rust toolchain:
+There are no published binaries yet, so you build it from source. The whole dependency tree is one
+crate (`libc`), so this is short: clone, build and install took 36 s on a desktop (i7-14700KF),
+longer on a small ARM board.
 
 ```sh
+# if you do not have Rust yet
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
+
+That puts `kern` in `~/.cargo/bin`, which rustup adds to your `PATH` (open a new shell, or
+`source "$HOME/.cargo/env"`, if `kern` is not found).
 
 Once a release is published, [`install.sh`](install.sh) fetches the binary for your architecture and
 verifies its SHA256 (`curl -fsSL .../install.sh | sh`); until then it has nothing to download.
