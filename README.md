@@ -19,11 +19,14 @@
 </div>
 
 ```sh
+# install from source (no published binaries yet, needs a Rust toolchain)
 cargo install --git https://github.com/getkern/kern getkern --locked
+
+# a throwaway shell in a real OCI image: rootless, kernel-enforced, a few ms
 kern box dev --image alpine -it -- sh
 ```
 
-<sub>Built from source: no published binaries yet, and it needs a Rust toolchain. No native Windows, use WSL2. [Install](#install).</sub>
+<sub>No native Windows: use WSL2. [Install](#install).</sub>
 
 ---
 
