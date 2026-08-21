@@ -69,6 +69,14 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- **`kern wait` answers for a box that has already exited**, from the same exit record `kern ps -a`
+  reads, for as long as `ps -a` still lists it (an hour). It used to refuse - "kern keeps no stopped
+  boxes" - which was an inconsistency in kern's own surface rather than ephemerality: `ps -a` listed
+  that box WITH its code while `wait` declined to print the same number, so a script that stopped a
+  service could not ask how it had exited. Docker answers immediately there too. A box that is still
+  running is unaffected: `wait` blocks until it exits, as before. Outside the window, and for an
+  interactive `-it` box that never had a supervisor to record a code, `wait` still fails and says
+  which case it is.
 - **`--stop-timeout` is honoured in full, not rounded down to whole seconds.** `stop` waits the time
   LEFT until a deadline shared by the whole stack, and that remainder was truncated to seconds, so a
   box asked for 3 s got 2. Measured: a workload that flushes for 2.5 s under `--stop-timeout 3` was
@@ -87,8 +95,11 @@ state of the tree; full detail is in the git history.
   20 on its own - so `stop` holds the box's own reaper with SIGSTOP for the microseconds it takes,
   which makes it 30 out of 30. The hold is taken before any signal goes out (the group signal would
   otherwise kill the reaper first), released by a `Drop` on every path, and only ever applied to a
-  process the box owns. Cost measured at +0.6 ms on a single stop and +12% on `stop --all` of 50
-  boxes (101 ms to 116 ms).
+  process the box owns - never the user's systemd manager, which inherits an orphaned init, and never
+  a FOREGROUND box's own process, which would print `Stopped` in the user's terminal. Cost measured:
+  none. A single stop is 16.20 ms against a 16.23 ms baseline and `stop --all` of 50 boxes is 110 ms
+  against 119 ms, because consolidating the `/proc` readers onto one `stat_field` (reading `stat`
+  rather than the much more expensive `status`) paid for the two extra signals.
 - `kern gc` reaps orphaned box cgroups wherever a box was created, not only under kern.slice. A box
   that the OOM killer or a SIGKILL takes down leaves its `kern-box-*` cgroup dir behind (the RAII Drop
   that removes it cannot run on SIGKILL), and gc looked in one place while `apply_limits` creates in

@@ -305,17 +305,32 @@ machine, same images, real commands, timed with the shell.
 | `exec` into a running service | **0.79 ms** | 43.3 ms | 148.6 ms |
 | list what is running (`ps`) | **0.30 ms** | 8.2 ms | 13.5 ms |
 | read logs | **0.35 ms** | 8.2 ms | 37.5 ms |
-| stop a service (`--init` handles SIGTERM) | **2.4 ms** | ~300 ms | |
-| bring a 2-service stack up | **185 ms** | 301 ms | |
+| stop a service (init handles SIGTERM) | **4.6 ms** | 126.8 ms | 199.7 ms |
+| stop nginx (the same image on all three) | **48.5 ms** | 187.2 ms | 256.9 ms |
+| bring a 2-service stack up | **188 ms** | 292 ms | 1022 ms |
+| stop that stack | **77 ms** | 263 ms | 496 ms |
 
 Reproduce any row with `time`, on both sides. No script of ours is involved.
 
-**One row needs a caveat.** Stopping a service whose init does *not* handle SIGTERM takes 10 s on
-Docker and Podman, and 2.7 ms on kern. That is **not** Docker being slow: a PID-namespace init
-discards signals it has no handler for, so the container genuinely cannot die of SIGTERM, and waiting
-the full grace before `SIGKILL` is correct, documented behaviour. kern reads `/proc/<pid>/status`
-first and skips a wait that provably cannot end. The honest comparison is the row above, with an init
-that does handle the signal.
+**The stop rows need two caveats, and both cut against the headline.**
+
+FIRST, an init that does *not* handle SIGTERM: 10 278 ms on Docker, 10 287 ms on Podman, 21.9 ms on
+kern. That is **not** Docker being slow. A PID-namespace init discards signals it has no handler for,
+so the container genuinely cannot die of SIGTERM, and waiting the full grace before `SIGKILL` is
+correct, documented behaviour. kern reads `SigCgt` from `/proc/<pid>/status` first and skips a wait
+that provably cannot end. Publishing that as a 470x win would be dishonest, which is why the table
+measures an init that *does* handle the signal.
+
+SECOND, the two runtimes do not signal the same set of processes. Docker and Podman send the stop
+signal to PID 1 only; kern also signals the box's process group, so a shell blocked in `sleep 0.5`
+wakes at once instead of when its child happens to finish. On that shape of workload the same table
+row reads 7.7 ms against 310.8 and 397.1 - a 40x that is mostly the sleeping child, not the runtime.
+The rows above therefore use an init that handles SIGTERM in a handler and returns immediately (a
+static C binary, `signal(SIGTERM)` + `pause()`, the same binary bind-mounted into all three), which
+is the comparison where only the runtime differs.
+
+The `stop nginx` row is the one closest to what a developer actually types, and it is the least
+flattering: most of those 48.5 ms are nginx's own shutdown, identical on all three.
 
 ## Where a box start actually goes
 

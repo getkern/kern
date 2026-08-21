@@ -7569,14 +7569,29 @@ fn write_cgroup(cg: &std::path::Path, file: &str, val: &str) -> Result<(), Strin
 }
 
 /// `kern wait <box>...` - block until each box exits, then print its exit code, one per line, in
-/// argument order (Docker `wait`). The box must be RUNNING when `wait` starts (kern is ephemeral - it
-/// keeps no stopped boxes; an interactive `-it` box isn't registered either). The command itself
-/// returns 0 unless a name doesn't resolve. Polls the registry every 100 ms - no daemon, no busy-spin.
+/// argument order (Docker `wait`). A box that has ALREADY exited answers at once from its exit
+/// record, for as long as `kern ps -a` still lists it; past that window, and for an interactive
+/// `-it` box (never registered, no supervisor to record a code), there is nothing to answer with.
+/// The command itself returns 0 unless a name doesn't resolve. Polls the registry every 100 ms - no
+/// daemon, no busy-spin.
 pub fn wait(names: &[String]) -> Result<(), Error> {
     for name in names {
         let Some(inst) = registry::find_ref(name) else {
+            // Not running: answer from the exit record if the box left one, which is Docker's
+            // behaviour (`docker wait` on a stopped container returns its code at once) and the one
+            // `kern ps -a` already implies - it lists that box WITH its code, so refusing to say the
+            // same number here was an inconsistency in our own surface, not ephemerality. Newest
+            // first, so a recycled name answers about the run that just ended. Outside the `ps -a`
+            // window there is nothing left to read and the error below is the honest answer.
+            if let Some(exited) = registry::list_exited()
+                .into_iter()
+                .find(|e| e.name == *name)
+            {
+                println!("{}", exited.code);
+                continue;
+            }
             return Err(Error::NotRunning(format!(
-                "no running box named '{name}' (kern keeps no stopped boxes; `wait` needs it running)"
+                "no running box named '{name}' and no exit record for one (kern keeps no stopped boxes; a box that exited over an hour ago is history)"
             )));
         };
         // Block on the EXACT (name,pid) pair leaving the registry, so a reused pid or name can't make

@@ -268,6 +268,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Rootless | **yes**, always | opt-in | yes |
 | Cold start, bare box | **~2.2 ms** | ~294 ms | ~281 ms |
 | Cold start, from an OCI image | **~3.4 ms** | ~294 ms | ~281 ms |
+| Stop a service (init handles SIGTERM) | **~4.6 ms** | ~127 ms | ~200 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.58 MB binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |

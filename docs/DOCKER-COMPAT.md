@@ -132,7 +132,7 @@ Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same
 | `exec` | `exec` | joins the box's namespaces |
 | `ps` | `ps` | `-a`/`--all` (also lists recently-exited boxes), `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
 | `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs) |
-| `stop` / `kill` | `stop` / `kill` | SIGKILL the box's process group |
+| `stop` / `kill` | `stop` / `kill` | `stop` sends `--stop-signal` (SIGTERM), waits `--stop-timeout` (10 s) for the workload to flush and exit, then SIGKILLs what is left; `kill` skips the wait. A grace that provably cannot end is skipped, not sat out: an init with no handler for the signal is one the kernel would discard it for |
 | `pause` / `unpause` | `pause` / `unpause` | cgroup v2 freezer |
 | `attach` | `attach` | Ctrl-C detaches, box keeps running |
 | `cp` | `cp` | host↔box, symlinks can't escape the box root |
@@ -141,7 +141,7 @@ Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same
 | `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI for every box |
 | `rename` | `rename` | in place, pid unchanged |
 | `update` | `update` | live cgroup caps, no restart (needs a delegated cgroup) |
-| `wait` | `wait` | prints the exit code (`137` after `stop`); also resolves a box that has already exited, via its `waitexit` breadcrumb |
+| `wait` | `wait` | prints the exit code the workload itself exited with, including after a `stop` that let it shut down cleanly - `137` means it really was SIGKILLed; also resolves a box that has already exited, via its `waitexit` breadcrumb |
 | `diff` | `diff` | overlay-upper changes: `C` changed/added, `D` deleted |
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |
