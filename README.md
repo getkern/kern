@@ -117,8 +117,10 @@ kern box svc --image nginx:alpine -d -p 8080:80 \  # a service: published, resta
   --restart --health-cmd 'wget -qO- localhost:80' -- nginx -g 'daemon off;'
 kern ps                                            # what is running, with PORTS and HEALTH
 kern exec svc -it -- sh                            # shell into it
+kern stop svc                                      # its signal, its grace, then the code it exited with
 kern top                                           # live TUI: boxes, CPU/RAM, profiles, volumes
 kern compose stack.toml up                         # a multi-box stack (examples/) or a compose.yml
+kern compose stack.toml down                       # and take it down again
 ```
 
 Untrusted code, one flag for the bundle:
