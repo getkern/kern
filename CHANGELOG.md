@@ -69,6 +69,17 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- **A service's `stop_grace_period` is its own upper bound again, not the longest one in the file.**
+  `stop` shared ONE deadline across the stack, set to the longest grace configured anywhere in it,
+  and floored the remainder at a second - so a service that asked for 1 s could be held far longer.
+  MEASURED on a two-service stack, one asking 4 s and one asking 1 s, both hanging in their handler:
+  the 1 s service was SIGKILLed at 5154 ms and the stop took 5010 ms. Each box's grace is now counted
+  from the phase-1 signal against ITS OWN timeout: the same stack kills it at 1154 ms and finishes in
+  4008 ms, which is max(grace) - the convergence the shared deadline existed for, without overriding
+  what each service asked for. The bound stays one-sided by design: a member is never killed BEFORE
+  its own grace, and can be killed later if a longer-grace member is torn down first, because the
+  loop is sequential. Found by an external stress run of a mixed compose stack, in its own numbers:
+  a service measured at 2005 ms alone took 3010 ms inside the stack.
 - **Four lines of help and docs that no longer matched the code.** Found by re-reading the text
   against measured behaviour rather than against itself. `kern wait`'s help still said "Wait for
   RUNNING box(es)" after it learned to answer for one that already exited. `prune`'s said it removes

@@ -4283,23 +4283,33 @@ impl Teardown {
     }
 }
 
-/// How long `stop` may still wait on one box: the time LEFT until the deadline the whole stack
-/// shares, in MILLISECONDS.
+/// How long `stop` may still wait on THIS box: its own `--stop-timeout`, minus the time already
+/// spent since the signal went out, in MILLISECONDS.
 ///
-/// Milliseconds, not seconds. The signal went out in phase 1, so every box counts down against the
-/// same deadline and the stack converges instead of queueing - but rounding that remainder down to a
-/// whole second silently spent up to 999 ms of a grace the caller asked for. MEASURED before the fix:
-/// `--stop-timeout 3` gave a 2.5 s flush only 2019 ms and SIGKILLed it mid-write, where Docker's
-/// `stop -t 3` let the same workload finish in 2799 ms and exit 5.
+/// Every box is signalled in phase 1, so a box's grace runs from THERE, not from the moment the
+/// teardown loop reaches it. That is what keeps a stack converging - an N-service stop costs
+/// max(grace), never the sum - and it is also why the remainder must be measured per box rather than
+/// against one deadline shared by the stack: a shared `max(grace)` hands every member the LONGEST
+/// grace configured anywhere in the file. MEASURED on a two-service stack, one asking 4 s and one
+/// asking 1 s, both hanging in their handler: the 1 s service was killed at 5154 ms. Its own
+/// `stop_grace_period` is an upper bound, and it was exceeded five times over. With this it is
+/// killed as soon as its own second is spent, and the stack still finishes in max(grace).
 ///
-/// `has_grace` boxes whose deadline has ALREADY passed keep one more second on the graceful path
-/// rather than dropping to the SIGKILL: the deadline is there to bound a stack, not to punish the
-/// box that happens to be last in the loop. A box configured with no grace at all still gets zero.
-fn remaining_grace_ms(left: std::time::Duration, has_grace: bool) -> u64 {
-    let floor = if has_grace { 1000 } else { 0 };
-    u64::try_from(left.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(floor)
+/// Milliseconds, not seconds: rounding the remainder down to a whole second silently spent up to
+/// 999 ms of a grace the caller asked for (`--stop-timeout 3` gave a 2.5 s flush only 2019 ms and
+/// SIGKILLed it mid-write, where Docker's `stop -t 3` let it finish in 2799 ms and exit 5).
+///
+/// A box configured with no grace at all gets zero, which is the straight-to-SIGKILL path.
+///
+/// The bound this gives is one-sided, and deliberately so: a member is never SIGKILLed BEFORE its own
+/// grace, and can be killed later than it if a longer-grace member is torn down first, because the
+/// loop is sequential. Killing it exactly on its own second regardless of order would need concurrent
+/// waits; the stack total is max(grace) either way, and erring late costs a wait where erring early
+/// would cut a real shutdown short.
+fn remaining_grace_ms(own_grace_secs: u64, since_signal: std::time::Duration) -> u64 {
+    let own = own_grace_secs.saturating_mul(1000);
+    let spent = u64::try_from(since_signal.as_millis()).unwrap_or(u64::MAX);
+    own.saturating_sub(spent)
 }
 
 fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_ms: u64) -> Teardown {
@@ -13601,8 +13611,9 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     // workloads that ignore SIGTERM took N x grace (measured: 20 s for two `sh -c sleep` services).
     // Docker stops a project in parallel; so do we. The per-box wait below then sees processes that
     // have already been signalled and, for the ones that exit, returns at once.
-    let stop_deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(targets.iter().map(|b| b.stop_grace).max().unwrap_or(0));
+    // When the signal went out. Each box's own grace is measured from here, so a member that asked
+    // for less is not held to the longest grace in the stack - see `remaining_grace_ms`.
+    let signalled_at = std::time::Instant::now();
     // Hold every target's reaper BEFORE a single signal goes out, so each box's exit status is still
     // readable when its wait returns. Kept alive to the end of the teardown loop and released by
     // `Drop`; a box with no grace has nothing to observe and holds nothing. See `ReaperHold`.
@@ -13709,10 +13720,8 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                 } else {
                     libc::SIGTERM
                 },
-                remaining_grace_ms(
-                    stop_deadline.saturating_duration_since(std::time::Instant::now()),
-                    b.stop_grace > 0,
-                ),
+                // What is LEFT of this box's own grace, counted from the phase-1 signal.
+                remaining_grace_ms(b.stop_grace, signalled_at.elapsed()),
             )
         };
         // A `stop` signals the supervisor's group, so the supervisor never records its own exit code.
@@ -17841,21 +17850,23 @@ mod image_rm_tests {
     #[test]
     fn remaining_grace_keeps_the_milliseconds_it_was_given() {
         use std::time::Duration;
-        // The defect: 2999 ms left used to be spent as 2000.
-        assert_eq!(
-            remaining_grace_ms(Duration::from_millis(2999), true),
-            2999,
-            "a remainder must not be rounded down to a whole second"
-        );
-        assert_eq!(remaining_grace_ms(Duration::from_millis(1), true), 1000);
-        assert_eq!(remaining_grace_ms(Duration::from_millis(1500), true), 1500);
-        // Deadline already passed: a box that wants a grace keeps the one-second floor...
-        assert_eq!(remaining_grace_ms(Duration::ZERO, true), 1000);
-        // ...and one configured without a grace still goes straight to the SIGKILL.
-        assert_eq!(remaining_grace_ms(Duration::ZERO, false), 0);
-        assert_eq!(remaining_grace_ms(Duration::from_millis(900), false), 900);
-        // A degenerate deadline saturates instead of wrapping into a short wait.
-        assert_eq!(remaining_grace_ms(Duration::MAX, true), u64::MAX);
+        // Nothing spent yet: the box's own grace, in full and in milliseconds.
+        assert_eq!(remaining_grace_ms(3, Duration::ZERO), 3000);
+        // Part spent since the phase-1 signal: the REST of its own grace, to the millisecond. A
+        // whole-second truncation here spent up to 999 ms of what the caller asked for.
+        assert_eq!(remaining_grace_ms(3, Duration::from_millis(1)), 2999);
+        assert_eq!(remaining_grace_ms(3, Duration::from_millis(1500)), 1500);
+        // Its own grace is an UPPER bound: once spent, this box is SIGKILLed even if a longer-lived
+        // member of the same stack is still inside its own. Measured before this: a service asking
+        // 1 s in a stack whose longest ask was 4 s was killed at 5154 ms.
+        assert_eq!(remaining_grace_ms(1, Duration::from_millis(4000)), 0);
+        assert_eq!(remaining_grace_ms(3, Duration::from_millis(3000)), 0);
+        // Configured with no grace at all: straight to the SIGKILL, whatever the clock says.
+        assert_eq!(remaining_grace_ms(0, Duration::ZERO), 0);
+        assert_eq!(remaining_grace_ms(0, Duration::from_millis(500)), 0);
+        // Degenerate inputs saturate instead of wrapping into a short wait or a long one.
+        assert_eq!(remaining_grace_ms(u64::MAX, Duration::ZERO), u64::MAX);
+        assert_eq!(remaining_grace_ms(3, Duration::MAX), 0);
     }
 
     /// The mapping from a teardown to the recorded code: only a status we actually READ is reported
