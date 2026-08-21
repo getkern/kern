@@ -125,7 +125,10 @@ state of the tree; full detail is in the git history.
   a FOREGROUND box's own process, which would print `Stopped` in the user's terminal. It is also
   taken only for a box with a dedicated cgroup, the case where a `stop` killed mid-hold is
   recoverable: `kern ps` then shows the box ORPHANED and the next `kern stop` reaps its cgroup whole.
-  A box without one keeps the unguarded read rather than risking a stopped runner nothing can clear. Cost measured:
+  A box without one keeps the unguarded read rather than risking a stopped runner nothing can clear.
+  On such a host the recorded code is therefore BEST-EFFORT: measured at 1 run in 12 recording 137 for
+  a workload that exited 7, against 12 in 12 where a cgroup exists. It is not a timing window a caller
+  can wait out - the same 12 runs had the workload's handler installed for 800 ms before the stop. Cost measured:
   none. A single stop is 16.20 ms against a 16.23 ms baseline and `stop --all` of 50 boxes is 110 ms
   against 119 ms, because consolidating the `/proc` readers onto one `stat_field` (reading `stat`
   rather than the much more expensive `status`) paid for the two extra signals.

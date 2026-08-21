@@ -141,7 +141,7 @@ Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same
 | `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI for every box |
 | `rename` | `rename` | in place, pid unchanged |
 | `update` | `update` | live cgroup caps, no restart (needs a delegated cgroup) |
-| `wait` | `wait` | prints the exit code the workload itself exited with, including after a `stop` that let it shut down cleanly - `137` means it really was SIGKILLed; also resolves a box that has already exited, via its `waitexit` breadcrumb |
+| `wait` | `wait` | prints the exit code the workload itself exited with, including after a `stop` that let it shut down cleanly; also resolves a box that has already exited, via its `waitexit` breadcrumb. Reading that code back is exact where the box has its OWN cgroup (a delegated one, or its per-box systemd scope) and BEST-EFFORT where it does not: kern reads the init's status from its unreaped zombie, and only a box it can cap is a box whose reaper it can hold still for the read. On a host with no delegation a clean shutdown can therefore still record `137` - measured at 1 run in 12 there, against 12 in 12 where a cgroup exists. `kern doctor` says which host you are on |
 | `diff` | `diff` | overlay-upper changes: `C` changed/added, `D` deleted |
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |
