@@ -17,6 +17,19 @@
 set -eu
 kern="${KERN:-kern}"
 
+# Mirror kern's own precondition (the same check `multi-uid.sh` narrates): the official redis image drops privilege
+# in its entrypoint, which needs a subordinate uid RANGE, which needs the setuid `newuidmap` /
+# `newgidmap` helpers plus an /etc/subuid allocation. Without them kern warns and falls back to a
+# single-uid map, where that entrypoint fails on its own `chown` - not a kern defect and not
+# something this example can show, so it says which piece is missing and stops.
+if ! command -v newuidmap >/dev/null 2>&1 ||
+   ! grep -q "^$(id -un):" /etc/subuid 2>/dev/null; then
+    echo "SKIPPED: no uid RANGE available on this host (need the uidmap package and an"
+    echo "         /etc/subuid entry for $(id -un)). the official redis image cannot drop privilege without it."
+    exit 0
+fi
+
+
 vol="kern_redis_data"
 port="${PORT:-6379}"
 

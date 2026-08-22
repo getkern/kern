@@ -12,6 +12,17 @@
 # Done criterion: the two curls at the end return the notes we wrote.
 set -eu
 
+# Mirror kern's own precondition: the official postgres image drops privilege in its entrypoint,
+# which needs a subordinate uid RANGE, which needs the setuid `newuidmap`/`newgidmap` helpers plus
+# an /etc/subuid allocation. Without them kern falls back to a single-uid map and postgres fails on
+# its own chown - not a kern defect and not something this stack can demonstrate.
+if ! command -v newuidmap >/dev/null 2>&1 ||
+   ! grep -q "^$(id -un):" /etc/subuid 2>/dev/null; then
+    echo "SKIPPED: no uid RANGE available on this host (need the uidmap package and an"
+    echo "         /etc/subuid entry for $(id -un)). postgres cannot drop privilege without it."
+    exit 0
+fi
+
 KERN=${KERN:-kern}
 POD=stack-demo
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

@@ -25,6 +25,19 @@
 # port is taken, and it is). Run it with KEEP=0 to have it clean up after itself.
 set -eu
 kern="${KERN:-kern}"
+
+# Mirror kern's own precondition (the same check `multi-uid.sh` narrates): the in-box sshd (`--ssh`) drops privilege
+# in its entrypoint, which needs a subordinate uid RANGE, which needs the setuid `newuidmap` /
+# `newgidmap` helpers plus an /etc/subuid allocation. Without them kern warns and falls back to a
+# single-uid map, where that entrypoint fails on its own `chown` - not a kern defect and not
+# something this example can show, so it says which piece is missing and stops.
+if ! command -v newuidmap >/dev/null 2>&1 ||
+   ! grep -q "^$(id -un):" /etc/subuid 2>/dev/null; then
+    echo "SKIPPED: no uid RANGE available on this host (need the uidmap package and an"
+    echo "         /etc/subuid entry for $(id -un)). the in-box sshd (`--ssh`) cannot drop privilege without it."
+    exit 0
+fi
+
 img="${IMG:-web-ssh:demo}"
 name="${NAME:-edgeweb}"
 webport="${WEBPORT:-8080}"
