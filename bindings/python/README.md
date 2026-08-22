@@ -89,9 +89,12 @@ where cgroups cannot be delegated at all the old cost does return, so the option
 delegated host, turning it off buys nothing and costs the caps. **Leave it on.**
 
 `run_code` runs *Python code*, so it pays the **CPython interpreter start** on top of the box, that's
-a Python cost, not kern's, and it is why `run_code` is 13.9 ms against the bare box's 4.2. Even so:
-**13.9 ms against Docker's 285 ms is about 20× faster** for the same task, and we quote the number you
-get from `run_code`, never the bare-box best case dressed up as the code-execution number.
+a Python cost, not kern's, and it is why `run_code` is ~17 ms against the bare box's ~3.9. Even so:
+**~17 ms against `docker run python:3.12-alpine python -c pass` at ~309 ms is about 18× faster** for the
+same task, and we quote the number you get from `run_code`, never the bare-box best case dressed up as
+the code-execution number. Measured 2026-08-22 on an idle x86_64 desktop against the released binary and
+SDK 0.1.23: three runs of 40 read 17.1, 17.0 and 16.7 ms, the bare box 3.9, docker's median of seven
+309.2.
 
 **Concurrency**: 100 concurrent `run_code` calls on one `Sandbox`, 100/100 succeeded, zero leaked
 boxes, measured in the same session as the table above:
