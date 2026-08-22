@@ -313,7 +313,7 @@ machine, same images, real commands, timed with the shell.
 | `exec` into a running service | **0.79 ms** | 43.3 ms | 148.6 ms |
 | list what is running (`ps`) | **0.30 ms** | 8.2 ms | 13.5 ms |
 | read logs | **0.35 ms** | 8.2 ms | 37.5 ms |
-| stop a service (init handles SIGTERM) | **4.6 ms** | 126.8 ms | 199.7 ms |
+| stop a service (init handles SIGTERM) | **3.8 ms** | 136.1 ms | 199.2 ms |
 | stop nginx (the same image on all three) | **48.5 ms** | 187.2 ms | 256.9 ms |
 | bring a 2-service stack up | **188 ms** | 292 ms | 1022 ms |
 | stop that stack | **77 ms** | 263 ms | 496 ms |
@@ -338,7 +338,7 @@ measures an init that *does* handle the signal.
 SECOND, the two runtimes do not signal the same set of processes. Docker and Podman send the stop
 signal to PID 1 only; kern also signals the box's process group, so a shell blocked in `sleep 0.5`
 wakes at once instead of when its child happens to finish. On that shape of workload the same table
-row reads 4.9 ms against 346.7 and 364.5 - a 70x that is mostly the sleeping child, not the runtime.
+row reads 3.9 ms against 301.2 and 359.7 - a 77x that is mostly the sleeping child, not the runtime.
 The rows above therefore use an init that handles SIGTERM in a handler and returns immediately (a
 static C binary, `signal(SIGTERM)` + `pause()`, the same binary bind-mounted into all three), which
 is the comparison where only the runtime differs.
