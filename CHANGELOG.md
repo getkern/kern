@@ -8,10 +8,13 @@ renaming one is the breaking change the minor-bump rule covers. A `cli_surface_i
 snapshots the surface and fails the build on any undocumented change. Internal config-file keys may still evolve, but
 scripts and SDKs written against the CLI can rely on it. Install the release binary with
 `curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh`, or build from source
-with `cargo install --git https://github.com/getkern/kern getkern --locked`. What follows is the current
-state of the tree; full detail is in the git history.
+with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
+is in the git history.
 
-## Current
+## v0.7.0 - 2026-08-22
+
+The first published release: static binaries for x86_64 and aarch64, a Windows shim and a WSL rootfs,
+each with a `.sha256`, from a GPG-signed and independently timestamped tag. Everything below shipped in it.
 
 ### Security
 
