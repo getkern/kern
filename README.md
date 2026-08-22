@@ -181,8 +181,8 @@ binary. Every call runs in a fresh isolated box: network off, memory and pid cap
 dropped, output bounded, and a timeout the binding itself enforces.
 
 ```sh
-pip install kern-sandbox        # PyPI
-npm  install kern-sandbox       # npm
+pip install kern-sandbox        # PyPI   · needs the `kern` binary above, on PATH or $KERN_BIN
+npm  install kern-sandbox       # npm    · same
 ```
 
 ```python
