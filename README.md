@@ -49,10 +49,10 @@ and a stack runner at once, in 1.58 MB with no daemon.
 - **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
   `doctor`, plus a Python and Node SDK and an MCP server for agents.
 
-It carries only what it has to: the entire Rust dependency tree is `libc`, JSON and OCI manifests are
-parsed by hand, and `pull` uses the `curl` and `tar` already on the machine instead of linking a TLS
-stack and a decompressor. A box from a `--rootfs` needs neither. (1.58 MB is the size-optimized
-release build; what you get from `cargo install` today, before any release is published, is ~2 MB.)
+Its entire Rust dependency tree is `libc`: JSON and OCI manifests are parsed by hand, and `pull`
+shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack. (1.58 MB
+is the size-optimized release build; `cargo install`, which is what you get until a release exists,
+is ~2 MB.)
 
 <p align="center">
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one 1.58 MB static binary, no daemon.">
@@ -192,12 +192,11 @@ r = run_code("import platform; print(platform.python_version())")
 print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
 ```
 
-- **Fresh box per call** by default; a `Sandbox` persists a workspace across calls, and a warm
-  `kernel()` keeps one interpreter for sub-millisecond cells (weaker isolation, by choice).
 - **Faults are data, not exceptions**: a timeout, OOM-kill or blocked syscall is a field on the
-  result; only a box that failed to *start* raises.
-- **Rich results without a Jupyter kernel**: the last expression, `display()`, and matplotlib figures
-  are captured, like a notebook cell.
+  result, not a raise. A fresh box per call by default; `Sandbox` keeps a workspace across calls and
+  a warm `kernel()` keeps one interpreter for sub-millisecond cells (weaker isolation, by choice).
+- **Rich results without a Jupyter kernel**: the last expression, `display()` and matplotlib figures
+  come back captured, like a notebook cell.
 - Ships an **MCP server** (`kern-mcp`): a dependency-free stdio server that gives Claude Desktop,
   Cursor or any MCP client a local code interpreter. Point the client at it:
 
@@ -217,6 +216,9 @@ Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md
 A slice is declared once in `~/.config/kern/kern.toml` and attached by name, to a sandboxed box or a
 bare process, with the same token.
 
+Three kinds: `vcpu:` (CPU and memory), `vdisk:` (a size-capped scratch disk) and `vgpio:` (device
+nodes). Two of them, and the anchors they are carved from:
+
 ```toml
 [[cpu]]                     # the host budget a slice is carved from
 id    = "cpu:0"
@@ -227,15 +229,6 @@ name    = "heavy"
 backend = "cpu:0"
 cpus    = 1.5
 memory  = "512m"
-
-[[disk]]                    # a physical pool a vdisk can be placed on
-id   = "pool"
-path = "/var/lib/kern/disks"
-
-[[vdisk]]                   # a 64 MiB scratch disk   ->  attach as  vdisk:scratch
-name    = "scratch"
-backend = "disk:pool"       # or "ram" for a RAM-backed tmpfs, with no [[disk]] block at all
-size    = "64m"
 
 [[gpio]]                    # a controller anchor
 id = "gpio:0"
@@ -299,15 +292,9 @@ A thousand simultaneous boxes take ~0.60 s, all 1000 of them. One more live box 
 memory (100 boxes measured 26.3 MB against 13 MB of ambient drift over the same interval, so read the
 per-box figure as approximate). `exec` into a running box is ~0.93 ms against Docker's ~41.5.
 
-**Every figure above reproduces.** Cold start 2.2 then and 2.3 now, concurrency 0.09 both times,
-`exec` 0.79 then and 0.93 now, all inside the run-to-run spread the paragraph below describes.
-
-One warning for anyone re-measuring by hand, because it cost an hour here: a shell loop that calls
-`date` around each run charges the measurement for its own forks. Two `date` calls cost **1.26 ms**
-on this machine, which turned a 0.93 ms `exec` into 1.6 and a 3.5 ms image start into 4.3 - a
-"regression" that vanished when the same loop was run against the binary from before any of these
-changes and measured exactly the same inflated number. Use `examples/benchmark.py`, or bash's
-`$EPOCHREALTIME` around a batch, and divide.
+Every figure above reproduces against 2026-08-01: cold start 2.2 then and 2.3 now, concurrency
+0.09 both times, `exec` 0.79 then and 0.93 now. How to re-measure without fooling yourself, and what
+the run-to-run spread costs: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 Nobody wins single-shot latency outright: the physical floor for `unshare` + `exec` is 1 to 2 ms, so
 the top tier sits inside its own run-to-run noise. At the same level of work kern is ahead of

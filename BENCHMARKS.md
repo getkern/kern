@@ -25,6 +25,14 @@ KERN=./target/release/kern python3 examples/benchmark.py --runs 500 --conc 100
 
 The remaining sections are measured by hand with the commands shown inline.
 
+**Measuring it by hand: do not pay for your own instrument.** A shell loop that calls `date` around
+each run charges the measurement for its own forks. Two `date` calls cost **1.26 ms** on this
+machine, which turned a 0.93 ms `exec` into 1.6 and a 3.5 ms image start into 4.3 - a "regression"
+that vanished when the same loop was run against a build from before the change under test and
+measured exactly the same inflated number. Use the script above, or bash's `$EPOCHREALTIME` around a
+batch of 100 and divide. The concurrency row is sensitive to what ran BEFORE it, too: measured
+immediately after 200 parallel podman containers it reads 0.25 s against 0.09 on a quiet machine.
+
 ## Cold start, one isolated `/bin/true`
 
 Time per run, total divided by 200 sequential runs.
