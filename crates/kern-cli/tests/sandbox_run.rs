@@ -776,6 +776,33 @@ fn a_signal_to_a_foreground_box_reports_the_workloads_code_and_the_second_always
     let rootfs = root.to_str().unwrap();
     let pid = std::process::id();
 
+    // POSITIVE CONTROL, and the only honest way to skip here. A signalled box is watched through its
+    // exit CODE, so "the host cannot run a box" and "the contract is broken" arrive on the same
+    // channel: the first version of this test guessed which codes meant the former (126/127) and a
+    // GitHub runner answered 1, turning an environment into a red build. So the question is asked
+    // separately, of a box that is not signalled at all - if THAT cannot run, nothing below can be
+    // read, and kern's own stderr is the reason printed.
+    let control = kern()
+        .args([
+            "box",
+            &format!("fgsigctl-{pid}"),
+            "--rootfs",
+            rootfs,
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .output()
+        .expect("run kern");
+    if !control.status.success() {
+        eprintln!(
+            "skip: this host cannot start a plain foreground box: {}",
+            String::from_utf8_lossy(&control.stderr).trim()
+        );
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+
     // (what the init does with SIGTERM, how many signals we send, the code kern must exit with)
     let cases = [
         ("trap 'exit 42' TERM", 1, 42),
@@ -784,6 +811,10 @@ fn a_signal_to_a_foreground_box_reports_the_workloads_code_and_the_second_always
     ];
     for (trap, signals, want) in cases {
         let name = format!("fgsig{signals}-{pid}");
+        // kern's stderr goes to a file rather than to /dev/null: a box that fails to start for a
+        // reason the control did not hit must say so in the failure message, not leave a bare number.
+        let errlog = std::env::temp_dir().join(format!("kern-{name}.err"));
+        let err = fs::File::create(&errlog).expect("create stderr log");
         let mut child = kern()
             .args([
                 "box",
@@ -797,28 +828,54 @@ fn a_signal_to_a_foreground_box_reports_the_workloads_code_and_the_second_always
                 &format!("{trap}; while :; do sleep 0.2; done"),
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(err))
             .spawn()
             .expect("spawn kern");
-        // Let the shell install its trap first: signalling before that tests the startup race, not the
-        // shutdown contract.
-        std::thread::sleep(std::time::Duration::from_millis(900));
+        // WAIT for the box to be observably up, do not sleep and hope. Signalling a box that has not
+        // started yet tests the startup race and not the shutdown contract, and how long a start takes
+        // is a property of the host: measured in milliseconds here, and slow enough on a cold CI runner
+        // that a fixed sleep is a coin toss. `ps` answering with this box's name is the fact itself.
+        let mut up = false;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let ps = kern().args(["ps", "--json"]).output().expect("run kern");
+            if String::from_utf8_lossy(&ps.stdout).contains(name.as_str()) {
+                up = true;
+                break;
+            }
+            // The box can also have died on its own; then there is nothing to signal and nothing to
+            // read, and the reason is in kern's stderr below.
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+        }
+        if !up {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "skip: the box never came up on this host: {}",
+                fs::read_to_string(&errlog).unwrap_or_default().trim()
+            );
+            let _ = fs::remove_file(&errlog);
+            continue;
+        }
+        // The shell needs its trap installed, which happens at its first instruction, after the box is
+        // listed. One short settle is honest here: it is bounded work, not a start of unknown length.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         for _ in 0..signals {
             unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
             std::thread::sleep(std::time::Duration::from_millis(400));
         }
         let status = child.wait().expect("wait kern");
-        // A host where the box could not start at all reports 127/126 from kern's own start path; that
-        // is an environment answer, not a contract answer, so it skips rather than fails.
         let code = status.code().unwrap_or(-1);
-        if code == 126 || code == 127 {
-            eprintln!("skip: box did not start here (kern exited {code})");
-            continue;
-        }
+        let said = fs::read_to_string(&errlog).unwrap_or_default();
+        let _ = fs::remove_file(&errlog);
         assert_eq!(
-            code, want,
+            code,
+            want,
             "a foreground box whose init does `{trap}`, sent {signals} SIGTERM(s), must make kern \
-             exit {want}"
+             exit {want}; kern said: {}",
+            said.trim()
         );
     }
     let _ = fs::remove_dir_all(&root);
