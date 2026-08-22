@@ -4,10 +4,10 @@
 
 **kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
 
-**A real, kernel-enforced container in ~3.4 ms, out of one 1.58 MB binary with no daemon.**
+**A real, kernel-enforced container in ~3.6 ms, out of one 1.58 MB binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.4 ms against docker run's 291 ms. A real OCI image, rootless, a 1.58 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.6 ms against docker run's 290 ms. A real OCI image, rootless, a 1.58 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
@@ -269,7 +269,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
 | Cold start, bare box | **~2.3 ms** | ~296 ms | ~288 ms |
-| Cold start, from an OCI image | **~3.5 ms** | ~296 ms | ~288 ms |
+| Cold start, from an OCI image | **~3.6 ms** | ~290 ms | ~290 ms |
 | Stop a service (init handles SIGTERM) | **~4.6 ms** | ~127 ms | ~200 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.58 MB binary** | daemon stack | multi-binary install |

@@ -301,7 +301,7 @@ machine, same images, real commands, timed with the shell.
 
 | what you actually type | kern | docker | podman |
 |---|---:|---:|---:|
-| a throwaway box (`run … true`) | **3.4 ms** | 290.8 ms | 290.5 ms |
+| a throwaway box (`box --image … true`) | **~3.6 ms** | ~290 ms | ~290 ms |
 | `exec` into a running service | **0.79 ms** | 43.3 ms | 148.6 ms |
 | list what is running (`ps`) | **0.30 ms** | 8.2 ms | 13.5 ms |
 | read logs | **0.35 ms** | 8.2 ms | 37.5 ms |

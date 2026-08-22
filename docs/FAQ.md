@@ -6,7 +6,7 @@ Short, honest answers to the questions that come up first. The threat model in f
 ## Is kern a Docker replacement?
 
 Partly. kern speaks Docker's **formats** (OCI images, `docker-compose.yml`, Dockerfiles), not its API.
-It starts a real, kernel-enforced container from an OCI image in ~3.4 ms against `docker run`'s ~291 ms,
+It starts a real, kernel-enforced container from an OCI image in ~3.6 ms against `docker run`'s ~290 ms,
 with no daemon, rootless by default, and 0 RAM at rest. It has no overlay networks, no plugin
 ecosystem and no Swarm; it does not implement CRI (for Kubernetes, use containerd or CRI-O). Reach for
 kern where the daemon, the root, and the hundreds of milliseconds hurt: agent tool-calls, CI jobs,

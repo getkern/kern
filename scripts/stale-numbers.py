@@ -53,22 +53,17 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         "It moves with the Docker version and with what the daemon has done, so it is a range.",
         {"BENCHMARKS.md"},  # explains the history of this very number
     ),
-    (
-        # Anchored on the CLAIM, not on the digits. An unanchored `3.6 ms` fired on "about 3.6 ms
-        # per network round trip", a measurement of pasta that has nothing to do with a cold start,
-        # and a gate that cries wolf is a gate that gets switched off. The figure only matters when
-        # it is next to the thing it measures, so the pattern requires one of those words on the
-        # same line.
-        # `\s*` and not a literal space: the launch post writes `3.6ms`, and the first version of
-        # this rule required `3.6 ms`, so the gate stayed silent on the one document it mattered
-        # most for. Same for every other rule here. A gate that only matches the spelling you
-        # happened to use when you wrote it is a gate for that document alone.
-        r"\b3\.6\s*ms\b(?=[^\n]{0,80}(?:cold|start|box))"
-        r"|(?:cold|start|box)[^\n]{0,80}\b3\.6\s*ms\b",
-        "3.4 ms",
-        "cold start from an OCI image; the README table and BENCHMARKS.md both measure 3.4.",
-        set(),
-    ),
+    # No STALE rule for the OCI-image cold start any more, and the reversal is the point. This file
+    # used to pin it at 3.4 ms and flag 3.6 as the stale one. Re-measured 2026-08-22 on the same
+    # machine, quiet, five batches of 100 with `$EPOCHREALTIME` around each batch: 3.62 ms, median of
+    # medians, min 3.51 max 3.77 - and BENCHMARKS.md's own cold-start table had said 3.61 all along
+    # while its working-day table said 3.4. The gate had picked the flattering half of a document
+    # that disagreed with itself, and then enforced it across seven files. A blacklist cannot be
+    # trusted to hold the right end of a drift, so this claim moves to `latency_claims_agree()`
+    # below: an agreement check has no opinion about which value is true, only that one value is
+    # written everywhere. Inverting the blacklist was tried first and rejected - "3.4 ms" is a TRUE
+    # statement in this repo (WSL2, cap enforced, a different host), so the rule would have fired on
+    # a correct line, which is how a gate gets switched off.
     # No STALE rule for the binary size. It was tried and removed: a bare "1.7 MB" also names the RSS
     # of three processes in BENCHMARKS.md, and "1.81 MB" is the recorded measurement of an earlier
     # release in the binary-size entry of OPEN_ITEMS.md. Both are correct where they stand, so the
@@ -314,6 +309,56 @@ def size_claims_agree() -> list[str]:
     return bad
 
 
+def latency_claims_agree() -> list[str]:
+    """The OCI-image cold start claimed anywhere must equal the one the README states.
+
+    The twin of [`size_claims_agree`], for the same reason and after the same failure: on 2026-08-22
+    that figure read 3.4 ms in the README headline, the GIF generator, both binding READMEs, the FAQ
+    and the launch post, 3.5 in the README's own comparison table, and 3.61 in BENCHMARKS.md's
+    cold-start table - one measurement with seven homes and three values. Re-measured the same day it
+    is 3.62 ms, so the 3.4 that six of those files carried was the flattering end of the drift.
+
+    An agreement check rather than a blacklist, because there is exactly one right answer and the
+    README holds it: this cannot fire on a true statement, and it does not need to be re-taught when
+    the number is measured again - only the README has to be edited, and every other claimant is then
+    checked against it.
+    """
+    readme = re.search(
+        r"kernel-enforced container in\s+~?([\d.]+)\s*ms", open("README.md", encoding="utf-8").read()
+    )
+    if not readme:
+        return ["README.md no longer states the image cold start in its headline, so nothing can be "
+                "checked against it. Restore the claim or drop this check."]
+    canonical = readme.group(1)
+    claim = re.compile(
+        r'KERN_MS\s*=\s*"~?([\d.]+)\s*ms"'
+        r'|from an OCI image in ~?([\d.]+)\s*ms'
+        r'|starts in \*\*~?([\d.]+)\s*ms\*\* from an OCI image'
+        r'|~?([\d.]+)\s*ms with `--image`'
+    )
+    bad = []
+    for path in (
+        "assets/make-demo-gif.py",
+        "docs/FAQ.md",
+        "bindings/python/README.md",
+        "bindings/node/README.md",
+        "blog/introducing-kern.md",
+    ):
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue  # a claimant that no longer exists is not a disagreement
+        for lineno, line in enumerate(text.split("\n"), 1):
+            for m in claim.finditer(line):
+                said = next(g for g in m.groups() if g)
+                if said != canonical:
+                    bad.append(
+                        f"{path}:{lineno} claims a {said} ms image cold start, "
+                        f"README.md says {canonical} ms"
+                    )
+    return bad
+
+
 def scan(path: str) -> list[tuple[int, str, str, str, str]]:
     try:
         text = open(path, encoding="utf-8").read()
@@ -378,6 +423,12 @@ def main(argv: list[str]) -> int:
         print(f"\n{problem}")
         print("       the signed-tag and timestamp counts are a trust claim, and both are "
               "countable from this repository. Count them.")
+    for problem in latency_claims_agree():
+        total += 1
+        print(f"\n{problem}")
+        print("       one measurement, several homes: the headline is canonical and every other "
+              "claimant is checked against it. Edit README.md first, then the others; if the GIF "
+              "generator moved, re-run it: python3 assets/make-demo-gif.py")
     for problem in size_claims_agree():
         total += 1
         print(f"\n{problem}")
