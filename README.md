@@ -268,8 +268,8 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.2 ms** | ~294 ms | ~281 ms |
-| Cold start, from an OCI image | **~3.4 ms** | ~294 ms | ~281 ms |
+| Cold start, bare box | **~2.3 ms** | ~296 ms | ~288 ms |
+| Cold start, from an OCI image | **~3.5 ms** | ~296 ms | ~288 ms |
 | Stop a service (init handles SIGTERM) | **~4.6 ms** | ~127 ms | ~200 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.58 MB binary** | daemon stack | multi-binary install |
@@ -280,24 +280,33 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 
 ## Performance
 
-Measured 2026-08-01 on an Intel i7-14700KF, Linux 7.0.0, against the runtimes installed there. Every
-number comes from one script you can run yourself, `python3 examples/benchmark.py`. Medians on that
-machine; yours will differ with your CPU, kernel and filesystem, which is why the table above rounds.
+Re-measured 2026-08-22 on an Intel i7-14700KF, Linux 7.0.0, with the **release-optimized binary**
+(1.58 MB, the one a release ships), against the runtimes installed there. Every number comes from one
+script you can run yourself, `python3 examples/benchmark.py`. Medians on that machine; yours will
+differ with your CPU, kernel and filesystem, which is why these are approximate.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **2.2 ms** | 3.0 ms | 13.2 ms | 281.5 ms | 294.4 ms |
-| 200 boxes in parallel | **0.09 s** | 0.19 s | 0.30 s | 41.8 s | 16.6 s |
+| Cold start (bare box) | **~2.3 ms** | ~2.7 ms | ~14.7 ms | ~288 ms | ~297 ms |
+| 200 boxes in parallel | **~0.09 s** | ~0.16 s | ~0.35 s | ~44.8 s | ~16.2 s |
 
-A thousand simultaneous boxes take 0.61 s, all 1000 of them. One more live box costs 0.35 MB of real
-memory. `exec` into a running box is 0.79 ms against Docker's 43.3.
+A thousand simultaneous boxes take ~0.60 s, all 1000 of them. One more live box costs ~0.3 MB of real
+memory (100 boxes measured 26.3 MB against 13 MB of ambient drift over the same interval, so read the
+per-box figure as approximate). `exec` into a running box is ~0.93 ms against Docker's ~41.5.
 
-Re-run on 2026-08-03: 2.3 ms, 0.10 s, `exec` 0.66 ms. The whole table moved by that much on the day,
-**bubblewrap included**, which is the machine's state rather than kern's code.
+**Every figure above reproduces.** Cold start 2.2 then and 2.3 now, concurrency 0.09 both times,
+`exec` 0.79 then and 0.93 now, all inside the run-to-run spread the paragraph below describes.
+
+One warning for anyone re-measuring by hand, because it cost an hour here: a shell loop that calls
+`date` around each run charges the measurement for its own forks. Two `date` calls cost **1.26 ms**
+on this machine, which turned a 0.93 ms `exec` into 1.6 and a 3.5 ms image start into 4.3 - a
+"regression" that vanished when the same loop was run against the binary from before any of these
+changes and measured exactly the same inflated number. Use `examples/benchmark.py`, or bash's
+`$EPOCHREALTIME` around a batch, and divide.
 
 Nobody wins single-shot latency outright: the physical floor for `unshare` + `exec` is 1 to 2 ms, so
 the top tier sits inside its own run-to-run noise. At the same level of work kern is ahead of
-bubblewrap on **every host where both are installed**, 2.2 ms against 2.9 here, 3.5 against 5.6 on a
+bubblewrap on **every host where both are installed**, ~2.3 ms against ~2.7 here, 3.5 against 5.6 on a
 Jetson, 9.6 against 15.0 on an Arduino, and still ahead at 4.2 and 11.3 while enforcing a cgroup cap
 bubblewrap does not enforce at all. bubblewrap is a launcher with no images, caps or lifecycle. The
 gap that matters is to the engines, 128 to 134x above. Method, per-phase breakdown, board numbers
