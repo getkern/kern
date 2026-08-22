@@ -198,7 +198,16 @@ print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape 
   result; only a box that failed to *start* raises.
 - **Rich results without a Jupyter kernel**: the last expression, `display()`, and matplotlib figures
   are captured, like a notebook cell.
-- Ships an **MCP server** (`kern-mcp`) for Claude Desktop and Cursor.
+- Ships an **MCP server** (`kern-mcp`): a dependency-free stdio server that gives Claude Desktop,
+  Cursor or any MCP client a local code interpreter. Point the client at it:
+
+```json
+{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
+```
+
+Tools: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`. Each call is a fresh
+network-off box; files persist across calls in a workspace on disk. Setup command, image and the
+other options: [bindings/python/README.md](bindings/python/README.md).
 
 Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md) ·
 [bindings/node/README.md](bindings/node/README.md).
@@ -244,18 +253,14 @@ kern run vcpu:heavy -- ./train.sh            # the same slice, no sandbox
 kern box iot --image alpine vgpio:sensor -- ls /dev
 ```
 
-Declare as many `[[disk]]` pools as you have, one path each, and give a `vdisk:` exactly one
-`backend`: a pool id or `ram`. There is no "disk and ram", but several `vdisk:` with different
-backends attach to one box, each with its own cap. A backend naming no declared pool is refused when
-the config is read, not when the box runs.
+Profiles compose: several attach to one box, and an explicit flag beats a profile's own value. Every
+key is spelled like its CLI flag, so `cpus` is `--cpus` and `memory` is `--memory`. A backend naming
+no declared pool is refused when the config is read, not when the box runs.
+[docs/RESOURCES.md](docs/RESOURCES.md) has the field-by-field schema.
 
 A `vdisk:` is a RAM-backed tmpfs when kern runs rootless, whatever its backend says, and an
-ext4-on-loop image with a real disk quota when it runs privileged in the foreground. kern says which
-one you got, per profile, rather than letting you assume, and the size cap is enforced either way.
-
-Profiles compose: several attach to one box, and an explicit flag beats a profile's own value. Every
-key is spelled like its CLI flag, so `cpus` is `--cpus` and `memory` is `--memory`.
-[docs/RESOURCES.md](docs/RESOURCES.md) has the field-by-field schema.
+ext4-on-loop image with a real quota when it runs privileged. kern says which one you got, per
+profile, rather than letting you assume, and the size cap is enforced either way.
 
 **`vgpio:` is chip-granular, not per-line.** Asking for `pins` binds the whole `/dev/gpiochipN`, and
 that character device exposes every line of that controller. `pins = [17]` does not restrict the box
