@@ -61,9 +61,12 @@ release build; what you get from `cargo install` today, before any release is pu
 ## What kern is not
 
 - **Not a hypervisor.** The boundary is the Linux kernel, so a kernel privilege-escalation bug is an
-  escape. Docker and Podman share that condition, which is why gVisor and Firecracker exist; for
-  actively hostile multi-tenant code, reach for one of those. kern's ground is your own or
-  semi-trusted code, and it starts on the other side of the root question: rootless always.
+  escape. Docker and Podman share that condition, which is why gVisor and Firecracker exist.
+
+  Read with the tagline, that is one line seen from both sides: untrusted and AI-generated code is
+  what kern is FOR, because you chose to run it and own the blast radius (agent tool-calls, CI jobs,
+  build steps, code cells). What it is not for is hostile code from strangers, multi-tenant, on a
+  kernel you serve other tenants from. kern does start rootless always, where Docker's is opt-in.
 - **Not free of the userns trade.** Its isolation is built on an unprivileged user namespace, a
   fertile source of kernel LPE bugs. [SECURITY.md](SECURITY.md) states this before any claim.
 - **Not a wall around what you mount in.** `-v $HOME:/host` gives the box your home directory: a
