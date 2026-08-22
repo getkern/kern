@@ -1,7 +1,7 @@
 # Introducing kern: a container runtime that does less than Docker, on purpose
 
 *A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and
-AI-generated code. One ~1.58 MB static binary, one Rust dependency (`libc`), no daemon. It starts a
+AI-generated code. One ~1.59 MB static binary, one Rust dependency (`libc`), no daemon. It starts a
 real, kernel-enforced box in 2.2 ms, embeds from Python or Rust, and runs the same on a laptop, in
 CI, or on a Raspberry Pi.*
 
@@ -50,7 +50,7 @@ print(r.stdout, r.success)                     # → a fresh box, discarded afte
 Safe by default: every *relaxing* argument (`network=True`, extra `mounts`) has to be spelled out, and
 the binding owns the timeout, so a `timeout` fault is a fact, not a guess. There's a Rust crate
 (`kern-isolation`, `Sandbox::builder()`) with the same story. This is microVM-grade isolation territory, but
-*local* and ~1.58 MB, no cloud, no account, no VM.
+*local* and ~1.59 MB, no cloud, no account, no VM.
 
 ## Fast, and honest about it
 
@@ -68,7 +68,7 @@ One isolated `/bin/true`, warm image cache, on an x86_64 desktop (Linux 6.17, me
 The honest version: **nobody wins single-shot latency outright**: the top tier is all within a couple
 of milliseconds, i.e. noise. kern leads that tier while being the only one of them that ships a full
 daemonless container UX (OCI pull *and build*, overlay, volumes, secrets, `ps`/`exec`/`logs`, compose)
-in ~1.58 MB. The real gap is to the *engines*: **~80-133× faster to start** than podman/Docker (the
+in ~1.59 MB. The real gap is to the *engines*: **~80-133× faster to start** than podman/Docker (the
 spread is the two kern paths: 2.2 ms with `--rootfs`, ~3.6 ms with `--image`, which also maps a uid
 range), which
 fork `conmon` or round-trip a daemon every run, and kern keeps **0 RAM resident** where Docker holds
@@ -99,7 +99,7 @@ test you hope exists, [that's a separate post](what-the-type-system-buys-you.md)
 
 That's strong for first-party and semi-trusted workloads, CI, dev, edge, your own agents' code. It is
 **not** a hardware-virtualization boundary. For actively hostile, multi-tenant, untrusted code where
-you want a VM boundary, reach for a microVM, a deliberate trade for 2.2 ms starts and a ~1.58 MB
+you want a VM boundary, reach for a microVM, a deliberate trade for 2.2 ms starts and a ~1.59 MB
 footprint. [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md) marks every guarantee
 that's cooperative or opt-in, and says exactly when to use kern versus a microVM.
 
