@@ -5,10 +5,10 @@
 never on a patch, and only after a deprecation entry here at least one release earlier. `--json`
 output is additive: new fields may appear, so consumers must **ignore unknown fields**; removing or
 renaming one is the breaking change the minor-bump rule covers. A `cli_surface_is_frozen` test
-snapshots the surface and fails the build on any undocumented change. The project is still pre-release
-in the sense that binaries are not published yet (build from source) and internal config-file keys may
-still evolve, but scripts and SDKs written against the CLI can rely on it. Build from source with
-`cargo install --git https://github.com/getkern/kern getkern --locked`. What follows is the current
+snapshots the surface and fails the build on any undocumented change. Internal config-file keys may still evolve, but
+scripts and SDKs written against the CLI can rely on it. Install the release binary with
+`curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh`, or build from source
+with `cargo install --git https://github.com/getkern/kern getkern --locked`. What follows is the current
 state of the tree; full detail is in the git history.
 
 ## Current

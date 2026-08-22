@@ -7,10 +7,29 @@ and a decompressor, which is most of why the release binary is 1.59 MB (a from-s
 ~2 MB; the size optimization is release-only). `kern doctor` reports whether both
 are present. This page is the long form of the [README](../README.md).
 
-kern is a **pre-release work in progress with no published binaries**, so every platform builds from
-source. It needs a Rust toolchain and a Linux kernel with unprivileged user namespaces and cgroup v2.
+Every release ships static binaries for `x86_64` and `aarch64`, each with a `.sha256` next to it, and
+the tag they were built from is GPG-signed and timestamped ([provenance/](../provenance/)). Building
+from source stays supported and needs a Rust toolchain. Either way the host needs a Linux kernel with
+unprivileged user namespaces and cgroup v2.
 
 **🐧 Linux & ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q), on `x86-64` or `aarch64`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+The script detects the architecture, downloads the matching `.tar.gz` from the latest release,
+**verifies its SHA256 and refuses to install on a mismatch**, and puts `kern` in `~/.local/bin`
+(`/usr/local/bin` as root; `KERN_INSTALL_DIR` overrides, `KERN_VERSION=vX.Y.Z` pins a release). To do
+it by hand, or on a host where piping a script into a shell is not acceptable:
+
+```sh
+curl -fsSLO https://github.com/getkern/kern/releases/latest/download/kern-x86_64-unknown-linux-musl.tar.gz{,.sha256}
+sha256sum -c kern-x86_64-unknown-linux-musl.tar.gz.sha256
+tar xzf kern-x86_64-unknown-linux-musl.tar.gz && install -Dm755 kern ~/.local/bin/kern
+```
+
+Or build it yourself:
 
 ```sh
 cargo install --git https://github.com/getkern/kern getkern --locked
@@ -56,7 +75,7 @@ first, and it is not an executable, so the Python and Node SDKs run **from Windo
 get the exe back, allow the folder the installer names in your antivirus and re-run the installer.
 Throughout, `wsl -d kern -- kern ...` and the SDKs run inside the distro are unaffected.
 
-**From source** (the only route today, since no binaries are published yet):
+**From source** (the route that needs no trust in a published artifact):
 
 ```sh
 cargo install --git https://github.com/getkern/kern getkern --locked

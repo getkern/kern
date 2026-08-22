@@ -19,8 +19,8 @@
 </div>
 
 ```sh
-# install from source (no published binaries yet, needs a Rust toolchain)
-cargo install --git https://github.com/getkern/kern getkern --locked
+# install the release binary (static, 1.59 MB, checksum-verified by the script)
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 
 # a throwaway shell in a real OCI image: rootless, kernel-enforced, a few ms
 kern box dev --image alpine -it -- sh
@@ -87,9 +87,24 @@ kern needs a Linux kernel with unprivileged user namespaces and cgroup v2. It ru
 and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q); there is **no native Windows** build, use
 WSL2 (kern ships a pre-baked WSL rootfs).
 
-There are no published binaries yet, so you build it from source. The whole dependency tree is one
-crate (`libc`), so this is short: clone, build and install took 36 s on a desktop (i7-14700KF),
-longer on a small ARM board.
+The quickest route is the release binary: one static file, no toolchain, and the script verifies its
+SHA256 before installing it.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+It picks `x86_64` or `aarch64` for you, installs to `~/.local/bin` (`/usr/local/bin` as root, or
+`KERN_INSTALL_DIR`), and refuses to install a download whose checksum does not match. Verifying by
+hand instead is two lines:
+
+```sh
+curl -fsSLO https://github.com/getkern/kern/releases/latest/download/kern-x86_64-unknown-linux-musl.tar.gz{,.sha256}
+sha256sum -c kern-x86_64-unknown-linux-musl.tar.gz.sha256 && tar xzf kern-x86_64-unknown-linux-musl.tar.gz
+```
+
+**From source** is the other route, and the whole dependency tree is one crate (`libc`), so it is
+short: clone, build and install took 36 s on a desktop (i7-14700KF), longer on a small ARM board.
 
 ```sh
 # if you do not have Rust yet
@@ -101,8 +116,8 @@ cargo install --git https://github.com/getkern/kern getkern --locked
 That puts `kern` in `~/.cargo/bin`, which rustup adds to your `PATH` (open a new shell, or
 `source "$HOME/.cargo/env"`, if `kern` is not found).
 
-Once a release is published, [`install.sh`](install.sh) fetches the binary for your architecture and
-verifies its SHA256 (`curl -fsSL .../install.sh | sh`); until then it has nothing to download.
+The release also ships an `aarch64` binary, a Windows `.exe` shim and a pre-baked WSL rootfs, each
+with its own `.sha256`; the tag is GPG-signed and independently timestamped ([provenance/](provenance/)).
 
 `kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the
