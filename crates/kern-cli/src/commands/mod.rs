@@ -48,7 +48,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}box{z} <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
-    {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [-- CMD...]           Run CMD in a running box
+    {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
     {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     {c}logs{z} <name> [--tail N] [-f|--follow]                           Show a box's output
     {c}stop{z} <name>... | --all                                         Stop box(es), or all

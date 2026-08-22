@@ -190,7 +190,7 @@ pub enum Command {
         /// `--config <path>`: a specific `kern.toml` for the profile tokens (parity with `box`).
         config: Option<String>,
     },
-    /// `kern exec <name> [-it] [--env K=V] [--workdir <dir>] [-- cmd...]`: run a command in a box.
+    /// `kern exec <name> [-it] [--env K=V] [--workdir <dir>] [--] [cmd...]`: run a command in a box.
     Exec {
         name: String,
         command: Vec<String>,
@@ -2400,7 +2400,8 @@ fn is_cpu_list(s: &str) -> bool {
     crate::config::is_cpu_list(s)
 }
 
-/// Parse `exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]`. Missing name → usage error.
+/// Parse `exec <name> [--env K=V] [--workdir <dir>] [--] [cmd...]`. Missing name → usage error.
+/// The `--` is OPTIONAL: trailing words are the command, as `docker exec <c> ls` reads.
 fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
     let mut name: Option<&str> = None;
     let mut env: Vec<String> = Vec::new();
@@ -2431,7 +2432,22 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
                     return Err(Error::Usage("exec: unknown flag (see --help)"))
                 }
                 s if name.is_none() => name = Some(s),
-                _ => {}
+                // The command WITHOUT the `--`, which is how `docker exec <c> ls` reads and how
+                // people type it. This arm used to be `_ => {}`: the words were parsed, dropped on
+                // the floor, and the empty command then defaulted to an interactive shell - so
+                // `kern exec box echo hi` printed NOTHING, exited 0, and looked like the command had
+                // run and produced no output. MEASURED that way before the fix. Taking arguments and
+                // silently doing something else is the one thing this codebase refuses to do; the
+                // separator stays supported and is still what the help shows for an ambiguous
+                // command, but omitting it can no longer lose what you typed.
+                //
+                // `after_dd` is set with the first word so the REST of the command is taken
+                // verbatim - `kern exec box ls -la` passes `-la` to `ls` rather than failing on an
+                // unknown kern flag, which is again what the same line does under docker.
+                s => {
+                    command.push(s.to_string());
+                    after_dd = true;
+                }
             }
         }
         i += 1;
@@ -2444,7 +2460,7 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
             workdir,
             tty,
         }),
-        None => Err(Error::Usage("exec <name> [-- cmd...]")),
+        None => Err(Error::Usage("exec <name> [--] [cmd...]")),
     }
 }
 
@@ -3928,6 +3944,38 @@ mod tests {
             parse(&["frobnicate".into()]),
             Err(Error::UnknownCommand(_))
         ));
+    }
+
+    /// A command typed WITHOUT the `--` is the command, not silence.
+    ///
+    /// It used to be dropped: `kern exec box echo hi` parsed the words, discarded them, and the empty
+    /// command then defaulted to an interactive shell - so the line printed nothing, exited 0, and
+    /// read exactly like a command that had run and produced no output. Measured that way. This is the
+    /// assertion that keeps the drop from coming back, and it covers the part that makes the feature
+    /// usable rather than merely present: everything after the first word goes to the COMMAND, flags
+    /// included, so `ls -la` reaches `ls` instead of failing on an unknown kern flag.
+    #[test]
+    fn exec_takes_the_command_with_or_without_the_separator() {
+        let cases: [(&[&str], &[&str]); 5] = [
+            (&["exec", "svc", "echo", "hi"], &["echo", "hi"]),
+            (&["exec", "svc", "--", "echo", "hi"], &["echo", "hi"]),
+            (&["exec", "svc", "ls", "-la"], &["ls", "-la"]),
+            (
+                &["exec", "svc", "-it", "sh", "-c", "id"],
+                &["sh", "-c", "id"],
+            ),
+            (&["exec", "svc"], &[]), // no command at all is still the interactive default
+        ];
+        for (argv, want) in cases {
+            let args: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            match parse(&args).unwrap().1 {
+                Command::Exec { name, command, .. } => {
+                    assert_eq!(name, "svc", "{argv:?}");
+                    assert_eq!(command, want, "{argv:?}");
+                }
+                other => panic!("expected Exec for {argv:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

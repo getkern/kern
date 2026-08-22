@@ -6,7 +6,7 @@ COMMANDS:
     box <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     box <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     run [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
-    exec <name> [-it] [--env K=V] [-w <dir>] [-- CMD...]           Run CMD in a running box
+    exec <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
     ps [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     logs <name> [--tail N] [-f|--follow]                           Show a box's output
     stop <name>... | --all                                         Stop box(es), or all
