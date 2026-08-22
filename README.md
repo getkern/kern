@@ -32,21 +32,27 @@ kern box dev --image alpine -it -- sh
 
 ## What kern is
 
-kern runs Linux workloads in real, kernel-enforced sandboxes: user, PID, mount, network, UTS and IPC
-namespaces, an overlay or read-only root pivoted in, an always-on seccomp filter, and cgroup v2
-limits. It pulls OCI images, builds them, runs them, and gets out of the way. No daemon, one
-short-lived process per box.
+**One binary that manages resources, of which isolation is the first.** That is why there is no
+single row for kern in a comparison table: it is a container runtime, a sandbox, a resource slicer
+and a stack runner at once, in 1.58 MB with no daemon.
 
-It is 1.58 MB (the size-optimized release build; a from-source `cargo install` is ~2 MB) because it
-carries only what it has to: the entire Rust dependency tree is `libc`,
-JSON and OCI manifests are parsed by hand, and `pull` uses the `curl` and `tar` already on the
-machine instead of linking a TLS stack and a decompressor. `kern doctor` checks for those two; a box
-from a `--rootfs` needs neither.
+- **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
+  `save`/`load`. A box from an image starts in ~3.6 ms.
+- **A sandbox, always rootless.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
+  read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
+  `--security-profile untrusted`, is the whole hardened bundle.
+- **Resource profiles, not just isolation.** CPU (`vcpu:`), memory, disk (`vdisk:`) and devices
+  (`vgpio:`), declared once in a `kern.toml` and attached by name. `kern run` applies the same caps
+  to a process on the host, with no sandbox at all. [docs/RESOURCES.md](docs/RESOURCES.md)
+- **Stacks, from the `docker-compose.yml` you already have.** `kern compose <file> up` reads it as
+  written, one stack to one pod, services reaching each other by name. Up in ~188 ms, down in ~69.
+- **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
+  `doctor`, plus a Python and Node SDK and an MCP server for agents.
 
-It has **two verbs**. `kern box` wraps a process in a full isolated slice. `kern run` caps a resource
-on a process you launch yourself, with no sandbox. Isolation is simply the first resource kern
-manages; the same model slices CPU (`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`), defined
-once in a `kern.toml` and attached by name. [docs/RESOURCES.md](docs/RESOURCES.md).
+It carries only what it has to: the entire Rust dependency tree is `libc`, JSON and OCI manifests are
+parsed by hand, and `pull` uses the `curl` and `tar` already on the machine instead of linking a TLS
+stack and a decompressor. A box from a `--rootfs` needs neither. (1.58 MB is the size-optimized
+release build; what you get from `cargo install` today, before any release is published, is ~2 MB.)
 
 <p align="center">
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one 1.58 MB static binary, no daemon.">
@@ -55,31 +61,22 @@ once in a `kern.toml` and attached by name. [docs/RESOURCES.md](docs/RESOURCES.m
 ## What kern is not
 
 - **Not a hypervisor.** The boundary is the Linux kernel, so a kernel privilege-escalation bug is an
-  escape. For actively hostile, multi-tenant code from strangers, reach for a microVM (Firecracker,
-  Kata) or gVisor. kern's ground is your own or semi-trusted code: CI jobs, build steps, dev
-  sandboxes, an agent's tool-calls under your supervision.
-
-  This is the container model, not a kern limitation: Docker and Podman share the same kernel and the
-  same escape condition, which is why gVisor and Firecracker exist. Where kern differs is which side
-  you start on: rootless always, where Docker's daemon runs as root and rootless is opt-in.
-- **Not free of the userns trade.** kern's isolation is built on an unprivileged user namespace, and
-  userns has been a fertile source of kernel LPE bugs. Running untrusted code in a box hands it that
-  surface to probe. [SECURITY.md](SECURITY.md) states this first, before any claim.
-- **Not a wall around what you mount in.** A `-v` bind hands the box read/write on that host path;
-  `-v $HOME:/host` gives it your home directory. A mount is a trust decision you make, not a boundary
-  kern enforces: mount only what the workload needs, and `:ro` when it only reads. (The one thing kern
-  refuses to bind is its OWN runtime registry, which would hand a box another box's secrets and state.)
-  Likewise `--net host` and `--privileged` are opt-outs of the isolation, by name.
-- **Not a Docker Engine reimplementation.** kern speaks Docker's *formats*, images and
-  `docker-compose.yml` and Dockerfiles, not its API. No overlay networks, no plugin ecosystem, no
-  Swarm. Full matrix: [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
-- **Not a Kubernetes runtime.** It does not implement CRI. For that, use containerd or CRI-O.
-- **Not shipping GPU slices.** They are on the [roadmap](ROADMAP.md) and there is no GPU code in this
-  edition, so there is nothing here to trust or to attack yet.
+  escape. Docker and Podman share that condition, which is why gVisor and Firecracker exist; for
+  actively hostile multi-tenant code, reach for one of those. kern's ground is your own or
+  semi-trusted code, and it starts on the other side of the root question: rootless always.
+- **Not free of the userns trade.** Its isolation is built on an unprivileged user namespace, a
+  fertile source of kernel LPE bugs. [SECURITY.md](SECURITY.md) states this before any claim.
+- **Not a wall around what you mount in.** `-v $HOME:/host` gives the box your home directory: a
+  mount is a trust decision you make, not a boundary kern enforces. `--net host` and `--privileged`
+  are opt-outs by name. (The one path kern refuses to bind is its own runtime registry.)
+- **Not a Docker Engine reimplementation.** It speaks Docker's *formats*, not its API: no overlay
+  networks, no plugins, no Swarm. Matrix: [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
+- **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
+- **Not shipping GPU slices.** On the [roadmap](ROADMAP.md), with no GPU code in this edition, so
+  there is nothing here to trust or to attack yet.
 
 What it does not know or does not do yet is in [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than left for
-you to find: whether a mapped seccomp filter helps an attacker who already runs code, and which fleet
-limit is a guard rail instead of a boundary.
+you to find.
 
 ## Install
 
