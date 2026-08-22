@@ -5,13 +5,13 @@
 # provenance/<tag>.provenance.txt (naming the signed tag object hash + the release commit hash) and
 # stamps it with OpenTimestamps, producing the .ots anchor. Then commit both files.
 #
-#   sh provenance/make-provenance.sh v0.6.9
+#   sh provenance/make-provenance.sh v0.7.0
 #
 # Requires: a GPG-verifiable signed tag, and `ots` (OpenTimestamps client). Defaults OTS to the venv at
 # ~/.venv-ots/bin/ots, override with $OTS.
 set -eu
 
-TAG="${1:-v0.6.9}"
+TAG="${1:-v0.7.0}"
 OTS="${OTS:-$HOME/.venv-ots/bin/ots}"
 DIR="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 TXT="$DIR/$TAG.provenance.txt"

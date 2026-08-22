@@ -9,6 +9,28 @@ and how to report.
 Advisories ("Report a vulnerability" on the repo) or email hello@getkern.dev. You will get an
 acknowledgement and a coordinated-disclosure timeline.
 
+## Verifying a release
+
+Release tags are GPG-signed and independently timestamped (see [provenance/](provenance/)). Both
+checks need the public key, so it ships in the repository:
+
+```sh
+gpg --import provenance/getkerndev-signing-key.asc
+gpg --fingerprint 9737460E1260B27B     # CFBC 8C13 C150 EBBA FBF2  F25C 9737 460E 1260 B27B
+git verify-tag v0.7.0
+```
+
+The fingerprint above is what to compare against; the file is a convenience, not the authority, and a
+key shipped next to the thing it signs proves authorship of the release, not the identity of the
+author. The OpenTimestamps anchor in `provenance/` is what makes the DATE independent of this
+repository, of GitHub, and of the key holder.
+
+Released binaries carry a `.sha256` next to the `.tar.gz`:
+
+```sh
+sha256sum -c kern-x86_64-unknown-linux-musl.tar.gz.sha256
+```
+
 ## Threat model
 
 The structured view - assets, entry points, and the two trust levels (a kernel-enforced boundary

@@ -6,7 +6,7 @@
 # "not upgraded" and leaves the file alone, so the guard here is about not producing an empty commit
 # and not claiming an anchor that is not there yet.
 #
-#   sh provenance/upgrade-when-ready.sh v0.6.32
+#   sh provenance/upgrade-when-ready.sh v0.7.0
 set -eu
 
 TAG="${1:?usage: upgrade-when-ready.sh vX.Y.Z}"
