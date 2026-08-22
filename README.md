@@ -281,8 +281,8 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.3 ms** | ~296 ms | ~288 ms |
-| Cold start, from an OCI image | **~3.6 ms** | ~290 ms | ~290 ms |
+| Cold start, bare box | **~2.3 ms** | ~293 ms | ~285 ms |
+| Cold start, from an OCI image | **~3.6 ms** | ~293 ms | ~285 ms |
 | Stop a service (init handles SIGTERM) | **~3.8 ms** | ~136 ms | ~199 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.59 MB binary** | daemon stack | multi-binary install |
@@ -300,7 +300,7 @@ differ with your CPU, kernel and filesystem, which is why these are approximate.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.3 ms** | ~2.7 ms | ~14.7 ms | ~288 ms | ~297 ms |
+| Cold start (bare box) | **~2.3 ms** | ~2.8 ms | ~13.5 ms | ~285 ms | ~293 ms |
 | 200 boxes in parallel | **~0.09 s** | ~0.16 s | ~0.35 s | ~44.8 s | ~16.2 s |
 
 A thousand simultaneous boxes take ~0.60 s, all 1000 of them. One more live box costs ~0.3 MB of real
@@ -313,7 +313,7 @@ the run-to-run spread costs: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 Nobody wins single-shot latency outright: the physical floor for `unshare` + `exec` is 1 to 2 ms, so
 the top tier sits inside its own run-to-run noise. At the same level of work kern is ahead of
-bubblewrap on **every host where both are installed**, ~2.3 ms against ~2.7 here, 3.5 against 5.6 on a
+bubblewrap on **every host where both are installed**, ~2.3 ms against ~2.8 here, 3.5 against 5.6 on a
 Jetson, 9.6 against 15.0 on an Arduino, and still ahead at 4.2 and 11.3 while enforcing a cgroup cap
 bubblewrap does not enforce at all. bubblewrap is a launcher with no images, caps or lifecycle. The
 gap that matters is to the engines, 128 to 134x above. Method, per-phase breakdown, board numbers

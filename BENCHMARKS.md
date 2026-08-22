@@ -186,11 +186,15 @@ between boxes. `kern doctor` states the trade instead of choosing for you.
 
 ### At the same level of work
 
-bubblewrap binds rather than overlays, so `--bind-rootfs` is the like-for-like flag.
+bubblewrap binds rather than overlays, so `--bind-rootfs` is the like-for-like flag. This table is
+that flag, from the 2026-07-30 session; the cold-start tables above use `--rootfs` (an overlay), so
+kern's two figures differ on purpose and are not two readings of one number. bubblewrap is the same
+command in both, and its x86_64 cell was re-measured on 2026-08-22 against the released binary, three
+runs of 200 at a load below 0.4: **2.8 ms** (2.8, 2.8, 2.7), where kern's `--rootfs` path read 2.3.
 
 | board | kern, cgroup off, `--bind-rootfs` | bubblewrap |
 |---|---:|---:|
-| x86_64 desktop | **2.2 ms** | 2.9 ms |
+| x86_64 desktop | **2.2 ms** | 2.8 ms |
 | Raspberry Pi 5 | **2.3 ms** | not installed |
 | Jetson Orin Nano | **3.5 ms** | 5.6 ms |
 | Arduino UNO Q | **9.6 ms** | 15.0 ms |
