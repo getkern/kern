@@ -5,6 +5,10 @@ trademark**: please do not use these marks for a fork, a modified build, or a co
 service without permission. See [TRADEMARK.md](../../TRADEMARK.md), or ask at hello@getkern.dev.
 
 ## Files
+- `kern-icon.png` . the K alone, 512x512 square, transparent - the avatar/profile mark (GitHub org
+  and repo, favicons, anywhere the wordmark is too wide to read). Cut from the wordmark, so it is the
+  same stencil and the same teal, not a second drawing that can drift from it.
+- `kern-icon-dark.png` . the same square on `#0d1117`, for a surface that needs an opaque tile
 - `kern-logo.png` . stencil KERN wordmark, transparent background (works on light or dark)
 - `kern-logo-dark.png` . stencil KERN wordmark on dark (`#0d1117`)
 - `kern-banner.png` . 1500x500 header (X / social banner)
