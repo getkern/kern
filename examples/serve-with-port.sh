@@ -8,10 +8,14 @@
 set -eu
 kern="${KERN:-kern}"
 name=web
+# The host port is overridable because this repo has several examples that publish one, and a box
+# left running by an earlier one holds it: `PORT=8081 sh examples/serve-with-port.sh` then works
+# instead of failing on a bind kern is right to refuse.
+port="${PORT:-8080}"
 
-echo "==> starting a detached HTTP service: host 8080 -> box 80, with restart + health-check:"
+echo "==> starting a detached HTTP service: host $port -> box 80, with restart + health-check:"
 "$kern" box "$name" --image alpine -d \
-  -p 8080:80 --restart \
+  -p "$port:80" --restart \
   --health-cmd 'wget -qO- localhost:80 >/dev/null' --health-interval 3 \
   -- sh -c 'while true; do printf "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello from kern\n" | nc -lp 80; done'
 
@@ -26,13 +30,13 @@ while [ $i -lt 10 ]; do
   sleep 0.2; i=$((i + 1))
 done
 [ $i -lt 10 ] || echo "    (still not healthy after 2s - continuing so you can see what ps reports)"
-echo "==> kern ps - note the PORTS (127.0.0.1:8080->80) and HEALTH (healthy) columns:"
+echo "==> kern ps - note the PORTS (127.0.0.1:$port->80) and HEALTH (healthy) columns:"
 "$kern" ps
 
 echo
 echo "==> reach the box service from the HOST, over the published port:"
 if command -v curl >/dev/null 2>&1; then
-  curl -s http://127.0.0.1:8080/ || true
+  curl -s "http://127.0.0.1:$port/" || true
 else
   wget -qO- http://127.0.0.1:8080/ || true
 fi

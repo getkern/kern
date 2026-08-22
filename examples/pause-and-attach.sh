@@ -26,7 +26,23 @@ before="$("$kern" logs ticker | wc -l)"
 
 echo
 echo "==> freeze it with kern pause - every process in the box stops dead:"
-"$kern" pause ticker
+# `pause` is the cgroup-v2 freezer, so it needs the box to have a cgroup of its own. Where no
+# systemd user manager is reachable kern refuses it by name instead of pretending, and this example
+# has nothing left to show - so it SKIPS with that reason rather than dying half-read. Any OTHER
+# pause failure is still a failure: only the documented unsupported case is classified as a skip.
+if ! pause_err="$("$kern" pause ticker 2>&1)"; then
+    case "$pause_err" in
+        *"no dedicated cgroup"*)
+            echo "    $pause_err"
+            echo
+            echo "SKIPPED: this host has no delegated cgroup, so the freezer is unavailable."
+            echo "         Everything above ran; \`kern doctor\` explains the delegation state."
+            "$kern" stop ticker >/dev/null 2>&1 || true
+            exit 0
+            ;;
+        *) echo "$pause_err" >&2; exit 1 ;;
+    esac
+fi
 # A full second is FIVE ticks' worth at this rate: if the freeze leaked even one, the count moves.
 sleep 1
 

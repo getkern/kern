@@ -14,6 +14,16 @@
 set -eu
 kern="${KERN:-kern}"
 
+# `--privileged` is honoured in ROOTLESS mode only, which the header explains and kern enforces: as
+# real root it is refused, because the box's root would BE root on the host. Said here too, so the
+# example skips with the reason instead of failing on a refusal that is the design working.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "SKIPPED: running as real root, where kern refuses --privileged by design."
+    echo "         Re-run as an unprivileged user: the box's root then maps to your own uid,"
+    echo "         which is what makes a nested user namespace grant nothing new on the host."
+    exit 0
+fi
+
 echo "── 1. the DEFAULT box blocks the nesting syscalls (safe by default)"
 echo "   trying to mount a tmpfs in a plain box (mount() is one of the 5):"
 set +e

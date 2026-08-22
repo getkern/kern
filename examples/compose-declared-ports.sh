@@ -17,10 +17,10 @@ w=$(mktemp -d); trap '"$kern" compose "$w/ok.toml" down >/dev/null 2>&1 || true;
 say() { printf '\n==> %s\n' "$1"; }
 
 # --- 1. a healthy stack, one of each spelling ------------------------------------------------
-cat > "$w/ok.toml" <<'EOF'
+cat > "$w/ok.toml" <<EOF
 [box.web]
 image = "alpine:3.19"
-ports = ["8080:80"]
+ports = ["${PORT:-8080}:80"]
 command = ["sleep", "60"]
 
 [box.admin]
