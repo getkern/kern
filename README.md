@@ -337,7 +337,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today and is tested:** 828 Rust, 78 Python and 61 Node
+**The core is done. Everything above works today and is tested:** 831 Rust, 78 Python and 61 Node
 tests, clippy-clean, `cargo-deny`-clean. You build from source, and the CLI
 and config surface can still change, always called out in [CHANGELOG.md](CHANGELOG.md). It is being
 tested hard on real hardware (Linux, WSL2, Raspberry Pi, Jetson, Arduino UNO Q) and refined ahead of

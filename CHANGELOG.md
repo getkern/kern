@@ -69,6 +69,36 @@ state of the tree; full detail is in the git history.
 
 ### Fixed
 
+- **A box's exit code no longer depends on the init system's version.** Same binary, same workload
+  past its `--memory` cap: an Arduino UNO Q (systemd 257) reported **143** where a Raspberry Pi 5 (252)
+  and a Jetson Orin Nano (249) reported **137**, and a DETACHED box on the newer manager left no exit
+  record at all - `kern ps -a` empty, `kern wait` answering "no exit record for one" - so an SDK could
+  not tell an OOM-killed box from one that never ran. The kernel had SIGKILLed the box on all three;
+  what differed is that the newer systemd's default `OOMPolicy=stop` answers that same kill by stopping
+  the unit, with a SIGKILL to the whole scope - including the kern process that had the box's status in
+  hand and had not yet written it. Three things now hold it: on the scope path the box is capped in its
+  OWN cgroup inside the scope (`kern-box-*`, at exactly the requested cap) with kern's supervisor in a
+  `kern-sup` sibling, so the whole-box OOM kill takes the workload and not the bookkeeper; a fatal
+  signal that reaches a waiting kern no longer costs the box its verdict; and the scope is asked for
+  `OOMPolicy=continue` where the manager accepts it - PROBED once per boot, never version-gated,
+  because an older manager rejects the property outright and would fail the `systemd-run` the box
+  depends on. MEASURED after: **137 on all three boards, foreground and detached, exit record present**,
+  with the cap read back at exactly `--memory` and no leaked scope, unit or process. `--memory` is now
+  the WORKLOAD's ceiling on that path - kern's own ~1.3 MB no longer comes out of your budget - and the
+  cost is ~2 ms of box start on the scope path only (x86's direct path measured unchanged at
+  ~2.6 ms/box). Two things deliberately NOT done, both measured: `Delegate=yes` on the scope, which
+  would be the textbook way to own that subtree and took a Jetson from 8 ms to **846 ms** per scope
+  (kern does not need it - a user manager already creates the directory as the user), and a blanket
+  `OOMPolicy=continue`, which on systemd 249 fails scope creation and would have started the box
+  **uncapped**.
+- **A signal aimed at a foreground `kern box` is aimed at the box.** kern used to die on a SIGTERM and
+  leave the box to the PDEATHSIG cascade; it now forwards the signal, keeps waiting, and exits with the
+  WORKLOAD's code - `docker run`'s contract, and what makes the exit code above survive a manager that
+  stops the unit underneath it. A workload that ignores the first signal cannot make kern unkillable:
+  the second exits immediately with `128+signo`, and `kern stop --stop-timeout 0` / SIGKILL remain the
+  hard escapes. Behind a supervisor (a detached box) the signal is deliberately NOT relayed inwards -
+  the box is already signalled directly, and relaying it was measured to record 143 for an OOM-killed
+  box, kern's own SIGTERM beating the kernel's `oom.group` SIGKILL to the workload.
 - **A service's `stop_grace_period` is its own upper bound again, not the longest one in the file.**
   `stop` shared ONE deadline across the stack, set to the longest grace configured anywhere in it,
   and floored the remainder at a second - so a service that asked for 1 s could be held far longer.

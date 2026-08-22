@@ -83,6 +83,12 @@ fn main() -> ExitCode {
         }
         std::env::remove_var("KERN_SCOPE_READY_FD");
     }
+    // Inside our own transient scope: move kern's processes into a leaf of their own, so the box can be
+    // capped in a sibling cgroup whose whole-box OOM kill takes the workload and NOT the supervisor that
+    // records its exit code. Must run HERE - before any fork, because cgroup v2 refuses to enable
+    // controllers for a cgroup's children while that cgroup still holds processes. A no-op off the scope
+    // path and on a scope that is not ours; fail-safe (see `prepare_delegated_scope`).
+    kern_isolation::prepare_delegated_scope();
     // Detect invocation *as* `docker` / `docker-compose` (via a symlink or wrapper) and rewrite the
     // argv into kern's own dialect before dispatch. Pure argument translation - no daemon, no
     // docker.sock. When invoked normally (`kern …`), this is a couple of cheap string checks.

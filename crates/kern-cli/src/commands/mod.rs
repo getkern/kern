@@ -4816,6 +4816,21 @@ fn supervise_box(
         if attempt == 0 && have_pipe {
             unsafe { libc::close(wr) };
         }
+        // A fatal signal must not cost the box its exit record: swallow the first one and keep waiting,
+        // so this process lives long enough to reap the box and write the record below.
+        //
+        // MEASURED on an Arduino UNO Q (systemd 257): a DETACHED box past its `--memory` cap left NO
+        // record at all - `kern ps -a` empty, `kern wait` answering "no exit record for one" - because
+        // that manager's `OOMPolicy=stop` stops the scope on the OOM and its SIGTERM killed the
+        // supervisor before it could write one. A Raspberry Pi 5 (252) and a Jetson (249) recorded 137
+        // for the same box. The record a box leaves behind should not depend on the manager's version.
+        //
+        // It does NOT relay the signal inwards: the box is signalled directly (`kern stop` signals the
+        // box's process group, which the runner and PID 1 are in), and relaying it was measured to
+        // record 143 for an OOM-killed box - kern's own SIGTERM beating the kernel's `oom.group`
+        // SIGKILL to the workload. `kern stop`'s phase-2 SIGKILL is uncatchable and unaffected, and a
+        // second signal exits immediately - see `keep_waiting_through_signals`.
+        kern_isolation::keep_waiting_through_signals();
         let mut st = 0i32;
         let code = if runner > 0 && crate::eintr::waitpid(runner, &mut st, 0) > 0 {
             if libc::WIFEXITED(st) {
@@ -5289,7 +5304,9 @@ fn install_persistent_box(
 
 /// Memory + task ceilings for a sandbox scope. `MemorySwapMax=0` makes `MemoryMax` a HARD total
 /// cap - without it, a workload over the RAM cap just swaps (on a host with swap) instead of OOM.
-const SCOPE_MEMORY_MAX: &str = "MemoryMax=512M";
+/// In BYTES, because the scope's ceiling is the box's cap plus `SCOPE_SUPERVISOR_HEADROOM` (kern's own
+/// supervisor lives in the scope, in its own leaf, and must not eat into what the workload asked for).
+const SCOPE_MEMORY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const SCOPE_SWAP_MAX: &str = "MemorySwapMax=0";
 const SCOPE_TASKS_MAX: &str = "TasksMax=512";
 
@@ -5370,6 +5387,22 @@ struct ScopeReexec<'a> {
     die_with_parent: bool,
     /// `--allow-uncapped`/`KERN_ALLOW_UNCAPPED`: suppress the once-per-host "not enforced" notice.
     allow_uncapped: bool,
+}
+
+/// The ceiling the per-box SCOPE gets, in bytes: the box's own `--memory` (or the default) plus kern's
+/// supervisor headroom.
+///
+/// The scope holds kern's bookkeeping AND the box; the box itself is capped at EXACTLY what was asked
+/// for, by the inner `kern-box-*` child (see `prepare_delegated_scope`). The two ceilings must not be
+/// equal: charges are counted at every level, so an equal outer one is reached FIRST - by exactly the
+/// supervisor's share - and the box would be killed by the scope's OOM, which takes the supervisor with
+/// it and loses the exit code. A pure function so that arithmetic is checked on every run, including
+/// the `saturating_add`: a `--memory` near `u64::MAX` must not wrap the scope's ceiling down to a tiny
+/// number and make every box OOM instantly.
+fn scope_memory_max(memory: Option<u64>) -> u64 {
+    memory
+        .unwrap_or(SCOPE_MEMORY_MAX_BYTES)
+        .saturating_add(kern_isolation::SCOPE_SUPERVISOR_HEADROOM)
 }
 
 fn reexec_in_scope_if_possible(p: ScopeReexec) {
@@ -5485,10 +5518,7 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     // The scope's memory cap tracks `--memory` (so the outer scope never caps a box below what it
     // asked for); `--cpus` maps to a CPUQuota, `--cpuset-cpus` to AllowedCPUs. Swap tracks
     // `--memory-swap-max` (default 0 = hard cap) and TasksMax stays default.
-    let mem_prop = match memory {
-        Some(b) => format!("MemoryMax={b}"),
-        None => SCOPE_MEMORY_MAX.to_string(),
-    };
+    let mem_prop = format!("MemoryMax={}", scope_memory_max(memory));
     let swap_prop = match memory_swap_max {
         Some(b) => format!("MemorySwapMax={b}"),
         None => SCOPE_SWAP_MAX.to_string(),
@@ -5516,6 +5546,16 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     if let Some(set) = cpuset {
         props.push("-p".into());
         props.push(format!("AllowedCPUs={set}"));
+    }
+    // Leave the OOM kill to the KERNEL, which kern has already told to take the whole box at once
+    // (`memory.oom.group`). A newer manager's default `OOMPolicy=stop` answers that same kill by
+    // stopping the unit - SIGKILL to the entire scope, including the supervisor that would have
+    // recorded the box's exit code - so on systemd 257 an OOM-killed detached box left `kern wait` with
+    // nothing to report, where 249 and 252 recorded 137. Gated on a PROBE, never on a version: an older
+    // manager rejects the property and would fail `systemd-run` outright. See `scope_accepts_oom_policy`.
+    if kern_isolation::scope_accepts_oom_policy() {
+        props.push("-p".into());
+        props.push("OOMPolicy=continue".into());
     }
     // Resolve `systemd-run` by trusted absolute path, NOT via `$PATH`: on a box start this spawn is on
     // the critical path, and a long user `$PATH` (cargo/nvm/local/…) makes the kernel try execve in each
@@ -5545,6 +5585,16 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     let mut cmd = std::process::Command::new(systemd_run);
     cmd.arg(kern_isolation::systemd_scope_mode()) // `--system` as root, else `--user`
         .args(["--scope", "--quiet", "--collect"])
+        // NO `-p Delegate=yes` here, deliberately. kern DOES build a cgroup subtree inside this scope
+        // (`prepare_delegated_scope`), which is what `Delegate=` is nominally for - but it does not need
+        // the property: a user manager creates the scope's directory as the user, so it is already ours
+        // to `mkdir` in (MEASURED `owner=1000` on systemd 249, 252 and 257, with the child cgroup, the
+        // process move and the `cgroup.subtree_control` write all accepted without it).
+        //
+        // Asking for it anyway costs a box start: MEASURED per scope, `Delegate=yes` alone took a Jetson
+        // Orin Nano (systemd 249) from 8 ms to 846 ms and an Arduino UNO Q (257) from 47 ms to 148 ms,
+        // while the subtree kern actually builds costs ~2 ms on top of a bare scope. A 100x start-latency
+        // regression to ask for permission already held is not a trade; the property stays off.
         .arg(&unit)
         .args(&props)
         .arg("--")
@@ -6243,6 +6293,45 @@ fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Err
     }
     push_unescaped(&mut out, rest);
     Ok(out)
+}
+
+#[cfg(test)]
+mod scope_ceiling_tests {
+    use super::*;
+
+    /// The scope's ceiling is always ABOVE the box's own, and never wraps.
+    ///
+    /// Equal ceilings would silently undo the reason the box has an inner cgroup at all: the outer one
+    /// is reached first, by the supervisor's share, so the box dies of the SCOPE's OOM - which kills
+    /// the supervisor too and leaves `kern wait` with nothing to report. That was the measured defect
+    /// on all three ARM boards. A `--memory` near `u64::MAX` must saturate, not wrap: wrapping would
+    /// hand systemd a tiny `MemoryMax` and OOM every box instantly.
+    #[test]
+    fn the_scope_ceiling_is_above_the_boxs_own_and_saturates() {
+        let head = kern_isolation::SCOPE_SUPERVISOR_HEADROOM;
+        assert!(head > 0, "a zero headroom is the equal-ceilings bug");
+        for asked in [1, 4096, 64 * 1024 * 1024, 8 * 1024 * 1024 * 1024] {
+            assert_eq!(
+                scope_memory_max(Some(asked)),
+                asked + head,
+                "the scope must clear the box's own cap by exactly the headroom"
+            );
+        }
+        assert_eq!(
+            scope_memory_max(None),
+            SCOPE_MEMORY_MAX_BYTES + head,
+            "a box with no --memory takes the default cap, plus the same headroom"
+        );
+        assert_eq!(
+            scope_memory_max(Some(u64::MAX)),
+            u64::MAX,
+            "an absurd --memory must saturate at the ceiling, never wrap to a tiny one"
+        );
+        assert!(
+            scope_memory_max(Some(u64::MAX - 1)) >= u64::MAX - 1,
+            "saturation must never LOWER the ceiling below what was asked"
+        );
+    }
 }
 
 #[cfg(test)]

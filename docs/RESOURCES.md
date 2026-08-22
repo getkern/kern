@@ -35,14 +35,21 @@ kern box oom   --image alpine --memory 256m -- \
   sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=512' ; echo "exit=$?"       # exit=137, OOM-killed
 ```
 
-The cap binds on every host tested. On the Arduino UNO Q - whose rootless boxes take the
-`systemd-run --scope` path, not the direct `kern.slice` one - an over-allocation is OOM-killed as a
-WHOLE box (exit **137**), the same as the direct path: the per-box scope is not `Delegate=yes`, so
-kern writes `memory.oom.group=1` onto the scope's own cgroup and the kernel SIGKILLs every task at
-once rather than one victim (measured: a sleeper child and the parent both vanish, no task survives,
-and `kern ps` shows no stale box afterwards). Android's `lmkd` is **not running** on that board, so it
-is the cgroup doing the killing, not a host-level low-memory killer. `memory.max` reads back 33554432
-throughout.
+The cap binds on every host tested, and an over-allocation is OOM-killed as a WHOLE box (exit **137**,
+recorded for `kern wait` / `kern ps -a` too): kern writes `memory.oom.group=1` on the box's own cgroup,
+so the kernel SIGKILLs every task at once rather than picking one victim and leaving the box half-dead
+(measured: a sleeper child and the parent both vanish, no task survives, and `kern ps` shows no stale
+box afterwards).
+
+That holds on BOTH cap paths. On boards whose rootless boxes take the `systemd-run --scope` path rather
+than the direct `kern.slice` one, kern builds its own cgroup inside that scope: the workload in a
+`kern-box-*` child capped at exactly what you asked for, kern's supervisor in a `kern-sup` sibling, and
+the scope itself 4 MiB above the box's cap so the kernel's group-kill takes the WORKLOAD and not the
+process that has to report what it exited with. Your cap is what the box gets - kern's own ~1.3 MB is
+no longer taken out of it. Measured identical on systemd **249, 252 and 257** (Jetson Orin Nano,
+Raspberry Pi 5, Arduino UNO Q), foreground and detached, at a cost of ~2 ms of box start on that path.
+Android's `lmkd` is **not running** on the UNO Q, so it is the cgroup doing the killing, not a
+host-level low-memory killer.
 
 **Enforce, or refuse to start.** Where the `memory`/`pids` controllers are not delegated (footnote ¹),
 the default is to warn once and run uncapped. `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that

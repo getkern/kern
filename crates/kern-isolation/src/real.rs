@@ -2950,6 +2950,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         hint_missing_uid_range(range_unmet, code);
         return Ok(code); // `forwarders` drops here and stops them
     }
+    // Whatever signal reaches this process, what it exits with must be the BOX's verdict rather than
+    // its own death. A FOREGROUND box is the user's own process and nothing else would carry their
+    // signal inwards, so it forwards; behind a supervisor the box is signalled directly and a forward
+    // would be a second delivery, so it only survives. Same discriminant as the PDEATHSIG above.
+    if die_with_parent {
+        forward_signals_to_the_box(pid);
+    } else {
+        keep_waiting_through_signals();
+    }
     // Reap the box (EINTR-robust, so a signal can't return early and drop the cgroup guard on a
     // still-live box → EBUSY leak).
     let mut status = 0i32;
@@ -3593,6 +3602,83 @@ pub fn run_pod_holder() -> ! {
     loop {
         unsafe { libc::pause() };
     }
+}
+
+/// The box this process waits on, for [`forward_signals_to_the_box`]'s handler. `0` = nothing to
+/// forward to (the handler then keeps the signal's default meaning).
+static BOX_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// How many fatal signals this process has taken while waiting for the box. The SECOND one always ends
+/// it, so two Ctrl-Cs end a box whose workload ignores the first.
+static BOX_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Handler for the fatal signals a waiting kern can take. Async-signal-safe: two atomics, `kill` and
+/// `_exit`, nothing else.
+extern "C" fn forward_to_box(sig: libc::c_int) {
+    // Asked twice: honour the signal's default meaning, whatever we were doing with the first.
+    if BOX_SIGNALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+        unsafe { libc::_exit(128 + sig) };
+    }
+    let pid = BOX_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        unsafe { libc::kill(pid, sig) };
+    }
+    // `pid == 0`: swallow it and keep waiting. See `keep_waiting_through_signals`.
+}
+
+/// While kern waits for a box, treat a fatal signal as "end the BOX", not "end kern": forward it to
+/// PID 1 and keep reaping, so this process exits with the box's own status.
+///
+/// This is what makes a box's exit code independent of the INIT SYSTEM, which is where it came from.
+/// MEASURED, same binary and same workload past its `--memory` cap: an Arduino UNO Q (systemd 257)
+/// reported 143 where a Raspberry Pi 5 (252) and a Jetson Orin Nano (249) reported 137. The kernel had
+/// already SIGKILLed the box on all three; what differed is that the newer manager's default
+/// `OOMPolicy=stop` ALSO stops the unit, and its SIGTERM reached kern - blocked in `waitpid`, with the
+/// box's status already there to be read - and killed it before it could read it. The exit code of a
+/// box that hit its memory cap should not depend on the manager's version.
+///
+/// Two properties this deliberately buys beyond that, both matching `docker run`:
+///   * `kill <kern>` (or a SIGTERM to a non-tty box) now tears the box DOWN and reports what it exited
+///     with, instead of killing kern and leaving the box to the PDEATHSIG cascade;
+///   * a workload that IGNORES the first signal cannot make kern unkillable - the second exits at once
+///     with `128+signo`, and `kern stop --time 0` / SIGKILL remain the hard escapes.
+///
+/// Installed AFTER the box is forked, so the workload never inherits these dispositions, and only for
+/// a FOREGROUND box - the one case where this process is the user's own and nothing else would carry
+/// their signal into the box. Everything behind a supervisor uses [`keep_waiting_through_signals`]
+/// instead, because there the box is signalled directly and a forward would be a SECOND delivery.
+pub fn forward_signals_to_the_box(pid: libc::pid_t) {
+    BOX_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = forward_to_box as extern "C" fn(libc::c_int) as usize;
+        // No `SA_RESTART`, deliberately: `reap_retry_eintr` re-loops on EINTR, and coming back through
+        // it is what lets the reap see a box that died while the signal was being delivered.
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for &sig in &[libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            libc::sigaddset(&mut sa.sa_mask, sig);
+        }
+        for &sig in &[libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Take the first fatal signal WITHOUT dying and without touching the box: keep waiting, so this
+/// process lives to read the box's status and record it. The second one exits, as it would have.
+///
+/// For every kern process that sits BEHIND a supervisor - the detached runner and the supervisor
+/// itself. Two reasons it swallows rather than forwards, both measured:
+///   * the box is already being signalled directly. `kern stop` signals the box's process GROUP, which
+///     these processes share, so a forward would be a SECOND delivery: a workload whose handler is
+///     re-entrant runs its shutdown twice.
+///   * a forward can FALSIFY the verdict. On an Arduino UNO Q (systemd 257) a detached box past its
+///     `--memory` cap recorded 143 while forwarding: the manager's `OOMPolicy=stop` SIGTERMs the scope,
+///     and kern's own relay of that SIGTERM reached the workload BEFORE the kernel's `oom.group`
+///     SIGKILL, so the box was recorded as terminated rather than OOM-killed. Swallowing it leaves the
+///     kernel's kill as the only thing that touches the box: 137, the same as on systemd 249 and 252.
+pub fn keep_waiting_through_signals() {
+    forward_signals_to_the_box(0)
 }
 
 /// Blocking `waitpid(pid)` that retries on `EINTR`, writing the status through `status` and returning

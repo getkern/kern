@@ -751,6 +751,79 @@ fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
     drop_runtime_dir_if_ours(&xdg);
 }
 
+/// A signal aimed at a FOREGROUND `kern box` is aimed at the box: kern forwards it, waits, and exits
+/// with the WORKLOAD's code - not with its own death.
+///
+/// This is what makes a box's exit code independent of the init system. MEASURED before it: an Arduino
+/// UNO Q (systemd 257) reported 143 for a box past its `--memory` cap where a Raspberry Pi 5 (252) and
+/// a Jetson Orin Nano (249) reported 137 - the newer manager's `OOMPolicy=stop` also stops the scope,
+/// and its SIGTERM killed kern while the box's real status was already there to be read. The same
+/// mechanism is what a plain `kill <kern>` hits, which is what this test can reproduce anywhere.
+///
+/// The second signal must still end it, so a workload that ignores the first cannot make kern
+/// unkillable.
+#[test]
+fn a_signal_to_a_foreground_box_reports_the_workloads_code_and_the_second_always_ends_it() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "fgsignal");
+    let rootfs = root.to_str().unwrap();
+    let pid = std::process::id();
+
+    // (what the init does with SIGTERM, how many signals we send, the code kern must exit with)
+    let cases = [
+        ("trap 'exit 42' TERM", 1, 42),
+        // Ignored, so the first signal can never end it: the SECOND is kern's own exit, 128+SIGTERM.
+        ("trap '' TERM", 2, 143),
+    ];
+    for (trap, signals, want) in cases {
+        let name = format!("fgsig{signals}-{pid}");
+        let mut child = kern()
+            .args([
+                "box",
+                &name,
+                "--rootfs",
+                rootfs,
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                &format!("{trap}; while :; do sleep 0.2; done"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn kern");
+        // Let the shell install its trap first: signalling before that tests the startup race, not the
+        // shutdown contract.
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        for _ in 0..signals {
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        let status = child.wait().expect("wait kern");
+        // A host where the box could not start at all reports 127/126 from kern's own start path; that
+        // is an environment answer, not a contract answer, so it skips rather than fails.
+        let code = status.code().unwrap_or(-1);
+        if code == 126 || code == 127 {
+            eprintln!("skip: box did not start here (kern exited {code})");
+            continue;
+        }
+        assert_eq!(
+            code, want,
+            "a foreground box whose init does `{trap}`, sent {signals} SIGTERM(s), must make kern \
+             exit {want}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// The grace is what the caller asked for, not that minus up to a second. `stop` waits the time LEFT
 /// until a deadline shared by the whole stack, and that remainder used to be rounded DOWN to whole
 /// seconds: `--stop-timeout 3` gave a workload 2 s. Measured before the fix at 2019 ms and a SIGKILL

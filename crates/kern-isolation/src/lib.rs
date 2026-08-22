@@ -47,6 +47,13 @@ pub use cgroup::gc_orphan_box_cgroups;
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
 /// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.
 pub use cgroup::memory_cap_enforceable;
+/// Move kern's own processes out of the box's scope root, so the box's whole-box OOM kill takes the
+/// workload and not the supervisor that records its exit code. Call once, at process entry, before any
+/// fork. See [`cgroup::prepare_delegated_scope`].
+pub use cgroup::prepare_delegated_scope;
+/// Will this systemd accept `OOMPolicy=` on a transient scope? Probed once per boot, because a manager
+/// that refuses it fails the whole `systemd-run`. See [`cgroup::scope_accepts_oom_policy`].
+pub use cgroup::scope_accepts_oom_policy;
 /// Apply a fleet-wide `memory.max`/`pids.max` budget to kern's shared `kern.slice`, bounding the SUM of
 /// all running boxes at the kernel. The real-enforcement backstop to the cooperative box counter. See
 /// [`cgroup::set_fleet_caps`].
@@ -58,6 +65,9 @@ pub use cgroup::systemd_scope_mode;
 /// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;
 pub use cgroup::warn_unenforced_caps;
+/// Bytes the per-box scope gets ABOVE the box's `--memory`, to hold kern's supervisor without eating
+/// into the workload's budget. See [`cgroup::SCOPE_SUPERVISOR_HEADROOM`].
+pub use cgroup::SCOPE_SUPERVISOR_HEADROOM;
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
 /// records itself in an in-process marker) and the scrub of an INHERITED marker (a nested kern must
 /// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,
@@ -72,6 +82,13 @@ pub use cgroup::{memory_cap_signal, record_memory_cap_signal};
 pub use cgroup::{memory_cap_state, MemoryCapState};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 pub use ports::{preflight as preflight_ports, PortMap};
+/// While kern waits for a box, treat a fatal signal as "end the BOX", not "end kern": forward it to
+/// the box and keep reaping, so kern exits with (and records) the box's own status. See
+/// [`real::forward_signals_to_the_box`].
+pub use real::forward_signals_to_the_box;
+/// Take the first fatal signal without dying, so this process lives to read the box's status and
+/// record it. For every kern process behind a supervisor. See [`real::keep_waiting_through_signals`].
+pub use real::keep_waiting_through_signals;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
 /// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
 /// The per-phase timer, exported because the PARENT was not instrumented at all: `KERN_TIMING`

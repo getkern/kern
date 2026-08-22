@@ -693,6 +693,16 @@ pub fn box_cgroup_dir(pid: i32) -> Option<PathBuf> {
     parse_box_cgroup_line(&raw)
 }
 
+/// Is this cgroup leaf one KERN named - a `kern-box-*` dir or scope - rather than one it merely found
+/// itself in? The single definition of that rule, because every use of it decides whether kern may act
+/// on a cgroup: `parse_box_cgroup_line` (which dir a reap may `rmdir`) and `prepare_delegated_scope`
+/// (which scope kern may restructure). An ambient `run-p123-i456.scope` - what `systemd-run --user
+/// --scope bash` gives a user, and what `kern doctor` itself suggests running - must fail BOTH, or a
+/// box started in that shell would let kern reap or reshape the user's own session.
+fn is_kern_box_leaf(leaf: &str) -> bool {
+    leaf.starts_with("kern-box-")
+}
+
 /// Parse a cgroup-v2 `/proc/<pid>/cgroup` body (`0::<path>`) into kern's own box-cgroup dir, or `None`.
 /// Split out from [`box_cgroup_dir`] so the parse + kern-box gate is unit-testable without a live box.
 ///
@@ -706,7 +716,7 @@ pub fn box_cgroup_dir(pid: i32) -> Option<PathBuf> {
 fn parse_box_cgroup_line(raw: &str) -> Option<PathBuf> {
     let rel = raw.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
     let leaf = rel.rsplit('/').next()?;
-    if !leaf.starts_with("kern-box-") {
+    if !is_kern_box_leaf(leaf) {
         return None; // only ever a box leaf - never the shared slice/root
     }
     Some(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
@@ -943,6 +953,153 @@ const DEFAULT_PIDS_MAX: &str = "512";
 /// cgroup v2 CPU period (µs) for `cpu.max`; the quota is `cores * PERIOD`.
 const CPU_PERIOD_US: u64 = 100_000;
 
+/// The leaf that holds kern's OWN processes inside a delegated box scope, so the box's group-OOM kill
+/// cannot take the bookkeeper with the workload. Named, not `.`-hidden, so `systemd-cgls` shows what it
+/// is; it never holds a workload process.
+const SUPERVISOR_LEAF: &str = "kern-sup";
+
+/// Extra bytes the per-box systemd scope gets ABOVE the box's own `--memory`, to hold kern's supervisor
+/// without eating into what the workload asked for.
+///
+/// The scope caps supervisor + workload TOGETHER; the box's inner `kern-box-*` child caps the workload
+/// alone. With both ceilings equal the OUTER one is reached first (by exactly the supervisor's charge),
+/// so the scope OOM would fire before the box's own - killing the supervisor and losing the exit record,
+/// which is the whole point of the inner child. MEASURED, at rest, on an Arduino UNO Q and a Raspberry
+/// Pi 5: `memory.current` of a whole idle box (three kern processes + the workload) is 1.27-1.84 MB, so
+/// 4 MiB is roughly a 2x margin over the entire box's resting charge and >3x kern's own share.
+///
+/// The consequence, stated rather than hidden: on this path a box's WORKLOAD is capped at exactly what
+/// was asked for (before this, kern's own ~1.3 MB came out of the user's budget), and where the
+/// delegated layout cannot be built (see [`prepare_delegated_scope`]) the box keeps the scope as its
+/// only ceiling and can therefore use up to 4 MiB more than it asked.
+pub const SCOPE_SUPERVISOR_HEADROOM: u64 = 4 * 1024 * 1024;
+
+/// Will THIS manager accept `OOMPolicy=` on a transient scope - and does the box need it?
+///
+/// A newer systemd's default `OOMPolicy=stop` reacts to the kernel's OOM kill by stopping the unit,
+/// and it does that with a SIGKILL to the WHOLE scope. MEASURED on an Arduino UNO Q (systemd 257): a
+/// detached box past its `--memory` cap left NO exit record, because the supervisor that writes one
+/// was killed along with the box - no in-scope arrangement can survive that, so the only fix is to
+/// tell the manager not to stop the unit. The kernel has already killed the box as one group
+/// (`memory.oom.group`); systemd stopping it again adds nothing but the loss of the verdict.
+///
+/// PROBED, not version-gated. `OOMPolicy=` on a SCOPE is rejected outright by older managers
+/// ("Unknown assignment"), which makes `systemd-run` FAIL - and on the foreground path kern has
+/// already `exec`d into it, so the box would die uncapped. Measured refused on systemd 249 and
+/// accepted on 252 and 257; the versions that refuse it are also the ones that do not stop the unit on
+/// OOM, so the box's exit code comes out right there without it. One `systemd-run /bin/true` proves
+/// it, memoised per process and cached in `$XDG_RUNTIME_DIR` - which the kernel clears on reboot,
+/// exactly the lifetime of "which systemd is running" - so a host pays it once per boot, and never on
+/// the direct-cgroup path where no scope is built. MEASURED cost when the answer is yes: none per box
+/// (a Raspberry Pi 5 scope is 11 ms without the property and 10 ms with it).
+pub fn scope_accepts_oom_policy() -> bool {
+    static MEMO: OnceLock<bool> = OnceLock::new();
+    *MEMO.get_or_init(|| {
+        let cache = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .map(|d| d.join("kern").join("scope-oom-policy"));
+        if let Some(p) = &cache {
+            if let Ok(v) = fs::read_to_string(p) {
+                return v.starts_with('1');
+            }
+        }
+        let Some(systemd_run) = crate::real::trusted_helper("systemd-run") else {
+            return false;
+        };
+        let ok = Command::new(systemd_run)
+            .arg(systemd_scope_mode())
+            .args(["--scope", "--quiet", "--collect"])
+            .args(["-p", "OOMPolicy=continue"])
+            .arg("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if let Some(p) = &cache {
+            if let Some(dir) = p.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            let _ = fs::write(p, if ok { "1" } else { "0" });
+        }
+        ok
+    })
+}
+
+/// The box's own delegated scope, once [`prepare_delegated_scope`] has proven the layout works here.
+/// A `OnceLock` set BEFORE kern forks its supervisor, so every later process sees the same answer.
+static DELEGATED_SCOPE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Move kern's own processes OUT of the box's scope root, so the box can be capped in a child cgroup
+/// whose group-OOM kill takes the workload and NOT kern's supervisor. Returns true when the layout is
+/// in force. Idempotent, and a no-op off the scope path.
+///
+/// Why this exists, MEASURED on all three ARM boards (systemd 249/252/257) before the change: a
+/// DETACHED box that hit its `--memory` cap vanished with NO exit record - `kern ps -a` empty and
+/// `kern wait` answering "no exit record for one" - while the SAME box on the direct-cgroup path (x86)
+/// reported 137. The cause is not the exit-code plumbing but the topology: on the scope path every kern
+/// process runs in the scope, `memory.oom.group` kills the cgroup as one unit, and the supervisor that
+/// would have read the workload's status and written the record dies with it. A foreground box was
+/// unaffected (its exit code travels back through the launcher), so the gap was exactly: detached +
+/// OOM + scope path, i.e. the SDK's own pattern on the edge hardware kern targets.
+///
+/// The fix mirrors the direct path's topology: supervisor OUTSIDE the capped cgroup, runner + workload
+/// inside it. cgroup v2 forbids a cgroup that holds processes from enabling controllers for its
+/// children ("no internal processes"), so the scope root must be vacated FIRST - hence this runs at
+/// process entry, before the supervisor forks. No `Delegate=yes` is needed for any of it: a user
+/// manager creates the scope's directory as the user, so it is already writable by us (see the
+/// `systemd-run` call in `reexec_in_scope_if_possible` for what asking for the property would cost).
+///
+/// FAIL-SAFE by construction: every step is checked and any failure restores exactly the previous
+/// layout (back to the scope root, leaf removed), where systemd's `MemoryMax` on the scope remains the
+/// enforcer. It can lose the improvement; it cannot lose the cap.
+pub fn prepare_delegated_scope() -> bool {
+    DELEGATED_SCOPE
+        .get_or_init(|| {
+            if !env_flag("KERN_SCOPE") {
+                return None;
+            }
+            let scope = current_v2_cgroup()?;
+            // ONLY a scope kern created and named (`kern-box-<pid>.scope`), never an ambient one: a user
+            // running `systemd-run --user --scope bash` (which `kern doctor` itself suggests) would
+            // otherwise have their shell's own scope restructured underneath them. Same prefix rule the
+            // registry uses to decide which cgroup belongs to a box.
+            if !scope
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_kern_box_leaf)
+            {
+                return None;
+            }
+            let sup = scope.join(SUPERVISOR_LEAF);
+            if fs::create_dir(&sup).is_err() && !sup.is_dir() {
+                return None; // not delegated to us - the scope stays the only ceiling
+            }
+            if fs::write(sup.join("cgroup.procs"), std::process::id().to_string()).is_err() {
+                let _ = fs::remove_dir(&sup);
+                return None;
+            }
+            enable_subtree_controllers(&scope);
+            // Claim the layout only if `memory` actually reached the children: without it the box's
+            // child cgroup could be created but never capped, and `apply_limits` would tear it down and
+            // report no cap at all - strictly worse than staying in the scope. Restore and give up.
+            let delegated = fs::read_to_string(scope.join("cgroup.subtree_control"))
+                .is_ok_and(|s| s.split_whitespace().any(|c| c == "memory"));
+            if !delegated {
+                let _ = fs::write(scope.join("cgroup.procs"), std::process::id().to_string());
+                let _ = fs::remove_dir(&sup);
+                return None;
+            }
+            Some(scope)
+        })
+        .is_some()
+}
+
+/// The delegated scope to cap the box under, or `None` when kern is not on that path (every host off
+/// the scope path, and any scope where [`prepare_delegated_scope`] could not build the layout).
+fn delegated_scope() -> Option<&'static PathBuf> {
+    DELEGATED_SCOPE.get().and_then(|o| o.as_ref())
+}
+
 /// The `--require-limits` success gate, as a PURE decision. Factored out of [`apply_limits`] (whose live
 /// cgroup path is not exercised on every host, so a `mem_ok && pids_ok` -> `mem_ok || pids_ok` slip would
 /// pass CI silently and let a partially-capped box - a fork-bomb / OOM hole - start under a flag whose
@@ -1011,7 +1168,12 @@ pub fn apply_limits(
     // caller's cgroup). The build box still gets whole-box OOM via the `kern-box-*` child write below
     // where the controller is delegated. Best-effort and idempotent; runs before the box's mount
     // namespace remounts `/sys/fs/cgroup` read-only.
-    if env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED") {
+    //
+    // NOT when the delegated layout is in force: there `origin` is kern's OWN `kern-sup` leaf, and
+    // flipping that to group-kill would put the supervisor back in the blast radius - the exact thing
+    // `prepare_delegated_scope` exists to take it out of. The box's whole-box kill is then carried by
+    // the `kern-box-*` child's own `oom.group` write below, on the cgroup that holds the workload.
+    if (env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED")) && delegated_scope().is_none() {
         if let Some(o) = &origin {
             let _ = fs::write(o.join("memory.oom.group"), "1");
         }
@@ -1028,6 +1190,12 @@ pub fn apply_limits(
     // gracefully (no kern.slice `systemd-run` spawn, no relocation).
     let parent = if direct {
         ensure_kern_slice().or_else(|| origin.clone())?
+    } else if let Some(scope) = delegated_scope() {
+        // Scope path with the delegated layout: cap under the SCOPE, not under `origin` - which is now
+        // `<scope>/kern-sup`, where kern's supervisor sits precisely so the box's group-OOM kill cannot
+        // reach it. The child built below is the box's own ceiling; the scope keeps its `MemoryMax` (the
+        // box's cap plus `SCOPE_SUPERVISOR_HEADROOM`) as the outer backstop.
+        scope.clone()
     } else {
         origin.clone()?
     };
@@ -2042,6 +2210,39 @@ mod tests {
             !d.exists(),
             "guard's Drop must remove the (empty) cgroup dir"
         );
+    }
+
+    /// The ownership rule both callers share, stated on the predicate itself.
+    ///
+    /// `prepare_delegated_scope` RESTRUCTURES the cgroup it accepts - it creates leaves under it,
+    /// moves kern's processes into one and enables controllers on it. Doing that to a scope kern did
+    /// not create would reshape a user's own session: `kern doctor` recommends `systemd-run --user
+    /// --scope bash` to pay the scope cost once, and every box started in that shell runs in an
+    /// ambient `run-*.scope`. The prefix kern puts on its OWN units is the proof of ownership, and this
+    /// is the assertion that keeps a future "any scope will do" from passing review.
+    #[test]
+    fn only_a_leaf_kern_named_itself_counts_as_a_box_cgroup() {
+        for ours in [
+            "kern-box-db-193325",   // direct path: the dir `apply_limits` creates
+            "kern-box-8067.scope",  // scope path: the transient unit kern asks systemd for
+            "kern-box-web-1.scope", // both shapes at once
+        ] {
+            assert!(is_kern_box_leaf(ours), "{ours} is kern's own");
+        }
+        for theirs in [
+            "run-p123-i456.scope", // `systemd-run --user --scope bash` - the user's shell
+            "app.slice",           // a shared slice: reaping or reshaping it hits the whole session
+            "user@1000.service",   // the user manager itself
+            "session-2.scope",     // a login session
+            "kern.slice",          // kern's OWN shared slice is still not a BOX
+            "notkern-box-1",       // the prefix must anchor at the start
+            "",
+        ] {
+            assert!(
+                !is_kern_box_leaf(theirs),
+                "{theirs} is not kern's to reap or restructure"
+            );
+        }
     }
 
     #[test]
