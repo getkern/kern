@@ -56,21 +56,23 @@ no KVM. The sandbox for an agent's dev loop, a CI step, or an air-gapped host.
 ## Performance
 
 Measured on one x86_64 desktop (Intel i7-14700KF, Linux 7.0.0, rootless, cgroup delegated),
-`python:3.12-slim`, on 2026-08-02. p50 over 25 calls after a discarded warmup, every row from
-the same session. Not aspirational. Your hardware will differ, measure and claim your own number.
+`python:3.12-slim`, re-measured on 2026-08-23 against the released binary and this SDK. p50 over 25
+calls after a discarded warmup, every row from the same session. Not aspirational. Your hardware will
+differ, measure and claim your own number.
 
 **Single call, sequential** (p50):
 
 | call (p50) | `enforce_limits=False` | default (`enforce_limits=True`) |
 | --- | --- | --- |
-| `run(["true"])` (bare box) | 4.03 ms | 4.22 ms |
-| `run_code("print(1)")` (+ Python interpreter start) | 13.55 ms | 13.87 ms |
-| `docker run --rm python:3.12-slim python3 -c` | n/a | 285 ms |
+| `run(["true"])` (bare box) | 3.7 ms | 3.8 ms |
+| `run_code("print(1)")` (+ Python interpreter start) | 13.1 ms | 13.5 ms |
+| `docker run --rm python:3.12-slim python3 -c` | n/a | 290 ms |
 
-For reference, `kern box --image python:3.12-slim` **natively** (no Python wrapper) is 3.80 ms on the
-same machine in the same session, so the 4.03 ms bare-box row is that plus **0.23 ms** of wrapper:
-one subprocess, two reader threads, and the flags the binding adds that the native run does not
-(`--ro`, the caps, the workspace mount).
+For reference, `kern box --image python:3.12-slim` **natively** (no Python wrapper) is 3.85 ms on the
+same machine in the same session, so the binding's own cost is inside the run-to-run spread here: one
+subprocess, two reader threads, and the flags the binding adds that the native run does not (`--ro`,
+the caps, the workspace mount). It was **0.23 ms** when this table was first measured; it is not
+something to quote to three decimals.
 
 That figure was **+3.9 ms in an earlier binding**, and almost all of it was one line of CPython. The binding
 enforced its own deadline with `Popen.wait(timeout=...)`, which does not block on the child: it polls
@@ -89,12 +91,14 @@ where cgroups cannot be delegated at all the old cost does return, so the option
 delegated host, turning it off buys nothing and costs the caps. **Leave it on.**
 
 `run_code` runs *Python code*, so it pays the **CPython interpreter start** on top of the box, that's
-a Python cost, not kern's, and it is why `run_code` is ~17 ms against the bare box's ~3.9. Even so:
-**~17 ms against `docker run python:3.12-alpine python -c pass` at ~309 ms is about 18× faster** for the
-same task, and we quote the number you get from `run_code`, never the bare-box best case dressed up as
-the code-execution number. Measured 2026-08-22 on an idle x86_64 desktop against the released binary and
-SDK 0.1.23: three runs of 40 read 17.1, 17.0 and 16.7 ms, the bare box 3.9, docker's median of seven
-309.2.
+a Python cost, not kern's, and it is why `run_code` is ~13.5 ms against the bare box's ~3.8. Even so:
+**~13.5 ms against `docker run --rm python:3.12-slim python3 -c` at ~290 ms is about 21× faster** for
+the same task, and we quote the number you get from `run_code`, never the bare-box best case dressed up
+as the code-execution number.
+
+The image is part of the claim, not decoration: the same call on `python:3.12-alpine` reads ~17 ms,
+because that interpreter starts slower, and a table that mixed the two would compare kern against
+itself. Every row here is `python:3.12-slim`, including docker's.
 
 **Concurrency**: 100 concurrent `run_code` calls on one `Sandbox`, 100/100 succeeded, zero leaked
 boxes, measured in the same session as the table above:
