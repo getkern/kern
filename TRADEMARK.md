@@ -6,9 +6,14 @@ which are *not* covered by the code license.
 
 ## The marks
 
-**"kern"** and the kern logo are trademarks of the kern project (`getkern.dev` is its official
-domain). Trademark law protects users from confusion about *who stands behind* a piece of software, it
-is separate from, and does not restrict, your rights to the code.
+**"kern"** and the kern logo are **unregistered** trademarks of the kern project (`getkern.dev` is its
+official domain). Unregistered is stated rather than left to be assumed: nothing is filed with the
+EUIPO or the USPTO today, so this page is a statement of intent and of use, not a registration you can
+look up. It is written now because a policy that appears the day it is first needed is worth less than
+one that was always here.
+
+Trademark law protects users from confusion about *who stands behind* a piece of software. It is
+separate from, and does not restrict, your rights to the code.
 
 ## What you can do without asking (nominative / fair use)
 
