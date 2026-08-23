@@ -14891,6 +14891,18 @@ fn run_terminal_verb(
                 if !b.ports.is_empty() {
                     println!("    ports: {}", b.ports.join(", "));
                 }
+                // The v-profiles, because `config` answers "what did kern understand" and a profile
+                // changes every cap the box runs under. Shown as the TOKENS the box will receive, so
+                // the line can be copied onto a `kern box` command and behave the same; the file they
+                // resolve against is named too, since a profile that is not in it is the one failure
+                // this preview can warn about before anything starts.
+                let tokens = b.profile_tokens();
+                if !tokens.is_empty() {
+                    println!("    profiles: {}", tokens.join(" "));
+                    if let Some(c) = &b.config {
+                        println!("      defined in: {c}");
+                    }
+                }
                 // `config` answers "what did kern understand", so it must show a declared `port:`:
                 // it is what the pod preflight reserves AND what the service receives as `PORT`, so
                 // hiding it would leave the one command that exists to explain the file silent about

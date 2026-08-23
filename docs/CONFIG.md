@@ -206,6 +206,12 @@ described below.
 image      = "alpine:3.19"        # --image
 rootfs     = "/var/lib/rootfs"    # --rootfs   (mutually: image OR rootfs)
 
+# named resource profiles, the ones declared above as [[vcpu]] / [[vdisk]] / [[vgpio]]
+config     = "kern.toml"          # --config: the file those profiles are DECLARED in
+vcpu       = "slim"               # -> the positional token `vcpu:slim`
+vdisk      = ["scratch", "logs"]  # -> `vdisk:scratch vdisk:logs`, one mount each
+vgpio      = "leds"               # -> `vgpio:leds`
+
 # command & ordering
 command    = ["/bin/sh", "-c", "exec app"]   # -- <command...>
 depends_on = ["db"]               # start after these boxes
@@ -297,10 +303,24 @@ volumes    = ["/data:/data:ro", "/etc/app:/app"]  # --volume / -v  (repeatable)
 | `sysctls`           | `--sysctl`          |
 | `ulimits`           | `--ulimit`          |
 | `stop_grace_period` | `--stop-timeout`    |
+| `vcpu`/`vdisk`/`vgpio` | positional `vcpu:<name>` … |
 
 Everything else shares the flag's long name. **Two keys have no flag**, `port` and `expose`: they
 declare what a service listens on so `compose` can refuse a port collision inside the shared pod
 namespace before starting anything, which is a property of the stack rather than of one box.
+
+**The three v-profile keys are named after the tables that declare them**, not after a flag, because
+`kern box` takes them POSITIONALLY (`kern box api --image alpine vcpu:slim vdisk:scratch -- app`).
+Each takes one name or a list, and the prefix is optional inside the value: `vcpu = "slim"` and
+`vcpu = "vcpu:slim"` are the same profile. They could not be called `profiles`: that key already
+exists here with Docker's meaning (which services a plain `up` starts), and one word with two
+meanings in one file is how a stack quietly does something else.
+
+`config` names the file those profiles resolve against. Without it kern falls back to its usual
+discovery order, which depends on the caller's `$HOME` and environment: fine on a laptop, wrong for a
+stack that ships its own `kern.toml` beside it. `kern compose <file> config` prints the tokens each
+service will receive and the file they resolve against, so a name that is not in it is visible before
+anything starts.
 
 ---
 

@@ -146,6 +146,23 @@ pub struct ComposeBox {
     /// the profile-less services. Empty = always active. `parse` drops inactive services from the
     /// returned set (with a warning) so a profiled service can never be started by accident.
     pub profiles: Vec<String>,
+    /// `--config <file>`: the file that DEFINES the named `[[vcpu]]`/`[[vdisk]]`/`[[vgpio]]` profiles
+    /// this box attaches. Without it kern uses its usual config discovery, so a stack that ships its
+    /// own profiles next to itself names the file here and stops depending on the caller's `$HOME`.
+    pub config: Option<String>,
+    /// Named virtual-CPU profiles (`[[vcpu]] name = "db"` → the `vcpu:db` token `kern box` takes
+    /// positionally). A stack file could express the raw caps (`cpus`, `cpuset`, `memory`, `nice`)
+    /// but not a PROFILE, so the one thing kern has that the engines do not - reuse a named slice
+    /// across boxes - stopped at the CLI and never reached the file where per-service sizing is
+    /// written. The prefix is optional in the value: `vcpu = "db"` and `vcpu = "vcpu:db"` are the
+    /// same token, because a reader who writes the prefix means the profile they can see in the
+    /// config, and refusing it would be pedantry.
+    pub vcpu: Vec<String>,
+    /// Named virtual-disk profiles (`[[vdisk]] name = "dbdata"` → `vdisk:dbdata`). A list: a box can
+    /// mount more than one, each at `/vdisk/<name>` with its own size cap.
+    pub vdisk: Vec<String>,
+    /// Named GPIO/device profiles (`[[vgpio]] name = "leds"` → `vgpio:leds`).
+    pub vgpio: Vec<String>,
     /// Network aliases from a service's `networks.<net>.aliases` - extra names the service is reachable
     /// by inside the stack pod (Docker gives each service DNS for its aliases). `kern compose` adds
     /// each to the pod's shared `/etc/hosts` (→ `127.0.0.1`), so a peer that connects to an alias
@@ -223,6 +240,9 @@ impl ComposeBox {
     /// Append this box's fields to a `kern box <name>` command line as their mirror flags, in a
     /// stable order. The detached `-d` and the trailing `-- command` are added by the caller.
     pub fn push_box_flags(&self, cmd: &mut std::process::Command) {
+        if let Some(v) = &self.config {
+            cmd.arg("--config").arg(v);
+        }
         if let Some(v) = &self.image {
             cmd.arg("--image").arg(v);
         }
@@ -364,6 +384,36 @@ impl ComposeBox {
         for v in &self.cap_drop {
             cmd.arg("--cap-drop").arg(v);
         }
+        // LAST, and positional rather than flagged, because that is how `kern box` takes them:
+        // `kern box <name> [flags] vcpu:db vdisk:dbdata -- <command>`. The caller appends the `--`
+        // and the command after this, so the tokens land in the one place the parser reads them.
+        for t in self.profile_tokens() {
+            cmd.arg(t);
+        }
+    }
+
+    /// The `vcpu:`/`vdisk:`/`vgpio:` tokens this box attaches, in the order `kern box` would take
+    /// them. A value that already carries its prefix is passed through unchanged, so a file may say
+    /// `vcpu = "db"` or `vcpu = "vcpu:db"` and mean the same profile; anything else gets the prefix
+    /// its key implies. Split out from `push_box_flags` so the normalisation is unit-testable without
+    /// building a `Command`.
+    pub fn profile_tokens(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (kind, names) in [
+            ("vcpu", &self.vcpu),
+            ("vdisk", &self.vdisk),
+            ("vgpio", &self.vgpio),
+        ] {
+            for n in names.iter().filter(|n| !n.trim().is_empty()) {
+                let n = n.trim();
+                if n.starts_with(&format!("{kind}:")) {
+                    out.push(n.to_string());
+                } else {
+                    out.push(format!("{kind}:{n}"));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -863,6 +913,14 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "depends_completed" => {
                 b.depends_completed = parse_string_array(val).map_err(|e| line_err(i, &e))?
             }
+            "config" => b.config = Some(s(val)?),
+            // The v-profile keys. Each takes a bare profile NAME or a list of them, because the table
+            // that declares them is already `[[vcpu]]`/`[[vdisk]]`/`[[vgpio]]`: repeating the prefix in
+            // the value would be the file saying twice what it says once. A value that DOES carry the
+            // prefix is accepted and normalised (see `profile_tokens`), since it names the same thing.
+            "vcpu" => b.vcpu = parse_scalar_or_array(val).map_err(|e| line_err(i, &e))?,
+            "vdisk" => b.vdisk = parse_scalar_or_array(val).map_err(|e| line_err(i, &e))?,
+            "vgpio" => b.vgpio = parse_scalar_or_array(val).map_err(|e| line_err(i, &e))?,
             "volumes" => b.volumes = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "env" => b.env = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "env_file" => b.env_file = parse_string_array(val).map_err(|e| line_err(i, &e))?,
@@ -1279,6 +1337,18 @@ fn parse_positive_int(v: &str) -> Result<i64, String> {
         Ok(n) if n > 0 => Ok(n),
         Ok(_) => Err(format!("expected a positive integer, got `{}`", v.trim())),
         Err(_) => Err(format!("expected an integer, got `{}`", v.trim())),
+    }
+}
+
+/// A key that takes either one value or several: `vcpu = "db"` and `vcpu = ["db", "burst"]` both
+/// parse. The v-profile keys use it because attaching exactly one is the common case and forcing
+/// `["db"]` on every line would be ceremony; the array form stays for a box that mounts two vdisks.
+fn parse_scalar_or_array(val: &str) -> Result<Vec<String>, String> {
+    let t = val.trim();
+    if t.starts_with('[') {
+        parse_string_array(t)
+    } else {
+        Ok(vec![parse_string(t)?])
     }
 }
 
@@ -2635,6 +2705,21 @@ mod contract_tests {
                 "profiles",
                 "the YAML parser DROPS an inactive service, so it never reaches a command line",
             ),
+            // Read by `profile_tokens`, which `push_box_flags` appends: the scanner below only sees
+            // `self.<field>` written in that function's own body, and these three are consumed one
+            // call away so the normalisation stays unit-testable without building a `Command`.
+            (
+                "vcpu",
+                "profile_tokens(): the positional `vcpu:<name>` push_box_flags appends",
+            ),
+            (
+                "vdisk",
+                "profile_tokens(): the positional `vdisk:<name>` push_box_flags appends",
+            ),
+            (
+                "vgpio",
+                "profile_tokens(): the positional `vgpio:<name>` push_box_flags appends",
+            ),
             (
                 "net_aliases",
                 "extra-host resolution for the pod's shared namespace",
@@ -2678,6 +2763,95 @@ mod contract_tests {
     /// that omits a working field is worse than no reference at all, because a reader concludes the
     /// field does not exist. The sibling test above pins field -> reader; this one pins key -> docs,
     /// so a key cannot be added in silence at either end.
+    /// A named v-profile reaches the command line as the token `kern box` takes positionally.
+    ///
+    /// Before this, a stack file could set `cpus`/`cpuset`/`memory` per service but could not
+    /// reference a PROFILE: the one thing kern has that the engines do not, a named slice reused
+    /// across boxes, stopped at the CLI and never reached the file where per-service sizing is
+    /// actually written. `profiles` was already taken, by Docker's own meaning (which services a
+    /// plain `up` starts), so the keys are named after the tables that declare them.
+    #[test]
+    fn v_profiles_reach_the_command_line_as_positional_tokens() {
+        let src = r#"
+[box.db]
+image = "mariadb:lts"
+config = "profili.toml"
+vcpu = "db"
+vdisk = ["dbdata", "logs"]
+"#;
+        let boxes = crate::parse(src).expect("parses");
+        let b = &boxes[0];
+        assert_eq!(b.config.as_deref(), Some("profili.toml"));
+        assert_eq!(b.vcpu, vec!["db"]);
+        assert_eq!(b.vdisk, vec!["dbdata", "logs"]);
+        assert_eq!(
+            b.profile_tokens(),
+            vec!["vcpu:db", "vdisk:dbdata", "vdisk:logs"],
+            "the tokens are what `kern box <name> … vcpu:db vdisk:dbdata -- cmd` expects"
+        );
+    }
+
+    /// The prefix is optional, and writing it means the same profile rather than a different one.
+    ///
+    /// `vcpu = "vcpu:db"` is what a reader copies out of the CLI line they already had working, and
+    /// turning that into `vcpu:vcpu:db` would fail with "no [[vcpu]] profile named 'vcpu:db'" - a
+    /// message about a name they never typed.
+    #[test]
+    fn a_profile_value_may_carry_its_own_prefix() {
+        let src = r#"
+[box.a]
+image = "alpine"
+vcpu = "vcpu:db"
+vdisk = ["vdisk:scratch", "logs"]
+vgpio = "leds"
+"#;
+        let b = &crate::parse(src).expect("parses")[0];
+        assert_eq!(
+            b.profile_tokens(),
+            vec!["vcpu:db", "vdisk:scratch", "vdisk:logs", "vgpio:leds"]
+        );
+    }
+
+    /// An empty or whitespace-only entry is dropped rather than turned into a bare `vcpu:` token,
+    /// which `kern box` would classify as a profile with no name and refuse - an error about the
+    /// file's punctuation, not about anything the reader meant.
+    #[test]
+    fn an_empty_profile_entry_produces_no_token() {
+        let src = r#"
+[box.a]
+image = "alpine"
+vcpu = ""
+vdisk = ["", "  ", "real"]
+"#;
+        let b = &crate::parse(src).expect("parses")[0];
+        assert_eq!(b.profile_tokens(), vec!["vdisk:real"]);
+    }
+
+    /// The tokens come LAST on the command line, after every flag, because that is where the box
+    /// parser reads them: they are positional, and the caller appends `--` and the command after
+    /// this call. A token emitted before `--image` would still parse today, but the order is part of
+    /// what the generated line looks like when a user copies it out of `compose config`.
+    #[test]
+    fn profile_tokens_are_appended_after_the_flags() {
+        let src = r#"
+[box.a]
+image = "alpine"
+memory = "256m"
+vcpu = "slim"
+"#;
+        let b = &crate::parse(src).expect("parses")[0];
+        let mut cmd = std::process::Command::new("kern");
+        b.push_box_flags(&mut cmd);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let mem = argv.iter().position(|a| a == "--memory").expect("--memory");
+        let tok = argv.iter().position(|a| a == "vcpu:slim").expect("token");
+        assert!(tok > mem, "the token must follow the flags: {argv:?}");
+        assert_eq!(argv.last().map(String::as_str), Some("vcpu:slim"));
+    }
+
     #[test]
     fn every_box_key_is_documented() {
         let src = include_str!("lib.rs");
