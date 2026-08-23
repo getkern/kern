@@ -694,7 +694,12 @@ fn check_tools() -> Vec<R> {
         ),
         tool_opt(
             "pasta",
-            "pod / box outbound networking (NAT + DNS)",
+            // NOT "pod / box": a plain box is loopback-only whatever pasta does, and outbound there
+            // comes from `--net` (the host's own stack), not from this tool. Measured: a default box
+            // reaches neither an IP nor DNS with pasta installed; the same command in a pod reaches
+            // the internet. `doctor` is what a reader runs to learn what will work, so it may not
+            // name a capability the next command will not have.
+            "pod outbound networking (NAT + DNS); a plain box is loopback-only, `--net` gives it the host's",
             "install passt (apt install passt / dnf install passt); without it a pod is loopback-only \
              - peers reach each other but nothing reaches the network (no apk add / pip install). kern \
              uses pasta if present, it does not ship it",
