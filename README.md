@@ -366,8 +366,15 @@ gates; contributions are covered by the [CLA](CLA.md).
 ## Maintainer
 
 Alex, [@realexhub](https://github.com/realexhub). Commits come from
-[@getkerndev](https://github.com/getkerndev), the project's commit identity, so every commit has the
-same author and the same signing key.
+[@getkerndev](https://github.com/getkerndev), the project's commit identity: 747 of the 749 in this
+history, under two spellings of the same no-reply address, plus two documentation commits from the
+maintainer's own account on 2026-08-04.
+
+**The commits are not signed; the release TAG is.** That is the thing to verify, and it is the thing
+the provenance record and the OpenTimestamps anchor are about: `git verify-tag v0.7.0` against the key
+in [provenance/](provenance/), whose fingerprint is in [SECURITY.md](SECURITY.md). A sentence here
+once claimed every commit carried the same signing key. It did not: none of them do, and a claim about
+provenance is the last place to round up.
 
 ## License
 
