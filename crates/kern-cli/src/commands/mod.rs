@@ -15383,6 +15383,34 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             UidRange::Off
         };
         crate::pod::create_with_range(&pod, true, pod_needs_range)?;
+        // Feedback-first, and the counterpart of the rule just above: the pod's user namespace has ONE
+        // map, the holder's, so a member that asked for the narrow one does not get it when a peer needs
+        // the range. That is structural, not a bug to fix, but silently handing a service a WIDER map
+        // than its file asked for is the "accepted it and did something else" failure this codebase
+        // refuses. Name the services and the peer that decided it, so the reader can split the stack or
+        // drop the peer's default instead of wondering why `uid_range = false` changed nothing.
+        if !matches!(pod_needs_range, UidRange::Off) {
+            let opted_out: Vec<&str> = boxes
+                .iter()
+                .filter(|b| b.uid_range_explicit_false)
+                .map(|b| b.name.strip_prefix(&format!("{pod}-")).unwrap_or(&b.name))
+                .collect();
+            if !opted_out.is_empty() {
+                let because: Vec<&str> = boxes
+                    .iter()
+                    .filter(|b| b.wants_uid_range())
+                    .map(|b| b.name.strip_prefix(&format!("{pod}-")).unwrap_or(&b.name))
+                    .collect();
+                eprintln!(
+                    "kern: note: {} asked for the single-uid map (`uid_range = false`), but a pod shares \
+                     ONE user namespace and {} needs the range, so every member gets it. Split the stack \
+                     or set `uid_range = false` on {} too if the narrow map is what you want.",
+                    opted_out.join(", "),
+                    because.join(", "),
+                    because.join(", ")
+                );
+            }
+        }
     }
     // Feedback-first: a `--net` (host-network) service in a podded stack is NOT on the pod net, so its
     // peers can't reach it by name - say so rather than let it silently not resolve.
