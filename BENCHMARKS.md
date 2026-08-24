@@ -313,22 +313,35 @@ machine, same images, real commands, timed with the shell.
 
 | what you actually type | kern | docker | podman |
 |---|---:|---:|---:|
-| a throwaway box (`box --image … true`) | **~3.6 ms** | ~290 ms | ~290 ms |
-| `exec` into a running service | **0.79 ms** | 43.3 ms | 148.6 ms |
-| list what is running (`ps`) | **0.30 ms** | 8.2 ms | 13.5 ms |
-| read logs | **0.35 ms** | 8.2 ms | 37.5 ms |
-| stop a service (init handles SIGTERM) | **3.8 ms** | 136.1 ms | 199.2 ms |
-| stop nginx (the same image on all three) | **48.5 ms** | 187.2 ms | 256.9 ms |
-| bring a 2-service stack up | **188 ms** | 292 ms | 1022 ms |
-| stop that stack | **77 ms** | 263 ms | 496 ms |
-| take it down (stop + remove) | **68.8 ms** | 402.3 ms | 515.5 ms |
+| a throwaway box (`box --image … true`) | **3.51 ms** | ~290 ms | ~290 ms |
+| `exec` into a running service | **1.10 ms** | 42.2 ms | 147.6 ms |
+| list what is running (`ps`) | **0.54 ms** | 8.2 ms | 14.6 ms |
+| read logs | **0.44 ms** | 8.4 ms | 38.7 ms |
+| stop a service (init handles SIGTERM) | **1.9 ms** | 310 ms | 380 ms |
+| stop nginx (the same image on all three) | **50.4 ms** | 176.5 ms | 240.2 ms |
+| bring a 2-service stack up | **186 ms** | 404 ms | 1209 ms |
+| stop that stack | **6.1 ms** | 575 ms | 848 ms |
+| take it down (stop + remove) | **7.0 ms** | 748 ms | 870 ms |
 
-Reproduce any row with `time`, on both sides. No script of ours is involved.
+Re-measured end to end on 2026-08-24, every cell in ONE session on the machine below, against the
+published v0.7.0 binary, with the SAME workload in all three columns (an init that catches SIGTERM,
+so no column pays a 10 s grace the others do not). Reproduce any row with `time`, on both sides. No
+script of ours is involved.
+
+Four cells moved enough to say why. `ps` and `logs` went UP (0.30 -> 0.54, 0.35 -> 0.44): the earlier
+pair was optimistic, and a claim that flatters us is the one worth correcting first. `stop that stack`
+and `take it down` went DOWN by an order of magnitude (77 -> 6.1, 68.8 -> 7.0), which is the teardown
+work done since. The Docker and Podman columns moved too - `stop` 136 -> 310, the stack rows up
+across the board - because they were re-measured in the same session rather than carried over: a
+comparison whose columns come from different days compares days, not runtimes.
 
 The `take it down` row is `compose down` on a RUNNING stack, so it includes stopping both services;
-run against an already-stopped one it is 9 ms on kern, which is the removal alone and not a fair
+run against an already-stopped one it is 1.6 ms on kern, which is the removal alone and not a fair
 column. Podman's compose cells need `podman.socket` enabled - without it `podman compose` fails
-without starting anything and "measures" 28.7 ms, which is what a cell reads when nothing ran.
+without starting anything and "measures" 28.7 ms, which is what a cell reads when nothing ran. That
+is not hypothetical: on this desktop the socket was inactive for the user, the cells read 23-31 ms,
+and `podman ps` showed zero containers. Enabling it (`systemctl --user start podman.socket`) is what
+produced the numbers above.
 
 **The stop rows need two caveats, and both cut against the headline.**
 

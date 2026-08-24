@@ -46,14 +46,13 @@ and a stack runner at once, in 1.52 MB with no daemon.
   to a process on the host, with no sandbox at all. [docs/RESOURCES.md](docs/RESOURCES.md)
 - **Stacks, in kern's own format or in Docker's.** `kern compose <file> up` takes a `kern-compose.toml`
   (`[box.NAME]` tables, with the resource profiles above) or the `docker-compose.yml` you already have,
-  read as written. One stack to one pod, services reaching each other by name. Up in ~188 ms, down in ~69.
+  read as written. One stack to one pod, services reaching each other by name. Up in ~186 ms, down in ~7.
 - **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
   `doctor`, plus a Python and Node SDK and an MCP server for agents.
 
 Its entire Rust dependency tree is `libc`: JSON and OCI manifests are parsed by hand, and `pull`
 shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack. (1.52 MB
-is the size-optimized release build; `cargo install`, which is what you get until a release exists,
-is ~2 MB.)
+is the size-optimized release build; a plain `cargo install` from source is 1.91 MB.)
 
 <p align="center">
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one 1.52 MB static binary, no daemon.">
@@ -284,7 +283,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Rootless | **yes**, always | opt-in | yes |
 | Cold start, bare box | **~2.3 ms** | ~293 ms | ~285 ms |
 | Cold start, from an OCI image | **~3.6 ms** | ~293 ms | ~285 ms |
-| Stop a service (init handles SIGTERM) | **~3.8 ms** | ~136 ms | ~199 ms |
+| Stop a service (init handles SIGTERM) | **~1.9 ms** | ~310 ms | ~380 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.52 MB binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
