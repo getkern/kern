@@ -46,7 +46,7 @@ and a stack runner at once, in 1.52 MB with no daemon.
   to a process on the host, with no sandbox at all. [docs/RESOURCES.md](docs/RESOURCES.md)
 - **Stacks, in kern's own format or in Docker's.** `kern compose <file> up` takes a `kern-compose.toml`
   (`[box.NAME]` tables, with the resource profiles above) or the `docker-compose.yml` you already have,
-  read as written. One stack to one pod, services reaching each other by name. Up in ~186 ms, down in ~7.
+  read as written. One stack to one pod, services reaching each other by name.
 - **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
   `doctor`, plus a Python and Node SDK and an MCP server for agents.
 
@@ -293,31 +293,22 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 
 ## Performance
 
-Re-measured 2026-08-22 on an Intel i7-14700KF, Linux 7.0.0, with the **release-optimized binary**
-(1.52 MB, the one a release ships), against the runtimes installed there. Every number comes from one
-script you can run yourself, `python3 examples/benchmark.py`. Medians on that machine; yours will
-differ with your CPU, kernel and filesystem, which is why these are approximate.
+Intel i7-14700KF, Linux 7.0.0, the release binary, one script you can run yourself:
+`python3 examples/benchmark.py`. Yours will differ with your CPU, kernel and filesystem.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
 | Cold start (bare box) | **~2.3 ms** | ~2.3 ms | ~18.6 ms | ~293 ms | ~297 ms |
 | 200 boxes in parallel | **~0.11 s** | ~0.16 s | ~0.35 s | ~44.8 s | ~16.2 s |
 
-A thousand simultaneous boxes take ~0.59 s, all 1000 of them; two thousand take ~1.44 s and three thousand ~2.21 s. One more live box costs ~0.3 MB of real
-memory (100 boxes measured 26.3 MB against 13 MB of ambient drift over the same interval, so read the
-per-box figure as approximate). `exec` into a running box is ~1.1 ms against Docker's ~42.2.
+Three thousand at once take ~2.2 s, and a live box costs ~0.3 MB of memory.
 
-Every figure above reproduces against 2026-08-01: cold start 2.2 then and 2.3 now, concurrency
-0.09 both times, `exec` 0.79 then and 0.93 now. How to re-measure without fooling yourself, and what
-the run-to-run spread costs: **[BENCHMARKS.md](BENCHMARKS.md)**.
+Two honest notes. **Nobody wins single-shot latency outright**: the floor for `unshare` + `exec` is
+1 to 2 ms, so the whole top tier sits inside its own noise, and bubblewrap is a launcher with no
+images, caps or lifecycle. The gap that means something is to the *engines*, two orders of magnitude
+above.
 
-Nobody wins single-shot latency outright: the physical floor for `unshare` + `exec` is 1 to 2 ms, so
-the top tier sits inside its own run-to-run noise. At the same level of work kern is ahead of
-bubblewrap on **every host where both are installed**, ~2.3 ms against ~2.8 here, 3.5 against 5.6 on a
-Jetson, 9.6 against 15.0 on an Arduino, and still ahead at 4.2 and 11.3 while enforcing a cgroup cap
-bubblewrap does not enforce at all. bubblewrap is a launcher with no images, caps or lifecycle. The
-gap that matters is to the engines, 128 to 134x above. Method, per-phase breakdown, board numbers
-and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
+Method, per-phase breakdown, board numbers and every caveat: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
