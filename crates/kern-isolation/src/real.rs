@@ -2846,7 +2846,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         // one and never builds a range at all.
         range_unmet = spec.uid_range == UidRange::ImageDefault && range.is_none();
         match range {
-            Some(range) => apply_userns_range(ns_flags, euid, egid, &range)?,
+            Some(range) => {
+                apply_userns_range(ns_flags, euid, egid, &range)?;
+                // The RANGED branch was the one arm without a mark, which is why a `KERN_TIMING` run of
+                // the `--image` path (where the range is the default) attributed about a millisecond to
+                // nothing: the two setuid helpers are the single most expensive step in a box start and
+                // they were the step nobody could see. Same label as the cheap branch, so one line
+                // answers "what did the id map cost here" whichever path a host took.
+                pt_spawn.mark("parent:unshare(ns)+idmap");
+            }
             None => {
                 if unsafe { libc::unshare(ns_flags) } != 0 {
                     let e = std::io::Error::last_os_error();
