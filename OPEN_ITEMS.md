@@ -108,16 +108,17 @@ users run, the same span is ~2.45 ms.
 
 The published Linux binaries are built with a pinned nightly, `-Zbuild-std=std,panic_abort`,
 `-Zbuild-std-features=optimize_for_size` and `-Cpanic=immediate-abort`, reaching
-**1518392 B x86_64 (1.52 MB)** and **1226296 B aarch64 (1.23 MB)** - a ~734 KB `.tar.gz` download.
-`optimize_for_size` builds std with core's size-first code paths and was worth a further ~5% on both
-targets (x86_64 1600312 -> 1518392 B, aarch64 1299000 -> 1226296 B), latency-neutral on the same
-alternating 200-round measurement the panic flag got. The x86_64 figure reproduces ACROSS MACHINES:
-this desktop rebuilt the commit that first published a size and got 1575480 B, the CI artifact's byte
-count exactly, so the stripped binary embeds nothing machine-specific and the number can be
+**1518392 B x86_64 (1.52 MB)** and **1247528 B aarch64 (1.25 MB)**, a 733 KB and a 699 KB `.tar.gz`
+download. `optimize_for_size` builds std with core's size-first code paths and was worth a further ~5%
+(x86_64 1600312 -> 1518392 B on this desktop, aarch64 1299000 -> 1226296 B on the same CROSS build,
+which is why those two aarch64 numbers are a ratio and not the shipped size), latency-neutral on the
+same alternating 200-round measurement the panic flag got. The x86_64 figure reproduces ACROSS
+MACHINES: this desktop's build of the tagged commit is 1518392 B, the byte count of the binary inside
+the published tarball, so the stripped binary embeds nothing machine-specific and the number can be
 re-measured anywhere with the pinned toolchain. The aarch64 one cannot, and is CI's: a native build
-there and a CROSS build here are different link jobs (cross needs `rust-lld`, and the same commit
-measured 1281480 B that way), so an aarch64 size is only ever quoted from the release build - the
-number above is v0.7.0's published artifact, read off the tarball that ships. A plain stable
+there and a CROSS build here are different link jobs (cross needs `rust-lld`, and the tagged commit
+measured 1226296 B that way against CI's 1247528), so an aarch64 size is only ever quoted from the
+release build - the number above is v0.7.0's published artifact, read off the tarball that ships. A plain stable
 `cargo build --release` still yields a working ~2.0 MB binary; the nightly is only the
 release-artifact size optimization.
 

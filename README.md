@@ -353,10 +353,9 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 ## Status
 
 **The core is done. Everything above works today and is tested:** 838 Rust, 78 Python and 61 Node
-tests, clippy-clean, `cargo-deny`-clean. You build from source, and the CLI
-and config surface can still change, always called out in [CHANGELOG.md](CHANGELOG.md). It is being
-tested hard on real hardware (Linux, WSL2, Raspberry Pi, Jetson, Arduino UNO Q) and refined ahead of
-a first publication. Commits are signed.
+tests, clippy-clean, `cargo-deny`-clean. Tested on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson
+Orin Nano, Arduino UNO Q. The CLI and config surface can still change, always called out in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
@@ -366,15 +365,11 @@ gates; contributions are covered by the [CLA](CLA.md).
 ## Maintainer
 
 Alex, [@realexhub](https://github.com/realexhub). Commits come from
-[@getkerndev](https://github.com/getkerndev), the project's commit identity: 747 of the 749 in this
-history, under two spellings of the same no-reply address, plus two documentation commits from the
-maintainer's own account on 2026-08-04.
+[@getkerndev](https://github.com/getkerndev), the project's commit identity.
 
-**The commits are not signed; the release TAG is.** That is the thing to verify, and it is the thing
-the provenance record and the OpenTimestamps anchor are about: `git verify-tag v0.7.0` against the key
-in [provenance/](provenance/), whose fingerprint is in [SECURITY.md](SECURITY.md). A sentence here
-once claimed every commit carried the same signing key. It did not: none of them do, and a claim about
-provenance is the last place to round up.
+**The commits are not signed; the release TAG is.** That is what to verify:
+`git verify-tag v0.7.0` against the key in [provenance/](provenance/), whose fingerprint is in
+[SECURITY.md](SECURITY.md).
 
 ## License
 
