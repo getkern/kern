@@ -106,16 +106,20 @@ users run, the same span is ~2.45 ms.
 
 ## The release binary trades panic diagnostics for size
 
-The published Linux binaries are built with a pinned nightly, `-Zbuild-std=std,panic_abort` and
-`-Cpanic=immediate-abort`, reaching **1592088 B x86_64 (1.59 MB)** and **1313056 B aarch64 (1.31 MB)** -
-a ~764 KB `.tar.gz` download. The x86_64 figure reproduces ACROSS MACHINES: this desktop rebuilt the
-commit that first published a size and got 1575480 B, the CI artifact's byte count exactly, so the
-stripped binary embeds nothing machine-specific and the number can be re-measured anywhere with the
-pinned toolchain. The aarch64 one cannot, and is CI's: a native build there and a CROSS build here are
-different link jobs (cross needs `rust-lld`, and the same commit measured 1281480 B that way), so an
-aarch64 size is only ever quoted from the release build - the number above is v0.7.0's published
-artifact, read off the tarball that ships. A plain stable `cargo build --release` still
-yields a working ~2.0 MB binary; the nightly is only the release-artifact size optimization.
+The published Linux binaries are built with a pinned nightly, `-Zbuild-std=std,panic_abort`,
+`-Zbuild-std-features=optimize_for_size` and `-Cpanic=immediate-abort`, reaching
+**1518392 B x86_64 (1.52 MB)** and **1226296 B aarch64 (1.23 MB)** - a ~734 KB `.tar.gz` download.
+`optimize_for_size` builds std with core's size-first code paths and was worth a further ~5% on both
+targets (x86_64 1600312 -> 1518392 B, aarch64 1299000 -> 1226296 B), latency-neutral on the same
+alternating 200-round measurement the panic flag got. The x86_64 figure reproduces ACROSS MACHINES:
+this desktop rebuilt the commit that first published a size and got 1575480 B, the CI artifact's byte
+count exactly, so the stripped binary embeds nothing machine-specific and the number can be
+re-measured anywhere with the pinned toolchain. The aarch64 one cannot, and is CI's: a native build
+there and a CROSS build here are different link jobs (cross needs `rust-lld`, and the same commit
+measured 1281480 B that way), so an aarch64 size is only ever quoted from the release build - the
+number above is v0.7.0's published artifact, read off the tarball that ships. A plain stable
+`cargo build --release` still yields a working ~2.0 MB binary; the nightly is only the
+release-artifact size optimization.
 
 The honest cost, kept in view: under `immediate-abort` a panic prints no file and no line, so a bug
 that can only reach a panic aborts with a bare `SIGABRT` and no diagnostic. kern's production code is

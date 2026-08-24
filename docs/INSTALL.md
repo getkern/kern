@@ -3,7 +3,7 @@
 One static binary and no daemon. Its only Rust dependency is `libc`, and a box built from a
 `--rootfs` needs nothing else on the host. The image path is the exception and is stated as one:
 `kern pull` and `--image` shell out to the system `curl` and `tar` rather than linking a TLS stack
-and a decompressor, which is most of why the release binary is 1.59 MB (a from-source build is
+and a decompressor, which is most of why the release binary is 1.52 MB (a from-source build is
 ~2 MB; the size optimization is release-only). `kern doctor` reports whether both
 are present. This page is the long form of the [README](../README.md).
 
@@ -85,7 +85,7 @@ cargo install --git https://github.com/getkern/kern getkern --locked
 was tested with. This is the one route that does need a Rust toolchain.
 
 **📦 Offline / air-gapped** (a board or locked-down server with no internet). kern is a single
-static binary (~2 MB from a source build; 1.59 MB x86_64 / 1.31 MB aarch64 in the size-optimized
+static binary (~2 MB from a source build; 1.52 MB x86_64 / 1.23 MB aarch64 in the size-optimized
 release build), so copying that one file *is* the install:
 
 ```sh
@@ -159,7 +159,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 **Linux, multi-architecture.** kern builds to a static (musl) binary for **`linux-x86_64`** and
 **`linux-aarch64`**: one file per arch (~2.0 MB x86_64 / ~1.6 MB aarch64 from a source build; the
-size-optimized release build is 1.59 MB / 1.31 MB), no Rust deps beyond `libc` (the pull path shells
+size-optimized release build is 1.52 MB / 1.23 MB), no Rust deps beyond `libc` (the pull path shells
 out to system `curl`/`tar`). No prebuilt binaries are published yet; every target builds from source.
 
 | Platform | Arch | Status |

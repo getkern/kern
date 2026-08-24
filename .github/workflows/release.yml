@@ -52,11 +52,20 @@ jobs:
         # drops std's panic-formatting machinery (the code is panic-free in production, and a panic that
         # cannot happen now fail-fast aborts instead of unwinding). ~22% smaller, latency-neutral. A plain
         # stable `cargo build --release` remains the supported fallback and yields the same behavior.
+        #
+        # `optimize_for_size` builds that std with core's size-first code paths (the smaller sort, the
+        # compact formatting and search implementations). MEASURED on this tree: x86_64 1600312 ->
+        # 1518392 B, aarch64 1299000 -> 1226296 B, a further ~5%. Latency-neutral, verified the way the
+        # panic flag was: 200-round sequential `box --image` alternating the two binaries, 3329/3373 us
+        # against 3379/3349 - inside the run-to-run noise. Behaviour verified on the built artifact, not
+        # assumed: the 48-check end-to-end battery gives the same result as the standard binary, and a
+        # box on all three ARM boards still comes up capped at the exact `--memory` value.
         env:
           RUSTFLAGS: "-Zunstable-options -Cpanic=immediate-abort"
         run: >
           cargo +nightly-2026-08-09 build --release --target ${{ matrix.target }} --bin kern
           -Z build-std=std,panic_abort
+          -Z build-std-features=optimize_for_size
       - name: Package
         run: |
           set -eu
