@@ -299,6 +299,19 @@ pub enum MemoryCapState {
     /// A write to a freshly-created child's `memory.max` stuck and read back unchanged: a real
     /// `--memory` cap WILL bind here.
     Enforced,
+    /// The direct write does not bind, but the box does not take that path here: it is capped by the
+    /// systemd user manager on its own transient scope, and a probe scope came up with the requested
+    /// `MemoryMax` IN FORCE (read back from the scope's own `memory.max`). A real `--memory` cap binds.
+    ///
+    /// This state exists because reporting the direct probe alone was WRONG on every ARM board.
+    /// MEASURED 2026-08-24 on an Arduino UNO Q (systemd 257), a Raspberry Pi 5 (252) and a Jetson Orin
+    /// Nano (249): a live box started with `--memory 64M` sat in
+    /// `.../kern-box-<pid>.scope/kern-box-<name>-<pid>` with `memory.max = 67108864` inside a scope at
+    /// `71303168` (the cap plus the supervisor headroom) - the cap enforced by the kernel, exactly as
+    /// designed - while `kern doctor`, on the same host in the same second, printed "`--memory` won't
+    /// be enforced". Three boards, three systemd versions, the same false negative, on the hardware
+    /// kern is aimed at and in the first command a new user runs.
+    EnforcedOnScope,
     /// The `memory` controller is in this tree but not delegated to a child kern can create, so a
     /// `memory.max` write is accepted and never bites. `--memory` is silently ineffective.
     PresentNotDelegated,
@@ -308,6 +321,27 @@ pub enum MemoryCapState {
     /// Could not be determined: no cgroup v2, or `/proc/self/cgroup` was unreadable.
     Unknown,
 }
+
+/// The value both cap probes write and read back: 1 MiB, small, page-aligned and unmistakably not the
+/// `max` sentinel a fresh cgroup starts at. ONE definition, because the two probes must agree - the
+/// direct one writes it into a child's `memory.max`, the scope one hands it to systemd as `MemoryMax`
+/// and compares what the scope reports. Two copies of a number that has to match is how a probe starts
+/// answering a question nobody asked.
+const CAP_PROBE_BYTES: &str = "1048576";
+
+/// kern's shared parent slice, named ONCE. [`kern_slice_path`] resolves it to a directory and the
+/// scope probe hands the same name to `systemd-run --slice=`; two spellings of it is one rename away
+/// from a probe that measures a slice no box uses.
+const KERN_SLICE_NAME: &str = "kern.slice";
+
+/// How long the scope probe waits for `systemd-run` before giving up on it. Generous next to a healthy
+/// scope (measured 8-11 ms on a Raspberry Pi 5, ~40 ms on the slowest board) and short enough that a
+/// wedged user manager costs `kern doctor` a bounded pause instead of hanging it.
+const SCOPE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Poll interval while waiting for the probe scope. Small against the timeout, large enough that the
+/// wait costs no measurable CPU.
+const SCOPE_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Probe, by a real write, whether a `--memory` cap will actually bind for a box on this host - and
 /// probe it WHERE THE BOX WILL CAP, not where this process runs.
@@ -339,7 +373,127 @@ pub fn memory_cap_state() -> MemoryCapState {
     let Some(target) = ensure_kern_slice().or_else(current_v2_cgroup) else {
         return MemoryCapState::Unknown;
     };
-    memory_cap_state_at(&target)
+    let direct = memory_cap_state_at(&target);
+    if direct == MemoryCapState::Enforced {
+        return direct;
+    }
+    // The direct write does not bind - but on the boards that is not how a box is capped. There kern
+    // re-execs into a transient scope and the MANAGER applies `MemoryMax` to it, which the direct
+    // probe never touches because it creates no scope. Ask the second path before reporting a host
+    // uncapped: see [`MemoryCapState::EnforcedOnScope`] for the measurement that made this necessary.
+    if scope_path_caps_memory() {
+        return MemoryCapState::EnforcedOnScope;
+    }
+    direct
+}
+
+/// Does a box get a REAL `--memory` cap through the scope path on this host?
+///
+/// Not deduced from what the manager delegates - MEASURED, the same way [`scope_accepts_oom_policy`]
+/// measures `OOMPolicy=`: build a transient scope carrying `MemoryMax` and have it read back its OWN
+/// `memory.max`. [`CAP_PROBE_BYTES`] back means the limit was in force while a process lived under it;
+/// `max` means the manager accepted the property and dropped it (what a host with no `memory`
+/// controller does), and that is reported as uncapped.
+///
+/// It takes TWO scopes because the scope's cgroup path must not be ASSUMED. The first attempt computed
+/// it from [`kern_slice_path`], which derives from the CURRENT cgroup - and an ssh session lives in
+/// `user-<uid>.slice/session-N.scope`, with no `user@<uid>.service` ancestor, so the path came out
+/// `None` and the probe silently answered "no cap" on all three boards even though the scope path caps
+/// them. So the first scope prints its OWN `/proc/self/cgroup`, and the second reads the `memory.max`
+/// under the DIRECTORY that answer names. Only the parent is taken from the measurement, never the
+/// leaf: the two scopes carry DIFFERENT unit names because reusing one is refused by older managers
+/// ("Unit kern-cp-x.scope was already loaded", measured on systemd 252 and 249, accepted on 257), which
+/// is exactly the kind of version-dependent behaviour that has to be probed rather than assumed.
+/// `--collect` removes each unit, so nothing is left behind.
+///
+/// Memoised per process. Its only caller is the doctor probe, on the path where the direct write has
+/// already failed, so no box start pays for the two scopes.
+fn scope_path_caps_memory() -> bool {
+    static MEMO: OnceLock<bool> = OnceLock::new();
+    *MEMO.get_or_init(|| {
+        let pid = unsafe { libc::getpid() };
+        // Where does such a scope live? Ask one, and keep only the directory it reports.
+        let first = format!("kern-capprobe-{pid}-a");
+        let Some(reported) = scope_probe_read(&first, std::path::Path::new("/proc/self/cgroup"))
+        else {
+            return false;
+        };
+        let Some(parent) = scope_parent_from_proc_cgroup(&reported) else {
+            return false;
+        };
+        let second = format!("kern-capprobe-{pid}-b");
+        let own_max = PathBuf::from(format!("/sys/fs/cgroup{parent}/{second}.scope/memory.max"));
+        scope_probe_read(&second, &own_max).is_some_and(|v| v.trim() == CAP_PROBE_BYTES)
+    })
+}
+
+/// The DIRECTORY a probe scope reported for itself, from the `/proc/self/cgroup` it printed: the v2
+/// line (`0::/…`) minus its leaf. `None` for anything that is not a v2 path, so a cgroup v1 host or a
+/// garbled read makes the probe answer "no cap" instead of building a path out of nonsense. Pure, so
+/// the parsing is tested without a systemd.
+fn scope_parent_from_proc_cgroup(reported: &str) -> Option<String> {
+    reported
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)
+        .filter(|p| p.starts_with('/'))
+        .and_then(|p| p.rsplit_once('/'))
+        .map(|(dir, _leaf)| dir.to_string())
+        .filter(|dir| !dir.is_empty())
+}
+
+/// One `systemd-run --scope -p MemoryMax=…` whose whole job is to `cat` the file it is given, from
+/// inside the scope. Returns its stdout, or `None` if the scope could not be built (no `systemd-run`,
+/// no `cat`, a manager that refuses the property, or a manager that does not answer). Shared by both
+/// passes of [`scope_path_caps_memory`] so the two scopes differ only in the file they read.
+///
+/// BOUNDED, unlike a plain `output()`. `systemd-run` talks to the user manager over D-Bus, and a
+/// manager that never replies would hang it forever - which for a diagnostic is the worst failure
+/// there is: `kern doctor` exists to TELL you the state of a sick host, so it must not become part of
+/// the sickness. The child is reaped after [`SCOPE_PROBE_TIMEOUT`], and its output is read only once
+/// it has exited, so nothing is left running and nothing blocks on a full pipe.
+fn scope_probe_read(unit: &str, what: &std::path::Path) -> Option<String> {
+    let systemd_run = crate::real::trusted_helper("systemd-run")?;
+    let cat = crate::real::trusted_helper("cat")?;
+    let mut child = Command::new(systemd_run)
+        .arg(systemd_scope_mode())
+        .args(["--scope", "--quiet", "--collect"])
+        .arg(format!("--slice={KERN_SLICE_NAME}"))
+        .arg(format!("--unit={unit}"))
+        .arg("-p")
+        .arg(format!("MemoryMax={CAP_PROBE_BYTES}"))
+        .arg(cat)
+        .arg(what)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + SCOPE_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            // Exited: read what it printed. A non-zero status means no usable answer.
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                use std::io::Read;
+                let mut out = String::new();
+                child.stdout.take()?.read_to_string(&mut out).ok()?;
+                return Some(out);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Take the child away rather than leave a probe behind, and reap it so it cannot
+                    // become a zombie. `--collect` removes the unit if one was ever created.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(SCOPE_PROBE_POLL);
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Testable core of [`memory_cap_state`]: the probe against an explicit cgroup directory, split out
@@ -392,8 +546,7 @@ fn memory_cap_state_at(cur: &std::path::Path) -> MemoryCapState {
     // The same write-then-verify primitive `apply_limits` uses for a real box's `memory.max`: a fresh
     // child starts at the `max` sentinel, so "reads back a real (non-`max`) limit" is equivalent to the
     // exact-value check here, and there is one definition of "the write bound" instead of two.
-    const PROBE_BYTES: &str = "1048576"; // 1 MiB
-    let stuck = wrote_real_limit(&max, PROBE_BYTES);
+    let stuck = wrote_real_limit(&max, CAP_PROBE_BYTES);
     let _ = fs::remove_dir(&child);
     if stuck {
         MemoryCapState::Enforced
@@ -491,7 +644,7 @@ fn has_controller(dir: &std::path::Path, ctrl: &str) -> bool {
 fn kern_slice_path() -> Option<PathBuf> {
     if as_root() {
         // `systemd-run --system --slice=kern.slice` lands the slice at the top of the cgroup-v2 mount.
-        return Some(PathBuf::from("/sys/fs/cgroup/kern.slice"));
+        return Some(PathBuf::from("/sys/fs/cgroup").join(KERN_SLICE_NAME));
     }
     let cur = current_v2_cgroup()?;
     let root = cur.ancestors().find(|p| {
@@ -500,7 +653,7 @@ fn kern_slice_path() -> Option<PathBuf> {
             n.starts_with("user@") && n.ends_with(".service")
         })
     })?;
-    Some(root.join("kern.slice"))
+    Some(root.join(KERN_SLICE_NAME))
 }
 
 /// Apply a FLEET-WIDE budget to kern's shared parent slice (`kern.slice`): a hard `memory.max` and/or
@@ -1879,6 +2032,38 @@ mod tests {
             "enabling the subtree must not turn an unenforceable host into a false Enforced"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_scope_probe_takes_only_the_directory_from_what_a_scope_reports() {
+        // The scope path probe must not GUESS the cgroup layout: it takes the parent from what a probe
+        // scope printed about itself and appends its own unit name. This pins that parsing, which is
+        // where a wrong path would come from - and a wrong path reads no `memory.max`, which reports a
+        // capped host as uncapped (the false negative this whole probe exists to fix).
+        assert_eq!(
+            scope_parent_from_proc_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/kern.slice/kern-capprobe-9-a.scope\n"
+            )
+            .as_deref(),
+            Some("/user.slice/user-1000.slice/user@1000.service/kern.slice"),
+            "the leaf must be dropped and the slice kept"
+        );
+        // A cgroup v1 host has no `0::` line: answer None rather than build a path out of a v1 row.
+        assert_eq!(
+            scope_parent_from_proc_cgroup("1:name=systemd:/user.slice\n2:memory:/user.slice"),
+            None
+        );
+        // Garbage, an empty read, and a v2 line whose path is not absolute must all be None.
+        for junk in ["", "0::\n", "0::relative/path\n", "not a cgroup file"] {
+            assert_eq!(
+                scope_parent_from_proc_cgroup(junk),
+                None,
+                "must refuse to derive a path from {junk:?}"
+            );
+        }
+        // A scope directly under the root leaves an empty parent: refused, since `/sys/fs/cgroup` plus
+        // a unit name is not where a delegated scope lives.
+        assert_eq!(scope_parent_from_proc_cgroup("0::/some.scope\n"), None);
     }
 
     #[test]

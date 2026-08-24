@@ -527,6 +527,13 @@ fn check_cgroup() -> R {
                 "cgroup v2, no systemd --user manager needed: caps enforced in the current cgroup"
                     .into(),
             ),
+            // Reachable only if a transient scope carried a `MemoryMax` that bound while this host
+            // reports no user manager. Not observed anywhere; report what was measured, not a state
+            // derived from the two facts disagreeing.
+            MemoryCapState::EnforcedOnScope => R::Ok(
+                "cgroup v2: caps enforced on a transient scope (probed in force) though no systemd --user manager was detected"
+                    .into(),
+            ),
             MemoryCapState::PresentNotDelegated => R::Warn(
                 "cgroup v2 present, no systemd --user manager, and the `memory` controller is listed but NOT delegated to a child cgroup - a `--memory` write is accepted and silently never bites".into(),
                 "boxes still run and the isolation holds; add `memory` to this tree's `cgroup.subtree_control`, or run kern under a delegated `systemd --user` scope".into(),
@@ -546,18 +553,28 @@ fn check_cgroup() -> R {
     // it takes. Some distros (Raspberry Pi OS) delegate only `cpu`+`pids`; some list `memory` yet the
     // write is inert (root inside a container). So WRITE-PROBE the box's real target - its delegated
     // slice, the same one `apply_limits` writes - instead of reading the user manager's delegated set.
-    match kern_isolation::memory_cap_state() {
+    let cap_state = kern_isolation::memory_cap_state();
+    match cap_state {
         // A DELEGATED controller is not the same as an ENFORCEABLE knob. On an Arduino UNO Q's Android
         // kernel `cgroup.controllers` lists `cpu`, yet no `cpu.max` exists anywhere in the chain: the
         // controller is there with only its *weight* interface, so `--cpus` is a share, not a ceiling.
         // Memory is now write-probed; cpu keeps its own bandwidth-interface check so this row never
         // tells a comfortable lie about a knob it did not look at.
-        MemoryCapState::Enforced => {
+        //
+        // Two ways the cap is real, and the row names WHICH: the direct write into the box's cap
+        // target, or the user manager applying `MemoryMax` to the box's own transient scope. On all
+        // three ARM boards only the second holds, and reporting just the first made this row deny a cap
+        // the kernel was enforcing (see `MemoryCapState::EnforcedOnScope`).
+        MemoryCapState::Enforced | MemoryCapState::EnforcedOnScope => {
+            let how = if cap_state == MemoryCapState::Enforced {
+                "`--memory` write-probed to bind"
+            } else {
+                "`--memory` applied by the user manager on the box's own scope, probed in force"
+            };
             if cpu_bandwidth_interface_present() {
-                R::Ok(
-                    "cgroup v2 + systemd --user scope: resource caps enforced (`--memory` write-probed to bind)"
-                        .into(),
-                )
+                R::Ok(format!(
+                    "cgroup v2 + systemd --user scope: resource caps enforced ({how})"
+                ))
             } else {
                 R::Warn(
                     "memory/pids caps are enforced, but this kernel's `cpu` controller has no bandwidth interface (`cpu.max`) - `--cpus` is a SHARE here, not a ceiling".into(),
