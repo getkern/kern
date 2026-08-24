@@ -1656,11 +1656,18 @@ fn await_box_started(
     let p = crate::ui::Palette::detect();
     let gl = crate::ui::Glyphs::detect();
     let n = name.as_str();
-    println!(
+    // stderr, not stdout. A detached box writes its workload's output to its LOG, so nothing about
+    // this line is data: it is a confirmation and a hint, addressed to a person. Putting it on stdout
+    // means `kern box web -d … > file` captures a decorated sentence, and a caller reading stdout gets
+    // prose where it expected either nothing or a machine-readable value. Interactively nothing
+    // changes - stderr is the same terminal - and the box's name is an ARGUMENT the caller already
+    // holds, so there is no identifier to print in its place (unlike `docker run -d`, which prints a
+    // container id it generated).
+    eprintln!(
         "{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}",
         p.g, gl.ok, p.z, p.b, p.z, p.d, p.z
     );
-    println!(
+    eprintln!(
         "  {}next: kern ps {} kern logs {n} {} kern stop {n}{}",
         p.d, gl.dot, gl.dot, p.z
     );
