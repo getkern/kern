@@ -1,2 +1,2 @@
-kern v0.7.0 signed tag object: 27cb401072baac450bd757311932aafdd3c3d09a
-commit: 769e33cc827c5641912293c8a74432dfa0ad7365
+kern v0.7.0 signed tag object: 18c402fead0a512e9cee1ad3427affe86400a2c9
+commit: 8fb7fdb293e85dadccdadf620a96eedee6540696
