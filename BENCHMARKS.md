@@ -39,19 +39,25 @@ Time per run, total divided by 200 sequential runs.
 
 | Runtime | Cold start | What it does at that price |
 |---|---:|---|
-| **kern** `box --rootfs`, uncapped | **2.44 ms** | overlay + self-pivot + seccomp. Uncapped is what makes it comparable to bubblewrap |
-| **kern** `box --rootfs`, capped (the default) | **2.63 ms** | the same, plus a real cgroup cap: +0.19 ms |
-| **kern** `box --bind-rootfs` | 2.49 ms | no overlay, the source is shared and mutable |
-| **kern** `box --image` | **3.61 ms** (2.65 with `--no-uid-range`) | the same, plus the rootless uid-range mapping: two setuid helpers, ~1.1 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, so they are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing |
-| bubblewrap | 2.8 ms | a sandbox *primitive*: no images, caps, or lifecycle |
-| crun | 5.2 ms (June; not installed on the machine re-measured here) | OCI runtime (C): bundle + cgroup setup |
-| runc (rootless) | 14.6 ms | OCI runtime (Go): bundle + cgroup, high run-to-run variance |
-| podman (rootless) | 289.0 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
-| **docker run --rm** | 292.5 ms | client to daemon round-trip |
+| **kern** `box --rootfs`, uncapped | **2.26 ms** | overlay + self-pivot + seccomp. Uncapped is what makes it comparable to bubblewrap |
+| **kern** `box --rootfs`, capped (the default) | **2.60 ms** | the same, plus a real cgroup cap: +0.34 ms |
+| **kern** `box --bind-rootfs` | 2.32 ms | no overlay, the source is shared and mutable |
+| **kern** `box --image` | **3.47 ms** (2.61 with `--no-uid-range`) | the same, plus the rootless uid-range mapping: two setuid helpers, ~0.9 ms, run concurrently. A range cannot be written to `/proc/<pid>/uid_map` without `CAP_SETUID`, so they are not avoidable. It is what lets an official image drop privilege in its entrypoint (postgres, nginx) instead of failing |
+| bubblewrap | 2.30 ms | a sandbox *primitive*: no images, caps, or lifecycle |
+| runc (rootless) | 18.6 ms | OCI runtime (Go): bundle + cgroup, high run-to-run variance |
+| podman (rootless) | 292.9 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
+| **docker run --rm** | 296.9 ms | client to daemon round-trip |
 
-**A cgroup cap costs 0.19 ms**, not a `systemd-run` round trip, because kern caps
+Re-measured on 2026-08-24 against the published v0.7.0 binary, every row in one session. `crun` was in
+an earlier edition of this table at 5.2 ms; it is not installed on this machine, so rather than carry a
+number from another day next to nine taken today, the row is out. The uncapped row needs the env var
+EXPORTED, not passed through `env KERN_NO_SCOPE=1 …`: the extra fork+exec put it at 2.62 ms, above the
+capped path it is supposed to beat, which is a measurement artefact and not a runtime that got slower
+when you removed its cap.
+
+**A cgroup cap costs 0.34 ms**, not a `systemd-run` round trip, because kern caps
 directly in its own delegated slice. On the `--image` path `--memory 64m --cpus 1 --pids-limit 64`
-costs 0.52 ms. The cap bites: 200 MiB under `--memory 32m` exits 137.
+costs 0.47 ms. The cap bites: 200 MiB under `--memory 32m` exits 137.
 
 ⚠️ **The direct slice is reachable only when kern runs inside the systemd user manager's tree**, which
 a desktop session gives you and an **SSH session does not**: a login is placed under the SYSTEM
@@ -313,7 +319,7 @@ machine, same images, real commands, timed with the shell.
 
 | what you actually type | kern | docker | podman |
 |---|---:|---:|---:|
-| a throwaway box (`box --image … true`) | **3.51 ms** | ~290 ms | ~290 ms |
+| a throwaway box (`box --image … true`) | **3.47 ms** | 296.9 ms | 292.9 ms |
 | `exec` into a running service | **1.10 ms** | 42.2 ms | 147.6 ms |
 | list what is running (`ps`) | **0.54 ms** | 8.2 ms | 14.6 ms |
 | read logs | **0.44 ms** | 8.4 ms | 38.7 ms |

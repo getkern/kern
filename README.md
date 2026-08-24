@@ -4,10 +4,10 @@
 
 **kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
 
-**A real, kernel-enforced container in ~3.6 ms, out of one 1.52 MB binary with no daemon.**
+**A real, kernel-enforced container in ~3.5 ms, out of one 1.52 MB binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.6 ms against docker run's 290 ms. A real OCI image, rootless, a 1.52 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a 1.52 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
@@ -37,7 +37,7 @@ single row for kern in a comparison table: it is a container runtime, a sandbox,
 and a stack runner at once, in 1.52 MB with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
-  `save`/`load`. A box from an image starts in ~3.6 ms.
+  `save`/`load`. A box from an image starts in ~3.5 ms.
 - **A sandbox, always rootless.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
@@ -55,7 +55,7 @@ shells out to the `curl` and `tar` already on the machine rather than linking a 
 is the size-optimized release build; a plain `cargo install` from source is 1.91 MB.)
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~289 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one 1.52 MB static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~297 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one 1.52 MB static binary, no daemon.">
 </p>
 
 ## What kern is not
@@ -281,8 +281,8 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.3 ms** | ~293 ms | ~285 ms |
-| Cold start, from an OCI image | **~3.6 ms** | ~293 ms | ~285 ms |
+| Cold start, bare box | **~2.3 ms** | ~297 ms | ~293 ms |
+| Cold start, from an OCI image | **~3.5 ms** | ~297 ms | ~293 ms |
 | Stop a service (init handles SIGTERM) | **~1.9 ms** | ~310 ms | ~380 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.52 MB binary** | daemon stack | multi-binary install |

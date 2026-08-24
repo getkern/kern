@@ -2,7 +2,7 @@
 
 **[kern](https://github.com/getkern/kern)** is a fast, rootless sandbox and virtual resource
 runtime for any workload, including untrusted and AI-generated code: a real, kernel-enforced box
-that starts in **~3.6 ms** from an OCI image, out of one **1.52 MB** binary, with no daemon.
+that starts in **~3.5 ms** from an OCI image, out of one **1.52 MB** binary, with no daemon.
 **kern-sandbox**
 is its Python binding: run untrusted or agent-generated code in a fresh, isolated box, straight from Python.
 
