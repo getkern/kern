@@ -11,7 +11,7 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
-## v0.7.0 - 2026-08-22
+## v0.7.0 - 2026-08-24
 
 The first published release: static binaries for x86_64 and aarch64, a Windows shim and a WSL rootfs,
 each with a `.sha256`, from a GPG-signed and independently timestamped tag. Everything below shipped in it.
