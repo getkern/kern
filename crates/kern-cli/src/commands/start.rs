@@ -134,6 +134,276 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
     Ok(())
 }
 
+/// `--ssh` PREFLIGHT: sshd's privilege separation calls `setgroups()`, which a single-uid userns
+/// forbids (`/proc/self/setgroups=deny`). It works only with a real uid RANGE via newuidmap/subuid.
+/// On a host without those (common on edge boards), `--ssh` would leave a listening port whose auth
+/// silently closes with a confusing "Connection closed" - so say it up front instead of at handshake.
+///
+/// A warning, never a refusal: the box itself is fine, only the ssh login will not be, and the caller
+/// may well be starting it to run `kern exec` against.
+fn warn_if_ssh_lacks_a_uid_range(ssh_port: Option<u16>) {
+    if ssh_port.is_none() {
+        return;
+    }
+    let uid = unsafe { libc::getuid() };
+    let uname = kern_isolation::username(uid);
+    let have_range = kern_isolation::trusted_helper("newuidmap").is_some()
+        && kern_isolation::sub_range("/etc/subuid", uname.as_deref(), uid).is_some();
+    if !have_range {
+        eprintln!(
+            "kern: warning: --ssh needs a uid range (newuidmap + /etc/subuid) for sshd's privsep; \
+             this host has none, so sshd will refuse the login (setgroups denied). Install \
+             newuidmap/uidmap + add a subuid allocation, or use `kern exec` instead of ssh."
+        );
+    }
+}
+
+/// `--pod <name>`: join the pod's shared user+net namespace (created by `kern pod create`). Resolves
+/// its live holder PID, registers this box in the pod's shared `/etc/hosts` (so peers resolve it by
+/// name), and binds that hosts file over the box's `/etc/hosts`. Returns the holder PID, or `None`
+/// for a standalone box; pushes the pod's bind mounts onto `volumes`.
+fn join_pod_and_bind_its_files(
+    pod: Option<&str>,
+    name: &str,
+    volumes: &mut Vec<kern_isolation::Volume>,
+) -> Result<Option<i32>, Error> {
+    let Some(pod) = pod else { return Ok(None) };
+    let holder = crate::pod::holder_pid(pod).ok_or_else(|| {
+        Error::Sandbox(format!(
+            "no running pod '{pod}' - create it first with `kern pod create {pod}`"
+        ))
+    })?;
+    crate::pod::add_member(pod, name)?;
+    // Bind the pod's shared hosts over /etc/hosts. RW (not `:ro`): a read-only remount of a bind is
+    // refused inside the pod's single-uid user ns (EPERM), and pod members are co-trusted anyway
+    // (they already share the user+net ns).
+    // Canonicalize the source: `setup_volumes` resolves every bind source with an `O_NOFOLLOW`
+    // component walk, which fails if a component of the runtime dir is a symlink - so hand it the
+    // symlink-free path the walk expects (the file exists; kern just created it for the pod).
+    let symlink_free = |p: std::path::PathBuf| {
+        std::fs::canonicalize(&p)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .into_owned()
+    };
+    volumes.push(kern_isolation::Volume {
+        source: symlink_free(crate::pod::hosts_path(pod)),
+        target: "/etc/hosts".to_string(),
+        read_only: false,
+    });
+    // If the pod has outbound (a pasta NAT → a pod resolv.conf exists), bind it so DNS works.
+    let rp = crate::pod::resolv_path(pod);
+    if rp.exists() {
+        volumes.push(kern_isolation::Volume {
+            source: symlink_free(rp),
+            target: "/etc/resolv.conf".to_string(),
+            read_only: false,
+        });
+    }
+    Ok(Some(holder))
+}
+
+/// The port the egress filter listens on inside the box's netns. One definition: the proxy is started
+/// on it in the `on_started` callback, and the box's `*_PROXY` variables point at it.
+const EGRESS_PROXY_PORT: u16 = 3128;
+
+/// `--egress-allow <domains>`: an outbound domain allowlist. The box keeps its default ISOLATED netns
+/// (no route out, a real kernel boundary), and its ONLY egress is a kern-run filtering proxy started
+/// once the box's netns exists. This points the box's proxy environment at it, after refusing the two
+/// combinations where the flag would mean nothing.
+///
+/// See egress.rs and docs/EGRESS.md for the enforcement model and its honest limits.
+fn point_the_box_at_the_egress_proxy(
+    args: &BoxRunArgs,
+    env: &mut Vec<(String, String)>,
+) -> Result<(), Error> {
+    if args.egress_allow.is_empty() {
+        return Ok(());
+    }
+    if args.detached {
+        return Err(Error::Sandbox(
+            "--egress-allow is foreground-only for now (the filter's lifetime is tied to the box); \
+             drop -d"
+                .to_string(),
+        ));
+    }
+    if args.share_net || args.pod.is_some() {
+        return Err(Error::Sandbox(
+            "--egress-allow filters the box's OWN isolated network, so it can't combine with --net \
+             (host network) or --pod (shared pod network)"
+                .to_string(),
+        ));
+    }
+    eprintln!(
+        "kern: note: --egress-allow gives the box outbound to the listed domains only (over an HTTP \
+         CONNECT/forward proxy; the box's isolated netns has no other route). It resolves and pins the \
+         dialed host, refuses non-public resolved IPs (SSRF), and tunnels only ports 80/443. The one \
+         hole it can't close is domain fronting on a SHARED CDN (SNI != CONNECT host); see \
+         docs/EGRESS.md. For a fully hostile workload prefer a microVM with a real firewall."
+    );
+    let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        env.push((k.to_string(), proxy.clone()));
+    }
+    Ok(())
+}
+
+/// Attach the named volumes that carry a recorded quota, each on its own ext4 loop image so the limit
+/// is a REAL filesystem quota rather than an advisory number.
+///
+/// `ext4_ok` is the host's verdict on whether that backend can be built here; where it cannot, each
+/// volume degrades through `quota_fallback` to the plain directory, which is honest about losing the
+/// enforcement rather than pretending to have it.
+///
+/// The seeding copy is NOT best-effort, and that is the part to read carefully: on the first upgrade
+/// of an existing volume to the enforced backend, the plain `data/` dir is copied into the fresh
+/// image. The two backends are DISTINCT on-disk locations, so a discarded failure would mount an
+/// EMPTY volume over data that still exists elsewhere - the workload sees nothing, may recreate or
+/// overwrite it, and nothing said the copy did not happen. Refusing costs a failed box start; not
+/// refusing costs the dataset.
+fn attach_quota_volumes(
+    quota_specs: &[String],
+    ext4_ok: bool,
+    vdisk_work: &std::path::Path,
+    ext4_handles: &mut Vec<crate::vdisk::Ext4Vdisk>,
+    volumes: &mut Vec<Volume>,
+) -> Result<(), Error> {
+    for spec in quota_specs {
+        let (name_v, dest, ro) = crate::volume::parse_named_spec(spec)?;
+        let limit = crate::volume::size_limit(name_v).unwrap_or(0);
+        let backend = crate::volume::volumes_dir()
+            .join(name_v)
+            .to_string_lossy()
+            .into_owned();
+        let img_existed = std::path::Path::new(&backend)
+            .join(format!("kern-vdisk-{name_v}.img"))
+            .exists();
+        let source = if ext4_ok {
+            match crate::vdisk::prepare(name_v, limit, true, Some(&backend), vdisk_work) {
+                Some(h) => {
+                    let m = h.mount.to_string_lossy().into_owned();
+                    // First time this volume is upgraded to the enforced ext4 backend: seed the fresh
+                    // image from the plain `data/` dir, so switching rootless→privileged doesn't hide
+                    // the files already written to the volume (the enforced and unenforced backends are
+                    // otherwise distinct on-disk locations).
+                    if !img_existed {
+                        let data = crate::volume::volumes_dir().join(name_v).join("data");
+                        let has_data = data
+                            .read_dir()
+                            .map(|mut d| d.next().is_some())
+                            .unwrap_or(false);
+                        if has_data {
+                            // NOT best-effort. This is the one-time seeding of a freshly created ext4
+                            // image from the volume's plain `data/` dir when a quota'd volume is first
+                            // upgraded to the enforced backend. The two backends are DISTINCT on-disk
+                            // locations, so a discarded failure mounts an EMPTY volume over data that
+                            // still exists elsewhere: the workload sees no data, may recreate or
+                            // overwrite it, and nothing said the copy did not happen. Refusing costs a
+                            // failed box start; not refusing costs the dataset.
+                            let st = std::process::Command::new("cp")
+                                .arg("-a")
+                                .arg(format!("{}/.", data.display()))
+                                .arg(&m)
+                                .status()
+                                .map_err(|e| {
+                                    Error::Volume(format!(
+                                        "seeding volume '{name_v}' into its quota'd backend: {e}"
+                                    ))
+                                })?;
+                            if !st.success() {
+                                return Err(Error::Volume(format!(
+                                    "seeding volume '{name_v}' into its quota'd backend failed ({st}); the existing data is still in {} and the box was not started",
+                                    data.display()
+                                )));
+                            }
+                        }
+                    }
+                    ext4_handles.push(h);
+                    m
+                }
+                None => quota_fallback(name_v)?,
+            }
+        } else {
+            quota_fallback(name_v)?
+        };
+        volumes.push(Volume {
+            source,
+            target: dest,
+            read_only: ro,
+        });
+    }
+    Ok(())
+}
+
+/// Who keeps the box alive, decided once from the flags and the host.
+struct Supervision {
+    /// The parsed `--health-action`, validated before any host-side mount so a typo fails fast.
+    health_action: HealthAction,
+    /// In-process supervisor that dies with the host: `on-failure`, or a `restart` health action.
+    restart: bool,
+    /// A standalone persistent box on a host that HAS a `systemd --user` manager: it gets a unit and
+    /// survives a reboot.
+    systemd_supervises: bool,
+    /// The in-process supervisor restarts on ANY exit (a pod member, or a persistent box on a host
+    /// with no systemd manager).
+    restart_always: bool,
+    /// This process IS the foreground run systemd drives as the supervisor (`KERN_MANAGED=1`).
+    managed: bool,
+    /// A detached, persistent, non-pod box: the only shape that can take the systemd unit path.
+    standalone_persistent: bool,
+}
+
+/// Decide the supervision arrangement, and refuse the one combination that would silently do nothing.
+///
+/// A POD MEMBER with `always`/`unless-stopped` is supervised IN-PROCESS for the stack's lifetime
+/// (restart on ANY exit, including 0), NOT via a per-service systemd unit: a pod member needs the pod
+/// holder's shared namespace, so a standalone unit that outlives the holder could not re-join it.
+///
+/// A STANDALONE persistent box normally takes the systemd path (survives reboot) - but ONLY where a
+/// `systemd --user` manager actually exists. Where none does (WSL2 without systemd, a minimal
+/// container, no user manager) it FALLS BACK to the same in-process supervisor: restart on any exit
+/// for this process's lifetime, no reboot-survival. Without that fallback a systemd-less host could
+/// not run `--restart always` AT ALL - the unit install just errored and the box never started.
+///
+/// The systemd probe runs ONLY for a standalone persistent box, so an ordinary box start pays no
+/// socket connect for it.
+fn decide_supervision(args: &BoxRunArgs) -> Result<Supervision, Error> {
+    let health_action = parse_health_action(args.health_action)?;
+    let restart =
+        args.restart == RestartPolicy::OnFailure || health_action == HealthAction::Restart;
+    let standalone_persistent = args.detached && args.restart.persistent() && args.pod.is_none();
+    let systemd_present = standalone_persistent && kern_isolation::user_systemd_present();
+    let (systemd_supervises, restart_always) = persistent_supervision(
+        args.detached,
+        args.restart.persistent(),
+        args.pod.is_some(),
+        systemd_present,
+    );
+    // When systemd (re-)starts a persistent box it runs THIS binary in the foreground with
+    // `KERN_MANAGED=1`: that run skips the transient-scope re-exec (the box already lives in the
+    // unit's own service cgroup) and registers itself so `kern ps`/`logs`/`stop` still see it.
+    let managed = kern_common::env_flag("KERN_MANAGED");
+    // `--restart always`/`unless-stopped` needs a SUPERVISOR, and the only two are systemd (detached
+    // standalone) and the in-process loop (detached, incl. a pod member) - the FOREGROUND path runs
+    // the box exactly once. Reject it here rather than start the box and silently drop the policy.
+    // `managed` is exempt: that IS the foreground re-exec systemd itself drives as the supervisor, so
+    // `persistent() && !detached` is expected and correct there.
+    if args.restart.persistent() && !args.detached && !managed {
+        return Err(Error::Usage(
+            "--restart always/unless-stopped needs -d: a foreground box runs once, so nothing would \
+             supervise the restarts (use -d and systemd or kern's supervisor takes over)",
+        ));
+    }
+    Ok(Supervision {
+        health_action,
+        restart,
+        systemd_supervises,
+        restart_always,
+        managed,
+        standalone_persistent,
+    })
+}
+
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The PARENT was not instrumented: `KERN_TIMING` covered only the child's setup, so the time
     // spent here was invisible and nobody could optimise it, because nobody could see it. The marks
@@ -166,23 +436,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if std::env::var_os("KERN_SCOPE").is_none() {
         fleet_gate_and_budget()?;
     }
-    // `--ssh` PREFLIGHT: sshd's privilege separation calls `setgroups()`, which a single-uid userns
-    // forbids (`/proc/self/setgroups=deny`). It works only with a real uid RANGE via newuidmap/subuid.
-    // On a host without those (common on edge boards), `--ssh` would leave a listening port whose auth
-    // silently closes with a confusing "Connection closed" - so say it up front instead of at handshake.
-    if args.ssh_port.is_some() {
-        let uid = unsafe { libc::getuid() };
-        let uname = kern_isolation::username(uid);
-        let have_range = kern_isolation::trusted_helper("newuidmap").is_some()
-            && kern_isolation::sub_range("/etc/subuid", uname.as_deref(), uid).is_some();
-        if !have_range {
-            eprintln!(
-                "kern: warning: --ssh needs a uid range (newuidmap + /etc/subuid) for sshd's privsep; \
-                 this host has none, so sshd will refuse the login (setgroups denied). Install \
-                 newuidmap/uidmap + add a subuid allocation, or use `kern exec` instead of ssh."
-            );
-        }
-    }
+    warn_if_ssh_lacks_a_uid_range(args.ssh_port);
     // (The effective command is resolved AFTER the image is pulled, so an `--image`'s Entrypoint/Cmd
     // can supply the default - see `resolve_image_command` below.)
     // Split `-v` into local (host/named) and network (nfs/smb/sshfs) specs. Local ones are parsed
@@ -207,82 +461,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             crate::volume::is_named(src) && crate::volume::size_limit(src).is_some()
         });
     let mut volumes = parse_volumes(&plain_specs)?;
-    // `--pod <name>`: join the pod's shared user+net namespace (created by `kern pod create`). Resolve
-    // its live holder PID, register this box in the pod's shared `/etc/hosts` (so peers resolve it by
-    // name), and bind that hosts file read-only over the box's `/etc/hosts`.
-    let pod_holder = match args.pod {
-        Some(pod) => {
-            let holder = crate::pod::holder_pid(pod).ok_or_else(|| {
-                Error::Sandbox(format!(
-                    "no running pod '{pod}' - create it first with `kern pod create {pod}`"
-                ))
-            })?;
-            crate::pod::add_member(pod, name.as_str())?;
-            // Bind the pod's shared hosts over /etc/hosts. RW (not `:ro`): a read-only remount of a
-            // bind is refused inside the pod's single-uid user ns (EPERM), and pod members are
-            // co-trusted anyway (they already share the user+net ns).
-            // Canonicalize the source: `setup_volumes` resolves every bind source with an `O_NOFOLLOW`
-            // component walk, which fails if a component of the runtime dir is a symlink - so hand it the
-            // symlink-free path the walk expects (the file exists; kern just created it for the pod).
-            let symlink_free = |p: std::path::PathBuf| {
-                std::fs::canonicalize(&p)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            volumes.push(kern_isolation::Volume {
-                source: symlink_free(crate::pod::hosts_path(pod)),
-                target: "/etc/hosts".to_string(),
-                read_only: false,
-            });
-            // If the pod has outbound (a pasta NAT → a pod resolv.conf exists), bind it so DNS works.
-            let rp = crate::pod::resolv_path(pod);
-            if rp.exists() {
-                volumes.push(kern_isolation::Volume {
-                    source: symlink_free(rp),
-                    target: "/etc/resolv.conf".to_string(),
-                    read_only: false,
-                });
-            }
-            Some(holder)
-        }
-        None => None,
-    };
+    let pod_holder = join_pod_and_bind_its_files(args.pod, name.as_str(), &mut volumes)?;
     // `--env-file` first (K=V lines from a file), then `--env` on top (explicit wins).
     let mut env = parse_env_files(args.env_file)?;
     env.extend(parse_envs(args.env)?);
-    // `--egress-allow <domains>`: an outbound domain allowlist. The box keeps its default ISOLATED netns
-    // (no route out, a real kernel boundary), and its ONLY egress is a kern-run filtering proxy started
-    // once the box's netns exists (in the `on_started` callback below). Point the box's proxy env at it.
-    // See egress.rs and docs/EGRESS.md for the enforcement model and its honest limits.
-    const EGRESS_PROXY_PORT: u16 = 3128;
-    if !args.egress_allow.is_empty() {
-        if args.detached {
-            return Err(Error::Sandbox(
-                "--egress-allow is foreground-only for now (the filter's lifetime is tied to the box); \
-                 drop -d"
-                    .to_string(),
-            ));
-        }
-        if args.share_net || args.pod.is_some() {
-            return Err(Error::Sandbox(
-                "--egress-allow filters the box's OWN isolated network, so it can't combine with --net \
-                 (host network) or --pod (shared pod network)"
-                    .to_string(),
-            ));
-        }
-        eprintln!(
-            "kern: note: --egress-allow gives the box outbound to the listed domains only (over an HTTP \
-             CONNECT/forward proxy; the box's isolated netns has no other route). It resolves and pins the \
-             dialed host, refuses non-public resolved IPs (SSRF), and tunnels only ports 80/443. The one \
-             hole it can't close is domain fronting on a SHARED CDN (SNI != CONNECT host); see \
-             docs/EGRESS.md. For a fully hostile workload prefer a microVM with a real firewall."
-        );
-        let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
-        for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-            env.push((k.to_string(), proxy.clone()));
-        }
-    }
+    point_the_box_at_the_egress_proxy(&args, &mut env)?;
     // Fold resource profiles (`vcpu:name` …) into the caps - explicit flags win - before capping.
     let mut ap = AppliedProfiles {
         memory: args.memory,
@@ -319,45 +502,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         print_resolved_config(&args, name.as_str(), memory, cpus, cpuset.as_deref(), nice);
         std::process::exit(0);
     }
-    // Validate `--health-action` up front (before any host-side mount) so a typo fails fast. A
-    // `restart` action implies the on-failure restart policy (that's how it re-runs the box).
-    let health_action = parse_health_action(args.health_action)?;
-    // In-process supervisor (dies with the host): `on-failure` - or a `restart` health action.
-    let restart =
-        args.restart == RestartPolicy::OnFailure || health_action == HealthAction::Restart;
-    // A POD MEMBER with `always`/`unless-stopped` is supervised IN-PROCESS for the stack's lifetime
-    // (restart on ANY exit, including 0), NOT via a per-service systemd unit: a pod member needs the
-    // pod holder's shared namespace, so a standalone unit that outlives the holder could not re-join it.
-    // A STANDALONE persistent box normally takes the systemd path below (survives reboot) - but ONLY
-    // where a `systemd --user` manager actually exists. Where none does (WSL2 without systemd, a minimal
-    // container, no user manager) it FALLS BACK to the same in-process supervisor: restart on any exit
-    // for this process's lifetime, no reboot-survival. Without this fallback a systemd-less host could
-    // not run `--restart always` AT ALL - the unit install just errored and the box never started.
-    let standalone_persistent = args.detached && args.restart.persistent() && args.pod.is_none();
-    // Probe `systemd --user` ONLY for a standalone persistent box (avoid a socket connect on every box
-    // start). `persistent_supervision` decides systemd-unit vs in-process from that single bool.
-    let systemd_present = standalone_persistent && kern_isolation::user_systemd_present();
-    let (systemd_supervises, restart_always) = persistent_supervision(
-        args.detached,
-        args.restart.persistent(),
-        args.pod.is_some(),
-        systemd_present,
-    );
-    // When systemd (re-)starts a persistent box, it runs THIS binary in the foreground with
-    // `KERN_MANAGED=1`: skip the transient-scope re-exec (the box already lives in the unit's own
-    // service cgroup) and register the foreground run so `kern ps`/`logs`/`stop` still see it.
-    let managed = kern_common::env_flag("KERN_MANAGED");
-    // `--restart always`/`unless-stopped` needs a SUPERVISOR, and the only two are systemd (detached
-    // standalone, the branch below) and the in-process loop (detached, incl. a pod member) - the
-    // FOREGROUND path runs the box exactly once. Reject it here rather than start the box and silently
-    // drop the policy. `managed` is exempt: that IS the foreground re-exec systemd itself drives as the
-    // supervisor (`KERN_MANAGED=1`), so `persistent() && !detached` is expected and correct there.
-    if args.restart.persistent() && !args.detached && !managed {
-        return Err(Error::Usage(
-            "--restart always/unless-stopped needs -d: a foreground box runs once, so nothing would \
-             supervise the restarts (use -d and systemd or kern's supervisor takes over)",
-        ));
-    }
+    let Supervision {
+        health_action,
+        restart,
+        systemd_supervises,
+        restart_always,
+        managed,
+        standalone_persistent,
+    } = decide_supervision(&args)?;
     // A `kern build` RUN step (`KERN_BUILD_STEP=1`) is a transient, first-party box run many times in
     // a row - the ~7ms transient-scope re-exec would dominate the build. Skip it (the best-effort
     // in-process cgroup in run_in_sandbox still applies caps; isolation is unchanged).
@@ -520,70 +672,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         .collect();
     // Quota'd named volumes: back them with an ext4-loop image (real disk quota + persistence) when
     // privileged; else bind the plain data dir and say the quota isn't enforced (never silently).
-    for spec in &quota_specs {
-        let (name_v, dest, ro) = crate::volume::parse_named_spec(spec)?;
-        let limit = crate::volume::size_limit(name_v).unwrap_or(0);
-        let backend = crate::volume::volumes_dir()
-            .join(name_v)
-            .to_string_lossy()
-            .into_owned();
-        let img_existed = std::path::Path::new(&backend)
-            .join(format!("kern-vdisk-{name_v}.img"))
-            .exists();
-        let source = if ext4_ok {
-            match crate::vdisk::prepare(name_v, limit, true, Some(&backend), &vdisk_work) {
-                Some(h) => {
-                    let m = h.mount.to_string_lossy().into_owned();
-                    // First time this volume is upgraded to the enforced ext4 backend: seed the fresh
-                    // image from the plain `data/` dir, so switching rootless→privileged doesn't hide
-                    // the files already written to the volume (the enforced and unenforced backends are
-                    // otherwise distinct on-disk locations).
-                    if !img_existed {
-                        let data = crate::volume::volumes_dir().join(name_v).join("data");
-                        let has_data = data
-                            .read_dir()
-                            .map(|mut d| d.next().is_some())
-                            .unwrap_or(false);
-                        if has_data {
-                            // NOT best-effort. This is the one-time seeding of a freshly created ext4
-                            // image from the volume's plain `data/` dir when a quota'd volume is first
-                            // upgraded to the enforced backend. The two backends are DISTINCT on-disk
-                            // locations, so a discarded failure mounts an EMPTY volume over data that
-                            // still exists elsewhere: the workload sees no data, may recreate or
-                            // overwrite it, and nothing said the copy did not happen. Refusing costs a
-                            // failed box start; not refusing costs the dataset.
-                            let st = std::process::Command::new("cp")
-                                .arg("-a")
-                                .arg(format!("{}/.", data.display()))
-                                .arg(&m)
-                                .status()
-                                .map_err(|e| {
-                                    Error::Volume(format!(
-                                        "seeding volume '{name_v}' into its quota'd backend: {e}"
-                                    ))
-                                })?;
-                            if !st.success() {
-                                return Err(Error::Volume(format!(
-                                    "seeding volume '{name_v}' into its quota'd backend failed ({st}); the existing data is still in {} and the box was not started",
-                                    data.display()
-                                )));
-                            }
-                        }
-                    }
-                    ext4_handles.push(h);
-                    m
-                }
-                None => quota_fallback(name_v)?,
-            }
-        } else {
-            quota_fallback(name_v)?
-        };
-        volumes.push(Volume {
-            source,
-            target: dest,
-            read_only: ro,
-        });
-    }
+    attach_quota_volumes(
+        &quota_specs,
+        ext4_ok,
+        &vdisk_work,
+        &mut ext4_handles,
+        &mut volumes,
+    )?;
 
     // `--secret`: read the values on the host (files/stdin/inline) BEFORE the fork; the box writes
     // them into a RAM-backed `/run/secrets` tmpfs (mode 0400) that never touches the overlay upper.
