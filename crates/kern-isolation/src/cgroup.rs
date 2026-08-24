@@ -328,7 +328,10 @@ pub enum MemoryCapState {
 /// one-time `systemd-run --user` that exits immediately). Then exactly one `mkdir` + `rmdir` of a
 /// `kern-capprobe-<pid>` child and one write to that child's OWN `memory.max`; the child holds no
 /// processes, so nothing is throttled, and it is removed on every return path. It never writes an
-/// existing box's or sibling's limit files.
+/// existing box's or sibling's limit files. If the child comes up WITHOUT a `memory.max`, it also
+/// performs the parent's additive `cgroup.subtree_control` write - the same one every box start
+/// performs - because otherwise the probe reports on whether a box has run yet rather than on whether
+/// a cap binds. It enables controllers and sets no limit.
 ///
 /// NOT for the box-start hot path (a box ensures the slice itself). Its one caller, doctor, invokes it
 /// at most once; do not place it in a per-box-start or per-syscall loop.
@@ -360,7 +363,26 @@ fn memory_cap_state_at(cur: &std::path::Path) -> MemoryCapState {
     // From here the child EXISTS and must be removed on every path below.
     let max = child.join("memory.max");
     // cgroup v2 creates a controller's interface files in a child only when that controller is in the
-    // parent's `subtree_control`. No `memory.max` file therefore means `memory` is not delegated here.
+    // parent's `subtree_control`. No `memory.max` file therefore does NOT yet mean `memory` is not
+    // delegated: it can equally mean nobody has enabled it in the subtree yet, which is the state a
+    // freshly created `kern.slice` is in until the first box start writes it.
+    //
+    // MEASURED on this desktop (2026-08-24): with `kern.slice` delegated (`cgroup.controllers` =
+    // `cpu memory pids`) but its `cgroup.subtree_control` EMPTY, this probe reported
+    // `PresentNotDelegated` and doctor printed "`--memory` won't be enforced", while in that exact
+    // state a box started with `--memory 64M` was OOM-killed at the cap (exit 137). The probe was
+    // measuring the incidental state of `subtree_control` instead of what a box gets, and the first
+    // command a new user runs was told the opposite of the truth.
+    //
+    // So do here what `apply_limits` does before it caps: enable the controllers on the parent, then
+    // look again. The write is the same additive, idempotent one a box start performs (it enables
+    // controllers, it sets no limit), and the kernel refuses it on a cgroup that holds processes
+    // (measured: EBUSY on this desktop's own scope, 19 processes in it) - which is exactly the
+    // `current_v2_cgroup` fallback case, where it therefore changes nothing and the classification
+    // below still stands. So this cannot turn an unenforceable host into a false green.
+    if !max.exists() {
+        enable_subtree_controllers(cur);
+    }
     if !max.exists() {
         let _ = fs::remove_dir(&child);
         return classify_absent_or_not_delegated(cur);
@@ -1821,6 +1843,40 @@ mod tests {
             leaked.is_empty(),
             "the probe leaked a child cgroup dir: {:?}",
             leaked.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn capprobe_enables_the_subtree_before_calling_a_cap_unenforceable() {
+        // REGRESSION, measured on this desktop (2026-08-24): with `kern.slice` delegated
+        // (`cgroup.controllers` = `cpu memory pids`) and its `cgroup.subtree_control` EMPTY - the state
+        // the slice is in until the first box start writes it - the probe found no `memory.max` in its
+        // throwaway child and reported `PresentNotDelegated`, so `kern doctor` printed "`--memory`
+        // won't be enforced". In that exact state a box started with `--memory 64M` was OOM-killed at
+        // the cap (exit 137): the probe was reporting on whether a box had run yet, not on whether a cap
+        // binds, and it told the first command a new user runs the opposite of the truth.
+        //
+        // The fix is that the probe performs the parent's additive `subtree_control` write - the one
+        // every box start performs - before concluding. Asserted on that write, because a tmpfs is not a
+        // cgroupfs so the *outcome* (a `memory.max` appearing) cannot be reproduced synthetically,
+        // whereas "it did not give up without doing what a box does" can.
+        let d = std::env::temp_dir().join(format!("kern-capsub-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup.controllers"), "cpuset cpu io memory pids\n").unwrap();
+        std::fs::write(d.join("cgroup.subtree_control"), "").unwrap();
+        let state = memory_cap_state_at(&d);
+        let written = std::fs::read_to_string(d.join("cgroup.subtree_control")).unwrap_or_default();
+        assert!(
+            written.contains("+memory"),
+            "the probe must try to enable `memory` in the parent's subtree before reporting a cap \
+             unenforceable; subtree_control holds {written:?}"
+        );
+        // On a tmpfs the enable cannot make `memory.max` appear, so the honest verdict still stands.
+        assert_eq!(
+            state,
+            MemoryCapState::PresentNotDelegated,
+            "enabling the subtree must not turn an unenforceable host into a false Enforced"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
