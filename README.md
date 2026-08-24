@@ -46,7 +46,7 @@ and a stack runner at once, in 1.52 MB with no daemon.
   to a process on the host, with no sandbox at all. [docs/RESOURCES.md](docs/RESOURCES.md)
 - **Stacks, in kern's own format or in Docker's.** `kern compose <file> up` takes a `kern-compose.toml`
   (`[box.NAME]` tables, with the resource profiles above) or the `docker-compose.yml` you already have,
-  read as written. One stack to one pod, services reaching each other by name.
+  with no conversion step. One stack to one pod, services reaching each other by name.
 - **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
   `doctor`, plus a Python and Node SDK and an MCP server for agents.
 
