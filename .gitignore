@@ -15,6 +15,11 @@ target/
 /*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.layers
 /*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.base
 /*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.diff
+# `kern commit`/`kern diff` merge an image's layers into a scratch dir beside the CWD before they
+# read it. It is removed on the normal path, so one left here is the trace of an interrupted run -
+# ignored rather than committed, and safe to delete.
+/.kern-merged/
+
 # Legacy/plain rootfs dirs some docs use.
 /alpine/
 /ubuntu/
