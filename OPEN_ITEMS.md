@@ -119,7 +119,7 @@ re-measured anywhere with the pinned toolchain. The aarch64 one cannot, and is C
 there and a CROSS build here are different link jobs (cross needs `rust-lld`, and the tagged commit
 measured 1226296 B that way against CI's 1247528), so an aarch64 size is only ever quoted from the
 release build - the number above is v0.7.0's published artifact, read off the tarball that ships. A plain stable
-`cargo build --release` still yields a working ~2.0 MB binary; the nightly is only the
+`cargo build --release` still yields a working 1.91 MB binary (1.67 MB aarch64); the nightly is only the
 release-artifact size optimization.
 
 The honest cost, kept in view: under `immediate-abort` a panic prints no file and no line, so a bug
