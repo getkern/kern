@@ -270,8 +270,15 @@ pub fn scrub_direct_marker() {
 /// under it. Because it reports the recorded DECISION (not slice liveness, not an env re-derivation),
 /// the refusal fires when the slice was GC'd mid-flight - and never on the scope-exec-failed
 /// fall-through, which keeps its historical warn-and-run behavior.
+///
+/// Read with [`env_flag`], not a bare `is_some()`, and that distinction has already cost this project
+/// once: `KERN_NO_SCOPE=` exported EMPTY was read as "the flag is on" and left a box uncapped on a
+/// Raspberry Pi 5 (2026-07-30). The same shape here fails the other way - an empty `KERN_DIRECT_CAPS`
+/// in the environment would claim a decision this invocation never made, arming the fail-closed
+/// refusal and REJECTING a box on a host that never chose the direct path. `export FOO=${FOO:-}` over
+/// a set of `KERN_*` names is all it takes, so the marker is only a decision when it carries a value.
 pub fn took_direct_cap_path() -> bool {
-    std::env::var_os(DIRECT_MARKER).is_some()
+    env_flag(DIRECT_MARKER)
 }
 
 /// Could a `--memory` cap actually be ENFORCED on this host - i.e. is the `memory` controller
@@ -2764,5 +2771,114 @@ mod tests {
 
         drop(listener);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// One lock for every test that mutates the process-wide environment. `set_var` is global, so two
+    /// of these running at once would read each other's `KERN_NO_SCOPE` and fail for a reason that has
+    /// nothing to do with the code under test. Poison is recovered so one failure does not cascade.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the variables a test touched, on every exit path including a panic.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvGuard {
+        fn set(names: &[&'static str]) -> Self {
+            Self(names.iter().map(|n| (*n, std::env::var_os(n))).collect())
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (n, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_direct_cap_path_is_refused_before_it_can_touch_the_host() {
+        // `choose_direct_cap_path_given` decides between capping directly in `kern.slice` and paying a
+        // per-box `systemd-run --scope`, and the decision ARMS the fail-closed refusal in
+        // `run_in_sandbox`. Three of its four gates are pure environment, and this pins them: each must
+        // short-circuit to false BEFORE `direct_caps_available()` reads the host, and none may leave the
+        // marker behind - a stale marker makes `took_direct_cap_path` claim a path this box never took,
+        // which is how a host that ran boxes best-effort starts refusing all of them.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvGuard::set(&[
+            "KERN_NO_SCOPE",
+            "KERN_SCOPE",
+            "KERN_MANAGED",
+            "KERN_BUILD_STEP",
+            DIRECT_MARKER,
+        ]);
+        for n in [
+            "KERN_NO_SCOPE",
+            "KERN_SCOPE",
+            "KERN_MANAGED",
+            "KERN_BUILD_STEP",
+            DIRECT_MARKER,
+        ] {
+            std::env::remove_var(n);
+        }
+
+        // The manager is absent: nothing to ask for a scope, and no direct path either.
+        assert!(
+            !choose_direct_cap_path_given(false),
+            "no user manager must refuse the direct path"
+        );
+        assert!(
+            std::env::var_os(DIRECT_MARKER).is_none(),
+            "a refused decision must not record itself"
+        );
+
+        // The opt-out, with a manager present.
+        std::env::set_var("KERN_NO_SCOPE", "1");
+        assert!(
+            !choose_direct_cap_path_given(true),
+            "KERN_NO_SCOPE must refuse the direct path"
+        );
+        assert!(std::env::var_os(DIRECT_MARKER).is_none());
+        std::env::remove_var("KERN_NO_SCOPE");
+
+        // An OUTER enforcer already caps us: each of the three names alone is enough.
+        for outer in ["KERN_SCOPE", "KERN_MANAGED", "KERN_BUILD_STEP"] {
+            std::env::set_var(outer, "1");
+            assert!(
+                !choose_direct_cap_path_given(true),
+                "{outer} names an outer enforcer, so the direct path must be refused"
+            );
+            assert!(
+                std::env::var_os(DIRECT_MARKER).is_none(),
+                "{outer}: a refused decision must not record itself"
+            );
+            std::env::remove_var(outer);
+        }
+    }
+
+    #[test]
+    fn the_direct_path_marker_is_read_back_and_scrubbed() {
+        // `took_direct_cap_path` reports the RECORDED decision rather than re-deriving it from the
+        // environment, and `scrub_direct_marker` clears one INHERITED from a parent `kern`. Together
+        // they are what keeps a nested box from being poisoned by its parent's choice, so both
+        // directions are pinned here: what is set reads back, and what is scrubbed reads false.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvGuard::set(&[DIRECT_MARKER]);
+
+        std::env::set_var(DIRECT_MARKER, "1");
+        assert!(
+            took_direct_cap_path(),
+            "a recorded direct-path decision must read back as taken"
+        );
+        scrub_direct_marker();
+        assert!(
+            !took_direct_cap_path(),
+            "a scrubbed marker must read back as NOT taken, or a nested box inherits its parent's path"
+        );
+
+        // An exported-but-EMPTY value is the shape that broke `KERN_NO_SCOPE` on a Raspberry Pi 5:
+        // present in the environment, meaning nothing. It must not count as a decision either.
+        std::env::set_var(DIRECT_MARKER, "");
+        assert!(!took_direct_cap_path(), "an empty marker is not a decision");
     }
 }
