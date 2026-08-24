@@ -3235,8 +3235,10 @@ mod managed_unit_ownership {
         // indefinitely" contract and the up-for-days reliability this path exists for. Asserted on the
         // source because the unit is written to a FILE (a side effect), not returned, so there is no
         // value to assert without a `systemd` on the runner. Needle built via `concat!` so this test's
-        // own text is not what it counts.
-        let src = include_str!("mod.rs");
+        // own text is not what it counts. Reads `start.rs`, where the unit writer lives: when the verbs
+        // moved out of `mod.rs` this test FAILED with the needle missing rather than passing on an
+        // empty search, which is the property a source-reading contract has to have.
+        let src = include_str!("start.rs");
         let needle = concat!("StartLimitIntervalSec", "=0\\n\\n");
         assert!(
             src.contains(needle),
@@ -3582,7 +3584,9 @@ mod config_verbs_are_defined_in_one_place {
 mod the_plan_previews_every_profile_kind {
     #[test]
     fn all_three_kinds_are_picked_and_resolved() {
-        let src = include_str!("mod.rs");
+        // `start.rs`, where `box_plan` lives since the verbs moved out of `mod.rs`. That move made this
+        // test panic on the `else` below rather than silently pass, which is why it is written that way.
+        let src = include_str!("start.rs");
         let Some(start) = src.find("pub fn box_plan") else {
             panic!("box_plan is gone; this contract test cannot find what it guards");
         };
