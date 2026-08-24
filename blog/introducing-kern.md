@@ -59,12 +59,11 @@ One isolated `/bin/true`, warm image cache, on an x86_64 desktop (Linux 7.0), me
 
 | runtime | cold start | |
 |---|---|---|
-| **kern** `box --rootfs` | **2.3 ms** | overlay + self-pivot + seccomp |
-| bubblewrap | 2.8 ms | a sandbox *primitive*, no images, caps, or lifecycle |
-| crun | 5.2 ms (not installed on the machine re-measured) | OCI runtime (C) |
-| runc (rootless) | 13.5 ms | OCI runtime (Go) |
-| podman (rootless) | 284.6 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
-| docker run --rm | 293.1 ms | client → daemon round-trip |
+| **kern** `box --rootfs` | **2.26 ms** uncapped, 2.60 capped | overlay + self-pivot + seccomp |
+| bubblewrap | 2.30 ms | a sandbox *primitive*, no images, caps, or lifecycle |
+| runc (rootless) | 18.6 ms | OCI runtime (Go) |
+| podman (rootless) | 292.9 ms | daemonless engine: forks `conmon` + the full OCI stack per run |
+| docker run --rm | 296.9 ms | client → daemon round-trip |
 
 The honest version: **nobody wins single-shot latency outright**: the top tier is all within a couple
 of milliseconds, i.e. noise. kern leads that tier while being the only one of them that ships a full

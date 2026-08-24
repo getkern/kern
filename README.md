@@ -300,12 +300,12 @@ differ with your CPU, kernel and filesystem, which is why these are approximate.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.3 ms** | ~2.8 ms | ~13.5 ms | ~285 ms | ~293 ms |
-| 200 boxes in parallel | **~0.09 s** | ~0.16 s | ~0.35 s | ~44.8 s | ~16.2 s |
+| Cold start (bare box) | **~2.3 ms** | ~2.3 ms | ~18.6 ms | ~293 ms | ~297 ms |
+| 200 boxes in parallel | **~0.11 s** | ~0.16 s | ~0.35 s | ~44.8 s | ~16.2 s |
 
-A thousand simultaneous boxes take ~0.60 s, all 1000 of them. One more live box costs ~0.3 MB of real
+A thousand simultaneous boxes take ~0.59 s, all 1000 of them; two thousand take ~1.44 s and three thousand ~2.21 s. One more live box costs ~0.3 MB of real
 memory (100 boxes measured 26.3 MB against 13 MB of ambient drift over the same interval, so read the
-per-box figure as approximate). `exec` into a running box is ~0.93 ms against Docker's ~41.5.
+per-box figure as approximate). `exec` into a running box is ~1.1 ms against Docker's ~42.2.
 
 Every figure above reproduces against 2026-08-01: cold start 2.2 then and 2.3 now, concurrency
 0.09 both times, `exec` 0.79 then and 0.93 now. How to re-measure without fooling yourself, and what
