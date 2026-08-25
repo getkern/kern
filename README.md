@@ -344,7 +344,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 840 Rust, 78 Python and 61 Node tests,
+**The core is done. Everything above works today:** 848 Rust, 78 Python and 61 Node tests,
 clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
 Arduino UNO Q. **v0.7.0 is the first published release.** The CLI and config surface can still
 change, always called out in [CHANGELOG.md](CHANGELOG.md).
