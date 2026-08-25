@@ -19,7 +19,6 @@ and some may never ship if they would change what kern is. Recently shipped work
   would be an explicit opt-in mode, not the default, and only for same-host, non-GPU boxes. Not committed.
 - **macOS.** No native port, and it is a non-goal: a daemonless kernel + cgroup sandbox has no macOS
   equivalent. The only path considered is a thin shim over a Linux VM, the same shape as WSL2.
-- **Freeze.** The CLI and config surface stabilise; the threat model and architecture are finalised.
 
 **In progress**
 
