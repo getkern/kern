@@ -11,6 +11,61 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## Unreleased
+
+### Added
+
+- **`--landlock-rw <path>` now works on `kern run`**, not only on `kern box`. It is the one confinement
+  the governor verb can offer for real, because Landlock restricts the calling process instead of
+  requiring a mount namespace: no image, no `pivot_root`, nothing to build. `kern run --landlock-rw
+  ~/project -- ./agent` runs the binary already on the host with its writes confined by the kernel to
+  that directory, while everything else stays readable and executable. This is additive: no existing
+  invocation changes behaviour.
+
+  Two things differ from the same flag on `box`, both because there is no namespace to hide behind.
+  **It grants only what you name**, plus the character devices a program opens for writing
+  (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`). Inside a box
+  `/tmp`, `/run` and `/proc` are the box's own ephemeral ones and are granted automatically; on the
+  host they are real and persistent (`/run/user/$UID` alone holds the systemd user manager's private
+  socket), so granting them would silently widen "confine writes to this path" into something else.
+  And **it refuses to run** where the kernel has no Landlock, diverging from `run`'s cooperative
+  policy for resource caps: a cap that cannot be applied leaves the command running without a limit,
+  which `run` says out loud, but a confinement that cannot be applied would leave it running with the
+  operator's files reachable while they believed otherwise.
+
+  It implies `no_new_privs`, which Landlock requires, so `sudo` inside the confined command stops
+  working. A `--landlock-rw` path that does not exist, or whose final component is a symlink, is now
+  refused with the path named rather than silently skipped: on a box that silence is fail-safe, but
+  under `run` the allowlist is the entire confinement, so a grant that vanishes leaves a command that
+  can write nowhere.
+
+  The flag reaches the process that execs the workload through the scope re-exec as argv, which is
+  passed verbatim. That is a property of the code rather than of the type, and if it ever broke, an
+  argv that lost the flag would be indistinguishable from one that never carried it: a confined
+  workload and an unconfined one, with nothing downstream able to tell them apart. So the request now
+  travels beside it as a predicate (`KERN_LANDLOCK_REQUIRED`), never the paths. The two channels are
+  asymmetric on purpose and never assert the same fact, so they cannot disagree in a way that needs a
+  tie-break; the predicate arriving without the paths is the impossible state, it is the exact
+  signature of a lost transport, and it aborts before `execve`. Losing both across the same `execve`
+  takes two independent bugs rather than one.
+
+  Verified on this desktop (Landlock ABI 8) with a positive control on every assertion: writes land in
+  the granted path, `/tmp` and `/etc` are denied while the same write succeeds without the flag, reads
+  and `exec` outside the grant still work, the confinement survives `execve` into a child, a symlink
+  planted inside the grant does not reach outside it, cross-directory `rename` and `link` out of the
+  grant are denied, and `/proc/self/oom_score_adj` is not writable. The cost is below the noise floor
+  of 600 interleaved runs.
+
+### Fixed
+
+- **A Landlock grant on a file rather than a directory no longer loses the whole ruleset.** The rule
+  was built with every access right the kernel's ABI knows, including the directory-only ones
+  (`*_DIR`, `MAKE_*`, `REFER`); the kernel answers `EINVAL` when those are asked for on a file or a
+  device node, and the failure discards the entire ruleset, not just that rule. Every path kern granted
+  before happened to be a directory, so this was latent on both verbs: `kern box --landlock-rw
+  /etc/hosts` failed the same way. The rights are now masked to the file-valid subset when the target
+  is not a directory, so a per-file grant works and a `fstat` that fails takes the narrower branch.
+
 ## v0.7.0 - 2026-08-24
 
 The first published release: static binaries for x86_64 and aarch64, a Windows shim and a WSL rootfs,

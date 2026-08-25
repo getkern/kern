@@ -189,6 +189,10 @@ pub enum Command {
         cpuset: Option<String>,
         /// `--config <path>`: a specific `kern.toml` for the profile tokens (parity with `box`).
         config: Option<String>,
+        /// `--landlock-rw <path>` (repeatable): confine the workload's WRITES to these paths via the
+        /// Landlock LSM. The only real confinement `run` can offer, because Landlock restricts the
+        /// calling process rather than requiring a mount namespace.
+        landlock_rw: Vec<String>,
     },
     /// `kern exec <name> [-it] [--env K=V] [--workdir <dir>] [--] [cmd...]`: run a command in a box.
     Exec {
@@ -495,6 +499,11 @@ const USAGE_MEMORY: &str = "--memory <size> (e.g. 512m, 1g, 268435456)";
 const USAGE_CPUS: &str = "--cpus <n> (e.g. 1.5 = 1½ cores, 2)";
 const USAGE_CPUSET: &str = "--cpuset-cpus <list> (e.g. 0-3, 0,2,4)";
 const USAGE_SWAP_MAX: &str = "--memory-swap-max <size> (e.g. 1g, 512m)";
+/// `run`'s message for a missing or empty `--landlock-rw` value. `box` accepts the same flag but merely
+/// SKIPS an empty one, because a box that loses a Landlock grant still has its namespaces, seccomp and
+/// read-only root. `run` has none of those: the allowlist is the entire confinement, so a value that
+/// silently vanishes turns a confinement request into an unconfined process. It is an error here.
+const USAGE_LANDLOCK_RW: &str = "--landlock-rw <path> (an existing path; repeatable)";
 const REJECT_MEMORY_SWAP: &str =
     "--memory-swap is not supported (Docker's mem+swap total, ambiguous on cgroup v2); \
      use --memory-swap-max <size> = the swap allowance (memory.swap.max)";
@@ -2270,7 +2279,8 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--pod",
     "--hostname",
     "--egress-allow",
-    "--landlock-rw",
+    // `--landlock-rw` is deliberately NOT here: it is the one confinement that needs no mount
+    // namespace, so it is the one `box` flag that `run` can honour for real. See `parse_run`.
 ];
 
 fn parse_run(rest: &[&str]) -> Result<Command, Error> {
@@ -2279,6 +2289,7 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
     let mut cpus: Option<f64> = None;
     let mut cpuset: Option<String> = None;
     let mut config: Option<String> = None;
+    let mut landlock_rw: Vec<String> = Vec::new();
     let mut command: Vec<String> = Vec::new();
     let mut i = 1; // rest[0] == "run"
     while i < rest.len() {
@@ -2314,6 +2325,17 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
                 }
             }
             "--memory-swap" => return Err(Error::Usage(REJECT_MEMORY_SWAP)),
+            // The one `box` confinement `run` can honour: Landlock restricts the calling process, so it
+            // needs no mount namespace, no image and no pivot_root. Repeatable, like on `box`. An empty
+            // value is rejected here rather than becoming a rule on "" that `add_path` would silently
+            // skip, leaving a workload confined to nothing while the operator asked for a grant.
+            "--landlock-rw" => {
+                i += 1;
+                match rest.get(i).map(|v| v.trim()) {
+                    Some(p) if !p.is_empty() => landlock_rw.push(p.to_string()),
+                    _ => return Err(Error::Usage(USAGE_LANDLOCK_RW)),
+                }
+            }
             "--cpus" => {
                 i += 1;
                 match rest
@@ -2361,7 +2383,7 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
     }
     if command.is_empty() {
         return Err(Error::Usage(
-            "run [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--config F] [vcpu:PROFILE] [--] <cmd...>",
+            "run [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--landlock-rw P] [--config F] [vcpu:PROFILE] [--] <cmd...>",
         ));
     }
     Ok(Command::Run {
@@ -2371,6 +2393,7 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
         cpus,
         cpuset,
         config,
+        landlock_rw,
     })
 }
 
@@ -2845,6 +2868,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             cpus,
             cpuset,
             config,
+            landlock_rw,
         } => commands::run(
             &command,
             memory,
@@ -2852,6 +2876,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             cpus,
             cpuset.as_deref(),
             config.as_deref(),
+            &landlock_rw,
         ),
         Command::Exec {
             name,

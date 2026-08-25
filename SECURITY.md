@@ -158,6 +158,53 @@ privilege-escalation bug is an escape.
   flag is refused rather than run unconfined (verified on a Raspberry Pi 5, whose only LSM is
   `capability`), so the flag cannot silently mean less on one host than on another. A box that does
   not pass it is unaffected and keeps the namespace, seccomp and cgroup boundary.
+  The same flag works on **`kern run`**, which has no namespaces at all: Landlock restricts the calling
+  process, so it is the one real boundary the governor verb can offer. There it grants only the named
+  paths (plus the character devices a program opens for writing, `/dev/null` and friends), never the
+  host's `/tmp`, `/run` or `/proc`, and it refuses on the same fail-closed rule. Verified on this
+  desktop (ABI 8): writes land in the granted directory, `/tmp` and `/etc` are denied, a symlink
+  planted inside the grant does not reach outside it, and cross-directory `rename`/`link` out of the
+  grant are denied with `REFER` ungranted.
+
+  **Measured on four hosts**, each with a positive control so a host that cannot run the command at all
+  is never read as a pass:
+  - *Desktop, Linux 7.0, ABI 8, unprivileged* - enforced, as above.
+  - *VPS, Ubuntu 24.04, kernel 6.8, ABI 4, as root* - enforced. Landlock is not gated on capabilities,
+    so a write outside the grant is denied at uid 0 exactly as it is for a normal user, and the
+    file-rather-than-directory grant works on an ABI that does not govern `IOCTL_DEV`.
+  - *Raspberry Pi 5, kernel 6.6, LSM `capability` only* - **refused**, on `box` and on `run`. The
+    workload did not start, and without the flag the same command runs, so the refusal is the flag's
+    and not the host's.
+  - *Jetson Orin Nano, kernel 5.15-tegra, LSM `capability,yama,selinux`, systemd 249* - refused
+    identically, on an older systemd whose scope path differs.
+
+  **Two limits of a write allowlist, measured rather than assumed**, because "writes stay in the
+  folder" is true of bytes and not of everything:
+  - **A FIFO inside the grant is a channel out.** A named pipe in the granted directory, with a reader
+    running outside the confinement, carries data past the boundary: the write is inside the grant and
+    Landlock permits it exactly as documented. Verified on this desktop, the string arrives outside.
+    The boundary bounds *where bytes land*, not *who reads them*; for that you need the workload to have
+    no shared filesystem with the reader at all, which is what a box's mount namespace gives.
+  - **`/dev/tty` is in the `run` auto-grant set**, and on a kernel with `dev.tty.legacy_tiocsti=1` a
+    process sharing the controlling terminal can push characters into it with `TIOCSTI`. That vector
+    does not come from the grant: Landlock mediates filesystem access, not `ioctl`, and the workload
+    already holds the terminal through the inherited descriptors 0/1/2, so removing the path would not
+    close it. It is closed by the kernel setting, which is `0` by default on current kernels (measured
+    `0` here). The path is granted because tools that open the terminal directly, rather than through
+    stdio, need it.
+  - **Metadata is not confined, only content.** Landlock has no access right for `chmod`, `chown` or
+    `utimes`, so those are not mediated at all: measured on this desktop, a command confined to one
+    directory changed the mode, owner and timestamps of a file outside it, while a write to that same
+    file's contents and a `rename` were both denied. The gap is in the LSM, not in kern, and it cannot
+    be closed here. What differs between the two verbs is the reach: in a box the workload only sees
+    the box's own filesystem, so the blast radius is whatever was mounted into it; under `run` there is
+    no mount namespace, so it is every file the invoking user owns. A confined agent cannot alter your
+    files, and can still make them world-readable.
+  - **A device node inside the grant is granted as a device.** A block device under a `--landlock-rw`
+    path is writable raw, and `IOCTL_DEV` applies to it. Creating one needs privileges the confined
+    process does not have, so this is reachable only if the operator put a device node in the directory
+    they granted. Named because the flag says "confine writes to this path", and a device node is not a
+    file of bytes.
 - **Egress allowlist** (`--egress-allow`, opt-in, foreground): the box reaches the internet only
   through a kern-run filtering proxy. **SSRF-guarded**: a domain resolving to any non-public address
   is refused at connect time even if allow-listed. Honest residual: a domain sharing a CDN IP and SNI

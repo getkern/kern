@@ -207,6 +207,18 @@ fn join_pod_and_bind_its_files(
 /// on it in the `on_started` callback, and the box's `*_PROXY` variables point at it.
 const EGRESS_PROXY_PORT: u16 = 3128;
 
+/// The `kern run` confinement commitment, carried across the scope re-exec beside the argv.
+///
+/// It holds a PREDICATE ("a `--landlock-rw` was requested"), never the paths themselves: the paths are
+/// the argv's job. That asymmetry is the point. Two channels carrying the same fact would need a rule
+/// for which one wins when they disagree; two channels carrying different halves of one fact have an
+/// impossible state instead (predicate without content), which is precisely the signature of a lost
+/// transport and can only be answered by refusing. See the check in [`run`].
+///
+/// Not folded into `KERN_SCOPE`: that one a user may set by hand to opt out of the scope path, and it
+/// would then be asserting something about the argv that is not true.
+const LANDLOCK_REQUIRED_ENV: &str = "KERN_LANDLOCK_REQUIRED";
+
 /// `--egress-allow <domains>`: an outbound domain allowlist. The box keeps its default ISOLATED netns
 /// (no route out, a real kernel boundary), and its ONLY egress is a kern-run filtering proxy started
 /// once the box's netns exists. This points the box's proxy environment at it, after refusing the two
@@ -1240,8 +1252,31 @@ pub fn run(
     cpus: Option<f64>,
     cpuset: Option<&str>,
     config: Option<&str>,
+    landlock_rw: &[String],
 ) -> Result<(), Error> {
     use std::os::unix::process::CommandExt;
+    // A FAST-FAIL on the write-allowlist, so a typo costs a message instead of a systemd scope and a
+    // re-exec. This check is a convenience and is deliberately NOT the security decision: it stats a
+    // path here, and the rule is bound to an fd opened later, so the two could in principle be
+    // different objects (`O_NOFOLLOW` rejects a path that BECAME a symlink, but accepts one swapped for
+    // a different real directory). The authoritative check lives in `landlock::add_path`, which opens
+    // once and stats and binds that same fd, and refuses on this path when a named grant cannot be
+    // bound. Both messages name the path; this one simply arrives sooner.
+    for p in landlock_rw {
+        let md = std::fs::symlink_metadata(p).map_err(|e| {
+            Error::Cli(format!(
+                "--landlock-rw '{p}': {e}. The grant is bound to a path that must already exist; \
+                 create it first, or name one that does."
+            ))
+        })?;
+        if md.file_type().is_symlink() {
+            return Err(Error::Cli(format!(
+                "--landlock-rw '{p}' is a symlink. Landlock binds the grant with O_NOFOLLOW, so a \
+                 symlinked path would grant nothing and the command would run confined to nothing. \
+                 Name the target path instead."
+            )));
+        }
+    }
     // Fold any leading resource-profile tokens (`vcpu:name` …) into the caps - explicit flags win -
     // and find where the real command begins.
     let mut ap = AppliedProfiles {
@@ -1308,6 +1343,43 @@ pub fn run(
             "kern: vdisk profile(s) ignored by `run` (no mount namespace) - use `kern box vdisk:NAME …`"
         );
     }
+    // The confinement COMMITMENT, and why a second channel here is not the second transport it looks
+    // like.
+    //
+    // `--landlock-rw` reaches the post-re-exec pass as argv, which is verbatim today
+    // (`shim::effective_args` returns `env::args()`) and stays correct only as long as nothing ever
+    // rewrites, normalises or reorders it. That is an invariant of the code, not of the type: the day
+    // it breaks, an argv that LOST the flag is indistinguishable from one that never carried it, and
+    // the difference between those two is a confined workload and an unconfined one. No test can
+    // separate them after the fact, because a clean run and a lost-flag run look identical downstream.
+    //
+    // So make them distinguishable BEFORE the exec. The env below carries the PREDICATE (a confinement
+    // was requested); the argv carries the CONTENT (which paths). They are asymmetric on purpose: they
+    // never assert the same fact, so they cannot disagree in a way that needs adjudicating. Predicate
+    // present with content missing is the impossible state, it is the exact signature of a lost
+    // transport, and it aborts. Losing both across the same `execve` takes two independent bugs
+    // instead of one, which is the whole of what a belt buys.
+    //
+    // Checked only under `KERN_SCOPE`, because that is the sole situation in which an `execve` sat
+    // between the parse that saw the flag and this one. Elsewhere there is no transport to lose.
+    if kern_common::env_flag("KERN_SCOPE")
+        && kern_common::env_flag(LANDLOCK_REQUIRED_ENV)
+        && landlock_rw.is_empty()
+    {
+        return Err(Error::Cli(
+            "--landlock-rw was requested before the scope re-exec and did not survive it. Refusing \
+             to run the command unconfined. This is a kern bug, not a usage error: please report it \
+             with the exact command line."
+                .into(),
+        ));
+    }
+    // Authored here in BOTH directions, so the value the second pass reads is always one this pass
+    // wrote and never one a user happened to have exported into the environment.
+    if landlock_rw.is_empty() {
+        std::env::remove_var(LANDLOCK_REQUIRED_ENV);
+    } else {
+        std::env::set_var(LANDLOCK_REQUIRED_ENV, "1");
+    }
     // Robust caps via a transient systemd user scope whose MemoryMax/CPUQuota track the caps; this
     // re-execs once and returns here under KERN_SCOPE. Where systemd --user isn't present it's a
     // no-op and the best-effort in-process cgroup below applies the same caps.
@@ -1337,10 +1409,13 @@ pub fn run(
         None,  // no --io-weight in `kern run`
         false, // `kern run` is a cooperative governor, never fail-closed (best-effort gate)
     );
-    // `kern run` is a cooperative GOVERNOR, not an isolation boundary - so unlike `kern box` it does NOT
-    // fail-closed when a cap can't be applied. But make the drop VISIBLE, not silent: if the user asked
-    // for a cap, no outer scope is enforcing it (`KERN_SCOPE` unset), and we couldn't apply it (`cg` None),
-    // say so rather than let the workload quietly exceed it (there is no isolation here; only the limit).
+    // For its RESOURCE CAPS `kern run` is a cooperative governor, not an isolation boundary - so unlike
+    // `kern box` it does NOT fail-closed when a cap can't be applied. But make the drop VISIBLE, not
+    // silent: if the user asked for a cap, no outer scope is enforcing it (`KERN_SCOPE` unset), and we
+    // couldn't apply it (`cg` None), say so rather than let the workload quietly exceed it.
+    //
+    // `--landlock-rw` is the one thing on this verb that does NOT follow this policy: it is a
+    // confinement, not a limit, and it refuses instead of warning. See the block just before the exec.
     if cg.is_none()
         && (memory.is_some() || cpus.is_some())
         && std::env::var_os("KERN_SCOPE").is_none()
@@ -1370,6 +1445,35 @@ pub fn run(
     // live runs/sec - done here, in the final process that actually runs the workload (past any
     // scope re-exec), so each `kern run` counts exactly once. Best-effort: never fails the run.
     crate::runstats::record();
+    // The write-allowlist, applied LAST: after the scope re-exec (a ruleset applied before it would be
+    // inherited by `systemd-run`, which needs to write the user bus socket under /run/user/$UID that
+    // HOST_AUTO_RW deliberately does not grant, and the scope would fail) and immediately before
+    // `execve`, which the ruleset survives. Nothing of the workload has run at this point, so it never
+    // holds a pre-opened writable fd to a denied path.
+    //
+    // This FAILS CLOSED, unlike every resource cap above it. That divergence is deliberate: a cap that
+    // cannot be applied leaves the workload running without a limit, which `run` states plainly and
+    // accepts because it is a cooperative governor. A confinement that cannot be applied leaves the
+    // workload running with the operator's files reachable while the operator believes they are not.
+    // The `vgpio` branch earlier in this function names that shape "the worst this can take"; refusing
+    // is the only answer that keeps the flag's promise honest on a host where it cannot be kept.
+    if !landlock_rw.is_empty() {
+        match kern_isolation::landlock_confine_writes(landlock_rw) {
+            Ok(true) => {}
+            Ok(false) => return Err(Error::Cli(
+                "--landlock-rw: this kernel has no Landlock (needs Linux 5.13+, and it must not \
+                     be disabled at boot). Refusing to run the command unconfined - check with \
+                     `kern doctor`."
+                    .into(),
+            )),
+            Err(e) => {
+                return Err(Error::Cli(format!(
+                    "--landlock-rw: could not enforce the write allowlist ({e}). Refusing to run \
+                     the command unconfined."
+                )))
+            }
+        }
+    }
     // exec() replaces this process with the command (which inherits the cgroup) and only returns on
     // failure - so a successful run propagates the command's own exit code as kern's.
     let err = std::process::Command::new(&command[0])

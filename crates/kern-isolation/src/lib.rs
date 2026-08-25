@@ -24,6 +24,25 @@ mod landlock;
 pub fn landlock_abi() -> Option<i32> {
     landlock::abi_version()
 }
+
+/// Confine the CALLING process's writes to `rw` (plus the minimum character devices a program needs to
+/// open for writing), leaving the whole filesystem readable and executable. Survives `execve`, so the
+/// workload `kern run` is about to exec inherits it and cannot lift it.
+///
+/// This is the `kern run` counterpart of the box's `--landlock-rw`: same kernel mechanism, but with the
+/// auto-grant set that is correct when there is NO mount namespace and every path is the host's own.
+/// The box path is not reachable from outside this crate and stays where it is, applied on box PID 1.
+///
+/// Returns `Ok(true)` when the ruleset is enforced, `Ok(false)` when this kernel has no Landlock, and
+/// `Err` when a ruleset that WAS available could not be built or enforced. The caller must treat all
+/// three distinctly: only `Ok(true)` means the operator got what they asked for.
+///
+/// Side effect the caller must document to the operator: this sets `PR_SET_NO_NEW_PRIVS`, which
+/// Landlock requires. A workload run under it cannot gain privileges through a setuid binary, so
+/// `sudo` and friends stop working inside the confined command.
+pub fn landlock_confine_writes(rw: &[String]) -> Result<bool, Error> {
+    landlock::apply_rw_allowlist_host(rw)
+}
 mod outcome;
 mod ports;
 mod real;

@@ -6,6 +6,7 @@ COMMANDS:
     box <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     box <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     run [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
+    run --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     exec <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
     ps [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     logs <name> [--tail N] [-f|--follow]                           Show a box's output
@@ -131,6 +132,9 @@ OPTIONS for box:
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
     -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
     --landlock-rw <path> Confine writes to these paths with the Landlock LSM; root stays read+exec (repeatable)
+                        Also valid on `run`, where it is the only real confinement: it needs no
+                        namespace. There it grants ONLY these paths (plus /dev/null and friends),
+                        refuses if the kernel has no Landlock, and implies no-new-privs (no sudo)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
                         only the caller (faster + more isolated)
     --bind-rootfs       Bind --rootfs directly instead of an overlay, faster on kernels with a
@@ -154,7 +158,11 @@ OPTIONS for run:
     --cpus <N>              CPU quota, fractional allowed (0.5 = half a core)
     --cpuset-cpus <LIST>    Pin to these CPUs (e.g. 0-3,8); a CPU that does not exist is dropped
     --config <PATH>         kern.toml to resolve `vcpu:`/`vgpio:`/`vdisk:` profiles against
-    `run` caps a process on the HOST: no image, no namespaces, no sandbox. For isolation use `box`.
+    --landlock-rw <PATH>    Confine the process's WRITES to PATH (kernel LSM, needs no namespace);
+                            everything else stays readable and executable. Repeatable. Refuses to
+                            run if this kernel has no Landlock, and implies no-new-privs (no sudo)
+    `run` caps a process on the HOST: no image, no namespaces, no sandbox - except --landlock-rw,
+    which is a real kernel-enforced write boundary. For full isolation use `box`.
 
 OPTIONS:
     -V, --version  Print version

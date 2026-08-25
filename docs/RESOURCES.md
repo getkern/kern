@@ -108,7 +108,26 @@ command reads and writes. The full schema, every field, the 7-layer precedence a
 | Verb | Question it answers | What it does | Status |
 |------|--------------------|--------------|--------|
 | **`kern box`** | *"Isolate this workload, and slice its resources."* | Its own namespaces, overlay/read-only fs, private process tree, seccomp (**the container**), **plus** the same resource slices (`--memory`, `--cpus`, `vcpu:`, `vdisk:`, `vgpio:`). | ✅ works now |
-| **`kern run`** | *"Just slice resources, no sandbox."* | Run a command against a CPU / memory quota with no isolation: the lean governor on its own. (A **GPU slice** is on the roadmap.) | ✅ works now |
+| **`kern run`** | *"Just slice resources, no sandbox."* | Run a command against a CPU / memory quota with no namespaces: the lean governor on its own, **plus** `--landlock-rw` to confine its writes. (A **GPU slice** is on the roadmap.) | ✅ works now |
 
 **Both take resource slices;** the difference is the sandbox. `box` = isolation **+** slices; `run` =
 slices **without** the sandbox. They compose (`run` inside `box`). Both ship today.
+
+**One boundary crosses the split.** `--landlock-rw <path>` works on `run` as well as on `box`, because
+Landlock restricts the calling process rather than requiring a mount namespace: no image, no
+`pivot_root`, nothing to build. So `kern run --landlock-rw ~/project -- ./agent` runs the binary you
+already have on the host, with its writes confined by the kernel to that one directory and everything
+else readable and executable.
+
+Two differences from the same flag on `box`, both consequences of there being no namespace:
+
+- It grants **only what you name**, plus `/dev/null` and the other character devices a program opens
+  for writing. Inside a box `/tmp`, `/run` and `/proc` are the box's own ephemeral ones and are granted
+  automatically; on the host they are real and persistent, so they are not.
+- It **refuses to run** where the kernel has no Landlock, rather than warning and continuing as a
+  resource cap does. A cap that cannot be applied leaves the command running without a limit, which
+  `run` says out loud; a confinement that cannot be applied would leave it running with your files
+  reachable while you believed otherwise.
+
+It also implies `no_new_privs`, which Landlock requires: the confined command cannot gain privileges
+through a setuid binary, so `sudo` inside it stops working.

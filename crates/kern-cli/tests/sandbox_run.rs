@@ -5022,3 +5022,283 @@ fn landlock_rw_enforces_the_allowlist_or_refuses_the_box() {
         );
     }
 }
+
+/// `kern run --landlock-rw` confines writes with NO namespace, no image and no pivot_root - the one
+/// real boundary the governor verb can offer.
+///
+/// Four facts make the assertions meaningful, and each is measured rather than assumed:
+///  * `RAN` proves the command executed. Without it a host where `/bin/sh` is missing reads as a pass.
+///  * `IN-OK` proves the grant was honoured. Without it a ruleset that denies EVERYTHING reads as a pass.
+///  * `OUT-WROTE` absent is the property under test.
+///  * The control run (same script, no flag) proves the denied path was writable in the first place.
+///    Without it, a read-only `/tmp` on the test host would produce the expected output for the wrong
+///    reason.
+#[test]
+fn run_landlock_rw_confines_writes_or_refuses_to_run() {
+    let dir = std::env::temp_dir().join(format!("kern-it-ll-run-{}", std::process::id()));
+    let inside = dir.join("granted");
+    let outside = dir.join("denied");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&inside).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let script = format!(
+        "echo RAN; touch {}/f 2>/dev/null && echo IN-OK; touch {}/f 2>/dev/null && echo OUT-WROTE",
+        inside.display(),
+        outside.display()
+    );
+    let inside_s = inside.to_str().unwrap_or_default().to_string();
+
+    // The control FIRST, so a host that cannot write the "denied" dir at all is caught before the
+    // confined run is interpreted.
+    let ctrl = kern_out(&["run", "--", "/bin/sh", "-c", script.as_str()]);
+    let ctrl_out = String::from_utf8_lossy(&ctrl.stdout).to_string();
+    if !ctrl_out.contains("RAN") || !ctrl_out.contains("OUT-WROTE") {
+        let _ = fs::remove_dir_all(&dir);
+        eprintln!("skip: the unconfined control could not write the denied path ({ctrl_out:?})");
+        return;
+    }
+    let _ = fs::remove_file(outside.join("f"));
+
+    let out = kern_out(&[
+        "run",
+        "--landlock-rw",
+        inside_s.as_str(),
+        "--",
+        "/bin/sh",
+        "-c",
+        script.as_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = fs::remove_dir_all(&dir);
+
+    // Ask the same question kern asks, so the expectation comes from the host, never from a guess.
+    if kern_isolation::landlock_abi().is_some() {
+        assert!(
+            stdout.contains("RAN"),
+            "the command must run when the allowlist CAN be enforced. stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains("IN-OK"),
+            "positive control: a write INSIDE the grant must succeed, or the ruleset is denying a \
+             path it was told to permit. stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("OUT-WROTE"),
+            "a write OUTSIDE the grant must be denied by the LSM. The control run proved this same \
+             path was writable without the flag. stdout={stdout:?} stderr={stderr:?}"
+        );
+    } else {
+        // The regression this half exists to catch: `run` was told to confine and could not, and ran
+        // anyway. Unlike a resource cap, that leaves the operator's files reachable while they believe
+        // otherwise, so it must be a refusal.
+        assert!(
+            !stdout.contains("RAN"),
+            "with no Landlock on this kernel the command must be REFUSED, not run unconfined. \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !out.status.success() && stderr.contains("--landlock-rw"),
+            "the refusal must be a non-zero exit that names the flag. stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+}
+
+/// `run` does NOT inherit the box's scratch auto-grants. Inside a box `/tmp` is a fresh tmpfs that dies
+/// with it; under `run` it is the host's own, and granting it would silently widen "confine writes to
+/// this path" into "…and all of /tmp". Asserted separately from the main test because it is the one
+/// behaviour that differs between the two verbs, and a refactor that unified the two auto-grant sets
+/// would leave every other assertion here passing.
+#[test]
+fn run_landlock_rw_does_not_grant_the_hosts_tmp() {
+    if kern_isolation::landlock_abi().is_none() {
+        eprintln!("skip: this kernel has no Landlock");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-ll-tmp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let probe = std::env::temp_dir().join(format!("kern-it-ll-probe-{}", std::process::id()));
+    let script = format!(
+        "echo RAN; touch {} 2>/dev/null && echo TMP-WROTE",
+        probe.display()
+    );
+    let dir_s = dir.to_str().unwrap_or_default().to_string();
+    let out = kern_out(&[
+        "run",
+        "--landlock-rw",
+        dir_s.as_str(),
+        "--",
+        "/bin/sh",
+        "-c",
+        script.as_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = fs::remove_dir_all(&dir);
+    let wrote = probe.exists();
+    let _ = fs::remove_file(&probe);
+    if !stdout.contains("RAN") {
+        eprintln!("skip: the command did not run on this host ({stdout:?})");
+        return;
+    }
+    assert!(
+        !stdout.contains("TMP-WROTE") && !wrote,
+        "the host's /tmp must NOT be auto-granted under `run`: only the named paths are writable. \
+         stdout={stdout:?}"
+    );
+}
+
+/// A `--landlock-rw` path that does not exist, or whose final component is a symlink, is SKIPPED by
+/// `landlock::add_path` (it cannot open what is not there, and it opens `O_NOFOLLOW` on purpose). On a
+/// box that silence is fail-safe: the box keeps its namespaces and the allowlist only ever tightens.
+/// Under `run` the allowlist is the entire confinement, so the same silence produces a command that can
+/// write nowhere while the operator believes they granted a directory. Both must be refusals that NAME
+/// the path, and neither may reach the workload.
+#[test]
+fn run_landlock_rw_refuses_a_path_that_cannot_be_granted() {
+    let dir = std::env::temp_dir().join(format!("kern-it-ll-bad-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let real = dir.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = dir.join("link");
+    let missing = dir.join("nope");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    for (path, needle) in [
+        (missing.clone(), "must already exist"),
+        (link.clone(), "is a symlink"),
+    ] {
+        let p = path.to_str().unwrap_or_default().to_string();
+        let out = kern_out(&["run", "--landlock-rw", p.as_str(), "--", "/bin/echo", "RAN"]);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            !out.status.success(),
+            "--landlock-rw '{p}' must refuse, not run. stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("RAN"),
+            "--landlock-rw '{p}' must not reach the workload. stdout={stdout:?}"
+        );
+        assert!(
+            stderr.contains(needle) && stderr.contains(&p),
+            "the refusal must name the path and say why (expected {needle:?}). stderr={stderr:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The confinement commitment: `--landlock-rw` travelling to the post-re-exec pass as argv is correct
+/// only while nothing rewrites argv, and a lost flag is indistinguishable downstream from one that was
+/// never passed. `KERN_LANDLOCK_REQUIRED` carries the predicate beside it so the impossible state
+/// (requested, but no paths) is detectable, and it must ABORT rather than exec.
+///
+/// This is the one case a clean run cannot exercise, so it is forced here: the environment is set by
+/// hand to exactly what a lost transport would look like. The three other combinations are asserted
+/// alongside it, because a belt that also fires when it should not is a worse bug than no belt.
+#[test]
+fn run_landlock_commitment_aborts_when_the_flag_did_not_survive_the_reexec() {
+    let bin = env!("CARGO_BIN_EXE_kern");
+    let marker = "WORKLOAD-RAN";
+
+    // Requested before the re-exec, absent after it: the impossible state. Must refuse.
+    let lost = std::process::Command::new(bin)
+        .args(["run", "--", "/bin/echo", marker])
+        .env("KERN_SCOPE", "1")
+        .env("KERN_LANDLOCK_REQUIRED", "1")
+        .output();
+    let Ok(lost) = lost else {
+        eprintln!("skip: could not spawn kern");
+        return;
+    };
+    let out = String::from_utf8_lossy(&lost.stdout).to_string();
+    let err = String::from_utf8_lossy(&lost.stderr).to_string();
+    assert!(
+        !out.contains(marker),
+        "a lost confinement must not reach the workload. stdout={out:?} stderr={err:?}"
+    );
+    assert!(
+        !lost.status.success() && err.contains("--landlock-rw"),
+        "the abort must be non-zero and name the flag. stdout={out:?} stderr={err:?}"
+    );
+
+    // The three states that must NOT fire, so the belt cannot become a spurious refusal:
+    //  * inside a scope with no request at all,
+    //  * the variable inherited from a user's shell with no scope around it,
+    //  * request and paths both present.
+    let dir = std::env::temp_dir().join(format!("kern-it-ll-commit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap_or_default().to_string();
+    for (label, args, envs) in [
+        (
+            "in a scope, nothing requested",
+            vec!["run", "--", "/bin/echo", marker],
+            vec![("KERN_SCOPE", "1")],
+        ),
+        (
+            "stray variable, no scope",
+            vec!["run", "--", "/bin/echo", marker],
+            vec![("KERN_LANDLOCK_REQUIRED", "1")],
+        ),
+        (
+            "requested and carried",
+            vec![
+                "run",
+                "--landlock-rw",
+                dir_s.as_str(),
+                "--",
+                "/bin/echo",
+                marker,
+            ],
+            vec![("KERN_SCOPE", "1"), ("KERN_LANDLOCK_REQUIRED", "1")],
+        ),
+    ] {
+        let mut c = std::process::Command::new(bin);
+        c.args(&args);
+        for (k, v) in &envs {
+            c.env(k, v);
+        }
+        let Ok(o) = c.output() else {
+            eprintln!("skip: could not spawn kern for {label}");
+            continue;
+        };
+        let so = String::from_utf8_lossy(&o.stdout).to_string();
+        let se = String::from_utf8_lossy(&o.stderr).to_string();
+        if !kern_isolation::landlock_abi().is_some() && envs.len() == 2 {
+            // The third case legitimately refuses on a kernel with no Landlock, for a different reason.
+            continue;
+        }
+        assert!(
+            so.contains(marker),
+            "{label}: the belt must not fire here. stdout={so:?} stderr={se:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An empty or missing `--landlock-rw` value is a usage error on `run`, where `box` merely skips it.
+/// The divergence is deliberate and is asserted so it cannot be "tidied up" into parity: a box that
+/// loses a grant still has namespaces, seccomp and a read-only root; `run` has none of them, so a value
+/// that silently vanishes turns a confinement request into an unconfined process.
+#[test]
+fn run_landlock_rw_rejects_an_empty_or_missing_value() {
+    for args in [
+        vec!["run", "--landlock-rw", "", "--", "/bin/echo", "RAN"],
+        vec!["run", "--landlock-rw", "   ", "--", "/bin/echo", "RAN"],
+        vec!["run", "--landlock-rw"],
+    ] {
+        let out = kern_out(&args);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            !out.status.success() && !stdout.contains("RAN"),
+            "{args:?} must be a usage error, not a run. stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("--landlock-rw"),
+            "the usage error must name the flag. stderr={stderr:?}"
+        );
+    }
+}

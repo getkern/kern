@@ -43,6 +43,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}box{z} <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
+    {c}run{z} --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
     {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     {c}logs{z} <name> [--tail N] [-f|--follow]                           Show a box's output
@@ -168,6 +169,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
     -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
     --landlock-rw <path> Confine writes to these paths with the Landlock LSM; root stays read+exec (repeatable)
+                        Also valid on `run`, where it is the only real confinement: it needs no
+                        namespace. There it grants ONLY these paths (plus /dev/null and friends),
+                        refuses if the kernel has no Landlock, and implies no-new-privs (no sudo)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
                         only the caller (faster + more isolated)
     --bind-rootfs       Bind --rootfs directly instead of an overlay, faster on kernels with a
@@ -191,7 +195,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --cpus <N>              CPU quota, fractional allowed (0.5 = half a core)
     --cpuset-cpus <LIST>    Pin to these CPUs (e.g. 0-3,8); a CPU that does not exist is dropped
     --config <PATH>         kern.toml to resolve `vcpu:`/`vgpio:`/`vdisk:` profiles against
-    {d}`run` caps a process on the HOST: no image, no namespaces, no sandbox. For isolation use `box`.{z}
+    --landlock-rw <PATH>    Confine the process's WRITES to PATH (kernel LSM, needs no namespace);
+                            everything else stays readable and executable. Repeatable. Refuses to
+                            run if this kernel has no Landlock, and implies no-new-privs (no sudo)
+    {d}`run` caps a process on the HOST: no image, no namespaces, no sandbox - except --landlock-rw,{z}
+    {d}which is a real kernel-enforced write boundary. For full isolation use `box`.{z}
 
 {b}OPTIONS:{z}
     -V, --version  Print version

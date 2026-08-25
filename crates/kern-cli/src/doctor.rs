@@ -743,10 +743,11 @@ fn landlock() -> R {
         // opposite sides of the same question, which is the defect class this project keeps paying
         // for: a message that describes behaviour the code no longer has.
         None => R::Warn(
-            "Landlock: absent - --landlock-rw REFUSES to start a box here (fail-closed)".into(),
-            "boxes WITHOUT that flag are unaffected and still get namespaces + seccomp + cgroups; \
-             for the path allowlist you need a kernel with CONFIG_SECURITY_LANDLOCK=y (and \
-             `lsm=...,landlock` if your distro gates it)"
+            "Landlock: absent - --landlock-rw REFUSES to run here, on `box` and on `run` (fail-closed)"
+                .into(),
+            "commands WITHOUT that flag are unaffected: a box still gets namespaces + seccomp + \
+             cgroups, and `kern run` still gets its cgroup caps. For the path allowlist you need a \
+             kernel with CONFIG_SECURITY_LANDLOCK=y (and `lsm=...,landlock` if your distro gates it)"
                 .into(),
         ),
     }
