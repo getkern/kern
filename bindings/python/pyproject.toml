@@ -19,6 +19,13 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 
+# The binding itself has no dependencies and is meant to keep it that way: this extra exists so that
+# `kern_sandbox.langchain` can be installed on purpose, and never as a side effect of `pip install
+# kern-sandbox`. Floor measured, not assumed: the tool was built and run against langchain-core 0.3.0,
+# 0.3.29, 1.0.0 and 1.6.0.
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.3"]
+
 [project.scripts]
 kern-mcp = "kern_sandbox.mcp:main"
 

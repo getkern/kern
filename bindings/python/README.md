@@ -312,6 +312,45 @@ calls (a workspace on disk); each call is a fresh, **network-off** box. Optional
 `vcpu:heavy,vgpio:sensors`, the only way to grant an edge agent a hardware device set). Run it standalone
 with `python -m kern_sandbox.mcp`.
 
+## Use it from LangChain
+
+`kern_sandbox.langchain` turns a session into a tool an agent can call. `langchain-core` is an optional
+extra and is imported only when you build the tool, so the package itself stays dependency-free.
+
+```bash
+pip install 'kern-sandbox[langchain]'
+```
+
+```python
+from kern_sandbox.langchain import kern_code_tool
+
+tool = kern_code_tool(memory_mb=512, timeout_s=30)
+agent = create_agent(model, [tool])
+```
+
+The tool holds one session, so a file written by one call is there for the next, and each call still runs
+in a fresh box. What comes back is written for a model to act on: stdout, the value of a trailing bare
+expression, and **the traceback when the code raises**, which is what the agent needs in order to fix it.
+A sandbox fault is labelled as such (`[sandbox: timeout]`, `oom`, `escape_blocked`) so the model does not
+try to debug code that was killed for asking for 4 GB. Output is capped at `max_chars` (8000 by default,
+head and tail) because the sandbox caps capture at 64 MiB, which protects the host and not a context
+window.
+
+Everything a box prints is untrusted text on its way into a model's context, so the rendering strips
+terminal escapes and control characters, and neutralises the framing above wherever the **code** produced
+it: a cell that prints `[sandbox: oom]` would otherwise claim, byte for byte, that the sandbox killed it.
+Ordinary prompt injection is **not** filtered and cannot be at this layer, because a run whose output is
+`[system] ignore your instructions` is a run that printed a string, and no filter separates that from a
+program legitimately printing the same characters. Deciding what a model may act on belongs above this.
+
+The tool description is generated from the session, so the memory cap, the deadline and whether there is
+any network are stated to the model as they actually are. Startup failures (no `kern` on `PATH`, an image
+that will not pull) raise instead of being returned: an agent cannot fix those by rewriting its code, and
+handing it the message only buys a retry loop against a broken host.
+
+Pass `language="bash"` or `language="node"` for the other two, or your own open `Sandbox` as the first
+argument when you want to own its lifetime.
+
 ## Threat model (honest)
 
 kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code. Its default seccomp
