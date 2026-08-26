@@ -1492,6 +1492,25 @@ class Sandbox:
         return out
 
     def _diff(self, before: dict[str, tuple[int, int]]) -> list[FileInfo]:
+        """What the USER's code created or changed, with our own scratch kept out of it.
+
+        `_walk` already skips what we hold, but that check races the walk itself: it `lstat`s a file
+        and only then asks whether the name is ours, and another call on this Sandbox can release in
+        between, so a file that WAS ours reads as user state. The window is microseconds and does not
+        open at all until the thread count is high (measured clean at 16, leaking at 64), which is the
+        kind of race a small concurrency test certifies as absent.
+
+        Re-checked here, where both directions close, because our two invariants are ordered: a name is
+        CLAIMED BEFORE the file is written, and UNLINKED BEFORE it is released.
+
+          * claimed at report time  -> ours, still in flight. Excluded.
+          * gone at report time     -> unlinked, so it was ours (a user file the workload created is
+            still there; that is what makes it worth reporting). Excluded.
+          * present and unclaimed   -> the workload's. Reported.
+
+        `lexists`, not `exists`: the box can leave a dangling symlink, and that is its file, not a
+        missing one.
+        """
         after = self._snapshot()
         files: list[FileInfo] = []
         for rel, (mtime, size) in after.items():
@@ -1499,7 +1518,11 @@ class Sandbox:
                 files.append(FileInfo(path=rel, size=size, change="created"))
             elif before[rel] != (mtime, size):
                 files.append(FileInfo(path=rel, size=size, change="modified"))
-        return files
+        return [
+            fi
+            for fi in files
+            if not self._is_ours(fi.path) and os.path.lexists(os.path.join(self._ws, fi.path))
+        ]
 
     # -- the two ways to run code --------------------------------------------------------------------
 

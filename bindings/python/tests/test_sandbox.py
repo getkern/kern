@@ -1129,13 +1129,23 @@ def test_a_box_cannot_hide_a_file_by_naming_it_like_our_scratch():
 def test_a_concurrent_call_does_not_see_the_other_call_s_scratch():
     """Two calls on the SAME Sandbox share one workspace by design (that is what makes file state
     persist). Each used to filter only the three names IT had written, so a call's file diff reported
-    the other call's in-flight cell and runner to the caller as freshly created user files."""
+    the other call's in-flight cell and runner to the caller as freshly created user files.
+
+    SIXTY-FOUR threads, and the number is the point. `_walk` skips what the registry holds, but that
+    check races the walk itself: it `lstat`s a file and only then asks whether the name is ours, and
+    another call can release in between, so a file that WAS ours reads as user state. At eight threads
+    the window never opened and this test passed against a defect that was there; at sixty-four it
+    leaked six names on the first run. A concurrency test whose thread count is too low does not find
+    fewer races, it certifies them as absent.
+    """
+    THREADS, CALLS = 64, 128
+
     import concurrent.futures as cf
 
     with Sandbox(timeout_s=60) as s:
-        with cf.ThreadPoolExecutor(8) as pool:
-            results = list(pool.map(lambda i: s.run_code(f"print({i} * {i})"), range(8)))
-    assert [r.stdout.strip() for r in results] == [str(i * i) for i in range(8)]
+        with cf.ThreadPoolExecutor(THREADS) as pool:
+            results = list(pool.map(lambda i: s.run_code(f"print({i} * {i})"), range(CALLS)))
+    assert [r.stdout.strip() for r in results] == [str(i * i) for i in range(CALLS)]
     leaked = sorted({f.path for r in results for f in r.files})
     assert leaked == [], f"internal scratch reported as user files: {leaked}"
 
