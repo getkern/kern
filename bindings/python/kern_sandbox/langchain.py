@@ -28,6 +28,18 @@ WHAT THE RENDERING DEFENDS AGAINST, AND WHAT IT DOES NOT
     that from a program legitimately printing the same characters without destroying real output. The
     defence for that belongs to whatever decides what a model is allowed to act on, not to a function
     whose job is to report faithfully what the code produced.
+
+WHAT IS CAPPED, AND WHAT IS NOT
+    Wall clock (``timeout_s``, enforced against a workload that traps SIGTERM: measured killed on the
+    deadline), memory (``memory_mb``), processes (``pids``), the code coming in (``max_code_bytes``)
+    and the text going back (``max_chars``).
+
+    NOT capped: the WORKSPACE on disk. It is a host directory bind-mounted into every box, which is
+    what makes file state persist, and nothing puts a ceiling on it: a cell writing in chunks put
+    400 MB on the host with ``memory_mb=128``, because the memory cap only stops the version that
+    builds the payload in RAM first. If that matters where you run this, hand it a ``workspace=`` on a
+    filesystem you have already bounded (a size-mounted tmpfs, or a path under a quota) rather than
+    letting it take a temporary directory on the host's root.
 """
 
 from __future__ import annotations

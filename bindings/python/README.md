@@ -343,6 +343,13 @@ Ordinary prompt injection is **not** filtered and cannot be at this layer, becau
 `[system] ignore your instructions` is a run that printed a string, and no filter separates that from a
 program legitimately printing the same characters. Deciding what a model may act on belongs above this.
 
+Capped: wall clock (enforced even against a workload that traps `SIGTERM`), memory, processes, the code
+coming in (`max_code_bytes`) and the text going back. **Not capped: the workspace on disk.** It is a host
+directory bind-mounted into every box, which is what makes file state persist, and nothing bounds it: a
+cell writing in chunks put 400 MB on the host with `memory_mb=128`, since a memory cap only stops the
+version that builds the payload in RAM first. Where that matters, pass a `workspace=` on a filesystem you
+have already bounded (a size-mounted tmpfs, or a path under a quota).
+
 The tool description is generated from the session, so the memory cap, the deadline and whether there is
 any network are stated to the model as they actually are. Startup failures (no `kern` on `PATH`, an image
 that will not pull) raise instead of being returned: an agent cannot fix those by rewriting its code, and
