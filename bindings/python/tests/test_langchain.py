@@ -1143,3 +1143,112 @@ def test_repeated_sessions_do_not_grow_the_interpreter_s_exit_handlers():
         assert len(glob.glob("/tmp/kern-lc-ws-*")) == alias_before, "an alias survived"
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+@needs_shell
+@integration
+@pytest.mark.parametrize(
+    "desync",
+    [
+        "printf 'no-trailing-newline'",   # the common one: the marker lands on the same line
+        "echo -n also-no-newline",
+        "seq 1 3 | tr '\\n' ' '",
+        "cat",                            # swallows the marker as its own stdin
+        "exit 42",                        # kills the shell outright
+        "if ; then",                      # bash waits for the rest of the construct
+    ],
+)
+def test_the_session_recovers_from_every_way_a_command_can_desynchronise_it(desync):
+    """The protocol writes a marker after each command and reads until a line STARTS with it. Several
+    ordinary commands break that, and output with no trailing newline is the commonest by far: the
+    marker is appended to the last line instead of beginning one. `cat` swallows it, `exit` kills the
+    shell, an incomplete construct leaves bash waiting.
+
+    All six behave identically through `DockerExecutionPolicy` (measured, 7 of 7 including a healthy
+    control), so the defect belongs to the middleware's protocol. What is OURS, and what this pins, is
+    that the recovery works: the middleware restarts the session, the next command runs, and this side
+    leaves nothing behind.
+    """
+    import glob
+
+    from langchain.agents.middleware.shell_tool import ShellSession
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    policy = kern_execution_policy(image="python:3.12-slim")
+    workspace = Path(tempfile.mkdtemp(prefix="kern-desync-"))
+    env_before = len(glob.glob("/tmp/kern-lc-env-*"))
+    session = ShellSession(
+        workspace=workspace, policy=policy, command=("/bin/bash",), environment={}
+    )
+    session.start()
+    try:
+        assert session.execute("echo healthy", timeout=30.0).output.strip() == "healthy"
+        result = session.execute(desync, timeout=6.0)
+        assert result.timed_out, f"{desync!r} was expected to desynchronise the protocol"
+        # The middleware restarted the session inside `execute`; the next command must simply work.
+        recovered = session.execute("echo recovered", timeout=30.0)
+        assert recovered.output.strip() == "recovered", "the session did not come back"
+        assert not recovered.timed_out
+    finally:
+        with contextlib.suppress(Exception):
+            session.stop(policy.termination_timeout)
+        shutil.rmtree(workspace, ignore_errors=True)
+    assert len(glob.glob("/tmp/kern-lc-env-*")) == env_before, "a restart left an environment behind"
+
+
+@needs_shell
+def test_docker_capability_parity_is_one_flag_and_the_default_stays_hardened():
+    """A caller migrating from `DockerExecutionPolicy` must not find their workload broken by a
+    difference nobody chose, and must not have the hardened default taken away either.
+
+    Measured against a real Docker container: the default here drops everything (`CapEff` all zeros),
+    which breaks two ordinary things Docker allows, `chown` to another uid and `apt-get update`, since
+    apt drops privileges to the `_apt` user and needs SETUID and SETGID. With `match_docker_capabilities`
+    the box reports `CapEff: 00000000a80425fb`, byte for byte what a Docker container reports, and both
+    work again. A 32-command battery through the real `ShellSession` then came back 32 for 32 identical.
+    """
+    from kern_sandbox.langchain import _DOCKER_CAPABILITIES, kern_execution_policy
+
+    hardened = " ".join(
+        kern_execution_policy()._build_command("kern", Path("/tmp/x"), None, ["/bin/bash"])[0]
+    )
+    assert "--cap-drop ALL" in hardened
+    assert "--cap-add" not in hardened, "the default keeps nothing"
+
+    parity = " ".join(
+        kern_execution_policy(match_docker_capabilities=True)._build_command(
+            "kern", Path("/tmp/x"), None, ["/bin/bash"]
+        )[0]
+    )
+    assert "--cap-drop ALL" in parity, "parity is built on dropping everything first"
+    assert len(_DOCKER_CAPABILITIES) == 14, "Docker keeps fourteen by default"
+    for capability in _DOCKER_CAPABILITIES:
+        assert f"--cap-add {capability}" in parity, capability
+
+    # The two are exclusive by construction: asking for Docker's set while refusing to drop first
+    # would silently produce kern's own default instead of either.
+    with pytest.raises(ValueError, match="drop_all_capabilities"):
+        kern_execution_policy(match_docker_capabilities=True, drop_all_capabilities=False)
+
+
+@needs_shell
+def test_the_descriptor_limit_matches_a_container_rather_than_the_host():
+    """A gratuitous difference, so it is removed rather than documented. A kern box inherits the host's
+    `nofile`, measured at 1048576 here, where a Docker container reports 1024 soft and 524288 hard. A
+    workload that sizes something off `ulimit -n`, or loops over every possible descriptor to close it,
+    behaves differently for a reason nobody picked."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    argv = " ".join(
+        kern_execution_policy()._build_command("kern", Path("/tmp/x"), None, ["/bin/bash"])[0]
+    )
+    assert "--ulimit nofile=1024:524288" in argv
+
+    assert "--ulimit" not in " ".join(
+        kern_execution_policy(nofile=None)._build_command("kern", Path("/tmp/x"), None, ["/bin/bash"])[0]
+    ), "None inherits the host's, for a caller who wants that"
+
+    for bad in ((0, 10), (10, 0), (100, 10), (-1, 10)):
+        with pytest.raises(ValueError, match="nofile"):
+            kern_execution_policy(nofile=bad)

@@ -361,6 +361,16 @@ _POLICY_MISSING = (
 # keeps two agents on one host from colliding.
 _BOX_PREFIX = "lc-shell-"
 
+# The fourteen capabilities a Docker container keeps by default. Dropping everything and adding these
+# back reproduces `CapEff` exactly, which is what a caller migrating from `DockerExecutionPolicy` needs
+# when a workload of theirs depends on one of them: `chown` wants CHOWN, and `apt-get` drops privileges
+# to the `_apt` user, so it wants SETUID and SETGID. Both were measured failing under the hardened
+# default and passing under this set.
+_DOCKER_CAPABILITIES = (
+    "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "MKNOD",
+    "NET_BIND_SERVICE", "NET_RAW", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+)
+
 _POLICY_CACHE: dict = {}
 
 
@@ -456,6 +466,8 @@ def _build_policy_class():
         read_only_rootfs: bool = False
         user: "str | None" = None
         drop_all_capabilities: bool = True
+        match_docker_capabilities: bool = False
+        nofile: "tuple[int, int] | None" = (1024, 524288)
         use_init: bool = True
         mount_workspace: 'Literal["auto", "always", "never"]' = "auto"
         extra_box_args: "Sequence[str] | None" = None
@@ -466,6 +478,15 @@ def _build_policy_class():
                 raise ValueError("memory_bytes must be positive if provided.")
             if self.pids_limit is not None and self.pids_limit <= 0:
                 raise ValueError("pids_limit must be positive if provided.")
+            if self.match_docker_capabilities and not self.drop_all_capabilities:
+                raise ValueError(
+                    "match_docker_capabilities builds on dropping everything first; leave "
+                    "drop_all_capabilities at its default when asking for Docker's set"
+                )
+            if self.nofile is not None:
+                soft, hard = self.nofile
+                if soft <= 0 or hard <= 0 or soft > hard:
+                    raise ValueError("nofile must be a (soft, hard) pair of positive ints, soft <= hard")
             if self.cpus is not None and not self.cpus.strip():
                 raise ValueError("cpus must be a non-empty string when provided.")
             if self.user is not None and not self.user.strip():
@@ -539,10 +560,21 @@ def _build_policy_class():
                 argv.append("--init")
             if self.read_only_rootfs:
                 argv.append("--read-only")
-            if self.drop_all_capabilities:
+            if self.match_docker_capabilities:
+                # Exactly what a Docker container gets, for a caller whose workload needs one of them.
+                argv.extend(["--cap-drop", "ALL"])
+                for capability in _DOCKER_CAPABILITIES:
+                    argv.extend(["--cap-add", capability])
+            elif self.drop_all_capabilities:
                 argv.extend(["--cap-drop", "ALL"])
             if self.user is not None:
                 argv.extend(["-u", self.user])
+            if self.nofile is not None:
+                # Docker sets 1024/524288 in a container; a kern box inherits the host's, which here is
+                # 1048576/1048576. A workload that sizes a table off `ulimit -n`, or loops over every
+                # possible descriptor to close it, behaves differently for no reason anyone chose. This
+                # is a gratuitous difference rather than a posture one, so it is matched.
+                argv.extend(["--ulimit", f"nofile={self.nofile[0]}:{self.nofile[1]}"])
             if env_file is not None:
                 argv.extend(["--env-file", env_file])
             holder = None
@@ -738,7 +770,8 @@ def kern_execution_policy(**kwargs):
         **kwargs: any field of the policy. Inherited from langchain's base: ``command_timeout``,
             ``startup_timeout``, ``termination_timeout``, ``max_output_lines``, ``max_output_bytes``.
             Added here: ``binary``, ``image``, ``network_enabled``, ``memory_bytes``, ``cpus``,
-            ``pids_limit``, ``read_only_rootfs``, ``user``, ``drop_all_capabilities``, ``use_init``,
+            ``pids_limit``, ``read_only_rootfs``, ``user``, ``drop_all_capabilities``, ``nofile``,
+            ``use_init``,
             ``mount_workspace`` (``auto`` / ``always`` / ``never``) and ``extra_box_args``.
 
     Raises:
