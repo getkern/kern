@@ -48,6 +48,70 @@ jobs:
           # present (aarch64 is skipped here for lack of the cross-toolchain).
           python3 scripts/gen-seccomp-allowlist.py --check
 
+  workflow-lint:
+    name: workflow syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The workflows are the one thing here with no local check at all: `yaml.safe_load` parses
+      # `runs-on: ubunutu-latest` and a `${{ matrix.pyhton }}` typo without complaint, so a broken
+      # job is found by pushing it, which is the worst moment. actionlint knows the runner labels
+      # and type-checks the expression contexts; both were confirmed to fail on exactly those two
+      # mistakes before this step was added.
+      - uses: rhysd/actionlint@main
+        with:
+          args: -color
+
+  bindings:
+    name: python binding (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.9 is the floor `pyproject.toml` declares, and until this job existed the claim was static
+          # analysis only. Installed WITHOUT the extra, because the binding's own promise is that it
+          # needs nothing: the LangChain tests skip themselves and say so.
+          - python: "3.9"
+            extras: ""
+          - python: "3.12"
+            extras: "[langchain]"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest build
+          python -m pip install "./bindings/python${{ matrix.extras }}"
+      - name: test
+        working-directory: bindings/python
+        # `-rs` prints every skip WITH its reason. This runner cannot open a user namespace (AppArmor's
+        # userns restriction, the same reason `pentest/` is not in CI), so the box-backed tests skip
+        # here and the unit tests are what this job actually proves: rendering, output sanitising, the
+        # output cap, argv and mount guards. Integration coverage stays a local claim, and the skip
+        # list in the log is what says so out loud instead of a green tick implying otherwise.
+        run: python -m pytest tests/ -q -rs
+      - name: the binding depends on nothing
+        # Checked on the ARTEFACT, not on the environment: a fresh venv always contains pip, so
+        # "nothing else is installed" is not a statement anything can satisfy. Every Requires-Dist the
+        # wheel declares must be behind an extra; one without a marker is a dependency by accident.
+        run: |
+          python -m build --wheel --outdir /tmp/whl ./bindings/python
+          python - <<'PY'
+          import glob, zipfile
+          meta = ""
+          with zipfile.ZipFile(glob.glob("/tmp/whl/*.whl")[0]) as z:
+              meta = z.read([n for n in z.namelist() if n.endswith("METADATA")][0]).decode()
+          reqs = [l for l in meta.splitlines() if l.startswith("Requires-Dist:")]
+          unconditional = [r for r in reqs if "extra ==" not in r]
+          assert not unconditional, f"the binding grew a hard dependency: {unconditional}"
+          assert "Requires-Python: >=3.9" in meta, "the declared floor moved without anyone saying so"
+          print(f"{len(reqs)} declared, all optional")
+          PY
+
   test-arm:
     name: build + test (aarch64)
     # Native aarch64 hosted runner (free for public repos), not QEMU: the isolation code is
