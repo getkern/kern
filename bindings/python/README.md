@@ -397,8 +397,12 @@ wrote: `--net none`, `--cap-drop ALL` (measured `CapEff: 0000000000000000`), a 5
 
 - **The default image can run the default shell.** The middleware's default is `/bin/bash`, and alpine
   does not ship it; `python:3.12-alpine3.19`, the Docker policy's own default, cannot start it at all.
-- **Environment variables go through a 0600 file, not `-e` flags.** A session is long-lived, and
-  `-e SECRET=...` sits in the host's `ps` output for its whole life, readable by any local user.
+- **Environment variables go through an anonymous `memfd`, not `-e` flags.** A session is
+  long-lived, and `-e SECRET=...` sits in the host's world-readable process table for its whole life.
+  The anonymous file has no name on any filesystem, so nothing leaks and a `kill -9` leaves nothing
+  behind. It is **not** secrecy from another process of the same user: kern holds the descriptor for
+  the session, so `/proc/<kern-pid>/fd/N` stays readable by anything running as you (measured over the
+  whole lifecycle, not assumed). Same exposure as a 0600 file while the session lives, none after.
 - **A workspace path containing a colon still works.** A colon separates SRC from DST in a mount, so
   such a path cannot be expressed at all; it is mounted through a colon-free alias that resolves on
   the host too, keeping one absolute path meaning the same thing inside the box and out.

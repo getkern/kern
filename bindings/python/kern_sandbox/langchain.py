@@ -640,6 +640,22 @@ def _build_policy_class():
             kern reads it as `/proc/self/fd/N` because the descriptor is passed to it, and it ceases to
             exist the moment the last descriptor closes.
 
+            WHAT THIS BUYS, AND WHAT IT DOES NOT, MEASURED RATHER THAN CLAIMED
+                Bought: nothing on a filesystem to leak, nothing for a signal to leave behind, and
+                nothing in any argv (unlike `-e SECRET=...`, which sits in the world-readable process
+                table for the session).
+
+                NOT bought: secrecy from another process of the SAME user. kern holds the passed
+                descriptor for the life of the session, so `/proc/<kern-pid>/fd/N` is readable by
+                anything running as you. Measured with a sampler over the whole lifecycle: the window
+                is the session, not the milliseconds of startup, which is what a first and sloppier
+                probe of ours reported. The narrowing over a 0600 temp file is real but smaller than
+                it looks: same exposure while the session lives, none after it dies.
+
+                Against a compromised agent process running as the same user, this is not a boundary.
+                The remedy is on kern's side, closing the descriptor once the env is parsed, and until
+                that lands this is a limit and not a defence.
+
             That is the fix for the worst failure this module had. A named 0600 temp file is cleaned up
             by a finalizer, and a finalizer does not run when the process is SIGKILLed, which is exactly
             what happens to an agent in production: a supervisor OOM, a stopped container, a `kill -9`.
