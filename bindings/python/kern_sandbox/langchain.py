@@ -45,7 +45,9 @@ WHAT IS CAPPED, AND WHAT IS NOT
 from __future__ import annotations
 
 import atexit
+import os
 import re
+import shutil
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import _WORKSPACE, ExecutionResult, Sandbox
@@ -324,3 +326,355 @@ def kern_code_tool(
         name=name or _LANGUAGES[language][0],
         description=description or _describe(session, language),
     )
+
+
+# =====================================================================================================
+# The persistent-shell execution policy
+# =====================================================================================================
+#
+# `kern_code_tool` above gives an agent a CELL: one box per call, fresh process, file state carried on
+# the workspace. LangChain's shell middleware wants the other shape, a SESSION: one long-lived shell it
+# writes commands into and reads answers out of, so `cd` and `export` persist the way a terminal does.
+#
+# That shape is an extension point rather than a hardcoded list. `BaseExecutionPolicy` declares one
+# abstract method and langchain ships three implementations of it: `HostExecutionPolicy` (no isolation),
+# `CodexSandboxExecutionPolicy` (the Codex CLI sandbox) and `DockerExecutionPolicy`. A kern policy is a
+# fourth, and it is a peer of the Docker one rather than a wrapper around it.
+#
+# COMPATIBILITY, STATED RATHER THAN ASSUMED
+#     `BaseExecutionPolicy` is exported by `langchain.agents.middleware._execution.__all__`, but that
+#     module is private, and neither `langchain.agents.middleware` nor `shell_tool` lists the name in
+#     its own `__all__` (only the three concrete policies). So this subclasses a symbol that langchain
+#     does not promise: it is imported from the PUBLIC `shell_tool` module first, falls back to the
+#     private one, and raises with the installed version in the message if both fail, rather than
+#     dying on an AttributeError three frames deep. Verified against langchain 1.3.17.
+#
+#     It also needs `langchain` itself, not just `langchain-core`: the middleware lives in the umbrella
+#     package. That is a different dependency from the tool above, and it has its own extra.
+
+_POLICY_MISSING = (
+    "the kern execution policy needs `langchain` (not just `langchain-core`), which is where the shell "
+    "middleware lives. Install it with:  pip install 'kern-sandbox[langchain-shell]'"
+)
+
+# A box name per session. kern accepts letters, digits, dashes and underscores (measured), and the uid
+# keeps two agents on one host from colliding.
+_BOX_PREFIX = "lc-shell-"
+
+_POLICY_CACHE: dict = {}
+
+
+def _policy_bases():
+    """Import langchain's policy base and its temp-dir prefix, from the least private place that has them."""
+    try:
+        from langchain.agents.middleware.shell_tool import BaseExecutionPolicy, SHELL_TEMP_PREFIX
+
+        return BaseExecutionPolicy, SHELL_TEMP_PREFIX
+    except ImportError:
+        pass
+    try:
+        from langchain.agents.middleware._execution import BaseExecutionPolicy, SHELL_TEMP_PREFIX
+
+        return BaseExecutionPolicy, SHELL_TEMP_PREFIX
+    except ImportError as exc:
+        try:
+            import langchain
+
+            installed = getattr(langchain, "__version__", "unknown")
+        except ImportError:
+            raise ImportError(_POLICY_MISSING) from exc
+        raise ImportError(
+            f"{_POLICY_MISSING}\n(langchain {installed} is installed but does not expose "
+            f"BaseExecutionPolicy; this policy was built against 1.3.17)"
+        ) from exc
+
+
+def _build_policy_class():
+    """Define ``KernExecutionPolicy`` against whatever langchain is installed, once per process."""
+    import dataclasses
+    import subprocess
+    import tempfile
+    import uuid
+    import weakref
+    from collections.abc import Sequence  # noqa: F401  (used in field annotations)
+
+    base, temp_prefix = _policy_bases()
+
+    @dataclasses.dataclass
+    class KernExecutionPolicy(base):  # type: ignore[misc, valid-type]
+        """Run langchain's persistent shell inside a kern box.
+
+        A peer of ``DockerExecutionPolicy`` rather than a wrapper: same contract, same one method, and
+        the differences are the ones kern exists for. The box is rootless with no daemon, starts in
+        single-digit milliseconds, drops every capability by default, and is on no network unless asked.
+
+        WHERE THIS DELIBERATELY DIFFERS FROM THE DOCKER POLICY
+
+        ``image`` defaults to ``python:3.12-slim`` and not to an alpine one. The middleware's default
+        shell is ``/bin/bash``, and alpine does not ship bash: measured, ``python:3.12-alpine3.19``
+        (the Docker policy's own default) cannot start the default shell at all. A default that cannot
+        run the default is not a default.
+
+        Environment variables go in through ``--env-file`` on a 0600 file, not through repeated ``-e``
+        flags. A shell session is long-lived, and ``-e SECRET=...`` sits in the host's ``ps`` output for
+        its whole life, readable by any local user. The file is unlinked when the process object is
+        collected.
+
+        ``--cap-drop ALL`` by default. kern already drops fourteen capabilities; the rest are held over
+        the box's own user namespace, and this is the code path whose entire purpose is running commands
+        an agent wrote. Measured with the default on: ``CapEff: 0000000000000000``, with bash working.
+
+        ``--init`` by default, because a persistent shell is exactly where reparented children pile up
+        as zombies over a long session.
+
+        SECURITY, HONESTLY
+            The boundary is the Linux kernel, so a kernel privilege-escalation bug is an escape, the
+            same condition Docker and Podman share. This is for your own or semi-trusted code, which
+            agent-written commands are: you chose to run them. It is not a boundary against deliberately
+            hostile multi-tenant code; for that, a microVM. kern is rootless from the start, where
+            Docker's rootless mode is opt-in.
+
+            The WORKSPACE is a host directory bind-mounted in, and nothing bounds it on disk. Point
+            ``workspace_root`` at a filesystem you have already limited if that matters where you run.
+        """
+
+        binary: str = "kern"
+        image: str = "python:3.12-slim"
+        network_enabled: bool = False
+        memory_bytes: "int | None" = 512 * 1024 * 1024
+        cpus: "str | None" = None
+        pids_limit: "int | None" = 256
+        read_only_rootfs: bool = False
+        user: "str | None" = None
+        drop_all_capabilities: bool = True
+        use_init: bool = True
+        mount_workspace: 'Literal["auto", "always", "never"]' = "auto"
+        extra_box_args: "Sequence[str] | None" = None
+
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            if self.memory_bytes is not None and self.memory_bytes <= 0:
+                raise ValueError("memory_bytes must be positive if provided.")
+            if self.pids_limit is not None and self.pids_limit <= 0:
+                raise ValueError("pids_limit must be positive if provided.")
+            if self.cpus is not None and not self.cpus.strip():
+                raise ValueError("cpus must be a non-empty string when provided.")
+            if self.user is not None and not self.user.strip():
+                raise ValueError("user must be a non-empty string when provided.")
+            if not self.image.strip():
+                raise ValueError("image must be a non-empty string.")
+            if self.mount_workspace not in ("auto", "always", "never"):
+                raise ValueError("mount_workspace must be one of: auto, always, never")
+            self.extra_box_args = tuple(self.extra_box_args or ())
+
+        # -- the contract ----------------------------------------------------------------------------
+
+        def spawn(self, *, workspace, env, command):
+            """Launch the persistent shell in a fresh box and hand back its pipes."""
+            binary = self._resolve_binary()
+            env_file = self._write_env_file(env)
+            holder = None
+            try:
+                argv, holder = self._build_command(binary, workspace, env_file, command)
+            except BaseException:
+                _unlink_quietly(env_file)
+                _rmtree_quietly(holder)
+                raise
+            try:
+                process = subprocess.Popen(  # noqa: S603
+                    argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=str(workspace),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=os.environ.copy(),
+                    start_new_session=True,
+                )
+            except BaseException:
+                _unlink_quietly(env_file)
+                _rmtree_quietly(holder)
+                raise
+            if env_file is not None:
+                # kern reads the file at box start, but "start" has no observable end from out here, so
+                # it is kept for the session and removed when the caller lets the process object go.
+                weakref.finalize(process, _unlink_quietly, env_file)
+            if holder is not None:
+                weakref.finalize(process, _rmtree_quietly, holder)
+            return process
+
+        # -- argv ------------------------------------------------------------------------------------
+
+        def _build_command(self, binary, workspace, env_file, command):
+            argv = [binary, "box", _BOX_PREFIX + uuid.uuid4().hex[:12], "--image", self.image, "-q"]
+            argv.extend(["--net", "host" if self.network_enabled else "none"])
+            if self.memory_bytes is not None:
+                argv.extend(["-m", str(self.memory_bytes)])
+            if self.cpus is not None:
+                argv.extend(["--cpus", self.cpus])
+            if self.pids_limit is not None:
+                argv.extend(["--pids-limit", str(self.pids_limit)])
+            if self.use_init:
+                argv.append("--init")
+            if self.read_only_rootfs:
+                argv.append("--read-only")
+            if self.drop_all_capabilities:
+                argv.extend(["--cap-drop", "ALL"])
+            if self.user is not None:
+                argv.extend(["-u", self.user])
+            if env_file is not None:
+                argv.extend(["--env-file", env_file])
+            holder = None
+            if self._should_mount_workspace(workspace, temp_prefix):
+                mount_path, holder = self._mount_alias(workspace)
+                argv.extend(["-v", f"{mount_path}:{mount_path}", "-w", mount_path])
+            else:
+                argv.extend(["-w", "/"])
+            argv.extend(self.extra_box_args or ())
+            argv.append("--")
+            argv.extend(command)
+            return argv, holder
+
+        @staticmethod
+        def _mount_alias(workspace):
+            """Give ``workspace`` a mountable name, and say nothing when it already has one.
+
+            A colon separates SRC from DST in a mount specification, so a workspace at ``/tmp/a:b``
+            cannot be written as ``-v SRC:DST`` at all: kern refuses it outright (measured, fails
+            closed), and a runtime that split on the wrong colon would mount something nobody asked
+            for. Refusing the caller's own directory is not a fix either, so this makes a colon-free
+            ALIAS: a symlink to the workspace, mounted as ``alias:alias``.
+
+            That keeps the property the Docker policy has and the reason it mounts host-path onto
+            host-path, which is that one absolute path means the same thing inside the box and outside
+            it. Measured through the alias: `pwd` is the alias, and files written there appear in the
+            real directory.
+
+            The link lives in a fresh 0700 directory rather than loose in the temp root, so no other
+            local user can swap the target between the symlink being made and kern resolving it.
+
+            Returns (path_to_mount, directory_to_remove_afterwards).
+            """
+            path = str(workspace)
+            if ":" not in path:
+                return path, None
+            holder = tempfile.mkdtemp(prefix="kern-lc-ws-")
+            alias = os.path.join(holder, "workspace")
+            try:
+                os.symlink(path, alias)
+            except BaseException:
+                _rmtree_quietly(holder)
+                raise
+            return alias, holder
+
+        def _should_mount_workspace(self, workspace, prefix) -> bool:
+            """Mirror the Docker policy: an ephemeral session gets no mount, so the host is not exposed
+            for a workspace nobody asked to keep. `always`/`never` override the inference."""
+            if self.mount_workspace == "always":
+                return True
+            if self.mount_workspace == "never":
+                return False
+            return not workspace.name.startswith(prefix)
+
+        def _resolve_binary(self) -> str:
+            """`$KERN_BIN` first, matching the rest of this binding, then `PATH`."""
+            override = os.environ.get("KERN_BIN")
+            if override:
+                if not os.path.isfile(override) or not os.access(override, os.X_OK):
+                    raise RuntimeError(
+                        f"$KERN_BIN={override!r} is not an executable file."
+                    )
+                return override
+            path = shutil.which(self.binary)
+            if path is None:
+                raise RuntimeError(
+                    f"kern execution policy requires the {self.binary!r} binary on PATH "
+                    f"(or $KERN_BIN). Install it: https://github.com/getkern/kern"
+                )
+            return path
+
+        @staticmethod
+        def _write_env_file(env) -> "str | None":
+            """Serialise ``env`` to a 0600 file, or return None when there is nothing to pass.
+
+            Refused rather than mangled: a newline in a value would split the record and smuggle a
+            second variable, and a NUL or an `=` in a KEY would produce a line kern reads as something
+            else. The caller gets told which key, because silently dropping one is worse.
+            """
+            if not env:
+                return None
+            lines = []
+            for key, value in env.items():
+                key, value = str(key), str(value)
+                if not key or "=" in key or "\n" in key or "\0" in key:
+                    raise ValueError(f"environment variable name is not usable: {key!r}")
+                if "\n" in value or "\0" in value:
+                    raise ValueError(
+                        f"environment variable {key!r} has a newline or NUL in its value, which "
+                        f"cannot be written as one K=V record"
+                    )
+                lines.append(f"{key}={value}")
+            fd, path = tempfile.mkstemp(prefix="kern-lc-env-", suffix=".env")
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines) + "\n")
+            except BaseException:
+                _unlink_quietly(path)
+                raise
+            return path
+
+    return KernExecutionPolicy
+
+
+def _rmtree_quietly(path) -> None:
+    """Remove the alias holder directory. Called from a finalizer, so it can never raise."""
+    if not path:
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _unlink_quietly(path) -> None:
+    """Remove ``path`` if it is still there. Called from a finalizer, so it can never raise."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def kern_execution_policy(**kwargs):
+    """Build a langchain shell execution policy that runs in a kern box.
+
+        from langchain.agents.middleware import ShellToolMiddleware
+        from kern_sandbox.langchain import kern_execution_policy
+
+        middleware = ShellToolMiddleware(execution_policy=kern_execution_policy())
+
+    A factory rather than an exported class, for the same reason the tool above is: the base class
+    lives in langchain, so defining the subclass at module import would make `import kern_sandbox`
+    require it. The class is built on the first call and reused.
+
+    Args:
+        **kwargs: any field of the policy. Inherited from langchain's base: ``command_timeout``,
+            ``startup_timeout``, ``termination_timeout``, ``max_output_lines``, ``max_output_bytes``.
+            Added here: ``binary``, ``image``, ``network_enabled``, ``memory_bytes``, ``cpus``,
+            ``pids_limit``, ``read_only_rootfs``, ``user``, ``drop_all_capabilities``, ``use_init``,
+            ``mount_workspace`` (``auto`` / ``always`` / ``never``) and ``extra_box_args``.
+
+    Raises:
+        ImportError: `langchain` is not installed, or is a version without the policy base.
+        ValueError: a field is not usable.
+        RuntimeError: raised at spawn time when no kern binary can be found.
+    """
+    cls = _POLICY_CACHE.get("cls")
+    if cls is None:
+        cls = _POLICY_CACHE["cls"] = _build_policy_class()
+    return cls(**kwargs)

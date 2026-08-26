@@ -8,10 +8,12 @@
 Run: `pytest`  (both groups auto-skip; set KERN_BIN=/path/to/kern for the integration ones).
 """
 
+import contextlib
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -562,3 +564,267 @@ def test_every_sabotage_anchor_still_exists():
     }
     missing = [name for name, (needle, text) in anchors.items() if needle not in text]
     assert not missing, f"the review protocol sabotages symbols that no longer exist: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# The persistent-shell execution policy (langchain's own extension point)
+# ---------------------------------------------------------------------------
+
+
+def _have_shell_middleware() -> bool:
+    try:
+        from langchain.agents.middleware.shell_tool import BaseExecutionPolicy  # noqa: F401
+    except ImportError:
+        try:
+            from langchain.agents.middleware._execution import BaseExecutionPolicy  # noqa: F401
+        except ImportError:
+            return False
+    return True
+
+
+needs_shell = pytest.mark.skipif(
+    not _have_shell_middleware(),
+    reason="langchain>=1.3 with the shell middleware is not installed",
+)
+
+
+@needs_shell
+def test_the_policy_is_a_peer_of_the_docker_one():
+    """It subclasses langchain's own base and inherits its contract, rather than reimplementing a
+    parallel one. If this fails, kern is a wrapper next to the extension point instead of inside it."""
+    from langchain.agents.middleware import DockerExecutionPolicy
+
+    from kern_sandbox.langchain import _policy_bases, kern_execution_policy
+
+    base, _ = _policy_bases()
+    policy = kern_execution_policy()
+    assert isinstance(policy, base)
+    assert issubclass(DockerExecutionPolicy, base), "the Docker policy shares this base"
+    # The five knobs langchain's middleware reads off any policy must survive subclassing.
+    for field in ("command_timeout", "startup_timeout", "termination_timeout", "max_output_lines",
+                  "max_output_bytes"):
+        assert hasattr(policy, field), field
+
+
+@needs_shell
+def test_the_real_middleware_accepts_it():
+    from langchain.agents.middleware import ShellToolMiddleware
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    ShellToolMiddleware(execution_policy=kern_execution_policy())
+
+
+@needs_shell
+def test_the_default_image_can_actually_run_the_default_shell():
+    """The middleware's default shell is `/bin/bash`, and alpine does not ship it: measured, the Docker
+    policy's own default image (`python:3.12-alpine3.19`) cannot start the default shell at all. A
+    default that cannot run the default is not one, so this pins ours to an image that has bash."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    assert "alpine" not in kern_execution_policy().image
+
+
+@needs_shell
+def test_bad_configuration_is_refused_at_build_time():
+    from kern_sandbox.langchain import kern_execution_policy
+
+    for kwargs in ({"memory_bytes": 0}, {"memory_bytes": -1}, {"pids_limit": 0}, {"cpus": "  "},
+                   {"user": ""}, {"image": " "}, {"mount_workspace": "sometimes"},
+                   {"max_output_lines": 0}):
+        with pytest.raises(ValueError):
+            kern_execution_policy(**kwargs)
+
+
+@needs_shell
+def test_secrets_go_through_a_private_file_and_never_the_argv():
+    """A shell SESSION is long-lived. `-e SECRET=...` would sit in the host's `ps` output for its whole
+    life, readable by any local user on the box; the Docker policy does exactly that. A 0600 file keeps
+    it out of the process table, which is the point of preferring `--env-file`."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    policy = kern_execution_policy()
+    env_file = policy._write_env_file({"API_KEY": "s3cr3t", "NOTE": "two words"})
+    try:
+        assert oct(os.stat(env_file).st_mode & 0o777) == "0o600"
+        assert Path(env_file).read_text() == "API_KEY=s3cr3t\nNOTE=two words\n"
+        argv, _ = policy._build_command("kern", Path("/tmp/mine"), env_file, ["/bin/bash"])
+        assert "s3cr3t" not in " ".join(argv), "the secret reached the argv"
+        assert "--env-file" in argv and env_file in argv
+    finally:
+        os.unlink(env_file)
+    assert policy._write_env_file({}) is None, "nothing to pass, nothing written"
+
+
+@needs_shell
+@pytest.mark.parametrize(
+    "env",
+    [{"A": "line\nB=injected"}, {"A": "nul\0byte"}, {"A=B": "x"}, {"": "x"}, {"A\nB": "x"}],
+)
+def test_an_env_entry_that_cannot_be_one_record_is_refused(env):
+    """Written straight out, a newline in a value splits the record and smuggles a second variable."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    with pytest.raises(ValueError):
+        kern_execution_policy()._write_env_file(env)
+
+
+@needs_shell
+def test_an_ephemeral_workspace_is_not_mounted_and_a_real_one_is():
+    """Mirrors the Docker policy: a session the caller never asked to keep gets no bind mount, so the
+    host is not exposed for a directory that is about to be deleted."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    policy = kern_execution_policy()
+    ephemeral, _ = policy._build_command("kern", Path("/tmp/langchain-shell-abc"), None, ["/bin/bash"])
+    assert "-v" not in ephemeral and ephemeral[ephemeral.index("-w") + 1] == "/"
+    real, _ = policy._build_command("kern", Path("/tmp/my-project"), None, ["/bin/bash"])
+    assert "-v" in real and real[real.index("-v") + 1] == "/tmp/my-project:/tmp/my-project"
+    # And the inference can be overridden in both directions.
+    forced = kern_execution_policy(mount_workspace="always")
+    assert "-v" in forced._build_command("kern", Path("/tmp/langchain-shell-abc"), None, ["/bin/bash"])[0]
+    refused = kern_execution_policy(mount_workspace="never")
+    assert "-v" not in refused._build_command("kern", Path("/tmp/my-project"), None, ["/bin/bash"])[0]
+
+
+@needs_shell
+def test_the_box_is_locked_down_by_default():
+    """Defaults are the posture, because this is the path whose whole purpose is running commands an
+    agent wrote. Every one of these is checked against the argv, not against the docstring."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    argv = " ".join(kern_execution_policy()._build_command("kern", Path("/tmp/x"), None, ["/bin/bash"])[0])
+    assert "--net none" in argv, "no network unless asked"
+    assert "--cap-drop ALL" in argv, "every capability dropped"
+    assert "--pids-limit 256" in argv, "fork-bomb ceiling"
+    assert "-m 536870912" in argv, "memory cap"
+    assert "--init" in argv, "a persistent shell reaps its orphans"
+
+
+@needs_shell
+@integration
+def test_a_persistent_shell_really_persists():
+    """The session semantics the middleware is built on: `cd` and `export` survive between commands,
+    because it is one shell and not one box per call."""
+    import shutil as _shutil
+    import tempfile
+    import time
+    import uuid
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    workspace = Path(tempfile.mkdtemp(prefix="kern-test-shell-"))
+    policy = kern_execution_policy(image="python:3.12-slim")
+    proc = policy.spawn(workspace=workspace, env={"AGENT_ID": "abc-123"}, command=["/bin/bash"])
+
+    def run(line: str, budget: float = 30.0):
+        marker = "__LC_SHELL_DONE__" + uuid.uuid4().hex
+        proc.stdin.write(f"{line}\necho {marker} $?\n")
+        proc.stdin.flush()
+        collected, started = [], time.monotonic()
+        while time.monotonic() - started < budget:
+            out = proc.stdout.readline()
+            if not out:
+                return "DEAD", collected
+            if out.startswith(marker):
+                return out.split()[-1], collected
+            collected.append(out.rstrip())
+        return "TIMEOUT", collected
+
+    try:
+        assert run("pwd")[1] == [str(workspace)], "the workdir is the workspace"
+        assert run("echo $AGENT_ID")[1] == ["abc-123"], "env reached the box"
+        assert run("cd /etc")[0] == "0" and run("pwd")[1] == ["/etc"], "cd persisted"
+        assert run("export X=42")[0] == "0" and run("echo $X")[1] == ["42"], "export persisted"
+        assert run("grep CapEff /proc/self/status")[1] == ["CapEff:\t0000000000000000"]
+        assert run("ls /home")[1] == [], "the host is not visible"
+        assert run(f"echo hi > {workspace}/made.txt")[0] == "0"
+    finally:
+        with contextlib.suppress(Exception):
+            proc.stdin.write("exit\n")
+            proc.stdin.flush()
+            proc.wait(timeout=30)
+        with contextlib.suppress(Exception):
+            proc.kill()
+    assert (workspace / "made.txt").is_file(), "the file reached the host workspace"
+    _shutil.rmtree(workspace, ignore_errors=True)
+
+
+@needs_shell
+def test_a_workspace_whose_path_has_a_colon_still_works():
+    """A colon separates SRC from DST in a mount specification, so `/tmp/a:b` cannot be written as
+    `-v SRC:DST` at all: kern refuses it outright (measured, fails closed). Refusing the caller's own
+    directory would be a defect of ours rather than a fix, so it is mounted through a colon-free ALIAS.
+
+    The alias keeps the property the Docker policy mounts host-path-onto-host-path to get: one absolute
+    path means the same thing inside the box and outside it, since the alias resolves on the host too.
+    """
+    from kern_sandbox.langchain import kern_execution_policy
+
+    policy = kern_execution_policy()
+    plain, holder = policy._build_command("kern", Path("/tmp/plain"), None, ["/bin/bash"])
+    assert holder is None, "a path with no colon needs no alias"
+    assert plain[plain.index("-v") + 1] == "/tmp/plain:/tmp/plain"
+
+    argv, holder = policy._build_command("kern", Path("/tmp/pro:ject"), None, ["/bin/bash"])
+    try:
+        assert holder is not None, "a colon in the path must produce an alias"
+        spec = argv[argv.index("-v") + 1]
+        assert spec.count(":") == 1, f"the mount spec is still ambiguous: {spec!r}"
+        alias = spec.split(":")[0]
+        assert argv[argv.index("-w") + 1] == alias, "the workdir follows the alias"
+        assert os.path.islink(alias) and os.readlink(alias) == "/tmp/pro:ject"
+        # 0700 on the holder, so no other local user can swap the link before kern resolves it.
+        assert oct(os.stat(holder).st_mode & 0o777) == "0o700"
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+
+
+@needs_shell
+@integration
+def test_the_alias_carries_writes_into_the_real_directory_and_is_cleaned_up():
+    import gc
+    import time
+    import uuid
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    workspace = Path(tempfile.mkdtemp(prefix="kern-test-")) / "pro:ject"
+    workspace.mkdir()
+    (workspace / "already.txt").write_text("here\n")
+    policy = kern_execution_policy(image="python:3.12-slim")
+    argv, holder = policy._build_command("kern", workspace, None, ["/bin/bash"])
+    shutil.rmtree(holder, ignore_errors=True)  # that one was only to read the shape
+
+    proc = policy.spawn(workspace=workspace, env=None, command=["/bin/bash"])
+
+    def run(line: str, budget: float = 30.0):
+        marker = "__LC_SHELL_DONE__" + uuid.uuid4().hex
+        proc.stdin.write(f"{line}\necho {marker} $?\n")
+        proc.stdin.flush()
+        collected, started = [], time.monotonic()
+        while time.monotonic() - started < budget:
+            out = proc.stdout.readline()
+            if not out:
+                return "DEAD", collected
+            if out.startswith(marker):
+                return out.split()[-1], collected
+            collected.append(out.rstrip())
+        return "TIMEOUT", collected
+
+    try:
+        assert run("ls")[1] == ["already.txt"], "the real directory is what got mounted"
+        assert run("echo new > made.txt")[0] == "0"
+        alias = run("pwd")[1][0]
+    finally:
+        with contextlib.suppress(Exception):
+            proc.stdin.write("exit\n")
+            proc.stdin.flush()
+            proc.wait(timeout=30)
+        with contextlib.suppress(Exception):
+            proc.kill()
+    assert sorted(p.name for p in workspace.iterdir()) == ["already.txt", "made.txt"]
+    del proc
+    gc.collect()
+    assert not os.path.exists(alias), "the alias outlived the session"
+    shutil.rmtree(workspace.parent, ignore_errors=True)

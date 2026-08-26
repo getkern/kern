@@ -49,7 +49,9 @@ and a stack runner at once, in 1.52 MB with no daemon.
   (`[box.NAME]` tables, with the resource profiles above) or the `docker-compose.yml` you already have,
   with no conversion step. One stack to one pod, services reaching each other by name.
 - **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
-  `doctor`, plus a Python and Node SDK and an MCP server for agents.
+  `doctor`, plus a Python and Node SDK and an MCP server for agents. The Python binding also plugs
+  into LangChain twice: as a code tool, and as an execution policy for its shell middleware, where it
+  is a peer of the Docker one. [bindings/python/README.md](bindings/python/README.md)
 
 Its entire Rust dependency tree is `libc`: JSON and OCI manifests are parsed by hand, and `pull`
 shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack. (1.52 MB
@@ -344,7 +346,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 848 Rust, 153 Python and 61 Node tests,
+**The core is done. Everything above works today:** 848 Rust, 168 Python and 61 Node tests,
 clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
 Arduino UNO Q. **v0.7.0 is the first published release.** The CLI and config surface can still
 change, always called out in [CHANGELOG.md](CHANGELOG.md).

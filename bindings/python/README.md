@@ -358,6 +358,45 @@ handing it the message only buys a retry loop against a broken host.
 Pass `language="bash"` or `language="node"` for the other two, or your own open `Sandbox` as the first
 argument when you want to own its lifetime.
 
+## Use it as a LangChain execution policy (the shell middleware)
+
+The tool above gives an agent a **cell**: one box per call, file state carried on the workspace.
+LangChain's shell middleware wants the other shape, a **session**: one long-lived shell it writes
+commands into, so `cd` and `export` persist the way a terminal does. That is an extension point, and
+kern plugs into it as a peer of the Docker policy rather than as a wrapper beside it.
+
+```bash
+pip install 'kern-sandbox[langchain-shell]'
+```
+
+```python
+from langchain.agents.middleware import ShellToolMiddleware
+from kern_sandbox.langchain import kern_execution_policy
+
+middleware = ShellToolMiddleware(execution_policy=kern_execution_policy())
+```
+
+Measured on one host, same image pre-pulled in both runtimes, same operation (start the session, run
+one command, tear it down), through langchain's own abstraction:
+
+    kern      p50    4.4 ms      (min 4.0, max 19.5, n=7)
+    docker    p50  154.3 ms      (min 141.9, max 183.3, n=7)
+
+Defaults are the posture, since this is the path whose whole purpose is running commands an agent
+wrote: `--net none`, `--cap-drop ALL` (measured `CapEff: 0000000000000000`), a 512 MiB memory cap, a
+256-process ceiling and a reaping init. Three deliberate differences from the Docker policy:
+
+- **The default image can run the default shell.** The middleware's default is `/bin/bash`, and alpine
+  does not ship it; `python:3.12-alpine3.19`, the Docker policy's own default, cannot start it at all.
+- **Environment variables go through a 0600 file, not `-e` flags.** A session is long-lived, and
+  `-e SECRET=...` sits in the host's `ps` output for its whole life, readable by any local user.
+- **A workspace path containing a colon still works.** A colon separates SRC from DST in a mount, so
+  such a path cannot be expressed at all; it is mounted through a colon-free alias that resolves on
+  the host too, keeping one absolute path meaning the same thing inside the box and out.
+
+`langchain>=1.3` is required for this one (the middleware lives in the umbrella package, not in
+`langchain-core`), and the floor is measured: 1.3.0 works, 1.2.0 has no such base class.
+
 ## Threat model (honest)
 
 kern is a **kernel-boundary** sandbox for **your own or semi-trusted** code. Its default seccomp
