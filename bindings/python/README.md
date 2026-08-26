@@ -376,6 +376,33 @@ from kern_sandbox.langchain import kern_execution_policy
 middleware = ShellToolMiddleware(execution_policy=kern_execution_policy())
 ```
 
+**Coming from `DockerExecutionPolicy`?** A 32-command battery through langchain's own `ShellSession`
+comes back identical between the two, with one flag:
+
+```python
+kern_execution_policy(match_docker_capabilities=True)
+```
+
+The default here drops every capability (`CapEff` all zeros), which is a stronger posture than a Docker
+container and breaks two ordinary things Docker allows: `chown` to another uid, and `apt-get update`,
+since apt drops privileges to the `_apt` user and needs SETUID and SETGID. That flag adds back exactly
+the fourteen a container keeps, and the box then reports `CapEff: 00000000a80425fb`, byte for byte what
+Docker reports. The descriptor limit is matched without asking: a kern box would inherit the host's
+`nofile`, measured at 1048576, against a container's 1024 soft and 524288 hard, and that is a difference
+nobody chose, so it is set rather than documented.
+
+Three differences remain and no option closes them, which is worth knowing before you spend an
+afternoon looking for the flag:
+
+- **Raw sockets, so `ping` and `traceroute`.** `CAP_NET_RAW` is in the effective set with the flag
+  above, and measurably so, but with `network_enabled` the box shares the host's network namespace, and
+  a capability held in a nested user namespace does not apply to a namespace owned by the initial one.
+  That is a kernel rule about rootless containers rather than a kern decision: a rootful Docker daemon
+  can, this cannot. DNS, TCP and HTTP go through the ordinary socket API and are unaffected.
+- **`mount`** dies on the seccomp filter where Docker returns `permission denied`, because a
+  deny-by-default allowlist is what kern is.
+- **The setuid bit** is not visible on files, because the rootfs is mounted `nosuid`.
+
 Measured on one host, same image pre-pulled in both runtimes, through langchain's own abstraction, and
 split by phase because a composite number hides where the difference is. n=16, and the **first**
 session reported separately from the rest because that is the one a reader is right to suspect was
@@ -428,33 +455,6 @@ wrote: `--net none`, `--cap-drop ALL` (measured `CapEff: 0000000000000000`), a 5
 - **A workspace path containing a colon still works.** A colon separates SRC from DST in a mount, so
   such a path cannot be expressed at all; it is mounted through a colon-free alias that resolves on
   the host too, keeping one absolute path meaning the same thing inside the box and out.
-
-**Coming from `DockerExecutionPolicy`?** A 32-command battery through langchain's own `ShellSession`
-comes back identical between the two, with one flag:
-
-```python
-kern_execution_policy(match_docker_capabilities=True)
-```
-
-The default here drops every capability (`CapEff` all zeros), which is a stronger posture than a Docker
-container and breaks two ordinary things Docker allows: `chown` to another uid, and `apt-get update`,
-since apt drops privileges to the `_apt` user and needs SETUID and SETGID. That flag adds back exactly
-the fourteen a container keeps, and the box then reports `CapEff: 00000000a80425fb`, byte for byte what
-Docker reports. The descriptor limit is matched without asking: a kern box would inherit the host's
-`nofile`, measured at 1048576, against a container's 1024 soft and 524288 hard, and that is a difference
-nobody chose, so it is set rather than documented.
-
-Three differences remain and no option closes them, which is worth knowing before you spend an
-afternoon looking for the flag:
-
-- **Raw sockets, so `ping` and `traceroute`.** `CAP_NET_RAW` is in the effective set with the flag
-  above, and measurably so, but with `network_enabled` the box shares the host's network namespace, and
-  a capability held in a nested user namespace does not apply to a namespace owned by the initial one.
-  That is a kernel rule about rootless containers rather than a kern decision: a rootful Docker daemon
-  can, this cannot. DNS, TCP and HTTP go through the ordinary socket API and are unaffected.
-- **`mount`** dies on the seccomp filter where Docker returns `permission denied`, because a
-  deny-by-default allowlist is what kern is.
-- **The setuid bit** is not visible on files, because the rootfs is mounted `nosuid`.
 
 `mount_workspace` decides whether the workspace is bind-mounted at all. `auto` (the default) mirrors
 the Docker policy and skips the mount for the ephemeral directory the middleware creates when the caller
