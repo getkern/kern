@@ -65,7 +65,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.25"
+__version__ = "0.1.26"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
