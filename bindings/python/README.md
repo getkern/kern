@@ -376,11 +376,20 @@ from kern_sandbox.langchain import kern_execution_policy
 middleware = ShellToolMiddleware(execution_policy=kern_execution_policy())
 ```
 
-Measured on one host, same image pre-pulled in both runtimes, same operation (start the session, run
-one command, tear it down), through langchain's own abstraction:
+Measured on one host, same image pre-pulled in both runtimes, through langchain's own abstraction, and
+split by phase because the composite number hides where the difference is (p50, n=9):
 
-    kern      p50    4.4 ms      (min 4.0, max 19.5, n=7)
-    docker    p50  154.3 ms      (min 141.9, max 183.3, n=7)
+    phase          kern      docker
+    start up      4.4 ms   158.5 ms      36x
+    round-trip    0.05 ms    0.15 ms      3x
+    tear down     1.1 ms    63.4 ms      59x
+    total         5.5 ms   222.1 ms      40x
+
+Read that honestly: **once a session is up, the per-command cost is the same for any practical
+purpose**, since both round-trips are well under a millisecond. The difference is in creating and
+destroying sessions, which is what an agent does per task rather than per command. This is kern
+rootless with no daemon against Docker with its daemon already running, which is the default
+configuration of each.
 
 Defaults are the posture, since this is the path whose whole purpose is running commands an agent
 wrote: `--net none`, `--cap-drop ALL` (measured `CapEff: 0000000000000000`), a 512 MiB memory cap, a
