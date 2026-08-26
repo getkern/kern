@@ -377,19 +377,32 @@ middleware = ShellToolMiddleware(execution_policy=kern_execution_policy())
 ```
 
 Measured on one host, same image pre-pulled in both runtimes, through langchain's own abstraction, and
-split by phase because the composite number hides where the difference is (p50, n=9):
+split by phase because a composite number hides where the difference is. n=16, load stated, and the
+**first** session reported separately from the rest because that is the one a reader is right to
+suspect was chosen for convenience:
 
-    phase          kern      docker
-    start up      4.4 ms   158.5 ms      36x
-    round-trip    0.05 ms    0.15 ms      3x
-    tear down     1.1 ms    63.4 ms      59x
-    total         5.5 ms   222.1 ms      40x
+    phase                      kern      docker
+    start up, FIRST session  14.5 ms   159.6 ms      11x
+    start up, steady state    4.1 ms   157.4 ms      38x
+    round-trip                0.05 ms    0.15 ms      3x
+    tear down                 1.1 ms    63.4 ms      59x
 
-Read that honestly: **once a session is up, the per-command cost is the same for any practical
-purpose**, since both round-trips are well under a millisecond. The difference is in creating and
+**Quote the 11x.** kern gains a lot from a warm page cache and Docker gains almost nothing, because
+Docker's cost is the engine's per-invocation machinery rather than the cache, so the steady-state
+figure flatters kern and the first-session one does not. The number that survives a hostile reading is
+the conservative one.
+
+Read the rest honestly too: **once a session is up, the per-command cost is the same for any practical
+purpose**, both round-trips being well under a millisecond. The difference is in creating and
 destroying sessions, which is what an agent does per task rather than per command. This is kern
-rootless with no daemon against Docker with its daemon already running, which is the default
-configuration of each.
+rootless with no daemon against Docker with its daemon already running, the default configuration of
+each.
+
+That last point is not academic, because **the middleware restarts the whole session on every command
+timeout** and one ordinary mistake makes timeouts routine (see below). One restart is a `stop()` plus a
+full `spawn()`: 5.4 ms here against 219.6 ms (p50, n=9). A model that writes twenty timing-out commands
+in a row therefore spends 0.11 s in restarts, or 4.4 s, on top of the timeouts themselves. Nothing
+counts or caps those restarts, in either runtime.
 
 Defaults are the posture, since this is the path whose whole purpose is running commands an agent
 wrote: `--net none`, `--cap-drop ALL` (measured `CapEff: 0000000000000000`), a 512 MiB memory cap, a
@@ -427,9 +440,26 @@ this policy adds:
   reads until it comes back; a `cat` with no arguments swallows that marker and echoes it as ordinary
   output, and from there each command times out while the model is handed the text of its own
   instructions. The middleware recovers by restarting the session, so the cost is one timeout plus the
-  silent loss of everything the session had accumulated (`cd`, `export`, background processes). The
-  model is told the command timed out, not that its state is gone. Nothing accumulates on this side
-  across those restarts: twelve cycles leave no environment, no alias and no descriptor behind.
+  silent loss of everything the session had accumulated (`cd`, `export`, background processes).
+
+  **The model is told the command timed out, not that its state is gone**, and that is the part worth
+  guarding against: a per-command message reads as "this one failed, the others did not", so the model
+  carries on with relative paths that no longer resolve and credentials it no longer has. The next
+  failure looks like a missing file rather than a lost session, and it confidently goes looking for the
+  file. The only place a model reliably reads is the tool description, so pass one that says so:
+
+  ```python
+  ShellToolMiddleware(
+      execution_policy=kern_execution_policy(),
+      tool_description=DEFAULT_TOOL_DESCRIPTION + (
+          "\n\nIf a command times out the shell is restarted and all session state is lost: "
+          "the working directory, exported variables, and any background processes."
+      ),
+  )
+  ```
+
+  Nothing accumulates on this side across those restarts: twelve cycles leave no environment, no alias
+  and no descriptor behind, and repeated sessions do not grow the interpreter's exit handlers.
 - **If the host removes the workspace under a live session**, the mount points at an inode with no
   name and nothing reports it. `pwd` answers, `ls` returns an empty listing with status 0, and writes
   fail without the caller noticing; only reading a file back surfaces it. A workspace that is already

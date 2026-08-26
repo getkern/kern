@@ -1102,3 +1102,44 @@ def test_a_workspace_deleted_under_a_live_session_fails_silently_and_that_is_the
             proc.kill()
             proc.wait(timeout=20)
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+@needs_shell
+@integration
+def test_repeated_sessions_do_not_grow_the_interpreter_s_exit_handlers():
+    """`weakref.finalize` already registers with `atexit` on its own (`finalize.atexit` defaults to
+    True), so an explicit `atexit.register` beside it did the same job twice AND appended a handler per
+    spawn. A long-lived agent reaches that often, because the middleware restarts the session on every
+    command timeout and one ordinary command (`cat` with no arguments) makes timeouts routine.
+
+    Measured before the removal: two handlers before, six after three spawns, growing without bound.
+    After: `weakref` registers its single global exit hook once, so the count settles.
+    """
+    import atexit
+    import gc
+    import glob
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    base = Path(tempfile.mkdtemp(prefix="kern-atexit-"))
+    workspace = base / "pro:ject"
+    workspace.mkdir()
+    policy = kern_execution_policy(image="python:3.12-slim")
+    handlers_before = atexit._ncallbacks()
+    alias_before = len(glob.glob("/tmp/kern-lc-ws-*"))
+    try:
+        for _ in range(6):
+            proc = policy.spawn(workspace=workspace, env={"K": "v"}, command=["/bin/bash"])
+            try:
+                proc.stdin.write("exit\n")
+                proc.stdin.flush()
+                proc.wait(timeout=30)
+            except Exception:
+                proc.kill()
+            del proc
+            gc.collect()
+        grown = atexit._ncallbacks() - handlers_before
+        assert grown <= 1, f"six sessions appended {grown} exit handlers"
+        assert len(glob.glob("/tmp/kern-lc-ws-*")) == alias_before, "an alias survived"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
