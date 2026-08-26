@@ -444,9 +444,17 @@ Docker reports. The descriptor limit is matched without asking: a kern box would
 `nofile`, measured at 1048576, against a container's 1024 soft and 524288 hard, and that is a difference
 nobody chose, so it is set rather than documented.
 
-Two differences remain on purpose and cannot be flagged away. `mount` inside the box dies on kern's
-seccomp filter where Docker returns `permission denied`, because a deny-by-default allowlist is what
-kern is; and the setuid bit is not visible on files, because the rootfs is mounted `nosuid`.
+Three differences remain and no option closes them, which is worth knowing before you spend an
+afternoon looking for the flag:
+
+- **Raw sockets, so `ping` and `traceroute`.** `CAP_NET_RAW` is in the effective set with the flag
+  above, and measurably so, but with `network_enabled` the box shares the host's network namespace, and
+  a capability held in a nested user namespace does not apply to a namespace owned by the initial one.
+  That is a kernel rule about rootless containers rather than a kern decision: a rootful Docker daemon
+  can, this cannot. DNS, TCP and HTTP go through the ordinary socket API and are unaffected.
+- **`mount`** dies on the seccomp filter where Docker returns `permission denied`, because a
+  deny-by-default allowlist is what kern is.
+- **The setuid bit** is not visible on files, because the rootfs is mounted `nosuid`.
 
 `mount_workspace` decides whether the workspace is bind-mounted at all. `auto` (the default) mirrors
 the Docker policy and skips the mount for the ephemeral directory the middleware creates when the caller

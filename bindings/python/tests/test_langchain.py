@@ -1252,3 +1252,73 @@ def test_the_descriptor_limit_matches_a_container_rather_than_the_host():
     for bad in ((0, 10), (10, 0), (100, 10), (-1, 10)):
         with pytest.raises(ValueError, match="nofile"):
             kern_execution_policy(nofile=bad)
+
+
+@needs_shell
+@integration
+def test_raw_sockets_stay_out_of_reach_and_that_is_rootless_not_a_flag():
+    """The one difference from Docker that no option closes, pinned so nobody spends an afternoon
+    looking for the flag.
+
+    `match_docker_capabilities` puts CAP_NET_RAW in the effective set, and it measurably is there. It
+    still does not work, because with `network_enabled` the box shares the HOST's network namespace,
+    and a capability held in a nested user namespace does not apply to a namespace owned by the initial
+    one. That is a kernel rule about rootless containers, not a kern decision: `ping` and raw sockets
+    work under a rootful Docker daemon and cannot here. Everything that goes through the normal socket
+    API, DNS and TCP and HTTP, is unaffected.
+    """
+    import selectors
+    import time
+    import uuid
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    workspace = Path(tempfile.mkdtemp(prefix="kern-rawsock-"))
+    proc = kern_execution_policy(
+        image="python:3.12-slim", network_enabled=True, match_docker_capabilities=True
+    ).spawn(workspace=workspace, env={}, command=["/bin/bash"])
+    stream = proc.stdout.fileno()
+    os.set_blocking(stream, False)
+    selector = selectors.DefaultSelector()
+    selector.register(stream, selectors.EVENT_READ)
+    pending = ""
+
+    def run(line: str, budget: float = 40.0):
+        nonlocal pending
+        marker = "__LC_SHELL_DONE__" + uuid.uuid4().hex
+        proc.stdin.write(f"{line}\necho {marker} $?\n")
+        proc.stdin.flush()
+        collected, deadline = [], time.monotonic() + budget
+        while time.monotonic() < deadline:
+            while "\n" in pending:
+                row, pending = pending.split("\n", 1)
+                if row.startswith(marker):
+                    return row.split()[-1], collected
+                collected.append(row)
+            if not selector.select(timeout=max(0.05, deadline - time.monotonic())):
+                continue
+            try:
+                chunk = os.read(stream, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                return "EOF", collected
+            pending += chunk.decode("utf-8", "replace")
+        return "TIMEOUT", collected
+
+    try:
+        held = run(
+            "python3 -c \"e=int([l.split()[1] for l in open('/proc/self/status') "
+            "if l.startswith('CapEff')][0],16); print(bool(e & (1<<13)))\""
+        )[1]
+        assert held == ["True"], f"CAP_NET_RAW should be in the effective set: {held}"
+        # And it still does not work, which is the point.
+        raw = run("python3 -c \"import socket; socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)\" 2>&1 | tail -1")[1]
+        assert any("PermissionError" in line for line in raw), raw
+        # Ordinary sockets are untouched.
+        assert run("getent hosts pypi.org > /dev/null; echo $?")[1] == ["0"], "DNS must still work"
+    finally:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=20)
+        shutil.rmtree(workspace, ignore_errors=True)
