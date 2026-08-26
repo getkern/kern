@@ -393,10 +393,13 @@ quiet machine. One run taken while a large install was still writing to disk cam
 across the board, which is worth saying because it is the shape of every benchmark that disagrees with
 this one: the ratio held there too.
 
-**Quote the 11x.** kern gains a lot from a warm page cache and Docker gains almost nothing, because
-Docker's cost is the engine's per-invocation machinery rather than the cache, so the steady-state
-figure flatters kern and the first-session one does not. The number that survives a hostile reading is
-the conservative one.
+**Quote the 11x.** The gap between the first session and the rest is not the image cache, which was
+the obvious guess and the wrong one: eight fresh processes each measuring only their own first session
+came back at 12 to 25 ms and none of them fell to 4, so it is per-process warm-up on the client side
+(imports, the first subprocess, the allocator). kern's own start is small enough that roughly ten
+milliseconds of that dominates it; Docker's is 157 ms, so the same ten are noise, which is why its two
+rows barely differ. The steady-state figure therefore flatters kern and the first-session one does not,
+and the first is also what anyone running the snippet will actually see.
 
 Read the rest honestly too: **once a session is up, the per-command cost is the same for any practical
 purpose**, both round-trips being well under a millisecond. The difference is in creating and
