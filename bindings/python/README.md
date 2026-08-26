@@ -407,6 +407,18 @@ wrote: `--net none`, `--cap-drop ALL` (measured `CapEff: 0000000000000000`), a 5
   such a path cannot be expressed at all; it is mounted through a colon-free alias that resolves on
   the host too, keeping one absolute path meaning the same thing inside the box and out.
 
+`mount_workspace` decides whether the workspace is bind-mounted at all. `auto` (the default) mirrors
+the Docker policy and skips the mount for the ephemeral directory the middleware creates when the caller
+supplied none, so nothing of the host is exposed for a directory about to be deleted; `always` mounts it
+regardless, `never` runs with no mount and a working directory of `/`.
+
+```python
+kern_execution_policy(mount_workspace="always", image="python:3.12-slim", memory_bytes=1 << 30)
+```
+
+The workspace has **no disk ceiling**, the same as for the code tool above: it is a host directory, and
+file state persisting is the point. Bound it yourself if that matters where you run.
+
 `langchain>=1.3` is required for this one (the middleware lives in the umbrella package, not in
 `langchain-core`), and the floor is measured: 1.3.0 works, 1.2.0 has no such base class.
 

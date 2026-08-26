@@ -290,6 +290,29 @@ box's own workload is always capped, and namespaces plus seccomp isolate the exe
 regardless. Each exec does not get its own capped scope on purpose: that would grant every exec the
 box's full limit, so N execs could use N times the box's memory.
 
+## Delivering an environment, and who can read it
+
+`--env-file` exists so a secret does not have to travel in `argv`, where the process table shows it to
+every local user for as long as the box lives. That is the whole of what it buys, and the boundary is
+worth stating exactly, because a caller who reads more into it will be wrong in the direction that costs
+them.
+
+**Against another user on the host**, the file's mode is the guard, and the Python binding's LangChain
+policy goes further: it puts the environment in an anonymous `memfd` and passes the descriptor, so there
+is no name on any filesystem to open, and a `kill -9` of the caller leaves nothing behind (a named temp
+file cleaned by a finalizer does, since finalizers do not run on a kill).
+
+**Against another process of the SAME user, it is not a boundary.** kern does not close descriptors it
+did not open, so an inherited one stays in its table for the life of the box: `/proc/<kern-pid>/fd/N` is
+readable by anything running as you. Measured with a sampler over a whole session rather than a single
+look at a running one, which is how a first and sloppier probe of ours reported the opposite. The window
+is the session, not the milliseconds of startup.
+
+So: better than `argv` in every case, better than a named file after the process dies, and the same as
+either while it lives. Closing an inherited descriptor once the environment is parsed would shrink that
+window to the parse itself; until that lands, this is a documented limit and not a defence, and a host
+where other local processes are hostile is not one to hand a secret to through any of these paths.
+
 ## Flags that change the posture
 
 - **`--security-profile untrusted`** is an opt-in bundle for code nobody has read: the seccomp
