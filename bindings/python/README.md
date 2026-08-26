@@ -377,15 +377,21 @@ middleware = ShellToolMiddleware(execution_policy=kern_execution_policy())
 ```
 
 Measured on one host, same image pre-pulled in both runtimes, through langchain's own abstraction, and
-split by phase because a composite number hides where the difference is. n=16, load stated, and the
-**first** session reported separately from the rest because that is the one a reader is right to
-suspect was chosen for convenience:
+split by phase because a composite number hides where the difference is. n=16, and the **first**
+session reported separately from the rest because that is the one a reader is right to suspect was
+chosen for convenience:
 
     phase                      kern      docker
     start up, FIRST session  14.5 ms   159.6 ms      11x
     start up, steady state    4.1 ms   157.4 ms      38x
     round-trip                0.05 ms    0.15 ms      3x
     tear down                 1.1 ms    63.4 ms      59x
+
+Measured at a load average of 0.8 and re-measured at 22.8 with the same result: tear-down came back
+at 1.1 ms and 63.4 ms both times, steady-state start at 4.1 and 4.0. These are not numbers that need a
+quiet machine. One run taken while a large install was still writing to disk came out roughly double
+across the board, which is worth saying because it is the shape of every benchmark that disagrees with
+this one: the ratio held there too.
 
 **Quote the 11x.** kern gains a lot from a warm page cache and Docker gains almost nothing, because
 Docker's cost is the engine's per-invocation machinery rather than the cache, so the steady-state
