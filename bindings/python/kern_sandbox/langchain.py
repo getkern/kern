@@ -75,6 +75,9 @@ _MAX_CHARS = 8_000
 # is precisely the thing the model can do about it.
 _MAX_CODE_BYTES = 1 << 20
 
+# How many workspace names the listing spells out before it says how many more there were.
+_FILES_SHOWN = 20
+
 # Language -> (default tool name, what the model is told it is writing). One table, because the two used
 # to disagree: a `node` tool was called `run_javascript` and then described as running "node code".
 _LANGUAGES = {
@@ -99,8 +102,15 @@ _LANGUAGES = {
 # which is a claim about completeness.
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
-_FORGED_FAULT = re.compile(r"^\[sandbox:", re.MULTILINE)
-_FORGED_CUT = re.compile(r"\.\.\. \d+ characters of output, cut to fit \.\.\.")
+
+# Each marker is spelled ONCE and both uses are derived from it. Written out twice, the emitting side
+# and the neutralising side would be one condition in two places: reword the marker in `_render` and the
+# pattern here silently stops matching, which does not break a test, it reopens the forgery.
+_FAULT_MARK = "[sandbox: "
+_CUT_HEAD, _CUT_TAIL = "... ", " characters of output, cut to fit ..."
+
+_FORGED_FAULT = re.compile("^" + re.escape(_FAULT_MARK.rstrip()), re.MULTILINE)
+_FORGED_CUT = re.compile(re.escape(_CUT_HEAD) + r"\d+" + re.escape(_CUT_TAIL))
 
 
 def _untrusted(text: str) -> str:
@@ -131,7 +141,7 @@ def _clip(text: str, limit: int) -> str:
     """
     if len(text) <= limit:
         return text
-    marker = f"\n\n... {len(text)} characters of output, cut to fit ...\n\n"
+    marker = f"\n\n{_CUT_HEAD}{len(text)}{_CUT_TAIL}\n\n"
     room = limit - len(marker)
     if room < 2:
         return text[:limit]
@@ -158,13 +168,13 @@ def _unfence(code: str) -> str:
 
 def _render(result: ExecutionResult, limit: int) -> str:
     """Turn one execution into the text the model reads back."""
-    blocks: list = []
+    blocks: list[str] = []
 
     # The verdict first, so a model that reads "timeout" before the output knows why it stops
     # mid-sentence. `fault` is the SANDBOX having acted; a non-zero exit with no fault is the code
     # itself, and conflating the two tells a model to rewrite code that was killed for using 4 GB.
     if result.fault is not None:
-        blocks.append(f"[sandbox: {result.fault.type}] {_untrusted(result.fault.message)}")
+        blocks.append(f"{_FAULT_MARK}{result.fault.type}] {_untrusted(result.fault.message)}")
     elif result.exit_code != 0:
         blocks.append(f"[exited with code {result.exit_code}]")
 
@@ -191,8 +201,8 @@ def _render(result: ExecutionResult, limit: int) -> str:
     # whatever follows at the same level as this module's own output.
     touched = sorted(_untrusted(f.path).replace("\n", "\\n").replace("\t", "\\t") for f in result.files)
     if touched:
-        more = f" (+{len(touched) - 20} more)" if len(touched) > 20 else ""
-        blocks.append("files in the workspace: " + ", ".join(touched[:20]) + more)
+        more = f" (+{len(touched) - _FILES_SHOWN} more)" if len(touched) > _FILES_SHOWN else ""
+        blocks.append("files in the workspace: " + ", ".join(touched[:_FILES_SHOWN]) + more)
 
     if result.truncated:
         blocks.append("[the sandbox discarded the output past its capture cap]")
