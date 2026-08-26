@@ -644,16 +644,24 @@ def test_secrets_go_through_a_private_file_and_never_the_argv():
     from kern_sandbox.langchain import kern_execution_policy
 
     policy = kern_execution_policy()
-    env_file = policy._write_env_file({"API_KEY": "s3cr3t", "NOTE": "two words"})
+    assert policy._env_records({"API_KEY": "s3cr3t", "NOTE": "two words"}) == \
+        "API_KEY=s3cr3t\nNOTE=two words\n"
+    assert policy._env_records({}) is None, "nothing to pass, nothing written"
+
+    path, fd, holder = policy._env_source({"API_KEY": "s3cr3t"})
     try:
-        assert oct(os.stat(env_file).st_mode & 0o777) == "0o600"
-        assert Path(env_file).read_text() == "API_KEY=s3cr3t\nNOTE=two words\n"
-        argv, _ = policy._build_command("kern", Path("/tmp/mine"), env_file, ["/bin/bash"])
+        # An ANONYMOUS file: no name on any filesystem, so a SIGKILL cannot leave it behind.
+        assert fd is not None and holder is None, "the memfd path is the one that must be taken"
+        assert path == f"/proc/self/fd/{fd}"
+        assert not os.path.exists("/tmp/" + os.path.basename(path))
+        argv, _ = policy._build_command("kern", Path("/tmp/mine"), path, ["/bin/bash"])
         assert "s3cr3t" not in " ".join(argv), "the secret reached the argv"
-        assert "--env-file" in argv and env_file in argv
+        assert "--env-file" in argv and path in argv
+        assert os.read(fd, 64) == b"API_KEY=s3cr3t\n"
     finally:
-        os.unlink(env_file)
-    assert policy._write_env_file({}) is None, "nothing to pass, nothing written"
+        if fd is not None:
+            os.close(fd)
+        shutil.rmtree(holder, ignore_errors=True)
 
 
 @needs_shell
@@ -666,7 +674,7 @@ def test_an_env_entry_that_cannot_be_one_record_is_refused(env):
     from kern_sandbox.langchain import kern_execution_policy
 
     with pytest.raises(ValueError):
-        kern_execution_policy()._write_env_file(env)
+        kern_execution_policy()._env_records(env)
 
 
 @needs_shell
@@ -828,3 +836,112 @@ def test_the_alias_carries_writes_into_the_real_directory_and_is_cleaned_up():
     gc.collect()
     assert not os.path.exists(alias), "the alias outlived the session"
     shutil.rmtree(workspace.parent, ignore_errors=True)
+
+
+@needs_shell
+@integration
+def test_a_sigkilled_agent_leaves_no_secret_on_disk():
+    """The worst failure this module had, and the one its first test could not see.
+
+    Cleanup by finalizer is cleanup on the happy path. `weakref.finalize` and `atexit` both fail to run
+    when the process is SIGKILLed, which is exactly what happens to an agent in production: a supervisor
+    OOM, a stopped container, a `kill -9` from a developer. Measured with a named 0600 temp file: the
+    kill left `/tmp/kern-lc-env-*.env` behind with the agent's API key in it.
+
+    The answer was not to clean up better but to have no file: the environment goes into an anonymous
+    `memfd`, which kern reads through a passed descriptor and which ceases to exist when the last
+    descriptor closes. This kills a real session and then looks at the filesystem.
+    """
+    import glob
+    import signal
+    import time
+
+    secret = "SECRET-THAT-MUST-NOT-SURVIVE"
+    workspace = Path(tempfile.mkdtemp(prefix="kern-kill-"))
+    driver = workspace / "session.py"
+    driver.write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "from kern_sandbox.langchain import kern_execution_policy\n"
+        "p = kern_execution_policy(image='python:3.12-slim')\n"
+        f"p.spawn(workspace=Path(sys.argv[1]), env={{'API_KEY': '{secret}'}}, command=['/bin/bash'])\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    before = set(glob.glob("/tmp/kern-lc-env-*"))
+    child = subprocess.Popen(
+        [sys.executable, str(driver), str(workspace)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)},
+    )
+    try:
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if (child.stdout.readline() or "").startswith("READY"):
+                break
+        else:
+            raise AssertionError("the session never came up")
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=30)
+        time.sleep(2)
+        leaked = set(glob.glob("/tmp/kern-lc-env-*")) - before
+        assert leaked == set(), f"a SIGKILL left the environment on disk: {sorted(leaked)}"
+    finally:
+        with contextlib.suppress(Exception):
+            child.kill()
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+@needs_shell
+@integration
+def test_a_session_accumulates_but_the_session_is_the_boundary():
+    """`command_timeout` bounds a command, not what a command started, and that is on purpose: a shell
+    where `&` did not work would not be a shell. What it means is that a long conversation builds up
+    state no per-command limit sees, so the unit that bounds a hostile session is the session.
+
+    Both halves asserted, because only the second one is a security claim: a background process is
+    still there ten commands later, and nothing at all is left on the host once the session dies.
+    """
+    import time
+    import uuid
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    workspace = Path(tempfile.mkdtemp(prefix="kern-bg-"))
+    proc = kern_execution_policy(image="python:3.12-slim", command_timeout=5.0).spawn(
+        workspace=workspace, env=None, command=["/bin/bash"]
+    )
+
+    def run(line: str, budget: float = 15.0):
+        marker = "__LC_SHELL_DONE__" + uuid.uuid4().hex
+        proc.stdin.write(f"{line}\necho {marker} $?\n")
+        proc.stdin.flush()
+        collected, started = [], time.monotonic()
+        while time.monotonic() - started < budget:
+            out = proc.stdout.readline()
+            if not out:
+                return None, collected
+            if out.startswith(marker):
+                return out.split()[-1], collected
+            collected.append(out.rstrip())
+        return "TIMEOUT", collected
+
+    try:
+        _, printed = run("sleep 600 & echo PID=$!")
+        assert printed and printed[0].startswith("PID="), printed
+        pid = printed[0].split("=", 1)[1].strip()
+        alive = f"if [ -d /proc/{pid} ]; then echo ALIVE; else echo gone; fi"
+        assert run(alive)[1] == ["ALIVE"], "a detached process should start"
+        for i in range(10):
+            run(f"echo c{i}", budget=10.0)
+        assert run(alive)[1] == ["ALIVE"], "command_timeout does not reach a detached process"
+    finally:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=20)
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    time.sleep(2)
+    survivors = subprocess.run(["pgrep", "-fa", "sleep 600"], capture_output=True, text=True)
+    left = [line for line in survivors.stdout.splitlines() if "pgrep" not in line]
+    assert left == [], f"the session died but something outlived it on the host: {left}"

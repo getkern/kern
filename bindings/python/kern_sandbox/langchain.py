@@ -436,6 +436,15 @@ def _build_policy_class():
 
             The WORKSPACE is a host directory bind-mounted in, and nothing bounds it on disk. Point
             ``workspace_root`` at a filesystem you have already limited if that matters where you run.
+
+            A SESSION ACCUMULATES. ``command_timeout`` bounds a command, not what a command started:
+            `sleep 600 &` returns at once and is measured still running ten commands later, because
+            that is what a terminal does and a developer would be right to expect it. What bounds it is
+            the session itself, `--pids-limit` while it lives and the PID namespace when it ends, and
+            that boundary was measured: killing the session left nothing on the host. So a long
+            conversation can build up state that no per-command limit sees. For your own or
+            semi-trusted code that is the feature; if the commands are hostile, the unit to bound is
+            the session, not the command.
         """
 
         binary: str = "kern"
@@ -472,15 +481,10 @@ def _build_policy_class():
         def spawn(self, *, workspace, env, command):
             """Launch the persistent shell in a fresh box and hand back its pipes."""
             binary = self._resolve_binary()
-            env_file = self._write_env_file(env)
-            holder = None
+            env_path, env_fd, env_holder = self._env_source(env)
+            ws_holder = None
             try:
-                argv, holder = self._build_command(binary, workspace, env_file, command)
-            except BaseException:
-                _unlink_quietly(env_file)
-                _rmtree_quietly(holder)
-                raise
-            try:
+                argv, ws_holder = self._build_command(binary, workspace, env_path, command)
                 process = subprocess.Popen(  # noqa: S603
                     argv,
                     stdin=subprocess.PIPE,
@@ -493,17 +497,26 @@ def _build_policy_class():
                     bufsize=1,
                     env=os.environ.copy(),
                     start_new_session=True,
+                    pass_fds=(env_fd,) if env_fd is not None else (),
                 )
             except BaseException:
-                _unlink_quietly(env_file)
-                _rmtree_quietly(holder)
+                _rmtree_quietly(env_holder)
+                _rmtree_quietly(ws_holder)
                 raise
-            if env_file is not None:
-                # kern reads the file at box start, but "start" has no observable end from out here, so
-                # it is kept for the session and removed when the caller lets the process object go.
-                weakref.finalize(process, _unlink_quietly, env_file)
-            if holder is not None:
-                weakref.finalize(process, _rmtree_quietly, holder)
+            finally:
+                # Ours is dropped as soon as the child has its own copy: the anonymous file then lives
+                # exactly as long as kern needs it and not one instant longer.
+                if env_fd is not None:
+                    _close_quietly(env_fd)
+            if env_holder is not None:
+                # Only the fallback path leaves anything on a filesystem, and only there is there a
+                # finalizer to regret. `atexit` is a second chance on an orderly exit; neither runs on
+                # SIGKILL, which is why the memfd path above is the one that matters.
+                weakref.finalize(process, _rmtree_quietly, env_holder)
+                atexit.register(_rmtree_quietly, env_holder)
+            if ws_holder is not None:
+                weakref.finalize(process, _rmtree_quietly, ws_holder)
+                atexit.register(_rmtree_quietly, ws_holder)
             return process
 
         # -- argv ------------------------------------------------------------------------------------
@@ -597,8 +610,8 @@ def _build_policy_class():
             return path
 
         @staticmethod
-        def _write_env_file(env) -> "str | None":
-            """Serialise ``env`` to a 0600 file, or return None when there is nothing to pass.
+        def _env_records(env) -> "str | None":
+            """Serialise ``env`` to the K=V text kern reads, or None when there is nothing to pass.
 
             Refused rather than mangled: a newline in a value would split the record and smuggle a
             second variable, and a NUL or an `=` in a KEY would produce a line kern reads as something
@@ -617,17 +630,64 @@ def _build_policy_class():
                         f"cannot be written as one K=V record"
                     )
                 lines.append(f"{key}={value}")
-            fd, path = tempfile.mkstemp(prefix="kern-lc-env-", suffix=".env")
+            return "\n".join(lines) + "\n"
+
+        @staticmethod
+        def _env_source(env):
+            """Put the environment somewhere kern can read it and an attacker cannot.
+
+            An ANONYMOUS file, not a path. `memfd_create` gives a file with no name on any filesystem;
+            kern reads it as `/proc/self/fd/N` because the descriptor is passed to it, and it ceases to
+            exist the moment the last descriptor closes.
+
+            That is the fix for the worst failure this module had. A named 0600 temp file is cleaned up
+            by a finalizer, and a finalizer does not run when the process is SIGKILLed, which is exactly
+            what happens to an agent in production: a supervisor OOM, a stopped container, a `kill -9`.
+            Measured before this: SIGKILL left `/tmp/kern-lc-env-*.env` behind, 0600 and readable, with
+            the agent's API key inside it. Cleaning up better was never the answer; not having a file
+            was.
+
+            The fallback exists for a host without `memfd_create`, and puts the file inside a fresh
+            0700 directory rather than loose in the temp root, so the protection does not rest on the
+            file mode alone.
+
+            Returns (path_for_kern, fd_to_pass_or_None, directory_to_remove_or_None).
+            """
+            records = KernExecutionPolicy._env_records(env)
+            if records is None:
+                return None, None, None
+            payload = records.encode("utf-8")
+            memfd = getattr(os, "memfd_create", None)
+            if memfd is not None:
+                fd = memfd("kern-lc-env", 0)
+                try:
+                    os.write(fd, payload)
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.set_inheritable(fd, True)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                return f"/proc/self/fd/{fd}", fd, None
+            holder = tempfile.mkdtemp(prefix="kern-lc-env-")
+            path = os.path.join(holder, "env")
             try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write("\n".join(lines) + "\n")
+                handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(handle, "wb") as out:
+                    out.write(payload)
             except BaseException:
-                _unlink_quietly(path)
+                _rmtree_quietly(holder)
                 raise
-            return path
+            return path, None, holder
 
     return KernExecutionPolicy
+
+
+def _close_quietly(fd) -> None:
+    """Drop our copy of a descriptor. Called from a `finally`, so it can never raise."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def _rmtree_quietly(path) -> None:
@@ -639,15 +699,6 @@ def _rmtree_quietly(path) -> None:
     except Exception:
         pass
 
-
-def _unlink_quietly(path) -> None:
-    """Remove ``path`` if it is still there. Called from a finalizer, so it can never raise."""
-    if not path:
-        return
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
 
 
 def kern_execution_policy(**kwargs):
