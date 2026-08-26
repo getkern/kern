@@ -358,8 +358,9 @@ gates; contributions are covered by the [CLA](CLA.md).
 
 ## Maintainer
 
-Alex, [@realexhub](https://github.com/realexhub). Commits come from
-[@getkerndev](https://github.com/getkerndev), the project's commit identity.
+Alessandro Polito, [@realexhub](https://github.com/realexhub), Italy. Commits up to and including
+v0.7.0 carry [@getkerndev](https://github.com/getkerndev), the account the project was published
+from.
 
 **The commits are not signed; the release TAG is.** That is what to verify:
 `git verify-tag v0.7.0` against the key in [provenance/](provenance/), whose fingerprint is in
