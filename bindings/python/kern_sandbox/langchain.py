@@ -508,15 +508,20 @@ def _build_policy_class():
                 # exactly as long as kern needs it and not one instant longer.
                 if env_fd is not None:
                     _close_quietly(env_fd)
+            # `weakref.finalize` already covers BOTH cases on its own: it fires when the process
+            # object is collected, and `finalize.atexit` defaults to True, so a session still alive at
+            # an orderly exit is cleaned up there. An explicit `atexit.register` beside it was doing
+            # the same job twice and growing the interpreter's handler list once per spawn, which a
+            # long-lived agent reaches often because the middleware restarts a session on every
+            # command timeout. Measured: two handlers before, six after three spawns.
+            #
+            # Neither mechanism runs on SIGKILL, which is exactly why the environment above is an
+            # anonymous file rather than something needing cleanup at all. Only the fallback path and
+            # the mount alias leave anything on a filesystem to regret.
             if env_holder is not None:
-                # Only the fallback path leaves anything on a filesystem, and only there is there a
-                # finalizer to regret. `atexit` is a second chance on an orderly exit; neither runs on
-                # SIGKILL, which is why the memfd path above is the one that matters.
                 weakref.finalize(process, _rmtree_quietly, env_holder)
-                atexit.register(_rmtree_quietly, env_holder)
             if ws_holder is not None:
                 weakref.finalize(process, _rmtree_quietly, ws_holder)
-                atexit.register(_rmtree_quietly, ws_holder)
             return process
 
         # -- argv ------------------------------------------------------------------------------------
