@@ -419,6 +419,22 @@ kern_execution_policy(mount_workspace="always", image="python:3.12-slim", memory
 The workspace has **no disk ceiling**, the same as for the code tool above: it is a host directory, and
 file state persisting is the point. Bound it yourself if that matters where you run.
 
+Two behaviours worth knowing before an agent runs for hours, both **measured identically through
+`DockerExecutionPolicy`**, so they are what a shell session and a bind mount are rather than anything
+this policy adds:
+
+- **A command can desynchronise the session.** The middleware writes a marker after every command and
+  reads until it comes back; a `cat` with no arguments swallows that marker and echoes it as ordinary
+  output, and from there each command times out while the model is handed the text of its own
+  instructions. The middleware recovers by restarting the session, so the cost is one timeout plus the
+  silent loss of everything the session had accumulated (`cd`, `export`, background processes). The
+  model is told the command timed out, not that its state is gone. Nothing accumulates on this side
+  across those restarts: twelve cycles leave no environment, no alias and no descriptor behind.
+- **If the host removes the workspace under a live session**, the mount points at an inode with no
+  name and nothing reports it. `pwd` answers, `ls` returns an empty listing with status 0, and writes
+  fail without the caller noticing; only reading a file back surfaces it. A workspace that is already
+  missing (or that is a file) is refused at `spawn`, which is the only point this policy gets to look.
+
 `langchain>=1.3` is required for this one (the middleware lives in the umbrella package, not in
 `langchain-core`), and the floor is measured: 1.3.0 works, 1.2.0 has no such base class.
 

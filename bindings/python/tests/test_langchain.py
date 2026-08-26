@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -945,3 +946,159 @@ def test_a_session_accumulates_but_the_session_is_the_boundary():
     survivors = subprocess.run(["pgrep", "-fa", "sleep 600"], capture_output=True, text=True)
     left = [line for line in survivors.stdout.splitlines() if "pgrep" not in line]
     assert left == [], f"the session died but something outlived it on the host: {left}"
+
+
+@needs_shell
+@integration
+def test_nothing_accumulates_across_the_restarts_a_desync_causes():
+    """The middleware restarts the whole session when a command times out, and one class of command
+    makes that routine rather than rare.
+
+    A `cat` with no arguments swallows the marker line the protocol writes after every command, echoes
+    it as ordinary output, and from there the session is desynchronised: each later command times out
+    and the model is handed the text of its own instructions. Measured identically through
+    `DockerExecutionPolicy`, so the defect is the middleware's protocol and not this policy, and the
+    middleware does recover, by tearing the session down and calling `spawn` again.
+
+    Which puts the question here: every restart makes a new box, a new anonymous environment and a new
+    mount alias. Twelve cycles, on a workspace whose path forces the alias, and nothing may be left.
+    """
+    import gc
+    import glob
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    base = Path(tempfile.mkdtemp(prefix="kern-restart-"))
+    workspace = base / "pro:ject"
+    workspace.mkdir()
+    policy = kern_execution_policy(image="python:3.12-slim")
+
+    def residue():
+        return len(glob.glob("/tmp/kern-lc-env-*")), len(glob.glob("/tmp/kern-lc-ws-*"))
+
+    env_before, alias_before = residue()
+    fds_before = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    try:
+        for cycle in range(12):
+            proc = policy.spawn(workspace=workspace, env={"K": str(cycle)}, command=["/bin/bash"])
+            try:
+                proc.stdin.write("exit\n")
+                proc.stdin.flush()
+                proc.wait(timeout=30)
+            except Exception:
+                proc.kill()
+            del proc
+            gc.collect()
+        env_after, alias_after = residue()
+        assert env_after == env_before, "an anonymous environment survived a restart"
+        assert alias_after == alias_before, "a mount alias survived a restart"
+        assert len(os.listdir(f"/proc/{os.getpid()}/fd")) == fds_before, "a descriptor leaked"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+@needs_shell
+def test_no_environment_at_all_is_accepted():
+    """`spawn(env=None)` is a shape the middleware can produce, and langchain's own Docker policy
+    raises `AttributeError: 'NoneType' object has no attribute 'items'` on it. Ours builds an argv
+    with no environment at all rather than crashing three frames deep."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    policy = kern_execution_policy()
+    assert policy._env_source(None) == (None, None, None)
+    assert policy._env_source({}) == (None, None, None)
+    argv, holder = policy._build_command("kern", Path("/tmp/plain"), None, ["/bin/bash"])
+    assert "--env-file" not in argv and holder is None
+
+
+@needs_shell
+@integration
+def test_a_workspace_that_is_not_there_is_refused_at_spawn():
+    """The one guard the policy can give, because `spawn` is its only entry point: a workspace that is
+    missing, or that is a file, fails loudly before a box is started rather than producing a session
+    whose writes go nowhere."""
+    from kern_sandbox.langchain import kern_execution_policy
+
+    policy = kern_execution_policy(image="python:3.12-slim")
+    gone = Path(tempfile.mkdtemp(prefix="kern-gone-"))
+    shutil.rmtree(gone)
+    with pytest.raises(FileNotFoundError):
+        policy.spawn(workspace=gone, env={}, command=["/bin/bash"])
+
+    handle, path = tempfile.mkstemp(prefix="kern-notdir-")
+    os.close(handle)
+    try:
+        with pytest.raises(NotADirectoryError):
+            policy.spawn(workspace=Path(path), env={}, command=["/bin/bash"])
+    finally:
+        os.unlink(path)
+
+
+@needs_shell
+@integration
+def test_a_workspace_deleted_under_a_live_session_fails_silently_and_that_is_the_bind():
+    """The most realistic failure nobody watches, pinned so a future change cannot make it worse
+    without saying so.
+
+    A long-lived agent keeps a session while something on the host removes the workspace: a cleanup
+    job, another process of the agent, a `tmpwatch`. The mount then points at an inode with no name.
+    Commands keep succeeding: `pwd` answers, `ls` returns an empty listing with status 0, and a write
+    fails without the session reporting anything the caller would notice. Only an explicit read back
+    shows it.
+
+    Measured identically through `DockerExecutionPolicy`, so this is what a bind mount is and not a
+    defect of this policy, and the policy cannot see it either way: `spawn` is its only entry point and
+    the session loop belongs to the middleware. What it can do is refuse a workspace that is already
+    missing, which the test above pins.
+    """
+    import selectors
+    import uuid
+
+    from kern_sandbox.langchain import kern_execution_policy
+
+    workspace = Path(tempfile.mkdtemp(prefix="kern-vanish-"))
+    (workspace / "before.txt").write_text("here\n")
+    proc = kern_execution_policy(image="python:3.12-slim").spawn(
+        workspace=workspace, env={}, command=["/bin/bash"]
+    )
+    stream = proc.stdout.fileno()
+    os.set_blocking(stream, False)
+    selector = selectors.DefaultSelector()
+    selector.register(stream, selectors.EVENT_READ)
+    pending = ""
+
+    def run(line: str, budget: float = 15.0):
+        nonlocal pending
+        marker = "__LC_SHELL_DONE__" + uuid.uuid4().hex
+        proc.stdin.write(f"{line}\necho {marker} $?\n")
+        proc.stdin.flush()
+        collected, deadline = [], time.monotonic() + budget
+        while time.monotonic() < deadline:
+            while "\n" in pending:
+                row, pending = pending.split("\n", 1)
+                if row.startswith(marker):
+                    return row.split()[-1], collected
+                collected.append(row)
+            if not selector.select(timeout=max(0.05, deadline - time.monotonic())):
+                continue
+            try:
+                chunk = os.read(stream, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                return "EOF", collected
+            pending += chunk.decode("utf-8", "replace")
+        return "TIMEOUT", collected
+
+    try:
+        assert run("ls")[1] == ["before.txt"], "the session must start healthy"
+        shutil.rmtree(workspace, ignore_errors=True)
+        status, listing = run("ls")
+        assert status == "0" and listing == [], "an empty listing with status 0 is what the box sees"
+        assert run("echo x > after.txt; echo $?")[1] == ["1"], "the write fails, silently to the caller"
+        assert run("cat after.txt")[0] == "1", "only reading back surfaces it"
+    finally:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=20)
+        shutil.rmtree(workspace, ignore_errors=True)
