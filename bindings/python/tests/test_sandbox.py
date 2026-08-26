@@ -960,18 +960,26 @@ def test_concurrent_calls_on_one_sandbox_do_not_fight_over_the_env_file():
     assert not leftover, f"env files left in the workspace: {leftover}"
 
 
-def test_our_env_file_is_hidden_from_file_listings_but_a_user_file_is_not():
-    """`.kern-env*` is ours; a user file whose name merely STARTS with it is theirs.
+def test_a_file_is_hidden_from_listings_only_if_this_binding_created_it():
+    """Ours by PROVENANCE, not by the shape of the name.
 
-    The filter became prefix-based when the env file went per-call, and a bare `startswith` would
-    have swallowed a user's `.kern-environment` from `files` and from `snapshot()`. Separator-anchored
-    instead, and asserted in both directions so the hiding cannot quietly widen.
+    The filter used to be prefix-based (`.kern-env.<box>`, and later `.cell-<uid>.<ext>` and friends),
+    which published the recipe for invisibility: the workspace is writable by the box, so anything that
+    wrote a matching name disappeared from `list_files`/`snapshot`/`files`, which is the listing a
+    caller would audit. Membership in a set this process filled cannot be imitated from inside a box.
+
+    `.kern-env` bare stays an exact legacy match: a workspace written by an older version has one and
+    it is ours, even though this process did not create it.
     """
-    assert Sandbox._is_env_file(".kern-env")
-    assert Sandbox._is_env_file(".kern-env.box-abc123")
-    assert not Sandbox._is_env_file(".kern-environment")
-    assert not Sandbox._is_env_file("kern-env")
-    assert not Sandbox._is_env_file("notes.txt")
+    s = _cfg()
+    assert not s._is_ours(".cell-deadbeef.py"), "a name we never wrote is not ours"
+    assert not s._is_ours(".kern-env.box-abc123"), "the prefix hole is what got closed"
+    assert s._claim(".cell-deadbeef.py") == ".cell-deadbeef.py", "claim returns the name it took"
+    assert s._is_ours(".cell-deadbeef.py"), "claimed, so ours"
+    s._release(".cell-deadbeef.py")
+    assert not s._is_ours(".cell-deadbeef.py"), "released, so theirs again"
+    assert s._is_ours(".kern-env"), "legacy exact name from an older version"
+    assert not s._is_ours(".kern-environment") and not s._is_ours("notes.txt")
 
 
 def test_the_version_in_the_code_matches_the_one_in_pyproject():
@@ -984,11 +992,22 @@ def test_the_version_in_the_code_matches_the_one_in_pyproject():
     the other.
     """
     import pathlib
-    import tomllib
 
     root = pathlib.Path(__file__).resolve().parent.parent
-    meta = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    declared = meta["project"]["version"]
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    try:
+        import tomllib
+
+        declared = tomllib.loads(text)["project"]["version"]
+    except ModuleNotFoundError:
+        # `tomllib` is stdlib from 3.11, and this package's floor is 3.9: on the interpreter that
+        # PROVES the floor, importing it is a ModuleNotFoundError and this test would fail for a
+        # reason that has nothing to do with the versions agreeing. One regex over one known line
+        # keeps the check running everywhere rather than skipping it exactly where it is cheapest
+        # to run. (Found by running the suite under a real 3.9, not by reading the imports.)
+        m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        assert m, "pyproject.toml no longer has a top-level `version = \"...\"`"
+        declared = m.group(1)
     assert kern.__version__ == declared, (
         f"kern_sandbox.__version__ is {kern.__version__} but pyproject.toml says {declared}"
     )
@@ -1080,3 +1099,142 @@ def test_the_wait_short_circuits_on_a_child_that_was_already_reaped():
     proc.wait()
     assert proc.returncode is not None
     assert kern._wait_for_exit(proc, 0) is True
+
+
+# ---------------------------------------------------------------------------
+# Our own scratch in a shared workspace
+# ---------------------------------------------------------------------------
+
+
+@integration
+def test_a_box_cannot_hide_a_file_by_naming_it_like_our_scratch():
+    """The listing a caller audits must not be something the audited party can edit.
+
+    Our scratch was once hidden by the SHAPE of its name (`.cell-<8 hex>.<ext>`, `.kern-env.<box>`),
+    and the workspace is writable by the box, so the rule published its own bypass: a cell that wrote
+    `/workspace/.cell-deadbeef.py` vanished from `list_files`, `snapshot` and `files`. Provenance is
+    not imitable from inside a box, and this is the discriminating test: names in exactly the retired
+    shapes, written BY THE BOX, must all still be visible to the caller.
+    """
+    planted = [".cell-deadbeef.py", ".run-00000000.py", ".res-a1b2c3d4.json",
+               ".kernel-01234567.py", ".kern-env.pysbx-forged"]
+    with Sandbox(timeout_s=60) as s:
+        code = "\n".join(f"open({name!r}, 'w').write('planted')" for name in planted)
+        assert s.run_code(code).success
+        listed = {f.path for f in s.list_files()}
+    assert set(planted) <= listed, f"a box hid files from the caller: {sorted(set(planted) - listed)}"
+
+
+@integration
+def test_a_concurrent_call_does_not_see_the_other_call_s_scratch():
+    """Two calls on the SAME Sandbox share one workspace by design (that is what makes file state
+    persist). Each used to filter only the three names IT had written, so a call's file diff reported
+    the other call's in-flight cell and runner to the caller as freshly created user files."""
+    import concurrent.futures as cf
+
+    with Sandbox(timeout_s=60) as s:
+        with cf.ThreadPoolExecutor(8) as pool:
+            results = list(pool.map(lambda i: s.run_code(f"print({i} * {i})"), range(8)))
+    assert [r.stdout.strip() for r in results] == [str(i * i) for i in range(8)]
+    leaked = sorted({f.path for r in results for f in r.files})
+    assert leaked == [], f"internal scratch reported as user files: {leaked}"
+
+
+@integration
+def test_the_provenance_registry_balances_under_parallel_calls():
+    """`_claim`/`_release` share one set across every call on a Sandbox, and the LangChain tool is
+    exactly the thing an agent runs several of at once. The observable invariant is that the registry
+    BALANCES: every name claimed is released, so after the last call it is empty again. A leak leaves
+    names behind, and a name that stays claimed forever hides a real user file from that point on, which
+    is the quiet failure a per-call assertion would never see.
+
+    Sixteen against eight in the other test, because a race that survives eight threads is not a race
+    that has been ruled out.
+    """
+    import concurrent.futures as cf
+
+    with Sandbox(timeout_s=60) as s:
+        with cf.ThreadPoolExecutor(16) as pool:
+            out = list(pool.map(lambda i: s.run_code(f"print({i})"), range(48)))
+        leftover = set(s._ours)
+    assert [r.stdout.strip() for r in out] == [str(i) for i in range(48)]
+    assert leftover == set(), f"names still claimed after every call returned: {sorted(leftover)}"
+
+
+
+
+@integration
+def test_a_call_that_dies_mid_flight_still_gives_its_names_back():
+    """The registry hides what it holds, so a name it never gives back hides a user file FOREVER.
+
+    A timeout returns a fault rather than raising, so the ordinary failure paths all released
+    correctly and hid this one: it opens only when `_spawn` RAISES, which is an interrupt or a kern
+    that dies mid-call. Measured before the `finally` existed: ten injected deaths left thirty names
+    claimed and twenty files on disk, and a user file written under one of the leaked names did not
+    appear in `list_files()` at all. That is the failure this pins, and the last assertion is the one
+    that matters, because a leaked name is only a leak when it starts hiding something real.
+    """
+    with Sandbox(timeout_s=30) as s:
+        real_spawn = s._spawn
+
+        def dies(*a, **kw):
+            raise RuntimeError("injected death between claim and release")
+
+        s._spawn = dies
+        for _ in range(10):
+            with pytest.raises(RuntimeError):
+                s.run_code("print(1)")
+        s._spawn = real_spawn
+
+        assert s._ours == set(), f"names never given back: {sorted(s._ours)}"
+        assert os.listdir(s._ws) == [], "scratch outlived the call that made it"
+
+        # And the consequence, asserted directly rather than inferred: a user file named like the
+        # scratch that just died must be visible.
+        s.write_file(".cell-deadbeef.py", "this one is the user's")
+        assert ".cell-deadbeef.py" in {f.path for f in s.list_files()}
+
+
+@integration
+def test_an_oversized_bash_cell_does_not_leave_its_source_behind():
+    """Over `_INLINE_CODE_MAX` the code goes to a workspace file and runs by path. The Python path has
+    always deleted that file; this one never did, so every big bash/node cell left its own source in
+    the workspace for the rest of the session. The box listing itself is the positive control: without
+    it, an empty workspace afterwards would equally well mean the file path was never taken."""
+    with Sandbox(timeout_s=60) as s:
+        padding = "\n".join(f"# {i} {'x' * 100}" for i in range(1400))
+        code = "ls -a /workspace | tr '\\n' ' '\n" + padding + "\necho"
+        assert len(code.encode()) > s._INLINE_CODE_MAX, "the inline path would be exercised instead"
+        r = s.run_code(code, language="bash")
+        assert re.search(r"\.cell-[0-9a-f]{8}\.sh", r.stdout), "the file path was not taken"
+        assert [f.path for f in r.files] == []
+        assert os.listdir(s._ws) == [], "the cell source outlived the call"
+
+
+@integration
+def test_a_failed_setup_does_not_leave_its_workspace_behind():
+    """`__enter__` creates the workspace and only then runs `setup`, so a setup that fails raises out of
+    `__enter__`: the `with` body is never entered, `__exit__` never runs, and the directory outlives the
+    session that made it. Setup is also the step most likely to fail, being a pip install against
+    whatever the index is doing that minute."""
+    import glob
+    import tempfile
+
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "kern-ws-*")))
+    with pytest.raises(SandboxError, match="setup failed"):
+        with Sandbox(setup="exit 3", timeout_s=30):
+            pass
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "kern-ws-*"))) == before
+
+
+@integration
+def test_a_failed_setup_keeps_a_workspace_the_caller_supplied(tmp_path):
+    """The cleanup must undo only what `__enter__` built. A `workspace=` predates the session, its
+    contents are documented as persisting, and deleting it would destroy caller data on a bad setup."""
+    theirs = tmp_path / "ws"
+    theirs.mkdir()
+    (theirs / "keep.txt").write_text("mine")
+    with pytest.raises(SandboxError, match="setup failed"):
+        with Sandbox(setup="exit 3", workspace=str(theirs), timeout_s=30):
+            pass
+    assert (theirs / "keep.txt").read_text() == "mine"
