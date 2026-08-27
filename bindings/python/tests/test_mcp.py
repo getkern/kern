@@ -330,6 +330,41 @@ def test_huge_method_name_is_not_echoed_back_whole(monkeypatch):
     assert len(r["error"]["message"]) <= M._MAX_NAME + 200
 
 
+def test_no_reply_carries_a_raw_surrogate_to_the_encoder(monkeypatch):
+    """_send's comment says main() reconfigured stdout with errors="replace", so the write "can never
+    raise UnicodeEncodeError". That reconfigure is wrapped in `except (AttributeError, ValueError):
+    pass`, so the guarantee is conditional on something allowed to fail silently.
+
+    Against a strict encoder the raw surrogate in the method name raised inside _send: the serve loop
+    caught it and kept the connection, but the reply was lost and that client waits for it forever.
+    Both error paths now go out through !r, which escapes the surrogate before the encoder ever sees
+    it, so neither depends on how the stream was configured."""
+
+    class _Strict(io.TextIOBase):
+        def __init__(self):
+            self.buf = []
+
+        def reconfigure(self, **kw):
+            raise AttributeError("this stream cannot be reconfigured")
+
+        def write(self, s):
+            s.encode("utf-8")  # no errors="replace": a lone surrogate raises here
+            self.buf.append(s)
+            return len(s)
+
+        def flush(self):
+            pass
+
+    for msg in ({"jsonrpc": "2.0", "id": 1, "method": "\ud800"},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": "\ud800", "arguments": {}}}):
+        out = _Strict()
+        monkeypatch.setattr(sys, "stdout", out)
+        M._Server().handle(msg)          # must not raise
+        monkeypatch.undo()
+        assert json.loads("".join(out.buf))["error"]["code"] in (-32601, -32602)
+
+
 @pytest.mark.parametrize("method", [None, 7, [], {}, True])
 def test_non_string_method_is_method_not_found_not_a_crash(method, monkeypatch):
     """`method` is compared with ==, which is safe for any type, but it then went into an f-string for
@@ -761,6 +796,20 @@ def test_faulted_kernel_is_reaped(monkeypatch):
     assert s._kernel is None
 
 
+def test_close_clears_the_session_even_when_its_exit_raises():
+    """A teardown that fails halfway is the same defect with one more step: if the reference survives
+    the failure, the next call reuses a session whose box is in an unknown state."""
+
+    class _Angry:
+        def __exit__(self, *exc):
+            raise OSError("teardown failed")
+
+    s = M._Server()
+    s._sbx = _Angry()
+    s.close()
+    assert s._sbx is None
+
+
 def test_close_reaps_both_kernel_and_session():
     class _Sess:
         def __init__(self):
@@ -1152,6 +1201,12 @@ def _peak_rss_mb_for_flood(tmp_path, megabytes):
 
     The caller compares two sizes rather than trusting one absolute number, because the inherited
     baseline is still in there and only a DIFFERENCE cancels it out.
+
+    Both sizes must sit on the PLATEAU. Measured, this server ramps from 17 MB at a 1 MB flood to
+    55 MB at 64 MB, then stays at 55 MB through 128, 256 and 400: the ramp is the reader reaching its
+    steady-state working set, and the plateau is the actual bound. A pair straddling the ramp
+    (25 MB against 400 MB) reports an 8 MB difference that is real growth, not slack, and leaves the
+    threshold measuring the wrong thing.
     """
     payload = tmp_path / f"flood-{megabytes}"
     with payload.open("wb") as fh:
@@ -1184,10 +1239,12 @@ def test_a_newline_free_flood_does_not_grow_the_server(tmp_path):
     reading the code, because TextIOWrapper.readline(size) bounds the string it RETURNS and says
     nothing about what it buffers while scanning for the newline.
 
-    Sixteen times the input for a 0.7 MB difference is the shape of a real bound. If the reader ever
-    accumulates, this fails by hundreds of megabytes, not by a rounding error."""
-    small, served_small = _peak_rss_mb_for_flood(tmp_path, 25)
+    128 MB and 400 MB both sit on the plateau, so a healthy server answers with the same number twice
+    and a reader that accumulates fails by hundreds of megabytes, not by a rounding error. Measured
+    both ways: 55.1 against 55.4 as it stands, and 150 against 423 with a deliberate leak in the drain
+    loop."""
+    small, served_small = _peak_rss_mb_for_flood(tmp_path, 128)
     large, served_large = _peak_rss_mb_for_flood(tmp_path, 400)
     assert served_small and served_large, "the ping after the flood must still be answered"
     assert small is not None and large is not None
-    assert large - small < 16, f"RSS grew {large - small:.1f} MB when the flood grew 16x"
+    assert large - small < 8, f"RSS grew {large - small:.1f} MB when the flood grew 3.1x"

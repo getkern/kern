@@ -270,9 +270,13 @@ class _Server:
             self._tool_call(mid, msg.get("params") or {})
         else:
             # Same amplification as the tool name: `method` is client-controlled and arrives inside a
-            # frame that may be _MAX_FRAME long, so it is clipped before it goes back out.
-            shown = _clip(method, _MAX_NAME) if isinstance(method, str) else repr(type(method).__name__)
-            self._error(mid, -32601, f"method not found: {shown}")
+            # frame that may be _MAX_FRAME long, so it is clipped before it goes back out. It also goes
+            # out through !r, exactly like the unknown-tool error: JSON accepts a lone surrogate, repr
+            # escapes it, and a raw one would instead reach the encoder inside _send. That only survives
+            # because main() reconfigured stdout with errors="replace", and that reconfigure is allowed
+            # to fail silently, in which case the reply is lost and the client waits for it forever.
+            shown = _clip(method, _MAX_NAME) if isinstance(method, str) else type(method).__name__
+            self._error(mid, -32601, f"method not found: {shown!r}")
 
     def _tools_view(self) -> list:
         """The tool list. In warm-kernel mode, tell the client the truth: python state now PERSISTS
