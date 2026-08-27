@@ -312,6 +312,12 @@ calls (a workspace on disk); each call is a fresh, **network-off** box. Optional
 `vcpu:heavy,vgpio:sensors`, the only way to grant an edge agent a hardware device set). Run it standalone
 with `python -m kern_sandbox.mcp`.
 
+Two knobs change what the model is told, so they are worth naming: `KERN_MCP_KERNEL=1` routes Python
+through one persistent warm interpreter, which makes in-memory state persist across calls and is the one
+case where "a fresh box per call" above stops being true (the tool description says so to the model as
+well, rather than leaving it to guess). `KERN_MCP_QUIET=0` restores kern's non-fatal notes, which are off
+by default so a tool call returns only the cell's own output.
+
 ## Use it from LangChain
 
 `kern_sandbox.langchain` turns a session into a tool an agent can call. `langchain-core` is an optional
