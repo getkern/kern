@@ -51,6 +51,13 @@ _MAX_REPLY_IMG = 8 * 1024 * 1024  # AGGREGATE image budget for one reply (N smal
 _MAX_TOTAL_TEXT = 64_000          # AGGREGATE text budget for one reply (unbounded rich-result COUNT can't blow up)
 _MAX_FRAME = 8 * 1024 * 1024      # max chars of one inbound JSON-RPC line; bounds a no-newline stdin flood
 
+# `_READ_CAP` bounds what the HOST loads; this bounds what the REPLY carries. They are different limits:
+# without the second one a read_file on a 16 MiB workspace file answered with 16 MiB of text in a single
+# tools/call - 250x the budget every other tool respects, enough to blow a model's context and stall the
+# client's stdio transport. The host cap stays large so a legitimate big file still reads and reports.
+_MAX_FILE_TEXT = _MAX_TOTAL_TEXT
+_MAX_NAME = 200                   # chars of a client-supplied method/tool name echoed back in an error
+
 
 def _clip(s: str, n: int) -> str:
     """Bound a box-controlled string before it goes into the reply."""
@@ -191,13 +198,22 @@ class _Server:
             self._kernel = k
         return self._kernel
 
-    def close(self) -> None:
-        if self._kernel is not None:
+    def _drop_kernel(self) -> None:
+        """Tear the warm kernel down and forget it, so the next call respawns a fresh one.
+
+        Dropping the reference alone is NOT enough: ``Kernel`` has no ``__del__`` and registers no
+        ``weakref.finalize``; its only teardown is ``__exit__``, which kills the process group. Clearing
+        the attribute without it strands the interpreter child for the whole life of the MCP server, and
+        a session that keeps timing out would strand one per timeout."""
+        k, self._kernel = self._kernel, None
+        if k is not None:
             try:
-                self._kernel.__exit__(None, None, None)
+                k.__exit__(None, None, None)
             except Exception:
                 pass
-            self._kernel = None
+
+    def close(self) -> None:
+        self._drop_kernel()
         if self._sbx is not None:
             try:
                 self._sbx.__exit__(None, None, None)
@@ -225,6 +241,15 @@ class _Server:
         method = msg.get("method")
         mid = msg.get("id")
         is_request = mid is not None
+        if method in ("notifications/initialized", "initialized", "notifications/cancelled"):
+            return  # notifications: no response
+        if not is_request:
+            # JSON-RPC 2.0 section 4.1: a Notification carries no `id`, and the server MUST NOT reply to
+            # one. Every branch below answers, so the guard belongs HERE rather than inside each: without
+            # it a `tools/list` or `tools/call` sent without an id got `{"id": null, ...}` back, which a
+            # strict client may drop or surface as a protocol error. An explicit `"id": null` is not a
+            # valid request id either, so it takes the same path.
+            return
         if method == "initialize":
             # Negotiate, don't echo: always answer with the version WE implement, never a client-chosen
             # string (echoing an arbitrary version back can make a client assume features we lack).
@@ -233,11 +258,8 @@ class _Server:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "kern-sandbox", "version": __version__},
             })
-        elif method in ("notifications/initialized", "initialized", "notifications/cancelled"):
-            pass  # notifications: no response
         elif method == "ping":
-            if is_request:
-                self._result(mid, {})
+            self._result(mid, {})
         elif method == "tools/list":
             self._result(mid, {"tools": self._tools_view()})
         elif method == "resources/list":
@@ -246,8 +268,11 @@ class _Server:
             self._result(mid, {"prompts": []})
         elif method == "tools/call":
             self._tool_call(mid, msg.get("params") or {})
-        elif is_request:
-            self._error(mid, -32601, f"method not found: {method}")
+        else:
+            # Same amplification as the tool name: `method` is client-controlled and arrives inside a
+            # frame that may be _MAX_FRAME long, so it is clipped before it goes back out.
+            shown = _clip(method, _MAX_NAME) if isinstance(method, str) else repr(type(method).__name__)
+            self._error(mid, -32601, f"method not found: {shown}")
 
     def _tools_view(self) -> list:
         """The tool list. In warm-kernel mode, tell the client the truth: python state now PERSISTS
@@ -273,6 +298,14 @@ class _Server:
             self._error(mid, -32602, "params must be an object")
             return
         name = params.get("name")
+        # `name` is client-controlled SHAPE too, and it is used as a DICT KEY below. A JSON object or
+        # array arrives as an unhashable dict/list, so `_ARG_SPEC.get(name)` raises TypeError right here,
+        # OUTSIDE the try that wraps the real work - it escapes handle(), escapes the serve loop (which
+        # only catches KeyboardInterrupt/BrokenPipeError) and kills the whole connection. One malformed
+        # tools/call was enough to end the session for every later message.
+        if not isinstance(name, str):
+            self._error(mid, -32602, f"tool name must be a string, got {type(name).__name__}")
+            return
         args = params.get("arguments")
         if not isinstance(args, dict):
             args = {}
@@ -281,7 +314,9 @@ class _Server:
         # argument (nor leak a box-controlled key into a structured error message).
         spec = _ARG_SPEC.get(name)
         if spec is None:
-            self._error(mid, -32602, f"unknown tool: {name!r}")
+            # Clip before echoing: `name` is client-controlled and a frame may carry up to _MAX_FRAME,
+            # so an unclipped repr turns an 8 MB request into an 8 MB error reply.
+            self._error(mid, -32602, f"unknown tool: {_clip(name, _MAX_NAME)!r}")
             return
         for key, typ in spec.items():
             if key not in args:
@@ -298,7 +333,8 @@ class _Server:
                 content, is_err = [{"type": "text", "text": f"wrote {_clip(args['path'], 200)}"}], False
             elif name == "read_file":
                 data = self._session().read_file(args["path"], max_bytes=_READ_CAP)
-                content, is_err = [{"type": "text", "text": _clip(data.decode("utf-8", "replace"), _READ_CAP)}], False
+                text = _clip(data.decode("utf-8", "replace"), _MAX_FILE_TEXT)
+                content, is_err = [{"type": "text", "text": text}], False
             else:  # list_files (validated present in _ARG_SPEC)
                 # The box controls the workspace and can create millions of files; bound the listing by
                 # both COUNT and total size so it can't blow the reply up (the only tool without a cap).
@@ -338,11 +374,13 @@ class _Server:
                 r = self._get_kernel().run_code(code, **kw)
             except SandboxError:
                 # kernel was torn down by a prior timeout: respawn a fresh warm kernel and retry once.
-                self._kernel = None
+                # _drop_kernel, not `= None`: the old one may still be ALIVE here (a SandboxError does not
+                # prove the interpreter died), and nothing else would ever reap it.
+                self._drop_kernel()
                 r = self._get_kernel().run_code(code, **kw)
             if r.fault is not None:
                 # this cell tore the kernel down (timeout/kill); drop it so the NEXT call respawns warm.
-                self._kernel = None
+                self._drop_kernel()
         else:
             r = self._session().run_code(code, language=language, **kw)
         content: list = []
@@ -447,10 +485,24 @@ def main() -> None:
                 continue
             try:
                 msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # malformed frame: skip, keep serving
-            if isinstance(msg, dict):
+            except (ValueError, RecursionError):
+                # JSONDecodeError (a ValueError) is the ordinary malformed frame. RecursionError is the
+                # hostile one: `[`*100000 is SYNTACTICALLY valid, so the decoder recurses past the
+                # interpreter's limit and raises something that is NOT a JSONDecodeError. Caught only as
+                # JSONDecodeError, it escaped the loop and killed the connection - one frame, no reply to
+                # anything after it.
+                continue  # malformed or abusive frame: skip, keep serving
+            if not isinstance(msg, dict):
+                continue
+            try:
                 server.handle(msg)
+            except (KeyboardInterrupt, BrokenPipeError):
+                raise  # the client is gone or the operator interrupted: leave the loop, do not "recover"
+            except Exception:
+                # Defence in depth, not a substitute for the guards above. Every handler already contains
+                # its own failures, but this is a long-lived stdio service: an unforeseen bug on ONE
+                # message must cost that one reply, never the connection and every request after it.
+                traceback.print_exc(file=sys.stderr)
     except (KeyboardInterrupt, BrokenPipeError):
         pass  # client closed the pipe or Ctrl-C: shut down cleanly (nobody left to answer)
     finally:
