@@ -32,6 +32,41 @@ gracefully** when the precondition is absent.
 - **Security fixtures must be synthetic, minimal, and self-contained**: no private paths, no
   real-world exploit payloads. See `kern-oci`'s symlink-escape regression for the template.
 
+## Harness traps that have produced a wrong answer here
+
+Every entry below is a mistake this project actually made, caught only because something else
+contradicted it. They are listed as environment facts, not as advice, because each one produced a
+confident wrong answer first and a correction second.
+
+- **A green test proves nothing until you have seen it go red.** Sabotage the fix and watch the
+  test fail. If it stays green, either the test or the sabotage is blind, and you do not yet know
+  which.
+- **A sabotage needs its own positive control.** Leaking the outer `readline` in the MCP serve loop
+  left the memory test green and looked like a blind test. The flood is consumed by the *drain*
+  loop, so that sabotage never produced accumulation. Verify the sabotage broke the thing before
+  reading the test's verdict.
+- **`ru_maxrss` of a forked child inherits the parent's peak.** A test that holds the payload in a
+  Python string measures the *parent* and reports a number that scales beautifully with the input
+  while proving nothing. The control that exposes it: a child that reads nothing reports the same
+  figure. Hand the payload over as a file descriptor and compare two sizes, so the inherited
+  baseline cancels.
+- **A differential measurement needs both points on the plateau.** 25 MB against 400 MB spans a
+  ramp and reports real growth as if it were slack. Find the knee first, then pick two points past
+  it.
+- **`io.StringIO` does not exercise the encode path.** A lone-surrogate defect is invisible
+  in-process and appears only against a real subprocess, or against a stream whose `write` actually
+  encodes.
+- **Under `LC_ALL=C` a search for the em-dash U+2014 silently returns zero.** Use `C.UTF-8` and
+  prove the search works with a positive control that returns a known hit.
+- **Querying git history by a stale path answers for a file nobody has touched.** This repo has
+  moved files; verify the path is current before believing "last changed 10 months ago".
+- **`pgrep` without a unique marker matches your own shell.** Use a marker, and prove the detector
+  is looking with a canary process that must be found.
+- **Delete `__pycache__`, or use `python -B`, between sabotage runs.** A same-length, same-second
+  restore has already executed stale bytecode while `diff` reported no change.
+- **A gate's exit code is read bare.** Never through a pipe. See the `no-em-dash` and
+  `stale-numbers` invocations.
+
 ## Changing a flag or config key (deprecation policy)
 
 The CLI/config surface isn't frozen pre-1.0, but changes still must not break a user's scripts

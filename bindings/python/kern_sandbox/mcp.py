@@ -514,6 +514,17 @@ def main() -> None:
                 server.handle(msg)
             except (KeyboardInterrupt, BrokenPipeError):
                 raise  # the client is gone or the operator interrupted: leave the loop, do not "recover"
+            except MemoryError:
+                # Deliberately NOT contained. Answering a MemoryError means composing and writing a
+                # reply from a state where the allocator has just failed, so the next _send can die
+                # PART WAY THROUGH a frame and leave a truncated line on the wire. For a
+                # newline-delimited protocol that is the worst outcome available: the client parses
+                # half a message instead of seeing the connection close. Dying clean beats replying
+                # from a state that cannot hold. A client cannot reach this by flooding (peak RSS is
+                # flat at ~55 MB from 64 MB of input through 2 GB), so if it fires the pressure came
+                # from the host, another process or a cgroup limit, and this process is not the one
+                # that gets to decide it is fine.
+                raise
             except Exception:
                 # Defence in depth, not a substitute for the guards above. Every handler already contains
                 # its own failures, but this is a long-lived stdio service: an unforeseen bug on ONE

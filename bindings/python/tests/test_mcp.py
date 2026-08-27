@@ -968,6 +968,35 @@ def test_main_survives_a_handler_that_raises(monkeypatch):
     assert [r["id"] for r in replies] == [2]
 
 
+def test_memory_error_is_not_contained(monkeypatch):
+    """Every other exception on a message is contained so the connection survives. MemoryError is
+    deliberately not, and the reason is the wire rather than the process: answering it means
+    composing and writing a reply from a state where the allocator has just failed, so the next
+    _send can die PART WAY THROUGH a frame and leave a truncated line behind. For a
+    newline-delimited protocol that is the worst available outcome, because the client parses half a
+    message instead of seeing the connection close.
+
+    A client cannot reach this by flooding: peak RSS is flat at ~55 MB from 64 MB of input through
+    2 GB. If it fires, the pressure came from the host, and this process does not get to decide it
+    is fine."""
+    real = M._Server.handle
+
+    def hungry(self, msg):
+        if msg.get("id") == 1:
+            raise MemoryError("out of memory")
+        return real(self, msg)
+
+    monkeypatch.setattr(M._Server, "handle", hungry)
+    stdin = json.dumps(_req("ping", mid=1)) + "\n" + json.dumps(_req("ping", mid=2)) + "\n"
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setenv("KERN_BIN", _FAKE_KERN)
+    with pytest.raises(MemoryError):
+        M.main()
+    assert out.getvalue() == "", "nothing may reach the wire once the allocator has failed"
+
+
 def test_main_answers_pipelined_requests_in_order(monkeypatch):
     """A client is entitled to send several requests before reading any reply. The replies must all
     arrive, once each, in the order the requests were made."""
@@ -1176,6 +1205,27 @@ def test_real_write_file_refuses_to_escape_the_workspace(tmp_path):
     r = {x["id"]: x for x in _parse(p)}[2]
     assert r["result"]["isError"] is True
     assert not (tmp_path.parent / "escaped.txt").exists()
+
+
+@integration
+def test_real_pipelined_calls_all_get_answered_in_order(tmp_path):
+    """A client may send several tool calls before reading any reply, and one of them may be slow.
+    A single-threaded stdio server has no race to lose here, which is exactly why it is worth
+    pinning: every reply must arrive, once each, in request order, with a slow cell in the middle
+    and nothing but JSON on the wire."""
+    p = _mcp_exchange([
+        _req("initialize"),
+        _call("run_code", mid=2, code="import time; time.sleep(3); print('SLOW')"),
+        _call("run_code", mid=3, code="print('FAST')"),
+        _call("write_file", mid=4, path="a.txt", content="x"),
+        _req("ping", mid=5),
+    ], env={"KERN_MCP_WORKSPACE": str(tmp_path)})
+    replies = _parse(p)
+    assert [r["id"] for r in replies] == [1, 2, 3, 4, 5]
+    def text(i):
+        r = next(x for x in replies if x["id"] == i)
+        return "\n".join(c["text"] for c in r["result"]["content"] if c["type"] == "text")
+    assert "SLOW" in text(2) and "FAST" in text(3)
 
 
 @integration
