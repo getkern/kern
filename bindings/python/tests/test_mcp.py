@@ -1133,3 +1133,61 @@ def test_real_write_file_refuses_to_escape_the_workspace(tmp_path):
 def test_real_server_exits_cleanly_on_eof():
     p = _mcp_exchange([_req("initialize")])
     assert p.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# MEMORY - the framing bound, measured rather than asserted
+# ---------------------------------------------------------------------------
+
+
+def _peak_rss_mb_for_flood(tmp_path, megabytes):
+    """Run the real server with `megabytes` of newline-free input and return ITS peak RSS.
+
+    Two things here are deliberate and were both learned the hard way.
+
+    The payload is written to a FILE and handed over as a file descriptor, never held in this
+    process. subprocess forks, and a child's peak RSS starts at whatever the parent's was, so a test
+    that keeps the flood in a Python string measures the PARENT and reports a number that scales
+    beautifully with the flood size while proving nothing at all.
+
+    The caller compares two sizes rather than trusting one absolute number, because the inherited
+    baseline is still in there and only a DIFFERENCE cancels it out.
+    """
+    payload = tmp_path / f"flood-{megabytes}"
+    with payload.open("wb") as fh:
+        block = b"Q" * (1024 * 1024)
+        for _ in range(megabytes):
+            fh.write(block)
+        fh.write(b"\n")
+        fh.write(json.dumps(_req("ping", mid=999)).encode() + b"\n")
+    reporter = (
+        "import atexit,sys,runpy\n"
+        "def _hwm():\n"
+        "    for ln in open('/proc/self/status'):\n"
+        "        if ln.startswith('VmHWM:'): sys.stderr.write(ln)\n"
+        "atexit.register(_hwm)\n"
+        "runpy.run_module('kern_sandbox.mcp', run_name='__main__')\n"
+    )
+    with payload.open("rb") as fh:
+        p = subprocess.run([sys.executable, "-c", reporter], stdin=fh, capture_output=True,
+                           text=True, timeout=300, env=dict(os.environ, KERN_BIN=_FAKE_KERN))
+    served = any(json.loads(ln).get("id") == 999
+                 for ln in p.stdout.split("\n") if ln.strip())
+    hwm = next((int(ln.split()[1]) for ln in p.stderr.splitlines() if ln.startswith("VmHWM:")), None)
+    return hwm / 1024 if hwm is not None else None, served
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="no /proc/self/status")
+def test_a_newline_free_flood_does_not_grow_the_server(tmp_path):
+    """The serve loop claims a client flooding megabytes with no newline is read in bounded chunks
+    rather than buffered into host RAM. That is the one claim in this file that cannot be checked by
+    reading the code, because TextIOWrapper.readline(size) bounds the string it RETURNS and says
+    nothing about what it buffers while scanning for the newline.
+
+    Sixteen times the input for a 0.7 MB difference is the shape of a real bound. If the reader ever
+    accumulates, this fails by hundreds of megabytes, not by a rounding error."""
+    small, served_small = _peak_rss_mb_for_flood(tmp_path, 25)
+    large, served_large = _peak_rss_mb_for_flood(tmp_path, 400)
+    assert served_small and served_large, "the ping after the flood must still be answered"
+    assert small is not None and large is not None
+    assert large - small < 16, f"RSS grew {large - small:.1f} MB when the flood grew 16x"
