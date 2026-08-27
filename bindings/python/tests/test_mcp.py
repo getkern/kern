@@ -373,6 +373,43 @@ def test_wrong_argument_type(name, args, monkeypatch):
     assert r["error"]["code"] == -32602 and "must be str" in r["error"]["message"]
 
 
+@pytest.mark.parametrize("name,args", [
+    ("read_file", {"path": "\udfff"}),
+    ("write_file", {"path": "ok", "content": "a\ud800b"}),
+    ("write_file", {"path": "\ud800", "content": "ok"}),
+    ("run_code", {"code": "print(1)\ud800"}),
+])
+def test_lone_surrogate_argument_is_invalid_params(name, args, monkeypatch):
+    """JSON accepts "\\ud800" and Python's decoder hands back a str no UTF-8 encoder will take. Unchecked
+    it reached os.open() and the box argv and died there as UnicodeEncodeError, which the catch-all
+    reported to the model as "internal error": a malformed argument misfiled as a server bug."""
+    s = _server(_FakeSession())
+    r = _one(s, _call(name, **args), monkeypatch)
+    assert r["error"]["code"] == -32602
+    assert "surrogate" in r["error"]["message"]
+
+
+def test_ordinary_non_ascii_arguments_still_pass(monkeypatch):
+    """Counter-proof for the surrogate guard: it must reject only what cannot be encoded, never ordinary
+    Unicode. Rejecting "café" or an emoji would break every non-English user."""
+    sess = _FakeSession()
+    s = _server(sess)
+    path, body = "data/café.txt", "nothing ☕ to see 中文"
+    r = _one(s, _call("write_file", path=path, content=body), monkeypatch)
+    assert r["result"]["isError"] is False
+    assert sess.written == [(path, body)]
+
+
+def test_surrogate_in_the_tool_name_is_a_clean_error(monkeypatch):
+    """The name goes out through repr(), which escapes a surrogate instead of handing it to the encoder.
+    That is why it never crashed, and it is worth pinning so a switch to plain {name} does not
+    reintroduce the encode."""
+    s = _server()
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": "\ud800BAD", "arguments": {}}}
+    assert _one(s, msg, monkeypatch)["error"]["code"] == -32602
+
+
 def test_arguments_not_a_dict_becomes_missing_argument(monkeypatch):
     """`"arguments": "oops"` must not reach the binding as a string; it degrades to {} and then fails
     the required check, which is a clean -32602 rather than a TypeError deep in the SDK."""
@@ -835,6 +872,23 @@ def test_main_resyncs_after_an_oversize_frame(monkeypatch):
 
 def test_main_stops_at_eof(monkeypatch):
     assert _run_main("", monkeypatch) == ""
+
+
+def test_main_answers_a_last_frame_with_no_trailing_newline(monkeypatch):
+    """A client that closes the pipe straight after writing, without the final newline, has still sent
+    a complete message. Dropping it would lose the last request of every such session."""
+    raw = _run_main(json.dumps(_req("ping", mid=8)), monkeypatch)
+    assert _lines(raw)[0]["id"] == 8
+
+
+def test_main_skips_two_json_objects_concatenated_without_a_newline(monkeypatch):
+    """The transport is newline-delimited: two objects on one line are one malformed frame, not two
+    messages. Skipping is correct; parsing the first and silently discarding the second would be worse
+    than either."""
+    glued = json.dumps(_req("ping", mid=1)) + json.dumps(_req("ping", mid=2)) + "\n"
+    stdin = glued + json.dumps(_req("ping", mid=3)) + "\n"
+    replies = _lines(_run_main(stdin, monkeypatch))
+    assert [r["id"] for r in replies] == [3]
 
 
 def test_main_survives_deeply_nested_json(monkeypatch):

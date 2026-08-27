@@ -325,6 +325,18 @@ class _Server:
             if not isinstance(args[key], typ):
                 self._error(mid, -32602, f"argument {key!r} must be {typ.__name__}")
                 return
+            # JSON accepts a LONE SURROGATE ("\ud800"), and Python's decoder hands it back as a str that
+            # no UTF-8 encoder will take. Unchecked it travels all the way to os.open() / the box argv
+            # and dies there as UnicodeEncodeError, which the catch-all below reports to the model as
+            # "internal error" - a malformed argument misfiled as a server bug, with nothing the model
+            # can act on. isascii() is the fast path: it allocates nothing and no ASCII string can carry
+            # a surrogate, so only genuinely non-ASCII values pay for the encode.
+            if typ is str and not args[key].isascii():
+                try:
+                    args[key].encode("utf-8")
+                except UnicodeEncodeError:
+                    self._error(mid, -32602, f"argument {key!r} is not encodable UTF-8 (lone surrogate)")
+                    return
         try:
             if name == "run_code":
                 content, is_err = self._run_code(args)
