@@ -484,6 +484,13 @@ this policy adds:
   instructions. The middleware recovers by restarting the session, so the cost is one timeout plus the
   silent loss of everything the session had accumulated (`cd`, `export`, background processes).
 
+  It is worse than accumulated state, and the asymmetry is the reason: a `restart: true` payload
+  re-runs `startup_commands`, a timeout does not. So whatever a caller put there as a guard stops
+  applying. Measured on a stock 1.3.17 with no sandbox backend at all: `ulimit -f 100` comes back
+  `unlimited`, `umask 0077` comes back `0002`, and a `readonly` variable is gone and no longer
+  readonly, while the session keeps answering. Reported upstream as
+  [langchain-ai/langchain#39953](https://github.com/langchain-ai/langchain/issues/39953).
+
   **The model is told the command timed out, not that its state is gone**, and that is the part worth
   guarding against: a per-command message reads as "this one failed, the others did not", so the model
   carries on with relative paths that no longer resolve and credentials it no longer has. The next
