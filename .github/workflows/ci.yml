@@ -51,11 +51,20 @@ jobs:
         # The ONE pentest suite that can run here, and it runs for a reason rather than for a green
         # tick. The other four start boxes and the runner's AppArmor denies the userns `setgroups`
         # they need, so they live behind `pentest/run-all.sh` and a freshness stamp. This one needs
-        # no box: with no GPU on the runner it exits 0 having asserted the two things that hold on a
-        # GPU-less host, namely that doctor reports the absence instead of inventing a card, and that
-        # the claim-word matcher still catches an overstated string (the positive control, without
-        # which the whole gate could be silently vacuous). Battery B skips itself, and the suite's
-        # third exit code makes sure a skipped battery can never be read as a verified one.
+        # no box.
+        #
+        # It covers MORE here than expected. The runner has one virtual DRM card in `/sys/class/drm`
+        # and no `/dev/dri` node this user can open, so section A runs in full against a real card:
+        # 10 PASS on the first CI run, including A8, which asserts against strace that the GPU scan
+        # opens nothing under `/sys/class/drm` or `/proc/driver` for writing. That property was read
+        # on one x86 desktop before this step existed; now a second machine of a different shape
+        # checks it on every push. A3, the positive control that keeps the whole claim gate from
+        # going quietly vacuous, runs here too.
+        #
+        # Battery B skips itself for want of an openable device node, which is a host that cannot
+        # answer rather than a host that declined to, and the suite exits 0. It exits 3 only when
+        # entry points exist and none of them answers, which is the case where a green would be a
+        # lie. That distinction cost this step a red run before it was drawn correctly.
         run: sh pentest/pentest-gpu-claims.sh ./target/debug/kern
 
   workflow-lint:
