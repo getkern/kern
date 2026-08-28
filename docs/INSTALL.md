@@ -76,22 +76,26 @@ get the exe back, allow the folder the installer names in your antivirus and re-
 Throughout, `wsl -d kern -- kern ...` and the SDKs run inside the distro are unaffected.
 
 **🍎 macOS.** There is no native port and there will not be one: macOS has no namespaces and no
-cgroups, so there is nothing for kern to build a box out of. The installer says so and stops, rather
-than dropping a Linux binary on a Mac. kern does run **inside a Linux VM on a Mac**, and there it is
-the ordinary Linux kern, the same aarch64 binary and the same CLI as a Linux host:
+cgroups, so there is nothing for kern to build a box out of. kern does run **inside a Linux VM on a
+Mac**, and there it is the ordinary Linux kern, the same aarch64 binary and the same CLI as a Linux
+host.
+
+**Start by running the installer on the Mac. It will refuse, and the refusal is the instructions.**
 
 ```sh
-brew install colima   # or Lima, OrbStack, UTM, or the VM Docker Desktop already runs
-colima start
-colima ssh            # from here on you are on Linux, not macOS
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-**If this Mac already runs Docker Desktop or OrbStack, do not install a second VM.** Theirs is a
-Linux VM and kern runs in it, which costs nothing extra on a machine that keeps one up anyway:
+It looks for a Linux VM you already have (colima, Lima, OrbStack, Docker Desktop) before telling you
+to install anything, and prints the route for the one it finds. Nothing is downloaded on a Mac: the
+check happens before the first byte.
+
+**If it names a VM you already run, use that one.** A Mac that keeps Docker Desktop or OrbStack up is
+already running a Linux VM, and a second one buys nothing:
 
 ```sh
-docker run --rm -it --privileged --tmpfs /run ubuntu
+colima ssh                                              # colima, or: limactl shell <instance>
+docker run --rm -it --privileged --tmpfs /run ubuntu    # OrbStack / Docker Desktop
 # then, inside: curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
@@ -99,10 +103,18 @@ docker run --rm -it --privileged --tmpfs /run ubuntu
 `/proc`, which Docker's default masking refuses (`mount(proc) failed: Operation not permitted`,
 measured). On a Mac that privilege is inside Docker's own Linux VM, which is already the boundary
 against macOS. On a Linux host it is privilege on the real machine, so this recipe is a way to TRY
-kern rather than the way to run it there. The installer checks for these before telling you to
-install anything.
+kern rather than the way to run it there.
 
-**Verified** on a MacBook with Apple Silicon, colima 0.10.3, guest Ubuntu 24.04.4 aarch64: kern 0.7.0
+**If it finds none, install one.** colima is the smallest thing that works:
+
+```sh
+brew install colima
+colima start
+colima ssh            # from here on you are on Linux, not macOS
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+**Verified** on a MacBook with Apple Silicon, colima 0.10.3, guest Ubuntu 24.04.4 aarch64: kern
 installs, `kern box --image alpine` starts and runs, and the Python SDK drives it. That run also found
 the two things below, which every Mac following these steps will meet, so they are here rather than in
 an issue tracker.
