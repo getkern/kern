@@ -26,7 +26,13 @@ and some may never ship if they would change what kern is. Recently shipped work
   restarts. Feasible but gated: rootless CRIU needs a capability and suspending the seccomp filter, so it
   would be an explicit opt-in mode, not the default, and only for same-host, non-GPU boxes. Not committed.
 - **macOS.** No native port, and it is a non-goal: a daemonless kernel + cgroup sandbox has no macOS
-  equivalent. The only path considered is a thin shim over a Linux VM, the same shape as WSL2.
+  equivalent. That is not the same as "kern does not work on a Mac": inside a Linux VM the Mac already
+  runs the ordinary Linux kern, verified on Apple Silicon with an Ubuntu 24.04 guest, and
+  [docs/INSTALL.md](docs/INSTALL.md) has the two obstacles and the caveat about caps.
+  What is under consideration is only the convenience half, a thin shim so `kern` can be typed on the
+  macOS side instead of inside the VM, the same shape as `kern.exe` on Windows. Nothing about it would
+  reach a GPU: Apple exposes no compute device to a Linux guest, which is why Docker Desktop has no GPU
+  for containers either.
 
 **In progress**
 
