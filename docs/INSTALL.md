@@ -123,13 +123,24 @@ does not delegate the `memory` controller, so `--memory` and the pid cap are acc
 `kern doctor` prints the delegation state and `--require-limits` refuses to start uncapped rather than
 run a box that only looks capped.
 
-Getting the caps back is a property of the guest, not of kern. The shape here is WSL2's: a VM with no
-`systemd --user` manager, where the measured answer was to run kern as **uid 0 inside the VM**, and
-there the cap bites (a 128m box reads back `memory.max = 134217728`). Running as root inside a guest
-that is already a boundary against the Mac is a different posture from running as root on your laptop.
-The other route is to delegate the controller to the tree kern uses, which is what `kern doctor`
-prescribes. Neither has been measured on colima yet: what HAS been measured is that kern refuses to
-pretend, and says at every start that the box is uncapped. Two further warnings are
+Getting the caps back is a property of the guest, not of kern, and the mechanism is **delegation of
+the `memory` controller**, not privilege. That distinction was measured rather than assumed, in a
+guest built to have colima's exact shape (Ubuntu 24.04, no `systemd --user` manager, the same
+`doctor` warning): as **uid 0**, a 200 MiB write under `--memory 32m` still survived. Being root does
+not make a cap bite where the controller was never handed down. WSL2 is the counter-example that
+misleads here: kern runs as uid 0 there AND that kernel delegates, and it is the second half that
+does the work.
+
+So the route is the one `kern doctor` prints, run inside the VM as root:
+
+```sh
+echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+```
+
+Not yet measured on colima: the proxy above could not test it, because a container refuses that write
+while a real VM should allow it. Treat it as the thing to try, and `kern doctor` will tell you whether
+it took. What IS measured is that kern refuses to pretend either way, and says at every start that the
+box is uncapped. Two further warnings are
 worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
 user (redis, postgres, nginx), and `sudo apt install passt` for outbound networking from a pod.
 
