@@ -62,8 +62,13 @@ const PCI_VENDOR_INTEL: u32 = 0x8086;
 /// model's middle tier has no variant here because nothing can construct it: see the module header.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
-    /// A true hardware partition: NVIDIA MIG, or an SR-IOV virtual function. The cap is enforced by
-    /// the device, so it holds against a tenant that is actively trying to exceed it.
+    /// A hardware partition is present on this card: MIG instances, or an SR-IOV virtual function.
+    /// The split such a partition makes is enforced by the device rather than by the tenant, which
+    /// is what separates this tier from the one below it.
+    ///
+    /// It is a statement about the CARD, and a tenant is confined only if it was given the partition
+    /// rather than the whole device. kern cannot see which of the two happened, and says so in the
+    /// claim string rather than letting the tier imply it.
     Hw,
     /// A cooperative quota. Applies to a workload that does not evade it, and to nothing else.
     Soft,
@@ -97,10 +102,32 @@ pub fn overclaims(text: &str) -> Option<&'static str> {
 impl Tier {
     /// The claim string kern is entitled to emit for this tier. Contractual, not cosmetic: see
     /// `BOUNDARY_WORDS` below.
+    ///
+    /// THE HARDWARE TIER SAYS LESS THAN IT USED TO, AND THE REASON IS THE POINT OF THIS FILE. It
+    /// read "per-tenant VRAM enforced by the device", which asserts an ENFORCEMENT. What the
+    /// detector establishes is a TOPOLOGY: a `physfn` link means this is an SR-IOV virtual function,
+    /// and a `gi*` capability means MIG instances are configured. Neither is a measurement of the
+    /// memory split. That is exactly the reasoning that refuses to promote on a `dmem` controller
+    /// being present, applied by this module to every tier except the one nobody could test, which
+    /// is how the strongest claim in the file came to be the least supported. Reported by an
+    /// outside reader on 2026-08-28, against a claim written the same day.
+    ///
+    /// Two gaps are named in the string rather than left for a reader to discover:
+    ///
+    ///   * kern read the partition's PRESENCE and did not measure what it partitions;
+    ///   * the verdict is PER CARD and MIG partitions PER INSTANCE ASSIGNED. A tenant handed the
+    ///     whole device node on a MIG-configured card is not inside a GPU instance, and no property
+    ///     of the card can tell you which of the two a given tenant got.
+    ///
+    /// kern has never run on MIG or SR-IOV hardware, so this branch has no positive control
+    /// anywhere in the tree. A claim with no positive control is exactly the one to state narrowly.
     pub fn claim(self) -> &'static str {
         match self {
             Tier::Hw => {
-                "hardware-isolated vGPU (MIG or SR-IOV): per-tenant VRAM enforced by the device"
+                "hardware partition present (MIG instance or SR-IOV virtual function): the split is \
+                 enforced by the device and not by the tenant's cooperation. kern read its presence \
+                 from the kernel and has not measured the VRAM split itself, and a tenant given the \
+                 whole device rather than a partition is not inside one"
             }
             Tier::Soft => {
                 "cooperative VRAM quota: fairness, accidental-overcommit and accounting for \
@@ -165,6 +192,10 @@ pub enum Evidence {
     SriovVirtualFunction,
     /// MIG instances are configured FOR THIS CARD, matched by its PCI address, not merely present
     /// somewhere on the host.
+    ///
+    /// "Configured for this card" is the whole of it. MIG partitions per GPU INSTANCE, and which
+    /// instance a tenant ends up in is decided by the capability and device nodes it is handed, none
+    /// of which is a property of the card and none of which kern hands out.
     MigInstance,
     /// Nothing that grants a stronger tier was found. Worded as "device-level" and not as
     /// "hardware" because the claim gate below refuses the reserved vocabulary on a
@@ -340,10 +371,21 @@ fn mig_instances_for_card(device_dir: &Path) -> bool {
 /// middle tier, and that absence is the honest encoding of a measurement that failed rather than an
 /// oversight. See the module header.
 fn classify(device_dir: &Path, vendor: Vendor) -> (Tier, Evidence) {
-    // An SR-IOV virtual function carries a `physfn` link back to the physical function that
-    // created it. This is unambiguous and vendor-neutral: if kern is looking at a VF, the
-    // partitioning was done by the device, not by kern.
-    if device_dir.join("physfn").exists() {
+    // An SR-IOV virtual function carries a `physfn` LINK back to the physical function that created
+    // it. Vendor-neutral, and made by the kernel rather than by kern.
+    //
+    // A symlink, not merely a path that exists. The kernel creates `physfn` as a symlink and only on
+    // a VF, so on real sysfs the two tests agree; they part company on anything that is not real
+    // sysfs, and this is the branch that awards the strongest tier in the file. Requiring the shape
+    // the kernel actually produces costs one syscall and means a plain file called `physfn` cannot
+    // promote a card. Raised by an outside reader who noticed the unit test was passing an empty
+    // FILE, which said the check was looser than the thing it claims to detect.
+    if device_dir
+        .join("physfn")
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
         return (Tier::Hw, Evidence::SriovVirtualFunction);
     }
     // MIG is NVIDIA-only. The vendor test comes first so kern does not walk the NVIDIA proc tree for
@@ -465,24 +507,51 @@ mod tests {
     /// THE GATE THIS MODULE EXISTS FOR. Every string kern can print about a non-hardware tier is
     /// checked against the reserved vocabulary. Written over the `match` rather than over one
     /// hand-listed string, so a tier added later is covered without anyone remembering to add it.
+    ///
+    /// The hardware tier is PERMITTED the vocabulary and is not required to use it. It used to be
+    /// required, as a guard against the gate going vacuous, and that requirement was pressure in the
+    /// wrong direction: it made the strongest string in the file the one the test pushed to stay
+    /// strong. The guard against a vacuous gate belongs in a positive control, which is the next
+    /// test, and not in a rule that rewards an assertive claim.
     #[test]
-    fn only_hardware_tier_may_use_boundary_words() {
+    fn no_tier_below_hardware_may_use_boundary_words() {
         for tier in [Tier::Hw, Tier::Soft] {
             let text = format!("{} {}", tier.label(), tier.claim());
-            match tier {
-                Tier::Hw => assert!(
-                    overclaims(&text).is_some(),
-                    "the hardware tier is the one that MAY claim a boundary, and its claim no \
-                     longer does. If that is intentional the gate below is now vacuous: {text}"
-                ),
-                Tier::Soft => assert_eq!(
-                    overclaims(&text),
-                    None,
-                    "tier {} claims a boundary it does not have: {text}",
-                    tier.label()
-                ),
+            if tier == Tier::Hw {
+                continue;
             }
+            assert_eq!(
+                overclaims(&text),
+                None,
+                "tier {} claims a boundary it does not have: {text}",
+                tier.label()
+            );
         }
+    }
+
+    /// The hardware tier may claim a boundary, and it may not claim to have MEASURED one.
+    ///
+    /// `physfn` proves this is an SR-IOV virtual function and `gi*` proves MIG instances exist. What
+    /// neither proves is the VRAM split, and the claim said "per-tenant VRAM enforced by the device"
+    /// until an outside reader pointed out that this is the same "present therefore enforcing" step
+    /// the module refuses everywhere else. Both caveats are pinned here so an edit that drops one
+    /// fails the build instead of quietly restoring the overstatement.
+    #[test]
+    fn the_hardware_claim_names_what_it_did_not_measure() {
+        let c = Tier::Hw.claim();
+        assert!(
+            c.contains("has not measured the VRAM split"),
+            "the hardware claim no longer says kern did not measure the split: {c}"
+        );
+        assert!(
+            c.contains("whole device rather than a partition is not inside one"),
+            "the hardware claim no longer warns that a per-card verdict is not a per-tenant one: {c}"
+        );
+        assert!(
+            !c.contains("enforced by the device")
+                || c.contains("the split is enforced by the device"),
+            "the claim asserts an enforcement kern has not measured: {c}"
+        );
     }
 
     /// The gate has to be able to FAIL, or a green result proves nothing. Positive control.
@@ -515,11 +584,41 @@ mod tests {
     // ── classification ──
 
     /// An SR-IOV virtual function is the one vendor-neutral hardware partition kern can see, and it
-    /// is a link the kernel creates, so its presence is the whole test.
+    /// is a LINK the kernel creates, so the fixture is a link.
+    ///
+    /// It used to be an empty file, and the check used to be `Path::exists`, which is how the two
+    /// stayed in agreement while both were looser than the kernel's own shape. A test that builds a
+    /// fixture the kernel would never produce is testing the code against itself.
     #[test]
-    fn physfn_link_promotes_to_hardware_tier() {
+    fn a_physfn_symlink_promotes_to_the_hardware_tier() {
         let d = TmpDir::new("physfn");
+        std::os::unix::fs::symlink("../0000:01:00.0", d.0.join("physfn")).expect("symlink physfn");
+        assert_eq!(
+            classify(&d.0, Vendor::Amd),
+            (Tier::Hw, Evidence::SriovVirtualFunction)
+        );
+    }
+
+    /// And a plain file of the same name does not, which is the half that was missing.
+    #[test]
+    fn a_physfn_that_is_not_a_link_does_not_promote() {
+        let d = TmpDir::new("physfn-file");
         std::fs::write(d.0.join("physfn"), "").expect("write physfn");
+        assert_eq!(
+            classify(&d.0, Vendor::Amd),
+            (Tier::Soft, Evidence::NoPartitionFound),
+            "a regular file named physfn promoted a card to the hardware tier"
+        );
+    }
+
+    /// A dangling link still promotes, and that is deliberate rather than an oversight. sysfs
+    /// `physfn` targets a sibling device directory; a target that cannot be resolved from wherever
+    /// the process happens to stand is a resolution failure, not evidence that the card is not a
+    /// virtual function. The test states the choice so the next reader does not have to guess it.
+    #[test]
+    fn a_dangling_physfn_link_still_counts_as_a_virtual_function() {
+        let d = TmpDir::new("physfn-dangling");
+        std::os::unix::fs::symlink("/nonexistent/pci/device", d.0.join("physfn")).expect("symlink");
         assert_eq!(
             classify(&d.0, Vendor::Amd),
             (Tier::Hw, Evidence::SriovVirtualFunction)

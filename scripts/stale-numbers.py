@@ -398,18 +398,33 @@ def gpu_claims_agree() -> list[str]:
                         f"The tiers the code emits are {', '.join(sorted(labels))}"
                     )
 
-    soft = _rust_string_literal_after(src, "Tier::Soft => {")
-    marker = "NOT a boundary against malicious code"
-    if marker not in soft:
-        bad.append(
-            "crates/kern-cli/src/gpu.rs: the cooperative tier's claim no longer contains "
-            f"{marker!r}. If that is deliberate, update this gate and both pages with it."
-        )
-    else:
+    # Both tiers carry a caveat that a later edit could smooth away, and the two caveats fail in
+    # opposite directions: dropping the cooperative one understates the danger, dropping the hardware
+    # one overstates the guarantee. The second is the one that actually happened. `Tier::Hw` claimed
+    # "per-tenant VRAM enforced by the device" from evidence that is purely topological, which an
+    # outside reader caught on 2026-08-28; it is pinned here so the narrower wording cannot drift
+    # back without failing the build.
+    for arm, marker, page_required in (
+        ("Tier::Soft => {", "NOT a boundary against malicious code", True),
+        ("Tier::Hw => {", "has not measured the VRAM split", True),
+    ):
+        claim = _rust_string_literal_after(src, arm)
+        if marker not in claim:
+            bad.append(
+                f"crates/kern-cli/src/gpu.rs: the claim for {arm.split(' ')[0]} no longer contains "
+                f"{marker!r}. If that is deliberate, update this gate and both pages with it."
+            )
+            continue
+        if not page_required:
+            continue
         for path in ("README.md", "SECURITY.md"):
             try:
                 text = open(path, encoding="utf-8").read()
             except OSError:
+                continue
+            # The README states only the cooperative half, which is the half a reader meets first;
+            # SECURITY.md is the page that owns both, so only it is held to the hardware caveat.
+            if marker == "has not measured the VRAM split" and path == "README.md":
                 continue
             if marker.lower() not in text.lower():
                 bad.append(

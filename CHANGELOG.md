@@ -15,6 +15,28 @@ is in the git history.
 
 ### Added
 
+- **The hardware tier now claims what it proved, after an outside review caught it claiming more.**
+  `TIER-HW` read "per-tenant VRAM enforced by the device", which asserts an ENFORCEMENT. What the
+  detector establishes is a TOPOLOGY: a `physfn` link means an SR-IOV virtual function, a `gi*`
+  capability means MIG instances are configured, and neither is a measurement of the memory split.
+  That is the same "present therefore enforcing" step this model refuses when it declines to promote
+  a card for merely having a `dmem` controller, so the strongest claim in the file was the least
+  supported, on the one branch that has no positive control anywhere in the tree because kern has
+  never run on MIG or SR-IOV hardware.
+
+  The string now names both gaps: that kern read the partition's presence and did not measure the
+  split, and that the verdict is per CARD while MIG partitions per INSTANCE ASSIGNED, so a tenant
+  handed the whole device node on a MIG-configured card is not inside a GPU instance. `stale-numbers`
+  pins the new wording in the code and in SECURITY.md, verified by sabotaging each.
+
+  Two smaller corrections from the same review. The `physfn` test required only that the path EXIST,
+  and the unit test fed it an empty regular file, so the check and its fixture agreed with each other
+  while both were looser than sysfs: it now requires the symlink the kernel actually creates, with a
+  test for the file case and one recording that a dangling link still counts. And SECURITY.md claimed
+  "no userspace mechanism" passes the raw-ioctl test, which is too wide: what fails is a userspace
+  VRAM QUOTA. Refusing the device outright, by not binding `/dev/nvidia*`, `/dev/dri/*` or
+  `/dev/kfd` into the box or by filtering `ioctl` on them, is userspace policy and does hold. A box
+  with no GPU is contained; a box with a GPU and a number attached to it is not.
 - **A fifth adversarial suite, and it publishes a defeat.**
   [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) attacks a claim rather than a
   mechanism: kern slices no GPU, so there is no cap here to break, and what is under test is whether

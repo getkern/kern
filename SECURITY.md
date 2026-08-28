@@ -467,9 +467,24 @@ worth, and this section is the evidence behind that line. The judgement ships ah
 capability on purpose: if the cap shipped first, it would be sold as a boundary for however long the
 description took to catch up.
 
-**TIER-HW** is a partition the device enforces: an SR-IOV virtual function, or MIG instances
-configured for that card. The cap holds against a tenant actively trying to exceed it, because it is
-not the tenant's software that enforces it.
+**TIER-HW** means a hardware partition is present on that card: an SR-IOV virtual function, or MIG
+instances configured for it. The split such a partition makes is enforced by the device rather than
+by the tenant's software, which is what separates this tier from the one below.
+
+Read the tier for exactly that, because kern establishes it from TOPOLOGY and not from a measurement.
+A `physfn` link says this is a virtual function; a `gi*` capability says MIG instances exist. The line
+kern prints says so in those words: it *has not measured the VRAM split* itself. This branch also has
+no positive control anywhere in the tree,
+because kern has never run on MIG or SR-IOV hardware. The claim string names both gaps rather than
+leaving them for a reader to find. The second one is the sharper of the two: the verdict is PER CARD
+and MIG partitions PER INSTANCE ASSIGNED, so a tenant handed the whole device node on a
+MIG-configured card is not inside a GPU instance, and nothing about the card can tell you which of
+the two a given tenant got. That is the operator's job, and kern does not do it.
+
+This paragraph is narrower than the one it replaces, which said "per-tenant VRAM enforced by the
+device". An outside reader pointed out that asserting an enforcement from the presence of a partition
+is the same step this model refuses when it declines to promote a card for having a `dmem`
+controller, and they were right: it was the strongest claim in the section and the least supported.
 
 **TIER-SOFT** is everything else, which on consumer hardware is everything. It is a cooperative
 quota: real and useful for density, fairness, accidental overcommit and accounting across trusted and
@@ -522,9 +537,16 @@ calls. That only holds if the workload has to go through it, and it does not.
 A seccomp filter is not the alternative either, and this part is reasoning rather than a
 measurement made here: on the NVIDIA driver the allocation is committed by a fault serviced in the
 kernel and on the GPU's own controller, so there is no syscall carrying the size for a filter to
-inspect. Nothing above is load-bearing on that sentence. The raw-ioctl result alone settles it, and
-it is a property of the problem rather than a defect above the kernel: no userspace mechanism passes
-that test, whoever writes it.
+inspect. Nothing above is load-bearing on that sentence; the raw-ioctl result settles the argument on
+its own.
+
+Be precise about what that argument covers, because the earlier wording here was not. It says: no
+userspace VRAM QUOTA can be a boundary. A quota lets the workload use the GPU and limits how much of
+it. What CAN hold, and is not a quota, is refusing the device outright: not binding
+`/dev/nvidia*`, `/dev/dri/*` or `/dev/kfd` into the box at all, or filtering `ioctl` on those
+descriptors with seccomp. Those are all-or-nothing, they are userspace policy, and they work, which
+is why the previous claim that "no userspace mechanism" passes the test was too wide. A box with no
+GPU is contained. A box with a GPU and a number attached to it is not.
 
 Run it: [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) with
 [`pentest/gpu-raw-ioctl.c`](pentest/gpu-raw-ioctl.c), T1 to T9, plus the checks that kern's own line
