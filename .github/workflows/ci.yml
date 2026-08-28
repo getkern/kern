@@ -191,8 +191,23 @@ jobs:
       - name: doctor says whether boxes will run here
         continue-on-error: true
         run: ./target/debug/kern doctor
-      - name: bring the stack up
-        run: ./target/debug/kern compose examples/compose-webstack.toml up
+      - name: bring the stack up, and prove the health gate actually gated
+        # The published page says "the cache was healthy first", and that string is printed by the web
+        # service unconditionally: asserting on it proves a page was served, not that anything waited.
+        # compose's own output is the observable that cannot be faked by the example, so require the
+        # line where it says it is holding the second service for the first one's health probe.
+        run: |
+          # The gate stays BARE: piping into `tee` would hand the step tee's exit status and a failed
+          # `compose up` would read as a pass. Capture first, show second, assert third.
+          ./target/debug/kern compose examples/compose-webstack.toml up > /tmp/up.log 2>&1 || {
+            cat /tmp/up.log >&2; exit 1
+          }
+          cat /tmp/up.log
+          grep -q "waiting for" /tmp/up.log || {
+            echo "compose started the stack without ever waiting on the health gate" >&2
+            cat /tmp/up.log >&2
+            exit 1
+          }
       - name: the published port answers, and says the cache was healthy first
         run: |
           for _ in $(seq 30); do

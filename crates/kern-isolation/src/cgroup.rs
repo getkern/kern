@@ -667,7 +667,13 @@ fn probe_child_cap(dir: &std::path::Path) -> bool {
     if fs::create_dir(&child).is_err() {
         return false;
     }
-    let ok = child.join("memory.max").exists();
+    // WRITE AND READ BACK, not "does the interface file exist". The file appearing already means the
+    // controller is in the parent's `subtree_control` (cgroup v2 creates it only then), so existence
+    // answers the delegation question - but this codebase has been bitten by a write that is accepted
+    // and does not bind, which is why `wrote_real_limit` exists and why doctor's own probe writes.
+    // Asking a weaker question here than doctor asks about the same host is how the two surfaces
+    // drifted apart in the first place.
+    let ok = wrote_real_limit(&child.join("memory.max"), CAP_PROBE_BYTES);
     let _ = fs::remove_dir(&child);
     ok
 }

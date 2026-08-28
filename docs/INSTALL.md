@@ -268,7 +268,7 @@ architectures; building from source stays supported and produces the larger figu
 | NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated (board) |
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
-| macOS, **inside a Linux VM** (colima / Lima / OrbStack / UTM) | aarch64 | ✅ verified by hand, caps not enforced on a default guest ([notes](#install)) |
+| macOS, **inside a Linux VM** | aarch64 | ✅ verified by hand on **colima** (Lima / OrbStack / UTM are the same shape, untested), caps not enforced on a default guest ([notes](#install)) |
 
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux
