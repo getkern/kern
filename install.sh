@@ -33,8 +33,11 @@ case "$os" in
       command -v "$vm" >/dev/null 2>&1 && have="$have $vm"
     done
     if [ -n "$have" ]; then
-      route="This Mac has a Linux VM installed (${have# }). If it is running, use it
-  rather than installing a second one:
+      # Presence, not function, and deliberately: `docker info` on a Mac whose Docker Desktop is not
+      # running can take seconds, and this is an ERROR path that has already failed the user once.
+      # So the message never claims the VM is up, it says what to do in either case.
+      route="This Mac has a Linux VM installed (${have# }). Start it if it is not running, and use
+  it rather than installing a second one:
 
       colima ssh            # colima. For Lima: limactl shell <instance>
       docker run --rm -it --privileged --tmpfs /run ubuntu   # OrbStack / Docker Desktop
