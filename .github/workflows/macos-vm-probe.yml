@@ -30,7 +30,12 @@ jobs:
       - name: try to start a Linux VM
         id: start
         continue-on-error: true
-        run: colima start --cpu 2 --memory 4
+        # `--runtime containerd` rather than the default: colima's default runtime is docker and it
+        # refuses to start at all when the docker CLI is absent, which a hosted runner's is. The first
+        # run of this probe hit exactly that and reported "cannot hold a VM", a dependency check
+        # mistaken for a hypervisor verdict. The VM is all this asks about, so the runtime inside it
+        # is beside the point.
+        run: colima start --runtime containerd --cpu 2 --memory 4
       - name: if it started, is it Linux, and does kern run in it
         if: steps.start.outcome == 'success'
         run: |
@@ -49,5 +54,7 @@ jobs:
           if [ "${{ steps.start.outcome }}" = "success" ]; then
             echo "A hosted Mac CAN hold a Linux VM. The end-to-end Mac check can be automated."
           else
-            echo "A hosted Mac CANNOT hold a Linux VM. The end-to-end check needs real hardware."
+            echo "colima did not start. READ THE LOG BEFORE CONCLUDING ANYTHING: a missing"
+            echo "dependency, a download, or a timeout are not a hypervisor verdict. Only a"
+            echo "failure inside the VM's own boot is evidence about nested virtualization."
           fi
