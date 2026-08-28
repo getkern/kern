@@ -13,6 +13,10 @@ is in the git history.
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.7.1 - 2026-08-28
+
 ### Added
 
 - **Final validation: eight sentences narrowed to their measurement, and one suite moved out of the

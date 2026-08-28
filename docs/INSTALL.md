@@ -154,11 +154,12 @@ echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
 
 Two things about that command. It is refused while any process sits in the cgroup you are writing to,
 which is cgroup v2's no-internal-process rule and not a permission problem: move them into a child
-first. And with the RELEASED binary the delegation alone was not enough, because kern's box path only
-took the cgroup a systemd user manager handed it; that is fixed on `main` and ships in the next
-release, after which a delegated guest caps for real (measured in a guest of this exact shape: a
-200 MiB write under `--memory 32m` is killed where it used to survive). Either way kern refuses to
-pretend, and says at every start whether the box is capped. Two further warnings are
+first. And until v0.7.1 the delegation alone was not enough, because kern's box path took only the
+cgroup a systemd user manager handed it: **from v0.7.1 a delegated guest caps for real**, measured in
+a guest of this exact shape and again against the published binary (`memory.max` reads back, and
+400 MiB under `--memory 64m` is killed where it used to survive). On an older binary the delegation
+is necessary and not sufficient. Either way kern refuses to pretend, and says at every start whether
+the box is capped. Two further warnings are
 worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
 user (redis, postgres, nginx), and `sudo apt install passt` for outbound networking from a pod.
 
