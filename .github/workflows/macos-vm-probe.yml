@@ -36,6 +36,18 @@ jobs:
         # mistaken for a hypervisor verdict. The VM is all this asks about, so the runtime inside it
         # is beside the point.
         run: colima start --runtime containerd --cpu 2 --memory 4
+      - name: what the guest's own boot said
+        if: steps.start.outcome != 'success'
+        # The run above dies at `Starting VZ` with a status line and a hint, and the hint is where
+        # the actual reason lives. Without these two files the conclusion would again be a guess
+        # about nested virtualization dressed as a finding.
+        run: |
+          for f in ~/.colima/_lima/colima/ha.stderr.log ~/.colima/_lima/colima/serial*.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f"
+            tail -60 "$f"
+          done
+
       - name: if it started, is it Linux, and does kern run in it
         if: steps.start.outcome == 'success'
         run: |
