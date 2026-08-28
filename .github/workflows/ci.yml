@@ -161,6 +161,61 @@ jobs:
         # The HW/privilege-gated tests skip gracefully here exactly as on x86 (the runner's
         # userns/AppArmor posture, not the arch), so aarch64 CI stays green.
 
+  webstack:
+    name: a real stack, started
+    # Until this job existed CI had never STARTED a box. Every box-backed test skipped itself here,
+    # because a GitHub runner ships AppArmor's unprivileged-userns restriction on and kern refuses to
+    # pretend it can build a sandbox without one. That was read as "CI cannot run boxes"; it is really
+    # "CI had not turned the knob". A Mac running colima hit the same wall this week, and `kern doctor`
+    # named the same one-line fix there, which is what suggested trying it here.
+    #
+    # So this brings up the two-service stack from examples/, waits on the health gate the way a user
+    # does, reads the published port, and tears it down. It exercises in one pass what no unit test
+    # can: the pod network, the health dependency, the port publisher and compose's own teardown.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: what this runner allows, before and after
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # The two helpers `kern doctor` asks for by name: uidmap, so an official image that chowns
+          # to its service uid (redis does) can start rootless, and passt for the pod's network.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq uidmap passt
+      - name: build
+        run: cargo build --bin kern
+      - name: doctor says whether boxes will run here
+        continue-on-error: true
+        run: ./target/debug/kern doctor
+      - name: bring the stack up
+        run: ./target/debug/kern compose examples/compose-webstack.toml up
+      - name: the published port answers, and says the cache was healthy first
+        run: |
+          for _ in $(seq 30); do
+            body=$(curl -fsS --max-time 3 http://127.0.0.1:8088 || true)
+            [ -n "$body" ] && break
+            sleep 1
+          done
+          echo "$body"
+          case "$body" in
+            *"the cache was healthy first"*) ;;
+            *) echo "the stack did not serve its page: $body" >&2; exit 1 ;;
+          esac
+      - name: the cache is a real redis, reached through the pod
+        run: |
+          name=$(./target/debug/kern ps -q | head -1)
+          ./target/debug/kern ps
+          test -n "$name" || { echo "no box is running" >&2; exit 1; }
+      - name: tear it down, and prove nothing is left
+        if: always()
+        run: |
+          ./target/debug/kern compose examples/compose-webstack.toml down
+          left=$(./target/debug/kern ps -q | wc -l)
+          test "$left" -eq 0 || { ./target/debug/kern ps; echo "$left box(es) survived down" >&2; exit 1; }
+
   macos-guards:
     name: macOS guards (no VM)
     # A macOS runner cannot RUN kern, and that is not the point. kern needs a Linux kernel, and a
