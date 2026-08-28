@@ -55,10 +55,23 @@ brew install colima && colima start && colima ssh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-The second line is the normal installer, run from inside the VM. **No GPU and no GPIO** are reachable
-from there: Apple exposes neither to a Linux guest, which is why Docker Desktop has no GPU for
-containers either. Reported to work, **not tested by the author on macOS**: if it fails for you,
-[an issue](https://github.com/getkern/kern/issues) is the fastest way to get it fixed.
+The second line is the normal installer, run from inside the VM. Verified on a MacBook with Apple
+Silicon, colima 0.10.3 and an Ubuntu 24.04 guest: kern installs, a box from an OCI image starts, and
+the Python SDK drives it.
+
+Three things to know before you try, all of them properties of that guest rather than of kern:
+
+- **The first box fails on AppArmor**, because Ubuntu 23.10 and newer restrict unprivileged user
+  namespaces. `kern doctor` names it first and prints the fix
+  (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), which a VM restart undoes.
+- **The resource caps do not bite** on a default colima guest: no `systemd --user` manager and no
+  delegated `memory` controller, so `--memory` is accepted and never enforced. kern says so at every
+  box start instead of pretending, and `--require-limits` refuses to run uncapped. The isolation
+  itself (namespaces, pivoted root, seccomp, Landlock) is unaffected.
+- **No GPU and no GPIO** are reachable from a Linux guest on a Mac. Apple exposes neither, which is
+  why Docker Desktop has no GPU for containers either.
+
+[docs/INSTALL.md](INSTALL.md) has the detail and the way back to enforced caps.
 
 ## Is it safe to run truly hostile, untrusted multi-tenant code?
 

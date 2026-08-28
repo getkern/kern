@@ -87,19 +87,61 @@ colima ssh            # from here on you are on Linux, not macOS
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-Two limits, stated where the feature is and not in a footnote. **No GPU and no GPIO** are reachable
-from a Linux guest on a Mac: Apple's `VZVirtioGraphicsDeviceConfiguration` gives the guest a display,
-not a compute device, which is the same reason Docker Desktop has no GPU for containers. And the cap
-you get is enforced by the Linux kernel **inside the VM**, so the VM's own size is the outer ceiling:
-size it for what you intend to run.
+**Verified** on a MacBook with Apple Silicon, colima 0.10.3, guest Ubuntu 24.04.4 aarch64: kern 0.7.0
+installs, `kern box --image alpine` starts and runs, and the Python SDK drives it. That run also found
+the two things below, which every Mac following these steps will meet, so they are here rather than in
+an issue tracker.
+
+**1. The box will fail once, on AppArmor.** colima's guest is Ubuntu, and Ubuntu 23.10 and newer
+restrict unprivileged user namespaces, so the first `kern box` stops with a message naming exactly
+that policy. `kern doctor` lists it first, with the same fix:
+
+```sh
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+That value is reset by a VM restart. Make it stick, INSIDE the VM, only if you accept relaxing a
+kernel protection there (the Mac itself is untouched either way):
+
+```sh
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/99-kern.conf
+```
+
+**2. DNS may be broken in the guest while IP works fine.** If `curl` cannot resolve a name but
+`ping 1.1.1.1` answers, `/etc/resolv.conf` is a symlink to a `systemd-resolved` path that does not
+exist, because that service is inactive there. Writing to it fails with a misleading
+`Directory nonexistent`. Remove the dangling link first:
+
+```sh
+sudo rm -f /etc/resolv.conf && sudo sh -c 'echo "nameserver 1.1.1.1" > /etc/resolv.conf'
+```
+
+**What holds there, and what does not.** The isolation is the real one: namespaces, the pivoted root,
+the seccomp allowlist, Landlock. The **resource caps are not enforced** on a default colima guest, and
+kern says so at every box start rather than pretending: that VM has no `systemd --user` manager and
+does not delegate the `memory` controller, so `--memory` and the pid cap are accepted and never bite.
+`kern doctor` prints the delegation state and `--require-limits` refuses to start uncapped rather than
+run a box that only looks capped.
+
+Getting the caps back is a property of the guest, not of kern. The shape here is WSL2's: a VM with no
+`systemd --user` manager, where the measured answer was to run kern as **uid 0 inside the VM**, and
+there the cap bites (a 128m box reads back `memory.max = 134217728`). Running as root inside a guest
+that is already a boundary against the Mac is a different posture from running as root on your laptop.
+The other route is to delegate the controller to the tree kern uses, which is what `kern doctor`
+prescribes. Neither has been measured on colima yet: what HAS been measured is that kern refuses to
+pretend, and says at every start that the box is uncapped. Two further warnings are
+worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
+user (redis, postgres, nginx), and `sudo apt install passt` for outbound networking from a pod.
+
+**No GPU and no GPIO** are reachable from a Linux guest on a Mac. Apple's
+`VZVirtioGraphicsDeviceConfiguration` gives that guest a display, not a compute device, which is the
+same reason Docker Desktop has no GPU for containers and why podman had to leave that framework to get
+one. It is not a gap in kern and no VM setting changes it.
 
 The right way to read this is the Windows advice one section up: run kern **inside** the VM. Crossing
 from the macOS side costs more per command than the box does, exactly as `wsl.exe` does on Windows.
 No macOS figure is published here because none has been measured; when one is, it will name what is
 kern's work and what is the crossing, like the Windows table does.
-
-Reported to work, **not tested by the author on macOS**. If it fails on yours,
-[open an issue](https://github.com/getkern/kern/issues).
 
 **From source** (the route that needs no trust in a published artifact):
 
