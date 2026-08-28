@@ -220,7 +220,15 @@ fn validate_net(host: &str, path: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The staging mountpoint for one network volume.
+///
+/// DIVERGENT RESOLVER, and it is named as one. Every other registry child is resolved by
+/// `registry::runtime_subdir`; this one interpolates its own path because it needs a per-process,
+/// per-index leaf under `mounts/` rather than the directory itself. The chokepoint below is on the
+/// NAME and not on the resolution, which is exactly why it can be called from a function that
+/// resolves differently.
 fn net_staging(idx: usize) -> String {
+    crate::registry::assert_registry_child("mounts"); // classification chokepoint (see registry.rs)
     let uid = unsafe { libc::getuid() };
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(|d| d.to_string_lossy().into_owned())

@@ -167,7 +167,25 @@ def main() -> int:
     # root the registry `-v` guard does not cover, so it is not a bypass.
     runtime_kern = re.compile(r"XDG_RUNTIME_DIR|/run/user/")
     sibling_root = re.compile(r"XDG_DATA_HOME|XDG_CACHE_HOME|\.local/share|\.cache")
-    kern_join = re.compile(r'\.join\("kern|"kern/')
+    # `.join("kern"` with the CLOSING QUOTE, not `.join("kern` as a prefix. The prefix form matched
+    # any join whose argument merely STARTS with `kern`, so `<runtime>/kern-vgpu/`, which is a
+    # SIBLING of the registry root and not a child of it, tripped a gate that exists to classify
+    # children. That is a false positive, and this file records elsewhere what happens to a gate that
+    # produces them: it gets switched off. `"kern/` still catches the embedded-path form
+    # (`format!("{root}/kern/{leaf}")`), which is the shape rule 3 was written for.
+    # THREE FORMS, and the third was missing while the comment above claimed it. `.join("kern"` with
+    # the closing quote catches the joined form; `"kern/` catches a literal path that STARTS with it;
+    # `}/kern/` catches the interpolated form, `format!("{root}/kern/{leaf}")`, which rule 3 was
+    # written for and did not match, because in that string `/kern/` is preceded by `}` and never by
+    # a quote. Verified by construction: the shape the comment names was added to a production
+    # function and this gate passed, on the regex as it stood before this line was widened.
+    #
+    # The closing quote is load-bearing in the first alternative. Without it the pattern matched any
+    # join whose argument merely BEGINS with `kern`, so `<runtime>/kern-vgpu/`, a SIBLING of the
+    # registry root rather than a child of it, tripped a gate that exists to classify children. A
+    # gate with false positives is a gate that gets switched off, which this repository records
+    # happening twice.
+    kern_join = re.compile(r'\.join\("kern"|"kern/|\}/kern/')
     child = re.compile(r'"kern/([.\w-]+)"|\.join\("kern"\)\s*\.join\("([.\w-]+)"\)')
     for path in sorted(SRC.rglob("*.rs")):
         prod = strip_test_code(path.read_text(encoding="utf-8"))

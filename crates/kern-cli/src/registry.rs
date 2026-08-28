@@ -244,7 +244,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 7] = [
+const AUTHORITATIVE_DIRS: [&str; 8] = [
     "instances",
     "claims",
     "exit",
@@ -252,6 +252,22 @@ const AUTHORITATIVE_DIRS: [&str; 7] = [
     "health",
     "pods",
     "ssh",
+    // `mounts/` is where a network volume (sshfs/nfs/smb) is staged before it is bound into a box,
+    // and it is AUTHORITATIVE for two reasons rather than one: what is mounted there is a PEER's
+    // remote filesystem, and the path itself is a location kern acts on during that peer's start, so
+    // a box able to place something there redirects where another box's volume comes from. That is a
+    // forgery vector, not the opaque-bytes foot-gun that `logs/` and `scratch/` are.
+    //
+    // The live guard already refused it, because it refuses the whole registry root minus the
+    // box-data allowlist; what was missing was the CLASSIFICATION, which is what the chokepoint
+    // exists to force. It went unclassified because `volume::net_staging` interpolates its path
+    // rather than joining it, and `scripts/registry-classified.py` did not match that shape despite
+    // its own comment claiming it did. Found by widening that gate on 2026-08-28.
+    //
+    // No quoted string in this comment: the gate extracts the array's entries by scanning for
+    // quoted text inside the braces, so an example written with quotes here becomes a phantom
+    // authoritative directory. It counted nine with eight entries until this line was rewritten.
+    "mounts",
 ];
 
 /// Registry children that are OPAQUE box DATA kern never interprets: mounting one is access to a peer
