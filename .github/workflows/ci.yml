@@ -47,6 +47,17 @@ jobs:
           # that would enter. Name level needs no compiler; the x86_64 number level runs when gcc is
           # present (aarch64 is skipped here for lack of the cross-toolchain).
           python3 scripts/gen-seccomp-allowlist.py --check
+          # And now the gates check THEMSELVES. Every check above is a claim about what cannot get
+          # in, and a green gate looks identical whether it is checking or asleep: registry-classified
+          # matched two of the three ways this codebase builds a runtime-root path and missed the
+          # third for as long as it existed, and no-ai-slop enforced the em-dash rule on .md alone
+          # while the rule says "anywhere", so a commit could put one in a .rs, an .svg or in THIS
+          # file and stay green. Both were found by writing the violation by hand and watching
+          # nothing happen. So: one violation per arm, introduced into the real production file CI
+          # reads, each gate required to go red, every file restored. It refuses to run if it cannot
+          # put the tree back exactly as it found it, and a case it can no longer apply is a failure
+          # rather than a skip.
+          python3 scripts/gates-selftest.py
       - name: gpu claim suite
         # The ONE pentest suite that can run here, and it runs for a reason rather than for a green
         # tick. The other four start boxes and the runner's AppArmor denies the userns `setgroups`
