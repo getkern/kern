@@ -33,7 +33,7 @@ case "$os" in
       command -v "$vm" >/dev/null 2>&1 && have="$have $vm"
     done
     if [ -n "$have" ]; then
-      route="This Mac already has a Linux VM available ($(echo "$have" | sed 's/^ //')), so use it
+      route="This Mac already has a Linux VM available (${have# }), so use it
   rather than installing a second one:
 
       colima ssh            # colima. For Lima: limactl shell <instance>
