@@ -210,6 +210,36 @@ jobs:
           name=$(./target/debug/kern ps -q | head -1)
           ./target/debug/kern ps
           test -n "$name" || { echo "no box is running" >&2; exit 1; }
+      - name: a pod resolves its peers by name, and only for its members
+        # The stack above uses a pod compose created for it; this drives the pod surface directly and
+        # checks the claim that makes a pod worth having. The control is the half that matters: a box
+        # OUTSIDE the pod must not resolve the peer at all, otherwise "reach each other by name" would
+        # just be describing the host's network.
+        run: |
+          K=./target/release/kern
+          test -x "$K" || K=./target/debug/kern
+          $K pod create ptest
+          $K box psrv --pod ptest -d --image alpine -- \
+            sh -c 'while true; do printf "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nHELLO-FROM-PEER\n" | nc -lp 8080; done'
+          for _ in $(seq 20); do
+            got=$($K box pcli --pod ptest --image alpine -- wget -T2 -qO- http://psrv:8080 2>/dev/null || true)
+            [ -n "$got" ] && break
+            sleep 1
+          done
+          echo "inside the pod: $got"
+          case "$got" in
+            *HELLO-FROM-PEER*) ;;
+            *) echo "a pod member could not reach its peer by name" >&2; exit 1 ;;
+          esac
+          out=$($K box pout --image alpine -- wget -T2 -qO- http://psrv:8080 2>&1 || true)
+          echo "outside the pod: $out"
+          case "$out" in
+            *HELLO-FROM-PEER*) echo "a NON-member resolved the peer: the pod is not a boundary" >&2; exit 1 ;;
+            *) ;;
+          esac
+          $K stop psrv || true
+          $K pod ls
+
       - name: tear it down, and prove nothing is left
         if: always()
         run: |
