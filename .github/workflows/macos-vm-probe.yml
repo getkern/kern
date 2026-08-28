@@ -75,6 +75,40 @@ jobs:
           colima ssh -- sh -c '$HOME/.local/bin/kern --version'
           # shellcheck disable=SC2016
           colima ssh -- sh -c '$HOME/.local/bin/kern box dev --image alpine -- cat /etc/os-release'
+      - name: what a Mac user gets from the REGISTRIES, not from this tree
+        # ci.yml checks the tree; this checks the artefact a stranger actually installs, which is a
+        # different thing and the one that can be stale: a readme and an error message only reach
+        # PyPI and npm when a release carries them. Kept out of the push CI on purpose, since it
+        # depends on two networks nobody here controls.
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install kern-sandbox
+          python3 - <<'PY'
+          import kern_sandbox as k
+
+          print("PyPI version:", k.__version__)
+          try:
+              found = k._find_kern()
+          except k.SandboxError as e:
+              msg = str(e)
+          else:
+              raise SystemExit(f"a kern turned up on a macOS runner: {found}")
+          print(msg)
+          for want in ("macOS", "Linux VM", "KERN_BIN"):
+              assert want in msg, f"the PUBLISHED package lost {want!r}: it needs a new release"
+          PY
+          npm install kern-sandbox --no-fund --no-audit
+          node -e '
+            const m = require("kern-sandbox");
+            console.log("npm version:", m.version);
+            let msg = null;
+            try { new m.Sandbox(); } catch (e) { msg = e.message; }
+            if (msg === null) throw new Error("a kern turned up on a macOS runner");
+            console.log(msg);
+            for (const want of ["macOS", "Linux VM", "KERN_BIN"])
+              if (!msg.includes(want)) throw new Error("the PUBLISHED package lost " + want);
+          '
+
       - name: the answer
         run: |
           echo "colima start: ${{ steps.start.outcome }}"

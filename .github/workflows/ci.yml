@@ -204,6 +204,50 @@ jobs:
           for want in ("macOS", "Linux VM", "KERN_BIN"):
               assert want in msg, f"the macOS message lost {want!r}: {msg}"
           PY
+      - name: the MCP server survives a Mac with no kern, and says why
+        # The likeliest way a Mac meets kern is not the CLI: it is `kern-mcp` in Claude Desktop or
+        # Cursor, both of which run on Macs. The sandbox is built lazily, so the server initializes
+        # and lists its tool with no kern present and only the first call fails. That call's text is
+        # what the MODEL reads and relays to the user, so it has to carry the way out rather than a
+        # bare "not found", and the process has to stay alive rather than take the client down.
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, sys
+
+          env = dict(os.environ)
+          env["PATH"] = "/nonexistent"
+          env.pop("KERN_BIN", None)
+          msgs = [
+              {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                          "clientInfo": {"name": "ci", "version": "0"}}},
+              {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+              {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+               "params": {"name": "run_code", "arguments": {"code": "print(1)"}}},
+          ]
+          p = subprocess.run(
+              [sys.executable, "-m", "kern_sandbox.mcp"],
+              input="\n".join(json.dumps(m) for m in msgs) + "\n",
+              capture_output=True, text=True, env=env, timeout=120,
+          )
+          print(p.stdout)
+          assert p.returncode == 0, f"the server died on a Mac: rc={p.returncode} {p.stderr[:400]}"
+          out = {}
+          for line in p.stdout.splitlines():
+              try:
+                  o = json.loads(line)
+              except ValueError:
+                  raise SystemExit(f"non-JSON on the MCP channel: {line[:200]}")
+              out[o.get("id")] = o
+          assert "result" in out.get(1, {}), "initialize did not answer"
+          assert "result" in out.get(2, {}), "tools/list did not answer"
+          call = out.get(3, {}).get("result", {})
+          assert call.get("isError") is True, f"the failing call was not reported as an error: {call}"
+          text = json.dumps(call)
+          for want in ("macOS", "Linux VM"):
+              assert want in text, f"the tool error lost {want!r}, so the model cannot relay the fix"
+          PY
+
       - name: the Node SDK says the same thing
         run: |
           node -e '
