@@ -625,6 +625,89 @@ mod tests {
         );
     }
 
+    /// THE HARDWARE PATH, FORCED. kern has never run on MIG or SR-IOV hardware, so `TIER-HW` is a
+    /// branch no test could reach end to end and its fail-closed behaviour was a property asserted in
+    /// a comment rather than measured. A reviewer's point on 2026-08-28: "fail-closed by design"
+    /// becomes "fail-closed measured" the moment something drives the path with a synthetic device
+    /// directory, and that costs nothing but a temp dir.
+    ///
+    /// This does not prove TIER-HW is correct on real hardware, and cannot. It proves the two things
+    /// that can be proved without one: the code does not panic on a card it promotes, and every
+    /// attribute around it can be garbage without changing the verdict or the shape of the output.
+    #[test]
+    fn the_hardware_path_survives_a_synthetic_card_with_garbage_around_it() {
+        let d = TmpDir::new("hw-forced");
+        std::os::unix::fs::symlink("../0000:65:00.1", d.0.join("physfn")).expect("symlink physfn");
+        // Every neighbouring attribute malformed in a different way. None may reach the verdict.
+        std::fs::write(
+            d.0.join("vendor"),
+            "not-a-hex-id
+",
+        )
+        .expect("write vendor");
+        std::fs::write(d.0.join("device"), "0xZZZZ").expect("write device");
+        std::os::unix::fs::symlink("/sys/bus/pci/drivers/amdgpu", d.0.join("driver")).expect("drv");
+
+        let (tier, evidence) = classify(&d.0, Vendor::Amd);
+        assert_eq!((tier, evidence), (Tier::Hw, Evidence::SriovVirtualFunction));
+
+        let gpu = Gpu {
+            card: "card7".into(),
+            vendor: Vendor::from_pci(0x1002),
+            device_id: read_hex_id(&d.0.join("device")), // None: the file is garbage
+            driver: driver_name(&d.0),
+            tier,
+            evidence,
+            dmem_controller: true,
+            kfd_present: true,
+        };
+        assert_eq!(gpu.device_id, None, "a malformed device id must not parse");
+        assert_eq!(gpu.driver.as_deref(), Some("amdgpu"));
+        let line = describe(&gpu);
+        assert_eq!(
+            line,
+            "card7 AMD (amdgpu): TIER-HW, SR-IOV virtual function (device/physfn present)"
+        );
+        // The one tier permitted the reserved vocabulary still has to carry its own caveats.
+        let claim = gpu.tier.claim();
+        assert!(claim.contains("has not measured the VRAM split"));
+    }
+
+    /// The other half, and the one that matters more: garbage EVERYWHERE and no partition link must
+    /// land on the weak tier rather than panic or promote. This is the fail-closed rule, measured.
+    #[test]
+    fn garbage_attributes_fall_to_the_cooperative_tier_and_never_panic() {
+        let d = TmpDir::new("hw-garbage");
+        for (name, content) in [
+            ("vendor", "\u{0}\u{1}\u{2}"),
+            ("device", "0x"),
+            ("physfn_not_really", "0x10de"),
+        ] {
+            std::fs::write(d.0.join(name), content).expect("write attr");
+        }
+        // A driver link whose target is not a plain component, so `driver_name` must yield nothing.
+        std::os::unix::fs::symlink("/a/b/../..", d.0.join("driver")).expect("symlink driver");
+
+        for v in [
+            Vendor::Nvidia,
+            Vendor::Amd,
+            Vendor::Intel,
+            Vendor::Other(0),
+            Vendor::NonPci,
+        ] {
+            assert_eq!(
+                classify(&d.0, v),
+                (Tier::Soft, Evidence::NoPartitionFound),
+                "garbage promoted a card for vendor {v:?}"
+            );
+        }
+        assert_eq!(read_hex_id(&d.0.join("vendor")), None);
+        assert_eq!(read_hex_id(&d.0.join("device")), None);
+        assert_eq!(driver_name(&d.0), None);
+        assert_eq!(pci_address(&d.0), None);
+        assert!(!mig_instances_for_card(&d.0));
+    }
+
     /// A dangling link still promotes, and that is deliberate rather than an oversight. sysfs
     /// `physfn` targets a sibling device directory; a target that cannot be resolved from wherever
     /// the process happens to stand is a resolution failure, not evidence that the card is not a

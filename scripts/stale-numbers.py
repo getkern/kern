@@ -474,7 +474,21 @@ def gpu_claims_agree() -> list[str]:
         # a single line: in ROADMAP.md "TIER-HW" ends one line and "enforced by the device" begins
         # the next, so the rule saw nothing and passed a sabotaged file. A gate that a line break
         # switches off is not a gate. 220 characters is about two wrapped lines.
-        claim = re.search(r"TIER-HW.{0,220}?enforc", text, re.IGNORECASE | re.DOTALL)
+        # BOTH ORDERS, and a hole for prose that is TALKING ABOUT the rule rather than making a
+        # claim. "TIER-HW ... enforce" was one-directional, so "enforcement ... below TIER-HW" was a
+        # false negative; and a document describing the gate itself ("A2 refuses isolation/secure/hard
+        # on every row below TIER-HW so that cooperative wording cannot claim enforcement") is correct
+        # prose that the rule would have failed. Both raised in review on 2026-08-28. A gate with
+        # false positives gets switched off, which this file records happening twice already, so the
+        # meta case is exempted by the words that only appear when describing the mechanism.
+        window = r"(?:TIER-HW.{0,220}?enforc|enforc.{0,220}?TIER-HW)"
+        claim = None
+        for m in re.finditer(window, text, re.IGNORECASE | re.DOTALL):
+            around = text[max(0, m.start() - 160):m.end() + 160].lower()
+            if any(w in around for w in ("refuse", "gate", "matcher", "vocabulary", "row below")):
+                continue  # describing the rule, not making the claim
+            claim = m
+            break
         if claim and hw_caveat.lower() not in text.lower():
             n = text.count("\n", 0, claim.start()) + 1
             bad.append(

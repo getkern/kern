@@ -564,6 +564,21 @@ matches what they find. The probe deliberately allocates nothing: the allocation
 per-vendor and driver-version-coupled, and every allocation entry point sits behind the same ioctl
 channel the handshake already proves is open.
 
+**Two blind spots in this section, named here and not only in the source.** They are marked in
+`gpu.rs` and in the probe, where a reader deciding whether to trust the verdict will never look.
+
+The `TIER-HW` branch has no positive control anywhere. kern has never run on a MIG or SR-IOV card, so
+no test in the tree can produce a true `TIER-HW`, and nobody has ever seen kern print one on real
+hardware. What IS measured is the other half: a synthetic device directory drives the promotion path,
+and garbage in every neighbouring attribute falls to `TIER-SOFT` rather than panicking or promoting.
+So the fail-closed behaviour is tested and the promotion itself is not.
+
+The probe's AMD compute arm has never executed. `AMDKFD_IOC_GET_VERSION` is declared from
+`kfd_ioctl.h` and reviewed by a second reader, and there is no AMD card on any machine this project
+can reach, so it has never run against a driver. On a host with `/dev/kfd`, a silent result from that
+arm means the probe is wrong at least as plausibly as the driver is closed, and the suite reports it
+as a fact rather than as a finding.
+
 **What to do with a hostile GPU tenant.** Give it a MIG instance or an SR-IOV virtual function, or
 give it the whole device. A cooperative quota is the right tool for packing several of your own
 models onto one card, and the wrong tool for containing someone else's.

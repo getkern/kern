@@ -67,6 +67,34 @@ confident wrong answer first and a correction second.
 - **A gate's exit code is read bare.** Never through a pipe. See the `no-em-dash` and
   `stale-numbers` invocations.
 
+## Shipping a claim about a boundary
+
+These three rules were paid for by the GPU work and lived only in its commit messages, which is where
+a rule goes to die. They apply to any claim about what kern enforces, not to GPUs.
+
+**A tier, a mode or a guarantee ships only if the code can assign it on hardware someone can reach.**
+The GPU model has three capability tiers and the code has two, because the measurement that would
+earn the middle one failed: `dmem` accounts device memory and does not enforce it for the compute
+path a tenant allocates through. The variant was removed rather than shipped weak. A level nobody can
+be awarded is not completeness, it is a promise in the enum.
+
+The test is not "is it verified", it is **"what happens when it is wrong"**. A branch that can only
+fail downward, granting less than the hardware deserves, is acceptable untested and says so. A branch
+that can fail upward, granting more, does not ship until it cannot.
+
+**When a defence is not a boundary, the demonstration that it is not goes in the repo before the
+announcement.** `pentest/pentest-gpu-claims.sh` publishes the result that defeats a userspace VRAM
+quota, on the same day the tier that depends on it was written. Finding your own defeat costs one
+paragraph; having a reader find it costs the credibility of every other number you have published.
+
+**A claim and the code that prints it are held together by a gate, not by the discipline of whoever
+edits next.** `scripts/stale-numbers.py` refuses a document that names a tier the code cannot print,
+requires each tier's caveat verbatim on the pages that carry it, and compares the forbidden
+vocabulary between the Rust gate and the shell one, because the shell cannot import a Rust constant
+and a duplicated derived condition with no gate on it drifts. Every arm of that gate has a sabotage
+test: break the thing on purpose, watch it go red, restore it. A gate nobody has seen fail is a gate
+nobody knows works.
+
 ## Changing a flag or config key (deprecation policy)
 
 The CLI/config surface isn't frozen pre-1.0, but changes still must not break a user's scripts
