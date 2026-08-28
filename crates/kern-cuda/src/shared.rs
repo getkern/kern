@@ -14,25 +14,25 @@
 //! reason about the other's failure modes.
 //!
 //! THE HARD PROBLEM IS NOT THE COUNTER, IT IS THE CRASH
-//!     A process that dies holding a reservation leaks it. The total stays high, every later tenant
-//!     sees less of the card than exists, and nothing ever gives it back. That is the failure that
-//!     makes naive shared counters unusable in production, and the whole slot design exists for it:
-//!     the total is authoritative and fast, and each process ALSO records its own contribution in a
-//!     slot it alone writes, so a survivor can work out exactly how much a corpse was holding and
-//!     subtract precisely that.
+//!   A process that dies holding a reservation leaks it. The total stays high, every later tenant
+//!   sees less of the card than exists, and nothing ever gives it back. That is the failure that
+//!   makes naive shared counters unusable in production, and the whole slot design exists for it:
+//!   the total is authoritative and fast, and each process ALSO records its own contribution in a
+//!   slot it alone writes, so a survivor can work out exactly how much a corpse was holding and
+//!   subtract precisely that.
 //!
 //! PID REUSE IS THE TRAP UNDER THE TRAP
-//!     Liveness by pid alone is wrong: pid 1234 dies, the kernel hands 1234 to an unrelated process,
-//!     and the reaper concludes the slot's owner is alive. The leak then becomes permanent. A slot
-//!     therefore records the owner's process START TIME as well, and a pid whose start time no longer
-//!     matches is a different process wearing a dead one's number.
+//!   Liveness by pid alone is wrong: pid 1234 dies, the kernel hands 1234 to an unrelated process,
+//!   and the reaper concludes the slot's owner is alive. The leak then becomes permanent. A slot
+//!   therefore records the owner's process START TIME as well, and a pid whose start time no longer
+//!   matches is a different process wearing a dead one's number.
 //!
 //! WHAT THIS IS NOT
-//!     A boundary, and less of one than [`crate::Quota`] even is. The segment is writable by every
-//!     participant by construction: a tenant that wants to defeat the accounting can map it and store
-//!     zero into the total. That is inherent to a shared counter between mutually distrusting
-//!     processes without a kernel to arbitrate, it is why the tier model calls this `TIER-SOFT`, and
-//!     it is stated here rather than left for a reader to work out.
+//!   A boundary, and less of one than [`crate::Quota`] even is. The segment is writable by every
+//!   participant by construction: a tenant that wants to defeat the accounting can map it and store
+//!   zero into the total. That is inherent to a shared counter between mutually distrusting
+//!   processes without a kernel to arbitrate, it is why the tier model calls this `TIER-SOFT`, and
+//!   it is stated here rather than left for a reader to work out.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

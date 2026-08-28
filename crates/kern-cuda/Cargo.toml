@@ -20,7 +20,15 @@ description = "Cooperative VRAM quota accounting for kern. Not a security bounda
 # So the accounting engine lands first, as a plain library, testable and benchmarkable on its own. The
 # `cdylib` and the hooks arrive when they arrive, and the release keeps shipping one file until they do.
 [lib]
-crate-type = ["rlib"]
+# `cdylib` AND `rlib`. The shared object is what gets loaded into the workload's address space in
+# front of the vendor library; the `rlib` is what the test binaries link so every property can be
+# checked without loading anything into anything.
+#
+# THE BINARY IS STILL ONE FILE. `kern-cli` does not depend on this crate and nothing links it into
+# the CLI: `cargo build --bin kern` does not build this, and the shipped `kern` has zero symbols from
+# it. The shared object is a SEPARATE artifact that only exists on a host that wants GPU accounting,
+# and a host without it behaves exactly as it does today.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # The single boundary to the kernel, and the only dependency in the whole workspace. `mmap`,

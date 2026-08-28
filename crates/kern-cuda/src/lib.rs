@@ -5,31 +5,31 @@
 //! sits on top of this, and nothing here knows what a GPU is.
 //!
 //! WHAT THIS IS NOT
-//!     A boundary. A quota implemented in userspace is bypassed by any tenant that reaches the driver
-//!     without going through the library the quota lives in, and `pentest/pentest-gpu-claims.sh`
-//!     demonstrates exactly that on every machine this project can reach. What a cooperative quota IS
-//!     worth is density, fairness, accidental-overcommit accounting and the ability to pack several of
-//!     your own models onto one card. Those are real and they are what this engine serves.
-//!     [`SECURITY.md`](../../../SECURITY.md) states the distinction before any claim.
+//!   A boundary. A quota implemented in userspace is bypassed by any tenant that reaches the driver
+//!   without going through the library the quota lives in, and `pentest/pentest-gpu-claims.sh`
+//!   demonstrates exactly that on every machine this project can reach. What a cooperative quota IS
+//!   worth is density, fairness, accidental-overcommit accounting and the ability to pack several of
+//!   your own models onto one card. Those are real and they are what this engine serves.
+//!   [`SECURITY.md`](../../../SECURITY.md) states the distinction before any claim.
 //!
 //! WHY IT HAS TO BE THIS FAST
-//!     A reservation happens on every device allocation a workload makes, and an inference server
-//!     makes a great many. If the accounting cost were microseconds it would show up in a token rate.
-//!     The design constraint is therefore an upper bound in NANOSECONDS on the uncontended path, and
-//!     the bound is measured in `tests/` rather than asserted here.
+//!   A reservation happens on every device allocation a workload makes, and an inference server
+//!   makes a great many. If the accounting cost were microseconds it would show up in a token rate.
+//!   The design constraint is therefore an upper bound in NANOSECONDS on the uncontended path, and
+//!   the bound is measured in `tests/` rather than asserted here.
 //!
 //! HOW THE COST IS KEPT THERE
-//!     No allocation: the whole state is three `u64`-sized atomics in a struct the caller owns.
-//!     No lock: reservation is a compare-and-swap loop, so a thread that loses a race retries rather
-//!     than blocks, and a thread that is descheduled mid-operation blocks nobody.
-//!     No syscall: nothing here reads a file, a clock or the environment.
+//!   No allocation: the whole state is three `u64`-sized atomics in a struct the caller owns.
+//!   No lock: reservation is a compare-and-swap loop, so a thread that loses a race retries rather
+//!   than blocks, and a thread that is descheduled mid-operation blocks nobody.
+//!   No syscall: nothing here reads a file, a clock or the environment.
 //!
 //! THE ONE THING A CAS LOOP MUST GET RIGHT
-//!     The check and the commit have to be the SAME atomic step. Reading the total, deciding it fits,
-//!     and then adding is a race with a window: two threads each read 1 GiB used against a 2 GiB
-//!     quota, each decide their 512 MiB fits, and both commit, leaving 2 GiB used from a 1 GiB start.
-//!     `compare_exchange` closes that by making the commit fail when the value moved, which sends the
-//!     loser back to re-read and re-decide against the new total.
+//!   The check and the commit have to be the SAME atomic step. Reading the total, deciding it fits,
+//!   and then adding is a race with a window: two threads each read 1 GiB used against a 2 GiB
+//!   quota, each decide their 512 MiB fits, and both commit, leaving 2 GiB used from a 1 GiB start.
+//!   `compare_exchange` closes that by making the commit fail when the value moved, which sends the
+//!   loser back to re-read and re-decide against the new total.
 
 // `deny` and not `forbid`, and the difference is one module. The accounting is unsafe-free and stays
 // that way; turning a `mmap`ed region into a `&[AtomicU64]` cannot be, and `forbid` cannot be lifted
@@ -39,7 +39,10 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub mod hooks;
 pub mod map;
+pub mod real;
+pub mod registry;
 pub mod shared;
 
 /// Why a reservation was refused.
@@ -287,6 +290,19 @@ impl Quota {
     /// Set the oversubscription allowance, in bytes above the quota.
     pub fn set_allowance(&self, bytes: u64) {
         self.allowance.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Drop everything this quota believes it holds, without releasing anything to a peer.
+    ///
+    /// FOR ONE CALLER ONLY: the `fork` child handler. A child inherits its parent's `held` by
+    /// copy-on-write and holds none of it, so the correct value in the child is zero. Calling this
+    /// anywhere else would tell a live process it holds nothing while its allocations are still
+    /// outstanding, which is the accounting drift the whole crate exists to prevent.
+    ///
+    /// A plain `Relaxed` store rather than a CAS loop: the only context this runs in is a child
+    /// immediately after `fork`, where exactly one thread exists.
+    pub fn reset_held(&self) {
+        self.held.0.store(0, Ordering::Relaxed);
     }
 
     /// Refuse every further reservation. Releases keep working, and this cannot be undone.

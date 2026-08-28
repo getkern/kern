@@ -346,3 +346,100 @@ fn shared_reservations_stay_within_an_order_of_magnitude_under_contention() {
         "under {tenants}-way contention a shared pair costs {ns:.1} ns, over {CEILING_NS} ns"
     );
 }
+
+// ── the pointer-to-size map ──────────────────────────────────────────────────────────────────────
+//
+// The free path's cost, which is the one the CUDA API forces on us: `cuMemFree` is given only a
+// pointer, so every free is a lookup. A workload with many small buffers frees as often as it
+// allocates, so this number is paid exactly as often as the reservation is.
+
+use kern_cuda::registry::Registry;
+
+#[test]
+fn an_insert_and_remove_pair_costs_nanoseconds() {
+    const ROUNDS: usize = 9;
+    const ITERS: usize = 200_000;
+    // Sized well above the live count, which is the intended operating point: an open-addressed
+    // table at a high load factor degrades into long probe chains, and the honest way to report a
+    // number is at the load factor the design tells operators to use.
+    let r = Registry::with_capacity(4096);
+
+    for i in 0..ITERS {
+        let p = 0x10_0000 + (i as u64 % 256) * 4096;
+        let _ = keep(r.insert(keep(p), keep(4096)));
+        let _ = keep(r.remove(keep(p)));
+    }
+
+    let mut per_round = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let p = 0x10_0000 + (i as u64 % 256) * 4096;
+            let _ = keep(r.insert(keep(p), keep(4096)));
+            let _ = keep(r.remove(keep(p)));
+        }
+        per_round.push(t0.elapsed().as_nanos() as f64 / ITERS as f64);
+    }
+    let ns = median(per_round);
+
+    println!("registry insert+remove:      {ns:.1} ns per pair");
+    assert_eq!(r.len(), 0, "the benchmark must leave the table empty");
+    assert!(
+        ns < CEILING_NS,
+        "a registry pair costs {ns:.1} ns, over the {CEILING_NS} ns ceiling"
+    );
+}
+
+/// THE WHOLE FREE PATH, end to end: look the pointer up, get its size, give it back to both the
+/// per-process quota and the shared total. This is the number that would actually appear in front of
+/// a `cuMemFree`, and it is the one worth quoting.
+#[test]
+fn the_complete_alloc_and_free_accounting_costs_nanoseconds() {
+    const ROUNDS: usize = 9;
+    const ITERS: usize = 200_000;
+    let q = Quota::new(GIB);
+    let r = Registry::with_capacity(4096);
+    let seg = segment(4);
+    assert_eq!(shared::init(&seg, 4), Ok(()));
+    let s = Shared::attach(&seg, 1, 1, &AllAlive).expect("attach");
+
+    let alloc_free = |i: usize| {
+        let p = 0x10_0000 + (i as u64 % 256) * 4096;
+        // Allocation: reserve locally, reserve globally, record the size.
+        if keep(q.reserve(keep(4096))).is_ok() {
+            if keep(s.reserve(keep(4096), GIB)).is_ok() {
+                let _ = keep(r.insert(keep(p), 4096));
+            } else {
+                q.release(4096);
+            }
+        }
+        // Free: recover the size, give it back to both.
+        if let Some(size) = keep(r.remove(keep(p))) {
+            s.release(size);
+            q.release(size);
+        }
+    };
+
+    for i in 0..ITERS {
+        alloc_free(i);
+    }
+
+    let mut per_round = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            alloc_free(i);
+        }
+        per_round.push(t0.elapsed().as_nanos() as f64 / ITERS as f64);
+    }
+    let ns = median(per_round);
+
+    println!("FULL alloc+free accounting:  {ns:.1} ns per pair");
+    assert_eq!(q.held(), 0, "the quota is balanced");
+    assert_eq!(s.total(), 0, "the shared total is balanced");
+    assert_eq!(r.len(), 0, "the registry is empty");
+    assert!(
+        ns < CEILING_NS,
+        "the full accounting pair costs {ns:.1} ns, over the {CEILING_NS} ns ceiling"
+    );
+}

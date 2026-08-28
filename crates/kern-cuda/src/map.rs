@@ -7,20 +7,20 @@
 //! modes, which is the whole reason the two are separate files.
 //!
 //! WHY A FILE AND NOT `shm_open`
-//!     POSIX shared memory lands in `/dev/shm`, which is a tmpfs kern's own boxes routinely mount
-//!     over, and its objects are not visible in the mount namespace a box lives in unless something
-//!     puts them there. A plain file under the runtime directory is visible to exactly the processes
-//!     kern intends and disappears with that directory. It is also inspectable: an operator can
-//!     `ls -l` it and `hexdump` it, which for a mechanism whose whole purpose is accounting is worth
-//!     more than the theoretical tidiness of an anonymous object.
+//!   POSIX shared memory lands in `/dev/shm`, which is a tmpfs kern's own boxes routinely mount
+//!   over, and its objects are not visible in the mount namespace a box lives in unless something
+//!   puts them there. A plain file under the runtime directory is visible to exactly the processes
+//!   kern intends and disappears with that directory. It is also inspectable: an operator can
+//!   `ls -l` it and `hexdump` it, which for a mechanism whose whole purpose is accounting is worth
+//!   more than the theoretical tidiness of an anonymous object.
 //!
 //! THE FAILURE THAT KILLS A PROCESS RATHER THAN RETURNING AN ERROR
-//!     Touching a page of a mapping that is beyond the end of the backing file raises SIGBUS, not a
-//!     Rust error. There is no way to catch that and no way to unwind from it. The file is therefore
-//!     sized with `ftruncate` BEFORE it is mapped and never shortened afterwards, and the mapped
-//!     length is taken from the size the file actually has rather than from the size that was asked
-//!     for. A file that is shorter than the layout needs is refused at open time, when refusing is
-//!     still possible.
+//!   Touching a page of a mapping that is beyond the end of the backing file raises SIGBUS, not a
+//!   Rust error. There is no way to catch that and no way to unwind from it. The file is therefore
+//!   sized with `ftruncate` BEFORE it is mapped and never shortened afterwards, and the mapped
+//!   length is taken from the size the file actually has rather than from the size that was asked
+//!   for. A file that is shorter than the layout needs is refused at open time, when refusing is
+//!   still possible.
 
 use core::sync::atomic::AtomicU64;
 use std::os::fd::{AsRawFd, OwnedFd};
