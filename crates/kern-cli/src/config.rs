@@ -350,7 +350,53 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
         }
         i += 1;
     }
+    // TWO ENTRIES WITH THE SAME NAME ARE REFUSED, at the file rather than at each lookup.
+    //
+    // Every `resolve_*` finds its entry with `.find(|e| e.name == name)`, so the FIRST one wins and
+    // the second is discarded without a word. Measured: a `kern.toml` with two `[[vgpu]]` blocks
+    // both named `z`, one 2g and one 8g, started the workload under 2g and said nothing, so an
+    // operator editing the second block would watch a cap refuse to change.
+    //
+    // The same shape is in every profile family and in the resource families, because it is one
+    // line of code repeated, so the check belongs here where the file is built rather than once at
+    // each point of use. Refusing is right rather than merciful: whichever entry the
+    // operator meant, one of the two does nothing, and there is no reading of a duplicate under
+    // which the file says what its author intended. It is the same judgement as two `vgpu:` profiles
+    // on one command line, which is refused for the same reason.
+    dup("[[vcpu]]", "name", cfg.vcpu.iter().map(|e| e.name.as_str()))?;
+    dup(
+        "[[vgpio]]",
+        "name",
+        cfg.vgpio.iter().map(|e| e.name.as_str()),
+    )?;
+    dup(
+        "[[vdisk]]",
+        "name",
+        cfg.vdisk.iter().map(|e| e.name.as_str()),
+    )?;
+    dup("[[cpu]]", "id", cfg.cpu.iter().map(|e| e.id.as_str()))?;
+    dup("[[disk]]", "name", cfg.disk.iter().map(|e| e.name.as_str()))?;
     Ok(cfg)
+}
+
+/// Refuse a repeated `name` (or `id`) within one family of config entries.
+///
+/// Quadratic on purpose. A `kern.toml` holds a handful of profiles, the comparison is a string
+/// equality, and a `BTreeSet` here would trade a measurable nothing for an allocation and a less
+/// obvious loop. The first repeat found is the one reported: naming them all would be a list an
+/// operator has to read, when fixing the first is what they will do either way.
+fn dup<'a>(table: &str, field: &str, names: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let seen: Vec<&str> = names.collect();
+    for (i, a) in seen.iter().enumerate() {
+        if seen[..i].contains(a) {
+            return Err(format!(
+                "two {table} entries share `{field} = \"{a}\"`. Only the first would ever be used \
+                 and the other would be silently discarded, so one of them does nothing: give them \
+                 different names, or delete the one you did not mean."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Open a new section, pushing a fresh array-of-tables entry where needed.
@@ -3273,5 +3319,56 @@ mod the_backend_error_is_true_for_each_kind {
                 "{k:?} rejected the bare form of a declared id"
             );
         }
+    }
+}
+
+/// The duplicate-name check, which is per-family and lives in `parse`.
+#[cfg(test)]
+mod duplicate_names {
+    use super::parse;
+
+    /// One case per family, because the check is per-family and a loop that covered four of the five
+    /// would look exactly like this one passing.
+    #[test]
+    fn a_repeated_name_is_refused_in_every_family() {
+        let cases: [(&str, &str); 5] = [
+            ("[[vcpu]]", "[[cpu]]\nid = \"host\"\n[[vcpu]]\nname = \"d\"\nbackend = \"host\"\nmemory = \"64m\"\n[[vcpu]]\nname = \"d\"\nbackend = \"host\"\nmemory = \"512m\"\n"),
+            ("[[vgpio]]", "[[vgpio]]\nname = \"d\"\nbackend = \"gpiochip0\"\n[[vgpio]]\nname = \"d\"\nbackend = \"gpiochip0\"\n"),
+            ("[[vdisk]]", "[[vdisk]]\nname = \"d\"\nbackend = \"ram\"\nsize = \"10m\"\n[[vdisk]]\nname = \"d\"\nbackend = \"ram\"\nsize = \"20m\"\n"),
+            ("[[cpu]]", "[[cpu]]\nid = \"a\"\n[[cpu]]\nid = \"a\"\n"),
+            ("[[disk]]", "[[disk]]\nname = \"a\"\n[[disk]]\nname = \"a\"\n"),
+        ];
+        for (table, body) in cases {
+            let text = format!("[kern]\nconfig_version = 1\n{body}");
+            let err = parse(&text)
+                .err()
+                .unwrap_or_else(|| panic!("{table}: a repeated name parsed cleanly"));
+            assert!(
+                err.contains(table),
+                "{table}: the error names the wrong table: {err}"
+            );
+        }
+    }
+
+    /// The control the test above needs: without it, a `parse` that rejected EVERY file would pass.
+    #[test]
+    fn distinct_names_in_the_same_family_are_accepted() {
+        let text = "[kern]\nconfig_version = 1\n\
+                    [[cpu]]\nid = \"host\"\n\
+                    [[vcpu]]\nname = \"a\"\nbackend = \"host\"\nmemory = \"64m\"\n\
+                    [[vcpu]]\nname = \"b\"\nbackend = \"host\"\nmemory = \"512m\"\n";
+        let cfg = parse(text).expect("two differently-named profiles must load");
+        assert_eq!(cfg.vcpu.len(), 2);
+    }
+
+    /// A name repeated across DIFFERENT families is not a duplicate: `vcpu:web` and `vdisk:web` are
+    /// two different profiles and an operator naming both after the same service is being clear.
+    #[test]
+    fn the_same_name_in_two_families_is_not_a_duplicate() {
+        let text = "[kern]\nconfig_version = 1\n\
+                    [[cpu]]\nid = \"host\"\n\
+                    [[vcpu]]\nname = \"web\"\nbackend = \"host\"\nmemory = \"64m\"\n\
+                    [[vdisk]]\nname = \"web\"\nbackend = \"ram\"\nsize = \"10m\"\n";
+        assert!(parse(text).is_ok(), "one name per family must be allowed");
     }
 }
