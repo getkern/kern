@@ -15,6 +15,36 @@ is in the git history.
 
 ### Added
 
+- **A second review round: a lying exit code, a green that verified nothing, and the MIG mapping
+  settled from source.**
+
+  `gpu-raw-ioctl.c`'s `exhaust` mode returned the exit code the file's own header defines as "the
+  driver answered a raw ioctl" on the strength of `open` alone, having issued no ioctl at all. No
+  caller read it that way, which is not a defence. It now asks the last descriptor it opened, so the
+  code is true and the fact is stronger: the number counts handles that still reach the driver, not
+  handles that opened. Its `/proc/self/maps` scan also carries a tail between chunks, so a maps line
+  longer than the buffer can no longer hide a vendor library across the cut.
+
+  `pentest-gpu-claims.sh` could exit 0 on a host with a GPU and no C compiler: section A green,
+  battery B entirely skipped, nothing attacked. `run-all.sh` stamps `pentest/.last-run` on a zero,
+  and that stamp is what stops "not in CI" from decaying into "never run", so the decay was arriving
+  through the check meant to prevent it. There is now a third outcome, exit 3, that says the decisive
+  battery did not run; the skips stay skips, and the stamp is refused.
+
+  The MIG attribution is no longer unverified. It was the only remaining route to an unearned
+  `TIER-HW`: if `capabilities/gpu<N>` were keyed by something other than the device minor, one card's
+  instances could promote another. It is the device minor, read from NVIDIA's own source rather than
+  inferred from a single-GPU host that could not tell the two apart: `nv-procfs.c` prints
+  `nvl->minor_num` as `Device Minor:`, `nv.c`'s `nv_get_dev_minor()` returns that field, and `os.c`'s
+  `osRmCapRegisterGpu` formats the capability directory as `"gpu%u"` from it.
+
+  The claim gate grew an arm and lost an illusion. Any document that writes `TIER-HW` next to a form
+  of "enforce" must now carry the hardware caveat, matched over a window rather than a line because
+  markdown wraps and the first version of the rule was switched off by a line break. README, ROADMAP
+  and the FAQ were stating the short form without it. And the gate's docstring now records what it
+  cannot catch, with the reviewer's counterexample verbatim: a sentence added elsewhere on the page
+  that gives back what the caveat took away passes every check here, and detecting it is reading for
+  contradiction rather than pattern matching.
 - **The hardware tier now claims what it proved, after an outside review caught it claiming more.**
   `TIER-HW` read "per-tenant VRAM enforced by the device", which asserts an ENFORCEMENT. What the
   detector establishes is a TOPOLOGY: a `physfn` link means an SR-IOV virtual function, a `gi*`

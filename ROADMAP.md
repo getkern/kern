@@ -11,7 +11,8 @@ and some may never ship if they would change what kern is. Recently shipped work
 
   The judgement ships ahead of the capability, deliberately. `kern doctor` detects each GPU from
   sysfs and prints the tier a cap on it would have: `TIER-HW` where a MIG or SR-IOV partition is
-  enforced by the device, `TIER-SOFT` everywhere else. A cooperative quota on consumer hardware is
+  present, enforced by the device rather than by the tenant, with kern saying plainly that it read
+  the partition's presence and has not measured the VRAM split; `TIER-SOFT` everywhere else. A cooperative quota on consumer hardware is
   bypassed by any tenant that talks to the device without going through the vendor library, so it is
   worth density and fairness and nothing else, and kern says so before it can cap anything. That
   detection is read-only: it reads, classifies and prints, and touches no driver.

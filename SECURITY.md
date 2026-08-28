@@ -486,6 +486,16 @@ device". An outside reader pointed out that asserting an enforcement from the pr
 is the same step this model refuses when it declines to promote a card for having a `dmem`
 controller, and they were right: it was the strongest claim in the section and the least supported.
 
+One thing about that branch IS settled, and from NVIDIA's source rather than from this host. kern
+attributes MIG instances to a card by its PCI address: card, to the `Device Minor:` in
+`/proc/driver/nvidia/gpus/<BDF>/information`, to `capabilities/gpu<minor>/mig`. That chain is the
+only remaining route by which kern could print `TIER-HW` for a card with no partition, if the index
+in the capability path were something other than the device minor. It is not:
+`kernel-open/nvidia/nv-procfs.c` prints that field from `nvl->minor_num`, `nv.c`'s
+`nv_get_dev_minor()` returns the same field, and `os.c`'s `osRmCapRegisterGpu` calls it and formats
+the directory name as `"gpu%u"` from it. One field, two uses. Read in
+[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) on 2026-08-28.
+
 **TIER-SOFT** is everything else, which on consumer hardware is everything. It is a cooperative
 quota: real and useful for density, fairness, accidental overcommit and accounting across trusted and
 semi-trusted tenants, and **not a boundary against malicious code**. The words *isolation*, *secure*

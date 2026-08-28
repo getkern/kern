@@ -63,7 +63,8 @@ reports `0.0.0`, which is expected and harmless.
 
 Slices are not in this edition, they are on the [roadmap](../ROADMAP.md). What is here is the
 verdict: `kern doctor` reads sysfs and reports, per GPU, what a VRAM cap would be worth. `TIER-HW`
-means a MIG or SR-IOV partition the device itself enforces. `TIER-SOFT`, which is what consumer
+means a MIG or SR-IOV partition is present, enforced by the device and not by the tenant. kern
+reads that the partition is there and has not measured the VRAM split, and says so on the line. `TIER-SOFT`, which is what consumer
 hardware gets, means a cooperative quota: useful for density, fairness and accidental overcommit, and
 not a boundary against code that is trying to get around it. Detection is read-only and caps nothing,
 so there is still nothing to attack. kern today virtualizes CPU (`vcpu:`), memory, disk (`vdisk:`)

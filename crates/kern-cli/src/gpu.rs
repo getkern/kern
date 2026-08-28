@@ -343,11 +343,25 @@ fn nvidia_device_minor(bdf: &str) -> Option<u32> {
 /// is not enough: a MIG-capable card with MIG disabled still exposes it, so kern requires at least
 /// one configured GPU INSTANCE (`gi*`), which is the thing that actually partitions the device.
 ///
-/// The minor-to-`gpu<N>` correspondence is corroborated on the one NVIDIA host available here
-/// (minor 0, `capabilities/gpu0/mig` present) and NOT verified against real MIG hardware, which this
-/// project does not own. That is why the whole path is written to fail closed: every unreadable
-/// file, unparsed line and absent directory returns `false`, so being wrong about the layout costs a
-/// MIG card an unearned `TIER-HW` and never gives a consumer card one.
+/// THE MINOR-TO-`gpu<N>` CORRESPONDENCE IS ESTABLISHED FROM NVIDIA'S OWN SOURCE, not inferred. It
+/// was written here as unverified, on the strength of one single-GPU host where minor 0 and `gpu0`
+/// agree, which is a degenerate case that could not distinguish the two. Read in
+/// `NVIDIA/open-gpu-kernel-modules` on 2026-08-28:
+///
+///   `kernel-open/nvidia/nv-procfs.c:158`   prints `"Device Minor: \t %u"` from `nvl->minor_num`
+///   `kernel-open/nvidia/nv.c:5720`         `nv_get_dev_minor()` returns that same `nvl->minor_num`
+///   `src/nvidia/arch/nvalloc/unix/src/os.c:4907`  `osRmCapRegisterGpu` takes `nv_get_dev_minor()`
+///   `src/nvidia/arch/nvalloc/unix/src/os.c:4931`  `os_snprintf(name, ..., "gpu%u", minor)`, then
+///                                                 creates that directory and `mig` beneath it
+///
+/// One field, printed in `/proc` and used to name the capability directory, so the number this
+/// module reads from a card's own `information` file is the number that keys its capabilities. The
+/// cross-card false promotion that was the only remaining route to an unearned `TIER-HW` is closed
+/// by construction, not by a policy.
+///
+/// The path stays fail-closed anyway: every unreadable file, unparsed line and absent directory
+/// returns `false`. Being wrong about a layout is then a MIG card missing a `TIER-HW` it had earned,
+/// never a consumer card receiving one it had not.
 fn mig_instances_for_card(device_dir: &Path) -> bool {
     let Some(bdf) = pci_address(device_dir) else {
         return false;
@@ -655,6 +669,10 @@ mod tests {
     /// and `/proc` cannot be faked. So this test proves only the fail-closed half. The `physfn` path
     /// has its positive control above precisely because a link CAN be created; the MIG path is
     /// written to fail closed for exactly the reason that it cannot.
+    ///
+    /// What a test cannot supply here, reading the driver's source did: the four-line chain from
+    /// `nvl->minor_num` to the `gpu%u` directory name is quoted in `mig_instances_for_card`, so the
+    /// attribution rests on NVIDIA's code rather than on this host's agreement with itself.
     #[test]
     fn mig_is_attributed_to_a_card_and_not_to_the_host() {
         let d = TmpDir::new("mig");

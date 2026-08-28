@@ -80,8 +80,10 @@ is the size-optimized release build; a plain `cargo install` from source is 1.91
 - **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
 - **Not shipping GPU slices.** On the [roadmap](ROADMAP.md). What ships is the *judgement*, not the
   capability: `kern doctor` reads sysfs and tells you what a VRAM cap on each GPU would be worth
-  (`TIER-HW` for a MIG or SR-IOV partition the device enforces, `TIER-SOFT` for everything else,
-  which on consumer hardware is a cooperative quota and not a boundary against malicious code).
+  (`TIER-HW` where a MIG or SR-IOV partition is present, which the device enforces rather than the
+  tenant, though kern reads its presence and has not measured the VRAM split; `TIER-SOFT` for
+  everything else, which on consumer hardware is a cooperative quota,
+  NOT a boundary against malicious code).
   Nothing intercepts a driver call, nothing caps a GPU, and the detection is read-only, so there is
   still nothing here to attack.
 

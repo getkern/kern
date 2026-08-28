@@ -322,6 +322,14 @@ def _rust_string_literal_after(src: str, marker: str) -> str:
     j = src.find('"', i)
     if j < 0:
         return ""
+    # Two Rust literal forms this cannot read: a raw string (`r#"..."#`, whose opening quote is
+    # preceded by `r#`) and any numeric escape (`\x41`, `\u{41}`), which it would emit as the letter
+    # `x` or `u` instead of the character. Both would make the gate compare a value that is not the
+    # one the code prints, and a gate that silently reads the wrong string is worse than no gate.
+    # Return a sentinel nobody can match so the caller reports a failure and a human looks. Raised in
+    # review on 2026-08-28; neither form appears in the claims today.
+    if src[max(0, j - 2):j].endswith(("r", "r#")):
+        return "<gate cannot read a raw string literal>"
     out: list[str] = []
     k = j + 1
     while k < len(src):
@@ -333,6 +341,8 @@ def _rust_string_literal_after(src: str, marker: str) -> str:
                 while k < len(src) and src[k] in " \t":
                     k += 1
                 continue
+            if nxt in "xu":
+                return "<gate cannot read a numeric escape in this literal>"
             out.append(nxt)
             k += 2
             continue
@@ -367,6 +377,21 @@ def gpu_claims_agree() -> list[str]:
          ``pentest/pentest-gpu-claims.sh`` cannot import a Rust constant, so it keeps its own copy,
          and a duplicated derived condition with no gate on it is exactly how the two quietly stop
          meaning the same thing. This is that gate.
+
+    WHAT THIS DOES NOT CATCH, stated because a gate mistaken for more than it is does more harm than
+    no gate at all. It checks that required text is PRESENT and that forbidden words are ABSENT. It
+    cannot see a sentence ADDED elsewhere on the same page that gives back what the caveat took
+    away. A reviewer produced this counterexample on 2026-08-28, and it passes every check here:
+
+        "On any host that shows TIER-HW, operators may rely on device memory limits for
+         hostile multi-tenant packing without further controls."
+
+    No reserved word, no invented tier, both caveats still present two paragraphs above, and a reader
+    walks away with a guarantee kern never made. Detecting that is reading for contradiction, not
+    pattern matching, and a regex aimed at it would fire on the sentences that discuss hostile
+    multi-tenant use on purpose. This file records elsewhere what happens to a gate with false
+    positives. So the defence against added prose is review, and this gate's job is the narrower one
+    it can actually do: keeping the code and the documents from drifting apart.
     """
     try:
         src = open("crates/kern-cli/src/gpu.rs", encoding="utf-8").read()
@@ -431,6 +456,31 @@ def gpu_claims_agree() -> list[str]:
                     f"{path} carries the GPU claim to a reader and no longer states "
                     f"{marker!r}, which is what the code prints"
                 )
+
+    # A page does not have to be README or SECURITY to make the hardware claim. Any document that
+    # writes TIER-HW next to a form of "enforce" is asserting the thing the caveat qualifies, and has
+    # to carry the caveat too. Anchored on "enforc" rather than on the tier name alone so a file that
+    # merely NAMES the tier (pentest/README.md describes the gate's threshold) is not dragged in: a
+    # rule that fires on a true statement is a rule that gets switched off.
+    hw_caveat = "has not measured the VRAM split"
+    for path in sorted(docs):
+        if os.path.basename(path) in ALWAYS_ALLOWED:
+            continue
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        # A WINDOW, not a line. Markdown prose wraps, and the first version of this rule anchored on
+        # a single line: in ROADMAP.md "TIER-HW" ends one line and "enforced by the device" begins
+        # the next, so the rule saw nothing and passed a sabotaged file. A gate that a line break
+        # switches off is not a gate. 220 characters is about two wrapped lines.
+        claim = re.search(r"TIER-HW.{0,220}?enforc", text, re.IGNORECASE | re.DOTALL)
+        if claim and hw_caveat.lower() not in text.lower():
+            n = text.count("\n", 0, claim.start()) + 1
+            bad.append(
+                f"{path}:{n} says TIER-HW enforces something and the file never states "
+                f"{hw_caveat!r}: {' '.join(claim.group(0).split())[:90]}"
+            )
 
     m = re.search(r"BOUNDARY_WORDS:\s*\[&str;\s*\d+\]\s*=\s*\[([^\]]*)\]", src)
     rust_words = re.findall(r'"([^"]+)"', m.group(1)) if m else []
