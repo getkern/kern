@@ -87,6 +87,21 @@ colima ssh            # from here on you are on Linux, not macOS
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
+**If this Mac already runs Docker Desktop or OrbStack, do not install a second VM.** Theirs is a
+Linux VM and kern runs in it, which costs nothing extra on a machine that keeps one up anyway:
+
+```sh
+docker run --rm -it --privileged --tmpfs /run ubuntu
+# then, inside: curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+`--privileged` is not decoration and is worth understanding before you type it: a box mounts its own
+`/proc`, which Docker's default masking refuses (`mount(proc) failed: Operation not permitted`,
+measured). On a Mac that privilege is inside Docker's own Linux VM, which is already the boundary
+against macOS. On a Linux host it is privilege on the real machine, so this recipe is a way to TRY
+kern rather than the way to run it there. The installer checks for these before telling you to
+install anything.
+
 **Verified** on a MacBook with Apple Silicon, colima 0.10.3, guest Ubuntu 24.04.4 aarch64: kern 0.7.0
 installs, `kern box --image alpine` starts and runs, and the Python SDK drives it. That run also found
 the two things below, which every Mac following these steps will meet, so they are here rather than in
