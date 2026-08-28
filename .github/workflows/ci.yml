@@ -323,6 +323,65 @@ jobs:
         # network, and a suite failure cannot be a pull that flaked.
         run: sh pentest/run-all.sh ./target/release/kern
 
+  caps-shape:
+    name: the cap fix, in the shape it fixes
+    # The bug this release closes lived on hosts with a delegated `memory` controller and NO systemd
+    # user manager: a container, WSL2, a colima VM on a Mac. This runner has systemd, so every other
+    # job here exercises the shape where the bug never appeared. Without this one the regression test
+    # for the release's headline fix would live only in a human's terminal.
+    #
+    # A privileged container reproduces the shape exactly: same `kern doctor` warning, same absent
+    # user manager. Both directions are asserted, because only the pair is evidence: where delegation
+    # is possible the cap must BITE, and where it is not, `doctor` and the box must AGREE that it does
+    # not. The second half is the one that would have caught the original defect.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build the binary under test
+        run: cargo build --release --bin kern
+      - name: with the controller delegated, the cap must bite
+        run: |
+          cat > /tmp/yes.sh <<'S'
+          export PATH=/fix:$PATH
+          apt-get update -qq >/dev/null 2>&1
+          apt-get install -y -qq curl ca-certificates uidmap >/dev/null 2>&1
+          /fix/kern pull alpine >/dev/null 2>&1
+          mkdir -p /sys/fs/cgroup/leaf
+          for p in $(cat /sys/fs/cgroup/cgroup.procs); do echo $p > /sys/fs/cgroup/leaf/cgroup.procs 2>/dev/null || true; done
+          echo "+memory +pids" > /sys/fs/cgroup/cgroup.subtree_control
+          # The positive control FIRST: if this grep finds nothing here, every other number this job
+          # prints is meaningless, including the 0 the next step reads as a verdict.
+          n=$(/fix/kern doctor 2>&1 | grep -ci "caps enforced")
+          echo "doctor enforced=$n"
+          [ "$n" = "1" ] || { echo "the assertion is broken, not the host" >&2; exit 1; }
+          m=$(/fix/kern box a --image alpine --memory 64m -- sh -c 'cat /sys/fs/cgroup/memory.max' 2>&1 | grep -E '^[0-9]+$|^max$' | tail -1)
+          echo "memory.max=$m"
+          [ "$m" = "67108864" ] || { echo "the cap was not written" >&2; exit 1; }
+          out=$(/fix/kern box b --image alpine --memory 64m -- sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=400 2>/dev/null; echo SURVIVED' 2>&1 | tail -1)
+          echo "400 MiB under 64m: $out"
+          case "$out" in *SURVIVED*) echo "the cap did not bite" >&2; exit 1 ;; esac
+          S
+          docker run --rm --privileged --tmpfs /run \
+            -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/yes.sh:/t.sh ubuntu:24.04 sh /t.sh
+      - name: where it cannot be delegated, doctor and the box must agree
+        run: |
+          cat > /tmp/no.sh <<'S'
+          export PATH=/fix:$PATH
+          apt-get update -qq >/dev/null 2>&1
+          apt-get install -y -qq curl ca-certificates uidmap >/dev/null 2>&1
+          /fix/kern pull alpine >/dev/null 2>&1
+          n=$(/fix/kern doctor 2>&1 | grep -ci "caps enforced")
+          m=$(/fix/kern box n --image alpine --memory 32m -- sh -c 'cat /sys/fs/cgroup/memory.max' 2>&1 | grep -E '^[0-9]+$|^max$' | tail -1)
+          echo "doctor enforced=$n  box memory.max=$m"
+          [ "$n" = "0" ] && [ "$m" = "max" ] && exit 0
+          echo "doctor and the box disagree: this is the defect the release fixes, returning" >&2
+          exit 1
+          S
+          docker run --rm --privileged --tmpfs /run \
+            -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/no.sh:/t.sh ubuntu:24.04 sh /t.sh
+
   macos-guards:
     name: macOS guards (no VM)
     # A macOS runner cannot RUN kern, and that is not the point. kern needs a Linux kernel, and a
