@@ -778,7 +778,10 @@ unsafe fn ours_for(symbol: *const c_char) -> Option<*mut c_void> {
     if len == 0 || len == MAX {
         return None;
     }
-    let name = core::slice::from_raw_parts(symbol as *const u8, len);
+    // `.cast()` rather than `as *const u8`: `c_char` is signed on x86_64 and UNSIGNED on aarch64, so
+    // the `as` form is a real cast on one target and a no-op clippy rejects on the other. The method
+    // spelling is correct on both, which is why CI caught this only on the aarch64 leg.
+    let name = core::slice::from_raw_parts(symbol.cast::<u8>(), len);
     let f: *mut c_void = match name {
         b"cuMemAlloc" | b"cuMemAlloc_v2" => cuMemAlloc_v2 as *mut c_void,
         b"cuMemAllocManaged" => cuMemAllocManaged as *mut c_void,
