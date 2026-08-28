@@ -17,7 +17,28 @@ info() { printf "${GRN}==>${ZZ} %s\n" "$1"; }
 
 # --- platform detection ---
 os="$(uname -s)"
-[ "$os" = "Linux" ] || err "kern is Linux-only (detected $os)."
+# Darwin gets its own message rather than the generic one: it is the single point where a Mac user
+# meets kern, and "Linux-only" alone reads as a dead end. There is no native port and there will not
+# be one (macOS has no namespaces or cgroups), but kern runs unchanged in any Linux VM, so the error
+# hands over the four commands that get there instead of just closing the door.
+case "$os" in
+  Linux) ;;
+  Darwin)
+    err "kern is Linux-only (detected Darwin), and a native macOS port is a non-goal: macOS has no
+  namespaces and no cgroups, so there is nothing for kern to build a box out of.
+
+  kern does run on a Mac inside a Linux VM (colima, Lima, OrbStack, UTM):
+
+      brew install colima
+      colima start
+      colima ssh
+      curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+
+  The last line is this installer, run again from inside the VM, where it finds Linux and works.
+  No GPU and no GPIO are reachable from there. See docs/INSTALL.md."
+    ;;
+  *) err "kern is Linux-only (detected $os)." ;;
+esac
 case "$(uname -m)" in
   x86_64 | amd64) arch="x86_64-unknown-linux-musl" ;;
   aarch64 | arm64) arch="aarch64-unknown-linux-musl" ;;

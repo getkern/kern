@@ -43,6 +43,23 @@ Not natively. kern's isolation is Linux kernel machinery (user namespaces, cgrou
 runs on **Linux, WSL2 and ARM boards** (Raspberry Pi, Jetson, Arduino UNO Q). On Windows, use WSL2: the
 release ships a pre-baked WSL rootfs and a small `kern.exe` shim.
 
+## Does it run on macOS?
+
+Not natively, and that is a non-goal rather than work left undone: macOS has no namespaces and no
+cgroups, so there is nothing there for kern to build a box out of. It does run **on a Mac inside a
+Linux VM** (colima, Lima, OrbStack, UTM, or the one Docker Desktop is already running), where it is
+the ordinary Linux kern, same binary and same CLI as your CI box:
+
+```sh
+brew install colima && colima start && colima ssh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+The second line is the normal installer, run from inside the VM. **No GPU and no GPIO** are reachable
+from there: Apple exposes neither to a Linux guest, which is why Docker Desktop has no GPU for
+containers either. Reported to work, **not tested by the author on macOS**: if it fails for you,
+[an issue](https://github.com/getkern/kern/issues) is the fastest way to get it fixed.
+
 ## Is it safe to run truly hostile, untrusted multi-tenant code?
 
 The boundary is the Linux kernel, so a kernel privilege-escalation bug is an escape, and an unprivileged

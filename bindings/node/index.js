@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.29";
+const VERSION = "0.1.31";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -499,6 +499,16 @@ function findKern() {
       }
     }
   }
+  // On macOS the generic "install it" is a dead end: there is no macOS build to install. kern needs
+  // a Linux kernel, so the answer is a VM, and the error says which one rather than leaving the
+  // reader hunting for a download that does not exist.
+  if (process.platform === "darwin")
+    throw new SandboxError(
+      "the `kern` binary was not found on PATH, and this is macOS: kern is Linux-only " +
+        "(no namespaces, no cgroups on a Mac), so there is no macOS build to find. " +
+        "Run inside a Linux VM (colima, Lima, OrbStack, UTM), where kern installs normally, " +
+        "or set $KERN_BIN to a kern reachable from here. https://github.com/getkern/kern",
+    );
   throw new SandboxError(
     "the `kern` binary was not found on PATH - install it " +
       "(https://github.com/getkern/kern) or set $KERN_BIN",

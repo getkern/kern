@@ -65,7 +65,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.30"
+__version__ = "0.1.31"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -645,6 +645,17 @@ def _find_kern() -> str:
         return env
     found = shutil.which("kern")
     if not found:
+        # On macOS the generic "install it" is a dead end: there is no macOS build to install, and a
+        # user who pip-installed this package here would otherwise keep looking for one. kern needs a
+        # Linux kernel, so the answer is a VM, and saying so costs one branch.
+        if sys.platform == "darwin":
+            raise SandboxError(
+                "the `kern` binary was not found on PATH, and this is macOS: kern is Linux-only "
+                "(no namespaces, no cgroups on a Mac), so there is no macOS build to find. "
+                "Run inside a Linux VM (colima, Lima, OrbStack, UTM), where kern installs "
+                "normally, or set $KERN_BIN to a kern reachable from here. "
+                "https://github.com/getkern/kern"
+            )
         raise SandboxError(
             "the `kern` binary was not found on PATH - install it "
             "(https://github.com/getkern/kern) or set $KERN_BIN"

@@ -75,6 +75,32 @@ first, and it is not an executable, so the Python and Node SDKs run **from Windo
 get the exe back, allow the folder the installer names in your antivirus and re-run the installer.
 Throughout, `wsl -d kern -- kern ...` and the SDKs run inside the distro are unaffected.
 
+**🍎 macOS.** There is no native port and there will not be one: macOS has no namespaces and no
+cgroups, so there is nothing for kern to build a box out of. The installer says so and stops, rather
+than dropping a Linux binary on a Mac. kern does run **inside a Linux VM on a Mac**, and there it is
+the ordinary Linux kern, the same aarch64 binary and the same CLI as a Linux host:
+
+```sh
+brew install colima   # or Lima, OrbStack, UTM, or the VM Docker Desktop already runs
+colima start
+colima ssh            # from here on you are on Linux, not macOS
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+Two limits, stated where the feature is and not in a footnote. **No GPU and no GPIO** are reachable
+from a Linux guest on a Mac: Apple's `VZVirtioGraphicsDeviceConfiguration` gives the guest a display,
+not a compute device, which is the same reason Docker Desktop has no GPU for containers. And the cap
+you get is enforced by the Linux kernel **inside the VM**, so the VM's own size is the outer ceiling:
+size it for what you intend to run.
+
+The right way to read this is the Windows advice one section up: run kern **inside** the VM. Crossing
+from the macOS side costs more per command than the box does, exactly as `wsl.exe` does on Windows.
+No macOS figure is published here because none has been measured; when one is, it will name what is
+kern's work and what is the crossing, like the Windows table does.
+
+Reported to work, **not tested by the author on macOS**. If it fails on yours,
+[open an issue](https://github.com/getkern/kern/issues).
+
 **From source** (the route that needs no trust in a published artifact):
 
 ```sh
