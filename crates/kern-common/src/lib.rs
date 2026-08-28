@@ -63,7 +63,17 @@ impl BoxName {
 pub fn parse_binary_size(s: &str) -> Option<u64> {
     const K: u64 = 1024;
     let lower = s.trim().to_ascii_lowercase();
-    let t = lower.strip_suffix('b').unwrap_or(&lower).trim_end(); // "gb"→"g", "512 b"→"512"
+    // "gib"→"g", "gb"→"g", "512 b"→"512". THE IEC FORM IS STRIPPED FIRST, and it has to be: one pass
+    // of `strip_suffix('b')` turns "2gib" into "2gi", whose last character is not a unit, so the most
+    // precise spelling of a binary size was the one form this parser refused while it accepted the
+    // sloppier "2gb". An operator who writes what they mean got an error; one who writes "2gb" did
+    // not. The units here have always been binary, so "gib" and "gb" name the same number and both
+    // are taken.
+    let t = lower
+        .strip_suffix("ib")
+        .or_else(|| lower.strip_suffix('b'))
+        .unwrap_or(&lower)
+        .trim_end();
     let (num, mult) = match t.chars().last()? {
         'k' => (&t[..t.len() - 1], K),
         'm' => (&t[..t.len() - 1], K * K),
@@ -294,5 +304,62 @@ mod an_exported_but_empty_flag_is_not_set {
             "any non-empty value is on: this is a presence flag, not a boolean"
         );
         std::env::remove_var(name);
+    }
+}
+
+/// Every spelling of a size that is accepted must mean the same number.
+#[cfg(test)]
+mod size_spellings {
+    use super::parse_binary_size as p;
+
+    const G: u64 = 1 << 30;
+
+    /// The case this module was written for. `2gb` was accepted and `2GiB`, the precise spelling of
+    /// exactly the same quantity, was the one form refused: one pass of `strip_suffix('b')` left
+    /// `2gi`, whose last character is not a unit.
+    #[test]
+    fn the_iec_spelling_agrees_with_the_short_one() {
+        for s in [
+            "2g", "2G", "2gb", "2GB", "2gib", "2GiB", "2GIB", "2 g", "2 GiB", " 2g ",
+        ] {
+            assert_eq!(p(s), Some(2 * G), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn every_unit_takes_the_iec_form() {
+        assert_eq!(p("512kib"), p("512k"));
+        assert_eq!(p("512mib"), p("512m"));
+        assert_eq!(p("512gib"), p("512g"));
+        assert_eq!(p("1tib"), p("1t"));
+    }
+
+    /// The units were always binary, so the IEC spelling must not be read as a decimal one: `1gib`
+    /// is 1073741824 and not 1000000000. Asserting the value, not just the agreement, because two
+    /// spellings could agree on the wrong number.
+    #[test]
+    fn the_units_are_binary_and_stay_binary() {
+        assert_eq!(p("1kib"), Some(1024));
+        assert_eq!(p("1mib"), Some(1024 * 1024));
+        assert_eq!(p("1gib"), Some(G));
+        assert_eq!(p("1tib"), Some(1024 * G));
+    }
+
+    /// A suffix is not a size on its own, and nothing here may make one parse.
+    #[test]
+    fn a_bare_unit_is_still_refused() {
+        for s in [
+            "", " ", "b", "gib", "ib", "g", "kib", "two gib", "-2gib", "2.5gib",
+        ] {
+            assert_eq!(p(s), None, "{s:?}");
+        }
+    }
+
+    /// Zero is not a size any caller can use, whichever way it is spelled.
+    #[test]
+    fn zero_is_refused_in_every_spelling() {
+        for s in ["0", "0k", "0gib", "0 GiB", "0b"] {
+            assert_eq!(p(s), None, "{s:?}");
+        }
     }
 }
