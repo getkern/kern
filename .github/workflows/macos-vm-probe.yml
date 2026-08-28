@@ -25,6 +25,21 @@ jobs:
           uname -m
           sysctl -n hw.memsize
           sysctl -n machdep.cpu.brand_string || true
+      - name: how long does macOS take to start a process
+        # The one macOS measurement that needs no VM, and in the shim budget it is the heaviest and
+        # least certain term: on a Mac every `kern` invocation pays dyld plus signature validation
+        # before any of kern's own work begins. Same command a human ran on a real MacBook, so the
+        # two numbers are comparable. READ IT AS AN UPPER BOUND: this runner is itself virtualized,
+        # and /usr/bin/true is far smaller than a real client binary, so the floor is below this and
+        # a shipped binary would sit above it.
+        run: |
+          for round in 1 2 3; do
+            start=$(python3 -c 'import time; print(time.time_ns())')
+            for _ in $(seq 100); do /usr/bin/true; done
+            end=$(python3 -c 'import time; print(time.time_ns())')
+            echo "round $round: $(( (end - start) / 100 / 1000 )) us per process"
+          done
+
       - name: install colima
         run: brew install colima
       - name: try to start a Linux VM
