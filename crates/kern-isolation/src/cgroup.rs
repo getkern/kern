@@ -633,6 +633,49 @@ fn in_tree(child: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> 
 /// e.g. a Raspberry Pi without `cgroup_enable=memory`). Board-test finding: without this, we'd take the
 /// direct path and then fail-closed-refuse EVERY capped box on such a host; with it, `direct_caps_available`
 /// is false there → we fall back to the scope / best-effort + warning path, exactly as before.
+/// Can a CHILD of `dir` carry a real cap? Measured the way a box start measures it, because
+/// "`memory` is listed in `cgroup.controllers`" answers a different question: a cgroup that HOLDS
+/// PROCESSES cannot enable controllers in its `cgroup.subtree_control` at all (cgroup v2's
+/// no-internal-process rule), so its children get no `memory.max` however well delegated it is.
+///
+/// That is not a corner case: it is every host where kern runs in the cgroup it was started in and
+/// there is no systemd user manager to hand it a leaf of its own. A container, WSL2, and a colima VM
+/// are all that shape, and on all three `apply_limits` used to build the box under that cgroup, find
+/// no `memory.max`, and report the box UNCAPPED while `kern doctor` reported caps enforced (it probes
+/// `kern.slice`, which as root it creates EMPTY, so its children cap fine). Two surfaces, one host,
+/// opposite answers.
+///
+/// Memoised: the probe creates and removes a directory, and a box start must not pay that twice.
+fn children_can_be_capped(dir: &std::path::Path) -> bool {
+    static MEMO: OnceLock<Option<(PathBuf, bool)>> = OnceLock::new();
+    let cached = MEMO.get_or_init(|| {
+        let d = dir.to_path_buf();
+        let verdict = probe_child_cap(&d);
+        Some((d, verdict))
+    });
+    match cached {
+        Some((cached_dir, verdict)) if cached_dir == dir => *verdict,
+        // A different directory than the memoised one: probe it directly rather than answer about
+        // another cgroup. Rare (one process caps under one parent), so the cost is not on any hot path.
+        _ => probe_child_cap(dir),
+    }
+}
+
+/// The measurement behind [`children_can_be_capped`]: enable the controllers the way a box start
+/// does, create a throwaway child, and report whether it received a `memory.max` to write. Removes
+/// what it created on every path.
+fn probe_child_cap(dir: &std::path::Path) -> bool {
+    enable_subtree_controllers(dir);
+    let child = dir.join(format!("kern-parentprobe-{}", std::process::id()));
+    let _ = fs::remove_dir(&child); // a leftover from a crashed probe
+    if fs::create_dir(&child).is_err() {
+        return false;
+    }
+    let ok = child.join("memory.max").exists();
+    let _ = fs::remove_dir(&child);
+    ok
+}
+
 fn slice_can_cap(slice: &std::path::Path) -> bool {
     has_controller(slice, "memory") && has_controller(slice, "pids")
 }
@@ -1378,6 +1421,23 @@ pub fn apply_limits(
         // reach it. The child built below is the box's own ceiling; the scope keeps its `MemoryMax` (the
         // box's cap plus `SCOPE_SUPERVISOR_HEADROOM`) as the outer backstop.
         scope.clone()
+    } else if allow_direct
+        && origin
+            .as_deref()
+            .is_some_and(|o| !children_can_be_capped(o))
+        && ensure_kern_slice().is_some_and(|s| children_can_be_capped(&s))
+    {
+        // RESCUE, and the narrowest one that closes the doctor/box contradiction. `origin` is a cgroup
+        // that holds processes (kern's own), so cgroup v2 refuses to enable controllers in its subtree
+        // and the box's child would get no `memory.max`: the box would run UNCAPPED on a host where a
+        // cap is perfectly available one directory over. `ensure_kern_slice()` is that directory, and
+        // as root it is created EMPTY, which is exactly why doctor's probe finds caps enforced there.
+        //
+        // Deliberately gated on `allow_direct`, so `kern run` keeps its promise never to relocate a
+        // host process into kern.slice, and on BOTH probes, so a box only moves when staying put means
+        // no cap at all and moving means a real one. Rootless is untouched: `ensure_kern_slice` only
+        // CREATES the slice as root, so where it is absent this arm cannot fire.
+        ensure_kern_slice()?
     } else {
         origin.clone()?
     };
