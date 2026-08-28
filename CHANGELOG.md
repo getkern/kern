@@ -250,7 +250,18 @@ is in the git history.
 
 ### Fixed
 
-- **A box is now capped where a cap is possible, not only where systemd says so.** `kern doctor` and
+- ⚠️ **BEHAVIOUR CHANGE: a box that used to run uncapped on some hosts is now capped, and can be
+  OOM-killed where it previously survived.** If you run kern as root on a host with no
+  `systemd --user` manager (a container, WSL2, a colima VM on a Mac), boxes there were running with
+  no memory or pid ceiling at all, including the DEFAULTS that apply when you pass no flags. kern
+  said so at every start, but it said it in a warning that is easy to scroll past. From this release
+  those boxes get the cap they always asked for, so a workload that quietly used more than
+  `--memory` allowed, or more than the 512m default, is killed instead of ignored. Nothing changes on
+  a host that was already capping (a normal desktop, a systemd user session, an ARM board on the
+  scope path), and `kern doctor` tells you which one you are on before you try. To keep the old
+  behaviour on purpose, `--allow-uncapped`.
+
+  The cause, for the record: `kern doctor` and
   `kern box` gave opposite answers on the same host in the same second: doctor reported caps enforced
   while the box reported UNCAPPED and read its own `memory.max` back as `max`. Both were true, about
   different cgroups. doctor probes `kern.slice`, which as root it CREATES, so the slice is empty and
