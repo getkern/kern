@@ -150,6 +150,61 @@ jobs:
         # The HW/privilege-gated tests skip gracefully here exactly as on x86 (the runner's
         # userns/AppArmor posture, not the arch), so aarch64 CI stays green.
 
+  macos-guards:
+    name: macOS guards (no VM)
+    # A macOS runner cannot RUN kern, and that is not the point. kern needs a Linux kernel, and a
+    # hosted macOS runner has no nested virtualization, so colima or Lima cannot start a VM to hold
+    # one. What this runner can check is everything kern SAYS to a Mac user, which is the part that
+    # had never been executed on Darwin at all: the installer's refusal, and each SDK's error when
+    # no binary is on PATH. Those are the three doors a Mac user meets, and they were verified only
+    # by faking `uname` on a Linux box until this job existed.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: the installer refuses Darwin, and hands over the route that works
+        run: |
+          set -u
+          if out="$(sh install.sh 2>&1)"; then
+            printf 'the installer exited 0 on macOS; it must refuse:\n%s\n' "$out" >&2
+            exit 1
+          fi
+          printf '%s\n' "$out"
+          printf '%s' "$out" | grep -q 'Linux-only (detected Darwin)' || {
+            echo 'the refusal stopped naming Darwin' >&2; exit 1; }
+          printf '%s' "$out" | grep -q 'colima' || {
+            echo 'the refusal stopped saying where kern does run' >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: the Python SDK names the VM, not a download that does not exist
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ./bindings/python
+          python - <<'PY'
+          import kern_sandbox as k
+
+          try:
+              found = k._find_kern()
+          except k.SandboxError as e:
+              msg = str(e)
+          else:
+              raise SystemExit(f"a kern turned up on a macOS runner: {found}")
+          print(msg)
+          for want in ("macOS", "Linux VM", "KERN_BIN"):
+              assert want in msg, f"the macOS message lost {want!r}: {msg}"
+          PY
+      - name: the Node SDK says the same thing
+        run: |
+          node -e '
+            const { Sandbox } = require("./bindings/node/index.js");
+            let msg = null;
+            try { new Sandbox(); } catch (e) { msg = e.message; }
+            if (msg === null) throw new Error("a kern turned up on a macOS runner");
+            console.log(msg);
+            for (const want of ["macOS", "Linux VM", "KERN_BIN"])
+              if (!msg.includes(want)) throw new Error("the macOS message lost " + want + ": " + msg);
+          '
+
   audit:
     name: cargo-audit + cargo-deny
     runs-on: ubuntu-latest
