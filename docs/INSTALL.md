@@ -228,7 +228,8 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 **Linux, multi-architecture.** kern builds to a static (musl) binary for **`linux-x86_64`** and
 **`linux-aarch64`**: one file per arch (1.91 MB x86_64 / 1.67 MB aarch64 from a source build; the
 size-optimized release build is 1.52 MB / 1.25 MB), no Rust deps beyond `libc` (the pull path shells
-out to system `curl`/`tar`). No prebuilt binaries are published yet; every target builds from source.
+out to system `curl`/`tar`). Prebuilt binaries ship with every release, checksummed, for both
+architectures; building from source stays supported and produces the larger figures above.
 
 | Platform | Arch | Status |
 |---|---|---|
@@ -238,6 +239,7 @@ out to system `curl`/`tar`). No prebuilt binaries are published yet; every targe
 | NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated (board) |
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
+| macOS, **inside a Linux VM** (colima / Lima / OrbStack / UTM) | aarch64 | ✅ verified by hand, caps not enforced on a default guest ([notes](#install)) |
 
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux
