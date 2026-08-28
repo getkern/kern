@@ -902,7 +902,8 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
     // pins → every gpiochip node (single readdir). HONEST LIMITATION:
     // GPIO isolation is *chip-granular*, not per-line - a `/dev/gpiochipN` chardev exposes ALL lines
     // of that controller via ioctl, and requesting any pin binds every gpiochip present. The per-pin
-    // list is cooperative metadata (surfaced as `KERN_VGPIO_PINS`), not a kernel boundary. Documented
+    // list is cooperative metadata (exported as `KERN_VGPIO_PINS` on the no-sandbox `run` path only,
+    // never inside a box, where it selects devices and nothing else), not a kernel boundary. Documented
     // in SECURITY.md so a profile author isn't misled into thinking `pins = [17]` hands out only
     // line 17.
     if !e.pins.is_empty() {

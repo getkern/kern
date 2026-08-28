@@ -4446,7 +4446,7 @@ fn tailored_kern_toml(h: &HostInv) -> String {
     }
     if !h.i2c.is_empty() || !h.gpiochips.is_empty() {
         s.push_str(
-            "\n# ── GPIO / I/O - `kern box … vgpio:io` binds ONLY these devices into the box ──\n\
+            "\n# ── GPIO / I/O - `kern box … vgpio:io` binds these peripherals into the box ──\n\
              [[gpio]]\nid = \"gpio:0\"\n\n[[vgpio]]\nname = \"io\"\nbackend = \"gpio:0\"\n",
         );
         if let Some(first) = h.i2c.first() {
@@ -4523,7 +4523,7 @@ backend = "host"      # no [[cpu]] to declare: slice the whole host directly
 cpus = 0.5
 memory = "256m"
 
-# ── GPIO / I/O - `kern box vgpio:leds …` binds ONLY these devices into the box ──
+# ── GPIO / I/O - `kern box vgpio:leds …` binds these peripherals into the box ──
 [[gpio]]
 id = "gpio:0"
 pins = [17, 27, 22]

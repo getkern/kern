@@ -1754,6 +1754,33 @@ fn box_applies_vcpu_profile() {
     let _ = fs::remove_dir_all(&cfgdir);
 }
 
+/// `kern examples` is the text an author reads WHILE writing a kern.toml, so a claim it makes about
+/// what a profile grants is the claim that gets believed. It once said `pins` would "expose ONLY
+/// these lines, nothing else" while SECURITY.md said the opposite and the code agreed with
+/// SECURITY.md: any pin binds every `/dev/gpiochipN`, whole. Measured on a host with a gpiochip, a
+/// box with no profile has no `/dev/gpiochip*` and one with `pins = [17, 27]` has the entire chip.
+///
+/// This pins the correction rather than trusting review: the words that overstated the boundary must
+/// stay out, and the granularity must be stated where the field is.
+#[test]
+fn the_examples_config_does_not_overstate_a_gpio_grant() {
+    let ex = kern().args(["examples"]).output().expect("run kern");
+    assert!(ex.status.success());
+    let out = String::from_utf8_lossy(&ex.stdout);
+
+    for overclaim in ["ONLY these lines", "ONLY these devices"] {
+        assert!(
+            !out.contains(overclaim),
+            "`kern examples` claims a per-line/per-device GPIO boundary kern does not enforce: \
+             {overclaim:?}. Requesting any pin binds every /dev/gpiochipN. See SECURITY.md."
+        );
+    }
+    assert!(
+        out.contains("CHIP-granular"),
+        "the pins field must state its granularity where it is declared, not only in SECURITY.md"
+    );
+}
+
 /// The config command surface round-trips: `kern examples` emits a config that `kern validate`
 /// accepts and `kern config` lists - so the embedded example can never drift out of the schema.
 #[test]
