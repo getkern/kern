@@ -4531,7 +4531,9 @@ pins = [17, 27, 22]
 [[vgpio]]
 name = "leds"
 backend = "gpio:0"    # REQUIRED: a [[gpio]] id above, or "host" for the host's own device nodes
-pins = [17, 27]       # a subset of the [[gpio]]'s pins - expose ONLY these lines, nothing else
+pins = [17, 27]       # WHICH lines you intend to drive. The grant is CHIP-granular, not per-line:
+                      # asking for any pin binds the whole /dev/gpiochipN, so the box can reach
+                      # every line on that chip. See SECURITY.md, "vGPIO device passthrough".
 
 # ── Disk - `kern box vdisk:scratch …` mounts a size-capped volume at /vdisk/scratch ──
 [[disk]]
