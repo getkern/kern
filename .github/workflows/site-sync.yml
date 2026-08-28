@@ -1,0 +1,37 @@
+name: site-sync
+
+# `getkern.dev/install.sh` must stay byte-identical to the one in this repo, because a user can audit
+# the file on GitHub before piping the OTHER one into their shell. That is the whole argument for
+# `curl | sh` being acceptable here, and it is only true while the two agree.
+#
+# Nothing enforced it. The file drifted TWICE in a single day: once carrying a stale Darwin message
+# that sent Mac users into a dead end the repo had already fixed, and again an hour after being
+# re-synced by hand. A rule that depends on someone remembering is not a rule.
+#
+# Scheduled rather than on push, deliberately: the site is deployed by hand, so for a few minutes
+# after a merge the two legitimately differ, and a push-gate would cry wolf every time. A daily check
+# turns "someone forgot" into a red mark that cannot be scrolled past.
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  installer:
+    name: the site serves the installer this repo audits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: compare the served file with this tree
+        run: |
+          # A cache-busting query so Cloudflare answers from origin: a HIT could show yesterday's file
+          # and report drift that was already fixed, or hide drift that exists.
+          curl -fsSL "https://getkern.dev/install.sh?ci=${GITHUB_RUN_ID}" -o /tmp/served.sh
+          if diff -u install.sh /tmp/served.sh; then
+            echo "getkern.dev serves the installer in this tree"
+            exit 0
+          fi
+          echo "::error::getkern.dev/install.sh has drifted from install.sh in main" >&2
+          echo "re-sync it, then re-run this check:" >&2
+          echo "  scp install.sh root@getkern.dev:/var/www/getkern.dev/install.sh" >&2
+          exit 1
