@@ -1,9 +1,17 @@
 //! `kern doctor` - a rootless-sandbox preflight. Answers "will `kern box` work on this machine, and
 //! which optional features are available?" with PASS / WARN / FAIL lines and a fix hint for each.
 //!
-//! It only *reads* the environment (sysctls, `/proc`, `PATH`) plus one real unprivileged-userns
-//! self-test - no mutation, no privilege. FAIL = boxes won't run; WARN = an optional feature is
-//! degraded/unavailable but the core sandbox still works.
+//! It takes no privilege, and it reads rather than changes the environment (sysctls, `/proc`,
+//! `/sys`, `PATH`). Three checks do more than read, and they are named here rather than discovered
+//! in a trace: the userns check performs one real unprivileged-userns self-test, the scope-toll
+//! check times three `systemd-run --user --scope /bin/true`, and the memory-cap check creates a
+//! `kern-capprobe-<pid>` cgroup, writes THAT CHILD's own `memory.max` and removes it, because the
+//! only way to answer "does a cap bind here?" is to try to make one bind. It never touches an
+//! existing box's limits. The GPU check is the read-only kind: `pentest-gpu-claims.sh` asserts
+//! against strace that it opens nothing under `/sys/class/drm` or `/proc/driver` for writing.
+//!
+//! FAIL = boxes won't run; WARN = an optional feature is degraded/unavailable but the core sandbox
+//! still works.
 
 use crate::error::Error;
 use crate::ui::Palette;

@@ -48,9 +48,10 @@ section is the summary; the rest of this file is the per-mechanism detail behind
 - Resource limits must hold: fork bombs and OOM must be contained.
 - seccomp must block the dangerous syscall set unconditionally.
 
-**Out of scope, by design.** GPU limits are not shipped, so there is nothing here to trust or to
-attack yet. When they land, expect a cooperative governor for honest workloads rather than a
-boundary, and expect this file to say so with the bypasses named.
+**Out of scope, by design: the GPU.** No GPU limit ships, so there is no cap here to attack. What
+ships is the verdict about one, and the verdict is that a VRAM cap in userspace is a quota and not a
+boundary. The bypasses are named below rather than promised for later, and
+[`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) runs them.
 
 **An unprivileged user namespace is itself kernel attack surface.** kern's isolation is *built on*
 one, and userns has historically been a fertile source of kernel privilege-escalation CVEs. Running
@@ -459,6 +460,73 @@ honest limitations:
 
 Grant a `vgpio:` profile only to workloads you would trust with that hardware.
 
+## GPU capability tiers, and why a VRAM cap is not a boundary
+
+kern slices no GPU. `kern doctor` prints one line per DRM card saying what a cap on it *would* be
+worth, and this section is the evidence behind that line. The judgement ships ahead of the
+capability on purpose: if the cap shipped first, it would be sold as a boundary for however long the
+description took to catch up.
+
+**TIER-HW** is a partition the device enforces: an SR-IOV virtual function, or MIG instances
+configured for that card. The cap holds against a tenant actively trying to exceed it, because it is
+not the tenant's software that enforces it.
+
+**TIER-SOFT** is everything else, which on consumer hardware is everything. It is a cooperative
+quota: real and useful for density, fairness, accidental overcommit and accounting across trusted and
+semi-trusted tenants, and **not a boundary against malicious code**. The words *isolation*, *secure*
+and *hard* are refused for it, mechanically, in [`crates/kern-cli/src/gpu.rs`](crates/kern-cli/src/gpu.rs)
+and again over the assembled `doctor` row.
+
+There is **no middle tier**, and its absence is a measurement rather than an omission. A
+kernel-enforced `dmem` cap that charged the path the tenant allocates through would be one. On the
+driver this was measured against, `dmem` accounts faithfully and does not enforce for the ROCm
+compute path: with a per-cgroup `dmem.max` of 2 GB, an 8 GB `hipMalloc` **succeeded** while the leaf
+cgroup's `dmem.current` stayed at **0** and 8 GB sat in VRAM. The process was in the cgroup, so the
+move worked; the charge simply is not attributed to it. Managed memory's VRAM portion *did* charge
+the leaf (166 MiB), so the DRM render path is charged and the KFD compute path, the one ML tenants
+use, is not. Measured on an AMD RX 6700 XT (gfx1031, amdgpu/ROCm as shipped on kernel 6.17,
+`CONFIG_CGROUP_DMEM=y`). It is coupled to that driver and kernel: the tier would move only after
+re-running the measurement per vendor, driver and kernel and finding the leaf charged. Until then
+`dmem` and `/dev/kfd` are printed next to the card as facts, never as a promotion.
+
+### Why no userspace cap can be a boundary here
+
+A userspace VRAM cap works by interception: it sits in front of the vendor library the workload
+calls. That only holds if the workload has to go through it, and it does not.
+
+- The device nodes are openable by an unprivileged process directly. NVIDIA ships `/dev/nvidiactl`
+  mode `0666`.
+- Opening a file does not consult the dynamic loader, so clearing the entire `LD_` environment
+  changes nothing.
+- The real vendor library loads by absolute path with `LD_LIBRARY_PATH` pointing nowhere, so
+  controlling the search path controls nothing.
+- **A process with libc and nothing else in its address space reaches the driver with a raw ioctl.**
+  Measured on an RTX 5060 Ti, driver 580.173.02: the NVIDIA resource manager answered a version
+  handshake (`reply=1 RECOGNIZED`) and the DRM render node answered `DRM_IOCTL_VERSION`, both from a
+  binary that links only libc. Two distinct driver ABIs, so intercepting one vendor library is not
+  intercepting the device.
+- Interception is also the wrong *granularity*: a descriptor to the device passes over a unix socket
+  as `SCM_RIGHTS` and answers the same ioctl in a process that never opened the device, never linked
+  the vendor library, and was never in scope for whatever was watching the first one.
+- There is no serialisation point to race, because there is nothing shared to serialise on: 64
+  concurrent processes each reached the driver through their own open. A single unprivileged process
+  held 4096 concurrent handles, stopped by the probe's own ceiling rather than by any device quota;
+  the limit that applies is `RLIMIT_NOFILE`, inherited from the shell.
+
+And VRAM is committed by a page fault handled in the kernel and the GSP, so there is no syscall
+carrying the size for a seccomp filter to trap either. This is a property of the problem, not a
+defect above the kernel: no userspace mechanism passes the raw-ioctl test, whoever writes it.
+
+Run it: [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) with
+[`pentest/gpu-raw-ioctl.c`](pentest/gpu-raw-ioctl.c), T1 to T9, plus the checks that kern's own line
+matches what they find. The probe deliberately allocates nothing: the allocation ABI is closed,
+per-vendor and driver-version-coupled, and every allocation entry point sits behind the same ioctl
+channel the handshake already proves is open.
+
+**What to do with a hostile GPU tenant.** Give it a MIG instance or an SR-IOV virtual function, or
+give it the whole device. A cooperative quota is the right tool for packing several of your own
+models onto one card, and the wrong tool for containing someone else's.
+
 ## vDisk
 
 A `vdisk:` profile mounts a size-capped volume at `/vdisk/<name>`. Rootless it is a RAM-backed
@@ -538,11 +606,19 @@ processes to steer the reuse. It is not a cross-tenant boundary.
 
 ## Check it yourself
 
-The claims above are asserted by four adversarial suites in [pentest/](pentest/), which ask the
+The claims above are asserted by five adversarial suites in [pentest/](pentest/), which ask the
 kernel what is true rather than asking kern to report on itself: that a published port cannot tunnel
 into a host service, that `--ssh` does not hand out the host's shell, that `kern exec` does not
 escape the box, that a box cannot raise its own `memory.max` and sees no cgroup above its own, that a
 device not granted does not cross, and that a SIGKILLed supervisor does not leave a host port held.
+
+The fifth is the GPU claim suite, and it is the one that attacks a claim rather than a mechanism: it
+reads what `kern doctor` says about each card, then runs T1 to T9 against the host's own driver and
+fails if the two disagree.
+
+```sh
+sh pentest/pentest-gpu-claims.sh ./target/release/kern
+```
 
 ```sh
 cargo build --release

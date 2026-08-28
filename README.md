@@ -326,7 +326,7 @@ via `KERN_SECCOMP=denylist`), cgroup v2 limits (`--require-limits` refuses to st
 and a deny-by-default `/dev`. Where a boundary is cooperative rather than kernel-enforced,
 [SECURITY.md](SECURITY.md) says so and names the bypass.
 
-You do not have to take it on trust: [pentest/](pentest/) holds four adversarial suites that assert
+You do not have to take it on trust: [pentest/](pentest/) holds five adversarial suites that assert
 those boundaries against the kernel rather than against kern's own reporting, and they run without a
 registry account or a network.
 

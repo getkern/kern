@@ -309,6 +309,132 @@ def size_claims_agree() -> list[str]:
     return bad
 
 
+def _rust_string_literal_after(src: str, marker: str) -> str:
+    """The first Rust string literal after `marker`, with `\\`-newline continuations joined.
+
+    Written rather than reached for with a regex because the strings this reads are wrapped across
+    source lines with a trailing backslash, and a regex that tried to handle that would either miss
+    the continuation or eat the closing quote. Twenty lines of state machine has one behaviour.
+    """
+    i = src.find(marker)
+    if i < 0:
+        return ""
+    j = src.find('"', i)
+    if j < 0:
+        return ""
+    out: list[str] = []
+    k = j + 1
+    while k < len(src):
+        c = src[k]
+        if c == "\\":
+            nxt = src[k + 1] if k + 1 < len(src) else ""
+            if nxt == "\n":
+                k += 2
+                while k < len(src) and src[k] in " \t":
+                    k += 1
+                continue
+            out.append(nxt)
+            k += 2
+            continue
+        if c == '"':
+            break
+        out.append(c)
+        k += 1
+    return "".join(out)
+
+
+def gpu_claims_agree() -> list[str]:
+    """What the docs say about a GPU tier must be what `crates/kern-cli/src/gpu.rs` emits.
+
+    The GPU line is a CLAIM about a security boundary, which makes it the most expensive sentence in
+    the tree to get wrong: overstate it once and every other honest statement here stops being
+    believed. It also has the shape that has failed before, several homes for one fact, and one of
+    those homes is source code rather than prose, so `no-ai-slop.py` and the blacklist above cannot
+    see the drift between them.
+
+    Three agreements, none of which can fire on a true statement:
+
+      1. Every ``TIER-`` label written in a document must be one the code can actually print. The
+         model has a middle tier, ``TIER-MED``, that no code path can reach, because the measurement
+         that would earn it failed; a document that starts offering it would be describing a verdict
+         kern cannot award. That is the drift this catches.
+
+      2. The cooperative tier's disclaimer, verbatim from ``Tier::claim()``, must appear in the two
+         pages that carry the claim to a reader. Reword it in the code and the gate names the pages
+         that still say the old thing.
+
+      3. The reserved vocabulary must be identical in the Rust gate and in the shell one.
+         ``pentest/pentest-gpu-claims.sh`` cannot import a Rust constant, so it keeps its own copy,
+         and a duplicated derived condition with no gate on it is exactly how the two quietly stop
+         meaning the same thing. This is that gate.
+    """
+    try:
+        src = open("crates/kern-cli/src/gpu.rs", encoding="utf-8").read()
+    except OSError:
+        return []  # a checkout without the GPU module is not a disagreement
+
+    bad: list[str] = []
+
+    labels = set(re.findall(r'Tier::\w+\s*=>\s*"(TIER-[A-Z]+)"', src))
+    if not labels:
+        return ["crates/kern-cli/src/gpu.rs no longer emits any TIER- label, so nothing can be "
+                "checked against it. Restore Tier::label() or drop this check."]
+
+    docs = subprocess.run(
+        ["git", "ls-files", "*.md"], capture_output=True, text=True
+    ).stdout.split()
+    for path in sorted(docs):
+        if os.path.basename(path) in ALWAYS_ALLOWED:
+            continue  # a changelog that recorded a tier kern used to print stays true
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.split("\n"), 1):
+            for said in re.findall(r"\bTIER-[A-Z]+\b", line):
+                if said not in labels:
+                    bad.append(
+                        f"{path}:{lineno} names {said}, which kern cannot print. "
+                        f"The tiers the code emits are {', '.join(sorted(labels))}"
+                    )
+
+    soft = _rust_string_literal_after(src, "Tier::Soft => {")
+    marker = "NOT a boundary against malicious code"
+    if marker not in soft:
+        bad.append(
+            "crates/kern-cli/src/gpu.rs: the cooperative tier's claim no longer contains "
+            f"{marker!r}. If that is deliberate, update this gate and both pages with it."
+        )
+    else:
+        for path in ("README.md", "SECURITY.md"):
+            try:
+                text = open(path, encoding="utf-8").read()
+            except OSError:
+                continue
+            if marker.lower() not in text.lower():
+                bad.append(
+                    f"{path} carries the GPU claim to a reader and no longer states "
+                    f"{marker!r}, which is what the code prints"
+                )
+
+    m = re.search(r"BOUNDARY_WORDS:\s*\[&str;\s*\d+\]\s*=\s*\[([^\]]*)\]", src)
+    rust_words = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+    try:
+        suite = open("pentest/pentest-gpu-claims.sh", encoding="utf-8").read()
+    except OSError:
+        suite = ""
+    if suite:
+        s = re.search(r"BOUNDARY_WORDS='([^']*)'", suite)
+        shell_words = s.group(1).split("|") if s else []
+        if sorted(rust_words) != sorted(shell_words):
+            bad.append(
+                "the reserved GPU vocabulary differs between the two gates that enforce it: "
+                f"gpu.rs has {sorted(rust_words)}, pentest-gpu-claims.sh has {sorted(shell_words)}"
+            )
+
+    return bad
+
+
 def latency_claims_agree() -> list[str]:
     """The OCI-image cold start claimed anywhere must equal the one the README states.
 
@@ -435,6 +561,13 @@ def main(argv: list[str]) -> int:
         print("       the front page states the size in an asset as well as in prose, and this "
               "gate reads only .md, so the asset drifts silently. Edit the generator, then "
               "re-run it: python3 assets/make-demo-gif.py")
+    for problem in gpu_claims_agree():
+        total += 1
+        print(f"\n{problem}")
+        print("       the GPU tier is a claim about a security boundary, and the code that prints "
+              "it is canonical. Edit crates/kern-cli/src/gpu.rs first, then the pages that quote "
+              "it; the shell gate in pentest/pentest-gpu-claims.sh keeps its own copy of the "
+              "reserved vocabulary and has to move with it.")
     n = len(files)
     print(f"\n{total} stale figure{'' if total == 1 else 's'} in {n} file{'' if n == 1 else 's'}")
     return 1 if total else 0

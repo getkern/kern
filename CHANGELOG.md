@@ -15,6 +15,42 @@ is in the git history.
 
 ### Added
 
+- **A fifth adversarial suite, and it publishes a defeat.**
+  [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) attacks a claim rather than a
+  mechanism: kern slices no GPU, so there is no cap here to break, and what is under test is whether
+  `kern doctor`'s verdict about each card survives contact with the host's own driver.
+
+  Section A checks what kern says: one tier row per DRM card counted from `/sys/class/drm` rather
+  than from kern's own output, the reserved vocabulary refused on every row below `TIER-HW` with a
+  positive control behind it, the disclaimer present on every cooperative row, the verdict identical
+  across five runs and unchanged with `LD_*`, `KERN_SECCOMP` and `KERN_CONFIG` set, and the GPU scan
+  asserted read-only against `strace`.
+
+  Section B is battery B of the GPU isolation spec, T1 to T9, run by
+  [`pentest/gpu-raw-ioctl.c`](pentest/gpu-raw-ioctl.c), a probe that links libc and nothing else and
+  reads its own `/proc/self/maps` before it counts anything. **T5 is the decisive one and it fails
+  the way the tier model says it must**: a process with no vendor library in its address space
+  reaches the driver with a raw ioctl. Measured on an RTX 5060 Ti (driver 580.173.02), a Jetson Orin
+  Nano (540.4.0, `tegra`, `nvidia-drm`) and a Raspberry Pi 5 (`v3d`, `vc4`), so it is not a property
+  of one driver build or one architecture. T7 settles the granularity: the descriptor answers the
+  same ioctl after crossing a unix socket into a process that never opened the device. T8 found the
+  ceiling on the boards, 1021 handles stopped by `RLIMIT_NOFILE`, which is the file-descriptor limit
+  a tenant inherited from its shell and not a device quota.
+
+  Section C is the only hard failure in the file: the card B found an open channel to must be the
+  card A calls `TIER-SOFT`. Everything B measures is a property of the driver; only a disagreement
+  between the claim and the measurement is kern's defect.
+
+  [SECURITY.md](SECURITY.md) now carries the same evidence in prose, including the `dmem` result
+  behind the missing middle tier, and `scripts/stale-numbers.py` gates the claim: a document may not
+  name a tier the code cannot print, the cooperative disclaimer must match `Tier::claim()` verbatim
+  on the two pages that carry it, and the reserved vocabulary must be identical in the Rust gate and
+  the shell one. All four arms verified by sabotage.
+
+  Also corrected while measuring it: `doctor`'s module header said it performed no mutation, and it
+  does. Its memory-cap check creates a `kern-capprobe-<pid>` cgroup, writes that child's own
+  `memory.max` and removes it, which is the only way to answer whether a cap binds. That was
+  documented in `kern-isolation` and contradicted in `doctor`; the header now names it.
 - **`kern doctor` now reports what a VRAM cap on each GPU would be worth.** kern still slices no GPU
   and this changes nothing about what it can do: it publishes the JUDGEMENT ahead of the capability,
   so there is never a window in which kern can cap a GPU while its own description of that cap is

@@ -104,7 +104,7 @@ box's network.
 
 The claims are checked by asking the kernel what is true, not by asking kern to report on itself:
 
-- Four adversarial suites in [pentest/](../pentest/) assert that a published port cannot tunnel into a
+- Five adversarial suites in [pentest/](../pentest/) assert that a published port cannot tunnel into a
   host service, that `--ssh` does not hand out the host's shell, that `kern exec` does not escape,
   that a box cannot raise its own `memory.max` or see a cgroup above its own, that an ungranted device
   does not cross, and that a SIGKILLed supervisor holds no host port. They run against a loopback
