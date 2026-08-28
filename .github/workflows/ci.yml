@@ -216,6 +216,33 @@ jobs:
           left=$(./target/debug/kern ps -q | wc -l)
           test "$left" -eq 0 || { ./target/debug/kern ps; echo "$left box(es) survived down" >&2; exit 1; }
 
+  pentest:
+    name: adversarial suites (the evidence behind SECURITY.md)
+    # These four suites were kept out of CI on the ground that a GitHub runner's AppArmor denies the
+    # unprivileged-userns setgroups they need, and a weekly freshness check stood in for them by
+    # asserting a human had run them locally. The premise was wrong: the restriction is a sysctl, and
+    # a runner has sudo. A stamp says a promise was kept; this says the boundary held, on this commit.
+    #
+    # 74 assertions across the four, plus the GPU claim suite that already ran here. Measured at 36
+    # seconds end to end on a desktop, so the cost of running the real evidence every push is small.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: let this runner open an unprivileged user namespace
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq uidmap passt
+      - name: build the binary the suites attack
+        run: cargo build --release --bin kern
+      - name: run every suite
+        # run-all.sh exits non-zero if ANY suite fails, so this step is the gate. Its own registry
+        # fixture serves the images over loopback, so nothing here needs a registry account or the
+        # network, and a suite failure cannot be a pull that flaked.
+        run: sh pentest/run-all.sh ./target/release/kern
+
   macos-guards:
     name: macOS guards (no VM)
     # A macOS runner cannot RUN kern, and that is not the point. kern needs a Linux kernel, and a
