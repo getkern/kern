@@ -7,7 +7,14 @@ and some may never ship if they would change what kern is. Recently shipped work
 [Status](README.md#status), not here.
 
 - **GPU slices.** A workload gets a *slice* of a GPU, not the whole device. Not shipped, and the
-  README will describe it when it is, not before. Nothing here touches a GPU today.
+  README will describe it when it is, not before.
+
+  The judgement ships ahead of the capability, deliberately. `kern doctor` detects each GPU from
+  sysfs and prints the tier a cap on it would have: `TIER-HW` where a MIG or SR-IOV partition is
+  enforced by the device, `TIER-SOFT` everywhere else. A cooperative quota on consumer hardware is
+  bypassed by any tenant that talks to the device without going through the vendor library, so it is
+  worth density and fairness and nothing else, and kern says so before it can cap anything. That
+  detection is read-only: it reads, classifies and prints, and touches no driver.
 - **More governed resources.** I/O bandwidth and IOPS caps already ship (`vdisk:` `--bandwidth` /
   `--iops`, box `--io-weight` → cgroup `io.max`/`io.weight`), and hold a box to the requested rate
   exactly where the host grants both: the `io` controller delegated to the box's cgroup (systemd

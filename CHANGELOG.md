@@ -15,6 +15,39 @@ is in the git history.
 
 ### Added
 
+- **`kern doctor` now reports what a VRAM cap on each GPU would be worth.** kern still slices no GPU
+  and this changes nothing about what it can do: it publishes the JUDGEMENT ahead of the capability,
+  so there is never a window in which kern can cap a GPU while its own description of that cap is
+  still catching up.
+
+  One line per DRM card, with the evidence for it. `TIER-HW` for a partition the device itself
+  enforces (an SR-IOV virtual function, or MIG instances configured for that card). `TIER-SOFT` for
+  everything else, which on consumer hardware is what you get: a cooperative quota, worth density,
+  fairness and accidental-overcommit accounting for trusted and semi-trusted tenants, and **not a
+  boundary against malicious code**. A tenant that talks to the device without going through the
+  vendor library never passes any userspace interception, and VRAM is committed by a fault handled
+  in the kernel and the GSP, so there is no syscall to trap either. That is a property of the
+  problem, not a defect above the kernel, and the line says so where you would read it.
+
+  There is no middle tier, and its absence is a measurement rather than an omission. A
+  kernel-enforced `dmem` cap that charged the path the tenant allocates through would be one, but on
+  the driver this was measured against `dmem` accounts without enforcing for the ROCm compute path:
+  with `dmem.max` at 2 GB an 8 GB `hipMalloc` succeeded while the leaf cgroup's `dmem.current` stayed
+  at 0. The DRM render path is charged, the KFD compute path that ML tenants use is not. So `dmem`
+  and `/dev/kfd` are reported next to the card as FACTS and never as a promotion.
+
+  Detection is read-only: `/sys/class/drm`, three sysfs attributes per card, and `/proc` for the
+  NVIDIA and cgroup facts. It opens no device, loads no library and caps nothing, which is why it
+  fits in the same single static binary. Measured at 36 us per scan on an i7-14700KF, against a
+  `doctor` run that already spends milliseconds in `systemd-run` probes.
+
+  It fails closed in both directions that matter. Unknown resolves to the weaker claim, never the
+  stronger: a card is promoted only on evidence read from the kernel, and MIG instances are
+  attributed to the card that owns them by PCI address, so one MIG card on a host cannot promote
+  another. And a card kern cannot identify is DESCRIBED, not dropped: a Raspberry Pi 5 (`v3d`,
+  `vc4-drm`) and a Jetson Orin Nano (`drm`, `nv_platform`) have DRM cards on the platform bus with no
+  PCI vendor at all, and both now name the driver instead of reporting no GPU. Verified on both
+  boards.
 - **`--landlock-rw <path>` now works on `kern run`**, not only on `kern box`. It is the one confinement
   the governor verb can offer for real, because Landlock restricts the calling process instead of
   requiring a mount namespace: no image, no `pivot_root`, nothing to build. `kern run --landlock-rw

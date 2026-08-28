@@ -30,6 +30,7 @@ mod doctor;
 mod egress;
 mod eintr;
 mod error;
+mod gpu;
 mod openat2;
 mod pod;
 mod ports;

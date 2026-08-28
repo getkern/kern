@@ -55,7 +55,10 @@ crates/
 ```
 
 A GPU layer is **deferred to a later phase** and is additive: nothing in the core changes to accommodate
-it: no GPU is touched today, because there is no GPU code here. This document will describe it when there is
+it. The only GPU code here is `kern-cli/src/gpu.rs`, a read-only classifier: it reads `/sys/class/drm`
+and `/proc`, decides what a VRAM cap on each card would be worth, and hands `kern doctor` a line to
+print. It slices nothing and loads nothing, which is why it fits in a single static binary while the
+layer that would actually cap a GPU does not. This document will describe that layer when there is
 something to describe.
 
 ## Design choices (and why)

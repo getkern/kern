@@ -176,6 +176,7 @@ pub fn doctor() -> Result<(), Error> {
         // Optional feature: multi-uid mapping.
         check_uid_range(),
     ];
+    results.extend(check_gpu());
     results.extend(check_tools());
     results.push(check_kernel());
 
@@ -779,6 +780,62 @@ fn check_kernel() -> R {
     R::Ok(format!("kernel: {ver}"))
 }
 
+/// What a VRAM cap would be worth on each GPU present, per [`crate::gpu`].
+///
+/// kern does not slice GPUs today, and this row says so by describing the AUTHORITY a cap would
+/// have rather than offering one. That ordering is the point: the honest description of the
+/// boundary ships before the mechanism, so there is never a window in which kern can cap a GPU
+/// while its own documentation is still catching up with what the cap is worth.
+///
+/// A cooperative tier is reported as a WARNING rather than as an OK, and the choice is deliberate.
+/// `doctor`'s contract is that a reader learns here what will and will not work; a green tick next
+/// to a GPU whose quota any tenant can step over would be read as "capping this GPU is safe", which
+/// is the exact misreading the tier model exists to prevent. A host with no GPU at all is an OK,
+/// because nothing is degraded: the feature simply does not apply.
+fn check_gpu() -> Vec<R> {
+    let gpus = crate::gpu::detect();
+    if gpus.is_empty() {
+        return vec![R::Ok(
+            "no GPU found: GPU capability tiers do not apply on this host".into(),
+        )];
+    }
+    gpus.iter().map(gpu_row).collect()
+}
+
+/// The row for ONE GPU, as a pure function of the detected facts.
+///
+/// Split out from [`check_gpu`] so the assembled text can be tested against every combination of
+/// tier, `dmem` controller and `/dev/kfd` without owning the hardware. The claim vocabulary is
+/// checked on THIS string, not on the tier's claim alone, because the appendices below are the part
+/// most likely to drift.
+fn gpu_row(g: &crate::gpu::Gpu) -> R {
+    let line = crate::gpu::describe(g);
+    match g.tier {
+        crate::gpu::Tier::Hw => R::Ok(format!("{line}. {}", g.tier.claim())),
+        crate::gpu::Tier::Soft => {
+            let mut hint = g.tier.claim().to_string();
+            // `dmem` presence is appended as a FACT and never as a promotion. The controller
+            // accounts faithfully and, on the driver this was measured against, does not charge the
+            // ROCm compute path to the allocating cgroup, so its presence alone changes nothing
+            // about what a cap is worth. Showing it keeps the reader from concluding that kern
+            // failed to notice.
+            if g.dmem_controller {
+                hint.push_str(
+                    ". dmem cgroup controller present on this kernel, which accounts device \
+                     memory but is not known to charge this driver's compute path",
+                );
+            }
+            if g.kfd_present {
+                hint.push_str(
+                    ". /dev/kfd present: the ROCm compute path is the one measured NOT to \
+                     be charged to the allocating cgroup",
+                );
+            }
+            R::Warn(line, hint)
+        }
+    }
+}
+
 // ── helpers ──
 
 fn read_int(path: &str) -> Option<i64> {
@@ -790,4 +847,103 @@ fn which(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).exists()))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::{overclaims, Evidence, Gpu, Tier, Vendor};
+
+    impl R {
+        /// Everything this row will print, message and hint together. Tests assert on the whole of
+        /// it: a claim moved from the message into the hint is still a claim on screen.
+        fn text(&self) -> String {
+            match self {
+                R::Ok(m) => m.clone(),
+                R::Warn(m, h) | R::Fail(m, h) => format!("{m} {h}"),
+            }
+        }
+    }
+
+    fn fake(tier: Tier, dmem: bool, kfd: bool) -> Gpu {
+        Gpu {
+            card: "card0".into(),
+            vendor: Vendor::Amd,
+            device_id: Some(0x73df),
+            driver: Some("amdgpu".into()),
+            tier,
+            evidence: match tier {
+                Tier::Hw => Evidence::SriovVirtualFunction,
+                Tier::Soft => Evidence::NoPartitionFound,
+            },
+            dmem_controller: dmem,
+            kfd_present: kfd,
+        }
+    }
+
+    /// THE GATE. Every assembled `doctor` row for a non-hardware GPU, across every combination of
+    /// the two facts that extend it, checked against the reserved vocabulary.
+    #[test]
+    fn no_cooperative_row_claims_a_boundary() {
+        for dmem in [false, true] {
+            for kfd in [false, true] {
+                let row = gpu_row(&fake(Tier::Soft, dmem, kfd)).text();
+                assert_eq!(
+                    overclaims(&row),
+                    None,
+                    "a TIER-SOFT row claims a boundary (dmem={dmem}, kfd={kfd}): {row}"
+                );
+                assert!(
+                    row.contains("NOT a boundary against malicious code"),
+                    "the disclaimer went missing: {row}"
+                );
+            }
+        }
+        let none = check_gpu();
+        assert!(
+            !none.is_empty(),
+            "doctor must always say something about GPUs"
+        );
+    }
+
+    /// A cooperative tier is a WARNING and a hardware tier is an OK. Asserted because the choice is
+    /// the row's whole editorial content: a green tick next to a quota any tenant can step over
+    /// reads as "capping this GPU is safe".
+    #[test]
+    fn tier_decides_the_severity() {
+        assert!(matches!(
+            gpu_row(&fake(Tier::Soft, false, false)),
+            R::Warn(..)
+        ));
+        assert!(matches!(gpu_row(&fake(Tier::Hw, false, false)), R::Ok(_)));
+    }
+
+    /// The `dmem` and `/dev/kfd` facts appear only when true, and neither changes the tier. This is
+    /// the exact confusion the row exists to prevent: `dmem` present does not mean `dmem` enforces.
+    #[test]
+    fn dmem_and_kfd_are_reported_as_facts_not_promotions() {
+        let bare = gpu_row(&fake(Tier::Soft, false, false)).text();
+        assert!(!bare.contains("dmem cgroup controller present"));
+        assert!(!bare.contains("/dev/kfd present"));
+
+        let both = gpu_row(&fake(Tier::Soft, true, true)).text();
+        assert!(both.contains("dmem cgroup controller present"));
+        assert!(both.contains("/dev/kfd present"));
+        assert!(
+            both.contains("TIER-SOFT"),
+            "dmem must not promote the tier: {both}"
+        );
+    }
+
+    /// `doctor` runs on hosts with no GPU at all, which is the majority case, and that must be an OK
+    /// rather than a warning: nothing is degraded, the feature does not apply.
+    #[test]
+    fn a_host_with_no_gpu_is_not_a_warning() {
+        for r in check_gpu() {
+            let t = r.text();
+            if t.starts_with("no GPU found") {
+                assert!(matches!(r, R::Ok(_)), "no GPU is not a degraded state");
+            }
+        }
+    }
 }

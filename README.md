@@ -78,8 +78,12 @@ is the size-optimized release build; a plain `cargo install` from source is 1.91
 - **Not a Docker Engine reimplementation.** It speaks Docker's *formats*, not its API: no overlay
   networks, no plugins, no Swarm. Matrix: [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
 - **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
-- **Not shipping GPU slices.** On the [roadmap](ROADMAP.md), with no GPU code in this edition, so
-  there is nothing here to trust or to attack yet.
+- **Not shipping GPU slices.** On the [roadmap](ROADMAP.md). What ships is the *judgement*, not the
+  capability: `kern doctor` reads sysfs and tells you what a VRAM cap on each GPU would be worth
+  (`TIER-HW` for a MIG or SR-IOV partition the device enforces, `TIER-SOFT` for everything else,
+  which on consumer hardware is a cooperative quota and not a boundary against malicious code).
+  Nothing intercepts a driver call, nothing caps a GPU, and the detection is read-only, so there is
+  still nothing here to attack.
 
 What it does not know or does not do yet is in [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than left for
 you to find.
@@ -346,7 +350,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 848 Rust, 340 Python and 61 Node tests,
+**The core is done. Everything above works today:** 863 Rust, 340 Python and 61 Node tests,
 clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
 Arduino UNO Q. **v0.7.0 is the first published release.** The CLI and config surface can still
 change, always called out in [CHANGELOG.md](CHANGELOG.md).
