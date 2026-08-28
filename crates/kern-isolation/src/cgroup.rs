@@ -657,25 +657,18 @@ fn children_can_be_capped(dir: &std::path::Path) -> bool {
     probe_child_cap(dir)
 }
 
-/// The measurement behind [`children_can_be_capped`]: enable the controllers the way a box start
-/// does, create a throwaway child, and report whether it received a `memory.max` to write. Removes
-/// what it created on every path.
+/// The measurement behind [`children_can_be_capped`], and it is DELIBERATELY the same function
+/// `kern doctor` reports from. The bug this whole arm exists to fix was two surfaces answering the
+/// same question about the same host and disagreeing; fixing it by writing a SECOND probe that
+/// happens to agree today would have rebuilt the defect with a longer fuse. One prober, one answer.
+///
+/// [`MemoryCapState::EnforcedOnScope`] is NOT enough here and that is the point of the match rather
+/// than a bool: it means the cap binds because a systemd manager applies it to a transient scope,
+/// which is precisely the path this arm exists because the host does NOT have. Only a direct write
+/// that stuck says a child of `dir` will carry a cap.
 fn probe_child_cap(dir: &std::path::Path) -> bool {
     enable_subtree_controllers(dir);
-    let child = dir.join(format!("kern-parentprobe-{}", std::process::id()));
-    let _ = fs::remove_dir(&child); // a leftover from a crashed probe
-    if fs::create_dir(&child).is_err() {
-        return false;
-    }
-    // WRITE AND READ BACK, not "does the interface file exist". The file appearing already means the
-    // controller is in the parent's `subtree_control` (cgroup v2 creates it only then), so existence
-    // answers the delegation question - but this codebase has been bitten by a write that is accepted
-    // and does not bind, which is why `wrote_real_limit` exists and why doctor's own probe writes.
-    // Asking a weaker question here than doctor asks about the same host is how the two surfaces
-    // drifted apart in the first place.
-    let ok = wrote_real_limit(&child.join("memory.max"), CAP_PROBE_BYTES);
-    let _ = fs::remove_dir(&child);
-    ok
+    matches!(memory_cap_state_at(dir), MemoryCapState::Enforced)
 }
 
 fn slice_can_cap(slice: &std::path::Path) -> bool {
