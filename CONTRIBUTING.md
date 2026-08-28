@@ -72,6 +72,26 @@ confident wrong answer first and a correction second.
 These three rules were paid for by the GPU work and lived only in its commit messages, which is where
 a rule goes to die. They apply to any claim about what kern enforces, not to GPUs.
 
+**Read this before reading `crates/kern-cli/src/gpu.rs`, or that file will look out of proportion.**
+It is 915 lines and it prints two strings, on a command whose GPU row most users will never have a
+GPU to trigger. That ratio is not an accident and it is not scope creep: the GPU work is the TEST
+CASE for the three rules below, and the rules are the deliverable. A capability tier is the smallest
+honest thing kern could ship about GPUs, which makes it the cheapest place to find out whether a rule
+like "ship a tier only if the code can assign it" survives contact with real hardware. It did not
+survive intact, and that is the useful part: the model has three tiers and the code has two, because
+the measurement that would have earned the middle one failed.
+
+What the phase actually produced, in order of how long it will matter:
+
+1. These three rules, and `scripts/stale-numbers.py` making them mechanical rather than aspirational.
+2. `pentest/pentest-gpu-claims.sh`, which is the shape of a suite that attacks a CLAIM instead of a
+   mechanism. Nothing about that shape is specific to GPUs.
+3. The GPU tier itself, which is the least of the three and the only one a user sees.
+
+Three reviews across three rounds found ten real defects in this work, and every one of them was the
+same class: a sentence or an exit code that said more than had been measured. Not one was a runtime
+bug. If you are about to change something here, that is the failure mode to expect from yourself.
+
 **A tier, a mode or a guarantee ships only if the code can assign it on hardware someone can reach.**
 The GPU model has three capability tiers and the code has two, because the measurement that would
 earn the middle one failed: `dmem` accounts device memory and does not enforce it for the compute

@@ -429,6 +429,19 @@ def gpu_claims_agree() -> list[str]:
     # "per-tenant VRAM enforced by the device" from evidence that is purely topological, which an
     # outside reader caught on 2026-08-28; it is pinned here so the narrower wording cannot drift
     # back without failing the build.
+    # WHY THESE TWO SENTENCES ARE PINNED, because a gate that says only "restore this string" leaves a
+    # successor with the lock and not the reason. Each marker is an ADMISSION OF A LIMIT, and each
+    # tier's admission fails in the opposite direction from the other's:
+    #
+    #   Tier::Soft's "NOT a boundary against malicious code" is the whole reason a cooperative quota
+    #   is safe to describe at all. Lose it and the remaining text reads as a capability.
+    #
+    #   Tier::Hw's "has not measured the VRAM split" is there because that branch has no positive
+    #   control anywhere in the tree: kern has never run on MIG or SR-IOV hardware, so nothing can
+    #   demonstrate the promotion is right. Lose it and kern asserts an enforcement nobody checked.
+    #
+    # Editing either is editing what kern admits it does not know. That is allowed, and it is not
+    # allowed to happen by accident while rewording a paragraph, which is what this gate is for.
     for arm, marker, page_required in (
         ("Tier::Soft => {", "NOT a boundary against malicious code", True),
         ("Tier::Hw => {", "has not measured the VRAM split", True),

@@ -6,13 +6,21 @@
 //! entitled to.
 //!
 //! WHY THIS SHIPS BEFORE ANY SLICING CODE
-//!   A cooperative VRAM quota is trivially bypassed on consumer NVIDIA: a tenant that never calls
-//!   into `libcuda` and talks to the device with raw ioctls does not pass through any userspace
-//!   interception, and VRAM is committed by a page fault handled in the kernel and the GSP, so
-//!   there is no syscall to trap either. That is a property of the problem, not a defect that can
-//!   be fixed above the kernel. A project that shipped the cap first and the honest description
-//!   second would be selling the cap as a boundary for however long the gap lasted. So the
-//!   judgement ships first and the capability follows it.
+//!   MEASURED, on the two NVIDIA hosts this project can reach (an RTX 5060 Ti on driver 580.173.02
+//!   and a Jetson Orin Nano on 540.4.0): a process with libc and nothing else in its address space
+//!   opens the device node and receives an answer from the driver. A cooperative VRAM quota is
+//!   installed in front of the vendor library, and that tenant never went through it. Same result
+//!   from the vendor-neutral side on a Raspberry Pi 5 (`v3d`, `vc4`). `pentest/pentest-gpu-claims.sh`
+//!   runs it.
+//!
+//!   NOT MEASURED HERE, and stated as the reasoning it is: on the NVIDIA driver the allocation is
+//!   committed by a fault serviced in the kernel and on the GPU's own controller, so a syscall
+//!   filter has no size to inspect either. Nothing in this file rests on that sentence. The raw
+//!   ioctl reaching the driver settles it on its own.
+//!
+//!   A project that shipped the cap first and the honest description second would be selling the
+//!   cap as a boundary for however long the gap lasted. So the judgement ships first and the
+//!   capability follows it.
 //!
 //! THE ONE DISTINCTION THAT GOVERNS THIS FILE
 //!   "the slice applies" and "the slice is a security boundary" are different properties, and
@@ -28,11 +36,14 @@
 //! THE MISSING MIDDLE TIER
 //!   The capability model has three levels, and this file can only ever produce two of them. The
 //!   middle one is a kernel-enforced device-memory limit (`dmem`) that charges the path the
-//!   workload actually allocates through. `dmem` accounts faithfully on AMD and Intel from kernel
-//!   6.14, but on the driver this was measured against it does not ENFORCE for the ROCm compute
-//!   path: with a per-cgroup `dmem.max` of 2 GB, an 8 GB `hipMalloc` succeeded and the leaf
-//!   cgroup's `dmem.current` stayed at 0 while 8 GB sat in VRAM. The DRM render/GEM path IS
-//!   charged; the KFD compute path, the one ML tenants use, is not.
+//!   workload actually allocates through. The `dmem` controller exists upstream from kernel 6.14;
+//!   what it DOES was measured on exactly one combination, and the tier turns on that measurement
+//!   rather than on the controller's existence. On an RX 6700 XT (gfx1031), amdgpu/ROCm as shipped
+//!   on kernel 6.17, `CONFIG_CGROUP_DMEM=y`: with a per-cgroup `dmem.max` of 2 GB an 8 GB
+//!   `hipMalloc` SUCCEEDED and the leaf cgroup's `dmem.current` stayed at 0 while 8 GB sat in VRAM,
+//!   while managed memory did charge the leaf 166 MiB. So on that card, that driver and that
+//!   kernel, the DRM render path is charged and the KFD compute path, the one ML tenants use, is
+//!   not. One card, one driver, one kernel: nothing here says what `dmem` does on any other.
 //!
 //!   So the middle tier is DEFINED but not ATTAINABLE, and no [`Tier`] variant exists for it.
 //!   Shipping a variant that no code path can construct would put a tier in the model that kern
@@ -43,10 +54,12 @@
 //!
 //! ALLOCATION NOTE
 //!   This path allocates: it reads sysfs into `String`s and returns an owned `Vec`. That is
-//!   deliberate and in scope. The project's no-heap rule governs the per-box hot path, where a
-//!   box starts in ~2.3 ms and an allocation is a measurable fraction of it. `kern doctor` runs
-//!   once, interactively, and already shells out to `systemd-run` three times to measure the
-//!   scope toll. Optimising a `read_to_string` here would buy nothing and cost clarity.
+//!   deliberate and in scope. The project's no-heap rule governs the per-box hot path, where a box
+//!   starts in ~2.3 ms and an allocation is a measurable fraction of it. This is not that path, and
+//!   the difference is measured rather than assumed: [`detect`] costs 36 us per call (1000
+//!   iterations, i7-14700KF) against a `kern doctor` run that already spends milliseconds forking
+//!   `systemd-run` three times to time the scope toll. Optimising a `read_to_string` here would buy
+//!   a fraction of a percent of one interactive command and cost clarity.
 
 use std::path::Path;
 
@@ -131,8 +144,9 @@ impl Tier {
             }
             Tier::Soft => {
                 "cooperative VRAM quota: fairness, accidental-overcommit and accounting for \
-                 trusted and semi-trusted tenants. NOT a boundary against malicious code. For a \
-                 real boundary use a MIG GPU or an SR-IOV part"
+                 trusted and semi-trusted tenants. NOT a boundary against malicious code. Where a \
+                 boundary is needed, look for a device-level partition (MIG or SR-IOV) or give the \
+                 tenant the whole device; kern has measured neither"
             }
         }
     }

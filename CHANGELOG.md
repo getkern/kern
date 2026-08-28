@@ -15,6 +15,43 @@ is in the git history.
 
 ### Added
 
+- **Final validation: eight sentences narrowed to their measurement, and one suite moved out of the
+  stamp and into CI.** Two reviewers, one asked whether the prose was wider than the evidence and one
+  asked whether the work survives without its author.
+
+  Eight claims said more than had been measured, and none of them was wrong, which is the point:
+  each was stated at a width the measurement does not carry. "No userspace VRAM quota can be a
+  boundary" was universal over three hosts. "Trivially bypassed on consumer NVIDIA" was a class over
+  two NVIDIA machines. "`dmem` accounts faithfully on AMD and Intel from kernel 6.14" was a property
+  of a controller over one card, one driver, one kernel. "Every allocation entry point sits behind
+  the same ioctl channel" was an assertion about paths the probe never touched. The cooperative
+  tier's own claim ended with "for a real boundary use a MIG GPU or an SR-IOV part", pointing at
+  hardware whose VRAM split kern had just finished admitting it has never measured. The read-only
+  GPU scan was a property of the tool where it is one machine agreeing with the code. Each now
+  states its host, its card, its driver or its mechanism.
+
+  `pentest-gpu-claims.sh` now runs **in CI on every push**. It starts no box, so the AppArmor policy
+  that keeps the other four out does not apply, and on a GPU-less runner it exits 0 having asserted
+  that `doctor` reports the absence rather than inventing a card, and that the claim-word matcher
+  still catches an overstated string. That second one is the positive control: without it the whole
+  gate could go vacuous while every run stayed green. Verified by running the suite in a namespace
+  with an empty `/sys/class/drm` and a synthetic `/dev`.
+
+  That split is the answer to a sharper point: a `.last-run` stamp is a promise that a person did
+  something, and a successor inheriting a red freshness check for suites CI structurally cannot run
+  will raise the threshold or silence it. So what can be automated is, what cannot is named, and the
+  stamp now covers four suites instead of standing in for five.
+
+  `CONTRIBUTING.md` gained the bridge the repo was missing: the GPU work is the TEST CASE for the
+  three rules, not the point of them. 915 lines printing two strings looks out of proportion until
+  that is said out loud, and it was said nowhere outside the commit messages. It also records the
+  shape of every defect three review rounds found: ten of them, all the same class, a sentence or an
+  exit code that said more than had been measured, and not one a runtime bug.
+
+  And `stale-numbers.py` now says WHY its two pinned sentences are pinned. Each is an admission of a
+  limit, and they fail in opposite directions: losing the cooperative one makes a quota read as a
+  capability, losing the hardware one asserts an enforcement nobody checked. A gate that says only
+  "restore this string" hands a successor the lock without the reason.
 - **Closing the GPU phase: a shell payload in a `sudo` hint, a second weak green, and the rules
   written down.** A third review round plus a closing review, and everything either fixed or stated.
 

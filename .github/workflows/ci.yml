@@ -47,6 +47,16 @@ jobs:
           # that would enter. Name level needs no compiler; the x86_64 number level runs when gcc is
           # present (aarch64 is skipped here for lack of the cross-toolchain).
           python3 scripts/gen-seccomp-allowlist.py --check
+      - name: gpu claim suite
+        # The ONE pentest suite that can run here, and it runs for a reason rather than for a green
+        # tick. The other four start boxes and the runner's AppArmor denies the userns `setgroups`
+        # they need, so they live behind `pentest/run-all.sh` and a freshness stamp. This one needs
+        # no box: with no GPU on the runner it exits 0 having asserted the two things that hold on a
+        # GPU-less host, namely that doctor reports the absence instead of inventing a card, and that
+        # the claim-word matcher still catches an overstated string (the positive control, without
+        # which the whole gate could be silently vacuous). Battery B skips itself, and the suite's
+        # third exit code makes sure a skipped battery can never be read as a verified one.
+        run: sh pentest/pentest-gpu-claims.sh ./target/debug/kern
 
   workflow-lint:
     name: workflow syntax

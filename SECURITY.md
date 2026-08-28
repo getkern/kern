@@ -496,7 +496,9 @@ in the capability path were something other than the device minor. It is not:
 the directory name as `"gpu%u"` from it. One field, two uses. Read in
 [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) on 2026-08-28.
 
-**TIER-SOFT** is everything else, which on consumer hardware is everything. It is a cooperative
+**TIER-SOFT** is everything else, and it is the only tier ever produced on a machine this project
+can reach: two NVIDIA hosts, a Raspberry Pi 5 and a Jetson Orin Nano, none of which exposes a MIG or
+SR-IOV partition in sysfs. It is a cooperative
 quota: real and useful for density, fairness, accidental overcommit and accounting across trusted and
 semi-trusted tenants, and **not a boundary against malicious code**. The words *isolation*, *secure*
 and *hard* are refused for it, mechanically, in [`crates/kern-cli/src/gpu.rs`](crates/kern-cli/src/gpu.rs)
@@ -550,9 +552,17 @@ kernel and on the GPU's own controller, so there is no syscall carrying the size
 inspect. Nothing above is load-bearing on that sentence; the raw-ioctl result settles the argument on
 its own.
 
-Be precise about what that argument covers, because the earlier wording here was not. It says: no
-userspace VRAM QUOTA can be a boundary. A quota lets the workload use the GPU and limits how much of
-it. What CAN hold, and is not a quota, is refusing the device outright: not binding
+Be precise about what that argument covers, in both directions, because the earlier wording was too
+wide in one and is still bounded in the other.
+
+The MECHANISM it rules out is a VRAM quota: something that lets the workload use the GPU and limits
+how much of it, by sitting in front of the vendor library. The HOSTS it rules it out on are the three
+where T5 ran, named above. It is not a proof about every driver ever shipped, and nowhere here is it
+one; what makes it worth acting on is that the property it turns on, an unprivileged process reaching
+the driver without the vendor library, held on every machine tried, across two NVIDIA driver series
+and three vendors. On a host you have not tested, run the suite before assuming either answer.
+
+What CAN hold, and is not a quota, is refusing the device outright: not binding
 `/dev/nvidia*`, `/dev/dri/*` or `/dev/kfd` into the box at all, or filtering `ioctl` on those
 descriptors with seccomp. Those are all-or-nothing, they are userspace policy, and they work, which
 is why the previous claim that "no userspace mechanism" passes the test was too wide. A box with no
@@ -560,9 +570,15 @@ GPU is contained. A box with a GPU and a number attached to it is not.
 
 Run it: [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) with
 [`pentest/gpu-raw-ioctl.c`](pentest/gpu-raw-ioctl.c), T1 to T9, plus the checks that kern's own line
-matches what they find. The probe deliberately allocates nothing: the allocation ABI is closed,
-per-vendor and driver-version-coupled, and every allocation entry point sits behind the same ioctl
-channel the handshake already proves is open.
+matches what they find.
+
+The probe deliberately allocates nothing, and here is exactly what that costs the argument. What is
+measured is that an unprivileged process with no vendor library reaches the driver and is answered.
+What is NOT measured is that every allocation entry point rides that same channel: the allocation ABI
+is closed, per-vendor and driver-version-coupled, and reimplementing it would produce a probe that
+rots on the next driver bump. So the finding is about the CHANNEL, not about a specific allocation
+call, and the conclusion drawn from it is the one a channel supports: a cap that works by standing in
+front of the vendor library is not standing anywhere this process went.
 
 **Two blind spots in this section, named here and not only in the source.** They are marked in
 `gpu.rs` and in the probe, where a reader deciding whether to trust the verdict will never look.

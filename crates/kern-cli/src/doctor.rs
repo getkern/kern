@@ -7,8 +7,10 @@
 //! check times three `systemd-run --user --scope /bin/true`, and the memory-cap check creates a
 //! `kern-capprobe-<pid>` cgroup, writes THAT CHILD's own `memory.max` and removes it, because the
 //! only way to answer "does a cap bind here?" is to try to make one bind. It never touches an
-//! existing box's limits. The GPU check is the read-only kind: `pentest-gpu-claims.sh` asserts
-//! against strace that it opens nothing under `/sys/class/drm` or `/proc/driver` for writing.
+//! existing box's limits. The GPU check is the read-only kind: it opens no file for writing by
+//! construction, and `pentest-gpu-claims.sh` case A8 confirms that against strace wherever the suite
+//! runs, which so far is one x86 host. The property belongs to the code; the strace is one machine
+//! agreeing with it.
 //!
 //! FAIL = boxes won't run; WARN = an optional feature is degraded/unavailable but the core sandbox
 //! still works.
