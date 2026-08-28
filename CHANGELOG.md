@@ -250,6 +250,36 @@ is in the git history.
 
 ### Fixed
 
+- **A box is now capped where a cap is possible, not only where systemd says so.** `kern doctor` and
+  `kern box` gave opposite answers on the same host in the same second: doctor reported caps enforced
+  while the box reported UNCAPPED and read its own `memory.max` back as `max`. Both were true, about
+  different cgroups. doctor probes `kern.slice`, which as root it CREATES, so the slice is empty and
+  its children take a cap; `apply_limits` never looked there, because its direct path is gated on a
+  systemd user manager, and built the box under the cgroup kern itself runs in. That cgroup holds
+  processes, and cgroup v2 refuses to enable controllers in the subtree of one that does, so the box
+  got no `memory.max` and ran with no OOM or fork-bomb backstop one directory from a cgroup where the
+  cap works. That is every host with a delegated controller and no systemd user manager: a container,
+  WSL2, and a colima VM on a Mac, which is where it was found. The parent selection now takes
+  `kern.slice` when staying put would mean no cap and moving means a real one, both conditions
+  measured by creating a throwaway child and asking whether it received a `memory.max` rather than by
+  reading a presence flag. `kern run` cannot relocate (it never takes the direct path) and rootless is
+  untouched (the slice is only created as root), so the change lives in root-without-systemd.
+
+- **macOS is answered where a Mac user actually looks.** The installer refused Darwin with
+  "Linux-only" and stopped, which is true and a dead end; the README, the platform table and both SDK
+  pages did not mention macOS at all, while PyPI counted 108 Darwin downloads of `kern-sandbox`. All
+  of them now say the same thing: no native port, kern runs inside a Linux VM on a Mac, verified on
+  Apple Silicon with an Ubuntu 24.04 guest, with the two obstacles that host is certain to produce and
+  the caveat that resource caps do not bite on a default guest. The two SDKs and the MCP server say it
+  too when they find no binary, and CI now runs those three messages on a real Mac on every push.
+
+- **The GPU section of `kern examples` promised a boundary kern does not enforce.** Next to `pins` it
+  said "expose ONLY these lines, nothing else" and its header said "binds ONLY these devices", while
+  SECURITY.md and the code agree that the grant is chip-granular: requesting any pin binds every
+  `/dev/gpiochipN` the host has. Measured on a host with a gpiochip, a box with no profile has none
+  and a box with `pins = [17, 27]` has the whole chip. A test now fails on either phrase and requires
+  the granularity to be stated where the field is declared.
+
 - **A Landlock grant on a file rather than a directory no longer loses the whole ruleset.** The rule
   was built with every access right the kernel's ABI knows, including the directory-only ones
   (`*_DIR`, `MAKE_*`, `REFER`); the kernel answers `EINVAL` when those are asked for on a file or a

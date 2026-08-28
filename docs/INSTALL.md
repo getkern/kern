@@ -137,10 +137,13 @@ So the route is the one `kern doctor` prints, run inside the VM as root:
 echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
 ```
 
-Not yet measured on colima: the proxy above could not test it, because a container refuses that write
-while a real VM should allow it. Treat it as the thing to try, and `kern doctor` will tell you whether
-it took. What IS measured is that kern refuses to pretend either way, and says at every start that the
-box is uncapped. Two further warnings are
+Two things about that command. It is refused while any process sits in the cgroup you are writing to,
+which is cgroup v2's no-internal-process rule and not a permission problem: move them into a child
+first. And with the RELEASED binary the delegation alone was not enough, because kern's box path only
+took the cgroup a systemd user manager handed it; that is fixed on `main` and ships in the next
+release, after which a delegated guest caps for real (measured in a guest of this exact shape: a
+200 MiB write under `--memory 32m` is killed where it used to survive). Either way kern refuses to
+pretend, and says at every start whether the box is capped. Two further warnings are
 worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
 user (redis, postgres, nginx), and `sudo apt install passt` for outbound networking from a pod.
 
