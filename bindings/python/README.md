@@ -532,6 +532,12 @@ opt-out (`KERN_SECCOMP=denylist`), and `security_profile="untrusted"` bundles th
 The `kern` binary on `PATH` (or set `$KERN_BIN`). A Linux kernel with unprivileged user namespaces +
 cgroup v2; on Windows it runs under WSL2. Python 3.9+.
 
+**On a Mac this package installs but cannot run**, and it says so instead of looking for a download
+that does not exist: kern is Linux-only, because macOS has no namespaces and no cgroups. Run your code
+inside a Linux VM (colima, Lima, OrbStack, UTM), install `kern` and this package there, and everything
+works as on Linux. Verified on Apple Silicon with an Ubuntu 24.04 guest.
+[Install notes for macOS](https://github.com/getkern/kern/blob/main/docs/INSTALL.md).
+
 ## License
 
 Apache-2.0.

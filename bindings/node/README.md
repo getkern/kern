@@ -33,8 +33,14 @@ import { runCode, withSandbox, Sandbox } from "kern-sandbox";
 npm install kern-sandbox
 ```
 
-You also need the `kern` binary on `PATH` (or point `$KERN_BIN` at it). Build it on Linux (no
-prebuilt binaries are published yet):
+You also need the `kern` binary on `PATH` (or point `$KERN_BIN` at it). The quickest route is the
+released static binary, whose checksum the script verifies:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+From source instead, if you would rather not trust a published artifact:
 
 ```sh
 cargo install --git https://github.com/getkern/kern getkern --locked
@@ -42,6 +48,12 @@ cargo install --git https://github.com/getkern/kern getkern --locked
 
 kern needs a Linux kernel with unprivileged user namespaces + cgroup v2. On Windows it runs under WSL2.
 Node 18+.
+
+**On a Mac this package installs but cannot run**, and it says so rather than sending you after a
+download that does not exist: kern is Linux-only, because macOS has no namespaces and no cgroups. Run
+inside a Linux VM (colima, Lima, OrbStack, UTM), install `kern` and this package there, and it behaves
+as on Linux. Verified on Apple Silicon with an Ubuntu 24.04 guest.
+[Install notes for macOS](https://github.com/getkern/kern/blob/main/docs/INSTALL.md).
 
 ## A session: files persist, processes are ephemeral
 

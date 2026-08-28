@@ -14,7 +14,7 @@
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20ARM%20boards-informational.svg)](docs/INSTALL.md)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20macOS%20(Linux%20VM)%20%C2%B7%20ARM%20boards-informational.svg)](docs/INSTALL.md)
 
 </div>
 
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 kern box dev --image alpine -it -- sh
 ```
 
-<sub>No native Windows: use WSL2. [Install](#install).</sub>
+<sub>No native Windows: use WSL2. No native macOS: run it in a Linux VM. [Install](#install).</sub>
 
 ---
 
@@ -95,6 +95,13 @@ you to find.
 kern needs a Linux kernel with unprivileged user namespaces and cgroup v2. It runs on **Linux, WSL2
 and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q); there is **no native Windows** build, use
 WSL2 (kern ships a pre-baked WSL rootfs).
+
+**On a Mac** there is no native build either, and there will not be one: macOS has no namespaces and
+no cgroups. kern runs on a Mac **inside a Linux VM** (colima, Lima, OrbStack, UTM, or the one Docker
+Desktop already runs), where it is the ordinary Linux kern, same binary and same CLI as your CI box.
+Verified on Apple Silicon with an Ubuntu 24.04 guest. Read
+[docs/INSTALL.md](docs/INSTALL.md) first: two obstacles are certain there, and the resource caps do
+not bite on a default guest.
 
 The quickest route is the release binary: one static file, no toolchain, and the script verifies its
 SHA256 before installing it.
