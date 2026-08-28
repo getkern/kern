@@ -647,18 +647,14 @@ fn in_tree(child: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> 
 ///
 /// Memoised: the probe creates and removes a directory, and a box start must not pay that twice.
 fn children_can_be_capped(dir: &std::path::Path) -> bool {
-    static MEMO: OnceLock<Option<(PathBuf, bool)>> = OnceLock::new();
-    let cached = MEMO.get_or_init(|| {
-        let d = dir.to_path_buf();
-        let verdict = probe_child_cap(&d);
-        Some((d, verdict))
-    });
-    match cached {
-        Some((cached_dir, verdict)) if cached_dir == dir => *verdict,
-        // A different directory than the memoised one: probe it directly rather than answer about
-        // another cgroup. Rare (one process caps under one parent), so the cost is not on any hot path.
-        _ => probe_child_cap(dir),
+    static MEMO: OnceLock<(PathBuf, bool)> = OnceLock::new();
+    let (probed, verdict) = MEMO.get_or_init(|| (dir.to_path_buf(), probe_child_cap(dir)));
+    if probed == dir {
+        return *verdict;
     }
+    // A different cgroup than the memoised one: probe it rather than answer about another. One
+    // process caps under one parent, so this is rare and off the hot path either way.
+    probe_child_cap(dir)
 }
 
 /// The measurement behind [`children_can_be_capped`]: enable the controllers the way a box start
