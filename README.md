@@ -376,7 +376,7 @@ v0.7.0 carry [@getkerndev](https://github.com/getkerndev), the account the proje
 from.
 
 **The commits are not signed; the release TAG is.** That is what to verify:
-`git verify-tag v0.7.0` against the key in [provenance/](provenance/), whose fingerprint is in
+`git verify-tag v0.7.1` against the key in [provenance/](provenance/), whose fingerprint is in
 [SECURITY.md](SECURITY.md).
 
 ## License
