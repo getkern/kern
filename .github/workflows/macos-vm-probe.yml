@@ -1,0 +1,53 @@
+name: macOS VM probe (manual)
+
+# A ONE-QUESTION experiment, run by hand, kept because the answer decides real work.
+#
+# The claim it tests: a hosted macOS runner cannot hold a Linux VM, because GitHub's Mac runners are
+# themselves virtualized and nested virtualization is not exposed, so colima has nothing to boot a
+# guest on. That claim has been repeated as a reason to buy hardware and to ask a human to run the
+# end-to-end check by hand. It has never been executed. If it is WRONG, the whole "kern inside a
+# Linux VM on a Mac" path becomes testable on every push and the human is not needed.
+#
+# `continue-on-error` on the start step is the point: a failure here is a RESULT, not a broken build.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: can a hosted Mac hold a Linux VM?
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: what this runner actually is
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n hw.memsize
+          sysctl -n machdep.cpu.brand_string || true
+      - name: install colima
+        run: brew install colima
+      - name: try to start a Linux VM
+        id: start
+        continue-on-error: true
+        run: colima start --cpu 2 --memory 4
+      - name: if it started, is it Linux, and does kern run in it
+        if: steps.start.outcome == 'success'
+        run: |
+          # `$HOME` is single-quoted on purpose: it must expand in the GUEST shell, where the home
+          # is the VM user's, not in this runner's shell. shellcheck cannot see across that boundary.
+          # shellcheck disable=SC2016
+          colima ssh -- uname -s -m
+          colima ssh -- sh -c 'curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh'
+          # shellcheck disable=SC2016
+          colima ssh -- sh -c '$HOME/.local/bin/kern --version'
+          # shellcheck disable=SC2016
+          colima ssh -- sh -c '$HOME/.local/bin/kern box dev --image alpine -- cat /etc/os-release'
+      - name: the answer
+        run: |
+          echo "colima start: ${{ steps.start.outcome }}"
+          if [ "${{ steps.start.outcome }}" = "success" ]; then
+            echo "A hosted Mac CAN hold a Linux VM. The end-to-end Mac check can be automated."
+          else
+            echo "A hosted Mac CANNOT hold a Linux VM. The end-to-end check needs real hardware."
+          fi
