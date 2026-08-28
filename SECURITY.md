@@ -494,8 +494,11 @@ re-running the measurement per vendor, driver and kernel and finding the leaf ch
 A userspace VRAM cap works by interception: it sits in front of the vendor library the workload
 calls. That only holds if the workload has to go through it, and it does not.
 
-- The device nodes are openable by an unprivileged process directly. NVIDIA ships `/dev/nvidiactl`
-  mode `0666`.
+- The device nodes are openable by an unprivileged process directly, with no group membership and
+  no capability. On the host these numbers come from, `/dev/nvidiactl` and `/dev/nvidia0` are mode
+  `0666`; the DRM render node is `0660 root:render`, which is a group a desktop user is usually in.
+  Check your own with `ls -l /dev/nvidia* /dev/dri/`: the suite below decides what is an entry point
+  by TRYING to open it, not by assuming.
 - Opening a file does not consult the dynamic loader, so clearing the entire `LD_` environment
   changes nothing.
 - The real vendor library loads by absolute path with `LD_LIBRARY_PATH` pointing nowhere, so
@@ -509,13 +512,19 @@ calls. That only holds if the workload has to go through it, and it does not.
   as `SCM_RIGHTS` and answers the same ioctl in a process that never opened the device, never linked
   the vendor library, and was never in scope for whatever was watching the first one.
 - There is no serialisation point to race, because there is nothing shared to serialise on: 64
-  concurrent processes each reached the driver through their own open. A single unprivileged process
-  held 4096 concurrent handles, stopped by the probe's own ceiling rather than by any device quota;
-  the limit that applies is `RLIMIT_NOFILE`, inherited from the shell.
+  concurrent processes each reached the driver through their own open. Nor is there a per-tenant
+  ceiling on handles. One unprivileged process held 4096 open descriptors on the device before the
+  probe stopped counting at its own limit on the desktop, and on both ARM boards it held 1021 and
+  was stopped by `EMFILE` at `RLIMIT_NOFILE` 1024. That second run is the one that names the limit:
+  it is the file-descriptor limit the process inherited from its shell, and there is nothing
+  underneath it.
 
-And VRAM is committed by a page fault handled in the kernel and the GSP, so there is no syscall
-carrying the size for a seccomp filter to trap either. This is a property of the problem, not a
-defect above the kernel: no userspace mechanism passes the raw-ioctl test, whoever writes it.
+A seccomp filter is not the alternative either, and this part is reasoning rather than a
+measurement made here: on the NVIDIA driver the allocation is committed by a fault serviced in the
+kernel and on the GPU's own controller, so there is no syscall carrying the size for a filter to
+inspect. Nothing above is load-bearing on that sentence. The raw-ioctl result alone settles it, and
+it is a property of the problem rather than a defect above the kernel: no userspace mechanism passes
+that test, whoever writes it.
 
 Run it: [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) with
 [`pentest/gpu-raw-ioctl.c`](pentest/gpu-raw-ioctl.c), T1 to T9, plus the checks that kern's own line
