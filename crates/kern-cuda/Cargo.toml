@@ -1,0 +1,25 @@
+[package]
+name = "kern-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Cooperative VRAM quota accounting for kern. Not a security boundary: see SECURITY.md."
+
+# `rlib` ONLY, for now, and the absence of `cdylib` is the deliberate part.
+#
+# The interception layer this crate will eventually carry has to be a shared object, because it works
+# by being loaded into the WORKLOAD's address space and standing in front of the vendor library.
+# Nothing in this crate does that yet. Shipping a `cdylib` before there is anything to load would put
+# a second artifact in the release, change `install.sh` and the checksum story, and hand a reader an
+# object with no symbols worth calling.
+#
+# So the accounting engine lands first, as a plain library, testable and benchmarkable on its own. The
+# `cdylib` and the hooks arrive when they arrive, and the release keeps shipping one file until they do.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

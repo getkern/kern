@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kern-cli",
+    "crates/kern-cuda",
     "crates/kern-common",
     "crates/kern-compose",
     "crates/kern-oci",
