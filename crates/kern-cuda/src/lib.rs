@@ -31,9 +31,16 @@
 //!     `compare_exchange` closes that by making the commit fail when the value moved, which sends the
 //!     loser back to re-read and re-decide against the new total.
 
-#![forbid(unsafe_code)]
+// `deny` and not `forbid`, and the difference is one module. The accounting is unsafe-free and stays
+// that way; turning a `mmap`ed region into a `&[AtomicU64]` cannot be, and `forbid` cannot be lifted
+// even locally. So the rule is denied crate-wide, and `map` carries the single documented exception
+// with the safety argument written where the code is.
+#![deny(unsafe_code)]
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+pub mod map;
+pub mod shared;
 
 /// Why a reservation was refused.
 ///

@@ -23,3 +23,6 @@ description = "Cooperative VRAM quota accounting for kern. Not a security bounda
 crate-type = ["rlib"]
 
 [dependencies]
+# The single boundary to the kernel, and the only dependency in the whole workspace. `mmap`,
+# `shm_open`, `ftruncate`: three calls, in one module, behind the crate's one `unsafe` exception.
+libc = "0.2"

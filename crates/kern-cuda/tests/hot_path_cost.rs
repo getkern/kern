@@ -244,3 +244,105 @@ fn readers_of_the_cold_fields_are_not_starved_by_the_hot_one() {
         "reading the ceiling while the hot field is written costs {ns:.1} ns, over {CEILING_NS} ns"
     );
 }
+
+// ── the cross-process path ───────────────────────────────────────────────────────────────────────
+//
+// The shared total is a second hot path and a more expensive one: a reservation touches a word every
+// other tenant on the host is also writing, so the CAS contends across processes rather than across
+// threads of one. Measured here over a plain `Vec`, which is the same code the mapping runs, so the
+// number is the ALGORITHM's cost with the page-fault and syscall costs of the mapping excluded. Those
+// are paid once at attach, not per reservation, and measuring them here would hide the thing this
+// file exists to watch.
+
+use core::sync::atomic::AtomicU64;
+use kern_cuda::shared::{self, Liveness, Shared};
+
+struct AllAlive;
+impl Liveness for AllAlive {
+    fn alive(&self, _pid: u64, _start: u64) -> bool {
+        true
+    }
+}
+
+fn segment(slots: usize) -> Vec<AtomicU64> {
+    (0..shared::words_for(slots))
+        .map(|_| AtomicU64::new(0))
+        .collect()
+}
+
+#[test]
+fn a_shared_reserve_and_release_costs_nanoseconds() {
+    const ROUNDS: usize = 9;
+    const ITERS: usize = 200_000;
+    let seg = segment(4);
+    assert_eq!(shared::init(&seg, 4), Ok(()));
+    let s = Shared::attach(&seg, 1, 1, &AllAlive).expect("attach");
+
+    for _ in 0..ITERS {
+        let _ = keep(s.reserve(keep(4096), GIB));
+        s.release(keep(4096));
+    }
+
+    let mut per_round = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let _ = keep(s.reserve(keep(4096), GIB));
+            s.release(keep(4096));
+        }
+        per_round.push(t0.elapsed().as_nanos() as f64 / ITERS as f64);
+    }
+    let ns = median(per_round);
+
+    println!("shared reserve+release:      {ns:.1} ns per pair (uncontended)");
+    assert_eq!(
+        s.total(),
+        0,
+        "the benchmark must leave the segment balanced"
+    );
+    assert_eq!(s.held(), 0, "and the slot with it");
+    assert!(
+        ns < CEILING_NS,
+        "a shared pair costs {ns:.1} ns, over the {CEILING_NS} ns ceiling"
+    );
+}
+
+/// Several tenants hammering ONE shared word, which is the worst case the design has: unlike the
+/// per-process quota, this line cannot be split up, because a single total is the entire point.
+#[test]
+fn shared_reservations_stay_within_an_order_of_magnitude_under_contention() {
+    let tenants = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16);
+    const ITERS: usize = 100_000;
+    let seg = Arc::new(segment(16));
+    assert_eq!(shared::init(&seg, 16), Ok(()));
+
+    let t0 = Instant::now();
+    let mut handles = Vec::with_capacity(tenants);
+    for i in 0..tenants {
+        let seg = Arc::clone(&seg);
+        handles.push(std::thread::spawn(move || {
+            let pid = i as u64 + 1;
+            let Ok(s) = Shared::attach(&seg, pid, pid, &AllAlive) else {
+                return;
+            };
+            for _ in 0..ITERS {
+                if keep(s.reserve(keep(4096), GIB)).is_ok() {
+                    s.release(keep(4096));
+                }
+            }
+        }));
+    }
+    for h in handles {
+        assert!(h.join().is_ok(), "a tenant thread panicked");
+    }
+    let ns = t0.elapsed().as_nanos() as f64 / (tenants * ITERS) as f64;
+
+    println!("shared pair, {tenants} tenants:      {ns:.1} ns per pair (wall / total ops)");
+    assert!(
+        ns < CEILING_NS,
+        "under {tenants}-way contention a shared pair costs {ns:.1} ns, over {CEILING_NS} ns"
+    );
+}

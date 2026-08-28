@@ -27,6 +27,9 @@ dependencies = [
 [[package]]
 name = "kern-cuda"
 version = "0.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "kern-isolation"
