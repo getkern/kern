@@ -254,31 +254,11 @@ Nothing yet.
 
 ### Fixed
 
-- ⚠️ **BEHAVIOUR CHANGE: a box that used to run uncapped on some hosts is now capped, and can be
-  OOM-killed where it previously survived.** If you run kern as root on a host with no
-  `systemd --user` manager (a container, WSL2, a colima VM on a Mac), boxes there were running with
-  no memory or pid ceiling at all, including the DEFAULTS that apply when you pass no flags. kern
-  said so at every start, but it said it in a warning that is easy to scroll past. From this release
-  those boxes get the cap they always asked for, so a workload that quietly used more than
-  `--memory` allowed, or more than the 512m default, is killed instead of ignored. Nothing changes on
-  a host that was already capping (a normal desktop, a systemd user session, an ARM board on the
-  scope path), and `kern doctor` tells you which one you are on before you try. To keep the old
-  behaviour on purpose, `--allow-uncapped`.
-
-  The cause, for the record: `kern doctor` and
-  `kern box` gave opposite answers on the same host in the same second: doctor reported caps enforced
-  while the box reported UNCAPPED and read its own `memory.max` back as `max`. Both were true, about
-  different cgroups. doctor probes `kern.slice`, which as root it CREATES, so the slice is empty and
-  its children take a cap; `apply_limits` never looked there, because its direct path is gated on a
-  systemd user manager, and built the box under the cgroup kern itself runs in. That cgroup holds
-  processes, and cgroup v2 refuses to enable controllers in the subtree of one that does, so the box
-  got no `memory.max` and ran with no OOM or fork-bomb backstop one directory from a cgroup where the
-  cap works. That is every host with a delegated controller and no systemd user manager: a container,
-  WSL2, and a colima VM on a Mac, which is where it was found. The parent selection now takes
-  `kern.slice` when staying put would mean no cap and moving means a real one, both conditions
-  measured by creating a throwaway child and asking whether it received a `memory.max` rather than by
-  reading a presence flag. `kern run` cannot relocate (it never takes the direct path) and rootless is
-  untouched (the slice is only created as root), so the change lives in root-without-systemd.
+- ⚠️ **A box that used to run uncapped on some hosts is now capped, and can be OOM-killed where it
+  previously survived.** `--memory` and the pid cap now bind on a host with no `systemd --user`
+  manager: a container, WSL2, a colima VM on a Mac. Boxes there had no ceiling at all, including the
+  defaults that apply with no flags. `kern doctor` shows which kind of host you are on;
+  `--allow-uncapped` keeps the old behaviour. Hosts that were already capping are unaffected.
 
 - **macOS is answered where a Mac user actually looks.** The installer refused Darwin with
   "Linux-only" and stopped, which is true and a dead end; the README, the platform table and both SDK
