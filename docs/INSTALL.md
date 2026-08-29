@@ -148,7 +148,8 @@ the seccomp allowlist, Landlock. The **resource caps are not enforced** on a def
 kern says so at every box start rather than pretending: that VM has no `systemd --user` manager and
 does not delegate the `memory` controller, so `--memory` and the pid cap are accepted and never bite.
 `kern doctor` prints the delegation state and `--require-limits` refuses to start uncapped rather than
-run a box that only looks capped.
+run a box that only looks capped. To get that refusal everywhere without adding the flag to each
+command, export `KERN_REQUIRE_LIMITS=1` in the VM's shell profile: same effect, whole session.
 
 Getting the caps back is a property of the guest, not of kern, and the mechanism is **delegation of
 the `memory` controller**, not privilege. That distinction was measured rather than assumed, in a
