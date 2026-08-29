@@ -371,9 +371,12 @@ gates; contributions are covered by the [CLA](CLA.md).
 
 ## Maintainer
 
-Alessandro Polito, [@realexhub](https://github.com/realexhub), Italy. Commits up to and including
-v0.7.0 carry [@getkerndev](https://github.com/getkerndev), the account the project was published
-from.
+Alessandro Polito, [@realexhub](https://github.com/realexhub), Italy. Commits authored before
+2026-08-26 carry [@getkerndev](https://github.com/getkerndev), the account the project was published
+from; from that day they carry the personal one. The two overlap on the switch day itself, and two
+documentation commits from 2026-08-04 carry the same person under a different display name.
+`git log --format='%an'` settles any of it, which is why this names the boundary rather than a
+release: a tag is not where the accounts changed.
 
 **The commits are not signed; the release TAG is.** That is what to verify:
 `git verify-tag v0.7.1` against the key in [provenance/](provenance/), whose fingerprint is in
