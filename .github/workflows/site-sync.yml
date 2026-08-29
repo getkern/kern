@@ -35,3 +35,7 @@ jobs:
           echo "re-sync it, then re-run this check:" >&2
           echo "  scp install.sh root@getkern.dev:/var/www/getkern.dev/install.sh" >&2
           exit 1
+      - name: the hero names every platform the page's own metadata claims
+        run: |
+          curl -fsSL "https://getkern.dev/?ci=${GITHUB_RUN_ID}" -o /tmp/live.html
+          python3 scripts/site-hero-platforms.py /tmp/live.html
