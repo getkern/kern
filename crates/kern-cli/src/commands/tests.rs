@@ -3622,3 +3622,71 @@ mod the_plan_previews_every_profile_kind {
         );
     }
 }
+
+#[cfg(test)]
+mod scratch_placement_tests {
+    use crate::commands::rootfs::scratch_base_usable;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `$XDG_RUNTIME_DIR` is not always the operator's choice. A WSL distro with WSLg exports
+    /// `/mnt/wslg/runtime-dir`, and a second uid that inherits it cannot write there: measured on
+    /// WSL2, every `kern box` died with `overlay scratch: Permission denied (os error 13)`. The
+    /// placement now asks first, and the question is asked about the deepest EXISTING ancestor,
+    /// because the leaf is created on demand.
+    #[test]
+    fn a_scratch_path_is_probed_on_the_ancestor_that_exists() {
+        let base = std::env::temp_dir().join(format!("kern-scratchprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp dir");
+        // The leaf does not exist yet, and that must not read as "unusable".
+        assert!(
+            scratch_base_usable(&base, &base.join("kern/scratch")),
+            "a writable base with no leaf yet is usable"
+        );
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skip: the refusal arm needs a non-root uid (root bypasses W_OK)");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        assert!(
+            !scratch_base_usable(&base, &base.join("kern/scratch")),
+            "a base this user cannot write is not a place to put a box's writable layer"
+        );
+        // Positive control: the mode is what moved the answer, not the missing leaf.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(scratch_base_usable(&base, &base.join("kern/scratch")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Writable is not enough: it must be OURS. `/tmp` is mode 1777 and owned by root, so it is the
+    /// one directory every non-root uid can write and none of them owns - the exact shape of a
+    /// `kern` dir another user created first under a shared `$XDG_RUNTIME_DIR`, and of a
+    /// pre-created `/tmp/kern-<uid>` left by someone else.
+    #[test]
+    fn a_directory_owned_by_another_uid_is_refused_even_when_writable() {
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skip: as root every directory is ours by permission (uid 0 owns /tmp here)");
+            return;
+        }
+        let foreign = std::path::Path::new("/tmp");
+        assert!(
+            foreign.exists(),
+            "the whole test rests on /tmp being present and root-owned"
+        );
+        assert!(
+            !scratch_base_usable(
+                std::path::Path::new("/nowhere-that-exists"),
+                &foreign.join("kern-someone-else/scratch")
+            ),
+            "a root-owned ancestor is not a place to put this user's writable layer"
+        );
+        // Positive control: the OWNERSHIP is what refused it. Name the same directory as the system
+        // base - the one component kern never created and therefore never requires to be ours - and
+        // the same path is accepted.
+        assert!(
+            scratch_base_usable(foreign, &foreign.join("kern-someone-else/scratch")),
+            "as the declared system base, /tmp is usable: so the refusal above was about ownership"
+        );
+    }
+}

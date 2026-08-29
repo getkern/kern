@@ -13,6 +13,14 @@ is in the git history.
 
 ## Unreleased
 
+### Fixed
+
+- Two users on one machine can now both run boxes when `$XDG_RUNTIME_DIR` is shared between them (a
+  WSL distro with WSLg exports the same path to every uid). Whoever started a box first used to lock
+  the other out with `overlay scratch: Permission denied`. kern picks the next scratch location and
+  says so.
+- A failure to create the box scratch now names the directory.
+
 ### Changed
 
 - `kern doctor` no longer tells you to write `cgroup.subtree_control` where you have no permission to

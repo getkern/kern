@@ -1530,10 +1530,6 @@ pub(crate) fn seed_resolv_conf(rootfs: &std::path::Path) -> bool {
 /// against the box's memory cap. Created mode 0700 by the caller.
 pub(crate) fn scratch_dir() -> PathBuf {
     crate::registry::assert_registry_child("scratch"); // classification chokepoint (see registry.rs)
-                                                       // An explicit XDG_RUNTIME_DIR always wins - it is the documented override.
-    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(x).join("kern/scratch");
-    }
     let uid = unsafe { libc::getuid() };
     // The scratch holds each box's overlay upper/work - and the kernel refuses an overlay UPPER
     // that itself lives on overlayfs. On a normal host `/run/user/<uid>` (tmpfs) or `/tmp` is fine;
@@ -1542,29 +1538,96 @@ pub(crate) fn scratch_dir() -> PathBuf {
     // inside Docker (size-capped - last resort, announced on stderr so an ENOSPC later isn't a
     // mystery). If everything is overlayfs, fall through to /tmp and let the mount fail with the
     // actionable nested-overlay error from kern-isolation.
-    let run = PathBuf::from(format!("/run/user/{uid}"));
-    let mut cands: Vec<(PathBuf, &str)> = Vec::new();
-    if run.is_dir() {
-        cands.push((run.join("kern/scratch"), "run"));
+    //
+    // `$XDG_RUNTIME_DIR` still wins when it works - it is the documented override - but it is now a
+    // CANDIDATE rather than an unconditional answer, the same shape `registry::runtime_subdir` has
+    // always had. The reason is measured, on WSL2 (2026-08-29): a distro with WSLg exports
+    // `XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir`, the SAME path for every uid, and `kern/scratch` under
+    // it is created 0700 by whichever user starts a box first. The other user then gets
+    // `overlay scratch: Permission denied` - and root, who passes every permission check, gets
+    // something worse: it writes into a dir owned by a uid that is not mapped inside the box's user
+    // namespace and the failure surfaces later as `mount(overlay) failed: Permission denied`. Both
+    // directions were reproduced by simply changing which user ran first. So a candidate must be
+    // ours, not merely writable, and refusing a foreign-owned `kern-<uid>` dir also closes the
+    // pre-created-directory trap on world-writable `/tmp` and `/dev/shm`.
+    let mut cands: Vec<(PathBuf, PathBuf, &str)> = Vec::new();
+    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let base = PathBuf::from(&x);
+        cands.push((base.join("kern/scratch"), base, "xdg"));
     }
-    cands.push((PathBuf::from(format!("/tmp/kern-{uid}/scratch")), "tmp"));
-    cands.push((PathBuf::from(format!("/dev/shm/kern-{uid}/scratch")), "shm"));
-    for (cand, kind) in &cands {
-        if fs_magic_of(cand) != Some(OVERLAYFS_SUPER_MAGIC) {
-            if *kind == "shm" && !kern_common::env_flag("KERN_QUIET") {
+    let run = PathBuf::from(format!("/run/user/{uid}"));
+    if run.is_dir() {
+        cands.push((run.join("kern/scratch"), run, "run"));
+    }
+    let tmp = PathBuf::from(format!("/tmp/kern-{uid}/scratch"));
+    cands.push((tmp.clone(), PathBuf::from("/tmp"), "tmp"));
+    cands.push((
+        PathBuf::from(format!("/dev/shm/kern-{uid}/scratch")),
+        PathBuf::from("/dev/shm"),
+        "shm",
+    ));
+    for (cand, base, kind) in &cands {
+        if fs_magic_of(cand) == Some(OVERLAYFS_SUPER_MAGIC) {
+            continue;
+        }
+        if !scratch_base_usable(base, cand) {
+            if *kind == "xdg" && !kern_common::env_flag("KERN_QUIET") {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     eprintln!(
-                        "kern: note: /run and /tmp are on overlayfs (container?) - using the \
-                         size-capped /dev/shm for box scratch; set XDG_RUNTIME_DIR to a tmpfs/disk \
-                         path for full capacity"
+                        "kern: note: $XDG_RUNTIME_DIR ({}) holds a `kern` dir this user does not \
+                         own - putting box scratch under /run/user/<uid> or /tmp instead",
+                        base.display()
                     );
                 });
             }
-            return cand.clone();
+            continue;
+        }
+        if *kind == "shm" && !kern_common::env_flag("KERN_QUIET") {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "kern: note: /run and /tmp are on overlayfs (container?) - using the \
+                     size-capped /dev/shm for box scratch; set XDG_RUNTIME_DIR to a tmpfs/disk \
+                     path for full capacity"
+                );
+            });
+        }
+        return cand.clone();
+    }
+    tmp
+}
+
+/// Can this user put a box's writable layer at `cand`? The leaf is created on demand, so the
+/// question is asked of the deepest ancestor that EXISTS: it must be writable, and - unless it is
+/// `base`, the system directory kern did not create - it must be OURS. Ownership is the half that
+/// permissions alone cannot answer, because root passes `access(2)` on every directory and then the
+/// overlay mount fails inside the box's user namespace instead. Read-only, so probing leaves nothing
+/// behind.
+pub(crate) fn scratch_base_usable(base: &std::path::Path, cand: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::getuid() };
+    let mut p = cand;
+    loop {
+        if let Ok(md) = std::fs::symlink_metadata(p) {
+            if !md.is_dir() {
+                return false; // a file (or a symlink) where a directory belongs is not ours to use
+            }
+            if p != base && md.uid() != uid {
+                return false;
+            }
+            let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+                return false;
+            };
+            // SAFETY: `c` is a live NUL-terminated path and `access` only reads it.
+            return unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 };
+        }
+        match p.parent() {
+            Some(up) => p = up,
+            None => return false,
         }
     }
-    PathBuf::from(format!("/tmp/kern-{uid}/scratch"))
 }
 
 pub(crate) const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
