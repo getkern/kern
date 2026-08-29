@@ -158,7 +158,7 @@ not make a cap bite where the controller was never handed down. WSL2 is the coun
 misleads here: kern runs as uid 0 there AND that kernel delegates, and it is the second half that
 does the work.
 
-So the route is the one `kern doctor` prints, run inside the VM as root:
+So the route, on a guest whose cgroup root you can write, is:
 
 ```sh
 echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
@@ -172,7 +172,7 @@ that is still not enough, measured on the guest itself.** A session opened with 
 `cgroup.subtree_control` changes that: what is missing is a write permission, not a controller.
 v0.7.1 fixed the neighbouring case, kern running as ROOT with no user manager, which is a container
 or WSL2 rather than this. Either way kern says at every start whether the box is capped, and
-`--require-limits` turns that into a refusal to start. Two further warnings areTwo further warnings are
+`--require-limits` turns that into a refusal to start. Two further warnings are
 worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
 user (redis, postgres, nginx), and `sudo apt install passt` for outbound networking from a pod.
 

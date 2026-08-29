@@ -59,7 +59,18 @@ fn check_scope_toll() -> R {
     if !kern_isolation::user_systemd_present() {
         // No user manager means no transient scope to pay for, which on WSL2 is why a box costs 4.2 ms
         // there WITH its cap enforced: the direct path was never optional, it was the only one.
-        return R::Ok("no systemd user manager here: no per-box scope is paid at all".into());
+        //
+        // The same fact leaves a colima guest UNCAPPED, and this row said only the good half of it: a
+        // tester read a green "no scope is paid at all" one line under a warning that caps do not
+        // bind and reported the two as a contradiction. They are one fact with two consequences, so
+        // say both and point at the row that decides. Deliberately still a tick and NOT a second
+        // warning: the cgroup row above already carries the warning, and duplicating it would make a
+        // single problem look like two. This row costs no probe, which is what its doc promises.
+        return R::Ok(
+            "no systemd user manager here: no per-box scope is paid, and none is available to \
+             delegate a cap through either - whether caps bind is the cgroup row above"
+                .into(),
+        );
     }
     // THREE runs, report the median, and throw the first away. A single cold sample read 34.0 ms on a
     // Raspberry Pi 5 where the warm median is 9.4: the first `systemd-run` in a session pays for the
@@ -527,6 +538,38 @@ fn check_max_userns() -> R {
     }
 }
 
+/// The hint for "the controller is there and a cap still does not bind", chosen from what this user
+/// can actually do here.
+///
+/// The single fixed string it replaces told every reader to `echo +memory > cgroup.subtree_control`.
+/// A macOS tester ran it on a colima guest (2026-08-29), where an ssh session sits in
+/// `/system.slice/ssh.service` owned by root: the write is refused, the shell prints nothing, and the
+/// next `kern box` is still uncapped. A hint that cannot work on the host it is printed on is worse
+/// than none, because the reader spends the attempt and concludes kern is broken rather than
+/// undelegated.
+fn delegation_hint() -> String {
+    let common = "boxes still run and the isolation holds";
+    match kern_isolation::delegation_blocker() {
+        kern_isolation::DelegationBlocker::ControllerNotEnabled => format!(
+            "{common}; add `memory` to this tree's `cgroup.subtree_control`, or run kern under a \
+             delegated `systemd --user` scope"
+        ),
+        // Root is NOT offered as the fix. On a guest with colima's shape it was measured not to be
+        // one (uid 0, `--memory 32m`, a 200 MiB write survived: the controller was never delegated
+        // down, and being root does not delegate it), so pointing at the probe is the honest form.
+        kern_isolation::DelegationBlocker::NotWritable => format!(
+            "{common}; this cgroup is not writable by you, so no `cgroup.subtree_control` write \
+             helps - a cap needs a delegated `systemd --user` scope; `sudo kern doctor` says \
+             whether root gets one here"
+        ),
+        kern_isolation::DelegationBlocker::Neither => format!(
+            "{common}; `memory` is already in this tree's `cgroup.subtree_control` and a cap still \
+             does not read back - a cap needs a delegated `systemd --user` scope; `sudo kern doctor` \
+             says whether root gets one here"
+        ),
+    }
+}
+
 fn check_cgroup() -> R {
     use kern_isolation::MemoryCapState;
     if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
@@ -562,7 +605,7 @@ fn check_cgroup() -> R {
             ),
             MemoryCapState::PresentNotDelegated => R::Warn(
                 "cgroup v2 present, no systemd --user manager, and the `memory` controller is listed but NOT delegated to a child cgroup - a `--memory` write is accepted and silently never bites".into(),
-                "boxes still run and the isolation holds; add `memory` to this tree's `cgroup.subtree_control`, or run kern under a delegated `systemd --user` scope".into(),
+                delegation_hint(),
             ),
             MemoryCapState::Absent => R::Warn(
                 "cgroup v2 present, no systemd --user manager, and the `memory` controller is not in this cgroup's tree - `--memory`/`--pids-limit` will not bind".into(),

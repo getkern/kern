@@ -66,6 +66,9 @@ pub use cgroup::gc_orphan_box_cgroups;
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
 /// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.
 pub use cgroup::memory_cap_enforceable;
+/// Why no systemd user manager is reachable on THIS host, for the uncapped warning's middle clause.
+/// See [`cgroup::missing_manager_clause`].
+pub use cgroup::missing_manager_clause;
 /// Move kern's own processes out of the box's scope root, so the box's whole-box OOM kill takes the
 /// workload and not the supervisor that records its exit code. Call once, at process entry, before any
 /// fork. See [`cgroup::prepare_delegated_scope`].
@@ -92,6 +95,9 @@ pub use cgroup::SCOPE_SUPERVISOR_HEADROOM;
 /// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,
 /// `env_claims_enforcer_but_none_real`) stay crate-internal - only `real.rs` reads them.
 pub use cgroup::{choose_direct_cap_path, choose_direct_cap_path_given, scrub_direct_marker};
+/// Which local change, if any, would make a cap bind here - so a hint cannot suggest a write that
+/// this user is not allowed to perform. See [`cgroup::delegation_blocker`].
+pub use cgroup::{delegation_blocker, DelegationBlocker};
 pub use cgroup::{fleet_status, FleetStatus};
 pub use cgroup::{memory_cap_signal, record_memory_cap_signal};
 /// The write-tested state of `--memory` enforcement on this host (`Enforced` / `PresentNotDelegated`

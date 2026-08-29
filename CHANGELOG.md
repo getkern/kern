@@ -13,7 +13,15 @@ is in the git history.
 
 ## Unreleased
 
-Nothing yet.
+### Changed
+
+- `kern doctor` no longer tells you to write `cgroup.subtree_control` where you have no permission to
+  write it. It now says which of the two things is in the way, measured on the cgroup a box would be
+  capped in.
+- The uncapped-box warning names `XDG_RUNTIME_DIR` only when pointing it somewhere else would change
+  the answer. On a host with no user manager at all it says so instead.
+- The `no systemd user manager here` line in `doctor` says what that costs and what it prevents, so it
+  no longer reads as good news one row under the warning that caps do not bind.
 
 ## v0.7.1 - 2026-08-28
 

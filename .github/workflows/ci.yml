@@ -381,6 +381,24 @@ jobs:
           S
           docker run --rm --privileged --tmpfs /run \
             -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/no.sh:/t.sh ubuntu:24.04 sh /t.sh
+      - name: doctor must not suggest a write this user cannot make
+        # An unprivileged uid in a container has colima's exact cgroup shape: the cgroup is root-owned
+        # and read-only, so `echo +memory > cgroup.subtree_control` is refused - and the shipped hint
+        # said to run it anyway. A macOS tester ran it, saw nothing, and reported kern broken. The
+        # assertion is on the ABSENCE of that sentence, so it needs the two controls below: the shape
+        # must be the one under test, and the row that carries the hint must have fired at all.
+        run: |
+          cat > /tmp/ro.sh <<'S'
+          if [ -w /sys/fs/cgroup ]; then echo "not the shape under test: the cgroup IS writable" >&2; exit 1; fi
+          out=$(/fix/kern doctor 2>&1)
+          echo "$out" | grep -q "NOT delegated to a child cgroup" || { echo "the hint's row never fired: nothing to assert about" >&2; echo "$out"; exit 1; }
+          echo "$out" | grep -q "not writable by you" || { echo "the permission is not named" >&2; echo "$out"; exit 1; }
+          if echo "$out" | grep -q "add .memory. to this tree"; then
+            echo "doctor still prescribes a write that is refused here" >&2; exit 1
+          fi
+          S
+          docker run --rm --user 1000:1000 --tmpfs /run \
+            -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/ro.sh:/t.sh ubuntu:24.04 sh /t.sh
 
   macos-guards:
     name: macOS guards (no VM)
