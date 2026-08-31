@@ -128,29 +128,64 @@ pub fn config_add(args: &[String]) -> Result<(), Error> {
     //
     // THE BLOCK WRITTEN IS MINIMAL, the id alone: see `save_physical_block` for why inventing a
     // capacity would be worse than leaving it undeclared.
+    // THE PHYSICAL BLOCK IS WRITTEN BEFORE THE PROFILE IS VALIDATED, so the file has to be put back
+    // when the profile is then refused. Measured: on a config whose `[[cpu]]` is named `host`,
+    // `kern config add vcpu:big --cpus 4` printed `id 'host' is the reserved backend`, exited 1, and
+    // had already appended a `[[cpu]] id = "cpu:0"` the caller never asked for. Not data loss - the
+    // write is idempotent, so three failed attempts left one block, and the result still validates -
+    // but a command that reports failure may not leave the operator's file changed, and the next
+    // person to open it finds a block with no history.
+    //
+    // The snapshot is taken only when something is about to be materialised, and the restore undoes
+    // exactly that: no speculative rewriting of a file this command did not touch.
+    let mut snapshot: Option<(std::path::PathBuf, Option<Vec<u8>>)> = None;
     let mut materialised: Option<(&str, String)> = None;
     if !update && !pairs.iter().any(|(k, _)| k == "backend") {
         let (phys, id) = crate::config::physical_for(&kind);
         // ONLY IF ABSENT. Rewriting an existing block would erase the fields the operator put in
         // it, and what this command was asked to add is a PROFILE.
         if !crate::config::physical_block_exists(phys, &id).map_err(Error::Config)? {
+            snapshot = crate::config::active_path().map(|p| {
+                let before = std::fs::read(&p).ok();
+                (p, before)
+            });
             crate::config::save_physical_block(phys, &id).map_err(Error::Config)?;
             materialised = Some((phys, id.clone()));
         }
         pairs.push(("backend".to_string(), id));
     }
+    // A file that did not exist before is removed rather than left empty: "as it was" includes
+    // absent. Failures here are swallowed on purpose - the caller is already returning an error,
+    // and a second one about the rollback would bury the first.
+    let undo = |snap: &Option<(std::path::PathBuf, Option<Vec<u8>>)>| {
+        if let Some((p, before)) = snap {
+            match before {
+                Some(bytes) => drop(std::fs::write(p, bytes)),
+                None => drop(std::fs::remove_file(p)),
+            }
+        }
+    };
 
     let refs: Vec<(&str, &str)> = pairs
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let body = crate::config::profile_block(&name, &refs).map_err(Error::Config)?;
+    let body = match crate::config::profile_block(&name, &refs) {
+        Ok(b) => b,
+        Err(e) => {
+            undo(&snapshot);
+            return Err(Error::Config(e));
+        }
+    };
     // The flags passed here are the fields this command controls; the merge keeps every other key in
     // the block. Update edits in place (orig = the name, skipping the collision guard); a plain add
     // refuses to clobber an existing profile.
     let managed: Vec<&str> = refs.iter().map(|(k, _)| *k).collect();
     let orig = update.then_some(name.as_str());
-    crate::config::save_named_block(&kind, orig, &name, &managed, &body).map_err(Error::Config)?;
+    if let Err(e) = crate::config::save_named_block(&kind, orig, &name, &managed, &body) {
+        undo(&snapshot);
+        return Err(Error::Config(e));
+    }
     let p = crate::ui::Palette::detect();
     println!(
         "{g}{}{z} {kind}:{name}   {d}attach with `{kind}:{name}`{z}",
@@ -911,6 +946,52 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    /// A `config add` THAT FAILS MAY NOT LEAVE THE OPERATOR'S FILE CHANGED.
+    ///
+    /// The physical block is materialised BEFORE the profile is validated, so a refusal used to land
+    /// after the write. Measured: on a config whose `[[cpu]]` is named `host`, `config add vcpu:big`
+    /// printed `id 'host' is the reserved backend`, exited 1, and had already appended a
+    /// `[[cpu]] id = "cpu:0"` nobody asked for. Not data loss - it is idempotent and the result still
+    /// validates - but a command that reports failure has to leave the file alone.
+    ///
+    /// Compared BYTE FOR BYTE, not by parsing: what is asserted is that nothing was written, and a
+    /// parse would agree on two files that differ in exactly the way this is about.
+    #[test]
+    fn a_refused_config_add_leaves_the_file_byte_identical() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-cfg-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("kern")).expect("temp config dir");
+        let file = tmp.join("kern/kern.toml");
+        // `host` is the reserved sentinel for a cpu backend, so naming a block that way is exactly
+        // what `require_backend` refuses - and it refuses it AFTER the materialisation.
+        let before = b"[[cpu]]\nid = \"host\"\ncores = 8\n".to_vec();
+        std::fs::write(&file, &before).expect("seed config");
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let err = super::config_add(&["vcpu:big".into(), "--cpus".into(), "4".into()])
+            .expect_err("a reserved backend id must refuse the add");
+        let after = std::fs::read(&file).expect("the file must still be there");
+
+        // POSITIVE CONTROL FIRST: the refusal is the one this test is about, not some other failure
+        // that happens not to write. Without it, a config_add that broke on argument parsing would
+        // pass this test while the defect stayed.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("reserved backend"),
+            "the refusal must be the post-materialisation one: {msg}"
+        );
+        assert_eq!(
+            after, before,
+            "a failed `config add` rewrote the file: it must be byte-identical"
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// Write a case file, validate it, and hand back the outcome as a string.
     ///
     /// One helper for every case: what differs between them is the CONTENT, and writing the file out

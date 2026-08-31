@@ -180,6 +180,25 @@ shape, and it is stated rather than left to be noticed.
   no longer reads as good news one row under the warning that caps do not bind.
 
 ### Fixed
+
+- **A `kern config add` that failed had already changed your config file.** The physical block a
+  profile needs is materialised BEFORE the profile is validated, so a refusal landed after the
+  write. Measured: on a config whose `[[cpu]]` is named `host`, `kern config add vcpu:big --cpus 4`
+  printed `id 'host' is the reserved backend`, exited 1, and had already appended a
+  `[[cpu]] id = "cpu:0"` nobody asked for.
+
+  Not data loss, and said plainly because the difference matters: the write is idempotent, so three
+  failed attempts left one block and not three, and the resulting file still validates. What was
+  wrong is narrower and still worth fixing: a command that reports failure may not leave the
+  operator's file changed, and the next person to open it finds a block with no history.
+
+  The file is snapshotted only when something is about to be materialised, and restored to exactly
+  that: a file this command did not touch is not rewritten, and a file that did not exist before is
+  removed rather than left empty.
+
+  Injection: verified - removing the restore turns `a_refused_config_add_leaves_the_file_byte_identical`
+  red with the appended block visible in the byte diff. The comparison is byte for byte and not by
+  parsing, because a parse agrees on the two files this is about.
 - **The macOS CI job tested one of the installer's two branches and could not tell them apart.**
   `install.sh` says something different to a Mac that already runs a Linux VM: use the one you have,
   do not install a second. Which branch a bare run takes depends on what the runner image happens to
