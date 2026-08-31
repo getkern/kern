@@ -756,7 +756,8 @@ fn handle_nav(
     false
 }
 
-/// Boxes-tab action keys: stop / pause / unpause / kill the selected box, or open its logs. The CLI
+/// Boxes-tab action keys: stop / pause / unpause the selected box, or open its logs. There is no
+/// kill key: `k` is navigation, and the one lifecycle stop is `s`, behind a confirmation. The CLI
 /// helpers are reused with muted stdio so their messages don't bleed into the alt-screen. Returns
 /// `true` when a lifecycle op changed box state (so the caller re-reads the list), `false` for a
 /// read-only action (opening logs) or an unbound key.
@@ -2332,7 +2333,7 @@ fn help_text() -> String {
        n  new         e  edit         d  delete        Enter  details        p  prune unused\n\
      \n\
      HEALTH colors:  green = healthy   red = unhealthy   dim = starting or no check\n\
-     Destructive actions (delete / kill / prune) ask y / n first."
+     Destructive actions (stop / delete / prune) ask y / n first."
         .to_string()
 }
 
@@ -3769,6 +3770,13 @@ mod tests {
         assert!(
             help.contains("stop (asks first)"),
             "a destructive key that asks must say so where the user reads the keys"
+        );
+        // The residue of the same defect: the summary line at the bottom of the help still listed
+        // `kill` among the destructive actions long after the key was gone, so the overlay named an
+        // action the TUI does not have. The word may not appear at all: there is no kill here.
+        assert!(
+            !help.contains("kill"),
+            "the help may not name a `kill` action the TUI does not offer: {help}"
         );
 
         let footer = nav_footer(&plain(), TAB_BOXES, &[row("x", false)], &[], &[], &[], &[]);
