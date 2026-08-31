@@ -199,13 +199,51 @@ jobs:
           # to its service uid (redis does) can start rootless, and passt for the pod's network.
           sudo apt-get update -qq
           sudo apt-get install -y -qq uidmap passt
+      - name: the Darwin branch stays on Darwin
+        # The macOS job proves the guard FIRES on a Mac. Nothing proved it does not fire anywhere
+        # else, and a guard that greets every host is worse than none: it would turn every Linux
+        # install into a lecture about colima. A faked `uname` reporting Linux on an arch kern does
+        # not publish stops the script at the ARCH check, which is one step PAST the branch under
+        # test, so reaching that error is itself the evidence the Darwin arm was not taken.
+        run: |
+          mkdir -p /tmp/fakeuname
+          # $1 is the FAKE uname's own argument and must reach the file unexpanded, which is what the
+          # single quotes are for. shellcheck cannot see that this string is a program.
+          # shellcheck disable=SC2016
+          printf '#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo riscv64;; esac\n' > /tmp/fakeuname/uname
+          chmod +x /tmp/fakeuname/uname
+          out="$(PATH=/tmp/fakeuname:$PATH sh install.sh 2>&1)" && {
+            echo "the installer exited 0 on an unsupported arch" >&2; exit 1
+          }
+          echo "$out"
+          case "$out" in
+            *Darwin*) echo "the Darwin branch fired on a Linux host" >&2; exit 1 ;;
+            *"unsupported architecture"*) ;;
+            *) echo "expected the arch check, got: $out" >&2; exit 1 ;;
+          esac
+
       - name: build
         run: cargo build --bin kern
       - name: doctor says whether boxes will run here
         continue-on-error: true
         run: ./target/debug/kern doctor
-      - name: bring the stack up
-        run: ./target/debug/kern compose examples/compose-webstack.toml up
+      - name: bring the stack up, and prove the health gate actually gated
+        # The published page says "the cache was healthy first", and that string is printed by the web
+        # service unconditionally: asserting on it proves a page was served, not that anything waited.
+        # compose's own output is the observable that cannot be faked by the example, so require the
+        # line where it says it is holding the second service for the first one's health probe.
+        run: |
+          # The gate stays BARE: piping into `tee` would hand the step tee's exit status and a failed
+          # `compose up` would read as a pass. Capture first, show second, assert third.
+          ./target/debug/kern compose examples/compose-webstack.toml up > /tmp/up.log 2>&1 || {
+            cat /tmp/up.log >&2; exit 1
+          }
+          cat /tmp/up.log
+          grep -q "waiting for" /tmp/up.log || {
+            echo "compose started the stack without ever waiting on the health gate" >&2
+            cat /tmp/up.log >&2
+            exit 1
+          }
       - name: the published port answers, and says the cache was healthy first
         run: |
           for _ in $(seq 30); do
@@ -297,6 +335,83 @@ jobs:
         # fixture serves the images over loopback, so nothing here needs a registry account or the
         # network, and a suite failure cannot be a pull that flaked.
         run: sh pentest/run-all.sh ./target/release/kern
+
+  caps-shape:
+    name: the cap fix, in the shape it fixes
+    # The bug this release closes lived on hosts with a delegated `memory` controller and NO systemd
+    # user manager: a container, WSL2, a colima VM on a Mac. This runner has systemd, so every other
+    # job here exercises the shape where the bug never appeared. Without this one the regression test
+    # for the release's headline fix would live only in a human's terminal.
+    #
+    # A privileged container reproduces the shape exactly: same `kern doctor` warning, same absent
+    # user manager. Both directions are asserted, because only the pair is evidence: where delegation
+    # is possible the cap must BITE, and where it is not, `doctor` and the box must AGREE that it does
+    # not. The second half is the one that would have caught the original defect.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build the binary under test
+        run: cargo build --release --bin kern
+      - name: with the controller delegated, the cap must bite
+        run: |
+          cat > /tmp/yes.sh <<'S'
+          export PATH=/fix:$PATH
+          apt-get update -qq >/dev/null 2>&1
+          apt-get install -y -qq curl ca-certificates uidmap >/dev/null 2>&1
+          /fix/kern pull alpine >/dev/null 2>&1
+          mkdir -p /sys/fs/cgroup/leaf
+          for p in $(cat /sys/fs/cgroup/cgroup.procs); do echo $p > /sys/fs/cgroup/leaf/cgroup.procs 2>/dev/null || true; done
+          echo "+memory +pids" > /sys/fs/cgroup/cgroup.subtree_control
+          # The positive control FIRST: if this grep finds nothing here, every other number this job
+          # prints is meaningless, including the 0 the next step reads as a verdict.
+          n=$(/fix/kern doctor 2>&1 | grep -ci "caps enforced")
+          echo "doctor enforced=$n"
+          [ "$n" = "1" ] || { echo "the assertion is broken, not the host" >&2; exit 1; }
+          m=$(/fix/kern box a --image alpine --memory 64m -- sh -c 'cat /sys/fs/cgroup/memory.max' 2>&1 | grep -E '^[0-9]+$|^max$' | tail -1)
+          echo "memory.max=$m"
+          [ "$m" = "67108864" ] || { echo "the cap was not written" >&2; exit 1; }
+          out=$(/fix/kern box b --image alpine --memory 64m -- sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=400 2>/dev/null; echo SURVIVED' 2>&1 | tail -1)
+          echo "400 MiB under 64m: $out"
+          case "$out" in *SURVIVED*) echo "the cap did not bite" >&2; exit 1 ;; esac
+          S
+          docker run --rm --privileged --tmpfs /run \
+            -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/yes.sh:/t.sh ubuntu:24.04 sh /t.sh
+      - name: where it cannot be delegated, doctor and the box must agree
+        run: |
+          cat > /tmp/no.sh <<'S'
+          export PATH=/fix:$PATH
+          apt-get update -qq >/dev/null 2>&1
+          apt-get install -y -qq curl ca-certificates uidmap >/dev/null 2>&1
+          /fix/kern pull alpine >/dev/null 2>&1
+          n=$(/fix/kern doctor 2>&1 | grep -ci "caps enforced")
+          m=$(/fix/kern box n --image alpine --memory 32m -- sh -c 'cat /sys/fs/cgroup/memory.max' 2>&1 | grep -E '^[0-9]+$|^max$' | tail -1)
+          echo "doctor enforced=$n  box memory.max=$m"
+          [ "$n" = "0" ] && [ "$m" = "max" ] && exit 0
+          echo "doctor and the box disagree: this is the defect the release fixes, returning" >&2
+          exit 1
+          S
+          docker run --rm --privileged --tmpfs /run \
+            -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/no.sh:/t.sh ubuntu:24.04 sh /t.sh
+      - name: doctor must not suggest a write this user cannot make
+        # An unprivileged uid in a container has colima's exact cgroup shape: the cgroup is root-owned
+        # and read-only, so `echo +memory > cgroup.subtree_control` is refused - and the shipped hint
+        # said to run it anyway. A macOS tester ran it, saw nothing, and reported kern broken. The
+        # assertion is on the ABSENCE of that sentence, so it needs the two controls below: the shape
+        # must be the one under test, and the row that carries the hint must have fired at all.
+        run: |
+          cat > /tmp/ro.sh <<'S'
+          if [ -w /sys/fs/cgroup ]; then echo "not the shape under test: the cgroup IS writable" >&2; exit 1; fi
+          out=$(/fix/kern doctor 2>&1)
+          echo "$out" | grep -q "NOT delegated to a child cgroup" || { echo "the hint's row never fired: nothing to assert about" >&2; echo "$out"; exit 1; }
+          echo "$out" | grep -q "not writable by you" || { echo "the permission is not named" >&2; echo "$out"; exit 1; }
+          if echo "$out" | grep -q "add .memory. to this tree"; then
+            echo "doctor still prescribes a write that is refused here" >&2; exit 1
+          fi
+          S
+          docker run --rm --user 1000:1000 --tmpfs /run \
+            -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/ro.sh:/t.sh ubuntu:24.04 sh /t.sh
 
   macos-guards:
     name: macOS guards (no VM)

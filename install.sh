@@ -24,18 +24,40 @@ os="$(uname -s)"
 case "$os" in
   Linux) ;;
   Darwin)
-    err "kern is Linux-only (detected Darwin), and a native macOS port is a non-goal: macOS has no
-  namespaces and no cgroups, so there is nothing for kern to build a box out of.
+    # Look before prescribing. Telling a Mac that already runs OrbStack or Docker Desktop to install
+    # colima is asking for a second VM to do what the first one is doing right now, and it is the
+    # most common shape: someone who wants a container runtime usually has one running already. So
+    # name the Linux the machine ALREADY has, and keep the install line for a Mac that has none.
+    have=""
+    for vm in colima limactl orb docker; do
+      command -v "$vm" >/dev/null 2>&1 && have="$have $vm"
+    done
+    if [ -n "$have" ]; then
+      # Presence, not function, and deliberately: `docker info` on a Mac whose Docker Desktop is not
+      # running can take seconds, and this is an ERROR path that has already failed the user once.
+      # So the message never claims the VM is up, it says what to do in either case.
+      route="This Mac has a Linux VM installed (${have# }). Start it if it is not running, and use
+  it rather than installing a second one:
 
-  kern does run on a Mac inside a Linux VM (colima, Lima, OrbStack, UTM):
+      colima ssh            # colima. For Lima: limactl shell <instance>
+      docker run --rm -it --privileged --tmpfs /run ubuntu   # OrbStack / Docker Desktop
+
+  then run this installer again inside it. --privileged is privilege INSIDE that VM, which is
+  already a boundary against macOS, and it is needed because a box mounts its own /proc."
+    else
+      route="No Linux VM was found on this Mac. One way to get one:
 
       brew install colima
       colima start
       colima ssh
-      curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+      curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh"
+    fi
+    err "kern is Linux-only (detected Darwin), and a native macOS port is a non-goal: macOS has no
+  namespaces and no cgroups, so there is nothing for kern to build a box out of.
 
-  The last line is this installer, run again from inside the VM, where it finds Linux and works.
-  No GPU and no GPIO are reachable from there. See docs/INSTALL.md."
+  $route
+
+  No GPU and no GPIO are reachable from a Linux guest on a Mac. See docs/INSTALL.md."
     ;;
   *) err "kern is Linux-only (detected $os)." ;;
 esac

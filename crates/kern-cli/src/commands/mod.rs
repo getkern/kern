@@ -1179,7 +1179,13 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         // Create the ephemeral parent once (0700) so the per-leaf creates below (`upper`/`work`/`merged`,
         // all under `eph` in the common case) are a single bare mkdir each instead of each re-walking
         // and re-stat-ing the shared parent chain - a few fewer serial pre-fork syscalls per box.
-        own_only_dir(&eph).map_err(|e| Error::Sandbox(format!("overlay scratch: {e}")))?;
+        // Name the directory. `overlay scratch: Permission denied (os error 13)` was the whole
+        // message, and a reader cannot act on it: the path is derived from `$XDG_RUNTIME_DIR` when
+        // that is set, so the fix is usually to unset or correct a variable the message never
+        // mentioned. `scratch_dir` now falls back when that variable is unusable, so reaching this
+        // error means the fallback failed too - which makes the path the only useful thing to say.
+        own_only_dir(&eph)
+            .map_err(|e| Error::Sandbox(format!("overlay scratch {}: {e}", eph.display())))?;
         let merged = eph.join("merged");
         let (upper, work) = match &b.overlay_upper {
             Some(dir) => {

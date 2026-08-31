@@ -148,6 +148,23 @@ because a word in backticks is a symbol and not the document's voice. The reason
 commercial rather than aesthetic: readers who see one of those words decide a model wrote the page
 and stop, before checking a single measurement.
 
+## A changelog entry is not a commit message
+
+The commit explains how a defect was found and why the fix is shaped that way. That is the right
+place for it: the reader is whoever maintains this next, and the diagnosis is the content.
+
+The changelog has a different reader, deciding whether a version changes anything for them. So an
+entry answers that in its first line and stops. What went wrong, which review caught it, and how it
+was verified do not belong there, because a reader scanning for "does this affect me" has to walk
+past them to find out.
+
+The measure that made this a rule: the v0.7.1 entries went from 268 lines to 57 without losing a fact
+a user needs. Everything cut was already in the commits. If an entry runs past about eight lines, it
+is usually telling the story rather than the change.
+
+Behaviour changes are the exception in one direction only: they lead with the symptom, in the words
+of someone it happens to, and they say how to keep the old behaviour on purpose.
+
 ## Reporting security issues
 
 Do **not** open a public issue, see `SECURITY.md`.

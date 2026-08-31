@@ -17,7 +17,7 @@ checks need the public key, so it ships in the repository:
 ```sh
 gpg --import provenance/getkerndev-signing-key.asc
 gpg --fingerprint 9737460E1260B27B     # CFBC 8C13 C150 EBBA FBF2  F25C 9737 460E 1260 B27B
-git verify-tag v0.7.0
+git verify-tag v0.7.1
 ```
 
 The fingerprint above is what to compare against; the file is a convenience, not the authority, and a

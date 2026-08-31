@@ -143,6 +143,70 @@ fn user_manager_reachable() -> bool {
     unix_socket_live(&xdg.join("systemd/private"))
 }
 
+/// WHY there is no user manager to delegate a cap through, on THIS host - the clause the uncapped
+/// warning carries.
+///
+/// The warning used to name `XDG_RUNTIME_DIR` every time and suggest pointing it at
+/// `/run/user/<uid>`. That is the right advice for exactly one host shape (the variable is unset or
+/// wrong while a manager IS listening) and a dead end on every other, including the one a macOS
+/// tester hit on 2026-08-29: a colima guest whose session has no user manager at all, where setting
+/// the variable to a directory that holds nothing changes nothing and reads as the missing step. So
+/// name the variable only when changing it would change the answer, and otherwise say the host has
+/// none. Same probe as [`user_manager_reachable`], so the clause cannot contradict the decision.
+pub fn missing_manager_clause() -> String {
+    if as_root() {
+        return "this host does not run systemd (`/run/systemd/system` is absent)".into();
+    }
+    let uid = unsafe { libc::getuid() };
+    let standard_live =
+        unix_socket_live(&PathBuf::from(format!("/run/user/{uid}/systemd/private")));
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|d| !d.as_os_str().is_empty());
+    let xdg_live = xdg
+        .as_ref()
+        .is_some_and(|d| unix_socket_live(&d.join("systemd/private")));
+    missing_manager_clause_from(uid, xdg, xdg_live, standard_live)
+}
+
+/// Testable core of [`missing_manager_clause`]: the wording decision alone, with the host's facts
+/// passed in, so a unit test can drive every branch without touching the environment or a socket.
+///
+/// `xdg_live` is carried rather than assumed false. The caller only reaches this when a cap could not
+/// be placed, which USUALLY means no manager - but `apply_limits` can also fail with a perfectly
+/// reachable one, and a clause that reported "nothing is listening" about a live socket would be the
+/// same kind of unmeasured sentence this function exists to remove.
+fn missing_manager_clause_from(
+    uid: u32,
+    xdg: Option<PathBuf>,
+    xdg_live: bool,
+    standard_live: bool,
+) -> String {
+    let standard = PathBuf::from(format!("/run/user/{uid}"));
+    if xdg_live {
+        return format!(
+            "a systemd user manager IS reachable at `{}`, so what failed here is the delegation, \
+             not the manager",
+            xdg.as_deref().unwrap_or(&standard).display()
+        );
+    }
+    match xdg {
+        None if standard_live => format!(
+            "`XDG_RUNTIME_DIR` is unset while a user manager IS listening at `/run/user/{uid}` - \
+             export `XDG_RUNTIME_DIR=/run/user/{uid}`"
+        ),
+        Some(ref d) if standard_live && d != &standard => format!(
+            "`XDG_RUNTIME_DIR` points at `{}` while the user manager is at `/run/user/{uid}`",
+            d.display()
+        ),
+        _ => format!(
+            "this session has no systemd user manager (nothing is listening on \
+             `{}/systemd/private`)",
+            xdg.as_deref().unwrap_or(&standard).display()
+        ),
+    }
+}
+
 /// Is a unix-domain socket at `path` LIVE - will a listener accept a connection? A `connect()` succeeds
 /// only when something is listening, so this separates a manager whose control socket is up from a STALE
 /// socket file left by a dead systemd user manager (where `systemd-run --user` would then die with
@@ -574,6 +638,61 @@ fn classify_absent_or_not_delegated(cur: &std::path::Path) -> MemoryCapState {
     }
 }
 
+/// Which of the two things a reader could change is in the way, when `memory` is present in the tree
+/// but a child cgroup still cannot carry a cap.
+///
+/// It exists because the hint that shipped said "add `memory` to this tree's `cgroup.subtree_control`"
+/// unconditionally. On a colima guest (macOS, 2026-08-29) that command runs, prints nothing, changes
+/// nothing and exits 0: an `colima ssh` session is uid 501 under `/system.slice/ssh.service`, owned by
+/// root and mode 755, so the write is refused and the shell's redirection swallows it. Advice that
+/// cannot work AND looks like it worked costs more than no advice.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DelegationBlocker {
+    /// The cgroup kern runs in is not writable by this user: no child can be created in it and
+    /// `cgroup.subtree_control` cannot be written either. Nothing to enable here.
+    NotWritable,
+    /// Writable, and `memory` is missing from `cgroup.subtree_control`: the one case where enabling
+    /// the controller by hand is the fix.
+    ControllerNotEnabled,
+    /// Writable, controller already enabled, and a cap still does not read back. Neither of the two
+    /// local changes applies.
+    Neither,
+}
+
+/// [`DelegationBlocker`] for the cgroup a box would actually be capped in - the same target
+/// [`memory_cap_state`] probes, so the diagnosis and the verdict cannot describe different cgroups.
+pub fn delegation_blocker() -> DelegationBlocker {
+    match ensure_kern_slice().or_else(current_v2_cgroup) {
+        Some(dir) => delegation_blocker_at(&dir),
+        None => DelegationBlocker::Neither,
+    }
+}
+
+/// Testable core of [`delegation_blocker`], against an explicit directory.
+fn delegation_blocker_at(dir: &std::path::Path) -> DelegationBlocker {
+    if !dir_writable(dir) {
+        return DelegationBlocker::NotWritable;
+    }
+    let enabled = fs::read_to_string(dir.join("cgroup.subtree_control"))
+        .is_ok_and(|s| s.split_whitespace().any(|c| c == "memory"));
+    if enabled {
+        DelegationBlocker::Neither
+    } else {
+        DelegationBlocker::ControllerNotEnabled
+    }
+}
+
+/// Can THIS user create an entry in `dir`? `access(2)` with the real uid, which is what matters: kern
+/// runs unprivileged here and the write it would suggest is the user's, not a namespace-mapped one.
+fn dir_writable(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c` is a live NUL-terminated path; `access` only reads it.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
 /// Does an env var CLAIM an outer enforcer while NO real memory cap is actually in force up-tree?
 /// A caller launching `kern box` can FORGE `KERN_SCOPE`/`KERN_MANAGED` to disarm the fail-closed -
 /// but a genuine scope ALWAYS sets a `MemoryMax` (see `reexec`'s props) and a genuine managed unit
@@ -633,6 +752,44 @@ fn in_tree(child: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> 
 /// e.g. a Raspberry Pi without `cgroup_enable=memory`). Board-test finding: without this, we'd take the
 /// direct path and then fail-closed-refuse EVERY capped box on such a host; with it, `direct_caps_available`
 /// is false there → we fall back to the scope / best-effort + warning path, exactly as before.
+/// Can a CHILD of `dir` carry a real cap? Measured the way a box start measures it, because
+/// "`memory` is listed in `cgroup.controllers`" answers a different question: a cgroup that HOLDS
+/// PROCESSES cannot enable controllers in its `cgroup.subtree_control` at all (cgroup v2's
+/// no-internal-process rule), so its children get no `memory.max` however well delegated it is.
+///
+/// That is not a corner case: it is every host where kern runs in the cgroup it was started in and
+/// there is no systemd user manager to hand it a leaf of its own. A container, WSL2, and a colima VM
+/// are all that shape, and on all three `apply_limits` used to build the box under that cgroup, find
+/// no `memory.max`, and report the box UNCAPPED while `kern doctor` reported caps enforced (it probes
+/// `kern.slice`, which as root it creates EMPTY, so its children cap fine). Two surfaces, one host,
+/// opposite answers.
+///
+/// Memoised: the probe creates and removes a directory, and a box start must not pay that twice.
+fn children_can_be_capped(dir: &std::path::Path) -> bool {
+    static MEMO: OnceLock<(PathBuf, bool)> = OnceLock::new();
+    let (probed, verdict) = MEMO.get_or_init(|| (dir.to_path_buf(), probe_child_cap(dir)));
+    if probed == dir {
+        return *verdict;
+    }
+    // A different cgroup than the memoised one: probe it rather than answer about another. One
+    // process caps under one parent, so this is rare and off the hot path either way.
+    probe_child_cap(dir)
+}
+
+/// The measurement behind [`children_can_be_capped`], and it is DELIBERATELY the same function
+/// `kern doctor` reports from. The bug this whole arm exists to fix was two surfaces answering the
+/// same question about the same host and disagreeing; fixing it by writing a SECOND probe that
+/// happens to agree today would have rebuilt the defect with a longer fuse. One prober, one answer.
+///
+/// [`MemoryCapState::EnforcedOnScope`] is NOT enough here and that is the point of the match rather
+/// than a bool: it means the cap binds because a systemd manager applies it to a transient scope,
+/// which is precisely the path this arm exists because the host does NOT have. Only a direct write
+/// that stuck says a child of `dir` will carry a cap.
+fn probe_child_cap(dir: &std::path::Path) -> bool {
+    enable_subtree_controllers(dir);
+    matches!(memory_cap_state_at(dir), MemoryCapState::Enforced)
+}
+
 fn slice_can_cap(slice: &std::path::Path) -> bool {
     has_controller(slice, "memory") && has_controller(slice, "pids")
 }
@@ -1378,6 +1535,23 @@ pub fn apply_limits(
         // reach it. The child built below is the box's own ceiling; the scope keeps its `MemoryMax` (the
         // box's cap plus `SCOPE_SUPERVISOR_HEADROOM`) as the outer backstop.
         scope.clone()
+    } else if allow_direct
+        && origin
+            .as_deref()
+            .is_some_and(|o| !children_can_be_capped(o))
+        && ensure_kern_slice().is_some_and(|s| children_can_be_capped(&s))
+    {
+        // RESCUE, and the narrowest one that closes the doctor/box contradiction. `origin` is a cgroup
+        // that holds processes (kern's own), so cgroup v2 refuses to enable controllers in its subtree
+        // and the box's child would get no `memory.max`: the box would run UNCAPPED on a host where a
+        // cap is perfectly available one directory over. `ensure_kern_slice()` is that directory, and
+        // as root it is created EMPTY, which is exactly why doctor's probe finds caps enforced there.
+        //
+        // Deliberately gated on `allow_direct`, so `kern run` keeps its promise never to relocate a
+        // host process into kern.slice, and on BOTH probes, so a box only moves when staying put means
+        // no cap at all and moving means a real one. Rootless is untouched: `ensure_kern_slice` only
+        // CREATES the slice as root, so where it is absent this arm cannot fire.
+        ensure_kern_slice()?
     } else {
         origin.clone()?
     };
@@ -2880,5 +3054,93 @@ mod tests {
         // present in the environment, meaning nothing. It must not count as a decision either.
         std::env::set_var(DIRECT_MARKER, "");
         assert!(!took_direct_cap_path(), "an empty marker is not a decision");
+    }
+
+    /// The hint may name `cgroup.subtree_control` ONLY where writing it is possible. The three
+    /// verdicts are driven against real directories, because the fact that decides this is a
+    /// permission bit and a synthetic string cannot carry one.
+    #[test]
+    fn delegation_blocker_names_a_write_only_where_one_is_possible() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kern-blocker-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("temp dir");
+
+        // No `cgroup.subtree_control` at all: the controller is not enabled here, and the dir is ours
+        // to write - the one case where the old fixed hint was right.
+        assert_eq!(
+            delegation_blocker_at(&base),
+            DelegationBlocker::ControllerNotEnabled
+        );
+        // Listed: enabling it again changes nothing, so the hint must not send anyone to do it.
+        fs::write(base.join("cgroup.subtree_control"), "cpu memory pids\n").expect("write");
+        assert_eq!(delegation_blocker_at(&base), DelegationBlocker::Neither);
+        // A sibling controller is not `memory`: the token match must be exact, not a substring.
+        fs::write(base.join("cgroup.subtree_control"), "cpu memoryfoo pids\n").expect("write");
+        assert_eq!(
+            delegation_blocker_at(&base),
+            DelegationBlocker::ControllerNotEnabled,
+            "`memoryfoo` is not `memory`"
+        );
+
+        // Not writable = the colima shape (`/system.slice/ssh.service`, root-owned, 755). Root
+        // bypasses the permission check, so as root there is no way to build this state: skip with
+        // the reason rather than assert something false.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skip: the read-only arm needs a non-root uid (root bypasses W_OK)");
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        fs::write(base.join("cgroup.subtree_control"), "cpu pids\n").expect("write");
+        let ro = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(&base, ro).expect("chmod");
+        assert_eq!(
+            delegation_blocker_at(&base),
+            DelegationBlocker::NotWritable,
+            "a dir this user cannot write has nothing for them to enable"
+        );
+        // Positive control: the permission bit is what moved the verdict, not the file contents.
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).expect("chmod back");
+        assert_eq!(
+            delegation_blocker_at(&base),
+            DelegationBlocker::ControllerNotEnabled,
+            "same contents, writable again: the mode was the discriminant"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// `XDG_RUNTIME_DIR` gets named only when pointing it somewhere else would change the answer. The
+    /// shipped warning named it unconditionally, which on a host with no user manager at all is a
+    /// dead end dressed as a fix.
+    #[test]
+    fn the_runtime_dir_is_named_only_when_changing_it_would_help() {
+        let std_dir = PathBuf::from("/run/user/501");
+        // Unset, manager listening at the standard path: the export IS the fix, so say it.
+        let c = missing_manager_clause_from(501, None, false, true);
+        assert!(c.contains("export `XDG_RUNTIME_DIR=/run/user/501`"), "{c}");
+        // Unset, nothing listening: no variable can conjure a manager.
+        let c = missing_manager_clause_from(501, None, false, false);
+        assert!(c.contains("no systemd user manager"), "{c}");
+        assert!(!c.contains("export"), "nothing to export here: {c}");
+        // Set to a scratch dir while the manager is at the standard path: point at the mismatch.
+        let c = missing_manager_clause_from(501, Some(PathBuf::from("/tmp/scratch")), false, true);
+        assert!(
+            c.contains("/tmp/scratch") && c.contains("/run/user/501"),
+            "{c}"
+        );
+        // Set to the standard path with nothing listening: the host has none, and the variable is
+        // already right - the case the colima guest is in.
+        let c = missing_manager_clause_from(501, Some(std_dir.clone()), false, false);
+        assert!(c.contains("no systemd user manager"), "{c}");
+        assert!(
+            !c.contains("export"),
+            "the variable is already correct: {c}"
+        );
+        // A LIVE manager at the path kern uses: the clause must not report it absent, whatever else
+        // went wrong. This is the state that made the first version of this function print a
+        // falsehood on the author's own desktop.
+        let c = missing_manager_clause_from(501, Some(std_dir), true, true);
+        assert!(c.contains("IS reachable at `/run/user/501`"), "{c}");
+        assert!(!c.contains("no systemd user manager"), "{c}");
     }
 }

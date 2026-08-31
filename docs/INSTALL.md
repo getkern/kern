@@ -76,18 +76,45 @@ get the exe back, allow the folder the installer names in your antivirus and re-
 Throughout, `wsl -d kern -- kern ...` and the SDKs run inside the distro are unaffected.
 
 **🍎 macOS.** There is no native port and there will not be one: macOS has no namespaces and no
-cgroups, so there is nothing for kern to build a box out of. The installer says so and stops, rather
-than dropping a Linux binary on a Mac. kern does run **inside a Linux VM on a Mac**, and there it is
-the ordinary Linux kern, the same aarch64 binary and the same CLI as a Linux host:
+cgroups, so there is nothing for kern to build a box out of. kern does run **inside a Linux VM on a
+Mac**, and there it is the ordinary Linux kern, the same aarch64 binary and the same CLI as a Linux
+host.
+
+**Start by running the installer on the Mac. It will refuse, and the refusal is the instructions.**
 
 ```sh
-brew install colima   # or Lima, OrbStack, UTM, or the VM Docker Desktop already runs
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+It looks for a Linux VM you already have (colima, Lima, OrbStack, Docker Desktop) before telling you
+to install anything, and prints the route for the one it finds. Nothing is downloaded on a Mac: the
+check happens before the first byte.
+
+**If it names a VM you already run, use that one.** A Mac that keeps Docker Desktop or OrbStack up is
+already running a Linux VM, and a second one buys nothing:
+
+```sh
+colima ssh                                              # colima, or: limactl shell <instance>
+docker run --rm -it --privileged --tmpfs /run ubuntu    # OrbStack / Docker Desktop
+# then, inside: curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+`--privileged` is not decoration and is worth understanding before you type it: a box mounts its own
+`/proc`, which Docker's default masking refuses (`mount(proc) failed: Operation not permitted`,
+measured). On a Mac that privilege is inside Docker's own Linux VM, which is already the boundary
+against macOS. On a Linux host it is privilege on the real machine, so this recipe is a way to TRY
+kern rather than the way to run it there.
+
+**If it finds none, install one.** colima is the smallest thing that works:
+
+```sh
+brew install colima
 colima start
 colima ssh            # from here on you are on Linux, not macOS
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-**Verified** on a MacBook with Apple Silicon, colima 0.10.3, guest Ubuntu 24.04.4 aarch64: kern 0.7.0
+**Verified** on a MacBook with Apple Silicon, colima 0.10.3, guest Ubuntu 24.04.4 aarch64: kern
 installs, `kern box --image alpine` starts and runs, and the Python SDK drives it. That run also found
 the two things below, which every Mac following these steps will meet, so they are here rather than in
 an issue tracker.
@@ -121,15 +148,32 @@ the seccomp allowlist, Landlock. The **resource caps are not enforced** on a def
 kern says so at every box start rather than pretending: that VM has no `systemd --user` manager and
 does not delegate the `memory` controller, so `--memory` and the pid cap are accepted and never bite.
 `kern doctor` prints the delegation state and `--require-limits` refuses to start uncapped rather than
-run a box that only looks capped.
+run a box that only looks capped. To get that refusal everywhere without adding the flag to each
+command, export `KERN_REQUIRE_LIMITS=1` in the VM's shell profile: same effect, whole session.
 
-Getting the caps back is a property of the guest, not of kern. The shape here is WSL2's: a VM with no
-`systemd --user` manager, where the measured answer was to run kern as **uid 0 inside the VM**, and
-there the cap bites (a 128m box reads back `memory.max = 134217728`). Running as root inside a guest
-that is already a boundary against the Mac is a different posture from running as root on your laptop.
-The other route is to delegate the controller to the tree kern uses, which is what `kern doctor`
-prescribes. Neither has been measured on colima yet: what HAS been measured is that kern refuses to
-pretend, and says at every start that the box is uncapped. Two further warnings are
+Getting the caps back is a property of the guest, not of kern, and the mechanism is **delegation of
+the `memory` controller**, not privilege. That distinction was measured rather than assumed, in a
+guest built to have colima's exact shape (Ubuntu 24.04, no `systemd --user` manager, the same
+`doctor` warning): as **uid 0**, a 200 MiB write under `--memory 32m` still survived. Being root does
+not make a cap bite where the controller was never handed down. WSL2 is the counter-example that
+misleads here: kern runs as uid 0 there AND that kernel delegates, and it is the second half that
+does the work.
+
+So the route, on a guest whose cgroup root you can write, is:
+
+```sh
+echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+```
+
+Two things about that command. It is refused while any process sits in the cgroup you are writing to,
+which is cgroup v2's no-internal-process rule and not a permission problem. **But on a colima guest
+that is still not enough, measured on the guest itself.** A session opened with `colima ssh` lands in
+`/system.slice/ssh.service`, which root owns and the user cannot write, and colima creates no
+`user@<uid>.service`, so a rootless kern has no cgroup it may create a child in. No write to
+`cgroup.subtree_control` changes that: what is missing is a write permission, not a controller.
+v0.7.1 fixed the neighbouring case, kern running as ROOT with no user manager, which is a container
+or WSL2 rather than this. Either way kern says at every start whether the box is capped, and
+`--require-limits` turns that into a refusal to start. Two further warnings are
 worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
 user (redis, postgres, nginx), and `sudo apt install passt` for outbound networking from a pod.
 
@@ -239,7 +283,7 @@ architectures; building from source stays supported and produces the larger figu
 | NVIDIA Jetson (L4T) | aarch64 | ✅ manually validated (board) |
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
-| macOS, **inside a Linux VM** (colima / Lima / OrbStack / UTM) | aarch64 | ✅ verified by hand, caps not enforced on a default guest ([notes](#install)) |
+| macOS, **inside a Linux VM** | aarch64 | ✅ verified by hand on **colima** (Lima / OrbStack / UTM are the same shape, untested), caps not enforced on a default guest ([notes](#install)) |
 
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux

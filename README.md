@@ -363,7 +363,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 927 Rust, 340 Python and 61 Node tests,
+**The core is done. Everything above works today:** 940 Rust, 340 Python and 61 Node tests,
 clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
 Arduino UNO Q. **v0.7.0 is the first published release, and the CLI is stable from it**: verbs,
 flags and `--json` shapes change incompatibly only on a minor bump, after a deprecation entry at
@@ -378,12 +378,11 @@ gates; contributions are covered by the [CLA](CLA.md).
 
 ## Maintainer
 
-Alessandro Polito, [@realexhub](https://github.com/realexhub), Italy. Commits up to and including
-v0.7.0 carry [@getkerndev](https://github.com/getkerndev), the account the project was published
-from.
+Alessandro Polito, [@realexhub](https://github.com/realexhub), Italy. Earlier commits carry
+[@getkerndev](https://github.com/getkerndev), the account the project was published from.
 
 **The commits are not signed; the release TAG is.** That is what to verify:
-`git verify-tag v0.7.0` against the key in [provenance/](provenance/), whose fingerprint is in
+`git verify-tag v0.7.1` against the key in [provenance/](provenance/), whose fingerprint is in
 [SECURITY.md](SECURITY.md).
 
 ## License

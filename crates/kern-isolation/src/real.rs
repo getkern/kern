@@ -2750,13 +2750,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
             // best-effort host with no backstop). Accepting a cap - default or requested - and enforcing
             // nothing is the one thing this codebase does not do quietly. Warn (not refuse): the direct
             // path already hard-refuses, and a best-effort host is a legitimate configuration.
+            // The middle clause is MEASURED per host rather than fixed prose: the fixed version named
+            // `XDG_RUNTIME_DIR` and `/run/user/$(id -u)` on every host, which on a colima guest with no
+            // user manager at all sends the reader to set a variable that changes nothing.
             eprintln!(
                 "kern: warning: resource caps could not be enforced here (memory + pids, INCLUDING their \
                  defaults) - the box runs UNCAPPED, with no OOM / fork-bomb backstop. kern could not place \
-                 it in a delegated cgroup: no systemd user manager was reachable (its marker is \
-                 `$XDG_RUNTIME_DIR/systemd` - check that `XDG_RUNTIME_DIR` points at your real runtime dir, \
-                 e.g. `/run/user/$(id -u)`), or this host has none. `kern doctor` shows the delegation \
-                 state; `--require-limits` refuses to start uncapped, `--allow-uncapped` silences this."
+                 it in a delegated cgroup: {}. `kern doctor` shows the delegation state; \
+                 `--require-limits` refuses to start uncapped, `--allow-uncapped` silences this.",
+                crate::cgroup::missing_manager_clause()
             );
         }
     }
