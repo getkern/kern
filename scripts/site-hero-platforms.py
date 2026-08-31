@@ -19,7 +19,16 @@ page's shape changed enough that the check cannot run, which is not a pass.
 """
 import re, sys, pathlib
 
-html = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+# A gate invoked wrong must say so. This used to raise IndexError and print a traceback, which
+# reads like the gate is broken rather than like the caller forgot the argument: the same class of
+# confusion the checks in this directory exist to prevent.
+if len(sys.argv) != 2:
+    sys.exit(f"usage: {sys.argv[0]} <file>  (curl the page to a file first)")
+
+try:
+    html = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+except OSError as e:
+    sys.exit(f"cannot read {sys.argv[1]}: {e}")
 
 m = re.search(r'"operatingSystem":\s*"([^"]+)"', html)
 if not m:
