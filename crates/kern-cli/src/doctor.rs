@@ -802,14 +802,53 @@ fn is_pasteable_username(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+/// The identities under which `/etc/subuid` may legitimately carry THIS uid's allocation, most
+/// specific first: the login name from `/etc/passwd`, which is what `useradd` and a distro's own
+/// tooling write, and the numeric uid, which shadow-utils also accepts.
+///
+/// `$USER` is deliberately NOT one of them. It is environment, so it is whatever the caller decided:
+/// it can name a different account than the one we are running as, and it can be absent entirely
+/// (a container, `sudo` without `-E`, a CI runner, any daemon). Both of those were real defects
+/// here, and the second was reported from the field: with `USER` unset the lookup searched for lines
+/// beginning with `":"`, matched nothing, and `doctor` told an operator whose map was perfectly fine
+/// that `--uid-range` would fall back to a single-uid map. The tool people run BEFORE anything else
+/// was the one lying.
+///
+/// Pure and total on purpose: the caller supplies `/etc/passwd`, so the table can be tested without
+/// a matching account existing on the machine running the tests.
+fn subid_identities(uid: u32, passwd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(name) = passwd.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        // Fields are name:passwd:uid:gid:..., so the uid is the one after the placeholder.
+        let found: u32 = f.nth(1)?.trim().parse().ok()?;
+        (found == uid && !name.is_empty()).then(|| name.to_string())
+    }) {
+        out.push(name);
+    }
+    out.push(uid.to_string());
+    out
+}
+
+/// True when `/etc/subuid` carries an allocation for any of `ids`. A line is `name:start:count`, so
+/// the identity must match up to the first colon and not merely be a prefix of a longer name:
+/// `kern:100000:65536` is not an allocation for `ke`.
+fn has_subid_allocation(subuid: &str, ids: &[String]) -> bool {
+    subuid
+        .lines()
+        .filter_map(|l| l.split(':').next())
+        .any(|owner| ids.iter().any(|id| owner.trim() == id))
+}
+
 fn check_uid_range() -> R {
-    let user = std::env::var("USER")
-        .ok()
-        .filter(|u| is_pasteable_username(u))
-        .unwrap_or_default();
+    // SAFETY: `getuid` is infallible and takes no arguments.
+    let uid = unsafe { libc::getuid() };
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let ids = subid_identities(uid, &passwd);
     let has_helper = which("newuidmap") && which("newgidmap");
     let has_subid = std::fs::read_to_string("/etc/subuid")
-        .map(|s| s.lines().any(|l| l.starts_with(&format!("{user}:"))))
+        .map(|s| has_subid_allocation(&s, &ids))
         .unwrap_or(false);
     if has_helper && has_subid {
         return R::Ok("--uid-range / --user / --ssh: newuidmap + /etc/subuid present".into());
@@ -818,17 +857,16 @@ fn check_uid_range() -> R {
     // NOT write `/etc/subuid`/`/etc/subgid` itself: it is global state shared with shadow-utils and
     // Podman, needs root, and a range overlapping a peer's allocation corrupts that peer's map. kern
     // reports what an operator (or their Ansible) applies; it stays a consumer of the mapping.
-    // subuid accepts a NUMERIC uid, so when $USER is unset (a container, a uid with no /etc/passwd
-    // entry) OR REFUSED BY `is_pasteable_username`, fall back to the real uid rather than an
-    // `$(id -un)` that could itself fail in the shell. One fallback serves both, which is why the
-    // filter above yields an empty string instead of an error: a name kern will not print is, for
-    // this function, a name that is not there.
-    let who = if user.is_empty() {
-        // SAFETY: `getuid` is infallible and takes no arguments.
-        unsafe { libc::getuid() }.to_string()
-    } else {
-        user
-    };
+    //
+    // The pasted name is the one from `/etc/passwd`, checked against the same allowlist that used to
+    // guard `$USER`: `/etc/passwd` is root-owned, but a name kern will not print is, for this
+    // function, a name that is not there, and the numeric uid behind it is always accepted by
+    // shadow-utils and cannot carry a shell metacharacter into the line the reader is invited to run.
+    let who = ids
+        .iter()
+        .find(|id| is_pasteable_username(id))
+        .cloned()
+        .unwrap_or_else(|| uid.to_string());
     let mut steps: Vec<String> = Vec::new();
     if !has_helper {
         // Do NOT hardcode `apt`: the package and command differ per distro. Name the capability and
@@ -1208,5 +1246,85 @@ mod tests {
                 assert!(matches!(r, R::Ok(_)), "no GPU is not a degraded state");
             }
         }
+    }
+
+    /// THE FIELD CASE: an allocation that exists must be FOUND when `$USER` is not set.
+    ///
+    /// Reported against `dev`: helpers installed, `/etc/subuid` holding `root:100000:65536`, running
+    /// as uid 0 with an empty `USER`, and `doctor` warned that the map was missing. The old lookup
+    /// interpolated `$USER` into the pattern, so an empty variable searched for lines starting with
+    /// `":"` and matched nothing. The identity now comes from the kernel and `/etc/passwd`, which no
+    /// caller gets to choose.
+    #[test]
+    fn an_allocation_under_the_login_name_is_found_without_consulting_the_environment() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\nubuntu:x:1000:1000::/home/ubuntu:/bin/sh\n";
+        let subuid = "ubuntu:100000:65536\nroot:165536:65536\n";
+
+        let ids = subid_identities(0, passwd);
+        assert_eq!(ids, vec!["root".to_string(), "0".to_string()]);
+        assert!(
+            has_subid_allocation(subuid, &ids),
+            "uid 0 is allocated as `root`, and that is the spelling shadow-utils writes"
+        );
+
+        let ids = subid_identities(1000, passwd);
+        assert!(has_subid_allocation(subuid, &ids));
+    }
+
+    /// The numeric spelling is equally valid, and it is the only one available to a uid that has no
+    /// account: a container, or a host where the entry was never created.
+    #[test]
+    fn the_numeric_uid_is_accepted_and_is_the_fallback_when_no_account_exists() {
+        assert_eq!(subid_identities(1234, ""), vec!["1234".to_string()]);
+        assert!(has_subid_allocation(
+            "1234:100000:65536\n",
+            &subid_identities(1234, "")
+        ));
+
+        // A passwd that names OTHER uids must not lend its names to ours.
+        let passwd = "root:x:0:0::/root:/bin/sh\n";
+        assert_eq!(subid_identities(1234, passwd), vec!["1234".to_string()]);
+        assert!(
+            !has_subid_allocation("root:100000:65536\n", &subid_identities(1234, passwd)),
+            "root's allocation is not uid 1234's allocation"
+        );
+    }
+
+    /// The control that keeps the check honest in the other direction: a machine with no allocation
+    /// must still WARN. A lookup that matched too eagerly would silence the warning that sends an
+    /// operator to fix their map, which is the whole reason the check exists.
+    #[test]
+    fn a_missing_allocation_is_still_missing_and_a_prefix_is_not_a_match() {
+        let passwd = "kern:x:1000:1000::/home/kern:/bin/sh\n";
+        let ids = subid_identities(1000, passwd);
+
+        assert!(
+            !has_subid_allocation("", &ids),
+            "an empty file allocates nothing"
+        );
+        assert!(
+            !has_subid_allocation("someoneelse:100000:65536\n", &ids),
+            "another account's line is not ours"
+        );
+        assert!(
+            !has_subid_allocation("kernel:100000:65536\n", &ids),
+            "`kern` must not be satisfied by `kernel`: the owner ends at the first colon"
+        );
+        assert!(
+            has_subid_allocation("kern:100000:65536\n", &ids),
+            "positive control: the exact name does match, so the three refusals above mean something"
+        );
+    }
+
+    /// A malformed `/etc/passwd` may not make the check throw away the numeric identity it always
+    /// has. A line with a non-numeric uid field is skipped, not fatal.
+    #[test]
+    fn a_broken_passwd_line_does_not_cost_us_the_numeric_identity() {
+        let passwd = "brokenline\nnouid:x:notanumber:0::/:/bin/sh\nme:x:7:7::/:/bin/sh\n";
+        assert_eq!(
+            subid_identities(7, passwd),
+            vec!["me".to_string(), "7".to_string()]
+        );
+        assert_eq!(subid_identities(99, passwd), vec!["99".to_string()]);
     }
 }

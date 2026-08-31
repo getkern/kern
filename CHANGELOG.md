@@ -102,6 +102,37 @@ class of images that runs today.
 
 ### Fixed
 
+- **`kern doctor` reported a missing `/etc/subuid` allocation that was there.** The lookup
+  interpolated `$USER` into the pattern it searched for, so with the variable unset it looked for
+  lines beginning with `":"` and matched nothing: a host with `newuidmap` installed and
+  `root:100000:65536` in the file was told that `--uid-range`, non-root `--user` and `--ssh` would
+  fall back to a single-uid map, and handed a `sudo tee` line to add an allocation it already had.
+  `USER` is not set for a daemon, a container, `sudo` without `-E`, or many CI runners, and this is
+  the first command an operator runs.
+
+  The identity now comes from `getuid` plus `/etc/passwd`, and BOTH spellings shadow-utils accepts
+  are matched: the login name, which is what `useradd` writes, and the numeric uid. The environment
+  is not consulted at all, which also retires the last use of a variable that had already produced a
+  command-injection defect in this same function.
+
+  Injection: verified - restoring the previous `doctor.rs` and running `env -u USER kern doctor` on a
+  host whose allocation exists reproduces the false warning, with the wrong hint (`echo
+  1000:100000:65536 ...` while `alex:100000:65536` was already present). Reported from the field
+  against the `dev` branch.
+
+- **`kern builds --status interrupted` listed builds that the same command printed as `running`.**
+  `running` and `interrupted` are one stored status told apart only by asking whether the process is
+  still there, and the filter compared the STORED status, so either word selected every unfinished
+  record. Asking for interrupted builds returned the one that was building at that moment.
+
+  The filter is answered by `Record::label`, the same call that fills the STATUS column, so the query
+  and the column cannot disagree. This is the same shape as the defect it sits beside: a condition
+  derived in two places drifts.
+
+  Injection: verified - restoring the stored-status comparison turns
+  `the_status_filter_selects_by_the_word_the_status_column_prints` red with
+  `left: ["inflight", "abandoned"]`. Reported from the field against the `dev` branch.
+
 - **The flat build's base copy now names what it costs and why.** `copy_tree` passes
   `--reflink=auto`, which clones the base on btrfs/xfs/bcachefs and silently falls back to a full
   byte copy everywhere else - `auto` is defined not to complain. That one property decides whether a

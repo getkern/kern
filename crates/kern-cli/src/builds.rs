@@ -64,14 +64,22 @@ impl Status {
         }
     }
 
-    /// Parse a `--status <s>` filter value (accepts the labels shown by `kern builds`). `None` for an
-    /// unknown word so the caller can reject it with a usage error.
-    pub fn from_label(s: &str) -> Option<Status> {
+    /// Normalise a `--status <s>` filter word to the LABEL `kern builds` prints, or `None` for a
+    /// word kern never shows, so the caller can reject it with a usage error.
+    ///
+    /// This returns a label and not a `Status` on purpose. `running` and `interrupted` are the SAME
+    /// stored status and are told apart only by asking the process, so a filter that resolved to
+    /// `Status` selected both under either word: `--status interrupted` listed rows the same command
+    /// then printed as `running`. Reported from the field against `dev`. The filter has to be
+    /// answered by whatever answers the STATUS column, which is [`Record::label`], or the two drift
+    /// by construction.
+    pub fn filter_label(s: &str) -> Option<&'static str> {
         match s {
-            "ok" => Some(Status::Ok),
-            "warn" => Some(Status::Warn),
-            "failed" | "fail" => Some(Status::Failed),
-            "running" | "interrupted" => Some(Status::Running),
+            "ok" => Some("ok"),
+            "warn" => Some("warn"),
+            "failed" | "fail" => Some("failed"),
+            "running" => Some("running"),
+            "interrupted" => Some("interrupted"),
             _ => None,
         }
     }
@@ -395,8 +403,8 @@ fn record_ids_newest_first() -> Vec<String> {
 /// reads just the N newest `meta` files - not the whole history - since ids sort newest-first without a
 /// read. Any tag/status filter must read all records (those fields live in the meta), so it falls back
 /// to `list()`.
-pub fn query(tag: Option<&str>, status: Option<Status>, limit: Option<usize>) -> Vec<Record> {
-    if tag.is_none() && status.is_none() {
+pub fn query(tag: Option<&str>, label: Option<&str>, limit: Option<usize>) -> Vec<Record> {
+    if tag.is_none() && label.is_none() {
         if let Some(n) = limit {
             return record_ids_newest_first()
                 .into_iter()
@@ -405,21 +413,25 @@ pub fn query(tag: Option<&str>, status: Option<Status>, limit: Option<usize>) ->
                 .collect();
         }
     }
-    filter_builds(list(), tag, status, limit)
+    filter_builds(list(), tag, label, limit)
 }
 
 /// Apply the `kern builds` query to an already-newest-first list: keep records whose tag CONTAINS
-/// `tag` (if given) and whose status equals `status` (if given), then cap to the `limit` newest. Pure,
-/// so the filter/limit/status logic is unit-tested without the filesystem.
+/// `tag` (if given) and whose STATUS COLUMN reads `label` (if given), then cap to the `limit` newest.
+/// Pure, so the filter/limit/status logic is unit-tested without the filesystem.
+///
+/// The status test is `r.label()`, the same call that fills the column, not `r.status`: a record
+/// marked running is `running` or `interrupted` depending on whether its process is still there, so
+/// comparing the stored status would answer both words with one set. See [`Status::filter_label`].
 pub fn filter_builds(
     recs: Vec<Record>,
     tag: Option<&str>,
-    status: Option<Status>,
+    label: Option<&str>,
     limit: Option<usize>,
 ) -> Vec<Record> {
     recs.into_iter()
         .filter(|r| tag.is_none_or(|t| r.tag.contains(t)))
-        .filter(|r| status.is_none_or(|s| r.status == s))
+        .filter(|r| label.is_none_or(|l| r.label() == l))
         .take(limit.unwrap_or(usize::MAX))
         .collect()
 }
@@ -861,23 +873,81 @@ mod tests {
         assert_eq!(web.len(), 3);
         assert!(web.iter().all(|r| r.tag.contains("web")));
         // status
-        let ok = filter_builds(recs.clone(), None, Some(Status::Ok), None);
+        let ok = filter_builds(recs.clone(), None, Some("ok"), None);
         assert_eq!(
             ok.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(),
             vec!["web-api", "web-cron"]
         );
         // tag AND status AND limit (newest-first order preserved → first match kept)
-        let one = filter_builds(recs.clone(), Some("web"), Some(Status::Ok), Some(1));
+        let one = filter_builds(recs.clone(), Some("web"), Some("ok"), Some(1));
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].tag, "web-api");
         // limit alone
         assert_eq!(filter_builds(recs.clone(), None, None, Some(2)).len(), 2);
         // no filters → identity
         assert_eq!(filter_builds(recs.clone(), None, None, None).len(), 4);
-        // status label parsing (incl. interrupted == running)
-        assert_eq!(Status::from_label("failed"), Some(Status::Failed));
-        assert_eq!(Status::from_label("interrupted"), Some(Status::Running));
-        assert_eq!(Status::from_label("bogus"), None);
+        // status word normalisation
+        assert_eq!(Status::filter_label("failed"), Some("failed"));
+        assert_eq!(Status::filter_label("fail"), Some("failed"));
+        assert_eq!(Status::filter_label("bogus"), None);
+    }
+
+    /// `--status interrupted` MAY NOT LIST A BUILD THE SAME COMMAND CALLS `running`.
+    ///
+    /// Reported from the field against `dev`: with a build in flight, `kern builds --status
+    /// interrupted` listed it, and printed `running` in the STATUS column of the row it had just
+    /// selected as interrupted. `running` and `interrupted` are one stored status told apart by
+    /// asking the process, so a filter comparing the stored status answered both words with one set.
+    ///
+    /// This is the same shape as the defect it sits next to: a condition derived in two places, once
+    /// for the column and once for the query, drifting apart. The query now asks `label()`.
+    #[test]
+    fn the_status_filter_selects_by_the_word_the_status_column_prints() {
+        let me = std::process::id();
+        let mine = crate::registry::proc_starttime(me as i32);
+        assert!(
+            mine > 0,
+            "this test needs /proc for its own pid; without it nothing below measures anything"
+        );
+
+        // A live record: our own pid and starttime, so `is_live()` is true by construction.
+        let mut live = rec(&new_id(9, me), 9, Status::Running);
+        live.tag = "inflight".into();
+        live.pid_starttime = mine;
+
+        // A record still marked running whose process is gone: `pid_starttime` 0 is exactly what a
+        // record left behind by a killed build carries.
+        let mut dead = rec(&new_id(8, me), 8, Status::Running);
+        dead.tag = "abandoned".into();
+        dead.pid_starttime = 0;
+
+        assert_eq!(
+            live.label(),
+            "running",
+            "positive control for the live half"
+        );
+        assert_eq!(
+            dead.label(),
+            "interrupted",
+            "positive control for the dead half"
+        );
+
+        let recs = vec![live, dead];
+        let running = filter_builds(recs.clone(), None, Some("running"), None);
+        assert_eq!(
+            running.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(),
+            vec!["inflight"],
+            "`--status running` selects only what the column calls running"
+        );
+        let interrupted = filter_builds(recs, None, Some("interrupted"), None);
+        assert_eq!(
+            interrupted
+                .iter()
+                .map(|r| r.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abandoned"],
+            "and `--status interrupted` may not hand back the live one"
+        );
     }
 
     #[test]

@@ -35,10 +35,9 @@ pub fn builds_list(
     limit: Option<usize>,
 ) -> Result<(), Error> {
     let status = match status {
-        Some(s) => Some(
-            crate::builds::Status::from_label(s)
-                .ok_or(Error::Usage("build --status ok|warn|failed|interrupted"))?,
-        ),
+        Some(s) => Some(crate::builds::Status::filter_label(s).ok_or(Error::Usage(
+            "build --status ok|warn|failed|running|interrupted",
+        ))?),
         None => None,
     };
     let recs = crate::builds::query(filter, status, limit);
