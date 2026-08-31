@@ -246,11 +246,16 @@ the mount API - `mount`, `umount2`, `pivot_root`, `setns` and the whole reconfig
 box cannot re-mount its root writable OR `umount` the cgroup masks to reach the host hierarchy,
 whatever caps it holds. Second, a child user namespace's capabilities are not effective over the
 namespace that owns them, so even a kept or `--cap-add`ed `CAP_SYS_ADMIN` cannot act on the
-host-owned cgroupfs and mounts. `--no-seccomp` waives the first layer by choice; the second stands
-regardless, and `--privileged` (which relaxes `mount`/`umount2` for nesting) is honoured only when the
-box root maps to an unprivileged host uid. A third hardening, locking the mounts with `MNT_LOCKED` so
-the first layer holds even under `--no-seccomp`, is deferred rather than shipped untested: it reorders
-capability-sensitive setup that must be verified on real namespaces.
+host-owned cgroupfs and mounts. There is no flag that waives the first layer: a seccomp filter is
+always installed, and BOTH postures block the mount API, the shipped allowlist by not allowing it and
+the wider `KERN_SECCOMP=denylist` opt-out by naming it. The one thing that relaxes it is
+`--privileged`, which drops the CLASSIC `mount`/`umount2`/`pivot_root` denial so a nested `kern box`
+can set itself up, keeps the NEW mount API (`fsopen`, `fsconfig`, `fsmount`, `move_mount`,
+`open_tree`) blocked regardless so the denial cannot be walked around, and is honoured only when the
+box root maps to an unprivileged host uid. The second layer stands under all of them. A third
+hardening, locking the mounts with `MNT_LOCKED` so the first layer holds even under `--privileged`,
+is deferred rather than shipped untested: it reorders capability-sensitive setup that must be
+verified on real namespaces.
 
 ### Nested boxes (`--privileged`)
 

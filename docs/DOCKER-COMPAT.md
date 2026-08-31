@@ -136,7 +136,7 @@ Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same
 
 | `docker …` | `kern …` | Notes |
 |---|---|---|
-| `run` / `create` | `box` | one verb; `-d` detaches, `-it` for a PTY |
+| `run` / `create` | `box` | one verb; `-d` detaches, `-it` for a PTY, `--entrypoint` replaces the image's ENTRYPOINT and discards its CMD, as docker does (`--entrypoint ""` clears it) |
 | `exec` | `exec` | joins the box's namespaces |
 | `ps` | `ps` | `-a`/`--all` (also lists recently-exited boxes), `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
 | `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs) |

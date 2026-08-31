@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import glob
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -353,6 +354,35 @@ def _rust_string_literal_after(src: str, marker: str) -> str:
     return "".join(out)
 
 
+def example_count_agrees() -> list[str]:
+    """The README's count of runnable examples must be the number of files in `examples/`.
+
+    It said "ninety" while there were 88, and this gate did not see it for two reasons worth writing
+    down. The first is that the number was spelled in WORDS, and every rule here reads digits: a
+    figure a gate cannot parse is a figure with no gate. The second is that nothing counted the
+    directory at all, so the sentence was only ever as true as the last person to edit it.
+
+    The definition is the one the sentence makes: a runnable script is a `.sh` or a `.py` directly
+    in `examples/`. Subdirectories hold whole stacks rather than scripts, and `.md`/`.toml`/`.yml`
+    are documentation and fixtures.
+    """
+    ex = pathlib.Path("examples")
+    if not ex.is_dir():
+        return []
+    n = len([f for f in ex.iterdir() if f.is_file() and f.suffix in (".sh", ".py")])
+    out = []
+    readme = pathlib.Path("README.md")
+    if readme.exists():
+        text = readme.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"(\d+) runnable scripts", text)
+        if not m:
+            out.append("README.md: the 'N runnable scripts' sentence is gone or no longer uses a "
+                       "digit, so this gate reads nothing")
+        elif int(m.group(1)) != n:
+            out.append(f"README.md says {m.group(1)} runnable scripts, examples/ holds {n}")
+    return out
+
+
 def gpu_claims_agree() -> list[str]:
     """What the docs say about a GPU tier must be what `crates/kern-cli/src/gpu.rs` emits.
 
@@ -653,6 +683,11 @@ def main(argv: list[str]) -> int:
         print("       the front page states the size in an asset as well as in prose, and this "
               "gate reads only .md, so the asset drifts silently. Edit the generator, then "
               "re-run it: python3 assets/make-demo-gif.py")
+    for problem in example_count_agrees():
+        total += 1
+        print(f"\n{problem}")
+        print("       the count is checkable in one command, so a wrong one costs more than no "
+              "number at all. It drifted while spelled in words, where no gate could read it.")
     for problem in gpu_claims_agree():
         total += 1
         print(f"\n{problem}")
