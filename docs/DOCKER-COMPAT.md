@@ -95,6 +95,14 @@ file kern did not write; for a file you did, a typo should be named at once.
 refuses exactly what `up` would refuse: a dry run that disagreed with the bring-up would
 be worse than no dry run.
 
+`docker compose up -d` is the most common way anyone starts a stack, so `-d`/`--detach` is
+accepted and does exactly what it says: `kern compose <file> up` starts the services and
+returns, which is Docker's detached behaviour and kern's only one. It is accepted silently
+rather than with a "no effect" note, because that note would be false. The presentation and
+scheduling flags are the ones with no effect, and they say so when you pass them:
+`--ansi`, `--progress`, `--no-ansi`, `--compatibility`, `--dry-run`, and `--parallel`, which
+is deliberately not honoured because kern has its own concurrency cap.
+
 ### Starting a stack at boot
 
 kern is daemonless, so after a reboot PID 1 starts, not kern. `kern compose <file> systemd` prints a

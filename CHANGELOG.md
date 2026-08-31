@@ -62,6 +62,36 @@ class of images that runs today.
 
 ### Changed
 
+- **An image reference the OCI grammar cannot hold is refused where you type it, not where it
+  finally breaks.** `kern build -t Foo-BAR:latest` succeeded and put that name in the local cache,
+  which no registry will accept, so the refusal arrived at `kern push` after the build was already
+  paid for. `kern pull Foo-BAR:latest` was worse: it dialled the registry and came back with
+  `registry: no layers in manifest`, a message that names nothing about the actual problem.
+
+  The rule is `kern_oci::valid_reference`, which already rejected uppercase. It was simply not
+  consulted on either path, so this restricts nothing new: it applies an existing rule while it can
+  still be acted on. When lowercasing is the whole fix, the error prints the exact string to type
+  instead, and when it is not, it says nothing rather than suggesting a retype that changes nothing.
+
+  Listed under Changed and not Fixed: a script that built an uppercase tag locally now stops. Docker
+  refuses the same input at build with `repository name must be lowercase`, measured against Docker
+  29.6.2 on the same host where kern accepted it.
+
+  Injection: verified - removing either call site turns
+  `an_image_reference_the_oci_grammar_cannot_hold_is_refused_before_any_work` red, with the parse
+  returning `Build { tag: Some("Foo-BAR:latest") }`.
+
+- **`kern compose <file> up -d` used to be a usage error.** `docker compose up -d` is the most
+  common way anyone starts a stack, and the flag loop rejected every `-x` it did not know. `-d` and
+  `--detach` are accepted now, silently rather than with the "has no effect" note the presentation
+  flags get: kern's `up` starts the services and returns, so the flag names exactly what happens and
+  the note would have been false. `--ansi`, `--progress`, `--no-ansi`, `--compatibility`,
+  `--dry-run` and `--parallel` remain the ones that say they do nothing.
+
+  Injection: verified - removing the arm turns
+  `compose_up_accepts_the_detach_flag_because_that_is_what_it_already_does` red, and an unknown flag
+  is still refused, which is the control that the arm did not open the gate for everything.
+
 - **A numeric `USER` now takes its group from the image's `/etc/passwd`, not from its own number.**
   Listed here and not under Fixed: from kern's side it is a correction, and from the side of anyone
   running a box that worked - with a volume holding files written under the old gid - it is a

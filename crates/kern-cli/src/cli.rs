@@ -450,9 +450,10 @@ pub enum Command {
     },
     /// `kern top`: live auto-refreshing box monitor.
     Top,
-    /// `kern compose <file> [up|down] [--no-pod]`: bring up (or tear down) a stack of boxes in
+    /// `kern compose <file> [up|down] [--no-pod] [-d]`: bring up (or tear down) a stack of boxes in
     /// dependency order. `up` auto-creates a pod so services reach each other by name (`--no-pod`
-    /// opts out); `down` stops the boxes and removes the pod.
+    /// opts out); `down` stops the boxes and removes the pod. `-d`/`--detach` is accepted and is
+    /// what `up` already does, so a `docker compose up -d` runs unchanged.
     Compose {
         /// One or more compose files, merged left-to-right (`-f base -f override`).
         files: Vec<String>,
@@ -664,7 +665,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // the two that did not.
         Some("pull") => {
             reject_unknown_flags("pull", &rest, &["--dest", "--platform"])?;
-            parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?
+            let cmd = parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?;
+            if let Command::Pull { image, .. } = &cmd {
+                check_reference(image, "pull")?;
+            }
+            cmd
         }
         // `push <local-ref> [as <remote-ref>]` - publish a cached image. `as` lets you retag on push
         // (e.g. `kern push myapp as ghcr.io/me/myapp:1.0`).
@@ -1167,7 +1172,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .get_or_init(|| {
                     format!(
                         "compose <file>... [{}] [-p NAME] [--env-file F] [--profile P] [--no-pod] \
-                         [--tail N] [-f] [-a] [service...]",
+                         [-d] [--tail N] [-f] [-a] [service...]",
                         crate::commands::compose_verbs_help()
                     )
                 })
@@ -1220,6 +1225,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "--no-ansi" | "--compatibility" | "--dry-run" => {
                         eprintln!("kern compose: '{a}' has no effect on kern - ignored");
                     }
+                    // `-d`/`--detach` is how almost every Docker user starts a stack, and it is what
+                    // kern ALREADY does: `up` starts the services and returns. Accepted SILENTLY,
+                    // not with the "has no effect" note the presentation flags above get, because
+                    // that note would be false here. The flag has exactly the effect it names; it is
+                    // simply not optional. Refusing it was a usage error on the single most common
+                    // invocation there is, hit while running kern's own acceptance battery.
+                    "-d" | "--detach" => {}
                     "--tail" => {
                         // A non-numeric `--tail` is a typo, not "show everything": refuse it.
                         tail = Some(
@@ -2578,6 +2590,36 @@ fn positional_after_flags(rest: &[&str], value_flags: &[&str]) -> Option<String>
     None
 }
 
+/// Refuse an image reference the OCI grammar cannot represent, AT THE MOMENT THE USER SUPPLIES IT.
+///
+/// `kern build -t Foo-BAR:latest` used to succeed and put that name in the local cache, which no
+/// registry will accept, so the refusal arrived at `kern push` long after the build was paid for.
+/// `kern pull Foo-BAR:latest` was worse: it went to the network and came back `registry: no layers
+/// in manifest`, which names nothing about the actual problem. Docker refuses the same input before
+/// doing any work, with `repository name must be lowercase`; measured against Docker 29.6.2 on the
+/// same host as kern, where kern accepted `dd-A:latest` and docker would not build it at all.
+///
+/// The rule itself is `kern_oci::valid_reference`, which already rejected uppercase: it simply was
+/// not consulted on this path. Nothing here is a new restriction, it is an existing one applied
+/// where it can still be acted on.
+fn check_reference(spec: &str, flag: &str) -> Result<(), Error> {
+    if kern_oci::valid_reference(spec) {
+        return Ok(());
+    }
+    // Name the fix when the fix is mechanical. A spec that becomes valid by lowercasing is the
+    // common case (a directory named `Foo` used as a tag), and printing the exact string the user
+    // should have typed is worth more than restating the grammar.
+    let lower = spec.to_ascii_lowercase();
+    let remedy = if lower != spec && kern_oci::valid_reference(&lower) {
+        format!(" - OCI repository names are lowercase: use `{lower}`")
+    } else {
+        String::new()
+    };
+    Err(Error::Cli(format!(
+        "{flag}: '{spec}' is not a valid image reference{remedy}"
+    )))
+}
+
 fn parse_pull(rest: &[&str]) -> Option<Command> {
     let mut image: Option<&str> = None;
     let mut dest: Option<String> = None;
@@ -2740,11 +2782,9 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
         match rest[i] {
             "-t" | "--tag" => {
                 i += 1;
-                tag = Some(
-                    rest.get(i)
-                        .ok_or(Error::Usage("-t <name[:tag]>"))?
-                        .to_string(),
-                );
+                let t = rest.get(i).ok_or(Error::Usage("-t <name[:tag]>"))?;
+                check_reference(t, "build -t")?;
+                tag = Some((*t).to_string());
             }
             "-f" | "--file" => {
                 i += 1;
@@ -3112,6 +3152,92 @@ mod tests {
     /// to authenticate because of a spelling mistake, and the image they named never appears in any
     /// message. `push` had the same shape through its `filter(|a| !a.starts_with('-'))`.
     ///
+    /// A REFERENCE NO REGISTRY WILL ACCEPT IS REFUSED WHERE THE USER TYPED IT.
+    ///
+    /// `kern build -t Foo-BAR:latest` used to succeed and put that name in the local cache, so the
+    /// refusal arrived at `kern push`, after the build was paid for. `kern pull Foo-BAR:latest` was
+    /// worse: it dialled the registry and returned `registry: no layers in manifest`, which names
+    /// nothing about the real problem. The rule is `kern_oci::valid_reference`, which already
+    /// rejected uppercase; it was simply not consulted on either path.
+    ///
+    /// Measured against Docker 29.6.2 on one host: docker refuses `dd-A:latest` at build with
+    /// `repository name must be lowercase`, and kern built it.
+    #[test]
+    fn an_image_reference_the_oci_grammar_cannot_hold_is_refused_before_any_work() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+        let err = p(&["build", "-t", "Foo-BAR:latest", "."])
+            .expect_err("an uppercase tag is not a valid OCI reference");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Foo-BAR:latest"),
+            "the error must quote what was typed: {msg}"
+        );
+        assert!(
+            msg.contains("foo-bar:latest"),
+            "and must name the exact string to type instead, since the fix is mechanical: {msg}"
+        );
+
+        let err = p(&["pull", "NotInCache-UPPER:latest"])
+            .expect_err("pull must refuse before it dials a registry");
+        assert!(
+            format!("{err}").contains("notincache-upper:latest"),
+            "pull's refusal carries the same remedy: {err}"
+        );
+
+        // A reference invalid for a reason lowercasing does NOT fix must not carry a false remedy:
+        // telling someone to retype the same broken string in lower case is worse than saying
+        // nothing. `a..b` is a path traversal component, rejected by `valid_repo_path` either way.
+        let err = p(&["build", "-t", "a..b:latest", "."]).expect_err("`..` is never a valid path");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("lowercase"),
+            "no lowercase remedy when lowercasing changes nothing: {msg}"
+        );
+
+        // POSITIVE CONTROL, both verbs: a valid reference still parses, so the three refusals above
+        // are about the grammar and not about the arm rejecting everything it is given.
+        assert!(
+            p(&["build", "-t", "foo-bar:latest", "."]).is_ok(),
+            "a lowercase tag must still build"
+        );
+        assert!(
+            p(&["pull", "ghcr.io/owner/name:1.2.3"]).is_ok(),
+            "a fully qualified reference must still pull"
+        );
+    }
+
+    /// `docker compose up -d` IS THE MOST COMMON WAY ANYONE STARTS A STACK, AND IT MUST PARSE.
+    ///
+    /// It used to be a usage error: the flag loop rejected every unknown `-x`, and `-d` was not in
+    /// the list. kern's `up` is already detached, so the flag names exactly what happens and is
+    /// accepted silently rather than with the "has no effect" note the presentation flags get -
+    /// that note would be false here. Found while running kern's own acceptance battery, which
+    /// reached for the Docker habit without thinking, which is the point.
+    #[test]
+    fn compose_up_accepts_the_detach_flag_because_that_is_what_it_already_does() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+        for flag in ["-d", "--detach"] {
+            let (_, cmd) = p(&["compose", "stack.yml", "up", flag])
+                .unwrap_or_else(|e| panic!("`compose up {flag}` must parse: {e}"));
+            match cmd {
+                Command::Compose { files, action, .. } => {
+                    assert_eq!(files, vec!["stack.yml".to_string()]);
+                    assert_eq!(action, crate::commands::ComposeAction::Up);
+                }
+                other => panic!("`compose up {flag}` must stay a compose up: {other:?}"),
+            }
+        }
+
+        // POSITIVE CONTROL: an unknown flag is STILL refused, so the arm above did not open the
+        // gate for everything. A parser that accepts any `-x` cannot report a typo.
+        assert!(
+            p(&["compose", "stack.yml", "up", "--detatch"]).is_err(),
+            "a typo must still be a usage error"
+        );
+    }
+
     /// Asserted on the exact typo that produced it, plus the positive control that the correctly
     /// spelled flag still parses, so this cannot pass on a build that refuses everything.
     #[test]
