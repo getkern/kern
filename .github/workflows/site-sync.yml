@@ -11,9 +11,14 @@ name: site-sync
 # Scheduled rather than on push, deliberately: the site is deployed by hand, so for a few minutes
 # after a merge the two legitimately differ, and a push-gate would cry wolf every time. A daily check
 # turns "someone forgot" into a red mark that cannot be scrolled past.
+#
+# In the EVENING, on purpose. Cron here is UTC, so 19:00 UTC is 21:00 in Rome under CEST and 20:00
+# under CET: after the maintainer's working day either way, and never before 18:00 local, which the
+# morning slot could not promise. A red mark is only useful when the person who can fix it is free
+# to. The odd minute is not decoration: schedules on the hour queue behind everyone else's.
 on:
   schedule:
-    - cron: '23 7 * * *'
+    - cron: '23 19 * * *'
   workflow_dispatch: {}
 
 jobs:
