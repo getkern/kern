@@ -11,7 +11,7 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
-## Unreleased
+## v0.8.0 - 2026-08-31
 
 **This is a MINOR bump (0.8.0), not a patch.** Not because the command surface moved: it did not.
 No verb or flag is removed or renamed, `--entrypoint` and compose's `-d` are additive, and the
