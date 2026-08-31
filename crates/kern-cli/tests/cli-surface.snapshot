@@ -24,7 +24,7 @@ COMMANDS:
     rmi <image>...                                                 Remove cached images (frees unshared layers)
     save <image> [-o file]                                         Export an image to a tar (docker load-compatible)
     load [-i file]                                                 Import an image from a tar (docker save format)
-    builds [<tag>] [--status S] [-n N] [--json]                    List past builds (build history)
+    builds [<tag>] [--status S] [-n N] [--json]                    List past builds; S is ok|warn|failed|running|interrupted
     build logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
   Manage boxes
@@ -47,8 +47,8 @@ COMMANDS:
     history [-n N]                                                 Recently-run boxes
 
   Multi-box
-    compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|systemd] Run a stack (kern TOML or docker-compose.yml)
-    up [--no-pod] / down                                          Bring up / tear down the compose file in this dir
+    compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|systemd] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    up [--no-pod] [-d] / down                                     Bring up / tear down the compose file in this dir
     pod create <name> [--no-outbound] [--uid-range] / pod ls [--json] / pod rm <name>  Shared-network pod (boxes reach each other by name)
 
   Config & storage

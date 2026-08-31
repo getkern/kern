@@ -414,7 +414,7 @@ jobs:
             -v "$PWD/target/release/kern:/fix/kern:ro" -v /tmp/ro.sh:/t.sh ubuntu:24.04 sh /t.sh
 
   macos-guards:
-    name: macOS guards (no VM)
+    name: macOS guards
     # A macOS runner cannot RUN kern, and that is not the point. kern needs a Linux kernel, and a
     # hosted macOS runner has no nested virtualization, so colima or Lima cannot start a VM to hold
     # one. What this runner can check is everything kern SAYS to a Mac user, which is the part that
@@ -424,18 +424,79 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - name: the installer refuses Darwin, and hands over the route that works
+      - name: the installer refuses Darwin, and names the route for BOTH shapes of Mac
+        # TWO BRANCHES, AND THIS USED TO TEST NEITHER OF THEM ON PURPOSE. The installer looks for
+        # `colima limactl orb docker` and says something different when it finds one: a Mac that
+        # already runs a Linux VM must be told to USE it, not to install a second one. Which branch a
+        # bare run takes therefore depends on what the runner image happens to ship, so the old bare
+        # run could not assert which message it had seen. Its one content check, `grep -q colima`,
+        # passed in BOTH branches - `brew install colima` in one, `colima ssh` in the other - so it
+        # would have stayed green with the branches swapped. Both are driven from a controlled PATH
+        # now, and the assertion that separates them is the ABSENCE of `brew install` on the Mac that
+        # already has a VM, which is the entire point of that branch.
         run: |
           set -u
-          if out="$(sh install.sh 2>&1)"; then
-            printf 'the installer exited 0 on macOS; it must refuse:\n%s\n' "$out" >&2
+          echo "what this runner image happens to ship (reported, not relied on):"
+          for vm in colima limactl orb docker; do
+            printf '  %-8s %s\n' "$vm" "$(command -v "$vm" 2>/dev/null || echo absent)"
+          done
+
+          # THE "no VM" PATH IS BUILT, NOT ASSUMED. `PATH=/usr/bin:/bin` looks like it excludes a VM
+          # tool and does not: `docker` sits in `/usr/bin` on plenty of systems, and a runner image is
+          # free to put one there too. Whether this branch is reachable would then depend on the image
+          # of the day, which is not a test. On the Darwin path the installer needs `sh`, `uname` and
+          # shell builtins and nothing else, so two symlinks are the whole environment.
+          mkdir -p "$RUNNER_TEMP/novm" "$RUNNER_TEMP/hasvm"
+          ln -sf "$(command -v sh)" "$RUNNER_TEMP/novm/sh"
+          ln -sf "$(command -v uname)" "$RUNNER_TEMP/novm/uname"
+          for vm in colima limactl orb docker; do
+            if [ -e "$RUNNER_TEMP/novm/$vm" ]; then
+              echo "the no-VM environment is not empty: it holds $vm" >&2
+              exit 1
+            fi
+          done
+
+          # A Mac with a VM. A file named `colima` on PATH is enough: the installer tests PRESENCE,
+          # deliberately, because `docker info` on a stopped Docker Desktop takes seconds on a path
+          # that has already failed the user once.
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/hasvm/colima"
+          chmod +x "$RUNNER_TEMP/hasvm/colima"
+
+          if novm="$(PATH=$RUNNER_TEMP/novm sh install.sh 2>&1)"; then
+            printf 'the installer exited 0 on macOS; it must refuse:\n%s\n' "$novm" >&2
             exit 1
           fi
-          printf '%s\n' "$out"
-          printf '%s' "$out" | grep -q 'Linux-only (detected Darwin)' || {
-            echo 'the refusal stopped naming Darwin' >&2; exit 1; }
-          printf '%s' "$out" | grep -q 'colima' || {
-            echo 'the refusal stopped saying where kern does run' >&2; exit 1; }
+          if hasvm="$(PATH=$RUNNER_TEMP/hasvm:$RUNNER_TEMP/novm sh install.sh 2>&1)"; then
+            printf 'the installer exited 0 on macOS; it must refuse:\n%s\n' "$hasvm" >&2
+            exit 1
+          fi
+          printf '===== no VM on PATH =====\n%s\n\n===== a VM on PATH =====\n%s\n' "$novm" "$hasvm"
+
+          for out in "$novm" "$hasvm"; do
+            printf '%s' "$out" | grep -q 'Linux-only (detected Darwin)' || {
+              echo 'the refusal stopped naming Darwin' >&2; exit 1; }
+          done
+
+          printf '%s' "$novm" | grep -q 'No Linux VM was found on this Mac' || {
+            echo 'a Mac with no VM is no longer told it has none' >&2; exit 1; }
+          printf '%s' "$novm" | grep -q 'brew install colima' || {
+            echo 'a Mac with no VM is no longer told how to get one' >&2; exit 1; }
+
+          printf '%s' "$hasvm" | grep -q 'This Mac has a Linux VM installed (colima)' || {
+            echo 'a Mac that already has a VM is no longer told so, by name' >&2; exit 1; }
+          # `if`, not `grep ... && { exit 1; }`: a run step is `bash -e`, and in an AND-OR list only
+          # the LAST command is exempt from -e. A grep that finds nothing is the GOOD case here, and
+          # written as an `&&` it is also the list's exit status, so the step would have failed
+          # exactly when the product was correct.
+          if printf '%s' "$hasvm" | grep -q 'brew install'; then
+            echo 'a Mac that already has a VM is being told to install a second one' >&2
+            exit 1
+          fi
+
+          # THE CONTROL: the two runs must differ. If they do not, the PATH did not steer anything
+          # and every assertion above was reading the same output twice.
+          [ "$novm" != "$hasvm" ] || {
+            echo 'both runs produced the same text: the branch was never taken' >&2; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

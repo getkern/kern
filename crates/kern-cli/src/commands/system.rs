@@ -61,7 +61,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
     {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)
     {c}load{z} [-i file]                                                 Import an image from a tar (docker save format)
-    {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds (build history)
+    {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds; S is ok|warn|failed|running|interrupted
     {c}build{z} logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
   {d}Manage boxes{z}
@@ -84,8 +84,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
-    {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml)
-    {c}up{z} [--no-pod] / {c}down{z}                                          Bring up / tear down the compose file in this dir
+    {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    {c}up{z} [--no-pod] [-d] / {c}down{z}                                     Bring up / tear down the compose file in this dir
     {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls [--json] / pod rm <name>  Shared-network pod (boxes reach each other by name)
 
   {d}Config & storage{z}
