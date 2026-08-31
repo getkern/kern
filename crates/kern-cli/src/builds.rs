@@ -45,9 +45,17 @@ impl Status {
             _ => Status::Running,
         }
     }
-    /// Human label for `kern builds` / `inspect`. A lingering `running` record is a build that never
-    /// finished, so it reads as `interrupted` rather than pretending it's still going.
-    pub fn label(self) -> &'static str {
+    /// Human label for a status whose process is KNOWN NOT to be running any more.
+    ///
+    /// `Running` reads `interrupted` here because a record still marked running whose process is
+    /// gone is a build that never finished. Whether the process is gone is not a property of the
+    /// status, so the decision does not live here: see [`Record::label`], which asks the process.
+    ///
+    /// This used to be the only label function, and it labelled EVERY `Running` record
+    /// `interrupted` - including a build that was running at that moment. Measured: a build with a
+    /// live pid showed `interrupted  0ms  0 B` while its process sat at 53% CPU. A tool that
+    /// reports its own work as dead while doing it gets its output ignored, which is the whole cost.
+    pub fn label_when_not_running(self) -> &'static str {
         match self {
             Status::Running => "interrupted",
             Status::Ok => "ok",
@@ -84,6 +92,17 @@ pub struct Record {
     pub started: u64,
     /// Wall-clock build time in milliseconds (0 until finalized).
     pub duration_ms: u64,
+    /// The start time, in clock ticks since boot, of the process whose pid is in [`Record::id`].
+    ///
+    /// WHY A SECOND NUMBER FOR ONE PROCESS. A pid alone cannot answer "is this build still running":
+    /// the kernel recycles pids, so a dead build's number can belong to something else entirely, and
+    /// a liveness test built on the pid would then report a finished build as running forever. The
+    /// pair `(pid, start time)` identifies a process for as long as it exists, which is the same rule
+    /// `pod.rs` already applies to its holder marker.
+    ///
+    /// `0` on a record written before this field existed, and on a host where `/proc` could not be
+    /// read. [`Record::is_live`] states what it does with that.
+    pub pid_starttime: u64,
     pub status: Status,
     /// Number of Dockerfile lint warnings (drives the `warn` status).
     pub warnings: u32,
@@ -116,6 +135,74 @@ pub fn valid_id(id: &str) -> bool {
 /// single path component; the pid disambiguates concurrent builds in the same second.
 pub fn new_id(started: u64, pid: u32) -> String {
     format!("{started}-{pid}")
+}
+
+impl Record {
+    /// The pid embedded in [`Record::id`] (`<started_unix>-<pid>`), or `None` if it is not there.
+    ///
+    /// Parsed from the id rather than stored a second time: the id is minted from the pid and is
+    /// validated on every read, so a separate copy could only ever disagree with it.
+    pub fn pid(&self) -> Option<i32> {
+        self.id.rsplit_once('-')?.1.parse().ok()
+    }
+
+    /// Is the process that started this build still running?
+    ///
+    /// ## Why this is not `Path::new("/proc/<pid>").exists()`
+    ///
+    /// The kernel recycles pids. A finished build's number can belong to an unrelated process
+    /// minutes later, and a bare existence test would then report that build as running for as long
+    /// as the record survives - trading a false "dead" for a false "alive", which is worse, because
+    /// the first is a papercut and the second is a user waiting for something that already stopped.
+    ///
+    /// So the identity is the PAIR `(pid, start time)`, which is unique for as long as the process
+    /// exists. It is the same rule `pod.rs` uses for its holder marker, through the same reader.
+    ///
+    /// ## What it answers when it cannot tell
+    ///
+    /// `false`. Two ways to get there, and both are named because "cannot tell" is not "dead":
+    ///
+    ///   * a record written before `pid_starttime` existed carries `0`. Older records are older
+    ///     builds; a build old enough to predate this field is not one running now.
+    ///   * `/proc/<pid>/stat` unreadable - the process is gone, or is not ours to read. Either way
+    ///     nothing here can claim it is running.
+    ///
+    /// Answering `false` puts the reader back on the previous behaviour for those cases, which is
+    /// the conservative direction: it never invents a build in flight.
+    pub fn is_live(&self) -> bool {
+        if self.pid_starttime == 0 {
+            return false;
+        }
+        let Some(pid) = self.pid() else {
+            return false;
+        };
+        crate::registry::proc_starttime(pid) == self.pid_starttime
+    }
+
+    /// The label `kern builds` / `inspect` / `top` print for this record.
+    ///
+    /// A `Running` record whose process is alive is `running`; one whose process is gone is
+    /// `interrupted`. Every other status is settled and says so regardless.
+    pub fn label(&self) -> &'static str {
+        match self.status {
+            Status::Running if self.is_live() => "running",
+            other => other.label_when_not_running(),
+        }
+    }
+
+    /// Milliseconds to show in the TIME column.
+    ///
+    /// A finished build reports what it measured. A RUNNING one has `duration_ms == 0`, because that
+    /// field is written at finalize; showing that zero next to a live process is the same lie as
+    /// calling it interrupted, so the elapsed time is derived from the wall clock instead and counts
+    /// up. `saturating_sub` because a clock that moved backwards must yield zero, not a wrapped
+    /// number that would print as a build running for half a billion years.
+    pub fn elapsed_ms(&self, now_unix: u64) -> u64 {
+        if self.duration_ms > 0 || !self.is_live() {
+            return self.duration_ms;
+        }
+        now_unix.saturating_sub(self.started).saturating_mul(1000)
+    }
 }
 
 /// Collapse newlines so one free-text field stays on its own record line (same guard as the box
@@ -172,7 +259,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
     // Append-only wire format: readers tolerate missing keys, so new fields never break old records.
     let _ = write!(
         body,
-        "id={}\ntag={}\ndockerfile={}\ncontext={}\nstarted={}\nduration_ms={}\nstatus={}\nwarnings={}\nsize={}\nerror={}\n",
+        "id={}\ntag={}\ndockerfile={}\ncontext={}\nstarted={}\nduration_ms={}\nstatus={}\nwarnings={}\nsize={}\npid_starttime={}\nerror={}\n",
         rec.id,
         one_line(&rec.tag),
         one_line(&rec.dockerfile),
@@ -182,6 +269,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
         rec.status.as_str(),
         rec.warnings,
         rec.size,
+        rec.pid_starttime,
         one_line(&rec.error),
     );
     // Write a temp then rename over `meta` - the swap is atomic, so a crash mid-finalize can't leave a
@@ -215,6 +303,7 @@ fn parse(body: &str) -> Option<Record> {
             "context" => r.context = v.to_string(),
             "started" => r.started = v.parse().unwrap_or(0),
             "duration_ms" => r.duration_ms = v.parse().unwrap_or(0),
+            "pid_starttime" => r.pid_starttime = v.parse().unwrap_or(0),
             "status" => r.status = Status::parse(v),
             "warnings" => r.warnings = v.parse().unwrap_or(0),
             "size" => r.size = v.parse().unwrap_or(0),
@@ -524,6 +613,149 @@ mod tests {
         out
     }
 
+    /// A RUNNING RECORD WHOSE PROCESS IS ALIVE READS `running`, AND ONE WHOSE PROCESS IS GONE
+    /// READS `interrupted`.
+    ///
+    /// Every `Running` record used to read `interrupted`. Measured before the fix: a build with a
+    /// live pid showed `interrupted  0ms  0 B` while its process was at 53% CPU extracting a layer.
+    #[test]
+    fn a_live_build_reads_running_and_a_dead_one_reads_interrupted() {
+        let me = std::process::id();
+        let mine = crate::registry::proc_starttime(me as i32);
+        assert!(
+            mine > 0,
+            "this test needs /proc for its own pid; without it nothing below measures anything"
+        );
+
+        // Alive: this very process, identified by the pair the record stores.
+        let mut live = rec(&new_id(1000, me), 1000, Status::Running);
+        live.pid_starttime = mine;
+        live.duration_ms = 0;
+        assert!(live.is_live(), "our own process must read as alive");
+        assert_eq!(live.label(), "running");
+
+        // A PID THAT EXISTS BUT IS NOT THIS BUILD. Same pid, a start time that is not ours: this is
+        // pid reuse, and a bare `/proc/<pid>` existence test would call it alive forever.
+        let mut recycled = live.clone();
+        recycled.pid_starttime = mine.wrapping_add(1);
+        assert!(
+            !recycled.is_live(),
+            "a recycled pid must not be mistaken for the build that minted the record"
+        );
+        assert_eq!(recycled.label(), "interrupted");
+
+        // A pid that cannot exist.
+        let mut gone = rec(&new_id(1000, 0x7fff_fffe), 1000, Status::Running);
+        gone.pid_starttime = 12345;
+        assert!(!gone.is_live());
+        assert_eq!(gone.label(), "interrupted");
+
+        // A record written before the field existed carries 0, and older records are older builds.
+        let mut legacy = rec(&new_id(1000, me), 1000, Status::Running);
+        legacy.pid_starttime = 0;
+        assert!(
+            !legacy.is_live(),
+            "without a start time there is nothing to compare, so it must not claim to be alive"
+        );
+        assert_eq!(legacy.label(), "interrupted");
+
+        // A SETTLED STATUS IS UNAFFECTED by liveness: a finished build does not become `running`
+        // because some process happens to hold its old pid.
+        for st in [Status::Ok, Status::Warn, Status::Failed] {
+            let mut done = rec(&new_id(1000, me), 1000, st);
+            done.pid_starttime = mine;
+            assert_eq!(
+                done.label(),
+                st.label_when_not_running(),
+                "{st:?} is settled and must read the same either way"
+            );
+        }
+    }
+
+    /// The pid comes out of the id, and a malformed id yields nothing rather than a wrong number.
+    #[test]
+    fn the_pid_is_read_from_the_id_or_not_at_all() {
+        assert_eq!(rec("1700000000-4242", 0, Status::Ok).pid(), Some(4242));
+        assert_eq!(rec("1-2", 0, Status::Ok).pid(), Some(2));
+        // No separator, a non-numeric tail, an empty tail: none may parse into a pid that would
+        // then be probed for liveness.
+        assert_eq!(rec("nodash", 0, Status::Ok).pid(), None);
+        assert_eq!(rec("1700000000-abc", 0, Status::Ok).pid(), None);
+        assert_eq!(rec("1700000000-", 0, Status::Ok).pid(), None);
+        // `rsplit_once` takes the LAST dash, which is what the minted form uses.
+        assert_eq!(rec("17-00-99", 0, Status::Ok).pid(), Some(99));
+    }
+
+    /// THE TIME COLUMN COUNTS UP WHILE A BUILD RUNS, and reports what was measured once it stops.
+    #[test]
+    fn elapsed_counts_up_for_a_live_build_and_is_fixed_once_finished() {
+        let me = std::process::id();
+        let mine = crate::registry::proc_starttime(me as i32);
+        assert!(mine > 0, "this test needs /proc for its own pid");
+
+        let mut running = rec(&new_id(1_000_000, me), 1_000_000, Status::Running);
+        running.pid_starttime = mine;
+        running.duration_ms = 0;
+        assert_eq!(running.elapsed_ms(1_000_000), 0);
+        assert_eq!(running.elapsed_ms(1_000_012), 12_000);
+
+        // A CLOCK THAT MOVED BACKWARDS yields zero, never a wrapped number. `now < started` happens
+        // across an NTP step, and the wrapped value would print as a build running for millennia.
+        assert_eq!(running.elapsed_ms(999_999), 0);
+        assert_eq!(running.elapsed_ms(0), 0);
+
+        // A finished build reports what it measured, whatever the clock says now.
+        let done = rec(&new_id(1_000_000, me), 1_000_000, Status::Ok);
+        assert_eq!(
+            done.elapsed_ms(9_999_999),
+            1200,
+            "duration_ms wins once written"
+        );
+
+        // A record marked running whose process is gone keeps its stored duration (zero), because
+        // counting up for something that stopped is the same false report in the other direction.
+        let mut dead = rec(&new_id(1_000_000, 0x7fff_fffe), 1_000_000, Status::Running);
+        dead.pid_starttime = 12345;
+        dead.duration_ms = 0;
+        assert_eq!(dead.elapsed_ms(1_000_012), 0);
+    }
+
+    /// The new field survives a write/read round-trip, and its absence does not break an old record.
+    #[test]
+    fn the_start_time_round_trips_and_an_older_record_still_parses() {
+        let body = "id=1700000000-42\ntag=a:1\ndockerfile=D\ncontext=.\nstarted=1700000000\n\
+                    duration_ms=5\nstatus=ok\nwarnings=0\nsize=1\npid_starttime=999\nerror=\n";
+        let r = parse(body).expect("parses");
+        assert_eq!(r.pid_starttime, 999);
+        // The same record without the key: every other field still lands, and the missing one is 0.
+        let old = "id=1700000000-42\ntag=a:1\ndockerfile=D\ncontext=.\nstarted=1700000000\n\
+                   duration_ms=5\nstatus=ok\nwarnings=0\nsize=1\nerror=\n";
+        let r = parse(old).expect("an older record must still parse");
+        assert_eq!(r.pid_starttime, 0);
+        assert_eq!(r.tag, "a:1");
+        assert_eq!(r.duration_ms, 5);
+
+        // AND THE OTHER DIRECTION, which is the one a downgrade takes and which was not checked.
+        //
+        // "new kern reads old records" was verified above; nobody had asked whether an OLDER kern
+        // reads a record this one wrote. It does, and the reason is structural rather than lucky:
+        // the key/value loop ends in `_ => {}`, so a reader that predates a key SKIPS it instead of
+        // refusing the record. Asserting it with a key no version will ever define proves the
+        // property itself and not one instance of it - the same guarantee holds for every field
+        // added after this one.
+        let future = "id=1700000000-42\ntag=a:1\ndockerfile=D\ncontext=.\nstarted=1700000000\n\
+                      duration_ms=5\nstatus=ok\nwarnings=0\nsize=1\npid_starttime=7\n\
+                      a_key_no_version_defines=x\nerror=e\n";
+        let r = parse(future).expect("an unknown key must not make a record unreadable");
+        assert_eq!(r.tag, "a:1");
+        assert_eq!(r.duration_ms, 5);
+        assert_eq!(r.pid_starttime, 7);
+        assert_eq!(
+            r.error, "e",
+            "a field AFTER the unknown key must still land"
+        );
+    }
+
     fn rec(id: &str, started: u64, status: Status) -> Record {
         Record {
             id: id.to_string(),
@@ -535,6 +767,9 @@ mod tests {
             status,
             warnings: 0,
             size: 4096,
+            // Zero: these fixtures describe FINISHED builds, and zero is what a record written
+            // before this field existed carries, so the round-trip cases also cover that shape.
+            pid_starttime: 0,
             error: String::new(),
         }
     }

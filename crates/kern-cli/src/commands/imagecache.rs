@@ -24,20 +24,51 @@ pub(crate) fn image_default_uid_range(args: &BoxRunArgs) -> bool {
 /// `Cmd`; a shell is the fallback when nothing is set anywhere. `--ssh` with no command keeps the box
 /// alive instead (the sshd is a child of PID 1, which would otherwise exit). For `--rootfs` the
 /// config is empty, so this reduces to the user's command or a shell - the prior behaviour.
+///
+/// ## The override, and why it is HERE
+///
+/// `entrypoint` is `--entrypoint`, and it is the whole of Docker's rule:
+///
+///   * `None` - not given. The image's `Entrypoint` stands, and the image's `Cmd` is the default
+///     argument list.
+///   * `Some(ep)` - the image's `Entrypoint` is REPLACED by `ep`, and the image's `Cmd` IS DISCARDED.
+///     That second half is the part that is easy to miss and that Docker documents explicitly:
+///     "passing `--entrypoint` will clear out any default command set on the image". Keeping the
+///     `Cmd` would append the image's own arguments to a program that never expected them.
+///   * `Some(&[])` - an empty override CLEARS the entrypoint, which is compose's `entrypoint: []`.
+///     The command then runs as argv[0] with nothing in front of it.
+///
+/// ## Why it could not be done above this function
+///
+/// Both callers that already offered an override faked it by PREPENDING to the user's command: the
+/// `docker` shim did `command.insert(0, ep)` and the compose parser did `b.command = entrypoint ++
+/// command`. That composes to `IMAGE_ENTRYPOINT ++ override ++ args`, which is correct only for an
+/// image that has no `Entrypoint` - and an image with one is exactly when an override is needed.
+/// Measured against `quay.io/keycloak/keycloak:26.1`, whose entrypoint is `kc.sh`: asking for a
+/// shell produced `kc.sh sh -c …` and the image answered `Unknown option: 'sh'`. A field report hit
+/// that and could not get a shell inside the image to diagnose a crash loop.
+///
+/// One mechanism, at the bottom, so the flag, the shim and compose cannot disagree about it.
 pub(crate) fn resolve_image_command(
     user_command: &[String],
     ssh: bool,
     img: &kern_oci::ImageConfig,
+    entrypoint: Option<&[String]>,
 ) -> Vec<String> {
     if user_command.is_empty() && ssh {
         return vec!["sleep".to_string(), "infinity".to_string()];
     }
-    let args: Vec<String> = if user_command.is_empty() {
+    // The image's `Cmd` is a default for ITS OWN entrypoint. Once that entrypoint is replaced, the
+    // default belongs to a program that is no longer being run.
+    let args: Vec<String> = if user_command.is_empty() && entrypoint.is_none() {
         img.cmd.clone()
     } else {
         user_command.to_vec()
     };
-    let mut full = img.entrypoint.clone();
+    let mut full: Vec<String> = match entrypoint {
+        Some(ep) => ep.to_vec(),
+        None => img.entrypoint.clone(),
+    };
     full.extend(args);
     if full.is_empty() {
         // The image told us NOTHING to run and the caller gave no command. That is not "run a
@@ -154,7 +185,16 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
 /// `-v` guard enforces. Canonicalize the target and require it stays under the canonical layer; a symlink
 /// that escapes is treated as "no file in this layer" (try the next, else fall back to box-root). An
 /// in-rootfs symlink (a real distro layout) still resolves, since its target stays under the layer.
-pub(crate) fn image_account_entry(lower: &str, file: &str, name: &str) -> Option<Vec<String>> {
+///
+/// `key_field` is the colon-separated column `key` is matched against: `0` for a name (the usual
+/// lookup) and `2` for the numeric id, which is what a NUMERIC `USER` needs - see
+/// [`resolve_image_user`].
+pub(crate) fn image_account_entry(
+    lower: &str,
+    file: &str,
+    key: &str,
+    key_field: usize,
+) -> Option<Vec<String>> {
     use std::path::Path;
     for layer in lower.split(':') {
         let (Ok(target), Ok(base)) = (
@@ -170,7 +210,7 @@ pub(crate) fn image_account_entry(lower: &str, file: &str, name: &str) -> Option
             continue;
         };
         for line in text.lines() {
-            if line.split(':').next() == Some(name) {
+            if line.split(':').nth(key_field) == Some(key) {
                 return Some(line.split(':').map(str::to_string).collect());
             }
         }
@@ -193,9 +233,35 @@ pub(crate) fn resolve_image_user(spec: &str, lower: &str) -> Option<(u32, u32)> 
     // The user half yields both a uid and (for a bare `USER name`) the default gid from its ONE passwd
     // line: fields are `name:x:uid:gid:…`, so index 2 is the uid and 3 the primary gid.
     let (uid, passwd_gid) = match user.parse::<u32>() {
-        Ok(n) => (n, n),
+        // A NUMERIC user takes its primary group from the image's passwd entry FOR THAT UID, and
+        // the ROOT group when the image has no entry for it. It does NOT take the uid as its gid,
+        // which is what this did.
+        //
+        // ## What that cost
+        //
+        // `quay.io/keycloak/keycloak:26.1` declares `USER 1000` numerically and its passwd says
+        // `keycloak:x:1000:0:` - primary group 0. Its own tree is laid out for that:
+        // `/opt/keycloak/lib/quarkus` is `drwxrwxr-x root root`, writable by the OWNER and by GROUP
+        // 0 and by nobody else. Run with gid 1000, the process cannot write its own installation.
+        //
+        // Keycloak's startup runs a Quarkus augmentation that writes into its runner JAR, so the
+        // failure surfaced far from its cause: `jdk.nio.zipfs` opens a JAR it cannot write as a
+        // READ-ONLY zip filesystem, and the first `Files.createDirectory` inside it throws
+        // `ReadOnlyFileSystemException`. The box then restart-looped. A field report reported that
+        // exception and could not get past it; its author guessed at disk exhaustion, and this host
+        // reproduced the same crash with 3.2 GB free, which ruled that out.
+        //
+        // Three facts agree on gid 0 being right: the image's own passwd, the group bits on its own
+        // directories, and the report's baseline that the identical file runs healthy under Docker
+        // Compose.
+        Ok(n) => {
+            let gid = image_account_entry(lower, "etc/passwd", &n.to_string(), 2)
+                .and_then(|e| e.get(3)?.parse().ok())
+                .unwrap_or(0);
+            (n, gid)
+        }
         Err(_) => {
-            let e = image_account_entry(lower, "etc/passwd", user)?;
+            let e = image_account_entry(lower, "etc/passwd", user, 0)?;
             (e.get(2)?.parse().ok()?, e.get(3)?.parse().ok()?)
         }
     };
@@ -204,7 +270,7 @@ pub(crate) fn resolve_image_user(spec: &str, lower: &str) -> Option<(u32, u32)> 
         // `group` fields are `name:x:gid:…`, so index 2 is the gid.
         Some(g) => match g.parse::<u32>() {
             Ok(n) => n,
-            Err(_) => image_account_entry(lower, "etc/group", g)?
+            Err(_) => image_account_entry(lower, "etc/group", g, 0)?
                 .get(2)?
                 .parse()
                 .ok()?,

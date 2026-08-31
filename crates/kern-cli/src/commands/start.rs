@@ -638,7 +638,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // Resolve the effective command from the image config (docker semantics: Entrypoint + the user's
     // command, else the image's Cmd; a shell if nothing is set). `--ssh` with no command keeps the
     // box alive instead. Explicit `-- CMD` always wins over the image's Cmd.
-    let cmd = resolve_image_command(args.command, args.ssh_port.is_some(), &image_config);
+    let cmd = resolve_image_command(
+        args.command,
+        args.ssh_port.is_some(),
+        &image_config,
+        args.entrypoint,
+    );
     pt.mark("parent:image+command");
     // The image's Env are DEFAULTS: put them first, then the user's `--env`/`--env-file` on top so an
     // explicit variable overrides the image's.
@@ -770,9 +775,26 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // box-root with an honest note (so an odd image still starts).
     // `user_or_image` is the shared half both arms need: a NUMERIC spec parses directly, a NAME resolves
     // against the image. The arms differ ONLY in the miss handler (below), which is the whole point.
-    let user_or_image = |u: &str| match parse_user(Some(u)) {
-        Ok(parsed) => parsed, // numeric (uid or uid:gid)
-        Err(_) => resolve_image_user(u, &lower),
+    // THE IMAGE IS CONSULTED FIRST, INCLUDING FOR A NUMERIC SPEC, and it was consulted last.
+    //
+    // This tried `parse_user` first, which succeeds on any number, so a numeric `USER 1000` never
+    // reached the image at all and took `gid = uid`. Docker resolves a numeric user against the
+    // image's `/etc/passwd` exactly as it does a name, and falls back to the ROOT group when the
+    // image has no entry for that uid.
+    //
+    // Measured on `quay.io/keycloak/keycloak:26.1`: it declares `USER 1000`, its passwd says
+    // `keycloak:x:1000:0:`, and its own tree is `drwxrwxr-x root root` - writable by the owner and
+    // by GROUP 0. Run with gid 1000 the process cannot write its own installation, Quarkus'
+    // startup augmentation fails to write into its runner JAR, and `jdk.nio.zipfs` reports the
+    // JAR as a READ-ONLY zip filesystem. The box then restart-loops on a
+    // `ReadOnlyFileSystemException` that names nothing about permissions or uids.
+    //
+    // `resolve_image_user` answers for every spelling - `1000`, `1000:2000`, `keycloak`,
+    // `keycloak:root` - so `parse_user` is only the fallback for a spec the image cannot resolve,
+    // which is where the two arms below deliberately differ.
+    let user_or_image = |u: &str| match resolve_image_user(u, &lower) {
+        Some(pair) => Some(pair),
+        None => parse_user(Some(u)).ok().flatten(),
     };
     let run_as = match args.run_as {
         // Explicit `--user`/compose `user:`: a name the image can't resolve is an ERROR (caller asked).

@@ -85,6 +85,23 @@ pub fn parse_connect_host(line: &str) -> Option<String> {
 
 /// Parse the host of a plain-HTTP proxied request: the absolute-form request-target
 /// (`GET http://host/path …`) or, failing that, the `Host:` header. Returns the bare host.
+/// Does this request head contain a BARE LF - a `\n` not preceded by `\r`?
+///
+/// Extracted from `handle_client` so it can be asserted. The check lived inline in a function that
+/// takes a socket, so nothing could reach it: a mutation testing sweep flipped its comparison, every
+/// one of 920 tests stayed green, and the inverted form ACCEPTS a smuggled request while REJECTING
+/// well-formed CRLF. A security control with no coverage is a security control until somebody
+/// changes the line above it.
+///
+/// See the caller for why bare LF is refused rather than normalised: we terminate the head on strict
+/// CRLF while `.lines()` and the upstream may treat a lone `\n` as a line end, and that
+/// read-vs-parse-vs-upstream disagreement is request smuggling.
+pub fn has_bare_lf(head: &[u8]) -> bool {
+    head.iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\n' && (i == 0 || head[i - 1] != b'\r'))
+}
+
 pub fn parse_http_host(request_line: &str, headers: &str) -> Option<String> {
     // absolute-form: METHOD http://host[:port]/path VERSION
     if let Some(target) = request_line.split_whitespace().nth(1) {
@@ -517,11 +534,7 @@ fn handle_client(mut client: UnixStream, allow: &[String]) {
     // a bare LF can carry a second `Host:` (or a second request) that we parse as one header block and vet
     // as the allowed host, while the upstream splits on the LF and honours the smuggled `Host: evil.com`.
     // Only strict CRLF framing is accepted; real clients (pip/curl/wget) always send it.
-    if head
-        .iter()
-        .enumerate()
-        .any(|(i, &b)| b == b'\n' && (i == 0 || head[i - 1] != b'\r'))
-    {
+    if has_bare_lf(&head) {
         let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
         return;
     }
@@ -887,6 +900,38 @@ mod tests {
             assert!(!port_allowed(p), "port {p} must be refused");
         }
     }
+    /// A BARE LF IN THE REQUEST HEAD IS REFUSED, AND STRICT CRLF IS NOT.
+    ///
+    /// This is the smuggling defence, and until now nothing reached it: the check sat inline in a
+    /// function that takes a socket. A mutation sweep flipped its comparison and all 920 tests
+    /// stayed green - the inverted form accepts the smuggled request and rejects the well-formed
+    /// one, which is the worst possible pair of answers.
+    ///
+    /// Both directions are asserted, because a predicate that always says "bare LF" would also stop
+    /// smuggling, by stopping everything.
+    #[test]
+    fn a_bare_lf_is_refused_and_strict_crlf_is_not() {
+        // WELL-FORMED: every LF preceded by CR. Must NOT be flagged.
+        assert!(!has_bare_lf(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"));
+        assert!(!has_bare_lf(b""));
+        assert!(!has_bare_lf(b"no newline at all"));
+        assert!(!has_bare_lf(b"\r\n"));
+
+        // THE ATTACK: a first line ending in a lone LF, carrying a second Host the upstream would
+        // split on and honour.
+        assert!(has_bare_lf(
+            b"GET / HTTP/1.1\nHost: allowed.example\r\nHost: evil.example\r\n\r\n"
+        ));
+        // A bare LF anywhere else in the head is equally a split point upstream.
+        assert!(has_bare_lf(b"GET / HTTP/1.1\r\nHost: a\nX: b\r\n\r\n"));
+        // A LEADING LF: index 0 has no predecessor to be a CR, and the `i == 0` arm is exactly the
+        // place an off-by-one would hide.
+        assert!(has_bare_lf(b"\nGET / HTTP/1.1\r\n"));
+        // A lone CR is not an LF and is not this check's business.
+        assert!(!has_bare_lf(b"GET / HTTP/1.1\rHost: a\r\n"));
+        // CR LF LF: the second LF is preceded by an LF, not a CR.
+        assert!(has_bare_lf(b"a\r\n\nb"));
+    }
 
     #[test]
     fn parse_http_host_absolute_uri_then_header() {
@@ -955,6 +1000,52 @@ mod tests {
         ] {
             assert!(!valid_allow_entry(bad), "{bad:?} should be refused");
         }
+
+        // ── THE LENGTH BOUNDARIES, which nothing asserted ────────────────────────────────────
+        //
+        // A mutation sweep turned `e.len() > 253` into `>= 253` and every test above stayed green:
+        // the character-class rules were covered and not one length was. 253 is the FQDN limit and
+        // 63 the label limit, and this is a length check on a name that arrives from outside, so an
+        // off-by-one here is the same class as the two security controls the same sweep found
+        // uncovered in this file.
+        //
+        // Both sides of both boundaries, because a check that refuses everything would satisfy a
+        // one-sided assertion.
+        let label = |n: usize| "a".repeat(n);
+        // 63 + 1 + 63 + 1 + 63 + 1 + 61 = 253 exactly.
+        let at_253 = format!("{}.{}.{}.{}", label(63), label(63), label(63), label(61));
+        assert_eq!(at_253.len(), 253, "the fixture must sit ON the boundary");
+        assert!(
+            valid_allow_entry(&at_253),
+            "253 characters is the limit, not past it"
+        );
+
+        let past_253 = format!("{}.{}.{}.{}", label(63), label(63), label(63), label(62));
+        assert_eq!(past_253.len(), 254);
+        assert!(
+            !valid_allow_entry(&past_253),
+            "254 characters is past the limit"
+        );
+
+        // The LABEL limit, isolated from the total: both of these are far below 253 overall, so only
+        // the per-label rule can decide them.
+        assert!(
+            valid_allow_entry(&label(63)),
+            "a 63-character label is the limit"
+        );
+        assert!(
+            !valid_allow_entry(&label(64)),
+            "a 64-character label is past it"
+        );
+        assert!(
+            valid_allow_entry(&format!("{}.example.com", label(63))),
+            "a 63-character label inside a longer name is still fine"
+        );
+        assert!(!valid_allow_entry(&format!("{}.example.com", label(64))));
+
+        // The trailing dot is trimmed BEFORE the length is measured, so a 253-name with one is still
+        // 253. Without this a reader could not tell which of the two orders the code uses.
+        assert!(valid_allow_entry(&format!("{at_253}.")));
     }
 
     #[test]

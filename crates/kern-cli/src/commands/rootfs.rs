@@ -1135,6 +1135,55 @@ pub(crate) fn probe_overlay(
     ok
 }
 
+/// Does the filesystem holding `dir` support copy-on-write clones?
+///
+/// `Some(true)` a clone succeeded, `Some(false)` the filesystem refused it, `None` the probe could
+/// not run and nothing may be concluded from that.
+///
+/// ## Why this is worth knowing
+///
+/// [`copy_tree`] passes `--reflink=auto`, which makes the flat build's base copy nearly free on
+/// btrfs, xfs and bcachefs and a FULL BYTE COPY everywhere else - silently, because `auto` is
+/// defined to fall back without complaining. That single property decides whether a flat build of a
+/// 2 GB base costs milliseconds or minutes, and nothing anywhere said which one the operator was
+/// getting. A field report measured 2m49s and 1.9 GB re-copied per build and could not tell whether
+/// it was a property of kern or of their host; it is neither, it is the filesystem.
+///
+/// ## Why `cp` and not the `FICLONE` ioctl
+///
+/// The ioctl would avoid a process spawn, and its request number would have to be written out here
+/// as a literal because it is not exposed by every version of the `libc` crate. Probing with the
+/// SAME tool `copy_tree` actually uses answers the question that matters - "will the copy this code
+/// is about to run be cheap" - instead of a related one, and it cannot drift from it. The cost is
+/// one spawn on a path that is either `doctor` or a build already measured in seconds.
+pub(crate) fn supports_reflink(dir: &std::path::Path) -> Option<bool> {
+    let stamp = format!(".kern-reflink-{}", std::process::id());
+    let src = dir.join(format!("{stamp}.src"));
+    let dst = dir.join(format!("{stamp}.dst"));
+    // A one-byte file: a clone is a metadata operation, so the size decides nothing, and the smaller
+    // the file the less a fallback copy could cost if `cp` ignored `always`.
+    if std::fs::write(&src, b"k").is_err() {
+        return None; // cannot write here at all: the probe measured nothing
+    }
+    let _ = std::fs::remove_file(&dst); // a leftover would make `cp` refuse for the wrong reason
+    let out = std::process::Command::new("cp")
+        .arg("--reflink=always")
+        .arg("--")
+        .arg(&src)
+        .arg(&dst)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    match out {
+        Ok(st) => Some(st.success()),
+        // `cp` is missing or could not be spawned. `copy_tree` would fail for the same reason and
+        // says so; here there is simply no answer.
+        Err(_) => None,
+    }
+}
+
 /// `cp -a src/. dst` - copy the CONTENTS of `src` into the existing `dst`, preserving symlinks,
 /// modes and timestamps (used to make a mutable copy of the pulled base rootfs).
 pub(crate) fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Error> {
@@ -1506,22 +1555,143 @@ pub(crate) fn mkdir_in_rootfs(rootfs: &std::path::Path, dir: &str) -> Result<(),
     Ok(())
 }
 
+/// What [`seed_resolv_conf`] did, and therefore what [`restore_resolv_conf`] has to undo.
+///
+/// PRESENCE WAS THE WHOLE ANSWER, AND PRESENCE IS NOT THE QUESTION. This used to be a `bool`: true
+/// when the file had been created, false otherwise, and false also meant "the base had one, leave
+/// it". Two different situations behind one value is what made the defect below possible.
+pub(crate) enum SeededResolv {
+    /// Nothing was written: the base already names a server, or the host had nothing to copy.
+    Untouched,
+    /// Created where the base had no file at all: delete it before the image is finalized, but only
+    /// if it still holds `written`.
+    Created { written: Vec<u8> },
+    /// Overwrote a file that named no server: put `original` back, but only if the file still holds
+    /// `written`.
+    ///
+    /// The bytes and not "truncate to empty": an empty file and a file of comments are both
+    /// serverless and neither may be turned into the other. The image keeps what it shipped.
+    Replaced { written: Vec<u8>, original: Vec<u8> },
+}
+
+/// Does this `resolv.conf` name a server a resolver could actually use?
+///
+/// A `nameserver` line with a value. Comments, `search`, `options`, blank lines and an empty file all
+/// answer no, because none of them tells a resolver where to ask.
+fn names_a_server(content: &[u8]) -> bool {
+    content.split(|b| *b == b'\n').any(|line| {
+        let line = std::str::from_utf8(line).unwrap_or("");
+        let line = line.trim();
+        // `;` is a comment in resolv.conf as well as `#`.
+        if line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        let mut parts = line.split_whitespace();
+        parts.next() == Some("nameserver") && parts.next().is_some_and(|v| !v.is_empty())
+    })
+}
+
 /// Seed `/etc/resolv.conf` in the build rootfs from the host so RUN steps can resolve DNS over the
-/// shared network namespace. Returns `true` if it CREATED the file (the base had none) so the caller
-/// can remove it before finalizing - we don't want the host's DNS servers baked into the image
-/// (Docker provides resolv.conf only at runtime). Best-effort; a base that ships its own is left be.
-pub(crate) fn seed_resolv_conf(rootfs: &std::path::Path) -> bool {
+/// shared network namespace.
+///
+/// ## The defect this replaced
+///
+/// The test was `dst.exists()`, and Debian- and Ubuntu-based images SHIP AN EMPTY
+/// `/etc/resolv.conf`. An empty file exists, so kern left it alone, and the build sandbox got a
+/// resolver with nowhere to ask. Alpine ships no such file, so Alpine was created and worked - which
+/// made the failure look like a network fault instead of a file-contents one.
+///
+/// Measured on this host, one Dockerfile, one variable:
+///
+/// ```text
+/// FROM ubuntu:24.04, flat path  ->  wc -c < /etc/resolv.conf = 0, DNS KO
+/// FROM alpine:latest, same host ->  943 bytes, DNS OK
+/// ```
+///
+/// It bites only on the FLAT build path, which is why it took a field report to surface: where
+/// unprivileged overlay works, the RUN step is a box whose overlay UPPER gets a resolv.conf written
+/// into it, shadowing the base's empty one. WSL2 has no unprivileged overlay, so every build there
+/// takes the flat path and every Debian-based build loses DNS. `apt-get`, `pip` and `dotnet restore`
+/// all die, which is most real-world images.
+///
+/// ## Why it does not simply overwrite
+///
+/// Docker bind-mounts the daemon's resolv.conf over the image's for the duration of a build, so it
+/// always wins. kern seeds only where the base names NO server, which fixes the broken case and
+/// leaves a base that ships a working resolver saying what its author meant. Stated because it is a
+/// deliberate divergence and not an oversight.
+///
+/// The host's own file is copied as-is: the build box shares the host network namespace, so a
+/// loopback stub resolver (`nameserver 127.0.0.53`, systemd-resolved) is the same loopback in there.
+pub(crate) fn seed_resolv_conf(rootfs: &std::path::Path) -> SeededResolv {
     let dst = rootfs.join("etc/resolv.conf");
-    if dst.exists() {
-        return false; // base image already has one - leave it, don't touch/remove it
+    let existing = std::fs::read(&dst).ok();
+    if existing.as_deref().is_some_and(names_a_server) {
+        return SeededResolv::Untouched; // the base names a server: its author's choice stands
     }
-    if let Ok(rc) = std::fs::read("/etc/resolv.conf") {
-        let _ = std::fs::create_dir_all(rootfs.join("etc"));
-        if std::fs::write(&dst, rc).is_ok() {
-            return true;
+    let Ok(host) = std::fs::read("/etc/resolv.conf") else {
+        return SeededResolv::Untouched; // nothing to copy from
+    };
+    // A host file that names no server either would replace one useless file with another, and the
+    // restore afterwards would then be pure churn. Say nothing happened, because nothing useful can.
+    if !names_a_server(&host) {
+        return SeededResolv::Untouched;
+    }
+    if std::fs::create_dir_all(rootfs.join("etc")).is_err() || std::fs::write(&dst, &host).is_err()
+    {
+        return SeededResolv::Untouched;
+    }
+    match existing {
+        Some(original) => SeededResolv::Replaced {
+            written: host,
+            original,
+        },
+        None => SeededResolv::Created { written: host },
+    }
+}
+
+/// Undo [`seed_resolv_conf`], so the host's DNS servers are not baked into the image.
+///
+/// The restore is EXACT and not a delete. The code this replaced only ever deleted, which was right
+/// for the one case it handled (a file it had created) and would silently drop a base image's own
+/// file in the case it did not handle. An image that shipped an empty `/etc/resolv.conf` gets an
+/// empty `/etc/resolv.conf` back, byte for byte.
+///
+/// ## It only undoes what is still ITS OWN
+///
+/// A build step may write `/etc/resolv.conf` deliberately - `RUN echo 'nameserver 1.1.1.1' >
+/// /etc/resolv.conf` is the workaround a field report used to get DNS at all, and it is a legitimate
+/// thing for a Dockerfile to do on its own account. Undoing unconditionally deleted that file from
+/// the finished image: the step ran, the write succeeded, and the result was silently discarded.
+/// Measured: a base built with `nameserver 203.0.113.9` came back with no file, and a build FROM it
+/// then saw the host's resolver.
+///
+/// So the seed is undone only while the file still holds the bytes the seed put there. It is the
+/// same rule the VRAM reaper uses on a slot it means to reclaim: read, then act only if the value is
+/// still the one that was read. Anything else in the file belongs to the image.
+pub(crate) fn restore_resolv_conf(rootfs: &std::path::Path, seeded: &SeededResolv) {
+    let dst = rootfs.join("etc/resolv.conf");
+    let (written, original) = match seeded {
+        SeededResolv::Untouched => return,
+        SeededResolv::Created { written } => (written, None),
+        SeededResolv::Replaced { written, original } => (written, Some(original)),
+    };
+    // A read failure means the file is gone or unreadable, and either way there is nothing of ours
+    // left to take back.
+    let Ok(now) = std::fs::read(&dst) else {
+        return;
+    };
+    if now != *written {
+        return; // a build step owns this file now
+    }
+    match original {
+        Some(bytes) => {
+            let _ = std::fs::write(&dst, bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(&dst);
         }
     }
-    false
 }
 
 /// Per-box writable overlay scratch (upper/work) - placed on **tmpfs** where possible
@@ -1596,4 +1766,239 @@ pub(crate) fn cleanup_box_scratch(rootfs: &str) {
     // 100471) that a plain remove_dir_all can't unlink from the host - the fallback retries inside a
     // newuidmap'd user ns where they're removable.
     cleanup_scratch(Some(scratch));
+}
+
+#[cfg(test)]
+mod resolv_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "kern-resolv-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::create_dir_all(d.join("etc"));
+        d
+    }
+
+    /// AN EMPTY FILE NAMES NO SERVER, and that was the whole defect.
+    ///
+    /// Every Debian and Ubuntu image ships an empty `/etc/resolv.conf`. The old test was
+    /// `dst.exists()`, so kern read presence as configuration and left the build sandbox with a
+    /// resolver that had nowhere to ask. The forms below are the ones a real file takes.
+    #[test]
+    fn only_a_nameserver_line_counts_as_naming_a_server() {
+        assert!(names_a_server(b"nameserver 1.1.1.1\n"));
+        assert!(names_a_server(b"search example.com\nnameserver 8.8.8.8\n"));
+        assert!(names_a_server(b"  nameserver   127.0.0.53  \n"));
+        assert!(names_a_server(b"nameserver 1.1.1.1")); // no trailing newline
+
+        // The shapes that look configured and are not.
+        assert!(!names_a_server(b""), "an empty file is what Debian ships");
+        assert!(!names_a_server(b"\n\n  \n"));
+        assert!(
+            !names_a_server(b"# nameserver 1.1.1.1\n"),
+            "a comment is not a server"
+        );
+        assert!(
+            !names_a_server(b"; nameserver 1.1.1.1\n"),
+            "`;` comments too"
+        );
+        assert!(!names_a_server(b"search example.com\noptions edns0\n"));
+        assert!(
+            !names_a_server(b"nameserver\n"),
+            "the directive with no value"
+        );
+        assert!(!names_a_server(b"nameserver   \n"));
+        assert!(
+            !names_a_server(b"nameservers 1.1.1.1\n"),
+            "a different directive"
+        );
+        // Not UTF-8: must answer no rather than panic. A layer can contain anything.
+        assert!(!names_a_server(&[0xff, 0xfe, 0x00, 0x01]));
+    }
+
+    /// THE THREE OUTCOMES, AND THE RESTORE IS EXACT.
+    ///
+    /// The old code returned a bool and only ever deleted. Deleting is right for a file it created
+    /// and wrong for one it overwrote: an image that shipped an empty `/etc/resolv.conf` would have
+    /// come out without the file at all.
+    #[test]
+    fn seeding_is_undone_exactly_and_never_bakes_host_dns_into_the_image() {
+        // The host must name a server for any seeding to happen at all; where it does not, this
+        // whole case is inapplicable and says so rather than asserting the wrong thing.
+        let host = std::fs::read("/etc/resolv.conf").unwrap_or_default();
+        if !names_a_server(&host) {
+            eprintln!(
+                "SKIP: this host's /etc/resolv.conf names no server, so nothing can be seeded"
+            );
+            return;
+        }
+
+        // 1. The base ships no file: created, then removed.
+        let d = scratch("created");
+        let seeded = seed_resolv_conf(&d);
+        assert!(
+            matches!(seeded, SeededResolv::Created { .. }),
+            "an absent file must be created"
+        );
+        assert!(names_a_server(
+            &std::fs::read(d.join("etc/resolv.conf")).unwrap_or_default()
+        ));
+        restore_resolv_conf(&d, &seeded);
+        assert!(
+            !d.join("etc/resolv.conf").exists(),
+            "a file kern created must not survive into the image"
+        );
+
+        // 2. The base ships an EMPTY file: replaced, then restored to empty. The reported case.
+        let d = scratch("empty");
+        let _ = std::fs::write(d.join("etc/resolv.conf"), b"");
+        let seeded = seed_resolv_conf(&d);
+        assert!(
+            matches!(seeded, SeededResolv::Replaced { .. }),
+            "an empty file must be seeded over"
+        );
+        assert!(
+            names_a_server(&std::fs::read(d.join("etc/resolv.conf")).unwrap_or_default()),
+            "the build sandbox must have a resolver during RUN"
+        );
+        restore_resolv_conf(&d, &seeded);
+        assert_eq!(
+            std::fs::read(d.join("etc/resolv.conf")).unwrap_or_else(|_| b"MISSING".to_vec()),
+            b"".to_vec(),
+            "the image gets its empty file back, not a deletion and not the host's servers"
+        );
+
+        // 3. A file of comments only: same treatment, restored byte for byte.
+        let d = scratch("comments");
+        let original = b"# nothing here\n; nor here\n".to_vec();
+        let _ = std::fs::write(d.join("etc/resolv.conf"), &original);
+        let seeded = seed_resolv_conf(&d);
+        assert!(matches!(seeded, SeededResolv::Replaced { .. }));
+        restore_resolv_conf(&d, &seeded);
+        assert_eq!(
+            std::fs::read(d.join("etc/resolv.conf")).unwrap_or_default(),
+            original,
+            "an empty file and a file of comments are both serverless and are not interchangeable"
+        );
+
+        // 3b. A BUILD STEP OVERWROTE IT. The undo must not fire: `RUN echo 'nameserver 1.1.1.1' >
+        //     /etc/resolv.conf` is a legitimate thing for a Dockerfile to do, and it is the exact
+        //     workaround a field report used to get DNS at all. Deleting it afterwards discarded a
+        //     write that had already succeeded. Measured before this was fixed: a base built with
+        //     `nameserver 203.0.113.9` came out with no file, and a build FROM it saw the host's
+        //     resolver instead.
+        let d = scratch("stepwrote");
+        let _ = std::fs::write(d.join("etc/resolv.conf"), b"");
+        let seeded = seed_resolv_conf(&d);
+        assert!(matches!(seeded, SeededResolv::Replaced { .. }));
+        let theirs = b"nameserver 203.0.113.9\n".to_vec();
+        let _ = std::fs::write(d.join("etc/resolv.conf"), &theirs);
+        restore_resolv_conf(&d, &seeded);
+        assert_eq!(
+            std::fs::read(d.join("etc/resolv.conf")).unwrap_or_default(),
+            theirs,
+            "a file a build step wrote belongs to the image, not to the seed"
+        );
+
+        // 3c. The same on a file kern CREATED: the delete must not fire either.
+        let d = scratch("createdthenwritten");
+        let seeded = seed_resolv_conf(&d);
+        assert!(matches!(seeded, SeededResolv::Created { .. }));
+        let _ = std::fs::write(d.join("etc/resolv.conf"), &theirs);
+        restore_resolv_conf(&d, &seeded);
+        assert_eq!(
+            std::fs::read(d.join("etc/resolv.conf")).unwrap_or_default(),
+            theirs,
+            "the undo deletes only a file that still holds what the seed put there"
+        );
+
+        // 4. The base names a server: untouched, and still untouched after the restore.
+        let d = scratch("own");
+        let own = b"nameserver 203.0.113.9\n".to_vec();
+        let _ = std::fs::write(d.join("etc/resolv.conf"), &own);
+        let seeded = seed_resolv_conf(&d);
+        assert!(
+            matches!(seeded, SeededResolv::Untouched),
+            "a base that names a server keeps what its author meant"
+        );
+        restore_resolv_conf(&d, &seeded);
+        assert_eq!(
+            std::fs::read(d.join("etc/resolv.conf")).unwrap_or_default(),
+            own
+        );
+
+        for t in [
+            "created",
+            "empty",
+            "comments",
+            "own",
+            "stepwrote",
+            "createdthenwritten",
+        ] {
+            let _ = std::fs::remove_dir_all(
+                std::env::temp_dir().join(format!("kern-resolv-{t}-{}", std::process::id())),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reflink_tests {
+    use super::*;
+
+    /// THE PROBE ANSWERS ABOUT A REAL FILESYSTEM, AND CLEANS UP AFTER ITSELF.
+    ///
+    /// It decides whether the flat build's base copy is a clone or a full re-read of the whole base
+    /// image, which on a 2 GB base is the difference between milliseconds and minutes. A probe that
+    /// left files behind would litter the image cache it runs in, and one that answered from the
+    /// filesystem's NAME rather than from an attempted clone would be wrong on the cases that
+    /// matter: a filesystem can be btrfs and still refuse a clone across subvolumes.
+    #[test]
+    fn the_reflink_probe_answers_and_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("kern-reflink-t-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let before: Vec<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+
+        // The answer is a property of THIS host and cannot be asserted either way; that it IS an
+        // answer, and not a crash or a hang, is what this checks. Both values are legitimate.
+        let answer = supports_reflink(&dir);
+        assert!(
+            matches!(answer, Some(true) | Some(false) | None),
+            "the probe must return a verdict or an honest None"
+        );
+
+        let after: Vec<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the probe left files behind: {after:?}"
+        );
+
+        // A directory that cannot be written to yields None, never a verdict invented from a failed
+        // measurement - the same rule the overlay probe follows.
+        let missing = dir.join("no-such-subdir");
+        assert_eq!(
+            supports_reflink(&missing),
+            None,
+            "an unwritable location measured nothing, so it must not claim an answer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -15,6 +15,66 @@ pub fn compose_verbs_help() -> String {
         .join("|")
 }
 
+/// Rewrite every box's `name` to its BOX name and every `depends_on` edge with it, returning the
+/// service-to-box map so the caller can resolve command-line selectors through the same table.
+///
+/// ## What it decides
+///
+/// Docker names a container `<project>-<service>`; kern used the bare service name, and box names
+/// are global, so two projects that both have a `db` could not coexist. The rename happens once,
+/// right after parsing, and everything downstream - topological order, conditional waits, exit
+/// sidecars, health lookups, liveness - works on one consistent set of names without knowing about
+/// projects at all.
+///
+/// A `container_name:` wins over the scoped form, so `docker exec <name>` ports 1:1 to
+/// `kern exec <name>`. It does NOT change what peers resolve: the bare service name is pushed onto
+/// `net_aliases` here and registered in the pod's `/etc/hosts` at bring-up.
+///
+/// ## Why it is its own function
+///
+/// It was inline in `compose`, which meant the naming contract - the one a field report got wrong,
+/// and acted on by editing a working file - could not be asserted without starting a stack. Every
+/// claim in the paragraph above is now a case in this module's tests.
+fn resolve_box_names(
+    boxes: &mut [crate::compose::ComposeBox],
+    pod: &str,
+) -> std::collections::HashMap<String, String> {
+    let scoped = |svc: &str| format!("{pod}-{svc}");
+    // Each service's BOX name, built ONCE so the box's own name and every `depends_on` edge that
+    // names a service map to the SAME box name.
+    let box_name_of: std::collections::HashMap<String, String> = boxes
+        .iter()
+        .map(|b| {
+            (
+                b.name.clone(),
+                b.container_name.clone().unwrap_or_else(|| scoped(&b.name)),
+            )
+        })
+        .collect();
+    let box_name = |svc: &str| box_name_of.get(svc).cloned().unwrap_or_else(|| scoped(svc));
+    for b in boxes.iter_mut() {
+        // The service name must survive as an alias: it is what peers connect to inside the pod,
+        // regardless of what the box itself is named (a `container_name` does not change the DNS).
+        let svc = b.name.clone();
+        // Kept before the rewrite below destroys it: `config` reports the FILE, and the file calls
+        // this service `svc` whatever the box ends up being named.
+        b.service = svc.clone();
+        if !b.net_aliases.contains(&svc) {
+            b.net_aliases.push(svc.clone());
+        }
+        for d in b
+            .depends_on
+            .iter_mut()
+            .chain(b.depends_healthy.iter_mut())
+            .chain(b.depends_completed.iter_mut())
+        {
+            *d = box_name(d);
+        }
+        b.name = box_name(&svc);
+    }
+    box_name_of
+}
+
 pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let ComposeOpts {
         files,
@@ -96,37 +156,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // The bare service name is registered as a pod ALIAS below, so peers still reach each other as
     // `db` inside the stack - the name that appears in the compose file is the name that resolves.
     let service_names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
-    let scoped = |svc: &str| format!("{pod}-{svc}");
-    // Each service's BOX name: Docker's `container_name:` verbatim when set (so `docker exec <name>`
-    // ports 1:1 to `kern exec <name>`), else the project-scoped `<pod>-<service>`. Built ONCE so the
-    // box's own name and every `depends_on` edge that names a service map to the SAME box name.
-    let box_name_of: std::collections::HashMap<String, String> = boxes
-        .iter()
-        .map(|b| {
-            (
-                b.name.clone(),
-                b.container_name.clone().unwrap_or_else(|| scoped(&b.name)),
-            )
-        })
-        .collect();
-    let box_name = |svc: &str| box_name_of.get(svc).cloned().unwrap_or_else(|| scoped(svc));
-    for b in boxes.iter_mut() {
-        // The service name must survive as an alias: it is what peers connect to inside the pod,
-        // regardless of what the box itself is named (a `container_name` does not change the DNS).
-        let svc = b.name.clone();
-        if !b.net_aliases.contains(&svc) {
-            b.net_aliases.push(svc.clone());
-        }
-        for d in b
-            .depends_on
-            .iter_mut()
-            .chain(b.depends_healthy.iter_mut())
-            .chain(b.depends_completed.iter_mut())
-        {
-            *d = box_name(d);
-        }
-        b.name = box_name(&svc);
-    }
+    let box_name_of = resolve_box_names(&mut boxes, &pod);
+    let box_name = |svc: &str| {
+        box_name_of
+            .get(svc)
+            .cloned()
+            .unwrap_or_else(|| format!("{pod}-{svc}"))
+    };
     // Selectors from the command line name SERVICES; map them onto the boxes they now identify.
     let services: Vec<String> = services
         .iter()
@@ -397,11 +433,18 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             let results: Vec<Result<(), Error>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = chunk
                     .iter()
-                    .map(|name| {
-                        let b = boxes.iter().find(|b| &b.name == name).unwrap();
+                    .filter_map(|name| -> Option<_> {
+                        // A LEVEL NAMES BOXES THAT ARE IN `boxes`, and this `unwrap` said so by
+                        // aborting. `topo_levels` builds the levels FROM `boxes`, so the miss is
+                        // unreachable today - which is the shape of a panic that ships. A box that
+                        // is not there simply has nothing to start, and the level barrier below
+                        // still waits for the ones that are.
+                        let b = boxes.iter().find(|b| &b.name == name)?;
                         let (started, pod, up_token, self_exe, boxes, project_dir) =
                             (&started, &pod, &up_token, &self_exe, &boxes, &project_dir);
-                        scope.spawn(move || -> Result<(), Error> {
+                        // `Some(...)`: `filter_map` wants an `Option`, and the `?` above is the
+                        // miss. The spawn itself always succeeds.
+                        Some(scope.spawn(move || -> Result<(), Error> {
                             // Conditional deps (healthy/completed) live in an earlier, already-started
                             // level; plain `depends_on` is honored by the level barrier itself.
                             wait_for_conditions(b, pod, up_token)?;
@@ -454,7 +497,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                 )));
                             }
                             Ok(())
-                        })
+                        }))
                     })
                     .collect();
                 handles
@@ -476,7 +519,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // read-modify-write in `add_member` never runs concurrently, and the NEXT level resolves them.
         if use_pod {
             for name in level {
-                let b = boxes.iter().find(|b| &b.name == name).unwrap();
+                // Same as above: the level was built from `boxes`, so a miss cannot happen and
+                // aborting on it would be the only way it ever could.
+                let Some(b) = boxes.iter().find(|b| &b.name == name) else {
+                    continue;
+                };
                 if !b.net {
                     for alias in &b.net_aliases {
                         crate::pod::add_member(&pod, alias)?;
@@ -515,4 +562,112 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose::ComposeBox;
+
+    fn svc(name: &str, container_name: Option<&str>) -> ComposeBox {
+        ComposeBox {
+            name: name.to_string(),
+            container_name: container_name.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A `container_name` NAMES THE BOX AND NOTHING ELSE.
+    ///
+    /// A field report concluded the opposite - that kern used it as the service hostname too, so
+    /// "every inter-service URL in the file silently stops resolving" - and deleted four
+    /// `container_name` keys from a working file over it. Measured on a live pod, both names are in
+    /// `/etc/hosts` and peers resolve the service name. The output was the whole defect: `config`
+    /// printed the box name while claiming to print service names.
+    ///
+    /// This asserts the three things that were confused for one another, on one input.
+    #[test]
+    fn a_container_name_renames_the_box_and_leaves_the_service_name_resolving() {
+        let mut boxes = vec![svc("keycloak", Some("myapp-keycloak")), svc("db", None)];
+        let map = resolve_box_names(&mut boxes, "proj");
+
+        // 1. The BOX takes the container_name; without one it is the project-scoped form.
+        assert_eq!(boxes[0].name, "myapp-keycloak");
+        assert_eq!(boxes[1].name, "proj-db");
+
+        // 2. The SERVICE name is kept, which is what `config` reports and what a reader compares
+        //    against their own file.
+        assert_eq!(boxes[0].service, "keycloak");
+        assert_eq!(boxes[1].service, "db");
+
+        // 3. The service name is registered as a pod alias, which is what peers resolve. This is
+        //    the claim the report got wrong, and it holds for the renamed box too.
+        assert!(
+            boxes[0].net_aliases.contains(&"keycloak".to_string()),
+            "a renamed box must still answer to its service name: {:?}",
+            boxes[0].net_aliases
+        );
+        assert!(boxes[1].net_aliases.contains(&"db".to_string()));
+
+        // And the map the caller resolves command-line selectors through agrees with all of it.
+        assert_eq!(
+            map.get("keycloak").map(String::as_str),
+            Some("myapp-keycloak")
+        );
+        assert_eq!(map.get("db").map(String::as_str), Some("proj-db"));
+    }
+
+    /// EVERY `depends_on` EDGE IS REWRITTEN WITH THE SAME TABLE.
+    ///
+    /// The edges name SERVICES in the file and must name BOXES afterwards, or the topological order,
+    /// the conditional waits and the health lookups downstream all look up a name that no longer
+    /// exists. All three edge lists go through it, not just the plain one.
+    #[test]
+    fn dependency_edges_are_rewritten_onto_box_names() {
+        let mut api = svc("api", None);
+        api.depends_on = vec!["db".into()];
+        api.depends_healthy = vec!["keycloak".into()];
+        api.depends_completed = vec!["migrate".into()];
+        let mut boxes = vec![
+            svc("keycloak", Some("myapp-keycloak")),
+            svc("db", None),
+            svc("migrate", Some("myapp-migrate")),
+            api,
+        ];
+        resolve_box_names(&mut boxes, "proj");
+
+        let api = &boxes[3];
+        assert_eq!(api.depends_on, vec!["proj-db".to_string()]);
+        assert_eq!(
+            api.depends_healthy,
+            vec!["myapp-keycloak".to_string()],
+            "an edge onto a renamed service must follow the rename"
+        );
+        assert_eq!(api.depends_completed, vec!["myapp-migrate".to_string()]);
+
+        // AN EDGE ONTO A SERVICE THAT IS NOT IN THE FILE still gets the scoped form rather than
+        // being left bare: a bare name would collide with another project's box of that name.
+        let mut orphan = svc("x", None);
+        orphan.depends_on = vec!["nowhere".into()];
+        let mut boxes = vec![orphan];
+        resolve_box_names(&mut boxes, "proj");
+        assert_eq!(boxes[0].depends_on, vec!["proj-nowhere".to_string()]);
+    }
+
+    /// The rewrite is IDEMPOTENT in the field it must not lose, and does not duplicate the alias.
+    ///
+    /// `net_aliases` is a list a user also writes into (`networks.<net>.aliases`), so pushing the
+    /// service name must not add a second copy when it is already there.
+    #[test]
+    fn the_service_alias_is_added_once_and_a_user_alias_survives() {
+        let mut b = svc("db", None);
+        b.net_aliases = vec!["db".into(), "database".into()];
+        let mut boxes = vec![b];
+        resolve_box_names(&mut boxes, "proj");
+        assert_eq!(
+            boxes[0].net_aliases,
+            vec!["db".to_string(), "database".to_string()],
+            "the alias list must not gain a duplicate, and a user's own alias must survive"
+        );
+    }
 }

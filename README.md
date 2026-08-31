@@ -173,10 +173,14 @@ kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
 kern volume ls --json          # ps · images · stats · inspect · builds · pod ls · config list · diff
 ```
 
-## Your Docker Compose stack, without Docker Desktop
+## Docker Compose files, without Docker Desktop
 
 kern speaks `docker-compose.yml`. Point it at the stack you already have and `kern compose up` runs it
-with no daemon and no Docker Desktop, the same on Linux, WSL2 and ARM boards.
+with no daemon and no Docker Desktop, the same on Linux, WSL2 and ARM boards. One constraint comes
+with that: a stack is one pod sharing one network namespace, so **two services cannot both listen on
+the same container port**, even when their published ports differ. That is what makes a stack start
+in milliseconds, and `kern compose up` refuses the collision by name before it starts anything, so
+you meet it in a second rather than in production. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
 ```yaml
 # compose.yaml - a real stack, unchanged
@@ -303,7 +307,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.52 MB binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
-| `docker-compose.yml` | yes, read as-is | yes | partial |
+| `docker-compose.yml` | yes, read as-is (one port per service across the stack) | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
 | GPU | on the roadmap | yes | yes |
 
@@ -359,10 +363,13 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 878 Rust, 340 Python and 61 Node tests,
+**The core is done. Everything above works today:** 927 Rust, 340 Python and 61 Node tests,
 clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
-Arduino UNO Q. **v0.7.0 is the first published release.** The CLI and config surface can still
-change, always called out in [CHANGELOG.md](CHANGELOG.md).
+Arduino UNO Q. **v0.7.0 is the first published release, and the CLI is stable from it**: verbs,
+flags and `--json` shapes change incompatibly only on a minor bump, after a deprecation entry at
+least one release earlier, and a `cli_surface_is_frozen` test holds the build to it. Internal
+config-file keys can still evolve; that is the part still called out in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 

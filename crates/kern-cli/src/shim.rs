@@ -393,12 +393,19 @@ fn translate_run(rest: &[String]) -> Result<Vec<String>, ShimError> {
     // repeated `docker run` without --name doesn't collide within one shell (kern requires a name).
     let name = name.unwrap_or_else(|| format!("box-{}", std::process::id()));
 
-    // `--entrypoint X` + trailing args = Docker's `entrypoint ++ command`: X becomes argv[0] and the
-    // positionals after the image become its arguments. Exactly what the compose parser already does
-    // with `entrypoint:` + `command:`, so `docker run --entrypoint` and a compose `entrypoint:` can't
-    // disagree. kern has no `--entrypoint` flag: the composition IS the box command.
+    // `--entrypoint X` is FORWARDED, not composed here.
+    //
+    // This used to do `command.insert(0, ep)`, which builds `X args` and lets the box prepend the
+    // image's own `ENTRYPOINT` to the result: `IMAGE_ENTRYPOINT X args`. That is right only for an
+    // image that has no entrypoint - and an image with one is exactly when somebody reaches for
+    // this flag. Measured on `quay.io/keycloak/keycloak:26.1`, whose entrypoint is `kc.sh`: asking
+    // for a shell produced `kc.sh sh -c …` and the image answered `Unknown option: 'sh'`.
+    //
+    // `kern box --entrypoint` is the real override now, and it also discards the image's `CMD` the
+    // way Docker does - which prepending could never have done from out here.
     if let Some(ep) = entrypoint {
-        command.insert(0, ep);
+        passthrough.push("--entrypoint".into());
+        passthrough.push(ep);
     }
 
     let mut out: Vec<String> = Vec::with_capacity(passthrough.len() + command.len() + 5);
@@ -643,11 +650,18 @@ mod tests {
         assert!(out.windows(2).any(|w| w == ["--cap-add", "NET_ADMIN"]));
     }
 
+    /// `--entrypoint` IS FORWARDED, and it used to be composed here.
+    ///
+    /// The old shape built `X a b` as the box command and let the box prepend the image's own
+    /// `ENTRYPOINT` to it, producing `IMAGE_ENTRYPOINT X a b`. Correct only for an image without an
+    /// entrypoint, which is not the case anyone reaches for this flag in. Measured against
+    /// `quay.io/keycloak/keycloak:26.1` (entrypoint `kc.sh`): asking for a shell produced
+    /// `kc.sh sh -c …` and the image answered `Unknown option: 'sh'`.
+    ///
+    /// `kern box --entrypoint` performs the real override, including discarding the image's `CMD`
+    /// as Docker does - something a prepend out here could not do at all.
     #[test]
-    fn entrypoint_is_prepended_to_the_command() {
-        // Docker: `--entrypoint X image a b` runs `X a b`. kern has no --entrypoint flag; the box
-        // command IS the concatenation, which is also how the compose parser composes
-        // `entrypoint:` + `command:` - the two paths must not disagree.
+    fn entrypoint_is_forwarded_as_a_real_override() {
         assert_eq!(
             translate(&v(&["run", "--entrypoint", "/bin/echo", "alpine", "ciao"])).unwrap(),
             v(&[
@@ -655,12 +669,14 @@ mod tests {
                 &format!("box-{}", std::process::id()),
                 "--image",
                 "alpine",
-                "--",
+                "--entrypoint",
                 "/bin/echo",
+                "--",
                 "ciao"
             ])
         );
-        // Entrypoint with no trailing command: it becomes the whole command.
+        // Entrypoint with no trailing command: still an override, and the box runs it alone
+        // because the image's Cmd is discarded with the entrypoint it belonged to.
         assert_eq!(
             translate(&v(&["run", "--entrypoint=/bin/true", "alpine"])).unwrap(),
             v(&[
@@ -668,7 +684,7 @@ mod tests {
                 &format!("box-{}", std::process::id()),
                 "--image",
                 "alpine",
-                "--",
+                "--entrypoint",
                 "/bin/true"
             ])
         );

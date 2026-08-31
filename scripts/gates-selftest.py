@@ -28,6 +28,7 @@ Exit:   0 every gate turned red on its case, 1 if any stayed green (or the tree 
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
@@ -37,6 +38,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DASH = "\u2014"  # stated as an escape so this file does not contain what it helps forbid
+
+# Scripts in `scripts/` that are NOT gates, each with the reason it is excluded.
+#
+# The exclusion is a NAMED LIST and not a pattern on purpose: a new gate is covered the day it lands,
+# and the only way to escape coverage is to write your name here, where it is read.
+NOT_A_GATE = {
+    "gates-selftest": "this script, which runs the others by construction",
+    "seccomp-audit": "not a gate: it needs a live workload and an audit log to read",
+    "injection-declared": "reports rather than refuses: it always exits 0 by design, so a case that turned it red would be asserting the opposite of its contract",
+}
 
 # (gate, what the case proves, file, how to mutate its text)
 #
@@ -98,6 +109,21 @@ CASES: list[Case] = [
     # --- test-count ---
     ("test-count", "a README test count that does not match the suite", "README.md",
      sub_once(r"works today:\*\* [0-9]+ Rust", "works today:** 12345 Rust")),
+    # --- flat-continuation: la forma VERA del difetto, con una virgola prima della corsa.
+    #
+    # La prima stesura del cancello pretendeva una minuscola a sinistra e quindi non vedeva questo
+    # caso, che e' esattamente quello che l'ha fatto nascere. Il suo controllo positivo passava, e
+    # passava perche' non misurava niente: questo caso esiste per impedire che riaccada.
+    ("flat-continuation", "una continuazione di riga appiattita dentro un messaggio",
+     "crates/kern-cli/src/commands/mod.rs",
+     # L'INIEZIONE DEVE TOGLIERE LA CONTINUAZIONE, non aggiungere spazi prima di essa: Rust mangia
+     # `\` piu' il ritorno a capo piu' l'indentazione, quindi degli spazi messi PRIMA della barra
+     # sparirebbero e il caso resterebbe verde. La prima stesura faceva esattamente questo, e il
+     # selftest l'ha detto: "stayed GREEN on its own violation".
+     replace_once(
+         "in the box: {e} - \\\n                         name resolution",
+         "in the box: {e} -                          name resolution",
+     )),
     # --- registry-classified ---
     #
     # Rule 3 fires on a function that BOTH derives the runtime root and joins `kern` onto it, and
@@ -152,6 +178,101 @@ def run_gate(gate: str) -> int:
     ).returncode
 
 
+def gates() -> list[str]:
+    """Every script in `scripts/` that claims to be a gate."""
+    return sorted(
+        p.stem for p in (REPO / "scripts").glob("*.py") if p.stem not in NOT_A_GATE
+    )
+
+
+def content_state() -> dict[str, str]:
+    """Every tracked file that differs from HEAD, mapped to a HASH OF ITS DIFF.
+
+    CONTENT AND NOT STATUS, and the first draft compared status. It built a set of
+    `git status --porcelain` lines and called a gate clean when that set had not changed. On a clean
+    tree that works. On a tree with work in progress it does not: a file that is ALREADY modified is
+    reported by the same ` M path` line no matter what else gets appended to it, so a gate writing
+    into a file the operator was already editing produced no difference at all.
+
+    Measured, on a branch carrying nineteen modified files: a probe gate that appended a line to
+    `README.md` ran, wrote, and this phase reported that nothing had happened. A check that is blind
+    exactly where the tree is busiest is worse than no check, because it is run for reassurance.
+    """
+    state: dict[str, str] = {}
+    for ln in git("status", "--porcelain").splitlines():
+        # Untracked files are out of scope for the same reason as in `dirty()`, and a rename or a
+        # mode change carries no diff hunk, so the status line itself is the signature.
+        if ln.strip() and not ln.startswith("??"):
+            state[ln[3:].strip()] = ln[:2]
+    # Then the per-file diff, which is what sees a write into an already-modified file.
+    current = None
+    body: list[str] = []
+    for line in git("diff", "HEAD").splitlines():
+        if line.startswith("diff --git "):
+            if current is not None:
+                state[current] = hashlib.sha1("\n".join(body).encode()).hexdigest()
+            body = []
+            # `diff --git a/PATH b/PATH`; take the b-side, which is the name after any rename.
+            current = line.split(" b/", 1)[-1]
+        else:
+            body.append(line)
+    if current is not None:
+        state[current] = hashlib.sha1("\n".join(body).encode()).hexdigest()
+    return state
+
+
+def check_no_gate_writes(failures: list[str], keep: Path) -> None:
+    """RUN BARE, A GATE MUST READ AND NOT WRITE.
+
+    `gen-seccomp-allowlist.py` used to GENERATE when invoked with no argument and check only under
+    `--check`. Every other script here is a gate that reads, so a sweep that ran them all treated
+    that one as a gate too and it rewrote `seccomp_allow.rs` on the spot: the tree came back dirty on
+    a generated file, `cargo fmt --check` went red next, and the hunt was for a change nobody made.
+    Nothing was wrong with the allow-list. The generator was the only thing that had touched it.
+
+    The defect is not that one script's argument parsing; it is that a directory of read-only checks
+    had no rule saying so, so the hazardous default was invisible until it fired. This is the rule.
+    A generator keeps its power under an explicit `--write`, which is a word you cannot type by
+    accident.
+
+    HOW A WRITE IS UNDONE, and this is the part that has to be right before the check is worth
+    running at all. The first draft restored with `git checkout -- <path>`, which is correct for a
+    file that was clean and DESTROYS UNCOMMITTED WORK for a file that was not. This phase exists to
+    be run mid-change, so that is the case it would have hit. Every file that already differs from
+    HEAD is therefore copied aside BEFORE any gate runs, and a write is undone from that copy;
+    `git checkout` is used only for a file that had nothing to lose.
+    """
+    before = content_state()
+    # The safety net, taken before the first gate and not after the first surprise.
+    saved: dict[str, Path] = {}
+    for i, rel in enumerate(sorted(before)):
+        src = REPO / rel
+        if src.is_file():
+            dst = keep / f"pre-{i:03d}-{src.name}"
+            dst.write_bytes(src.read_bytes())
+            saved[rel] = dst
+
+    for gate in gates():
+        run_gate(gate)  # the exit code is the other phase's business; this one watches the tree
+        after = content_state()
+        wrote = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        if not wrote:
+            continue
+        failures.append(
+            f"{gate}: run with no argument, it MODIFIED the tree instead of checking it.\n"
+            f"      {', '.join(wrote)}\n"
+            "      A gate reads. Put the writing behind an explicit flag, and leave the bare\n"
+            "      invocation as the check, because bare is what a sweep and a habit will use."
+        )
+        for rel in wrote:
+            if rel in saved:
+                (REPO / rel).write_bytes(saved[rel].read_bytes())
+            else:
+                subprocess.run(["git", "checkout", "--", rel], cwd=REPO)
+        # Re-read, so the next gate is measured against the restored tree and not against this one's
+        # damage, which would otherwise blame every gate that follows.
+        before = content_state()
+
 def main(argv: list[str]) -> int:
     verbose = "-v" in argv
 
@@ -169,6 +290,10 @@ def main(argv: list[str]) -> int:
 
     backup = Path(tempfile.mkdtemp(prefix="kern-gates-selftest-"))
     failures: list[str] = []
+
+    # First, because a gate that writes would corrupt every measurement taken after it.
+    check_no_gate_writes(failures, backup)
+
     for i, (gate, what, rel, mutate) in enumerate(CASES):
         path = REPO / rel
         if not path.is_file():
@@ -208,8 +333,11 @@ def main(argv: list[str]) -> int:
             print(f"  {f}")
         print("\nA gate that stays green on its own violation is not checking anything.")
         return 1
-    gates = len({c[0] for c in CASES})
-    print(f"{len(CASES)} cases across {gates} gates: each one turned the gate red.")
+    exercised = len({c[0] for c in CASES})
+    print(
+        f"{len(CASES)} cases across {exercised} gates: each one turned the gate red.\n"
+        f"{len(gates())} gates run bare: none of them wrote to the tree."
+    )
     return 0
 
 

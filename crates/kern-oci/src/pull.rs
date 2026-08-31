@@ -2844,6 +2844,55 @@ mod token_error_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// `take_data` MUST NOT RETURN MORE THAN `keep`, whatever the layer says.
+    ///
+    /// `out.extend_from_slice(&buf[..real_here.min(room)])` is the bound that holds the returned
+    /// buffer to `keep`, on bytes that arrive from a registry. A mutation sweep turned that `min`
+    /// into a `max` and all 920 tests stayed green: the cap was load-bearing and uncovered.
+    ///
+    /// The sizes below straddle the 8192-byte read buffer on purpose, because the bound is applied
+    /// per chunk and a cap that holds for one chunk can still be exceeded across several.
+    #[test]
+    fn take_data_never_returns_more_than_keep() {
+        const BLOCK: usize = 512;
+        for (len, keep) in [
+            (0usize, 16usize),
+            (10, 4),
+            (10, 64),
+            (BLOCK, 1),
+            (8192, 100),
+            (8192, 8192),
+            (20_000, 7),
+            (20_000, 9000),
+            (20_000, 100_000),
+        ] {
+            // A layer body of `len` real bytes, padded to the tar block size as the caller does.
+            let padded = len.div_ceil(BLOCK) * BLOCK;
+            let mut body = vec![b'k'; len];
+            body.resize(padded, 0);
+            let mut cur = std::io::Cursor::new(body);
+            let got = take_data(&mut cur, len as u64, keep).expect("reads");
+            assert!(
+                got.len() <= keep,
+                "len {len} keep {keep}: returned {} bytes, past the cap",
+                got.len()
+            );
+            // AND IT RETURNS WHAT IT SHOULD, or a `min` replaced by a constant zero would also pass
+            // the assertion above by returning nothing at all.
+            assert_eq!(
+                got.len(),
+                len.min(keep),
+                "len {len} keep {keep}: the cap must bite only where it applies"
+            );
+            // Every byte returned is real data, never the tar padding that follows it.
+            assert!(
+                got.iter().all(|b| *b == b'k'),
+                "len {len} keep {keep}: padding leaked into the returned data"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -3771,6 +3820,161 @@ mod tests {
 
     fn end_marker() -> Vec<u8> {
         vec![0u8; BLK * 2]
+    }
+
+    /// A reader that yields `n` copies of one block and then `tail`, without materialising either.
+    ///
+    /// `MAX_LAYER_ENTRIES` is two million, so a `Vec` of that archive would be a gigabyte. The cap
+    /// is the defence against an inode bomb and it was uncovered; a generator makes it assertable
+    /// for the cost of the vetter's own work and nothing else.
+    struct RepeatBlocks {
+        block: [u8; BLK],
+        left: u64,
+        off: usize,
+        tail: Vec<u8>,
+        tpos: usize,
+    }
+
+    impl std::io::Read for RepeatBlocks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.left > 0 {
+                let n = (BLK - self.off).min(buf.len());
+                buf[..n].copy_from_slice(&self.block[self.off..self.off + n]);
+                self.off += n;
+                if self.off == BLK {
+                    self.off = 0;
+                    self.left -= 1;
+                }
+                return Ok(n);
+            }
+            let n = (self.tail.len() - self.tpos).min(buf.len());
+            buf[..n].copy_from_slice(&self.tail[self.tpos..self.tpos + n]);
+            self.tpos += n;
+            Ok(n)
+        }
+    }
+
+    /// THE ENTRY CAP BITES ONE PAST ITS LIMIT AND NOT AT IT.
+    ///
+    /// `entries > MAX_LAYER_ENTRIES` is the inode-bomb defence, and a mutation sweep flipped it to
+    /// `>=` with every test still green. Two million zero-length file headers, streamed rather than
+    /// built, so the archive never exists in memory.
+    ///
+    /// It is the slowest case in this file BY DESIGN: the cap can only be asserted by reaching it.
+    /// Measured: 1.8 s in release, 7.1 s in debug, which roughly doubles the workspace suite. The
+    /// alternative was to leave the one limit that bounds entry COUNT untested, which is the trade
+    /// this whole round exists to refuse. If the cost ever has to come down, the lever is the cap
+    /// constant, not this case.
+    #[test]
+    fn the_entry_cap_bites_one_past_its_limit_and_not_at_it() {
+        const ENTRY_CAP: u64 = 2_000_000; // MAX_LAYER_ENTRIES
+        let archive = |n: u64| RepeatBlocks {
+            block: hdr(b"f", b'0', 0, b""),
+            left: n,
+            off: 0,
+            tail: end_marker(),
+            tpos: 0,
+        };
+
+        // AT the cap: accepted. A `>=` would refuse an archive this vetter is documented to take.
+        let mut at = archive(ENTRY_CAP);
+        assert!(
+            vet_tar_stream(&mut at).is_ok(),
+            "an archive of exactly MAX_LAYER_ENTRIES members is not an inode bomb"
+        );
+
+        // One past: refused, naming what it is.
+        let mut past = archive(ENTRY_CAP + 1);
+        let e = vet_tar_stream(&mut past).expect_err("one member past the cap is an inode bomb");
+        assert!(
+            format!("{e:?}").contains("too many entries"),
+            "the refusal must name the reason: {e:?}"
+        );
+    }
+
+    /// THE RESOURCE CAPS ON A LAYER ARE ASSERTED AT THEIR BOUNDARY, and none of them was.
+    ///
+    /// A mutation sweep over `vet_tar_stream` turned every `>` into `>=` and every `==` into `!=`.
+    /// Eight died; six survived, and FIVE of the six were caps: `MAX_TAIL_BLOCKS`, `TAR_MAX_LONG`
+    /// at three sites, and `MAX_LAYER_ENTRIES`. The identity checks in this vetter were covered and
+    /// not one of the LIMITS was - and the limits are the whole defence against a malicious layer
+    /// (a zero bomb, a gigabyte long-name, an entry explosion) rather than a malformed one.
+    ///
+    /// Both sides of each boundary, because a cap that refuses everything also stops the attack.
+    #[test]
+    fn the_layer_caps_bite_one_past_their_limit_and_not_at_it() {
+        // These mirror the constants in `vet_tar_stream`. Deliberately written out rather than
+        // referenced: if a cap is ever loosened, this case must be looked at, not silently follow.
+        const TAIL_CAP: usize = 4096; // MAX_TAIL_BLOCKS
+        const LONG_CAP: u64 = 1 << 20; // TAR_MAX_LONG
+
+        // ── the zero-padding cap ────────────────────────────────────────────────────────────
+        // A well-formed archive: one file, then the end marker, then N blocks of zero padding.
+        let with_tail = |blocks: usize| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&hdr(b"f", b'0', 0, b""));
+            v.extend(end_marker());
+            v.extend(vec![0u8; BLK * blocks]);
+            v
+        };
+        // AT the cap: still accepted. `tail_blocks > MAX_TAIL_BLOCKS` fires one past it, so exactly
+        // 4096 blocks of padding must pass - which a `>=` would refuse.
+        // THE BOUNDARY IS AT `TAIL_CAP - 1` EXTRA BLOCKS, NOT AT `TAIL_CAP`, and the difference is
+        // worth writing down because a reader comparing this to `MAX_TAIL_BLOCKS = 4096` would go
+        // looking for a bug that is not there. `end_marker()` is TWO zero blocks; the vetter
+        // consumes one as the marker and the second already enters the tail loop, so `with_tail(n)`
+        // presents `n + 1` blocks to the counter. Measured, not assumed: 4095 passes, 4096 does not.
+        assert!(
+            vet_tar_stream(&mut std::io::Cursor::new(with_tail(TAIL_CAP - 1))).is_ok(),
+            "padding exactly at the cap is not a zero bomb"
+        );
+        // One past: refused, and the message names what it is.
+        let e = vet_tar_stream(&mut std::io::Cursor::new(with_tail(TAIL_CAP)))
+            .expect_err("one block past the cap is a zero bomb");
+        assert!(
+            format!("{e:?}").contains("zero-bomb"),
+            "the refusal must name the reason: {e:?}"
+        );
+
+        // ── the long-name cap, on both the GNU ('L') and the PAX ('x') paths ────────────────
+        // Each is a separate `if size > TAR_MAX_LONG` in the source, and a fix applied to one and
+        // not the other is exactly what a single-site test would miss.
+        let with_long = |typeflag: u8, size: u64| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&hdr(b"././@LongLink", typeflag, size, b""));
+            v.extend(data_block(&vec![b'a'; size as usize]));
+            v.extend_from_slice(&hdr(b"f", b'0', 0, b""));
+            v.extend(end_marker());
+            v
+        };
+        for tf in *b"Lx" {
+            // One past the cap is refused on BOTH paths.
+            let e = vet_tar_stream(&mut std::io::Cursor::new(with_long(tf, LONG_CAP + 1)))
+                .expect_err("a long record past the cap must be refused");
+            let txt = format!("{e:?}");
+            assert!(
+                txt.contains("oversized"),
+                "typeflag {}: the refusal must name the size: {txt}",
+                tf as char
+            );
+        }
+        // AT the cap the size check does NOT fire. A `>=` there would refuse a record this vetter
+        // is documented to accept, so the assertion is that the failure - if any - is about
+        // something else entirely, never about the size.
+        for tf in *b"Lx" {
+            let r = vet_tar_stream(&mut std::io::Cursor::new(with_long(tf, LONG_CAP)));
+            if let Err(e) = r {
+                let txt = format!("{e:?}");
+                assert!(
+                    !txt.contains("oversized"),
+                    "typeflag {}: a record AT the cap was refused for its size: {txt}",
+                    tf as char
+                );
+            }
+        }
     }
 
     /// REGRESSION (CRITICAL, hacker-mode audit): a symlink/hardlink/directory header with a LYING

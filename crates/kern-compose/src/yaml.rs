@@ -1405,34 +1405,128 @@ fn parse_inline_list(s: &str) -> Vec<String> {
         .unwrap_or(s);
     split_top_commas(inner)
         .into_iter()
-        .map(|x| scalar_str(&x))
+        .map(scalar_str)
         .filter(|x| !x.is_empty())
         .collect()
 }
 
-/// Split on top-level commas (depth 0, outside quotes) - shared shape with the TOML depends parser.
-fn split_top_commas(s: &str) -> Vec<String> {
+/// Which kind of quoted scalar the scanner is inside, if any.
+///
+/// AN ENUM AND NOT THE QUOTE CHARACTER. The state used to be `Option<char>`, which admits every
+/// `char` in the language while only two are reachable, so the scanner needed a branch for a state
+/// that cannot exist. The two variants also behave DIFFERENTLY, which is the actual reason to name
+/// them: YAML escapes are not one rule.
+#[derive(Clone, Copy)]
+enum Quoted {
+    /// `"…"`: backslash escapes, per YAML 1.2 §5.7.
+    Double,
+    /// `'…'`: no backslash escape exists; `''` is a literal quote.
+    Single,
+}
+
+/// Split on top-level commas: a comma inside a quoted scalar or inside a nested `[...]`/`{...}` does
+/// not split.
+///
+/// ## The defect this replaced
+///
+/// The scanner tracked quotes and NOT escapes. Inside `"…"`, a `\"` was read as the closing quote,
+/// so the scanner believed it had left the string, and the next comma split the value in half.
+///
+/// It reached users through compose healthchecks, where it is expensive: `healthcheck.test` in the
+/// `["CMD-SHELL", "…"]` form is taken as `rest.first()`, so a truncated split silently hands the
+/// health-checker a FRAGMENT of the command. The fragment fails, the service is marked `unhealthy`
+/// forever while answering traffic correctly, and `depends_on: condition: service_healthy` - the one
+/// feature built to trust that verdict - never opens. Measured, two services differing only in the
+/// health string, everything else identical:
+///
+/// ```text
+/// test: ["CMD-SHELL", "exit 0"]                                       -> healthy
+/// test: ["CMD-SHELL", "sh -c \"echo hi, there\" >/dev/null; exit 0"] -> unhealthy
+/// ```
+///
+/// Both commands exit 0. The second contains an escaped quote followed by a comma, which is the
+/// ordinary shape of a Python or shell one-liner, and it is why a simple `pg_isready` check passed
+/// while a real one did not: the difference was never CMD-SHELL.
+///
+/// ## Why the two quote styles are not one rule
+///
+/// YAML gives them different escapes, and treating them alike would trade this defect for another:
+///
+///   * `"…"` takes backslash escapes. `\"` is a quote that does not close, and `\\` is a backslash
+///     that does not escape the character after it.
+///   * `'…'` takes NO backslash escape at all. The single escape is `''`, meaning one literal quote,
+///     and a `\` inside is an ordinary character. Applying backslash logic here would make
+///     `'C:\path\'` swallow the closing quote and run the scan off the end of the value.
+///
+/// `scalar_str` already draws this distinction when it DECODES a scalar; this is the same rule
+/// applied where the scalar's BOUNDARIES are found. The two had to agree and did not.
+///
+/// Returns borrowed slices: the items are handed straight to `trim`/`split_once`/`scalar_str`, all of
+/// which take `&str`, so the owned copy this used to build per item was never read as an owned value.
+fn split_top_commas(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
-    let mut q: Option<char> = None;
+    let mut q: Option<Quoted> = None;
     let mut start = 0usize;
-    for (i, c) in s.char_indices() {
-        if let Some(qc) = q {
-            if c == qc {
-                q = None;
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        match q {
+            Some(Quoted::Double) => {
+                if c == '\\' {
+                    // Consume the escaped character WHOLE. This is what makes `\"` not close the
+                    // scalar, and equally what makes `\\` not turn the next `"` into an escape.
+                    // A trailing lone backslash simply ends the iteration: `next()` yields `None`
+                    // and the loop stops, so there is no index to run past.
+                    let _ = it.next();
+                } else if c == '"' {
+                    q = None;
+                }
             }
-        } else if c == '"' || c == '\'' {
-            q = Some(c);
-        } else if c == '[' || c == '{' {
-            depth += 1;
-        } else if c == ']' || c == '}' {
-            depth -= 1;
-        } else if c == ',' && depth == 0 {
-            out.push(s[start..i].to_string());
-            start = i + 1;
+            Some(Quoted::Single) => {
+                // A LONE `'` CLOSES, AND `''` NEEDS NO SPECIAL CASE HERE - which is not obvious and
+                // is why it is written down rather than left as an omission.
+                //
+                // YAML's only escape inside single quotes is `''`, one literal quote, and the first
+                // version of this consumed the pair to stay inside the scalar. That code could not
+                // change a single answer: `''` is TWO quote characters, so reading it as
+                // close-then-open leaves the scanner inside or outside at exactly the same
+                // positions. Parity is preserved, every split decision is identical, and an
+                // injected removal of it stayed green on 584 constructed inputs because there is
+                // nothing to catch.
+                //
+                // Code that cannot affect the output is code a reader will believe does something,
+                // and the comment on it claimed a correctness it was not providing. The pair DOES
+                // matter where a scalar is DECODED - `scalar_str` turns `''` into `'` - and that is
+                // the function that owns the rule. This one only finds boundaries.
+                if c == '\'' {
+                    q = None;
+                }
+            }
+            None => {
+                if c == '"' {
+                    q = Some(Quoted::Double);
+                } else if c == '\'' {
+                    q = Some(Quoted::Single);
+                } else if c == '[' || c == '{' {
+                    depth += 1;
+                } else if c == ']' || c == '}' {
+                    // CLAMPED AT ZERO. An unmatched closer is malformed input, and letting the
+                    // depth go negative would make every comma after it stop splitting - one stray
+                    // character silently swallowing the rest of the line. Refusing to go below the
+                    // top level costs nothing on well-formed input, where the counter is balanced.
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                } else if c == ',' && depth == 0 {
+                    out.push(&s[start..i]);
+                    // `len_utf8` and not `+ 1`: the comma is one byte, but deriving the step from
+                    // the character is what keeps this correct if the separator ever is not.
+                    start = i + c.len_utf8();
+                }
+            }
         }
     }
-    out.push(s[start..].to_string());
+    out.push(&s[start..]);
     out
 }
 
@@ -2045,17 +2139,23 @@ fn service_to_box(
     //    the entrypoint - so the box would run `/init here` and silently discard `command` (a "runs and
     //    lies" mis-conversion the audit caught). We drop `command` with a warning instead.
     if !entrypoint.is_empty() {
+        // FORWARDED AS AN OVERRIDE, not merged into `command`. The merge produced
+        // `IMAGE_ENTRYPOINT ++ entrypoint ++ command` once the box prepended the image's own, which
+        // is correct only for an image that has none - and an image with one is exactly when a file
+        // writes `entrypoint:`. See `ComposeBox::entrypoint`.
         if entrypoint_is_shell_form {
             if !b.command.is_empty() {
                 warn(&format!(
                     "service '{name}': a shell-form `entrypoint` ignores `command` (Docker semantics) - `command` dropped; use an exec-form (list) entrypoint to pass args"
                 ));
             }
-            b.command = entrypoint;
+            // `command_argv` ALREADY wrapped the shell form as `sh -c "<string>"`, so wrapping it
+            // again here would produce `sh -c sh -c …`. Only `command` is dropped, which is the
+            // Docker rule the warning above states.
+            b.command.clear();
+            b.entrypoint = Some(entrypoint);
         } else {
-            let mut merged = entrypoint;
-            merged.append(&mut b.command);
-            b.command = merged;
+            b.entrypoint = Some(entrypoint);
         }
     }
     Ok(b)
@@ -3113,12 +3213,26 @@ mod tests {
 
     #[test]
     fn entrypoint_and_command_compose_order_independent() {
-        // `entrypoint ++ command`, whichever order the keys appear (the merge must happen AFTER the
-        // whole service is parsed, not inline - else `command` overwrites the merge).
+        // THE TWO ARE NO LONGER MERGED, and the expected outcome changed with that.
+        //
+        // They used to be concatenated into `command`, which the box then prepended the IMAGE's own
+        // entrypoint to: `IMAGE_ENTRYPOINT ++ entrypoint ++ command`, correct only for an image
+        // that has no entrypoint. `entrypoint:` is forwarded as `--entrypoint` now, so it REPLACES
+        // the image's, and `command` stays its argument list.
+        //
+        // What this case guarded is unchanged and still guarded: the assignment must happen AFTER
+        // the whole service is parsed, or a later `command:` key overwrites what the earlier
+        // `entrypoint:` key set. Both key orders are asserted for exactly that.
         let ep_first = "services:\n  a:\n    image: alpine\n    entrypoint: [\"echo\", \"P\"]\n    command: [\"x\", \"y\"]\n";
         let cmd_first = "services:\n  a:\n    image: alpine\n    command: [\"x\", \"y\"]\n    entrypoint: [\"echo\", \"P\"]\n";
         for y in [ep_first, cmd_first] {
-            assert_eq!(boxes(y)[0].command, ["echo", "P", "x", "y"], "for:\n{y}");
+            let b = &boxes(y)[0];
+            assert_eq!(
+                b.entrypoint.as_deref(),
+                Some(&["echo".to_string(), "P".to_string()][..]),
+                "for:\n{y}"
+            );
+            assert_eq!(b.command, ["x", "y"], "for:\n{y}");
         }
     }
 
@@ -3128,13 +3242,30 @@ mod tests {
         // appended - the args would become the shell's positional params and `command` would be
         // silently discarded. Docker ignores `command` for a shell-form entrypoint; so do we (+warn).
         let y = "services:\n  a:\n    image: x\n    entrypoint: /init here\n    command: run now\n";
-        assert_eq!(boxes(y)[0].command, ["sh", "-c", "/init here"]);
-        // EXEC-form (list) entrypoint still composes with command.
+        let b = &boxes(y)[0];
+        assert_eq!(
+            b.entrypoint.as_deref(),
+            Some(&["sh".to_string(), "-c".to_string(), "/init here".to_string()][..])
+        );
+        assert!(
+            b.command.is_empty(),
+            "`command` is dropped, as Docker drops it"
+        );
+        // EXEC-form (list): the entrypoint overrides and `command` remains its arguments.
         let y2 = "services:\n  a:\n    image: x\n    entrypoint: [\"/bin/entry\"]\n    command: [\"arg1\"]\n";
-        assert_eq!(boxes(y2)[0].command, ["/bin/entry", "arg1"]);
-        // Shell-form entrypoint alone (no command) is unchanged.
+        let b2 = &boxes(y2)[0];
+        assert_eq!(
+            b2.entrypoint.as_deref(),
+            Some(&["/bin/entry".to_string()][..])
+        );
+        assert_eq!(b2.command, ["arg1"]);
+        // Shell-form alone: the wrapper `command_argv` built, and NOT a second one on top of it.
         let y3 = "services:\n  a:\n    image: x\n    entrypoint: /init here\n";
-        assert_eq!(boxes(y3)[0].command, ["sh", "-c", "/init here"]);
+        assert_eq!(
+            boxes(y3)[0].entrypoint.as_deref(),
+            Some(&["sh".to_string(), "-c".to_string(), "/init here".to_string()][..]),
+            "a shell form must be wrapped exactly once, never `sh -c sh -c`"
+        );
     }
 
     #[test]
@@ -3484,6 +3615,216 @@ mod tests {
                 boxes(y)[0].health_cmd.as_deref(),
                 Some(expected),
                 "for:\n{y}"
+            );
+        }
+    }
+
+    /// A COMMA INSIDE AN ESCAPED QUOTE MUST NOT SPLIT, and it did.
+    ///
+    /// The scanner tracked quotes and not escapes, so `\"` read as the closing quote and the next
+    /// comma cut the value in half. The cases below are the shapes that reach it from a real file.
+    #[test]
+    fn a_comma_inside_a_quoted_scalar_never_splits_it() {
+        // The exact defect: an escaped quote, then a comma.
+        assert_eq!(
+            split_top_commas(r#""CMD-SHELL", "echo \"hi, there\"""#),
+            vec![r#""CMD-SHELL""#, r#" "echo \"hi, there\"""#]
+        );
+        // An ODD number of escaped quotes was the case that broke; an even number used to
+        // self-correct, which is why this went unnoticed for so long. Both must hold.
+        assert_eq!(
+            split_top_commas(r#""a", "x \" y, z""#),
+            vec![r#""a""#, r#" "x \" y, z""#]
+        );
+        assert_eq!(
+            split_top_commas(r#""a", "x \" y \" z, w""#),
+            vec![r#""a""#, r#" "x \" y \" z, w""#]
+        );
+        // `\\` is a literal backslash, so the `"` after it DOES close the scalar and the comma
+        // after that DOES split. Getting this wrong in the other direction merges two items.
+        assert_eq!(
+            split_top_commas(r#""a\\", "b""#),
+            vec![r#""a\\""#, r#" "b""#]
+        );
+        // A plain comma inside quotes, no escapes involved.
+        assert_eq!(
+            split_top_commas(r#""a,b", "c""#),
+            vec![r#""a,b""#, r#" "c""#]
+        );
+    }
+
+    /// SINGLE QUOTES TAKE NO BACKSLASH ESCAPE, and treating them like double quotes would be a
+    /// second defect wearing the first one's clothes.
+    ///
+    /// YAML 1.2 gives `'…'` exactly one escape, `''`, meaning a literal quote. A backslash inside is
+    /// an ordinary character, so a Windows path ending in one must not swallow the closing quote.
+    #[test]
+    fn single_quotes_follow_yamls_rule_and_not_the_double_quoted_one() {
+        // `''` is a literal quote and does NOT close: the comma stays inside.
+        assert_eq!(
+            split_top_commas("'a''b, c', 'd'"),
+            vec!["'a''b, c'", " 'd'"]
+        );
+        // A backslash is ORDINARY here. If it were treated as an escape, the closing quote would be
+        // consumed and the following comma would stop splitting.
+        assert_eq!(
+            split_top_commas(r"'C:\path\', 'next'"),
+            vec![r"'C:\path\'", " 'next'"]
+        );
+        // And a double quote inside single quotes is just a character.
+        assert_eq!(
+            split_top_commas(r#"'say "hi, x"', 'b'"#),
+            vec![r#"'say "hi, x"'"#, " 'b'"]
+        );
+    }
+
+    /// THE SCANNER MUST NOT PANIC OR RUN PAST THE END ON MALFORMED INPUT.
+    ///
+    /// A compose file is third-party text. Every shape here is one a hostile or merely broken file
+    /// can contain, and none of them may abort the parse or lose the rest of the line.
+    #[test]
+    fn the_scanner_is_total_on_malformed_input() {
+        // A trailing lone backslash inside a string: the escape has nothing to consume.
+        assert_eq!(split_top_commas(r#""a\"#), vec![r#""a\"#]);
+        assert_eq!(split_top_commas(r#""a", "b\"#), vec![r#""a""#, r#" "b\"#]);
+        // An unterminated string swallows the rest, which is what a quote means.
+        assert_eq!(split_top_commas(r#""a, b"#), vec![r#""a, b"#]);
+        assert_eq!(split_top_commas("'a, b"), vec!["'a, b"]);
+        // AN UNMATCHED CLOSER MUST NOT POISON THE REST OF THE LINE. Without the clamp the depth
+        // goes negative and every later comma stops splitting: one stray character silently
+        // swallowing everything after it.
+        assert_eq!(split_top_commas("a], b, c"), vec!["a]", " b", " c"]);
+        assert_eq!(split_top_commas("a}, b"), vec!["a}", " b"]);
+        // Nesting still suppresses splitting at depth.
+        assert_eq!(split_top_commas("a, [b, c], d"), vec!["a", " [b, c]", " d"]);
+        assert_eq!(
+            split_top_commas("{k: 1, j: 2}, x"),
+            vec!["{k: 1, j: 2}", " x"]
+        );
+        // Degenerate inputs.
+        assert_eq!(split_top_commas(""), vec![""]);
+        assert_eq!(split_top_commas(","), vec!["", ""]);
+        assert_eq!(split_top_commas("a,"), vec!["a", ""]);
+        // Multi-byte characters on both sides of a separator: the byte offsets must land on
+        // character boundaries or the slicing panics.
+        assert_eq!(split_top_commas("caffè, però"), vec!["caffè", " però"]);
+        assert_eq!(
+            split_top_commas(r#""caffè \" x, y", "però""#),
+            vec![r#""caffè \" x, y""#, r#" "però""#]
+        );
+    }
+
+    /// A DETERMINISTIC SWEEP WHOSE GROUND TRUTH COMES FROM CONSTRUCTION.
+    ///
+    /// `split_top_commas` is a hand-written parser over a format with quotes and escapes, and the
+    /// defect it shipped with - `\"` read as a closing quote - is the same family as a size parser
+    /// accepting a value it then mis-reads: output that does not correspond to input. The cases
+    /// above cover the shapes somebody thought of; this covers the combinations nobody did.
+    ///
+    /// ## The property this does NOT use, and why
+    ///
+    /// The first version of this asserted that the pieces rejoined with commas reproduce the input.
+    /// It passed. It also passed with the depth counter removed, with the escape handling removed,
+    /// and with the scanner advancing by one byte instead of one character - THREE injected defects,
+    /// three greens. The property is a tautology for a comma splitter: rejoining with commas
+    /// rebuilds the input wherever you split, so it constrains nothing about the decision being
+    /// made. A sweep of 2801 inputs that cannot fail is worth less than one case that can.
+    ///
+    /// ## What replaces it
+    ///
+    /// The inputs are BUILT from atoms whose answer is known by construction: each atom is a string
+    /// that contains no top-level comma, so joining N of them with commas must return exactly those
+    /// N atoms. No oracle to write, nothing circular, and the assertion is about WHICH commas split
+    /// rather than about the bytes surviving. Every atom below carries the feature that decides the
+    /// scanner's state, and a comma hidden behind it.
+    #[test]
+    fn only_top_level_commas_split_over_every_combination_of_atoms() {
+        // Each atom contains a comma that must NOT split, behind a different mechanism.
+        const ATOMS: &[&str] = &[
+            "\"a,b\"",        // a comma inside double quotes
+            "'c,d'",          // a comma inside single quotes
+            "[1, 2]",         // a comma inside brackets
+            "{k: 1, j: 2}",   // a comma inside braces
+            r#""x\", y""#,    // a comma after an ESCAPED quote: the defect that shipped
+            "'p''q, r'",      // a comma after `''`, the only escape single quotes have
+            r"'C:\path\, x'", // a backslash inside single quotes is ORDINARY, not an escape
+            "plain",          // no mechanism at all
+            "caffè, però",    // multi-byte on both sides of a comma... which DOES split
+        ];
+        // The last atom is the exception and is handled apart: it has a top-level comma on purpose,
+        // to prove the sweep is not simply refusing to split anything.
+        let safe = &ATOMS[..ATOMS.len() - 1];
+
+        let mut checked = 0usize;
+        for len in 1..=3usize {
+            let total = safe.len().pow(len as u32);
+            for n in 0..total {
+                let mut chosen: Vec<&str> = Vec::with_capacity(len);
+                let mut rest = n;
+                for _ in 0..len {
+                    chosen.push(safe[rest % safe.len()]);
+                    rest /= safe.len();
+                }
+                let input = chosen.join(",");
+                let got = split_top_commas(&input);
+                assert_eq!(
+                    got, chosen,
+                    "input {input:?} split at a comma that is not top-level"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked,
+            8 + 64 + 512,
+            "the sweep did not cover what it claims to: a sweep that shrinks silently stops finding things"
+        );
+
+        // THE CONTROL IN THE OTHER DIRECTION. Without this the whole case would pass against a
+        // scanner that never splits at all, which is the mirror of the tautology it replaced.
+        assert_eq!(split_top_commas("caffè, però"), vec!["caffè", " però"]);
+        assert_eq!(split_top_commas("a,b,c"), vec!["a", "b", "c"]);
+        assert_eq!(
+            split_top_commas(r#""a,b",plain,[1, 2]"#),
+            vec!["\"a,b\"", "plain", "[1, 2]"]
+        );
+    }
+
+    /// THE DEFECT AS A USER MEETS IT: through `healthcheck.test`.
+    ///
+    /// `CMD-SHELL` takes `rest.first()`, so a split in the wrong place hands the health-checker a
+    /// FRAGMENT. The service then reads `unhealthy` forever while answering correctly, and
+    /// `depends_on: condition: service_healthy` never opens. This asserts the whole command
+    /// survives, which is the property that matters rather than the splitting itself.
+    #[test]
+    fn a_healthcheck_command_survives_its_own_quoting() {
+        let cases = [
+            (
+                "services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD-SHELL\", \"sh -c \\\"echo hi, there\\\" >/dev/null; exit 0\"]\n",
+                "sh -c \"echo hi, there\" >/dev/null; exit 0",
+            ),
+            // The reporter's shape: a Python one-liner, which carries both an escaped quote and the
+            // comma of an `import a,b`.
+            (
+                "services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD-SHELL\", \"python -c \\\"import sys,os; sys.exit(0)\\\"\"]\n",
+                "python -c \"import sys,os; sys.exit(0)\"",
+            ),
+            // And the simple form that already worked, so a fix that broke it would show here.
+            (
+                "services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U postgres\"]\n",
+                "pg_isready -U postgres",
+            ),
+            // Exec form with a comma in an argument.
+            (
+                "services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD\", \"sh\", \"-c\", \"echo a,b\"]\n",
+                "sh -c echo a,b",
+            ),
+        ];
+        for (y, expected) in cases {
+            assert_eq!(
+                boxes(y)[0].health_cmd.as_deref(),
+                Some(expected),
+                "the health command was truncated for:\n{y}"
             );
         }
     }

@@ -6,11 +6,32 @@
 //! byte - comments, blank lines, unknown `[gpu]`/`[intelligence]` sections - exactly as it was.
 //!
 //! A "block" is a `[[<header>]]` line and every line after it up to (but not including) the next line
-//! that starts a new `[table]`/`[[array]]`, or end of file. A block is matched by its `name = "…"`.
+//! that starts a new `[table]`/`[[array]]`, or end of file. A block is matched by its identity key,
+//! which is `name = "…"` on a profile and `id = "…"` on a physical block.
 
-/// The value of `name = "…"` on a block header line's body, if this trimmed line is a `name` key.
+/// The value of a block's IDENTITY key, if this trimmed line carries one.
+///
+/// TWO KEYS, BECAUSE THE FILE HAS TWO CONVENTIONS. A profile block identifies itself with
+/// `name = "…"`; a PHYSICAL block (`[[cpu]]`, `[[gpu]]`, `[[disk]]`, `[[gpio]]`) identifies itself
+/// with `id = "…"`. This function used to know only about `name`, which meant every lookup of a
+/// physical block answered "not there" no matter what the file said. It went unnoticed while nothing
+/// looked one up; the moment `config add` started materialising the physical block, the miss became
+/// visible in the worst shape available:
+///
+///     $ kern config add vcpu:a --cpus 1        # into a file that already declares [[cpu]] cpu:0
+///     error: refusing to write: two [[cpu]] entries share `id = "cpu:0"`
+///
+/// The lookup said absent, a second block was appended, and the whole-file parse guard caught the
+/// duplicate and refused the write. Adding a profile to a config that already declared its hardware
+/// failed outright. The guard doing its job is why this cost an error and not a corrupted file.
+///
+/// If a block carries both keys the first one wins, which is the same rule that already applied when
+/// only `name` was read: `find_block` takes the first match it sees walking the block down.
 fn name_value(trimmed: &str) -> Option<&str> {
-    let rest = trimmed.strip_prefix("name")?.trim_start();
+    let rest = trimmed
+        .strip_prefix("name")
+        .or_else(|| trimmed.strip_prefix("id"))?
+        .trim_start();
     let rest = rest.strip_prefix('=')?.trim();
     // The value may be followed by an inline comment (`name = "heavy"   # …`) - the starter config from
     // `kern config setup` writes exactly that. Take the QUOTED span (up to the closing quote), not
@@ -206,6 +227,31 @@ mod tests {
         assert_eq!(name_value("name='db'"), Some("db"));
         assert_eq!(name_value("nickname = \"x\""), None);
         assert_eq!(name_value("cpus = \"0-3\""), None);
+    }
+
+    /// A PHYSICAL BLOCK IS FOUND BY ITS `id`, and it was not.
+    ///
+    /// Reproduces exactly what the live audit hit: a config that already declares `[[cpu]] cpu:0`,
+    /// then `kern config add vcpu:a`. The lookup answered "absent", a second `[[cpu]]` was appended,
+    /// and the whole-file parse guard refused the write with "two [[cpu]] entries share id".
+    /// Declaring the hardware first made adding a profile fail.
+    #[test]
+    fn a_physical_block_is_found_by_its_id() {
+        let raw = "[[cpu]]\nid = \"cpu:0\"\ncores = 8\n\n[[disk]]\nid = \"d0\"\npath = \"/\"\n";
+        assert!(block_exists(raw, "cpu", "cpu:0"));
+        assert!(block_exists(raw, "disk", "d0"));
+        assert!(!block_exists(raw, "cpu", "cpu:1"));
+        assert!(!block_exists(raw, "gpio", "cpu:0")); // right id, wrong section
+                                                      // The identity keys do not leak into each other: an `id` does not answer a `name` lookup on
+                                                      // a different block, because the section is matched first.
+        assert!(!block_exists("[[vcpu]]\nname = \"a\"\n", "cpu", "a"));
+        // A key that merely STARTS with `id` is not an identity key.
+        assert_eq!(name_value("identity = \"x\""), None);
+        assert_eq!(name_value("ids = \"x\""), None);
+        assert_eq!(
+            name_value(r#"id = "cpu:0"   # the whole host"#),
+            Some("cpu:0")
+        );
     }
 
     #[test]

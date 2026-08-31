@@ -214,6 +214,12 @@ pub struct BoxRunArgs<'a> {
     /// `--pull <missing|never|always>`: registry-image fetch policy (see [`PullPolicy`]).
     pub pull: PullPolicy,
     pub command: &'a [String],
+    /// `--entrypoint` (repeatable): REPLACE the image's `ENTRYPOINT`, per Docker.
+    ///
+    /// `None` = absent, the image's entrypoint stands. `Some(list)` replaces it AND discards the
+    /// image's `CMD`, because that default belonged to the entrypoint being replaced.
+    /// `Some(empty)` clears it. See [`crate::commands::resolve_image_command`].
+    pub entrypoint: Option<&'a [String]>,
     pub detached: bool,
     pub read_only: bool,
     pub volumes: &'a [String],
@@ -397,10 +403,23 @@ fn host_cpu_count() -> usize {
 /// Clamp a `--cpus` request to the host's physical CPU count (from `/proc/cpuinfo`), so the cap
 /// is consistent across the systemd scope AND the in-namespace cgroup. The warning fires once - in
 /// the original process, before the scope re-exec (which sets `KERN_SCOPE`) runs the parse again.
+/// Is a `--cpus` request above what the machine has?
+///
+/// Extracted so the boundary can be asserted. Inside `clamp_cpus` it could not be: at `c == host`
+/// the clamped result and the unclamped one are the SAME NUMBER, so a mutation from `>` to `>=`
+/// leaves the return value untouched and changes only the warning - which then tells the operator
+/// that 28 CPUs "exceeds the 28 available". A false message is the whole observable difference, and
+/// a test on the return value cannot see it.
+///
+/// Equality is NOT above: asking for exactly the machine is asking for the machine.
+fn cpus_exceed_host(requested: f64, host: f64) -> bool {
+    requested > host
+}
+
 fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
     let c = cpus?;
     let host = host_cpu_count() as f64;
-    if c > host {
+    if cpus_exceed_host(c, host) {
         if std::env::var_os("KERN_SCOPE").is_none() {
             eprintln!(
                 "kern: --cpus {c} exceeds the {host:.0} available CPUs - clamping to {host:.0}"
@@ -1227,7 +1246,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
                     .and_then(|()| std::fs::write(etc.join("resolv.conf"), conf));
                 if let Err(e) = placed {
                     eprintln!(
-                        "kern: warning: could not place /etc/resolv.conf in the box: {e} -                          name resolution will not work inside it (literal IPs still do)"
+                        "kern: warning: could not place /etc/resolv.conf in the box: {e} - \
+                         name resolution will not work inside it (literal IPs still do)"
                     );
                 }
             }
@@ -2938,7 +2958,14 @@ fn verify_download_checksum(path: &std::path::Path, checksum: &str) -> Result<()
 /// opaque was honoured). `_exit(0)` iff hidden; any other path `_exit`s non-zero. Async-signal-safe until
 /// the `system()` - acceptable here (single-threaded at fork, like `merged_view_child`).
 unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: libc::gid_t) -> ! {
-    let cs = |p: String| std::ffi::CString::new(p).unwrap();
+    // A path with an interior NUL cannot name a file, and this ran inside a FORKED CHILD where a
+    // panic is not a clean error: unwinding past a `-> !` in a half-set-up namespace is the worst
+    // place in this codebase to abort. The child has an exit-code protocol already, so a path it
+    // cannot express is one more code, and the parent reads it like any other refusal.
+    let cs = |p: String| match std::ffi::CString::new(p) {
+        Ok(c) => c,
+        Err(_) => libc::_exit(19),
+    };
     if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
         libc::_exit(11);
     }
@@ -3690,13 +3717,17 @@ fn check_pod_global_conflicts(
     if no_pod || boxes.len() < 2 {
         return Ok(());
     }
-    let short = |b: &crate::compose::ComposeBox| b.name.clone();
+    // THE NAME THE FILE USES, which is what a reader compares a refusal against. One definition, in
+    // `ComposeBox::service_name`, and it borrows: quoting a service in an error allocates nothing.
+    let short = crate::compose::ComposeBox::service_name;
 
     // 1. INTERNAL ports. Two services listening on the same box port share one namespace: one binds,
     //    the other dies with EADDRINUSE. Common by default, not by accident - every framework has one
     //    canonical port (Node 3000, Flask 5000, Spring 8080), so two services of the same stack
     //    routinely want the same one even when their PUBLISHED ports differ.
-    let mut seen: std::collections::HashMap<(u16, bool), String> = std::collections::HashMap::new();
+    // Borrowed: `boxes` outlives this scan, so recording a name here allocates nothing. It held
+    // owned `String`s cloned once per port per service, for values that never leave this function.
+    let mut seen: std::collections::HashMap<(u16, bool), &str> = std::collections::HashMap::new();
     for b in boxes {
         // A declared `port` counts exactly like a published mapping's container port, and is the only
         // way an INTERNAL-only service (reached by name, publishing nothing) becomes visible here at
@@ -3719,7 +3750,7 @@ fn check_pod_global_conflicts(
                 }))
         {
             if let Some(other) = seen.insert((port, udp), short(b)) {
-                if other != b.name {
+                if other != b.service_name() {
                     let proto = if udp { "udp" } else { "tcp" };
                     return Err(Error::Compose(format!(
                         "services '{}' and '{}' both listen on container port {port}/{proto}. Services \
@@ -3752,7 +3783,7 @@ fn check_pod_global_conflicts(
                     )));
                 }
             } else {
-                sys.insert(k.to_string(), (v.to_string(), short(b)));
+                sys.insert(k.to_string(), (v.to_string(), short(b).to_string()));
             }
         }
     }
@@ -3937,7 +3968,8 @@ fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Err
     let mut slots: std::collections::HashMap<(u16, bool), PortSlot> =
         std::collections::HashMap::new();
     for b in boxes {
-        let name = b.name.as_str();
+        // The name the file uses, for the same reason as in `check_pod_global_conflicts`.
+        let name = b.service_name();
         for spec in &b.ports {
             let Some(pms) = crate::ports::parse(spec) else {
                 continue;
@@ -4058,14 +4090,43 @@ fn run_terminal_verb(
             println!("compose config: {} service(s) in {file}", boxes.len());
             // `config` reports the FILE, so it prints service names as written, not the
             // project-scoped box names the runtime uses.
+            //
+            // THE SERVICE NAME COMES FROM THE FIELD THAT KEPT IT, not from stripping a prefix off
+            // the box name. Stripping worked for the default `<project>-<service>` form and did
+            // nothing at all when a `container_name` replaced it, so the line printed the container
+            // name while the comment above claimed it printed service names. A field report read
+            // that output, concluded kern had replaced the service hostname, and removed four
+            // `container_name` keys from a working file over it. Peers resolve by service name
+            // either way - the alias is registered at bring-up - so the output was the entire
+            // defect. `short` remains for a box that never went through the rewrite.
             let short = |n: &str| n.strip_prefix(&format!("{pod}-")).unwrap_or(n).to_string();
+            // BOX NAME BACK TO THE FILE'S NAME, for the dependency edges. Those are rewritten onto
+            // box names at parse time so everything downstream agrees on one set of names, which is
+            // right for the runtime and wrong for this view: `config` reports the FILE, and the file
+            // writes `depends_on: [keycloak]`, not `depends_on: [myapp-keycloak]`. Printing the box
+            // name here is the same defect this line already had for the service name itself, one
+            // row further down. Built once, outside the loop: it is a scan over every box.
+            let service_of: std::collections::HashMap<&str, &str> = boxes
+                .iter()
+                .map(|b| (b.name.as_str(), b.service_name()))
+                .collect();
             for b in boxes.iter().filter(|b| selected(b)) {
                 let src = b
                     .image
                     .as_deref()
                     .or(b.rootfs.as_deref())
                     .unwrap_or("(build)");
-                println!("  {}  image={src}", short(&b.name));
+                let svc = b.service_name().to_string();
+                // The box name is shown only when it is NOT derivable from the service name, which
+                // is exactly when a `container_name` set it. Printing `box=<project>-<service>` on
+                // every line would be noise, and noise is how a reader stops reading the line that
+                // matters.
+                let boxed = if b.name == svc || b.name == format!("{pod}-{svc}") {
+                    String::new()
+                } else {
+                    format!("  box={}", b.name)
+                };
+                println!("  {svc}  image={src}{boxed}");
                 if !b.ports.is_empty() {
                     println!("    ports: {}", b.ports.join(", "));
                 }
@@ -4096,7 +4157,19 @@ fn run_terminal_verb(
                         .collect();
                     println!("    expose: {} (reserved in the pod)", list.join(", "));
                 }
-                let deps: Vec<String> = b.all_deps().into_iter().map(short).collect();
+                // Through the reverse map first; `short` remains the fallback for an edge onto a
+                // service that is not in this file, where there is no service name to recover and
+                // the scoped form is all there is.
+                let deps: Vec<String> = b
+                    .all_deps()
+                    .into_iter()
+                    .map(|d| {
+                        service_of
+                            .get(d)
+                            .map(|s| (*s).to_string())
+                            .unwrap_or_else(|| short(d))
+                    })
+                    .collect();
                 if !deps.is_empty() {
                     println!("    depends_on: {}", deps.join(", "));
                 }
@@ -4302,21 +4375,31 @@ fn parse_profile_token(token: &str, usage: &'static str) -> Result<(String, Stri
 /// clobber an existing one unless `--force`).
 /// The host's resource inventory - `config probe` prints it; `config setup` seeds a kern.toml whose
 /// example profiles already fit THIS machine (real core count / cpuset range / i2c buses).
-struct HostInv {
-    ncpu: usize,
-    ram: String,
-    disks: Vec<DiskInfo>, // physical block devices (whole disks, not partitions)
-    gpiochips: Vec<String>, // short names, e.g. "gpiochip0"
-    i2c: Vec<String>,     // "i2c-0", …
-    spi: Vec<String>,     // "spidev0.0", …
+pub(crate) struct HostInv {
+    pub(crate) ncpu: usize,
+    /// Total RAM in BYTES, or `None` when `/proc/meminfo` could not be read.
+    ///
+    /// BYTES AND NOT A DISPLAY STRING, which is what this used to hold. A humanised `"31.2G"` is
+    /// lossy and, worse, is not a size this project's parser reads back, so the one caller that
+    /// needed to WRITE the figure into a config could not have used it without generating a file
+    /// `kern validate` refuses. The measurement is kept as a number and formatted at each use.
+    pub(crate) ram_bytes: Option<u64>,
+    /// Total bytes of the filesystem backing `/`, which is where a `[[vdisk]]` volume lands.
+    pub(crate) root_total: Option<u64>,
+    /// The whole disk backing `/`, resolved rather than guessed from the order of `/sys/block`.
+    pub(crate) root_dev: Option<String>,
+    pub(crate) disks: Vec<DiskInfo>, // physical block devices (whole disks, not partitions)
+    pub(crate) gpiochips: Vec<String>, // short names, e.g. "gpiochip0"
+    pub(crate) i2c: Vec<String>,     // "i2c-0", …
+    pub(crate) spi: Vec<String>,     // "spidev0.0", …
 }
 
 /// A physical disk from `/sys/block`, for `kern probe` and the `[[disk]]` example in `config setup`.
-struct DiskInfo {
-    name: String, // "nvme0n1", "sda"
-    size: u64,    // bytes
-    ssd: bool,    // rotational == 0
-    model: String,
+pub(crate) struct DiskInfo {
+    pub(crate) name: String, // "nvme0n1", "sda"
+    size: u64,               // bytes
+    ssd: bool,               // rotational == 0
+    pub(crate) model: String,
 }
 
 /// Whole physical disks from `/sys/block`, sorted by name. Skips virtual/loop/ram/dm/optical devices
@@ -4359,11 +4442,13 @@ fn read_disks() -> Vec<DiskInfo> {
     out
 }
 
-fn detect_host() -> HostInv {
+pub(crate) fn detect_host() -> HostInv {
     let ncpu = std::fs::read_to_string("/proc/cpuinfo")
         .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
         .unwrap_or(0);
-    let ram = std::fs::read_to_string("/proc/meminfo")
+    // MemTotal is in kibibytes by kernel contract. The multiplication is checked because the value
+    // is external input and a wrapped total would be written into a config as a budget.
+    let ram_bytes = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {
             s.lines()
@@ -4371,8 +4456,8 @@ fn detect_host() -> HostInv {
                 .and_then(|v| v.split_whitespace().next())
                 .and_then(|kb| kb.parse::<u64>().ok())
         })
-        .map(|kb| human_bytes(kb * 1024))
-        .unwrap_or_else(|| "?".into());
+        .and_then(|kb| kb.checked_mul(1024))
+        .filter(|b| *b > 0);
     let mut dev: Vec<String> = std::fs::read_dir("/dev")
         .map(|rd| {
             rd.flatten()
@@ -4385,7 +4470,9 @@ fn detect_host() -> HostInv {
         |pat: &str| -> Vec<String> { dev.iter().filter(|n| n.starts_with(pat)).cloned().collect() };
     HostInv {
         ncpu,
-        ram,
+        ram_bytes,
+        root_total: fs_usage("/").map(|(_used, total)| total).filter(|t| *t > 0),
+        root_dev: disk_backing("/"),
         disks: read_disks(),
         gpiochips: by("gpiochip"),
         i2c: by("i2c-"),
@@ -4397,6 +4484,240 @@ fn detect_host() -> HostInv {
 /// `/sys/block` parsing lives in one place ([`read_disks`]).
 pub(crate) fn host_disks() -> Vec<String> {
     read_disks().iter().map(disk_label).collect()
+}
+
+/// `(used, total)` bytes of the filesystem backing `path`, or `None` when it cannot be measured.
+///
+/// `used` is blocks minus free, which is what `df` reports and is NOT the same as total minus
+/// available: the reserve a filesystem keeps for root belongs to neither side, and reporting it as
+/// free would overstate what a workload can actually write.
+///
+/// One implementation, because `kern top` and `config setup` were both going to want it and a second
+/// copy is how the two would come to disagree about the same disk on the same screen.
+pub(crate) fn fs_usage(path: &str) -> Option<(u64, u64)> {
+    // A path with an interior NUL cannot name a file, so this is a refusal and not an error.
+    let c = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `libc::statvfs` is a `repr(C)` aggregate of unsigned integers, for which the all-zero
+    // bit pattern is valid and inhabited. No field is read before the call below reports success.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` owns a NUL-terminated buffer that outlives the call, and `st` is a live, fully
+    // zeroed `statvfs` that the kernel only writes through this pointer. The return code is checked
+    // before either field is read.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let bs = st.f_frsize as u64;
+    let blocks = st.f_blocks as u64;
+    // CHECKED AND NOT WRAPPING. `f_blocks * f_frsize` is a product of two kernel-supplied numbers,
+    // and a filesystem that reports nonsense (a fuse mount is free to) must yield "unmeasurable"
+    // rather than a small wrapped total, because a small total here becomes a DECLARED BUDGET.
+    let total = blocks.checked_mul(bs)?;
+    let used = blocks
+        .saturating_sub(st.f_bfree as u64)
+        .checked_mul(bs)
+        .unwrap_or(total);
+    Some((used, total))
+}
+
+/// The kernel name of the whole disk backing `path` (`"nvme1n1"`), or `None` when it does not resolve.
+///
+/// ## Why this exists
+///
+/// `config setup` wrote `device = <the first entry of /sys/block, alphabetically>` next to
+/// `path = "/"`. Measured on the development host: `/` lives on `nvme1n1` and the generated config
+/// named `nvme0n1`, a different physical disk. Nothing reads that field today, so it cost nothing so
+/// far; it stops being free the moment a measured SIZE is written beside it, because a reader has no
+/// way to tell that the number and the name came from different disks.
+///
+/// ## How
+///
+/// `/proc/self/mountinfo` gives the `major:minor` of each mount, and the mount that backs a path is
+/// the longest mount point that is a prefix of it. `/sys/dev/block/<major>:<minor>` then resolves to
+/// the partition, whose parent directory is the whole disk. No subprocess and no `dev_t` bit
+/// arithmetic: the numbers are already text in `mountinfo`, and taking them from there avoids
+/// depending on an encoding that differs between libc versions.
+fn disk_backing(path: &str) -> Option<String> {
+    let mi = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mi.lines() {
+        // `36 35 98:0 / /mnt rw,… - ext4 /dev/sda1 rw`: field 2 is major:minor, field 4 the mount
+        // point. A line that does not have them is skipped rather than aborting the scan, because
+        // one unparsable mount must not blind this to every other one.
+        let mut f = line.split(' ');
+        let (Some(devno), Some(_root), Some(mount)) = (f.nth(2), f.next(), f.next()) else {
+            continue;
+        };
+        let mount = unescape_mountinfo(mount);
+        if !mount_covers(path, &mount) {
+            continue;
+        }
+        // The LAST longest match wins: mountinfo is in mount order, so a later line covering the
+        // same point is the one currently on top of it.
+        if best.as_ref().is_none_or(|(len, _)| mount.len() >= *len) {
+            best = Some((mount.len(), devno.to_string()));
+        }
+    }
+    let (_, devno) = best?;
+    let node = std::path::Path::new("/sys/dev/block").join(&devno);
+    let link = std::fs::read_link(&node).ok()?;
+    let mut parts = link.components().rev().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    let leaf = parts.next()?;
+    // `partition` exists only on a partition, so its presence is what says to climb one level to the
+    // whole disk. A whole-disk mount (an unpartitioned device, or LVM) has no such file and is
+    // already the answer.
+    if node.join("partition").exists() {
+        return parts.next().map(str::to_string);
+    }
+    Some(leaf.to_string())
+}
+
+/// Does the mount point `mount` contain `path`?
+///
+/// A PREFIX IN PATH TERMS AND NOT IN STRING TERMS. `"/variable".starts_with("/var")` is true and
+/// `/var` does not contain `/variable`: they are sibling directories. A plain string prefix would
+/// pick the wrong mount for any path whose name extends another mount's, and the wrong mount means
+/// the wrong device number, which means a measured budget attributed to a disk that does not hold
+/// the data. Extracted from the scan so the rule can be asserted without a filesystem.
+pub(crate) fn mount_covers(path: &str, mount: &str) -> bool {
+    if path == mount {
+        return true;
+    }
+    // The root contains everything absolute, and it is the one mount whose name ends in a separator,
+    // so the boundary test below would look for a second one.
+    if mount == "/" {
+        return path.starts_with('/');
+    }
+    // A trailing separator on the mount would otherwise make the boundary byte fall one place late.
+    let mount = mount.strip_suffix('/').unwrap_or(mount);
+    path.starts_with(mount) && path.as_bytes().get(mount.len()) == Some(&b'/')
+}
+
+/// Undo the four escapes the kernel writes into `mountinfo` fields.
+///
+/// Only these four are escaped by `seq_path` in the kernel: space, tab, newline and backslash. A
+/// mount point containing one of them is rare and entirely legal, and reading it raw would compare
+/// `\040` against a real space and silently fail to match.
+pub(crate) fn unescape_mountinfo(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // COMPARED AS BYTES, NOT AS A STRING SLICE. The first draft matched `&s[i..i + 4]`, and
+        // slicing a `String` at an index that is not a UTF-8 boundary PANICS. `i` sits on a
+        // backslash, which is a boundary, but `i + 4` need not be: `/mnt/\04è` puts the end of the
+        // window in the middle of the two-byte `è`, and that input panics. Verified by running it.
+        //
+        // A mount point is attacker-influenceable on any host where a user may mount, so a panic
+        // here is reachable from outside. Byte slices have no boundaries to violate, so the check
+        // below cannot panic for any input at all.
+        if b[i] == b'\\' && i + 3 < b.len() {
+            let w = &b[i..i + 4];
+            let decoded = match w {
+                b"\\040" => Some(' '),
+                b"\\011" => Some('\t'),
+                b"\\012" => Some('\n'),
+                b"\\134" => Some('\\'),
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                i += 4;
+                continue;
+            }
+        }
+        // Not an escape: copy the character whole, so a multi-byte one is not split.
+        match s[i..].chars().next() {
+            Some(ch) => {
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Can this process open `path` for reading AND writing?
+///
+/// Used to choose which peripheral a generated example names. A `[[vgpio]]` that lists a node the
+/// caller cannot open is refused help by `kern validate`, which warns on exactly this, so a starter
+/// file that names an unopenable bus warns about itself the first time it is checked. Probing with
+/// `access(2)` and not by opening: opening an i2c bus is a bus transaction, and a config generator
+/// has no business driving hardware.
+///
+/// A false answer is the safe one here: it only moves the choice to another bus, or to the comment.
+fn can_use(path: &str) -> bool {
+    let Ok(c) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    // SAFETY: `c` owns a NUL-terminated buffer that outlives the call. `access` only reads it.
+    unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) == 0 }
+}
+
+/// A byte count rendered as a size string [`kern_common::parse_binary_size`] reads back, never above
+/// the input, or `None` for a count that cannot be written as one.
+///
+/// ## Why not `fmt_bytes`
+///
+/// `fmt_bytes` is the DISPLAY convention and it emits one decimal place for anything that is not an
+/// exact multiple: this host's 31.2 GiB of RAM renders `31.2G`. The parser deliberately refuses a
+/// decimal, so writing a measured budget through the display formatter would have generated a
+/// `kern.toml` that `kern validate` REJECTS. That is the same defect as a command that emits config
+/// its own validator turns down, which is the one this work exists to remove.
+///
+/// ## Why it may only round DOWN
+///
+/// The value becomes a declared budget, and a budget larger than the machine would make the
+/// over-budget check silent on a profile that really does overrun: the check compares against this
+/// number, so an optimistic number disables it. Rounding down can only make the check fire earlier,
+/// which is the harmless direction.
+///
+/// Exact whenever the count divides a unit evenly, which every RAM figure in mebibytes does; the
+/// floor is to MEBIBYTES, so the most it can understate a budget by is one MiB.
+/// `value` pulled into `[low, high]`, total for every input.
+///
+/// `u64::clamp` is the idiomatic spelling and it PANICS when `low > high`. The bounds at every call
+/// site here are compile-time constants in the right order, so that branch is unreachable today, and
+/// "unreachable today" is exactly the shape of a panic that ships. An inverted range resolves to the
+/// CEILING rather than aborting, because every caller is sizing a budget and the ceiling is the bound
+/// whose violation has a consequence: too small only makes a warning fire early.
+pub(crate) const fn bounded(value: u64, low: u64, high: u64) -> u64 {
+    if high < low {
+        return high;
+    }
+    if value < low {
+        low
+    } else if value > high {
+        high
+    } else {
+        value
+    }
+}
+
+pub(crate) fn toml_size(bytes: u64) -> Option<String> {
+    const K: u64 = 1024;
+    // `parse_binary_size` refuses zero, so there is no string that round-trips to it. Saying so is
+    // the honest answer: a zero-byte budget is a resource nobody can slice, and the caller omits the
+    // field rather than writing something the parser will not take back.
+    if bytes == 0 {
+        return None;
+    }
+    for (unit, sz) in [("t", K.pow(4)), ("g", K.pow(3)), ("m", K.pow(2)), ("k", K)] {
+        if bytes >= sz && bytes % sz == 0 {
+            return Some(format!("{}{unit}", bytes / sz));
+        }
+    }
+    if bytes >= K * K {
+        return Some(format!("{}m", bytes / (K * K)));
+    }
+    // Under a mebibyte a bare integer is exact, and the parser reads a trailing digit as bytes.
+    Some(format!("{bytes}"))
 }
 
 /// One-line label for a disk in `kern probe`: `nvme0n1  931G  SSD (Samsung 980)`.
@@ -4412,44 +4733,187 @@ fn disk_label(d: &DiskInfo) -> String {
 
 /// A ready-to-use kern.toml whose example profiles use THIS host's real numbers (so a beginner can
 /// `kern run vcpu:heavy` straight away, no guessing). Only includes a GPIO block if the host has one.
-fn tailored_kern_toml(h: &HostInv) -> String {
+///
+/// ## The physical blocks carry MEASURED budgets
+///
+/// `[[cpu]]` declared `cores` and nothing else; `[[disk]]` declared neither a size nor the disk it
+/// actually sits on. That made the over-budget check in `kern validate` structurally silent on every
+/// file this command generates, because that check compares a profile against the budget its backend
+/// declares and there was no budget to compare against. The numbers were available the whole time:
+/// this command already reads the host to fill in the core count.
+///
+/// Three rules govern every figure written here, and they are the reason the code below looks more
+/// careful than "print the number":
+///
+///   1. NEVER FABRICATE. A figure that could not be measured is omitted, not defaulted. An absent
+///      budget means "undeclared", which is a state the validator handles by saying nothing; a
+///      guessed one is a number a reader would act on.
+///   2. NEVER ROUND UP. See [`toml_size`]: the value becomes the ceiling the check compares against,
+///      so an optimistic figure switches the check off rather than loosening it.
+///   3. THE FILE MUST PASS ITS OWN VALIDATOR, CLEANLY. Not just parse: emit zero warnings. That is
+///      why the example profiles below are derived from the measurement instead of being constants.
+///      With a hard-coded `memory = "512 MB"`, generating this file on a 512 MiB board produced a
+///      config that warned about itself the first time it was validated, which is precisely the
+///      "kern emits config kern rejects" defect this work exists to remove.
+pub(crate) fn tailored_kern_toml(h: &HostInv) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
     let n = h.ncpu.max(1);
     let half = ((n as f64 / 2.0) * 10.0).round() / 10.0; // ~half the cores, one decimal
     let pin_hi = n.saturating_sub(1).min(3);
+
+    // The example profiles, sized against the measurement so they cannot overrun what is declared.
+    //
+    // `min(ceiling, share)` keeps the familiar 512M/256m on any host with at least 2 GiB, which is
+    // every machine the quickstart is written for, and shrinks them on a board where the constant
+    // would have been larger than the whole machine. The final `.min(ram)` matters on a host too
+    // small for the floor: equal to the budget is not over it, and over is what warns.
+    let (heavy_mem, lean_mem) = match h.ram_bytes {
+        Some(ram) => (
+            bounded(ram / 4, 16 * MIB, 512 * MIB).min(ram),
+            bounded(ram / 8, 8 * MIB, 256 * MIB).min(ram),
+        ),
+        None => (512 * MIB, 256 * MIB),
+    };
+    let heavy_mem = toml_size(heavy_mem).unwrap_or_else(|| "512m".to_string());
+    let lean_mem = toml_size(lean_mem).unwrap_or_else(|| "256m".to_string());
+
+    // The RAM line on the `[[cpu]]` block, and the header's description of the host. Both come from
+    // the same measurement, so a reader cannot find them disagreeing.
+    let ram_display = h
+        .ram_bytes
+        .map(human_bytes)
+        .unwrap_or_else(|| "unknown RAM".to_string());
+    // THE EXACT VALUE, WITH THE HUMAN ONE BESIDE IT. `toml_size` is exact, which on a real
+    // /proc/meminfo means kibibytes: `32680724k` round-trips perfectly and cannot be sanity-checked
+    // by eye. The rounded figure goes in the comment so a reader can see at a glance that the budget
+    // is this machine, while the value the parser reads stays the measurement rather than a
+    // rounding of it.
+    let cpu_memory = match h.ram_bytes.and_then(toml_size) {
+        Some(v) => format!(
+            "memory = \"{v}\"   # measured: {}, all of this host's RAM\n",
+            ram_display
+        ),
+        // NOT A DEFAULT. An unreadable /proc/meminfo leaves the budget undeclared, and the comment
+        // says why, so the gap reads as a measurement that failed rather than as an oversight.
+        None => "# memory =        # /proc/meminfo was unreadable, so no RAM budget is declared\n"
+            .to_string(),
+    };
+
     let mut s = format!(
         "# ~/.config/kern/kern.toml - generated by `kern config setup` for this host \
-         ({n} cores, {ram}).\n# Attach a profile by prefix:  kern run vcpu:heavy -- ./train.sh   \
+         ({n} cores, {ram_display}).\n# Attach a profile by prefix:  kern run vcpu:heavy -- ./train.sh   \
          ·  edit with `kern config edit`\n\n[kern]\nlog_level = \"info\"\n\n\
          # ── CPU ──  (profile fields match the CLI flags: cpus=--cpus, cpuset=--cpuset-cpus, memory=--memory, nice=--nice)\n\
-         [[cpu]]\nid = \"cpu:0\"\ncores = {n}.0\n\n\
+         [[cpu]]\nid = \"cpu:0\"\ncores = {n}.0\n{cpu_memory}\n\
          [[vcpu]]\nname = \"heavy\"     # ~half this host, pinned to the first cores\n\
-         backend = \"cpu:0\"\ncpus = {half}\ncpuset = \"0-{pin_hi}\"\nmemory = \"512 MB\"\n\n\
-         [[vcpu]]\nname = \"lean\"\nbackend = \"cpu:0\"\ncpus = 0.5\nmemory = \"256m\"\n",
-        ram = h.ram
+         backend = \"cpu:0\"\ncpus = {half}\ncpuset = \"0-{pin_hi}\"\nmemory = \"{heavy_mem}\"\n\n\
+         [[vcpu]]\nname = \"lean\"\nbackend = \"cpu:0\"\ncpus = 0.5\nmemory = \"{lean_mem}\"\n",
     );
-    // A [[disk]] pool + a vdisk profile that references it, seeded from this host's primary disk, so
-    // `kern box … vdisk:scratch` has a real target. Only when a disk was actually detected.
-    if let Some(d) = h.disks.first() {
-        let kind = if d.ssd { "SSD" } else { "HDD" };
-        let model = if d.model.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", d.model)
+
+    // A [[disk]] pool + a vdisk profile that references it, seeded from the filesystem that actually
+    // backs `/`, so `kern box … vdisk:scratch` has a real target with a real ceiling.
+    //
+    // THE DISK IS RESOLVED, NOT GUESSED. This used to take the first entry of `/sys/block`
+    // alphabetically and print it next to `path = "/"`. Measured on the development host, `/` is on
+    // `nvme1n1` and the generated file said `nvme0n1`. Nothing read the field, so the wrong name was
+    // free; writing a measured SIZE beside it is what makes it cost something.
+    //
+    // THE SIZE IS THE FILESYSTEM'S, NOT THE DEVICE'S, and they are different numbers: a volume is a
+    // file under `path`, so the ceiling that can ever stop a write is the filesystem's, and the raw
+    // capacity of a device that may not even hold that path is not a budget for anything.
+    let described = h
+        .root_dev
+        .as_ref()
+        .and_then(|dev| h.disks.iter().find(|d| &d.name == dev))
+        .or_else(|| h.disks.first());
+    if described.is_some() || h.root_total.is_some() {
+        let hardware = match described {
+            Some(d) => {
+                let kind = if d.ssd { "SSD" } else { "HDD" };
+                let model = if d.model.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", d.model)
+                };
+                format!("{} {kind}{model}", human_bytes(d.size))
+            }
+            None => "device not identified".to_string(),
         };
+        let device_line = match h.root_dev.as_ref().or(described.map(|d| &d.name)) {
+            Some(dev) => format!("device = \"{dev}\"   # {hardware}\n"),
+            None => String::new(),
+        };
+        let size_line = match h.root_total.and_then(toml_size) {
+            Some(v) => format!(
+                "size = \"{v}\"   # measured: {}, the filesystem mounted at path\n",
+                h.root_total.map(human_bytes).unwrap_or_default()
+            ),
+            None => {
+                "# size =          # statvfs on the path failed, so no size budget is declared\n"
+                    .to_string()
+            }
+        };
+        // The example volume is a quarter of the filesystem, capped at 2 GiB and floored at 64 MiB,
+        // for the same reason the memory profiles are derived: on a small card a constant 2 GiB was
+        // larger than the disk, and the generated file warned about itself.
+        let scratch = h
+            .root_total
+            .map(|t| bounded(t / 4, 64 * MIB, 2 * GIB).min(t))
+            .unwrap_or(2 * GIB);
+        let scratch = toml_size(scratch).unwrap_or_else(|| "2g".to_string());
         s.push_str(&format!(
             "\n# ── Disk - `kern box … vdisk:scratch` gets a size-capped ext4 volume ──\n\
-             [[disk]]\nid = \"disk:0\"\npath = \"/\"\ndevice = \"{dev}\"   # {size} {kind}{model}\n\n\
-             [[vdisk]]\nname = \"scratch\"\nbackend = \"disk:0\"\nsize = \"2g\"\n",
-            dev = d.name,
-            size = human_bytes(d.size),
+             [[disk]]\nid = \"disk:0\"\npath = \"/\"\n{device_line}{size_line}\n\
+             [[vdisk]]\nname = \"scratch\"\nbackend = \"disk:0\"\nsize = \"{scratch}\"\n",
         ));
     }
+    // ── the RAM-backed form, which kern ACCEPTS and never once GENERATED ───────────────────────
+    //
+    // `backend = "ram"` is a tmpfs, and it is not a poorer `[[disk]]`: it is a different backend
+    // with different properties. Nothing wrote it. `config add` used to emit it as a default and
+    // stopped, correctly, because kern choosing a sentinel on a caller's behalf is what produced two
+    // conventions from one tool; the effect was that a legal form became invisible, and a reader of
+    // a generated config had no way to learn it exists.
+    //
+    // So it is written here as a SECOND, LABELLED example rather than as anybody's default: the
+    // choice stays with the operator and the form stays discoverable.
+    //
+    // SIZED FOR THE BOX THAT WILL MOUNT IT, not for the host. A tmpfs is charged to the memory
+    // cgroup of the box, measured on this host at one variable: writing 512 MiB into the volume
+    // under `--memory 256m` was killed with 137, and the same write under `--memory 2g` completed.
+    // A box with no memory profile gets `memory.max = 512 MiB`, so an example larger than that would
+    // be killed the first time a reader tried it. A quarter of a gibibyte fits inside that default
+    // with room for the workload itself.
+    let ram_vol = match h.ram_bytes {
+        Some(ram) => bounded(ram / 8, 32 * MIB, 256 * MIB).min(ram),
+        None => 256 * MIB,
+    };
+    let ram_vol = toml_size(ram_vol).unwrap_or_else(|| "256m".to_string());
+    s.push_str(&format!(
+        "\n# ── RAM disk - a tmpfs, needs no [[disk]]: `ram` is a reserved backend ──\n\
+         # EPHEMERAL (gone when the box exits) and charged to the box's memory, so keep it under\n\
+         # the box's --memory. Attach with `kern box … vdisk:tmp`.\n\
+         [[vdisk]]\nname = \"tmp\"\nbackend = \"ram\"\nsize = \"{ram_vol}\"\n",
+    ));
     if !h.i2c.is_empty() || !h.gpiochips.is_empty() {
         s.push_str(
             "\n# ── GPIO / I/O - `kern box … vgpio:io` binds these peripherals into the box ──\n\
              [[gpio]]\nid = \"gpio:0\"\n\n[[vgpio]]\nname = \"io\"\nbackend = \"gpio:0\"\n",
         );
-        if let Some(first) = h.i2c.first() {
+        // THE BUS NAMED IS ONE THIS USER CAN ACTUALLY OPEN, when there is one.
+        //
+        // The first bus alphabetically was named unconditionally, and `kern validate` warns when a
+        // `[[vgpio]]` lists a node the caller cannot open. On a desktop every `/dev/i2c-*` is
+        // root-only 0600, so the generated starter file warned about itself on the first check.
+        // Measured on the development host: eleven buses, none openable.
+        //
+        // Where a usable bus exists it is named, which is also more useful. Where none does, the
+        // line is written COMMENTED, with the reason: the file then validates clean, and a reader
+        // who fixes the permissions has the exact line to uncomment. Emitting it live with a warning
+        // teaches a new user that kern's own output is noisy, which is the more expensive lesson.
+        let usable = h.i2c.iter().find(|n| can_use(&format!("/dev/{n}")));
+        if let Some(first) = usable.or_else(|| h.i2c.first()) {
             // Keep the comment lean: show a few real buses, not all of them.
             let shown = h.i2c.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
             let more = h.i2c.len().saturating_sub(4);
@@ -4458,9 +4922,16 @@ fn tailored_kern_toml(h: &HostInv) -> String {
             } else {
                 String::new()
             };
-            s.push_str(&format!(
-                "i2c = [\"/dev/{first}\"]    # host buses: {shown}{extra}\n"
-            ));
+            if usable.is_some() {
+                s.push_str(&format!(
+                    "i2c = [\"/dev/{first}\"]    # host buses: {shown}{extra}\n"
+                ));
+            } else {
+                s.push_str(&format!(
+                    "# i2c = [\"/dev/{first}\"]  # none of these is readable/writable by this user; \
+                     fix the mode or group, then uncomment. host buses: {shown}{extra}\n"
+                ));
+            }
         }
         if !h.gpiochips.is_empty() {
             s.push_str(&format!(

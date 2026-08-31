@@ -318,14 +318,23 @@ def check() -> int:
 
 
 def main(argv: list[str]) -> int:
-    if "--check" in argv[1:]:
-        rc = check()
-        if rc != 0:
-            return rc
-        # The allow-list is in sync; also gate the denylist's future-coverage (a new kernel syscall the
-        # default filter would silently allow). Both run under the one `--check` the CI `docs` step calls.
-        return check_coverage()
-    return generate()
+    # CHECKING IS THE DEFAULT AND WRITING NEEDS TO BE ASKED FOR, which is the opposite of what this
+    # file used to do. Every other script in `scripts/` is a gate that reads, so a sweep that runs
+    # them all treated this one as a gate too and it REWROTE `seccomp_allow.rs` on the spot. The
+    # rewrite is byte-equivalent in content and unformatted in shape, so the tree came back dirty on
+    # a file whose own header says DO NOT EDIT BY HAND, and `cargo fmt --check` went red next.
+    # Nothing was wrong with the allow-list; the generator was the only thing that had changed it.
+    #
+    # A generator that mutates unless told otherwise is a hazard in a directory of read-only checks,
+    # so the safe mode is now the one you get by accident.
+    if "--write" in argv[1:]:
+        return generate()
+    rc = check()
+    if rc != 0:
+        return rc
+    # The allow-list is in sync; also gate the denylist's future-coverage (a new kernel syscall the
+    # default filter would silently allow). Both run under the one `--check` the CI `docs` step calls.
+    return check_coverage()
 
 
 if __name__ == "__main__":

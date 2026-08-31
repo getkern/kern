@@ -42,6 +42,19 @@ jobs:
           # exact bypass that let `waitexit/` ship mountable. This fails the build on a new registry child
           # that is not classified, or a chokepoint constructor that stops classifying.
           python3 scripts/registry-classified.py
+          # No message a user reads may carry a run of source indentation in the middle of a sentence.
+          # A multi-line literal continued without `\` prints "so this profile would         not slow
+          # the workload down". It happened twice: first in the CUDA shim, then in the budget warnings
+          # in commands/config.rs. The first occurrence grew a unit test inside kern-cuda, which is why
+          # the second one, in kern-cli, went unseen: a per-crate check has to be extended by hand, and
+          # the second occurrence is the proof that it is not. This one reads the whole tree.
+          python3 scripts/flat-continuation.py
+          # Every entry under a code section declares what it did about its own injection. A warning,
+          # never a refusal: it cannot verify an executed injection (several suites here need hardware
+          # CI does not have), so demanding one would leave it checking that a FILE EXISTS - state
+          # instead of content, which is the defect class the mechanism exists to catch. It asks for a
+          # line and reports how many say `none`.
+          python3 scripts/injection-declared.py
           # Diff-gate the seccomp allowlist: the allow set is DERIVED from the pinned moby profile, a
           # source we do not control, so a profile bump could pull a new syscall into it silently. This
           # fails if seccomp/allow-names.txt drifts from `moby_allow ∖ kern_denied`, naming the syscall

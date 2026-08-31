@@ -45,9 +45,34 @@ pub struct ComposeBox {
     /// verbatim. The service name still resolves inside the pod (kept as a DNS alias), so peers reach
     /// it by the compose-file name regardless. `None` = the default `<project>-<service>` name.
     pub container_name: Option<String>,
+    /// The name this service has IN THE FILE, kept after `name` is rewritten to the box name.
+    ///
+    /// WHY THE STRUCT HAS TO CARRY IT. `kern compose` rewrites `name` to the box name - the
+    /// `container_name` when one is set, else `<project>-<service>` - and the service name was
+    /// simply gone after that. `kern compose … config` then printed the box name while its own
+    /// comment said it "prints service names as written", and a field report read that output,
+    /// concluded kern had replaced the service hostname, and deleted four `container_name` keys
+    /// from a working file to fix a problem that did not exist. Peers resolve by service name
+    /// either way: the alias is registered a few lines above the rewrite.
+    ///
+    /// Reconstructing it from `net_aliases` was the alternative and is worse: aliases are a list a
+    /// user also writes into, so the recovery would be a guess. Empty on a box that never went
+    /// through that rewrite, in which case `name` is still the service name.
+    pub service: String,
     pub image: Option<String>,
     pub rootfs: Option<String>,
     pub command: Vec<String>,
+    /// Compose's `entrypoint:`, forwarded as `--entrypoint` rather than folded into `command`.
+    ///
+    /// `None` = not set. `Some(list)` REPLACES the image's `ENTRYPOINT` and discards its `CMD`, per
+    /// Docker. `Some(empty)` is `entrypoint: []`, which clears the entrypoint.
+    ///
+    /// IT USED TO BE FOLDED IN: `b.command = entrypoint ++ command`, which the box then prepended
+    /// the image's own entrypoint to - `IMAGE_ENTRYPOINT ++ override ++ args`. That composes
+    /// correctly only for an image with no entrypoint, and an image with one is exactly when a
+    /// compose file writes `entrypoint:`. The same defect lived in the `docker` shim, from the same
+    /// cause: neither could perform a replacement from outside the box.
+    pub entrypoint: Option<Vec<String>>,
     pub depends_on: Vec<String>,
     /// Dependencies this box waits to become HEALTHY before it starts (Docker's
     /// `condition: service_healthy`). Each named box must declare `health_cmd`. A superset relation
@@ -239,6 +264,28 @@ impl ComposeBox {
 
     /// Append this box's fields to a `kern box <name>` command line as their mirror flags, in a
     /// stable order. The detached `-d` and the trailing `-- command` are added by the caller.
+    /// The name this service has IN THE FILE.
+    ///
+    /// `name` is the BOX name once `resolve_box_names` has run - `<project>-<service>`, or a
+    /// `container_name` verbatim - and that is the right name for the runtime and the wrong one for
+    /// anything a reader compares against their own file. Every message that quotes a service, and
+    /// `compose … config`, goes through here.
+    ///
+    /// ONE DEFINITION, because there were three. The same three-line fallback was written into the
+    /// pod-conflict check, the host-port check and the config printer, one per fix, and a fourth
+    /// caller would have written a fourth. Borrowed, so quoting a service name in an error costs no
+    /// allocation.
+    ///
+    /// `service` is empty only for a box that never went through the rename, where `name` IS the
+    /// service name.
+    pub fn service_name(&self) -> &str {
+        if self.service.is_empty() {
+            &self.name
+        } else {
+            &self.service
+        }
+    }
+
     pub fn push_box_flags(&self, cmd: &mut std::process::Command) {
         if let Some(v) = &self.config {
             cmd.arg("--config").arg(v);
@@ -251,6 +298,18 @@ impl ComposeBox {
         }
         if let Some(v) = &self.workdir {
             cmd.arg("--workdir").arg(v);
+        }
+        // One `--entrypoint` per argv element; the flag is repeatable exactly so an exec-form list
+        // needs no quoting convention. An EMPTY list still emits one empty occurrence, which is how
+        // `entrypoint: []` reaches the box as "clear it" rather than as "not set".
+        if let Some(ep) = &self.entrypoint {
+            if ep.is_empty() {
+                cmd.arg("--entrypoint").arg("");
+            } else {
+                for a in ep {
+                    cmd.arg("--entrypoint").arg(a);
+                }
+            }
         }
         if let Some(v) = &self.memory {
             cmd.arg("--memory").arg(v);
@@ -2684,6 +2743,11 @@ mod contract_tests {
             (
                 "container_name",
                 "compose() names the box this exactly instead of <project>-<service>",
+            ),
+            (
+                "service",
+                "`compose ... config` prints it: the FILE's name for this service, kept when \
+                 resolve_box_names() rewrites `name` to the box name",
             ),
             ("command", "the trailing `-- <command>`"),
             (

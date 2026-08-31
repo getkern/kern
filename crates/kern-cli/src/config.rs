@@ -2067,6 +2067,38 @@ impl ProfileKind {
         }
     }
 
+    /// The family from its name in the file, or `None` for a name that is not one.
+    ///
+    /// It exists because the CLI's callers hold a `String` taken off the command line and not a
+    /// variant. Without it each of them rewrites its own table, which is precisely how the parallel
+    /// matches this enum was introduced to delete get started.
+    pub(crate) fn from_name(kind: &str) -> Option<Self> {
+        match kind {
+            "vcpu" => Some(Self::Vcpu),
+            "vgpio" => Some(Self::Vgpio),
+            "vdisk" => Some(Self::Vdisk),
+            _ => None,
+        }
+    }
+
+    /// The physical section's name without the brackets, as `save_named_block` wants it.
+    pub(crate) const fn phys_section(self) -> &'static str {
+        match self {
+            Self::Vcpu => "cpu",
+            Self::Vgpio => "gpio",
+            Self::Vdisk => "disk",
+        }
+    }
+
+    /// The default id of the physical block this family slices.
+    ///
+    /// Derived from the prefix rather than written out: `prefix()` is already the source of truth
+    /// for the link between a virtual family and its physical one, and a second table could drift
+    /// from it.
+    pub(crate) fn default_backend_id(self) -> String {
+        format!("{}0", self.prefix())
+    }
+
     /// The physical block a backend must name, as it is spelled in a `kern.toml`.
     pub(crate) const fn phys(self) -> &'static str {
         match self {
@@ -2159,6 +2191,50 @@ fn require_backend<'a>(
 fn backend_ref_matches(reference: &str, prefix: &str, declared: &str) -> bool {
     reference.strip_prefix(prefix).unwrap_or(reference)
         == declared.strip_prefix(prefix).unwrap_or(declared)
+}
+
+/// The physical family, and the default id, that a virtual family slices.
+pub(crate) fn physical_for(kind: &str) -> (&'static str, String) {
+    match ProfileKind::from_name(kind) {
+        Some(k) => (k.phys_section(), k.default_backend_id()),
+        None => {
+            debug_assert!(false, "virtual family with no physical resource: {kind}");
+            (
+                ProfileKind::Vcpu.phys_section(),
+                ProfileKind::Vcpu.default_backend_id(),
+            )
+        }
+    }
+}
+
+/// Whether the `kern.toml` in force already declares that physical block.
+pub(crate) fn physical_block_exists(section: &str, id: &str) -> Result<bool, String> {
+    let _lock = config_lock();
+    let (_path, raw) = read_kern_toml()?;
+    Ok(crate::toml_surgery::block_exists(&raw, section, id))
+}
+
+/// Write a MINIMAL physical block: the id, plus the path a disk cannot go without.
+///
+/// MINIMAL ON PURPOSE. A block carrying only an id declares the resource and asserts nothing about
+/// its capacity, which is exactly what a command run on somebody else's machine can honestly say:
+/// inventing a `cores` or a `size` would put a second-hand number in the file, and an invented
+/// number in a configuration is worse than an absent one because decisions get made underneath it.
+/// An operator who wants to declare the capacity writes it.
+pub(crate) fn save_physical_block(section: &str, id: &str) -> Result<(), String> {
+    // `path` is NOT optional on a `[[disk]]`: a block without one does not resolve, so the minimum
+    // valid block for that family is two fields and not one. The fields and the managed-key list are
+    // decided together, because a key managed but not written (or the reverse) is a block this
+    // command would then fail to update.
+    let (managed, body): (Vec<&str>, Vec<String>) = if section == "disk" {
+        (
+            vec!["id", "path"],
+            vec![format!("id = \"{id}\""), "path = \"/\"".to_string()],
+        )
+    } else {
+        (vec!["id"], vec![format!("id = \"{id}\"")])
+    };
+    save_named_block(section, None, id, &managed, &body)
 }
 
 pub(crate) fn save_named_block(

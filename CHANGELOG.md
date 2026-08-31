@@ -13,7 +13,158 @@ is in the git history.
 
 ## Unreleased
 
-### Added
+**This is a MINOR bump (0.8.0), not a patch.** Two reasons, and the weak one is the new flag: a
+`--entrypoint` added to a frozen CLI surface is additive and would not force it on its own. The
+binding reason is the `USER` change below, which alters the gid resolved on an EXISTING path for a
+class of images that runs today.
+
+### Security
+
+- **Five resource caps on untrusted registry data had no boundary test, and two security predicates
+  had no test at all.** Found by mutation sampling rather than by reading: 20 mechanical mutants over
+  files that have tests, of which 13 were ones a unit test could have killed and 5 survived - a 38%
+  survival rate on reachable sites.
+
+  Two of the five were the file's own defences. `take_data`'s `real_here.min(room)` is the bound that
+  holds a returned buffer to `keep` on bytes from a registry; `min` became `max` and 920 tests stayed
+  green. `has_bare_lf` is the documented request-smuggling defence; inverting it ACCEPTS the smuggled
+  request and REJECTS well-formed CRLF, and nothing reached it because it sat inline in a function
+  that takes a socket. It is a pure function now, which is the only shape in which it can be asserted
+  in both directions.
+
+  A second, targeted sweep over `vet_tar_stream` then found the pattern rather than the instance:
+  8 of 14 mutants died, and FIVE of the six survivors were caps - `MAX_TAIL_BLOCKS`, `TAR_MAX_LONG`
+  at three sites, `MAX_LAYER_ENTRIES`. The identity checks in that vetter were covered and not one of
+  the limits was, and the limits are the whole defence against a malicious layer rather than a
+  malformed one. `valid_allow_entry`'s 253-character FQDN bound was uncovered in the same way.
+
+  MEASURED, NOT ASSUMED: the zero-padding boundary sits at `MAX_TAIL_BLOCKS - 1` extra blocks,
+  because the end-of-archive marker's second zero block already enters the tail loop. The test says
+  so, so the next reader does not go looking for an off-by-one that is not there.
+
+  THE SAMPLE IS A LOWER BOUND. Sites were drawn only from files that HAVE tests, which excludes by
+  construction the files most likely to hold a gap. "38% of sampled testable sites do not
+  discriminate" is what was measured; "38% of the code is unprotected" was not.
+
+  The two survivors outside the registry path are closed too. `clamp_cpus` needed its comparison
+  EXTRACTED before it could be asserted at all: at `c == host` the clamped result and the unclamped
+  one are the same number, so mutating `>` to `>=` leaves every return value untouched and changes
+  only the warning - which then tells an operator that N CPUs "exceeds the N available". A false
+  message was the entire observable difference. `profiles_table` put the selection marker on every
+  row EXCEPT the selected one under `i != sel`, which is the `k`-kills-the-box failure reached from
+  the rendering side.
+
+  Injection: verified - every cap and predicate was re-mutated after its test landed; `>` to `>=` on
+  the tail cap, on both `TAR_MAX_LONG` sites, on the entry cap and on `cpus_exceed_host`, `min` to
+  `max` on the buffer bound, `!=` to `==` on the bare-LF check, `i == sel` to `i != sel` on the
+  marker, and `> 253` / `<= 63` on the allowlist bounds. Each turns its own case red. The entry-cap
+  case costs 7.1 s in debug because a two-million-member cap can only be asserted by reaching it.
+
+### Changed
+
+- **A numeric `USER` now takes its group from the image's `/etc/passwd`, not from its own number.**
+  Listed here and not under Fixed: from kern's side it is a correction, and from the side of anyone
+  running a box that worked - with a volume holding files written under the old gid - it is a
+  behaviour change that can break them. A CHANGELOG is read to answer "does this break something of
+  mine", and the honest classification is the one that answers that question rather than the one
+  that describes the intent.
+
+  Affects every image whose `USER` is numeric AND whose passwd entry declares a different primary
+  group. `USER 1000` resolved to `gid 1000`; it now resolves to what the image says, and to the root
+  group when the image lists no entry for that uid.
+
+  VERIFIED AGAINST THE IMPLEMENTATION, not against documentation: `moby/sys/user`'s `GetExecUser`
+  sets `user.Gid = users[0].Gid` from the matched passwd entry, and leaves `user.Gid` at
+  `defaults.Gid` when a numeric uid has no entry - which runc's `libcontainer/init_linux.go` sets to
+  `0`. The earlier claim rested on prose; this is the code that runs.
+
+  `quay.io/keycloak/keycloak:26.1` declares `USER 1000` with `keycloak:x:1000:0:` and lays its tree
+  out as `drwxrwxr-x root root`. With gid 1000 the process could not write its own installation,
+  Quarkus' startup augmentation failed to write into its runner JAR, `jdk.nio.zipfs` reported the
+  JAR as a read-only zip filesystem, and the box restart-looped on a `ReadOnlyFileSystemException`
+  naming nothing about permissions. A field report attributed it to tmpfs exhaustion; reproduced
+  here with 3.2 GB free, which ruled that out. The image now starts:
+  `Keycloak 26.1.5 … started in 3.693s. Listening on: http://0.0.0.0:8080`.
+
+  THE FIRST CORPUS FOR THIS WAS WORTHLESS AND IS RECORDED SO IT IS NOT REPEATED. Six official images
+  were run and all answered `0:0` under both rules, because not one declares a `USER`: the check was
+  never reached. It would have stayed green with the fix inverted. The corpus that replaced it was
+  built to discriminate - `1000:0`, `1000:2000`, and a uid absent from passwd - and gives 1000/1000/1000
+  under the old rule against 0/2000/0 under the new one, on three built images across two built
+  binaries.
+
+  Injection: verified - `Ok(n) => (n, n)` restored, and the always-0 variant; both turn
+  `a_numeric_user_takes_its_primary_group_from_the_images_passwd` red on the discriminating rows.
+
+  It moves box start onto a file read per box, which is why it was measured: 400 runs per side on an
+  image that declares a `USER`, medians 3.5 ms on both, minima 2.8 against 2.9. That is a cost BELOW
+  THE NOISE FLOOR of this measurement, which is not the same as no cost and is not claimed as one.
+
+### Fixed
+
+- **The flat build's base copy now names what it costs and why.** `copy_tree` passes
+  `--reflink=auto`, which clones the base on btrfs/xfs/bcachefs and silently falls back to a full
+  byte copy everywhere else - `auto` is defined not to complain. That one property decides whether a
+  flat build of a 2 GB base costs milliseconds or minutes, and nothing said which one you had. The
+  build line and `kern doctor` both state it now.
+
+  Injection: verified - dropping the probe's cleanup turns
+  `the_reflink_probe_answers_and_leaves_nothing_behind` red.
+
+  Measured while evaluating a field report's suggestion to "cache the flattened base rootfs per
+  image": kern already does that, at pull time - the image cache IS a flattened rootfs, with no
+  layer chain to merge - and an unchanged rebuild is already skipped
+  (`[cached · flat image unchanged]`, 0.00 s). What remains is the writable copy, which cannot be a
+  hardlink farm without a RUN step corrupting the shared cache, and cannot be an overlay because the
+  flat path exists precisely where overlay is unavailable. On this ext4 host `cp --reflink=always`
+  is refused and a 2.1 GB base copies in 0.86 s with the source in page cache - a LOWER BOUND, since
+  the caches cannot be dropped without privilege. The reporter's 2m49s is WSL2's filesystem, not a
+  repeated flattening.
+
+- **The README's compatibility promise now carries the constraint that qualifies it.** The
+  shared-namespace rule - two services in one stack cannot both listen on the same container port -
+  lived only in `docs/DOCKER-COMPAT.md`, while the README said `read as-is`, "with no conversion
+  step" and `# a real stack, unchanged` under the heading *"Your Docker Compose stack, without
+  Docker Desktop"*. A heading takes no clause, and the possessive claimed every reader's file, so
+  that one is now *"Docker Compose files, without Docker Desktop"* with the constraint in the
+  paragraph under it and in the comparison row.
+
+  Injection: none - prose only. The behaviour it now describes is asserted elsewhere
+  (`cli_surface_is_frozen`, and the port-collision entry below).
+
+  The Status line said the CLI surface can still change. That has been false since v0.7.0: the
+  CHANGELOG declares it stable and `cli_surface_is_frozen` holds the build to a committed snapshot.
+  Config-file keys, which no gate freezes, keep the caveat.
+
+- **A refused port collision named the box, not the service.** `services 'myapp-keycloak' and
+  'myapp-api' both listen on container port 8080/tcp` for a file whose services are `keycloak` and
+  `api`, because both checks read `ComposeBox::name` after it has been rewritten to the box name.
+  Injection: verified - restoring `b.name` in either check turns
+  `the_collision_message_names_the_services_the_file_declares` red; both were tried separately.
+
+  Fixed in the container-port check and the host-port check together: fixing one would have left a
+  reader chasing a name their file does not contain on half the failures.
+
+- **`kern box --entrypoint`: an override that actually overrides.** Repeatable (one argv element per
+  occurrence, so an exec-form list needs no quoting convention), and `--entrypoint ""` clears the
+  image's entrypoint the way compose's `entrypoint: []` does. Additive to the frozen CLI surface: no
+  verb or flag was removed or renamed.
+
+  It replaces two workarounds that could not work. The `docker` shim implemented `--entrypoint` by
+  PREPENDING the value to the box command, and the compose parser folded `entrypoint:` into
+  `command:` the same way. Both compose to `IMAGE_ENTRYPOINT ++ override ++ args` once the box
+  prepends the image's own entrypoint - correct only for an image that HAS no entrypoint, which is
+  never the case anyone reaches for an override in. Measured against
+  `quay.io/keycloak/keycloak:26.1`, whose entrypoint is `kc.sh`: asking for a shell produced
+  `kc.sh sh -c …` and the image answered `Unknown option: 'sh'`, which is what stopped a field
+  report from getting a shell inside an image to diagnose a crash loop.
+
+  Injection: verified - four, one per call site: the override ignored, the image CMD kept, the shim
+  prepending again, and compose merging into `command`. Each turns its own case red.
+
+  Both callers forward the flag now, so the CLI, the shim and compose cannot disagree about it, and
+  the override discards the image's `CMD` as Docker documents - a default that belonged to the
+  entrypoint being replaced.
 
 - **Final validation: eight sentences narrowed to their measurement, and one suite moved out of the
   stamp and into CI.** Two reviewers, one asked whether the prose was wider than the evidence and one

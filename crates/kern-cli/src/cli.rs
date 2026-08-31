@@ -40,6 +40,21 @@ pub enum Command {
         /// `--pull <missing|never|always>`: registry-image fetch policy (see [`commands::PullPolicy`]).
         pull: commands::PullPolicy,
         command: Vec<String>,
+        /// `--entrypoint <arg>` (repeatable): REPLACE the image's `ENTRYPOINT`.
+        ///
+        /// `None` when the flag is absent, which leaves the image's own entrypoint standing.
+        /// `Some(list)` replaces it, and Docker's rule then applies: the image's `CMD` is discarded,
+        /// because that default belonged to the entrypoint being replaced.
+        ///
+        /// REPEATABLE, one argv element per occurrence, because the two spellings kern must speak
+        /// disagree: `docker run --entrypoint` takes a single executable, compose's `entrypoint:`
+        /// takes a list. One occurrence is Docker's form; several express compose's exec form
+        /// without a second flag or a quoting convention to get wrong.
+        ///
+        /// `Some(empty)` CLEARS the entrypoint: `--entrypoint ""`, which is compose's
+        /// `entrypoint: []`. The distinction between absent and cleared is why this is an `Option`
+        /// around a `Vec` and not a bare `Vec`.
+        entrypoint: Option<Vec<String>>,
         detached: bool,
         read_only: bool,
         /// `-v src:dst[:ro]` (repeatable): host paths bind-mounted in.
@@ -1543,6 +1558,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut landlock_rw: Vec<String> = Vec::new();
     let mut apparmor: Option<String> = None;
     let mut workdir: Option<String> = None;
+    let mut entrypoint: Option<Vec<String>> = None;
     let mut command: Vec<String> = Vec::new();
     let mut profiles: Vec<String> = Vec::new();
     let mut after_dd = false;
@@ -1957,6 +1973,52 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         env.push((*v).to_string());
                     }
                 }
+                // `--entrypoint <arg>`, repeatable: one argv element per occurrence. See the field
+                // docs on `Command::BoxRun::entrypoint` for why it is repeatable and why an empty
+                // value is a distinct state rather than a missing one.
+                "--entrypoint" => {
+                    i += 1;
+                    match rest.get(i) {
+                        // An EMPTY value CLEARS the entrypoint (`--entrypoint ""`, compose's
+                        // `entrypoint: []`), and only as the FIRST occurrence: a later empty
+                        // argument is a legitimate empty argv element for the program named before
+                        // it, and reading that as "clear everything" would silently discard the
+                        // override the caller had just built.
+                        Some(v) if v.is_empty() && entrypoint.is_none() => {
+                            entrypoint = Some(Vec::new());
+                        }
+                        // A LEADING DASH IS REFUSED ON THE FIRST OCCURRENCE ONLY.
+                        //
+                        // `--entrypoint --privileged` is a typo, not a program: the value is taken
+                        // as the executable and the box then fails with `cannot start
+                        // '--privileged'`, which names the symptom and not the mistake. The `docker`
+                        // shim already refuses this shape (`reject_leading_dash`), and two paths
+                        // answering one input differently is the divergence class this codebase
+                        // treats as a defect.
+                        //
+                        // ONLY the first, because a later occurrence is an ARGUMENT to the program
+                        // named before it: `--entrypoint /bin/sh --entrypoint -c` is the exec-form
+                        // list this flag is repeatable for, and refusing `-c` there would break the
+                        // form the repetition exists to express.
+                        Some(v) if v.starts_with('-') && entrypoint.is_none() => {
+                            return Err(Error::Usage(
+                                "--entrypoint: the first value is the program to run and cannot start with '-'",
+                            ))
+                        }
+                        Some(v) => entrypoint
+                            .get_or_insert_with(Vec::new)
+                            .push((*v).to_string()),
+                        // The flag with nothing after it. An override of nothing is not an override,
+                        // and ignoring it would run the image's own entrypoint while the caller
+                        // believed they had replaced it.
+                        None => {
+                            return Err(Error::Usage(
+                                "--entrypoint needs a value (repeat it for an exec-form list; \
+                                 `--entrypoint \"\"` clears the image's entrypoint)",
+                            ))
+                        }
+                    }
+                }
                 "--egress-allow" => {
                     i += 1;
                     if let Some(v) = rest.get(i) {
@@ -2163,6 +2225,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             image,
             pull,
             command,
+            entrypoint,
             detached,
             read_only,
             volumes,
@@ -2734,6 +2797,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             image,
             pull,
             command,
+            entrypoint,
             detached,
             read_only,
             volumes,
@@ -2800,6 +2864,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             image: image.as_deref(),
             pull,
             command: &command,
+            entrypoint: entrypoint.as_deref(),
             detached,
             read_only,
             volumes: &volumes,
@@ -3282,6 +3347,50 @@ mod tests {
         assert_eq!(parse_size_z(" 0 "), Some(0));
         assert_eq!(parse_size_z("512m"), Some(512 * 1024 * 1024));
         assert_eq!(parse_size_z("bad"), None);
+    }
+
+    /// `--entrypoint` PARSES INTO THE THREE STATES IT HAS, and refuses the fourth.
+    ///
+    /// Absent, an override, and CLEARED are three different things, which is why the field is an
+    /// `Option<Vec<_>>` and not a `Vec<_>`: `--entrypoint ""` means "the image has no entrypoint",
+    /// and a bare `Vec` cannot tell that from "the flag was never given".
+    #[test]
+    fn entrypoint_parses_absent_override_cleared_and_refuses_a_leading_dash() {
+        let ep = |args: &[&str]| -> Result<Option<Vec<String>>, Error> {
+            let mut v = vec!["box", "b", "--image", "alpine"];
+            v.extend_from_slice(args);
+            match parse_box(&v)? {
+                Command::BoxRun { entrypoint, .. } => Ok(entrypoint),
+                _ => Ok(None),
+            }
+        };
+
+        // Absent: the image's own entrypoint stands.
+        assert_eq!(ep(&[]).expect("parses"), None);
+        // One occurrence: Docker's form.
+        assert_eq!(
+            ep(&["--entrypoint", "/bin/sh"]).expect("parses"),
+            Some(vec!["/bin/sh".to_string()])
+        );
+        // Repeated: the exec-form list, in order.
+        assert_eq!(
+            ep(&["--entrypoint", "/bin/sh", "--entrypoint", "-c"]).expect("parses"),
+            Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+            "a later value may start with '-': it is an ARGUMENT to the program named first"
+        );
+        // Cleared: distinct from absent.
+        assert_eq!(ep(&["--entrypoint", ""]).expect("parses"), Some(Vec::new()));
+
+        // A LEADING DASH ON THE FIRST VALUE is a typo, not a program. Without this the value is
+        // taken as the executable and the box fails later with `cannot start '--privileged'`, which
+        // names the symptom and not the mistake. The `docker` shim already refuses the same shape.
+        assert!(
+            ep(&["--entrypoint", "--privileged"]).is_err(),
+            "the first value must not be a flag"
+        );
+        // And the flag with nothing after it is refused rather than silently ignored, which would
+        // run the image's own entrypoint while the caller believed they had replaced it.
+        assert!(ep(&["--entrypoint"]).is_err());
     }
 
     #[test]

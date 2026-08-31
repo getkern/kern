@@ -347,7 +347,32 @@ fn cpu_bandwidth_interface_present() -> bool {
 /// round trip from the parent was the first attempt and it was useless: writing `uid_map` alone cost
 /// 20 ms on one run and 5 on the next, so the warning appeared and vanished between two invocations on
 /// a machine whose real overlay mount is 0.1 ms. A number that unstable must not gate a warning.
-fn overlay_mount_cost_ms() -> Option<f64> {
+/// What the unprivileged-overlay probe found.
+///
+/// THE PROBE ALWAYS KNEW THIS AND THE ROW THREW IT AWAY. `overlay_mount_cost_ms` returned
+/// `Option<f64>`, and every failure - including the mount being REFUSED - collapsed into `None`,
+/// which `check_overlay` matched with `_ =>` and reported as `overlayfs: available`. So on a host
+/// where an unprivileged overlay does not work, doctor printed a tick next to the exact capability
+/// it had just proved absent, while `kern build` on the same host fell back to copying the base.
+/// A field report hit that contradiction and could not tell which of the two was wrong.
+///
+/// The mount performed here is the same KIND the build needs: `CLONE_NEWUSER | CLONE_NEWNS`, mapped
+/// to root inside, then `mount("overlay", ...)`. That is what makes its verdict transferable.
+enum OverlayProbe {
+    /// Mounted. Carries the median cost of one mount, in milliseconds.
+    Works(f64),
+    /// The mount itself was refused. This is the state `kern build` reports as
+    /// `unprivileged overlay unavailable`.
+    Refused,
+    /// No user namespace, so the question could not be asked in the context that matters. Reported
+    /// separately because the remedy is a different one, and `check_userns` names it already.
+    NoUserns,
+    /// The probe could not run or did not answer within its bounded wait. NOT a verdict: saying
+    /// "unavailable" here would be inventing a fact from a failed measurement.
+    Unknown,
+}
+
+fn overlay_probe() -> OverlayProbe {
     use std::os::unix::ffi::OsStrExt;
     const N: usize = 3;
 
@@ -364,7 +389,7 @@ fn overlay_mount_cost_ms() -> Option<f64> {
         for sub in ["lower", "upper", "work", "merged"] {
             if std::fs::create_dir_all(dir.join(k.to_string()).join(sub)).is_err() {
                 let _ = crate::commands::remove_tree_forced(&dir); // never leave the tree we started
-                return None;
+                return OverlayProbe::Unknown;
             }
         }
     }
@@ -375,12 +400,21 @@ fn overlay_mount_cost_ms() -> Option<f64> {
     let mut optses: Vec<std::ffi::CString> = Vec::with_capacity(N);
     for k in 0..N {
         let base = dir.join(k.to_string());
-        let t = std::ffi::CString::new(base.join("merged").as_os_str().as_bytes()).ok()?;
-        let o = std::ffi::CString::new(format!(
-            "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work",
-            base.display()
-        ))
-        .ok()?;
+        // An interior NUL cannot appear in a path this function built, so the `else` is unreachable
+        // today. Handled anyway: a `?` here was the one place this function could return WITHOUT
+        // removing the tree it had just created, which is a leak on a path nobody would ever see
+        // fail.
+        let (Some(t), Some(o)) = (
+            std::ffi::CString::new(base.join("merged").as_os_str().as_bytes()).ok(),
+            std::ffi::CString::new(format!(
+                "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work",
+                base.display()
+            ))
+            .ok(),
+        ) else {
+            let _ = crate::commands::remove_tree_forced(&dir);
+            return OverlayProbe::Unknown;
+        };
         targets.push(t);
         optses.push(o);
     }
@@ -388,7 +422,7 @@ fn overlay_mount_cost_ms() -> Option<f64> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         let _ = crate::commands::remove_tree_forced(&dir);
-        return None;
+        return OverlayProbe::Unknown;
     }
     let (rd, wr) = (fds[0], fds[1]);
     let pid = unsafe { libc::fork() };
@@ -444,7 +478,7 @@ fn overlay_mount_cost_ms() -> Option<f64> {
     if pid < 0 {
         unsafe { libc::close(rd) };
         let _ = crate::commands::remove_tree_forced(&dir);
-        return None;
+        return OverlayProbe::Unknown;
     }
 
     // A BOUNDED wait. Without it, any reason the child fails to write - a deadlock, a stop signal,
@@ -466,8 +500,14 @@ fn overlay_mount_cost_ms() -> Option<f64> {
     let mut st = 0i32;
     crate::eintr::waitpid(pid, &mut st, 0);
     let _ = crate::commands::remove_tree_forced(&dir);
-    if n != buf.len() as isize || !libc::WIFEXITED(st) || libc::WEXITSTATUS(st) != 0 {
-        return None;
+    if !libc::WIFEXITED(st) {
+        return OverlayProbe::Unknown; // killed, including by this function's own timeout
+    }
+    if let Some(v) = exit_verdict(libc::WEXITSTATUS(st)) {
+        return v;
+    }
+    if n != buf.len() as isize {
+        return OverlayProbe::Unknown; // exited clean but the timings did not arrive
     }
     let mut us = [0u64; N];
     for (k, slot) in us.iter_mut().enumerate() {
@@ -476,7 +516,30 @@ fn overlay_mount_cost_ms() -> Option<f64> {
         *slot = u64::from_ne_bytes(w);
     }
     us.sort_unstable();
-    Some(us[N / 2] as f64 / 1000.0)
+    OverlayProbe::Works(us[N / 2] as f64 / 1000.0)
+}
+
+/// The overlay probe child's exit code, as a verdict. `None` for a clean exit, where the timings
+/// it wrote decide instead.
+///
+/// THE CODE IS THE REASON, AND IT WAS BEING DISCARDED: every non-zero status collapsed into one
+/// `None` that the row then read as "available". The numbers are the child's own `_exit` calls a few
+/// dozen lines above, and `the_exit_codes_this_maps_are_the_ones_the_child_writes` holds the two
+/// ends together, because a mapping keyed on constants written elsewhere is a mapping that goes
+/// silently wrong the day somebody renumbers them.
+const fn exit_verdict(code: i32) -> Option<OverlayProbe> {
+    match code {
+        0 => None,
+        // `unshare(CLONE_NEWUSER | CLONE_NEWNS)` failed: no user namespace to ask the question in.
+        1 => Some(OverlayProbe::NoUserns),
+        // The uid/gid map could not be written, so the child never reached the mount. Not a verdict
+        // about overlay: it never got to try.
+        2 => Some(OverlayProbe::Unknown),
+        // `mount("overlay", ...)` was refused. THE ANSWER the build acts on.
+        3 => Some(OverlayProbe::Refused),
+        // A code this function does not know cannot be turned into a fact about the kernel.
+        _ => Some(OverlayProbe::Unknown),
+    }
 }
 
 fn can_create_userns() -> bool {
@@ -650,15 +713,57 @@ fn check_overlay() -> R {
         })
         .unwrap_or(false);
     if supported {
-        // Available is not the same as cheap, and on one board the difference is the whole benchmark.
-        match overlay_mount_cost_ms() {
-            Some(ms) if ms >= 5.0 => R::Warn(
+        // `/proc/filesystems` answers a DIFFERENT QUESTION from the one that matters, and this row
+        // used to report only that one. The file says the kernel has an overlay driver; what a
+        // rootless box rootfs and a layered build both need is an overlay mounted from inside an
+        // UNPRIVILEGED USER NAMESPACE, which a kernel can list and still refuse. The probe below
+        // performs exactly that mount, so its verdict is the one `kern build` acts on.
+        //
+        // Both scopes are named, because they are what a reader compares against: a field report saw
+        // `✔ overlayfs: available` from this row and `[flat · unprivileged overlay unavailable]` from
+        // a build minutes later, with nothing anywhere saying the two sentences were about different
+        // things.
+        match overlay_probe() {
+            OverlayProbe::Works(ms) if ms >= 5.0 => R::Warn(
                 format!(
                     "overlayfs works but costs {ms:.0} ms per mount on this kernel, which is most of a box's start time"
                 ),
                 "measured constant here: same cost with an EMPTY lowerdir and with everything on tmpfs, so it is not your disk or your image. `--bind-rootfs` skips it (91.9 -> 11.3 ms per box on an Arduino UNO Q) but binds the source directly: mutable and shared between boxes, where the overlay root is per-box and leaves the source untouched".into(),
             ),
-            _ => R::Ok("overlayfs: available (default box rootfs strategy)".into()),
+            OverlayProbe::Works(_) => R::Ok(
+                "overlayfs: available unprivileged (box rootfs AND layered builds)".into(),
+            ),
+            // THE STATE THIS ROW USED TO CALL `available`. The driver is listed and the mount is
+            // refused, so every box falls back and every build copies its base.
+            OverlayProbe::Refused => R::Warn(
+                "overlayfs is listed in /proc/filesystems but an UNPRIVILEGED mount is refused here"
+                    .into(),
+                format!(
+                    "that is the mount a rootless box rootfs and a layered build both need, so builds copy the whole base image on every run (`[flat · unprivileged overlay unavailable]`) and boxes fall back to a plain rootfs. Common on WSL2 and on vendor kernels. Nothing here is broken; the cost is the copy{}",
+                    // AND WHAT THE COPY COSTS, which is a property of the filesystem holding the
+                    // image cache and not of kern. `copy_tree` passes `--reflink=auto`: a
+                    // copy-on-write filesystem clones the base for almost nothing, and everything
+                    // else re-reads and re-writes it in full. Saying "the cost is the copy" without
+                    // that leaves the reader with a number and no way to act on it.
+                    match crate::commands::supports_reflink(&crate::commands::cache_dir()) {
+                        Some(true) =>
+                            ", which this filesystem clones (copy-on-write), so it is nearly free",
+                        Some(false) =>
+                            ", and this filesystem has no copy-on-write, so it is a full re-read and re-write of the base each time. A cache on btrfs, xfs or bcachefs clones it instead",
+                        None => "",
+                    }
+                ),
+            ),
+            OverlayProbe::NoUserns => R::Warn(
+                "overlayfs is listed but the probe could not create a user namespace".into(),
+                "the overlay question cannot be answered without one, and unprivileged user namespaces are what every box needs first - see the `unprivileged user namespaces` row above for the remedy".into(),
+            ),
+            // NOT A VERDICT. The measurement did not complete, and reporting either answer would be
+            // inventing a fact from a failed probe.
+            OverlayProbe::Unknown => R::Warn(
+                "overlayfs is listed in /proc/filesystems, but the unprivileged-mount probe did not complete".into(),
+                "so this host's real capability is unknown here: `kern build` names what it found on the line it prints, and a box reports its own fallback. Re-run `kern doctor`; a probe that keeps timing out is worth reporting".into(),
+            ),
         }
     } else {
         R::Warn(
@@ -910,6 +1015,78 @@ fn which(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// THE ROW MUST NOT SAY `available` FOR A MOUNT THAT WAS REFUSED.
+    ///
+    /// Every non-zero exit collapsed into one `None`, which `check_overlay` matched with `_ =>` and
+    /// reported as `overlayfs: available`. A field report saw that tick and, minutes later,
+    /// `[flat · unprivileged overlay unavailable]` from a build on the same host.
+    #[test]
+    fn a_refused_mount_is_never_reported_as_available() {
+        assert!(
+            matches!(exit_verdict(3), Some(OverlayProbe::Refused)),
+            "a refused mount is the one answer the build acts on"
+        );
+        assert!(matches!(exit_verdict(1), Some(OverlayProbe::NoUserns)));
+        // NOT A VERDICT. The child never reached the mount, so neither answer is a fact.
+        assert!(matches!(exit_verdict(2), Some(OverlayProbe::Unknown)));
+        assert!(matches!(exit_verdict(99), Some(OverlayProbe::Unknown)));
+        // A clean exit defers to the timings the child wrote.
+        assert!(exit_verdict(0).is_none());
+    }
+
+    /// THE CODES THIS MAPS ARE THE CODES THE CHILD WRITES.
+    ///
+    /// `exit_verdict` is keyed on numbers chosen a few dozen lines away, inside the forked child.
+    /// Renumbering one there and not here would leave the mapping compiling, running, and silently
+    /// wrong - a refused mount reported as `Unknown`, which is the shape of the defect this whole
+    /// row exists to remove. The two ends are held together by reading the source.
+    #[test]
+    fn the_exit_codes_this_maps_are_the_ones_the_child_writes() {
+        const SRC: &str = include_str!("doctor.rs");
+        let start = SRC
+            .find("fn overlay_probe() -> OverlayProbe {")
+            .expect("the probe must exist");
+        let end = SRC[start..]
+            .find("\nfn ")
+            .map(|i| start + i)
+            .unwrap_or(SRC.len());
+        let body = &SRC[start..end];
+
+        let mut codes: Vec<i32> = Vec::new();
+        let mut rest = body;
+        while let Some(i) = rest.find("_exit(") {
+            rest = &rest[i + "_exit(".len()..];
+            let num: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = num.parse::<i32>() {
+                if !codes.contains(&n) {
+                    codes.push(n);
+                }
+            }
+        }
+        assert!(
+            codes.len() >= 4,
+            "expected the child's four exit codes, found {codes:?} - the probe changed shape and \
+             this check stopped reading it, which would leave it green by absence"
+        );
+        for c in [0, 1, 2, 3] {
+            assert!(
+                codes.contains(&c),
+                "the child no longer exits {c}, so `exit_verdict` maps a code nobody writes: {codes:?}"
+            );
+        }
+        // And every code the child DOES write must be one this mapping names, or a real failure
+        // mode arrives as `Unknown` and the row says nothing useful about it.
+        for c in codes {
+            if c == 0 {
+                continue;
+            }
+            assert!(
+                !matches!(exit_verdict(c), Some(OverlayProbe::Unknown)) || c == 2,
+                "the child exits {c} and `exit_verdict` has no name for it"
+            );
+        }
+    }
+
     use super::*;
     use crate::gpu::{overclaims, Evidence, Gpu, Tier, Vendor};
 

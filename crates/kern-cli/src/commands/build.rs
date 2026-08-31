@@ -13,7 +13,7 @@ fn build_json(r: &crate::builds::Record) -> String {
         "{{\"id\":{},\"tag\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{},\"dockerfile\":{},\"context\":{},\"error\":{}}}",
         json_str(&r.id),
         json_str(&r.tag),
-        json_str(r.status.label()),
+        json_str(r.label()),
         r.duration_ms,
         r.started,
         r.size,
@@ -87,13 +87,16 @@ pub fn builds_list(
             let label = if r.status == crate::builds::Status::Warn && r.warnings > 0 {
                 format!("warn {}", r.warnings)
             } else {
-                r.status.label().to_string()
+                r.label().to_string()
             };
             let status = format!("{sc}{:<11}{}", label, p.z);
             println!(
                 "{id} {:<tw$} {status} {:>8} {:>9}  {}",
                 truncate(&r.tag, tw),
-                fmt_dur(r.duration_ms),
+                // ELAPSED, NOT `duration_ms`. That field is written at finalize, so a build in
+                // flight has zero in it, and `0ms` next to a live process is the same false report
+                // as calling it interrupted. `elapsed_ms` counts up while it runs.
+                fmt_dur(r.elapsed_ms(now)),
                 human_bytes(r.size),
                 fmt_age(now.saturating_sub(r.started)),
             );
@@ -127,8 +130,11 @@ pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
         let s = crate::ui::scrub;
         println!("{}{}build {}{}", p.b, p.c, r.id, p.z);
         println!("  tag        {}", s(&r.tag));
-        println!("  status     {}", r.status.label());
-        println!("  duration   {}", fmt_dur(r.duration_ms));
+        println!("  status     {}", r.label());
+        println!(
+            "  duration   {}",
+            fmt_dur(r.elapsed_ms(crate::registry::now_unix()))
+        );
         println!("  size       {}", human_bytes(r.size));
         println!("  warnings   {}", r.warnings);
         println!("  dockerfile {}", s(&r.dockerfile));
@@ -254,6 +260,9 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
         status: crate::builds::Status::Running,
         warnings: warns.len() as u32,
         size: 0,
+        // Recorded at the same moment as the pid, so the pair identifies THIS process and a later
+        // reader cannot mistake a recycled pid for a build still in flight.
+        pid_starttime: registry::proc_starttime(std::process::id() as i32),
         error: String::new(),
     };
     let _ = crate::builds::write(&rec);
@@ -293,7 +302,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
         &id,
         &format!(
             "--- {} in {}ms · {} ---",
-            rec.status.label(),
+            rec.label(),
             rec.duration_ms,
             rec.tag
         ),
@@ -424,6 +433,37 @@ fn build_multi_stage(
 /// Prefers a **layered** build: the base stays a shared read-only overlay lower, and RUN/COPY writes
 /// accumulate in a persistent upper (the diff) - so the base is **never copied** (closing the
 /// base-copy bottleneck). The image is stored as its diff + a `<tag>.base` marker, and
+/// Why a build took the FLAT path (copy the base) instead of the layered one (overlay).
+///
+/// One message used to cover all three, and it named the least likely of them. See where this is
+/// decided for the cost of that.
+#[derive(Clone, Copy)]
+pub(crate) enum FlatReason {
+    /// `KERN_BUILD_FLAT=1`: the operator asked for it. Nothing is unavailable.
+    Forced,
+    /// The unprivileged overlay mount is refused by this kernel. The base is copied because there is
+    /// no other way to build here.
+    NoUnprivilegedOverlay,
+    /// The mount works and kern will not use it: this kernel does not record overlay OPAQUE markers,
+    /// so a file deleted in one build step would come back in a `COPY --from` or a push. Measured on
+    /// tegra 5.15. The flat path deletes for real, which closes the leak by construction.
+    OpaqueNotHonoured,
+}
+
+impl FlatReason {
+    /// The clause the build line prints, worded to complete `[flat · ___, copying the base]`.
+    pub(crate) const fn why(self) -> &'static str {
+        match self {
+            Self::Forced => "KERN_BUILD_FLAT=1",
+            Self::NoUnprivilegedOverlay => "unprivileged overlay unavailable",
+            Self::OpaqueNotHonoured => {
+                "this kernel does not record overlay opaque markers, so a layered build could \
+                 resurrect a deleted file"
+            }
+        }
+    }
+}
+
 /// [`resolve_image`] stacks it back over the (re-resolvable) base at run. Where unprivileged overlay
 /// isn't usable (probed once), it falls back to a **flat** build: copy the base, RUN over a bind
 /// mount, store a full rootfs - exactly as before, at the cost of the base copy.
@@ -469,9 +509,31 @@ fn build_run(
     // opaque marker involved), closing the leak by construction on every kernel. `probe_opaque_honored`
     // tests this once, in-process, and only matters on the (older/vendor) kernels that lack it; on a
     // modern kernel it's a sub-ms no-op that returns true.
-    let layered = std::env::var_os("KERN_BUILD_FLAT").is_none()
-        && probe_overlay(&self_exe, &base_lower, work)
-        && probe_opaque_honored();
+    // WHICH of the three reasons put this build on the flat path, because they are not the same
+    // fact and the single message they all produced said the wrong thing for two of them:
+    //
+    //   * the operator FORCED it - nothing is unavailable;
+    //   * the unprivileged overlay mount is refused by this kernel - the message was true here;
+    //   * the mount works and kern REFUSES to use it, because this kernel does not record overlay
+    //     opaque markers and a layered build would let a file deleted in a step reappear in a
+    //     `COPY --from` or a push. That is a deliberate security fallback, and reporting it as a
+    //     missing capability hides a decision kern made on the operator's behalf behind an apparent
+    //     limitation of their machine. A field report measured 2m49s of base copying on WSL2 and
+    //     concluded the cost "may be our host, not kern"; with one message for three causes there
+    //     was no way for them to tell which one they had.
+    //
+    // Evaluated in the same order as the `&&` chain it replaces, so the expensive probe still runs
+    // only when the cheap check has not already decided.
+    let flat_because = if std::env::var_os("KERN_BUILD_FLAT").is_some() {
+        Some(FlatReason::Forced)
+    } else if !probe_overlay(&self_exe, &base_lower, work) {
+        Some(FlatReason::NoUnprivilegedOverlay)
+    } else if !probe_opaque_honored() {
+        Some(FlatReason::OpaqueNotHonoured)
+    } else {
+        None
+    };
+    let layered = flat_because.is_none();
     if !layered && base_lower.contains(':') {
         return Err(Error::Sandbox(
             "cannot build FROM a layered image without unprivileged overlay + honoured opaque dirs on \
@@ -508,7 +570,25 @@ fn build_run(
     }
     // A real flat build (cache miss) - now note the base copy (slower than layered).
     if !quiet {
-        eprintln!("  [flat · unprivileged overlay unavailable, copying the base]");
+        // AND WHAT THE COPY WILL COST, which is a property of the filesystem and was never stated.
+        // `copy_tree` passes `--reflink=auto`: on btrfs/xfs/bcachefs the base is cloned and the line
+        // below is nearly free, everywhere else it is a full byte copy of the whole base image. A
+        // field report measured 2m49s and 1.9 GB per build and could not tell whether that was kern
+        // or their host. It is neither; it is whether this filesystem does copy-on-write.
+        let cow = supports_reflink(work);
+        eprintln!(
+            "  [flat · {}, copying the base{}]",
+            flat_because.map_or("no layered build", FlatReason::why),
+            match cow {
+                Some(true) => " (cloned: this filesystem does copy-on-write)",
+                // Short and on ONE line, deliberately. The first version wrapped this with a `\`
+                // continuation and `cargo fmt` joined it back with the indentation inside the
+                // literal, so the user would have read "the whole base is<35 spaces>re-read".
+                // `scripts/flat-continuation.py` caught it on the same file it was written into.
+                Some(false) => " in full: no copy-on-write here, so the whole base is re-copied",
+                None => "",
+            }
+        );
     }
     let write_dir = work.join("rootfs");
     copy_tree(std::path::Path::new(&base_lower), &write_dir)?;
@@ -662,10 +742,10 @@ fn build_run(
             }
         }
     }
-    // Strip the resolv.conf we seeded so host DNS isn't baked in; leave a base's own untouched.
-    if seeded_resolv {
-        let _ = std::fs::remove_file(write_dir.join("etc/resolv.conf"));
-    }
+    // Undo the seed so host DNS isn't baked in. EXACT, not a delete: a base that shipped an empty
+    // `/etc/resolv.conf` (every Debian and Ubuntu image does) gets its empty file back rather than
+    // losing it. See `seed_resolv_conf`.
+    restore_resolv_conf(&write_dir, &seeded_resolv);
 
     // Finalize: commit the new form FIRST (clearing only THIS mode's prior target so the rename can
     // land), THEN drop the OTHER mode's stale artifacts and the sentinel - so a failed rename never

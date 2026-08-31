@@ -117,6 +117,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         (auto-created; see `kern volume`), or nfs://|smb://|sshfs:// URL
     -e, --env K=V       Set an environment variable (repeatable)
     -w, --workdir <dir> Working directory inside the box
+        --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;
+                         `--entrypoint \"\"` clears it). Discards the image's CMD, as docker does
     -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default 512m)
     --cpus <n>          CPU cap in cores (e.g. 1.5, 2; default uncapped)
     --cpuset-cpus <list>  Pin to specific CPUs (e.g. 0-3, 0,2,4; default no pinning)

@@ -56,6 +56,89 @@ mod image_user_resolution_tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
+    /// A NUMERIC `USER` TAKES ITS GROUP FROM THE IMAGE, NOT FROM ITS OWN NUMBER.
+    ///
+    /// `gid = uid` for anything numeric, which is right only when the image happens to agree. It
+    /// usually does not: `USER 1000` with `keycloak:x:1000:0:` in the image's passwd means gid 0,
+    /// and the image's own tree is laid out for it - `/opt/keycloak/lib/quarkus` is
+    /// `drwxrwxr-x root root`, writable by the owner and by group 0 and by nobody else.
+    ///
+    /// The consequence surfaced far from the cause. Keycloak's startup runs a Quarkus augmentation
+    /// that writes into its runner JAR; with gid 1000 that write is refused, `jdk.nio.zipfs` opens
+    /// the JAR as a READ-ONLY zip filesystem, and the first `Files.createDirectory` inside it throws
+    /// `ReadOnlyFileSystemException`. The box restart-looped. A field report attributed it to disk
+    /// exhaustion; this host reproduced the identical crash with 3.2 GB free, which ruled that out,
+    /// and `id` inside the box named the real difference in one line.
+    #[test]
+    fn a_numeric_user_takes_its_primary_group_from_the_images_passwd() {
+        let root = std::env::temp_dir().join(format!("kern-usrnum-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).expect("the fixture rootfs");
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh
+             keycloak:x:1000:0:keycloak user:/opt/keycloak:/sbin/nologin
+             odd:x:3000:4000:odd:/odd:/bin/sh
+             app:x:2000:2000:app:/app:/bin/sh
+",
+        )
+        .expect("passwd");
+        let lower = root.to_string_lossy();
+
+        // THE ROWS BELOW ARE CHOSEN TO DISCRIMINATE, which is not the same as being realistic.
+        //
+        // Six official images were run against this change and every one answered `0:0` under BOTH
+        // the old rule (gid = the user's own number) and the new one, because not one of them
+        // declares a `USER` at all: `resolve_image_user` was never even reached. That corpus would
+        // have stayed green with the fix INVERTED. It is not a small sample, it is a sample with no
+        // discriminating power, which is the same "green by absence" this project keeps finding -
+        // this time in the bench rather than in the product.
+        //
+        // Each row here answers differently under the two rules. Old: 1000, 3000, 4242.
+        // New: 0, 4000, 0. Verified first against two built binaries on three built images.
+        //
+        // 1. gid zero and not the uid: the shape keycloak ships.
+        // THE CASE: uid 1000 whose passwd entry says group 0.
+        assert_eq!(
+            resolve_image_user("1000", &lower),
+            Some((1000, 0)),
+            "a numeric USER must take the group its own passwd entry declares"
+        );
+        // 2. gid neither the uid NOR zero: the shape no official image happens to have, and the one
+        //    that separates "reads the passwd" from "defaults to 0".
+        assert_eq!(
+            resolve_image_user("3000", &lower),
+            Some((3000, 4000)),
+            "the group comes from the passwd entry, not from a constant"
+        );
+        // And where passwd DOES say gid == uid, the answer is unchanged - so this is not a blanket
+        // "always 0", which would break the images that mean what the old code assumed.
+        assert_eq!(resolve_image_user("2000", &lower), Some((2000, 2000)));
+        assert_eq!(resolve_image_user("0", &lower), Some((0, 0)));
+
+        // AN EXPLICIT GROUP STILL WINS over the passwd entry, in both spellings.
+        assert_eq!(resolve_image_user("1000:1000", &lower), Some((1000, 1000)));
+        assert_eq!(resolve_image_user("1000:0", &lower), Some((1000, 0)));
+
+        // A uid the image does not list falls back to the ROOT group, which is Docker's documented
+        // default, and NOT to the uid.
+        assert_eq!(
+            resolve_image_user("4242", &lower),
+            Some((4242, 0)),
+            "an unlisted uid gets the root group, not its own number"
+        );
+        // Same with no account files at all: a numeric spec still has an answer, unlike a name.
+        let bare = std::env::temp_dir().join(format!("kern-usrnum-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&bare).expect("the empty rootfs");
+        assert_eq!(
+            resolve_image_user("1000", &bare.to_string_lossy()),
+            Some((1000, 0))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
     /// The lookup walks an overlay `top:…:base` chain and the TOP-most layer that carries the file wins,
     /// the way the merged rootfs would present it.
     #[test]
@@ -1050,29 +1133,78 @@ mod net_resource_tests {
         };
         // No user command → entrypoint + image Cmd.
         assert_eq!(
-            resolve_image_command(&[], false, &img),
+            resolve_image_command(&[], false, &img, None),
             vec!["docker-entrypoint.sh", "redis-server"]
         );
         // User command → entrypoint + user command (image Cmd dropped, docker-style).
         assert_eq!(
-            resolve_image_command(&["redis-cli".into()], false, &img),
+            resolve_image_command(&["redis-cli".into()], false, &img, None),
             vec!["docker-entrypoint.sh", "redis-cli"]
         );
         // --ssh + no command → keep-alive, ignore the image command.
         assert_eq!(
-            resolve_image_command(&[], true, &img),
+            resolve_image_command(&[], true, &img, None),
             vec!["sleep", "infinity"]
         );
         // No image config + no command → a shell (the --rootfs / bare case).
         let empty = kern_oci::ImageConfig::default();
         assert_eq!(
-            resolve_image_command(&[], false, &empty),
+            resolve_image_command(&[], false, &empty, None),
             vec![DEFAULT_SHELL]
         );
         // No image config + user command → the user command unchanged.
         assert_eq!(
-            resolve_image_command(&["echo".into(), "hi".into()], false, &empty),
+            resolve_image_command(&["echo".into(), "hi".into()], false, &empty, None),
             vec!["echo", "hi"]
+        );
+
+        // ── THE OVERRIDE, which is the whole of Docker's `--entrypoint` rule ──────────────────
+        //
+        // The image's ENTRYPOINT is replaced AND its CMD is discarded. Keeping the CMD would hand
+        // `redis-server` to a program that never expected it. Docker documents the discard
+        // explicitly, and it is the half that is easy to miss.
+        assert_eq!(
+            resolve_image_command(&[], false, &img, Some(&["/bin/sh".to_string()])),
+            vec!["/bin/sh"],
+            "an override with no command runs the override alone: the image's Cmd is not its args"
+        );
+        // With a command, the override takes it as its arguments.
+        assert_eq!(
+            resolve_image_command(
+                &["-c".into(), "id".into()],
+                false,
+                &img,
+                Some(&["/bin/sh".to_string()])
+            ),
+            vec!["/bin/sh", "-c", "id"]
+        );
+        // AN EXEC-FORM LIST, which is what repeating the flag builds.
+        assert_eq!(
+            resolve_image_command(
+                &["id".into()],
+                false,
+                &img,
+                Some(&["/bin/sh".to_string(), "-c".to_string()])
+            ),
+            vec!["/bin/sh", "-c", "id"]
+        );
+        // AN EMPTY OVERRIDE CLEARS the entrypoint (compose's `entrypoint: []`): the command runs
+        // as argv[0] with nothing in front of it, and the image's Cmd is still discarded.
+        assert_eq!(
+            resolve_image_command(&["id".into()], false, &img, Some(&[])),
+            vec!["id"]
+        );
+        // Cleared with no command at all: nothing is left to run, so the announced shell fallback
+        // applies rather than silently resurrecting the image's own entrypoint.
+        assert_eq!(
+            resolve_image_command(&[], false, &img, Some(&[])),
+            vec![DEFAULT_SHELL]
+        );
+        // `--ssh` still wins: the keep-alive is what holds the box open for sshd, and an override
+        // that replaced it would leave the box exiting the moment it started.
+        assert_eq!(
+            resolve_image_command(&[], true, &img, Some(&["/bin/sh".to_string()])),
+            vec!["sleep", "infinity"]
         );
     }
 
@@ -1210,6 +1342,114 @@ mod net_resource_tests {
             "kept change must bust"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `--entrypoint` AND THE USER RESOLUTION ARE INDEPENDENT, and that is asserted rather than
+    /// assumed.
+    ///
+    /// An outside review raised the residual on the `USER` change: reading `GetExecUser` says WHAT
+    /// runc computes, not WHETHER the identity is resolved at the same point in the chain relative
+    /// to an entrypoint override. The differential against a real Docker is still open and needs a
+    /// host that has one; what CAN be settled here is the half that lives in this codebase.
+    ///
+    /// `resolve_image_command` decides ARGV and `resolve_image_user` decides IDENTITY. They take
+    /// different inputs and neither reads the other's output, so an override of one cannot move the
+    /// other. Asserted on the same image config, across the whole entrypoint matrix.
+    #[test]
+    fn an_entrypoint_override_does_not_move_the_resolved_user() {
+        let root = std::env::temp_dir().join(format!("kern-epuser-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).expect("the fixture rootfs");
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsvc:x:1000:0:svc:/:/bin/sh\n",
+        )
+        .expect("passwd");
+        let lower = root.to_string_lossy();
+
+        let img = kern_oci::ImageConfig {
+            entrypoint: vec!["/entry.sh".into()],
+            cmd: vec!["serve".into()],
+            user: Some("1000".into()),
+            ..Default::default()
+        };
+
+        // The identity the image asks for, resolved once.
+        let expected = resolve_image_user("1000", &lower);
+        assert_eq!(
+            expected,
+            Some((1000, 0)),
+            "the fixture must exercise gid != uid"
+        );
+
+        // Every entrypoint shape, against the same image: none of them may change the identity,
+        // because the identity is not an input to any of them.
+        for ep in [
+            None,
+            Some(&[][..]),
+            Some(&["/bin/sh".to_string()][..]),
+            Some(&["/bin/sh".to_string(), "-c".to_string()][..]),
+        ] {
+            let _argv = resolve_image_command(&[], false, &img, ep);
+            assert_eq!(
+                resolve_image_user("1000", &lower),
+                expected,
+                "an entrypoint override changed the resolved user"
+            );
+        }
+
+        // AND THE CONTROL IN THE OTHER DIRECTION: the entrypoint override IS taking effect, or the
+        // loop above would be asserting stability across four identical no-ops.
+        assert_eq!(
+            resolve_image_command(&[], false, &img, None),
+            vec!["/entry.sh", "serve"],
+            "with no override the image's entrypoint and cmd both stand"
+        );
+        assert_eq!(
+            resolve_image_command(&[], false, &img, Some(&["/bin/sh".to_string()])),
+            vec!["/bin/sh"],
+            "with an override the image's entrypoint is replaced and its cmd discarded"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `--cpus` EQUAL TO THE HOST COUNT IS NOT ABOVE IT.
+    ///
+    /// `clamp_cpus` had no test at all - only its sibling `clamp_cpuset` did - and a mutation sweep
+    /// turned `c > host` into `c >= host` with all 920 green. The inverted form clamps a request
+    /// that is exactly the machine, and prints a warning saying it "exceeds" a number it equals.
+    ///
+    /// The host count is read rather than assumed, so this asserts the RULE on whatever machine it
+    /// runs, instead of a number that is true here.
+    #[test]
+    fn clamp_cpus_leaves_a_request_at_the_host_count_alone() {
+        let host = host_cpu_count() as f64;
+        assert!(host >= 1.0, "a host with no CPUs cannot run this suite");
+
+        // Absent: nothing to clamp.
+        assert_eq!(clamp_cpus(None), None);
+        // Below: untouched.
+        assert_eq!(clamp_cpus(Some(0.5)), Some(0.5));
+        // AT the host count: untouched.
+        assert_eq!(clamp_cpus(Some(host)), Some(host));
+
+        // THE BOUNDARY IS ASSERTED ON THE PREDICATE, NOT ON THE RETURN VALUE, and the difference is
+        // the reason `cpus_exceed_host` exists. At `c == host` the clamped result and the unclamped
+        // one are the SAME NUMBER, so `>` mutated to `>=` leaves everything above green and changes
+        // only the warning - which then tells the operator that N CPUs "exceeds the N available".
+        // The false message is the entire observable difference, and no assertion on the returned
+        // `Option` can reach it.
+        assert!(!cpus_exceed_host(host, host), "equal is not above");
+        assert!(!cpus_exceed_host(host - 0.5, host));
+        assert!(
+            cpus_exceed_host(host + 0.001, host),
+            "any excess at all is above"
+        );
+        assert!(cpus_exceed_host(host * 2.0, host));
+        // Above: clamped down to what the machine has, never left as asked.
+        assert_eq!(clamp_cpus(Some(host + 1.0)), Some(host));
+        assert_eq!(clamp_cpus(Some(host * 100.0)), Some(host));
     }
 
     #[test]
@@ -2919,6 +3159,51 @@ mod port_collision_tests {
         }
     }
 
+    /// THE REFUSAL NAMES THE SERVICES, and it used to name the boxes.
+    ///
+    /// By the time this check runs, `ComposeBox::name` is the BOX name - `<project>-<service>`, or a
+    /// `container_name` verbatim - so the message quoted a name that does not appear in the file the
+    /// reader is about to edit. Measured before the fix, on a file with `container_name` set:
+    /// `services 'myapp-keycloak' and 'myapp-api' both listen on container port 8080/tcp`, for a
+    /// file whose services are called `keycloak` and `api`.
+    ///
+    /// It is the same defect that made `compose ... config` print box names while its own comment
+    /// claimed it printed service names, and that one cost a field report a wrong diagnosis.
+    #[test]
+    fn the_collision_message_names_the_services_the_file_declares() {
+        let mut a = svc("myapp-keycloak", &["7080:8080"]);
+        a.service = "keycloak".into();
+        let mut b = svc("myapp-api", &["7212:8080"]);
+        b.service = "api".into();
+        let boxes = [a, b];
+
+        // 1. THE CONTAINER-PORT refusal, which is the one the README now points a reader at: two
+        //    services in one pod cannot both bind 8080 even though their host ports differ.
+        let Err(Error::Compose(msg)) = check_pod_global_conflicts(&boxes, false) else {
+            panic!("two services on container port 8080 must be refused before anything starts");
+        };
+        assert!(msg.contains("'keycloak'") && msg.contains("'api'"), "{msg}");
+        assert!(
+            !msg.contains("myapp-"),
+            "the message must not quote the box name: {msg}"
+        );
+
+        // 2. THE HOST-PORT refusal, same rule, different function - so fixing one and not the other
+        //    would leave a reader chasing a name their file does not contain on half the failures.
+        let mut c = svc("myapp-web", &["9000:80"]);
+        c.service = "web".into();
+        let mut d = svc("myapp-worker", &["9000:81"]);
+        d.service = "worker".into();
+        assert_collides(&[c, d], &["'web'", "'worker'"]);
+
+        // A box that never went through the rename has an empty `service`, and there `name` IS the
+        // service name: the message must still be able to say something.
+        assert_collides(
+            &[svc("web", &["1:80"]), svc("api", &["1:81"])],
+            &["'web'", "'api'"],
+        );
+    }
+
     #[test]
     fn distinct_host_ports_are_fine() {
         let boxes = [svc("web", &["8080:80"]), svc("api", &["8081:80"])];
@@ -3621,4 +3906,604 @@ mod the_plan_previews_every_profile_kind {
              different number of Err arms that print it"
         );
     }
+}
+
+// ── `kern config setup`: the generated file, and the measurements it carries ──────────────────────
+//
+// This generator had NO tests at all, which is how it came to emit a `device` naming a disk that
+// does not hold the path beside it. It is the file every new user starts from, so what follows
+// asserts the file rather than the helpers: the helpers are also asserted, but a green helper and a
+// generated file nobody parses is the shape of the gap that was there.
+
+/// A host description with nothing measured, as the starting point for the cases below.
+fn blank_host() -> super::HostInv {
+    super::HostInv {
+        ncpu: 0,
+        ram_bytes: None,
+        root_total: None,
+        root_dev: None,
+        disks: Vec::new(),
+        gpiochips: Vec::new(),
+        i2c: Vec::new(),
+        spi: Vec::new(),
+    }
+}
+
+/// Generate for `h`, parse the result, and return the over-budget rows it triggers.
+///
+/// PARSED AND CHECKED, NOT PATTERN-MATCHED. Asserting that the text contains `memory = ` proves the
+/// generator printed something; it does not prove the value is one this project's parser accepts,
+/// and the first draft of this work emitted `31.2G`, which the parser refuses. So the assertion goes
+/// through the real parser and then through the real over-budget table.
+fn generated(h: &super::HostInv) -> (String, Vec<crate::commands::OverBudget>) {
+    let text = super::tailored_kern_toml(h);
+    let cfg = match crate::config::parse(&text) {
+        Ok(c) => c,
+        Err(e) => panic!("the generated config does not parse: {e}\n---\n{text}"),
+    };
+    let rows = crate::commands::over_declared_budget(&cfg);
+    (text, rows)
+}
+
+/// THE FILE `config setup` WRITES MUST PASS THE CHECK `kern validate` RUNS, ON EVERY HOST SHAPE.
+///
+/// Not "must parse": must trigger ZERO rows of the over-budget table. A generator whose output warns
+/// about itself teaches a new user that kern's own output is noise, and it is the same defect as a
+/// command emitting config its own validator turns down.
+///
+/// The shapes below are the ones where a constant would have been wrong. The 512 MiB board is not
+/// hypothetical: it is the class of machine the GPIO half of this tool exists for, and a hard-coded
+/// `memory = "512 MB"` on it declared a profile as large as the whole machine.
+#[test]
+fn the_generated_config_never_overruns_the_budgets_it_declares() {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    for (what, h) in [
+        (
+            "a 28-core desktop",
+            super::HostInv {
+                ncpu: 28,
+                ram_bytes: Some(33_464_061_952),
+                root_total: Some(982_224_297_984),
+                ..blank_host()
+            },
+        ),
+        (
+            "a 512 MiB single-board computer",
+            super::HostInv {
+                ncpu: 4,
+                ram_bytes: Some(512 * MIB),
+                root_total: Some(4 * GIB),
+                ..blank_host()
+            },
+        ),
+        (
+            "a board with less RAM than the old constant",
+            super::HostInv {
+                ncpu: 1,
+                ram_bytes: Some(64 * MIB),
+                root_total: Some(128 * MIB),
+                ..blank_host()
+            },
+        ),
+        (
+            "a card smaller than the example volume",
+            super::HostInv {
+                ncpu: 2,
+                ram_bytes: Some(GIB),
+                root_total: Some(200 * MIB),
+                ..blank_host()
+            },
+        ),
+        (
+            "a host where nothing could be measured",
+            super::HostInv {
+                ncpu: 8,
+                ..blank_host()
+            },
+        ),
+        (
+            "one core, one byte of RAM, one byte of disk",
+            super::HostInv {
+                ncpu: 1,
+                ram_bytes: Some(1),
+                root_total: Some(1),
+                ..blank_host()
+            },
+        ),
+        (
+            "a host at the top of the range",
+            super::HostInv {
+                ncpu: 1024,
+                ram_bytes: Some(u64::MAX),
+                root_total: Some(u64::MAX),
+                ..blank_host()
+            },
+        ),
+    ] {
+        let (text, rows) = generated(&h);
+        assert!(
+            rows.is_empty(),
+            "{what}: the generated config warns about itself: {:?}\n---\n{text}",
+            rows.iter()
+                .map(|r| format!("{} {} {} > {}", r.family, r.field, r.asked, r.declared))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// AND THE CHECK IT PASSES IS AWAKE.
+///
+/// The case above is an assertion of ABSENCE, which is green against a table that never fires and
+/// against a generator that emits nothing at all. This drives the same table with a config that does
+/// overrun, so a silent table fails here first.
+#[test]
+fn the_over_budget_table_that_case_relies_on_is_not_asleep() {
+    let cfg = crate::config::parse(
+        "[[cpu]]\nid = \"cpu:0\"\ncores = 2.0\nmemory = \"1g\"\n\
+         [[vcpu]]\nname = \"x\"\nbackend = \"cpu:0\"\ncpus = 99\nmemory = \"64g\"\n",
+    )
+    .expect("the control config parses");
+    let rows = crate::commands::over_declared_budget(&cfg);
+    assert_eq!(
+        rows.len(),
+        2,
+        "a profile asking 99 cores and 64G of a 2-core 1G backend must raise both rows"
+    );
+}
+
+/// EVERY MEASURED FIGURE MUST BE READ BACK BY THE PARSER, AS THE NUMBER THAT WAS MEASURED.
+///
+/// The budget is the ceiling the check compares against, so a value the parser cannot read disables
+/// the check by making it skip (a `None` from `parse_binary_size` is a comparison that does not
+/// happen), and a value that reads HIGH disables it by making the comparison always pass.
+#[test]
+fn the_declared_budgets_round_trip_through_the_parser_and_never_read_high() {
+    for ram in [
+        1u64,
+        1023,
+        1024,
+        33_464_061_952,
+        32_680_724 * 1024,
+        1_000_000_007,
+        u64::MAX,
+    ] {
+        let h = super::HostInv {
+            ncpu: 4,
+            ram_bytes: Some(ram),
+            root_total: Some(ram),
+            ..blank_host()
+        };
+        let (text, _) = generated(&h);
+        let cfg = crate::config::parse(&text).expect("parses");
+        let cpu = cfg.cpu.first().expect("a [[cpu]] block is always written");
+        let declared = cpu
+            .memory
+            .as_deref()
+            .and_then(kern_common::parse_binary_size)
+            .unwrap_or_else(|| panic!("ram {ram}: the declared memory is not a size: {text}"));
+        assert!(
+            declared <= ram,
+            "ram {ram}: declared {declared} is ABOVE the measurement, which switches the check off"
+        );
+        assert!(
+            ram - declared < 1024 * 1024,
+            "ram {ram}: declared {declared} understates by more than a mebibyte"
+        );
+    }
+}
+
+/// NOTHING IS INVENTED WHERE NOTHING WAS MEASURED.
+///
+/// An absent budget is a state the validator handles by saying nothing. A defaulted one is a number
+/// a reader acts on, and this project has already withdrawn two figures that were written because a
+/// field looked empty.
+#[test]
+fn an_unmeasurable_host_gets_no_budget_rather_than_a_default() {
+    let (text, rows) = generated(&super::HostInv {
+        ncpu: 4,
+        ..blank_host()
+    });
+    assert!(rows.is_empty(), "no budget can be overrun when none exists");
+    let cfg = crate::config::parse(&text).expect("parses");
+    assert_eq!(
+        cfg.cpu.first().and_then(|c| c.memory.as_deref()),
+        None,
+        "an unreadable /proc/meminfo must leave the RAM budget undeclared, not guessed:\n{text}"
+    );
+    assert!(
+        text.contains("# memory ="),
+        "and it must say why the field is missing:\n{text}"
+    );
+    assert!(
+        cfg.disk.is_empty(),
+        "with no disk and no filesystem total there is nothing to declare:\n{text}"
+    );
+}
+
+/// `toml_size` IS THE CONTRACT THE BUDGETS REST ON: readable back, and never above.
+#[test]
+fn toml_size_round_trips_and_only_ever_rounds_down() {
+    const K: u64 = 1024;
+    let mut cases: Vec<u64> = vec![
+        1,
+        2,
+        1023,
+        K,
+        K + 1,
+        K * K - 1,
+        K * K,
+        K * K + 1,
+        K.pow(3),
+        K.pow(4),
+        K.pow(4) + 7,
+        32_680_724 * K,
+        959_203_416 * K,
+        1_000_000_007,
+        u64::MAX,
+        u64::MAX - 1,
+    ];
+    // A deterministic spread, so the property is exercised on values nobody chose by hand. A fixed
+    // multiplier and no RNG: a case that fails must fail again on the next run.
+    let mut v: u64 = 3;
+    for _ in 0..64 {
+        cases.push(v);
+        v = v.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+    }
+    for n in cases {
+        let Some(rendered) = super::toml_size(n) else {
+            assert_eq!(n, 0, "only zero has no representation, got none for {n}");
+            continue;
+        };
+        assert!(
+            !rendered.contains('.'),
+            "{n} rendered {rendered}, and the parser refuses a decimal"
+        );
+        let back = kern_common::parse_binary_size(&rendered)
+            .unwrap_or_else(|| panic!("{n} rendered {rendered}, which the parser will not read"));
+        assert!(
+            back <= n,
+            "{n} rendered {rendered} = {back}, which reads HIGH and disables the check"
+        );
+        assert!(
+            n - back < K * K,
+            "{n} rendered {rendered} = {back}, understating by a mebibyte or more"
+        );
+        // Exactness where it is promised: any multiple of a mebibyte, and anything under one.
+        if n % (K * K) == 0 || n < K * K {
+            assert_eq!(
+                back, n,
+                "{n} rendered {rendered} and lost bytes it need not"
+            );
+        }
+    }
+    assert_eq!(
+        super::toml_size(0),
+        None,
+        "zero has no representation the parser takes back"
+    );
+}
+
+/// `bounded` IS TOTAL: no input panics, including the inverted range `clamp` would abort on.
+#[test]
+fn bounded_is_total_and_prefers_the_ceiling_when_the_range_is_inverted() {
+    assert_eq!(super::bounded(5, 1, 10), 5);
+    assert_eq!(super::bounded(0, 1, 10), 1);
+    assert_eq!(super::bounded(99, 1, 10), 10);
+    assert_eq!(super::bounded(5, 5, 5), 5);
+    // The range `u64::clamp` panics on. The ceiling wins, because every caller is sizing a budget
+    // and the ceiling is the bound whose violation has a consequence.
+    assert_eq!(super::bounded(5, 10, 1), 1);
+    assert_eq!(super::bounded(u64::MAX, 0, u64::MAX), u64::MAX);
+    assert_eq!(super::bounded(0, 0, 0), 0);
+}
+
+/// The four escapes the kernel writes into `mountinfo`, and the shapes that are not escapes.
+#[test]
+fn mountinfo_unescaping_handles_every_form_the_kernel_writes() {
+    assert_eq!(super::unescape_mountinfo("/mnt/data"), "/mnt/data");
+    assert_eq!(
+        super::unescape_mountinfo("/mnt/my\\040disk"),
+        "/mnt/my disk"
+    );
+    assert_eq!(super::unescape_mountinfo("/a\\011b"), "/a\tb");
+    assert_eq!(super::unescape_mountinfo("/a\\012b"), "/a\nb");
+    assert_eq!(super::unescape_mountinfo("/a\\134b"), "/a\\b");
+    // A backslash that is not one of the four, and one with nothing after it: copied through, never
+    // dropped and never a panic on a truncated escape at the end of the string.
+    assert_eq!(super::unescape_mountinfo("/a\\999b"), "/a\\999b");
+    assert_eq!(super::unescape_mountinfo("/a\\"), "/a\\");
+    assert_eq!(super::unescape_mountinfo("\\"), "\\");
+    // THE PANIC THIS FUNCTION USED TO CARRY. `\\04` followed by a multi-byte character puts the end
+    // of the four-byte escape window in the middle of that character, and slicing a `String` there
+    // panics. Verified by running it before the fix; the window is compared as bytes now.
+    assert_eq!(super::unescape_mountinfo("/mnt/\\04è"), "/mnt/\\04è");
+    assert_eq!(super::unescape_mountinfo("\\0è"), "\\0è");
+    assert_eq!(super::unescape_mountinfo("\\è"), "\\è");
+    // Multi-byte content must not be split by the byte-wise walk.
+    assert_eq!(super::unescape_mountinfo("/mnt/caffè"), "/mnt/caffè");
+    assert_eq!(
+        super::unescape_mountinfo("/mnt/caffè\\040bar"),
+        "/mnt/caffè bar"
+    );
+}
+
+/// THE DISK NAMED BESIDE THE PATH IS THE DISK THAT HOLDS IT.
+///
+/// `/sys/block` sorted alphabetically gave `nvme0n1` on a host whose `/` is on `nvme1n1`. This
+/// asserts against the kernel rather than against a fixture: whatever `disk_backing` answers must be
+/// a real whole disk in `/sys/block`, and it must be the one `/proc/self/mountinfo` points at.
+///
+/// SKIPPED WITH A REASON on a host where `/` cannot be resolved (a container without a mountinfo
+/// entry for it), because a skip that says why beats a green that measured nothing.
+#[test]
+fn the_disk_resolved_for_a_path_is_a_real_whole_disk() {
+    let Some(dev) = super::disk_backing("/") else {
+        eprintln!("SKIP: `/` did not resolve to a block device on this host");
+        return;
+    };
+    assert!(
+        std::path::Path::new(&format!("/sys/block/{dev}")).is_dir(),
+        "{dev} is not a whole disk in /sys/block"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/sys/block/{dev}/partition")).exists(),
+        "{dev} is a partition, so the climb to the whole disk did not happen"
+    );
+    // AND IT IS THE RIGHT DISK, checked against a source this code does not parse.
+    //
+    // "is a whole disk" alone would have stayed GREEN on the defect this replaced: `nvme0n1` is a
+    // perfectly real whole disk, it just is not the one holding `/`. The oracle is `/proc/mounts`,
+    // which names the device directly and is a different file from the `/proc/self/mountinfo` the
+    // implementation reads, so a bug in that parsing cannot make both agree.
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let source = mounts.lines().find_map(|l| {
+        let mut f = l.split(' ');
+        let src = f.next()?;
+        let mnt = f.next()?;
+        (mnt == "/").then_some(src)
+    });
+    match source.and_then(|s| s.strip_prefix("/dev/")) {
+        Some(part) => {
+            let holds =
+                part == dev || std::path::Path::new(&format!("/sys/block/{dev}/{part}")).is_dir();
+            assert!(
+                holds,
+                "`/` is on {part} and this resolved {dev}, which does not contain it"
+            );
+        }
+        None => eprintln!("SKIP(partial): the source of `/` in /proc/mounts is not a /dev node"),
+    }
+
+    // A path that cannot exist resolves to whatever holds its longest existing prefix, and must
+    // never resolve to something that is not a disk.
+    let deep = super::disk_backing("/nonexistent-kern-test-path/deeper");
+    if let Some(d) = deep {
+        assert!(
+            std::path::Path::new(&format!("/sys/block/{d}")).is_dir(),
+            "a path under a nonexistent directory resolved to {d}, which is not a disk"
+        );
+    }
+}
+
+/// `fs_usage` AGREES WITH THE KERNEL, AND REFUSES RATHER THAN GUESSES.
+#[test]
+fn fs_usage_measures_a_real_filesystem_and_declines_an_impossible_path() {
+    let (used, total) = super::fs_usage("/").expect("`/` is always measurable");
+    assert!(total > 0, "a mounted filesystem has a nonzero total");
+    assert!(used <= total, "used cannot exceed the total");
+    assert_eq!(
+        super::fs_usage("/definitely-not-a-path-on-this-host-kern"),
+        None,
+        "an unmeasurable path yields nothing, never a zero that would become a budget"
+    );
+    assert_eq!(
+        super::fs_usage("has\0nul"),
+        None,
+        "a path with an interior NUL cannot name a file and must be refused, not truncated"
+    );
+}
+
+/// A MOUNT CONTAINS A PATH, IT DOES NOT MERELY PREFIX ITS NAME.
+///
+/// `/variable` starts with `/var` and is not inside it. Picking the wrong mount picks the wrong
+/// device number, and the device number is what a measured budget gets attributed to.
+#[test]
+fn a_mount_point_covers_only_what_is_really_under_it() {
+    assert!(super::mount_covers("/", "/"));
+    assert!(super::mount_covers("/home/alex", "/"));
+    assert!(super::mount_covers("/var", "/var"));
+    assert!(super::mount_covers("/var/log", "/var"));
+    assert!(super::mount_covers("/var/log", "/var/"));
+    // The case a string prefix gets wrong.
+    assert!(!super::mount_covers("/variable", "/var"));
+    assert!(!super::mount_covers("/variable/x", "/var"));
+    assert!(!super::mount_covers("/vary", "/var"));
+    // And the reverse: a mount deeper than the path does not contain it.
+    assert!(!super::mount_covers("/var", "/var/log"));
+    assert!(!super::mount_covers("", "/var"));
+    // A relative path is not under any absolute mount but the comparison must not panic on it.
+    assert!(!super::mount_covers("var/log", "/var"));
+    // Mount points carrying a decoded space, which is what `unescape_mountinfo` hands over.
+    assert!(super::mount_covers("/mnt/my disk/data", "/mnt/my disk"));
+    assert!(!super::mount_covers("/mnt/my diskette", "/mnt/my disk"));
+}
+
+// ── the `ram` sentinel: the form kern accepts, now generated and now checked ──────────────────────
+
+/// A `[[vdisk]] backend = "ram"` LARGER THAN THE HOST'S RAM MUST BE NAMED.
+///
+/// It was checked by nothing. There is no `[[disk]]` called `ram` and there cannot be (an id equal
+/// to a reserved sentinel is refused), so the disk lookup found nothing and every RAM-backed volume
+/// took the `continue`. Measured before this was written: `size = "500g"` against
+/// `[[cpu]] memory = "31g"` validated clean.
+///
+/// The ceiling is RAM because a tmpfs is charged to the memory cgroup of the box that mounts it,
+/// which is a measurement and not a reading: on this host, writing 512 MiB into the volume under
+/// `--memory 256m` was killed with 137, and the identical write under `--memory 2g` completed.
+#[test]
+fn a_ram_backed_volume_is_measured_against_the_ram_the_file_declares() {
+    let over = crate::config::parse(
+        "[[cpu]]\nid = \"cpu:0\"\ncores = 2.0\nmemory = \"31g\"\n\
+         [[vdisk]]\nname = \"huge\"\nbackend = \"ram\"\nsize = \"500g\"\n",
+    )
+    .expect("parses");
+    let rows = crate::commands::over_declared_budget(&over);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a 500G tmpfs on a 31G host must raise one row"
+    );
+    assert_eq!(rows[0].field, "size");
+    assert!(
+        rows[0].declared_by.contains("cpu:0"),
+        "the row must attribute the ceiling to the block that declared it, got {:?}",
+        rows[0].declared_by
+    );
+    assert!(
+        !rows[0].declared_by.contains("backend 'ram'"),
+        "`ram` declares nothing, so the row must not say it does: {:?}",
+        rows[0].declared_by
+    );
+
+    // THE POSITIVE CONTROL: the same shape inside the budget raises nothing, so the case above is
+    // not green against a check that fires on every RAM-backed volume.
+    let within = crate::config::parse(
+        "[[cpu]]\nid = \"cpu:0\"\ncores = 2.0\nmemory = \"31g\"\n\
+         [[vdisk]]\nname = \"small\"\nbackend = \"ram\"\nsize = \"1g\"\n",
+    )
+    .expect("parses");
+    assert!(
+        crate::commands::over_declared_budget(&within).is_empty(),
+        "a 1G tmpfs on a 31G host is not an overrun"
+    );
+
+    // Exactly at the ceiling is not over it.
+    let exact = crate::config::parse(
+        "[[cpu]]\nid = \"cpu:0\"\ncores = 2.0\nmemory = \"4g\"\n\
+         [[vdisk]]\nname = \"exact\"\nbackend = \"ram\"\nsize = \"4g\"\n",
+    )
+    .expect("parses");
+    assert!(
+        crate::commands::over_declared_budget(&exact).is_empty(),
+        "equal to the declared RAM is not over it"
+    );
+}
+
+/// THE CEILING IS THE LARGEST `[[cpu]]`, because a volume is not bound to any one of them.
+///
+/// Profiles are paired at launch, so a volume that fits the biggest declared RAM might be filled;
+/// only exceeding the biggest is a statement that holds however they are paired. Taking the first,
+/// or the smallest, would warn about configurations that work.
+#[test]
+fn the_ram_ceiling_is_the_largest_cpu_block_not_the_first() {
+    let cfg = crate::config::parse(
+        "[[cpu]]\nid = \"small\"\ncores = 2.0\nmemory = \"2g\"\n\
+         [[cpu]]\nid = \"large\"\ncores = 2.0\nmemory = \"64g\"\n\
+         [[vdisk]]\nname = \"v\"\nbackend = \"ram\"\nsize = \"8g\"\n",
+    )
+    .expect("parses");
+    assert!(
+        crate::commands::over_declared_budget(&cfg).is_empty(),
+        "8G fits the 64G block, so pairing it there works and nothing may be said"
+    );
+    // And past the largest, it is named against the largest.
+    let cfg = crate::config::parse(
+        "[[cpu]]\nid = \"small\"\ncores = 2.0\nmemory = \"2g\"\n\
+         [[cpu]]\nid = \"large\"\ncores = 2.0\nmemory = \"64g\"\n\
+         [[vdisk]]\nname = \"v\"\nbackend = \"ram\"\nsize = \"128g\"\n",
+    )
+    .expect("parses");
+    let rows = crate::commands::over_declared_budget(&cfg);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].declared, "64G", "the ceiling is the largest block");
+    assert!(rows[0].declared_by.contains("large"));
+}
+
+/// UNDECLARED IS SILENT, here as everywhere else in this table.
+///
+/// With no `[[cpu]] memory` in the file, kern does not know this machine's RAM and says nothing,
+/// rather than reaching for the RAM of whatever host happens to be running `validate`. A check that
+/// consulted the live machine would give two different answers for one file.
+#[test]
+fn a_ram_volume_is_silent_when_no_ram_budget_is_declared() {
+    let cfg = crate::config::parse(
+        "[[cpu]]\nid = \"cpu:0\"\ncores = 2.0\n\
+         [[vdisk]]\nname = \"huge\"\nbackend = \"ram\"\nsize = \"9000g\"\n",
+    )
+    .expect("parses");
+    assert!(
+        crate::commands::over_declared_budget(&cfg).is_empty(),
+        "with no declared RAM there is no ceiling to exceed"
+    );
+    // And with no `[[cpu]]` block at all.
+    let cfg =
+        crate::config::parse("[[vdisk]]\nname = \"huge\"\nbackend = \"ram\"\nsize = \"9000g\"\n")
+            .expect("parses");
+    assert!(crate::commands::over_declared_budget(&cfg).is_empty());
+}
+
+/// A TMPFS HAS NO DEVICE, so the two device throttles say nothing about it.
+///
+/// `iops` and `bandwidth` on a RAM-backed volume have no `[[disk]]` to be compared against, and
+/// inventing a comparison against the host's RAM would be a number with no meaning. The absence is
+/// asserted so a later edit that folds the `ram` branch into the disk branch is caught.
+#[test]
+fn a_ram_volume_has_no_device_throttles_to_check() {
+    let cfg = crate::config::parse(
+        "[[cpu]]\nid = \"cpu:0\"\ncores = 2.0\nmemory = \"31g\"\n\
+         [[disk]]\nid = \"d0\"\npath = \"/tmp\"\nsize = \"50g\"\niops = 10\nbandwidth = \"1m\"\n\
+         [[vdisk]]\nname = \"v\"\nbackend = \"ram\"\nsize = \"1g\"\niops = 99999\nbandwidth = \"99g\"\n",
+    )
+    .expect("parses");
+    assert!(
+        crate::commands::over_declared_budget(&cfg).is_empty(),
+        "a tmpfs must not be measured against a [[disk]] it does not use"
+    );
+}
+
+/// `config setup` MUST GENERATE THE `ram` FORM, because kern accepts it and generated nothing.
+///
+/// A form the tool takes but never writes is a form no reader of a generated file learns about. The
+/// example is checked all the way through: it parses, it resolves as a tmpfs (no backing directory),
+/// and it stays inside the RAM the same file declares.
+#[test]
+fn the_generated_config_shows_the_ram_backed_form_and_it_resolves() {
+    const MIB: u64 = 1024 * 1024;
+    let h = super::HostInv {
+        ncpu: 8,
+        ram_bytes: Some(8 * 1024 * MIB),
+        root_total: Some(500 * 1024 * MIB),
+        ..blank_host()
+    };
+    let (text, rows) = generated(&h);
+    assert!(
+        rows.is_empty(),
+        "the example must not overrun: {rows:?}",
+        rows = rows.len()
+    );
+    let cfg = crate::config::parse(&text).expect("parses");
+    let ram_vol = cfg
+        .vdisk
+        .iter()
+        .find(|v| v.backend == crate::config::BACKEND_RAM)
+        .unwrap_or_else(|| panic!("no RAM-backed [[vdisk]] in the generated file:\n{text}"));
+    // It resolves, and it resolves as a tmpfs: a backing directory would mean it landed on a disk.
+    let resolved = crate::config::resolve_vdisk(&cfg, &ram_vol.name)
+        .unwrap_or_else(|e| panic!("the generated RAM volume does not resolve: {e}\n{text}"));
+    assert_eq!(
+        resolved.backend_dir, None,
+        "`backend = \"ram\"` must resolve to a tmpfs, not to a directory"
+    );
+    // And the size fits inside the default box memory, or the first reader who runs the example
+    // without a --memory flag gets killed. Measured: a box with no memory profile gets 512 MiB.
+    let size = ram_vol
+        .size
+        .as_deref()
+        .and_then(kern_common::parse_binary_size)
+        .unwrap_or_else(|| panic!("the generated RAM volume has no readable size:\n{text}"));
+    assert!(
+        size <= 512 * MIB,
+        "the example is {size} bytes and a box with no memory profile gets 512 MiB"
+    );
 }

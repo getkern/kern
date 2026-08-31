@@ -1,7 +1,7 @@
 //! `kern top` - a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
 //! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Seven tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
 //! per-box table - MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) - with lifecycle
-//! actions: stop/pause/unpause/kill/logs), **Runs** (aggregate `kern run` throughput - rate/sec, avg
+//! actions: stop/pause/unpause/logs), **Runs** (aggregate `kern run` throughput - rate/sec, avg
 //! setup latency, peak, total + sparkline; a `⚡` on the tab marks live activity), **Builds** (`kern
 //! build` history), **Profiles** (the reusable
 //! specs you attach by prefix - vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
@@ -63,6 +63,7 @@ enum Pending {
     RemoveImage(String),                 // image ref (as shown in the Images tab)
     PruneImages,                         // reclaim orphaned build layers
     DeleteBuild(String),                 // build id
+    StopBox(String),                     // box name, from the Boxes tab
 }
 
 /// A multi-field input form. `active` is the focused field; typing edits its value.
@@ -733,6 +734,16 @@ fn handle_nav(
         b'6' => switch(tab, sel, TAB_PROFILES),
         b'7' => switch(tab, sel, TAB_STORAGE),
         b'j' => down(sel),
+        // `k` IS UP. It was not bound here at all, so it fell through to the per-tab arms below,
+        // where the Boxes tab read it as a lifecycle key and STOPPED the selected box. The help
+        // overlay has always advertised "↑ ↓ / j k  select a row", so the product documented vi
+        // navigation and delivered a destructive action on half of it: a user moving down the list
+        // with `j` and back up with `k` killed whatever they had landed on. Reported from the field
+        // as "the nav keys appear to work until they do a destructive change".
+        //
+        // Binding it here, beside `j`, is what makes the pair mean one thing. The per-tab arms below
+        // are only reached for keys navigation does not claim.
+        b'k' => up(sel),
         // Only the Boxes tab acts immediately (stop/pause/kill). Profiles/Storage keys just open a
         // modal, so the mutation (if any) happens later via Confirm/Form - nothing to refresh yet.
         _ if *tab == TAB_BOXES => return nav_boxes(key[0], *sel, rows, mode),
@@ -760,7 +771,26 @@ fn nav_boxes(k: u8, sel: usize, rows: &[Row], mode: &mut Mode) -> bool {
     // reason for it. The result is carried out of the muted section and shown in the same overlay pane
     // the log view already uses.
     let outcome = match k {
-        b's' | b'k' => quiet_io(|| crate::commands::stop(std::slice::from_ref(&name), false)),
+        // STOPPING A RUNNING BOX ASKS FIRST, and it did not.
+        //
+        // The confirmation in this file was inversely proportional to the cost of the action:
+        // deleting a PROFILE - a line of `kern.toml` that takes seconds to retype - opened a
+        // `(y/n)` prompt, while stopping a running box, which is live work that no `n` can bring
+        // back, executed on the keystroke. The prompt names the box, so a stale selection is
+        // visible before it is acted on.
+        //
+        // `k` is gone from this arm: it is navigation now (see `handle_nav`). `s` is the stop key,
+        // it is a mnemonic, and it is what the help has always listed first.
+        b's' => {
+            *mode = Mode::Confirm {
+                prompt: format!("stop box {name}?  (y/n)"),
+                action: Pending::StopBox(name.clone()),
+            };
+            return false;
+        }
+        // Pause and unpause stay immediate: both are reversible by the other key, so a mistaken
+        // press costs a keystroke rather than the work. Asking for every key would make the prompt
+        // noise, and noise is how a confirmation stops being read.
         b'p' => quiet_io(|| crate::commands::pause(std::slice::from_ref(&name), false, true)),
         b'u' => quiet_io(|| crate::commands::pause(std::slice::from_ref(&name), false, false)),
         b'\r' | b'\n' => {
@@ -946,6 +976,13 @@ fn perform_pending(action: Pending) -> Option<String> {
             Ok(_) => None,
             Err(e) => Some(format!("build '{id}': {e}")),
         },
+        // A refused stop is worth showing for the same reason as the others: the box stays on the
+        // list after a `y`, and without the reason that reads as the key having done nothing.
+        Pending::StopBox(name) => {
+            quiet_io(|| crate::commands::stop(std::slice::from_ref(&name), false))
+                .err()
+                .map(|e| e.to_string())
+        }
     }
 }
 
@@ -2050,16 +2087,13 @@ fn present_devices(kind: &str) -> Vec<String> {
 
 /// `(used, total)` bytes on the filesystem that backs the kern data root - `statvfs("/")`, matching
 /// `df` (used = blocks − free). This is the disk where images / volumes / vdisks physically live.
+///
+/// ONE IMPLEMENTATION, in [`crate::commands::fs_usage`]. This was a private copy here, and
+/// `config setup` needed the same measurement to write a `[[disk]]` budget. Two copies of a `statvfs`
+/// wrapper is how `kern top` and a generated config come to state different totals for the same
+/// disk; the shared one also does its arithmetic checked, which this one did not.
 fn host_disk() -> Option<(u64, u64)> {
-    let path = std::ffi::CString::new("/").ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    let bs = st.f_frsize as u64;
-    let total = st.f_blocks as u64 * bs;
-    let used = (st.f_blocks as u64).saturating_sub(st.f_bfree as u64) * bs;
-    Some((used, total))
+    crate::commands::fs_usage("/")
 }
 
 /// The host's logical CPU count (per-CPU lines in `/proc/stat`), resolved once - the core count is
@@ -2282,7 +2316,7 @@ fn help_text() -> String {
        7 Storage    physical disks (read-only) and your named volumes\n\
      \n\
      BOXES tab - act on the selected box\n\
-       s  stop        p  pause        u  unpause        k  kill\n\
+       s  stop (asks first)   p  pause        u  unpause\n\
        Enter          view its logs (a box's own output)\n\
      \n\
      IMAGES tab\n\
@@ -2318,7 +2352,7 @@ fn nav_footer(
     let help = format!("   [{z}?{d}] help{z}");
     match tab {
         TAB_BOXES if !rows.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}p{d}]ause [{z}u{d}]npause [{z}k{d}]ill [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}p{d}]ause [{z}u{d}]npause [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_IMAGES if !images.is_empty() => format!(
             "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}p{d}]rune-layers [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
@@ -3255,15 +3289,22 @@ mod tests {
     /// key that appeared to do nothing, and no reason anywhere. The outcome is now carried out of the
     /// muted section and shown in the overlay pane the log view already uses.
     ///
-    /// Driven with a box name that cannot exist, so `commands::stop` returns the "no running box"
+    /// Driven with a box name that cannot exist, so `commands::pause` returns the "no running box"
     /// error without touching anything on this machine.
+    ///
+    /// DRIVEN WITH `p` AND NOT `s`, and it used to be `s`. Stopping a box now opens a confirmation
+    /// instead of acting on the keystroke, so `s` no longer reaches this path at all: its failure is
+    /// reported after the `y`, by `perform_pending`, which
+    /// `a_refused_destructive_action_returns_its_reason` covers. `p` is the remaining key that acts
+    /// immediately - deliberately, because pause is undone by `u` - so it is the one that still has
+    /// to carry its own outcome to the screen.
     #[test]
     fn a_failed_lifecycle_key_is_reported_in_the_overlay() {
         let name = format!("tui-absent-{}-{}", std::process::id(), 0xC0FFEEu32);
         let rows = vec![row(&name, false)];
         let mut mode = Mode::Nav;
 
-        let changed = nav_boxes(b's', 0, &rows, &mut mode);
+        let changed = nav_boxes(b'p', 0, &rows, &mut mode);
 
         assert!(
             changed,
@@ -3301,6 +3342,22 @@ mod tests {
             !text.is_empty(),
             "the returned failure text must carry the reason, not an empty string"
         );
+
+        // AND THE SAME FOR A STOP, which reaches this function now instead of acting on the
+        // keystroke. Without this arm the newest destructive action would be the only one whose
+        // refusal could go unreported, which is the gap this whole contract exists to close.
+        let boxname = format!("tui-nobox-{}-{}", std::process::id(), 0xDEADBEEFu32);
+        let outcome = perform_pending(Pending::StopBox(boxname.clone()));
+        match outcome {
+            Some(t) => assert!(
+                t.contains(&boxname) || !t.is_empty(),
+                "the refusal must carry a reason: {t:?}"
+            ),
+            None => panic!(
+                "stopping a box that does not exist is refused, so perform_pending must return the \
+                 reason rather than letting the confirmation look like it worked"
+            ),
+        }
     }
 
     fn row(name: &str, paused: bool) -> Row {
@@ -3595,6 +3652,188 @@ mod tests {
         assert!(out.contains('∞'), "unlimited quota shows ∞: {out}");
         assert!(!out.contains(" - "), "no bare dash for the quota column");
         assert!(out.contains("2G"), "a capped quota shows its size");
+    }
+
+    /// Drive one key through `handle_nav` on the Boxes tab, returning the resulting mode and
+    /// selection. The signature is long and every argument is a live list, so a helper keeps the
+    /// cases below about the KEY rather than about the plumbing.
+    fn press(key: &[u8], rows: &[Row], sel_in: usize) -> (Mode, usize, bool) {
+        let mut tab = TAB_BOXES;
+        let mut sel = sel_in;
+        let mut mode = Mode::Nav;
+        let dirty = handle_nav(
+            key,
+            &mut tab,
+            &mut sel,
+            rows.len(),
+            rows,
+            &[],
+            &[],
+            &[],
+            &[],
+            &crate::config::KernConfig::default(),
+            &mut mode,
+        );
+        (mode, sel, dirty)
+    }
+
+    /// `k` MOVES THE SELECTION UP. IT DOES NOT ACT ON THE BOX.
+    ///
+    /// Reported from the field (getkern/kern#3): "the `hjkl` navigation half-works in top TUI mode
+    /// but has conflicting keys on some screens (`k` kills the box!)". `j` was bound to `down` in
+    /// the navigation match and `k` was bound to nothing, so it fell through to the Boxes tab's
+    /// lifecycle keys and stopped the selected box.
+    ///
+    /// The pair is asserted together, because half of a vi pair working is exactly the shape that
+    /// makes the other half a surprise.
+    #[test]
+    fn k_selects_up_and_never_acts_on_the_box() {
+        let rows = [row("a", false), row("b", false), row("c", false)];
+
+        // Down, then back up: the selection returns to where it started, and nothing was acted on.
+        let (mode, sel, dirty) = press(b"j", &rows, 0);
+        assert_eq!(sel, 1, "`j` moves down");
+        assert!(matches!(mode, Mode::Nav), "`j` opens nothing");
+        assert!(!dirty, "`j` changes no box state");
+
+        let (mode, sel, dirty) = press(b"k", &rows, 1);
+        assert_eq!(
+            sel, 0,
+            "`k` moves up, which is what the help has always promised"
+        );
+        assert!(
+            matches!(mode, Mode::Nav),
+            "`k` must not open a confirmation either: it is navigation, not an action"
+        );
+        assert!(
+            !dirty,
+            "`k` reported a state change, which means it acted on the box"
+        );
+
+        // At the top, `k` stays put rather than wrapping onto the last row, where a later action
+        // key would land somewhere the user did not look at.
+        let (_, sel, _) = press(b"k", &rows, 0);
+        assert_eq!(sel, 0, "`k` at the top does not wrap");
+    }
+
+    /// STOPPING A BOX ASKS FIRST, and it did not.
+    ///
+    /// Deleting a profile - a line of `kern.toml` - already opened a `(y/n)` prompt, while stopping
+    /// a running box executed on the keystroke. The confirmation was inversely proportional to the
+    /// cost of the action.
+    #[test]
+    fn stopping_a_box_opens_a_confirmation_naming_it() {
+        let rows = [row("alpha", false), row("beta", false)];
+        let (mode, sel, dirty) = press(b"s", &rows, 1);
+        assert_eq!(sel, 1, "the confirmation must not move the selection");
+        assert!(
+            !dirty,
+            "nothing has happened yet, so the caller must not re-read the list"
+        );
+        match mode {
+            Mode::Confirm { prompt, action } => {
+                assert!(
+                    prompt.contains("beta"),
+                    "the prompt must name the box being stopped, got {prompt:?}"
+                );
+                assert!(
+                    matches!(action, Pending::StopBox(ref n) if n == "beta"),
+                    "the pending action must target the SELECTED box"
+                );
+            }
+            Mode::Nav => panic!("`s` acted immediately instead of asking"),
+            _ => panic!("`s` must open a confirmation, and opened something else"),
+        }
+    }
+
+    /// THE HELP AND THE FOOTER MAY NOT PROMISE A KEY THE CODE DOES NOT HONOUR.
+    ///
+    /// This is the defect underneath the report rather than the keystroke itself: the help overlay
+    /// listed `↑ ↓ / j k  select a row` AND `k  kill` at the same time, and the footer advertised
+    /// `[k]ill`. The product documented vi navigation and delivered a destructive action on half of
+    /// it. `k` was also not a kill: it called the same graceful `stop` as `s`, so the word was wrong
+    /// twice over.
+    ///
+    /// Asserted against the real strings, so the two cannot drift apart again in silence.
+    #[test]
+    fn the_help_and_footer_describe_the_keys_that_actually_exist() {
+        let help = help_text();
+        assert!(
+            help.contains("j k  select a row"),
+            "the help must keep promising vi selection: {help}"
+        );
+        assert!(
+            !help.contains("k  kill"),
+            "the help must not also bind `k` to a destructive action"
+        );
+        assert!(
+            help.contains("stop (asks first)"),
+            "a destructive key that asks must say so where the user reads the keys"
+        );
+
+        let footer = nav_footer(&plain(), TAB_BOXES, &[row("x", false)], &[], &[], &[], &[]);
+        assert!(
+            !footer.contains("ill"),
+            "the footer must not advertise a kill key that is neither bound nor a kill: {footer}"
+        );
+        assert!(
+            footer.contains("top"),
+            "the footer still offers stop: {footer}"
+        );
+
+        // AND THE PROMISE IS TRUE, not merely present: pressing what the help lists must select.
+        // A text assertion alone would stay green if the binding were removed again.
+        let rows = [row("a", false), row("b", false)];
+        assert_eq!(press(b"j", &rows, 0).1, 1);
+        assert_eq!(press(b"k", &rows, 1).1, 0);
+    }
+
+    /// THE SELECTION MARKER SITS ON THE SELECTED ROW, AND ON NO OTHER.
+    ///
+    /// A mutation sweep turned `sel_marker(p, i == sel)` into `i != sel` and all 920 tests stayed
+    /// green: the marker would move onto every row EXCEPT the selected one, so a destructive key
+    /// would act on a box the user is not looking at. That is the same failure the `k` binding had -
+    /// an action landing somewhere the eye is not - reached from the rendering side instead.
+    ///
+    /// `plain()` has empty colour codes, so the marker is the only thing distinguishing the rows and
+    /// the assertion cannot pass on a stray escape sequence.
+    #[test]
+    fn the_selection_marker_is_on_the_selected_row_and_no_other() {
+        let prof = |n: &str| ProfRow {
+            section: "vcpu",
+            name: n.to_string(),
+            summary: String::new(),
+        };
+        let rows = [prof("alpha"), prof("beta"), prof("gamma")];
+
+        for sel in 0..rows.len() {
+            let table = profiles_table(&plain(), &rows, 10, sel);
+            // Only the PROFILE rows. The pane also renders section headers, a "none yet"
+            // placeholder per empty kind, and a hint line that itself contains `vcpu:heavy` - so
+            // filtering on the prefix would catch four lines and the count assertion below would
+            // have failed for the wrong reason. Filter on the names this case created.
+            let names = ["alpha", "beta", "gamma"];
+            let lines: Vec<&str> = table
+                .lines()
+                .filter(|l| names.iter().any(|n| l.contains(n)))
+                .collect();
+            assert_eq!(
+                lines.len(),
+                rows.len(),
+                "one line per profile, and the filter must not be catching the hint line: {table:?}"
+            );
+            for (i, line) in lines.iter().enumerate() {
+                // `sel_marker` emits "› " for the selected row and two spaces for the others.
+                let marked = line.contains('›');
+                assert_eq!(
+                    marked,
+                    i == sel,
+                    "sel={sel}: row {i} ({}) marked={marked}, which puts the cursor where the user \
+                     is not looking",
+                    lines[i].trim()
+                );
+            }
+        }
     }
 
     #[test]
