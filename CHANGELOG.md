@@ -158,6 +158,36 @@ class of images that runs today.
   no longer reads as good news one row under the warning that caps do not bind.
 
 ### Fixed
+- **The macOS CI job tested one of the installer's two branches and could not tell them apart.**
+  `install.sh` says something different to a Mac that already runs a Linux VM: use the one you have,
+  do not install a second. Which branch a bare run takes depends on what the runner image happens to
+  ship, so the job could not assert which message it had seen, and its one content check,
+  `grep -q colima`, matched in BOTH branches (`brew install colima` in one, `colima ssh` in the
+  other). It would have stayed green with the branches swapped.
+
+  Both branches are driven from a built PATH now. `PATH=/usr/bin:/bin` was not it: `docker` sits in
+  `/usr/bin` on plenty of systems, so "no VM here" would have been a property of the runner image
+  rather than of the test. The environment holds a `sh` and a `uname` and nothing else, and the job
+  asserts it is empty of VM tools before using it. The assertion that separates the branches is the
+  ABSENCE of `brew install` from the message a Mac with a VM gets, which is that branch's entire
+  reason to exist, and the control is that the two runs must differ at all.
+
+  The refusal is also written as `if`, not `grep -q X && { exit 1; }`: a run step is `bash -e`, and
+  in an AND-OR list only the last command is exempt from `-e`, so a grep that correctly finds
+  nothing would have failed the step exactly when the product was right.
+
+  Injection: verified - collapsing the installer's VM probe to `have=""` makes the has-a-VM
+  assertions red under a simulated Darwin, and both branches then print the same text, which the
+  control catches on its own.
+
+- **`kern --help` did not name the values `--status` takes, the compose `-d` it now accepts, or
+  `--profile`.** The vocabulary of `builds --status` was reachable only by typing something wrong
+  and reading the usage error. Audited rather than spotted: every long flag the parser matches was
+  compared against everything `--help` prints, in both directions. The reverse direction is clean,
+  nothing is promised that kern refuses, and of the flags absent from the help, three are internal
+  and documented as such in the source (`--def-hash`, `--overlay-lower`, `--overlay-upper`) and nine
+  are long aliases of documented short forms.
+
 
 - **The container-only port warning quoted port 8000 whatever the file said.** A stack declaring only
   `9090` was told about a port that appears nowhere in it, so the sentence read as an observation
