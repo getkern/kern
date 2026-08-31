@@ -1,7 +1,12 @@
 name: CI
 on:
   push:
-    branches: [main]
+    # `dev` is here so the branch that carries unreleased work is checked by the same jobs that
+    # guard main, including the macOS runner: a push to `dev` used to run nothing at all, so the
+    # only evidence for the Darwin guards was a local run against a faked `uname`. Drop `dev` from
+    # this list when the branch is merged and deleted; leaving a dead branch name here costs
+    # nothing but says something untrue about what is being built.
+    branches: [main, dev]
   pull_request:
   workflow_dispatch: {}
 
