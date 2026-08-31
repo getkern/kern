@@ -13,10 +13,32 @@ is in the git history.
 
 ## Unreleased
 
-**This is a MINOR bump (0.8.0), not a patch.** Two reasons, and the weak one is the new flag: a
-`--entrypoint` added to a frozen CLI surface is additive and would not force it on its own. The
-binding reason is the `USER` change below, which alters the gid resolved on an EXISTING path for a
-class of images that runs today.
+**This is a MINOR bump (0.8.0), not a patch.** Not because the command surface moved: it did not.
+No verb or flag is removed or renamed, `--entrypoint` and compose's `-d` are additive, and the
+`cli_surface_is_frozen` snapshot changed only in three description lines. By the letter of the
+stability rule above, a patch would have been allowed.
+
+The reason is that **three things that worked can now stop working**, all on existing paths, and a
+patch number tells a reader the opposite. kern is installed by a one-liner and by
+`cargo install --git`, both of which always take the latest: the version number is not read by a
+resolver, it is read by a person deciding whether to look before upgrading. These are what they
+would be looking for.
+
+- **A numeric `USER` takes its group from the image's `/etc/passwd`, not from its own number.**
+  A box that ran as `1000:1000` now runs as whatever the image declares, and as the ROOT group when
+  the image lists no entry for that uid. If a volume holds files written under the old gid, check
+  that the service can still write them.
+- **An image `USER` the image cannot resolve now refuses to start the box.** It used to run the
+  workload as box root after a note on stderr, so a box that STARTED now exits 1. Pass
+  `--user <uid[:gid]>` to choose one, or `--user 0` for the old behaviour, made explicit.
+- **An image reference the OCI grammar cannot hold is refused where you type it.**
+  `kern build -t Foo-BAR:latest` and `kern pull Foo-BAR:latest` used to be accepted and to fail
+  later, at push time or against a registry. Lowercase the reference; the error prints the exact
+  string to use.
+
+Nothing here had a deprecation entry a release earlier, which the rule above requires for the
+COMMAND SURFACE. It is not owed for these, because none of them is a verb, a flag or a `--json`
+shape, and it is stated rather than left to be noticed.
 
 ### Security
 
