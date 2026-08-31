@@ -4337,26 +4337,51 @@ fn the_disk_resolved_for_a_path_is_a_real_whole_disk() {
     // AND IT IS THE RIGHT DISK, checked against a source this code does not parse.
     //
     // "is a whole disk" alone would have stayed GREEN on the defect this replaced: `nvme0n1` is a
-    // perfectly real whole disk, it just is not the one holding `/`. The oracle is `/proc/mounts`,
-    // which names the device directly and is a different file from the `/proc/self/mountinfo` the
-    // implementation reads, so a bug in that parsing cannot make both agree.
-    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-    let source = mounts.lines().find_map(|l| {
-        let mut f = l.split(' ');
-        let src = f.next()?;
-        let mnt = f.next()?;
-        (mnt == "/").then_some(src)
-    });
-    match source.and_then(|s| s.strip_prefix("/dev/")) {
-        Some(part) => {
-            let holds =
-                part == dev || std::path::Path::new(&format!("/sys/block/{dev}/{part}")).is_dir();
+    // perfectly real whole disk, it just is not the one holding `/`.
+    //
+    // THE ORACLE IS A DEVICE NUMBER, NOT A NAME, and it used to be a name. `/proc/mounts` reports
+    // whatever the mount was made with, and on a GitHub runner that is `/dev/root`: a legacy kernel
+    // alias with no entry in `/sys/block` and no partition anywhere called `root`. The name
+    // comparison could not see through it, so it turned a CORRECT answer, `sda`, into a failure on
+    // every CI runner while passing on every developer machine. `stat("/").st_dev` is the number the
+    // kernel itself used and cannot be aliased, while `/sys/block/<disk>/dev` and
+    // `/sys/block/<disk>/<part>/dev` carry the same number from a tree the implementation never
+    // reads, so a bug in its `mountinfo` parsing still cannot make the two agree.
+    use std::os::unix::fs::MetadataExt as _;
+    // Linux packs `dev_t` the way glibc's `makedev` does: major is 12 low bits plus 32 high bits,
+    // minor is 8 low bits plus the rest. Written out rather than taken from libc so the oracle
+    // shares no code with anything under test.
+    let major = |d: u64| ((d >> 8) & 0xfff) | ((d >> 32) & !0xfff_u64);
+    let minor = |d: u64| (d & 0xff) | ((d >> 12) & !0xff_u64);
+    let devno = |p: String| -> Option<(u64, u64)> {
+        let s = std::fs::read_to_string(p).ok()?;
+        let (a, b) = s.trim().split_once(':')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    };
+    match std::fs::metadata("/").map(|m| m.dev()) {
+        Ok(root) => {
+            let want = (major(root), minor(root));
+            // The disk itself carries the number when `/` is on an unpartitioned device; otherwise
+            // one of its partitions does, which is the ordinary case.
+            let mut holds = devno(format!("/sys/block/{dev}/dev")) == Some(want);
+            if !holds {
+                if let Ok(rd) = std::fs::read_dir(format!("/sys/block/{dev}")) {
+                    holds = rd.filter_map(|e| e.ok()).any(|e| {
+                        devno(format!(
+                            "/sys/block/{dev}/{}/dev",
+                            e.file_name().to_string_lossy()
+                        )) == Some(want)
+                    });
+                }
+            }
             assert!(
                 holds,
-                "`/` is on {part} and this resolved {dev}, which does not contain it"
+                "`/` is device {}:{} and this resolved {dev}, which carries neither that number nor \
+                 a partition holding it",
+                want.0, want.1
             );
         }
-        None => eprintln!("SKIP(partial): the source of `/` in /proc/mounts is not a /dev node"),
+        Err(e) => eprintln!("SKIP(partial): `/` could not be stat'd, so the oracle is silent: {e}"),
     }
 
     // A path that cannot exist resolves to whatever holds its longest existing prefix, and must
