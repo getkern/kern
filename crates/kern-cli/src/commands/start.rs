@@ -416,6 +416,55 @@ fn decide_supervision(args: &BoxRunArgs) -> Result<Supervision, Error> {
     })
 }
 
+/// Who the box runs as: `--user` / compose `user:` when the caller gave one, otherwise the image's
+/// own `USER`. `Ok(None)` means neither asked, so the workload stays box root.
+///
+/// A spec that `resolve` cannot answer is an ERROR in BOTH cases. The image's own `USER` used to
+/// fall back to box root with a note on stderr, so that "an odd image still starts". That is the
+/// wrong shape of failure, for three reasons:
+///
+///  * **It fails open.** An image whose whole intent is to drop privilege ends up running as the
+///    box's root instead, which is the opposite of what it asked for. `real.rs` already refuses to
+///    exec rather than silently run a workload as in-box root when a drop cannot be honoured; this
+///    path was the one place that decided the other way.
+///  * **The note went to stderr**, ahead of the workload's own output, which is where a note is read
+///    last or not at all. A field test on the `dev` branch reported the behaviour as "ran as 0:0,
+///    not an error" and never mentioned the warning that was printed. That is the failure mode,
+///    demonstrated rather than argued.
+///  * **Docker refuses it** (`unable to find user X: no matching entries in passwd file`), and kern
+///    reads its user spec by Docker's rules everywhere else on this path. Deviating only in the
+///    failure case makes the compatible behaviour unpredictable.
+///
+/// The escape hatch is not removed, it is made explicit: `--user 0` runs as box root on purpose.
+///
+/// `resolve` is injected rather than called directly so the decision can be asserted without an
+/// image on disk: the resolution rules themselves are `resolve_image_user`'s, and are tested there.
+pub(crate) fn resolve_run_as(
+    flag: Option<&str>,
+    image_user: Option<&str>,
+    resolve: &dyn Fn(&str) -> Option<(u32, u32)>,
+) -> Result<Option<(u32, u32)>, Error> {
+    // An empty `USER` in the image config means the image said nothing, not that it asked for "".
+    let (spec, from_flag) = match flag {
+        Some(u) => (Some(u), true),
+        None => (image_user.filter(|u| !u.is_empty()), false),
+    };
+    let Some(u) = spec else {
+        return Ok(None);
+    };
+    match resolve(u) {
+        Some(pair) => Ok(Some(pair)),
+        None if from_flag => Err(Error::Sandbox(format!(
+            "--user '{u}': not a numeric UID[:GID] and no such account in the image's /etc/passwd"
+        ))),
+        None => Err(Error::Sandbox(format!(
+            "the image requests user '{u}', which is not a numeric UID[:GID] and has no account in \
+             the image's /etc/passwd (docker refuses this too). Pass `--user <uid[:gid]>` to choose \
+             one, or `--user 0` to run as box root on purpose"
+        ))),
+    }
+}
+
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The PARENT was not instrumented: `KERN_TIMING` covered only the child's setup, so the time
     // spent here was invisible and nobody could optimise it, because nobody could see it. The marks
@@ -796,25 +845,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         Some(pair) => Some(pair),
         None => parse_user(Some(u)).ok().flatten(),
     };
-    let run_as = match args.run_as {
-        // Explicit `--user`/compose `user:`: a name the image can't resolve is an ERROR (caller asked).
-        Some(u) => Some(user_or_image(u).ok_or_else(|| {
-            Error::Sandbox(format!(
-                "--user '{u}': not a numeric UID[:GID] and no such account in the image's /etc/passwd"
-            ))
-        })?),
-        // The image's OWN `USER`: a name it can't resolve falls back to box-root with an honest note.
-        None => match image_config.user.as_deref().filter(|u| !u.is_empty()) {
-            None => None,
-            Some(u) => user_or_image(u).or_else(|| {
-                eprintln!(
-                    "kern: image requests user '{u}' but it is not in the image's /etc/passwd - \
-                     running as box root (pass --user <uid[:gid]> to drop privilege)"
-                );
-                None
-            }),
-        },
-    };
+    let run_as = resolve_run_as(
+        args.run_as,
+        image_config.user.as_deref(),
+        &user_or_image as &dyn Fn(&str) -> Option<(u32, u32)>,
+    )?;
     // COMPAT HEADS-UP (not a security check; not parsing the entrypoint - only the image's own declared
     // `User`). An OCI image that drops privilege to a non-root user (postgres/redis/nginx via `User` or
     // an entrypoint `setpriv`/`gosu`) needs uids beyond box-root. Two honest cases:

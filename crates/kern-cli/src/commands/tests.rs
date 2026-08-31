@@ -7,6 +7,90 @@
 //! internals they did before, without widening one item's visibility.
 
 #[cfg(test)]
+mod run_as_policy_tests {
+    use crate::commands::*;
+    use crate::error::Error;
+
+    /// A resolver that knows exactly two specs, so a miss is a miss for a KNOWN reason.
+    fn only_known(spec: &str) -> Option<(u32, u32)> {
+        match spec {
+            "app" => Some((1000, 0)),
+            "0" => Some((0, 0)),
+            _ => None,
+        }
+    }
+
+    /// AN IMAGE `USER` THE IMAGE CANNOT RESOLVE IS AN ERROR, NOT A QUIET PROMOTION TO BOX ROOT.
+    ///
+    /// It used to return `None` after printing a note on stderr, so the workload ran as the box's
+    /// root: an image whose entire purpose was to drop privilege got the opposite of what it asked
+    /// for, and the only evidence was one line above the workload's own output. A field test on
+    /// `dev` reported it as "runs as 0:0, not an error" without mentioning the note at all, which is
+    /// the whole argument against a warning in this position.
+    ///
+    /// Docker refuses the same input (`unable to find user X: no matching entries in passwd file`).
+    #[test]
+    fn an_unresolvable_image_user_fails_closed_instead_of_running_as_box_root() {
+        let err = resolve_run_as(None, Some("1000:nosuchgroup"), &only_known)
+            .expect_err("an image USER that cannot be resolved must not start the box");
+        let Error::Sandbox(msg) = err else {
+            panic!("the refusal must be a sandbox error the caller reports as such");
+        };
+        assert!(
+            msg.contains("1000:nosuchgroup"),
+            "the message must quote the spec that could not be resolved: {msg}"
+        );
+        assert!(
+            msg.contains("--user"),
+            "and it must name the way out, which is the flag: {msg}"
+        );
+
+        // POSITIVE CONTROL: the same call with a spec the image DOES resolve still starts, so the
+        // assertion above is about resolution failing and not about the arm being unreachable.
+        assert_eq!(
+            resolve_run_as(None, Some("app"), &only_known).unwrap(),
+            Some((1000, 0))
+        );
+    }
+
+    /// The three shapes that must NOT become an error, or the change would break every image that
+    /// works today.
+    #[test]
+    fn an_absent_or_empty_user_still_leaves_the_box_as_root() {
+        // Nothing asked: no flag, no image USER.
+        assert_eq!(resolve_run_as(None, None, &only_known).unwrap(), None);
+        // An image config carrying an empty string said nothing; it did not ask for "".
+        assert_eq!(resolve_run_as(None, Some(""), &only_known).unwrap(), None);
+        // The escape hatch is explicit rather than implicit: ask for root and you get it.
+        assert_eq!(
+            resolve_run_as(Some("0"), Some("app"), &only_known).unwrap(),
+            Some((0, 0))
+        );
+    }
+
+    /// The flag wins over the image, and its own miss keeps its own sentence: the caller asked for
+    /// something specific, so the message must not talk about what the image requested.
+    #[test]
+    fn the_flag_overrides_the_image_and_keeps_its_own_refusal_message() {
+        assert_eq!(
+            resolve_run_as(Some("app"), Some("1000:nosuchgroup"), &only_known).unwrap(),
+            Some((1000, 0)),
+            "an explicit --user must be honoured even when the image's own USER is unresolvable"
+        );
+
+        let Err(Error::Sandbox(msg)) = resolve_run_as(Some("ghost"), Some("app"), &only_known)
+        else {
+            panic!("an explicit --user that cannot be resolved is an error");
+        };
+        assert!(msg.starts_with("--user 'ghost'"), "wrong sentence: {msg}");
+        assert!(
+            !msg.contains("the image requests"),
+            "the flag's refusal must not blame the image: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod image_user_resolution_tests {
     use crate::commands::*;
 

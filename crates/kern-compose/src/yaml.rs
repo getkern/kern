@@ -2630,9 +2630,16 @@ fn ports_value(node: &Node, svc: &str, declared: &mut Vec<(u16, bool)>) -> Vec<S
             match bare.parse::<u16>() {
                 Ok(n) if n > 0 => {
                     declared.push((n, keep_proto == "/udp"));
-                    warn_once(
-                        "a container-only port (`8000` / `:8000`) is DECLARED, not published: kern assigns no random host port. Write `HOST:8000` to publish one",
-                    );
+                    // NAME THE PORT THAT IS IN THE FILE. This used to be a fixed sentence quoting
+                    // `8000` whatever the file said, so a stack declaring only `9090` was told about
+                    // a port that appears nowhere in it. A field test on `dev` had to go and prove
+                    // that kern was not reading stale state from another file before it could be
+                    // dismissed, which is the cost of an example that looks like an observation.
+                    //
+                    // Still `warn_once`, so the dedup is now per DISTINCT PORT rather than per file:
+                    // a stack with one such port says it once, and each extra line names a different
+                    // number and is therefore worth its own line.
+                    warn_once(&container_only_port_note(n));
                 }
                 _ => warn(&format!(
                     "service '{svc}': port '{spec}' is not a port in 1..=65535, entry SKIPPED"
@@ -3093,6 +3100,21 @@ fn warn(msg: &str) {
 /// For facts that belong to the FILE rather than to a service: `networks:` is dropped for the whole
 /// stack, so a seven-service file was getting eight lines saying it. Repeating one fact per service
 /// trains the reader to skim past warnings, which is how the one that mattered gets missed.
+/// The note for a compose entry that names a container port with no host port.
+///
+/// A function rather than a fixed sentence because the number in the message has to be the number in
+/// the FILE. It used to read `a container-only port (\`8000\` / \`:8000\`) ...` whatever the file
+/// said, so a stack declaring only `9090` was told about a port that appears nowhere in it. A field
+/// test on the `dev` branch had to isolate the case and prove kern was not carrying stale state from
+/// another file before it could dismiss it: that is the cost of an example that reads like an
+/// observation.
+fn container_only_port_note(port: u16) -> String {
+    format!(
+        "a container-only port (`{port}` / `:{port}`) is DECLARED, not published: kern assigns no \
+         random host port. Write `HOST:{port}` to publish one"
+    )
+}
+
 fn warn_once(msg: &str) {
     use std::cell::RefCell;
     use std::collections::HashSet;
@@ -3128,6 +3150,30 @@ fn sanitize_for_terminal(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE WARNING MAY NOT NAME A PORT THAT IS NOT IN THE FILE.
+    ///
+    /// The sentence used to quote `8000` as an example regardless of the entry that triggered it, so
+    /// a file declaring only `9090` produced a line about port 8000. Reported from a field test on
+    /// `dev`, which had to isolate the case to establish that kern was not reading stale state from
+    /// a previous file. An example that reads like an observation costs the reader that
+    /// investigation, every time.
+    #[test]
+    fn the_container_only_port_note_names_the_port_the_file_declared() {
+        let note = container_only_port_note(9090);
+        assert!(
+            note.contains("`9090`") && note.contains("HOST:9090"),
+            "the note must quote the port that triggered it, in both places: {note}"
+        );
+        assert!(
+            !note.contains("8000"),
+            "and it must not mention a port the file never named: {note}"
+        );
+        // Positive control: 8000 is not banned, it is simply no longer hardcoded.
+        assert!(container_only_port_note(8000).contains("`8000`"));
+        // The two are different sentences, which is the property the old literal could not have.
+        assert_ne!(container_only_port_note(1), container_only_port_note(2));
+    }
 
     fn boxes(y: &str) -> Vec<ComposeBox> {
         parse(y).unwrap()

@@ -100,7 +100,37 @@ class of images that runs today.
   image that declares a `USER`, medians 3.5 ms on both, minima 2.8 against 2.9. That is a cost BELOW
   THE NOISE FLOOR of this measurement, which is not the same as no cost and is not claimed as one.
 
+### Changed
+
+- **An image `USER` the image cannot resolve now refuses to start the box, as Docker does.** It used
+  to run the workload as box root after printing a note on stderr, so that an odd image still
+  started. That is the wrong shape of failure: an image whose entire purpose is to drop privilege got
+  the opposite of what it asked for, and the only evidence was one line printed above the workload's
+  own output. A field test reported the behaviour as "ran as 0:0, not an error" without mentioning
+  the note at all, which is the argument against a warning in that position, demonstrated rather than
+  asserted. Docker refuses the same input (`unable to find user X: no matching entries in passwd
+  file`), and kern reads its user spec by Docker's rules everywhere else on that path.
+
+  The escape hatch is not removed, it is made explicit: `--user 0` runs as box root on purpose, and
+  an explicit `--user` still overrides an image whose own `USER` is unresolvable. Nothing changes for
+  an image whose `USER` resolves, which is every image that works today; the check is in
+  `resolve_run_as`, so the decision is asserted without an image on disk.
+
+  Injection: verified - restoring the fallback turns
+  `an_unresolvable_image_user_fails_closed_instead_of_running_as_box_root` red. Measured end to end:
+  `USER 1000:nosuchgroup` and `USER nobodyhere` now exit 1, a resolvable `USER 1000` still gives
+  `1000:0`, and `--user 0` still gives `0:0`.
+
 ### Fixed
+
+- **The container-only port warning quoted port 8000 whatever the file said.** A stack declaring only
+  `9090` was told about a port that appears nowhere in it, so the sentence read as an observation
+  when it was an example. A field test had to isolate the case to establish that kern was not
+  carrying stale state from another file before it could dismiss it. The note names the port that
+  triggered it, and `warn_once` now dedupes per distinct port rather than per file.
+
+  Injection: verified - restoring the fixed sentence turns
+  `the_container_only_port_note_names_the_port_the_file_declared` red.
 
 - **`kern doctor` reported a missing `/etc/subuid` allocation that was there.** The lookup
   interpolated `$USER` into the pattern it searched for, so with the variable unset it looked for
