@@ -7,6 +7,103 @@
 //! internals they did before, without widening one item's visibility.
 
 #[cfg(test)]
+mod helper_signal_guard_tests {
+    use crate::commands::*;
+
+    /// Run `body` in a child that has its OWN process group, and report how it ended.
+    ///
+    /// THE ISOLATION IS THE TEST'S POINT, not a convenience. What is under test is code that, if the
+    /// guard were missing, calls `kill(0, SIGKILL)` or `kill(-1, SIGKILL)` - "my whole process group"
+    /// and "every process I may signal". Running that in the test process would take the cargo test
+    /// harness down with it and, on a developer machine, whatever else the user owns. `setsid` first
+    /// bounds the blast radius to this one child, so a missing guard shows up as a dead child instead
+    /// of a dead session.
+    ///
+    /// Returns `Some(code)` for a normal exit and `None` when a signal ended it.
+    fn in_own_group(body: impl FnOnce()) -> Option<i32> {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed, so this test measured nothing");
+        if child == 0 {
+            unsafe { libc::setsid() };
+            body();
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0i32;
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child, "waitpid did not return this child");
+        if libc::WIFEXITED(status) {
+            Some(libc::WEXITSTATUS(status))
+        } else {
+            None
+        }
+    }
+
+    /// `signal_helper` MAY NOT SIGNAL ANYTHING WHEN HANDED A NON-POSITIVE PID.
+    ///
+    /// A failed `fork` returns -1, and three helpers here used to pass that straight to `libc::kill`.
+    /// `kill(-1, sig)` signals every process the caller may signal; `kill(0, sig)` signals the
+    /// caller's process group. Both are reachable exactly when a fork fails, which is when a host is
+    /// already under `RLIMIT_NPROC` or memory pressure - a machine running many boxes, not an idle
+    /// one.
+    #[test]
+    fn signal_helper_refuses_a_non_positive_pid_and_still_delivers_a_real_one() {
+        // The child survives BOTH refusals: if either forwarded to `kill`, SIGKILL would have ended
+        // its group (which is itself alone) and the exit status would be a signal, not a code.
+        assert_eq!(
+            in_own_group(|| {
+                let a = signal_helper(0, libc::SIGKILL);
+                let b = signal_helper(-1, libc::SIGKILL);
+                // 0 = both refused, as expected; 3 = one of them returned true.
+                unsafe { libc::_exit(i32::from(a) + 2 * i32::from(b)) };
+            }),
+            Some(0),
+            "signal_helper forwarded a non-positive pid to kill"
+        );
+
+        // POSITIVE CONTROL: it does deliver to a real pid. Without this the assertion above would
+        // also pass on a `signal_helper` that always returns false and never signals anything.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0)
+            };
+        }
+        assert!(
+            signal_helper(child, libc::SIGKILL),
+            "signal_helper refused a live pid, so the refusals above prove nothing"
+        );
+        let mut st = 0i32;
+        unsafe { libc::waitpid(child, &mut st, 0) };
+        assert!(
+            libc::WIFSIGNALED(st),
+            "the control child should have died by signal"
+        );
+    }
+
+    /// `signal_box`'s FALLBACK MAY NOT SIGNAL WHEN THERE IS NO PID 1 YET.
+    ///
+    /// A box is registered with `pid1: 0` and re-registered once its init exists. In that window the
+    /// recorded value is 0, `pidfd_open` on it fails so the `kill` fallback is taken, and
+    /// `init_catches_signal` returns `true` for `pid1 <= 0`, so the graceful arm is entered rather
+    /// than skipped. A `kern stop` landing there would have sent the stop signal, and then SIGKILL,
+    /// to the stopper's own process group.
+    #[test]
+    fn signal_box_refuses_a_box_with_no_pid1_recorded_yet() {
+        assert_eq!(
+            in_own_group(|| unsafe {
+                // pidfd < 0 forces the `kill` fallback, which is the branch with the hazard.
+                signal_box(-1, 0, libc::SIGKILL);
+                signal_box(-1, -1, libc::SIGKILL);
+            }),
+            Some(0),
+            "signal_box signalled its caller's process group for a box with no pid1"
+        );
+    }
+}
+
+#[cfg(test)]
 mod run_as_policy_tests {
     use crate::commands::*;
     use crate::error::Error;

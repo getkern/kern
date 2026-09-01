@@ -15,10 +15,15 @@ use super::*;
 /// `/bin/sh -c`) inside the box and records `healthy`/`unhealthy` in the registry health sidecar
 /// (shown by `kern ps`). It re-reads the box's PID 1 each round, so it follows `--restart`s.
 /// Returns the checker's pid.
-pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i32 {
+pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> Option<i32> {
+    // `Option`, not a bare pid, for the reason `fork_detached` spells out: this returned -1 on a
+    // failed fork and the teardown passed it to `kill`.
     let child = unsafe { libc::fork() };
-    if child != 0 {
-        return child;
+    if child > 0 {
+        return Some(child);
+    }
+    if child < 0 {
+        return None;
     }
     // CHILD: die with the launcher. Without this a SIGKILL'd parent (which skips every teardown,
     // including `stop_health_checker`) left this loop probing a box that no longer exists, forever -
@@ -129,20 +134,55 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i
 /// to the parent and `None` to the child (which then runs its body and `_exit`s). Escaping the group
 /// matters because these children call `stop()`, which group-kills the box; an in-group caller would
 /// otherwise be cut down mid-cleanup.
-pub(crate) fn fork_detached() -> Option<i32> {
+pub(crate) enum Forked {
+    /// The parent, holding the child's pid. Always `> 0`.
+    Parent(i32),
+    /// The child: run the body and `_exit`.
+    Child,
+    /// `fork` failed. Nothing was created, so there is nothing to run and nothing to signal.
+    Failed,
+}
+
+pub(crate) fn fork_detached() -> Forked {
+    // THREE STATES, NOT TWO, AND THE THIRD IS THE WHOLE POINT. This returned `Option<i32>` with
+    // `child != 0` deciding, so a FAILED fork (-1) came back as `Some(-1)` and the caller handed that
+    // to `libc::kill`. `kill(-1, sig)` signals EVERY process the caller may signal, which for a normal
+    // user is their entire session, and the trigger is precisely the moment a fork fails: `EAGAIN`
+    // under `RLIMIT_NPROC` or memory pressure, i.e. a host already running many boxes.
+    //
+    // `Option` could not express it: `None` already means "you are the child, run the body", so
+    // reporting failure that way would have made the PARENT run the watchdog and never return.
     let child = unsafe { libc::fork() };
-    if child != 0 {
-        return Some(child);
+    if child > 0 {
+        return Forked::Parent(child);
+    }
+    if child < 0 {
+        return Forked::Failed;
     }
     unsafe { libc::setsid() };
     kern_isolation::shed_inherited_fds(-1);
     detach_stdio(None);
-    None
+    Forked::Child
+}
+
+/// Signal a helper this module forked, and never anything else.
+///
+/// A guard on the pid, not on the caller's discipline: `kill(0, sig)` hits the caller's whole process
+/// group and `kill(-1, sig)` hits every process the user owns, so a pid that is not strictly positive
+/// is never a pid to signal. Returns whether the signal was delivered.
+pub(crate) fn signal_helper(pid: i32, sig: libc::c_int) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid, sig) == 0 }
 }
 
 pub(crate) fn spawn_detached_stop(name: String) {
-    if fork_detached().is_some() {
-        return;
+    match fork_detached() {
+        // The parent is done, and a failed fork means the stop simply does not happen here: this is a
+        // best-effort helper, and the alternative (running the body in the caller) would block it.
+        Forked::Parent(_) | Forked::Failed => return,
+        Forked::Child => {}
     }
     let _ = stop(std::slice::from_ref(&name), false);
     unsafe { libc::_exit(0) };
@@ -322,12 +362,23 @@ pub(crate) unsafe fn wait_for_box_exit(pidfd: i32, ms: u64) -> bool {
     }
 }
 
-/// Send `sig` to the box's PID 1: via its `pidfd` when we have one (reuse-proof), else plain `kill`.
-/// SAFETY: async-signal-safe - only raw syscalls, called from the post-fork watchdog child.
+/// Send `sig` to the box's BOX PID 1: via its `pidfd` when we have one (reuse-proof), else plain
+/// `kill`.
+///
+/// THE FALLBACK REFUSES A NON-POSITIVE PID, and that is not defensive padding. A box is registered
+/// with `pid1: 0` and re-registered once its init exists, so between those two writes the recorded
+/// value is 0 - and `kill(0, sig)` does not mean "nobody", it means the CALLER'S ENTIRE PROCESS
+/// GROUP. A `kern stop` landing in that window would have signalled the stopper's own shell, and
+/// with `SIGKILL` at the teardown site there is no second chance. `init_catches_signal` returns
+/// `true` for `pid1 <= 0`, so the graceful arm is taken rather than skipped, which is what makes the
+/// window reachable rather than theoretical.
+///
+/// SAFETY: async-signal-safe - an integer comparison and raw syscalls, called from the post-fork
+/// watchdog child.
 pub(crate) unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
     if pidfd >= 0 {
         libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig, 0, 0);
-    } else {
+    } else if pid1 > 0 {
         libc::kill(pid1, sig);
     }
 }
@@ -710,18 +761,17 @@ pub(crate) fn stop_health_checker(checker: Option<i32>, name: &str, key_pid: i32
     let Some(hp) = checker else {
         return;
     };
-    unsafe {
-        libc::kill(hp, libc::SIGTERM);
-        crate::eintr::reap(hp);
+    if !signal_helper(hp, libc::SIGTERM) {
+        return;
     }
+    crate::eintr::reap(hp);
     registry::clear_health(name, key_pid);
 }
 
 pub(crate) fn cancel_foreground_timeout(wd: Option<(i32, i32)>) {
     if let Some((wd_pid, wfd)) = wd {
-        unsafe {
-            libc::close(wfd);
-            libc::kill(wd_pid, libc::SIGKILL);
+        unsafe { libc::close(wfd) };
+        if signal_helper(wd_pid, libc::SIGKILL) {
             crate::eintr::reap(wd_pid);
         }
     }
@@ -732,9 +782,12 @@ pub(crate) fn cancel_foreground_timeout(wd: Option<(i32, i32)>) {
 /// can't resurrect it). It first checks the box is still the same instance (name + supervisor pid),
 /// so a box that already exited on its own isn't "stopped" a second time. Returns its pid so the
 /// supervisor can cancel it once the box exits normally.
-pub(crate) fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> i32 {
-    if let Some(child) = fork_detached() {
-        return child;
+pub(crate) fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> Option<i32> {
+    match fork_detached() {
+        Forked::Parent(child) => return Some(child),
+        // No watchdog was created, so the caller has nothing to cancel and nothing to signal.
+        Forked::Failed => return None,
+        Forked::Child => {}
     }
     // Wait for the SUPERVISOR to exit, with `secs` as a cap, rather than sleeping `secs` out.
     //
@@ -871,6 +924,25 @@ pub(crate) struct HealthConfig<'a> {
     pub(crate) start_period: u64,
     pub(crate) timeout: u64,
     pub(crate) action: HealthAction,
+}
+
+impl HealthConfig<'_> {
+    /// The same policy, owned, for a checker that outlives `box_run`'s borrowed args.
+    ///
+    /// ONE CONVERSION FOR BOTH LAUNCH PATHS. Each used to build `OwnedHealth` field by field at its
+    /// own call site, from different sources, which is how a flag comes to mean one thing detached
+    /// and another in the foreground. `cmd` is taken separately because the caller has already
+    /// matched on it to decide there is a checker to start at all.
+    pub(crate) fn owned(&self, cmd: &str) -> OwnedHealth {
+        OwnedHealth {
+            cmd: cmd.to_string(),
+            interval: self.interval,
+            retries: self.retries,
+            start_period: self.start_period,
+            timeout: self.timeout,
+            action: self.action,
+        }
+    }
 }
 
 /// Owned health policy handed to the forked checker (it outlives `box_run`'s borrowed args).

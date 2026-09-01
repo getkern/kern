@@ -1069,6 +1069,18 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
              enable a systemd --user manager, or generate a unit with `kern compose <file> systemd`."
         );
     }
+    // ONE HealthConfig FOR BOTH PATHS, built before the branch that chooses between them. It used to
+    // be constructed inline for `run_detached` and field-by-field again for the foreground checker,
+    // which is exactly how the same flag comes to mean two things depending on how the box was
+    // started - the defect this branch exists to fix, in miniature.
+    let health_cfg = HealthConfig {
+        cmd: args.health_cmd,
+        interval: args.health_interval,
+        retries: args.health_retries,
+        start_period: args.health_start_period,
+        timeout: args.health_timeout,
+        action: health_action,
+    };
     if args.detached {
         return run_detached(
             &name,
@@ -1079,14 +1091,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             args.pod.unwrap_or(""),
             restart,
             restart_always,
-            HealthConfig {
-                cmd: args.health_cmd,
-                interval: args.health_interval,
-                retries: args.health_retries,
-                start_period: args.health_start_period,
-                timeout: args.health_timeout,
-                action: health_action,
-            },
+            health_cfg,
             args.timeout,
             &args.labels.join(","),
             args.stop_signal,
@@ -1118,8 +1123,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // sandbox - makes `volume rm`'s in-use check race-free. A *managed* (persistent, systemd-unit) box
     // also redirects its stdio to a per-box log; a plain foreground box keeps its terminal. The entry
     // is removed on clean exit; a crash/kill leaves it, but `registry::list()` prunes it by start-time.
+    // THE REGISTRY KEY, COMPUTED ONCE. The entry below, the health checker armed further down and the
+    // teardown that clears its status must all agree on which pid the box is filed under. Reading
+    // `std::process::id()` at each of the three sites made that agreement a coincidence; one binding
+    // makes it structural.
+    let launcher_pid = std::process::id() as i32;
     let mut reg_state = {
-        let pid = std::process::id() as i32;
+        let pid = launcher_pid;
         if managed {
             let log = registry::logs_dir()
                 .ok()
@@ -1201,18 +1211,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     //
     // Keyed by THIS process's pid, the same value the entry above was registered under, so
     // `set_health` and `kern ps` agree on where the status lives.
-    let health_wd = args.health_cmd.map(|cmd| {
+    let health_wd = health_cfg.cmd.and_then(|cmd| {
         spawn_health_checker(
             name.as_str().to_string(),
-            std::process::id() as i32,
-            OwnedHealth {
-                cmd: cmd.to_string(),
-                interval: args.health_interval,
-                retries: args.health_retries,
-                start_period: args.health_start_period,
-                timeout: args.health_timeout,
-                action: health_action,
-            },
+            launcher_pid,
+            health_cfg.owned(cmd),
         )
     });
     // Egress filter: spawn BOTH helpers NOW, while box_run is still in the HOST pid namespace (before
@@ -1276,7 +1279,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The box has exited: stop the checker and drop its status. This path leaves via `process::exit`,
     // which skips Drop, so an unstopped checker would outlive the box as an orphan - the shape the
     // `--timeout` watchdog was once found leaking in.
-    stop_health_checker(health_wd, name.as_str(), std::process::id() as i32);
+    stop_health_checker(health_wd, name.as_str(), launcher_pid);
     // The box has exited: SIGKILL the egress helpers NOW (this foreground path leaves via
     // `process::exit`, which skips Drop, so an implicit drop would leak the proxy + pump).
     drop(egress_guard);
@@ -2181,24 +2184,14 @@ fn run_detached(
     crate::runstats::record_box(); // count this box start for kern top's box-start rate
                                    // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
                                    // `kern ps`. Lives in this supervisor's process group, so it's reaped on stop with everything else.
-    let health_pid = health.cmd.map(|hc| {
-        spawn_health_checker(
-            name.as_str().to_string(),
-            pid,
-            OwnedHealth {
-                cmd: hc.to_string(),
-                interval: health.interval,
-                retries: health.retries,
-                start_period: health.start_period,
-                timeout: health.timeout,
-                action: health.action,
-            },
-        )
-    });
+    let health_pid = health
+        .cmd
+        .and_then(|hc| spawn_health_checker(name.as_str().to_string(), pid, health.owned(hc)));
     // `--timeout N`: a watchdog that auto-stops the box N seconds after it starts (registry/scratch
     // cleaned up like `kern stop`). Cancelled below if the box exits on its own first.
-    let timeout_pid =
-        (timeout > 0).then(|| spawn_timeout_stop(name.as_str().to_string(), pid, timeout));
+    let timeout_pid = (timeout > 0)
+        .then(|| spawn_timeout_stop(name.as_str().to_string(), pid, timeout))
+        .flatten();
     // Run the box (re-registering with its PID 1 so `kern exec` can find it), restarting it per
     // `--restart`. Blocks for the box's whole lifetime.
     supervise_box(
@@ -2217,8 +2210,7 @@ fn run_detached(
     // Box is gone - cancel the sidecars and reap them (they're our children; setsid doesn't change
     // parentage) so we don't leave brief zombies behind before this supervisor exits.
     if let Some(tp) = timeout_pid {
-        unsafe {
-            libc::kill(tp, libc::SIGKILL);
+        if signal_helper(tp, libc::SIGKILL) {
             crate::eintr::reap(tp);
         }
     }

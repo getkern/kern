@@ -13,6 +13,37 @@ is in the git history.
 
 ## Unreleased
 
+### Security
+
+- **Three helpers could hand `-1` to `kill`, which signals every process the user owns.** Found by
+  auditing the change below rather than by a report, and it is older than that change.
+
+  `fork_detached` decided with `child != 0`, so a FAILED fork (-1) came back as `Some(-1)`; the
+  `--timeout` watchdog it builds then reached `libc::kill(tp, SIGKILL)`. `spawn_health_checker`
+  returned a bare pid with the same shape, and its teardown reached `kill(hp, SIGTERM)`.
+  `kill(-1, sig)` is not a no-op and not an error: POSIX sends the signal to every process the caller
+  has permission to signal, which for a normal user is their whole session. The trigger is precisely
+  a failed fork, that is `EAGAIN` under `RLIMIT_NPROC` or memory pressure - a host already running
+  many boxes, not an idle one.
+
+  `Option` could not express the fork-failure state, because `None` already meant "you are the
+  child": reporting failure that way would have made the PARENT run the watchdog body and never
+  return. The three states are now a `Forked` enum, the two spawners return `Option<i32>`, and every
+  helper signal goes through one `signal_helper` that refuses a non-positive pid.
+
+- **`signal_box` could send the stop signal, then `SIGKILL`, to the caller's own process group.** A
+  box is registered with `pid1: 0` and re-registered once its init exists. In that window the
+  recorded value is 0, `pidfd_open` on it fails so the plain-`kill` fallback is taken, and
+  `init_catches_signal` returns `true` for `pid1 <= 0`, so the graceful arm is ENTERED rather than
+  skipped. `kill(0, sig)` means the caller's process group, so a `kern stop` landing there would have
+  signalled the stopper's own shell. The fallback now requires `pid1 > 0`.
+
+  Injection: verified. Both guards are asserted from a child in its OWN process group (`setsid`
+  first), because the failure being tested is "kills my whole group" and running it in the test
+  process would take the harness down with it. Removing either guard turns its own test red; the
+  positive control is that `signal_helper` still delivers to a live pid, so a version that always
+  refuses cannot pass.
+
 ### Fixed
 
 - **A foreground box took `--health-cmd` and never evaluated it.** The checker was armed in exactly
