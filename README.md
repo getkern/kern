@@ -191,12 +191,13 @@ Official images that drop to a non-root user (postgres, redis, ...) want `uidmap
 `/etc/subuid` line, and outbound pulls want `pasta`; both are one `apt install`, and `kern doctor`
 names either if it is missing. This is the local dev loop, not a production orchestrator.
 
-## Embed it: Python & Node
+## Run an agent's code: Python, Node, MCP
 
-Run agent or LLM-generated code from your own program with
-**[`kern-sandbox`](bindings/python/README.md)**, a thin, dependency-free wrapper over the `kern`
-binary. Every call runs in a fresh isolated box: network off, memory and pid caps, capabilities
-dropped, output bounded, and a timeout the binding itself enforces.
+An agent needs somewhere to run what the model just wrote.
+**[`kern-sandbox`](bindings/python/README.md)** is that place, called from your own program: a thin,
+dependency-free wrapper over the `kern` binary. Every call runs in a fresh isolated box, with the
+network off, memory and pid caps, capabilities dropped, output bounded, and a timeout the binding
+enforces itself.
 
 ```sh
 pip install kern-sandbox        # PyPI   · needs the `kern` binary above, on PATH or $KERN_BIN
