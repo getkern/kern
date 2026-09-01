@@ -349,16 +349,11 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done, and the CLI is frozen.** 971 Rust, 340 Python and 61 Node tests, clippy-clean
-and `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q. Verbs,
-flags and `--json` shapes change incompatibly only after a deprecation entry a release earlier, and
-`cli_surface_is_frozen` holds the build to it. Config-file keys can still evolve:
-[CHANGELOG.md](CHANGELOG.md).
+**The core is done and the CLI is frozen.** 971 Rust, 340 Python and 61 Node tests, clippy-clean and
+`cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
-Upgrading from 0.7? The behaviour changes are listed under
-[v0.8.0](CHANGELOG.md#v080---2026-08-31): a numeric `USER` now takes its group from the image's
-`/etc/passwd`, an image `USER` that cannot be resolved refuses to start the box instead of running
-as root, and a repository name must be lowercase at build time rather than failing later at push.
+Verbs, flags and `--json` shapes change incompatibly only on a minor bump, never on a patch.
+Upgrading from 0.7? The behaviour changes are under [v0.8.0](CHANGELOG.md#v080---2026-08-31).
 
 ## What kern is not
 
