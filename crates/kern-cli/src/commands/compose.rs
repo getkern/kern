@@ -455,8 +455,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         // is not there simply has nothing to start, and the level barrier below
                         // still waits for the ones that are.
                         let b = boxes.iter().find(|b| &b.name == name)?;
-                        let (started, pod, up_token, self_exe, boxes, project_dir) =
-                            (&started, &pod, &up_token, &self_exe, &boxes, &project_dir);
+                        // `boxes` is no longer captured: it was here only to ask whether some peer
+                        // waited on this box's completion, and every box gets the exit key now.
+                        let (started, pod, up_token, self_exe, project_dir) =
+                            (&started, &pod, &up_token, &self_exe, &project_dir);
                         // `Some(...)`: `filter_map` wants an `Option`, and the `?` above is the
                         // miss. The spawn itself always succeeds.
                         Some(scope.spawn(move || -> Result<(), Error> {
@@ -486,18 +488,24 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             if use_pod && !b.net {
                                 cmd.arg("--pod").arg(pod);
                             }
-                            // If a peer waits on THIS box's completion, hand it the stack+run-scoped exit
-                            // KEY via env and CLEAR that exact key BEFORE the spawn. Each box owns a UNIQUE
-                            // key (carries this `up`'s token), so concurrent workers never touch each
-                            // other's - the review-round-2 invariant holds under parallelism too.
-                            let is_completion_target = boxes
-                                .iter()
-                                .any(|other| other.depends_completed.iter().any(|d| d == &b.name));
-                            if is_completion_target {
-                                let key = exit_key(pod, up_token, &b.name);
-                                registry::clear_exit(&key);
-                                cmd.env("KERN_EXIT_KEY", &key);
-                            }
+                            // EVERY box gets the stack+run-scoped exit KEY, and that key is CLEARED
+                            // before the spawn. Each box owns a unique one (it carries this `up`'s
+                            // token), so concurrent workers never touch each other's.
+                            //
+                            // IT USED TO BE HANDED OUT ONLY TO A `depends_completed` TARGET, and that
+                            // made the settle check below unable to tell success from failure. It asks
+                            // `exit_of(key) != Some(0)` to spare a service that finished CLEANLY inside
+                            // the window; with no key there is no file, `exit_of` answers `None`, and
+                            // the carve-out could never fire for any service that was not some peer's
+                            // completion target. MEASURED from a field report on 0.8.5: a one-shot
+                            // service running `/bin/echo` and exiting 0 was reported as
+                            // "died within 150ms of starting" and `up` exited 1, so a stack with a
+                            // migration or a build step failed its CI run by succeeding. The exit code
+                            // was already being recorded for `kern wait` under a different key the
+                            // whole time; only compose's own key was withheld.
+                            let key = exit_key(pod, up_token, &b.name);
+                            registry::clear_exit(&key);
+                            cmd.env("KERN_EXIT_KEY", &key);
                             cmd.arg("-d");
                             if !b.command.is_empty() {
                                 cmd.arg("--").args(&b.command);

@@ -11,6 +11,21 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## Unreleased
+
+### Fixed
+
+- **A one-shot service that succeeded failed the stack.** `compose up` is fail-closed on bring-up: a
+  service that dies inside the settle window is reported and the command exits non-zero. The carve-out
+  for a service that finished CLEANLY is decided by its recorded exit code, and that code was handed to
+  the box only when some peer waited on it with `depends_completed`. For every other service no record
+  was written, the lookup answered "no record", and the carve-out could never fire. MEASURED from a
+  field report on v0.8.5: a service running `/bin/echo` and exiting 0 was reported as "died within
+  150ms of starting" and `up` exited 1, so a stack holding a migration or a build step failed its CI
+  run BY SUCCEEDING. Every service is handed the key now. A service that exits non-zero is still
+  reported and still fails the command, which the same test asserts, because a fix that stopped
+  reporting deaths would have passed the other half.
+
 ## v0.8.5 - 2026-09-01
 
 ### Added

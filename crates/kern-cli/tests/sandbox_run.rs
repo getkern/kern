@@ -4743,6 +4743,87 @@ fn images_strips_terminal_escapes_from_untrusted_ref() {
 }
 
 /// End-to-end: a `compose` file using the extended box schema (resources + env + read-only)
+/// A ONE-SHOT SERVICE THAT SUCCEEDS MUST NOT FAIL THE STACK.
+///
+/// `up` is fail-closed on bring-up: a service that dies inside the settle window is reported and the
+/// command exits non-zero, because launching a box only proves the launcher returned. The carve-out
+/// is a service that finished CLEANLY, and it is decided by `exit_of(key) != Some(0)`.
+///
+/// That key used to be handed only to a service some peer waited on with `depends_completed`. For
+/// every other service no file was written, `exit_of` answered `None`, and the carve-out could not
+/// fire. MEASURED from a field report on 0.8.5: a service running `/bin/echo` and exiting 0 was
+/// reported as "died within 150ms of starting" and `up` exited 1, so a stack holding a migration or
+/// a build step failed its CI run BY SUCCEEDING.
+///
+/// Both halves are asserted, because a fix that stopped reporting deaths altogether would pass the
+/// first one: a service exiting 3 must still be reported and must still exit non-zero.
+#[test]
+fn a_one_shot_service_that_exits_zero_does_not_fail_the_stack() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "oneshot");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-1shot-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    let run = |tag: &str, code: &str| -> std::process::Output {
+        let toml =
+            std::env::temp_dir().join(format!("kern-1shot-{tag}-{}.toml", std::process::id()));
+        fs::write(
+            &toml,
+            format!(
+                "[box.job]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sh\", \"-c\", \"exit {code}\"]\n"
+            ),
+        )
+        .unwrap();
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", toml.to_str().unwrap(), "up"])
+            .output()
+            .expect("run kern");
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", toml.to_str().unwrap(), "down"])
+            .output()
+            .ok();
+        let _ = fs::remove_file(&toml);
+        out
+    };
+
+    let ok = run("ok", "0");
+    if String::from_utf8_lossy(&ok.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let ok_err = String::from_utf8_lossy(&ok.stderr).to_string();
+    assert!(
+        ok.status.success() && !ok_err.contains("died within"),
+        "a service that exited 0 was reported as dead: status {:?}, stderr {ok_err}",
+        ok.status.code()
+    );
+
+    let bad = run("bad", "3");
+    let bad_err = String::from_utf8_lossy(&bad.stderr).to_string();
+    assert!(
+        !bad.status.success() && bad_err.contains("died within"),
+        "a service that exited 3 must still be reported and must still fail the command: \
+         status {:?}, stderr {bad_err}",
+        bad.status.code()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
 /// brings the box up - proving every mirror flag `push_box_flags` emits is one `kern box` accepts.
 #[test]
 fn compose_full_schema_brings_box_up() {

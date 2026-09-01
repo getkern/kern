@@ -350,7 +350,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done and the CLI is frozen.** 971 Rust, 340 Python and 61 Node tests, clippy-clean and
+**The core is done and the CLI is frozen.** 972 Rust, 340 Python and 61 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Verbs, flags and `--json` shapes change incompatibly only on a minor bump, never on a patch.
