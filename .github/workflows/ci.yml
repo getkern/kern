@@ -5,7 +5,7 @@ on:
     # `dev` was added while it carried unreleased work and removed with it, because a dead branch
     # name says something untrue about what is being built. Add the branch back, in the same push
     # that creates it, whenever work leaves `main` again.
-    branches: [main, dev]
+    branches: [main]
   pull_request:
   workflow_dispatch: {}
 
