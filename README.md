@@ -353,8 +353,9 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 **The core is done and the CLI is frozen.** 972 Rust, 340 Python and 61 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
-Verbs, flags and `--json` shapes change incompatibly only on a minor bump, never on a patch.
-Upgrading from 0.7? The behaviour changes are under [v0.8.0](CHANGELOG.md#v080---2026-08-31).
+Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning
+inside a `0.8.x`. Coming from 0.7, three things behave differently, and they are listed in the
+[0.8.0 notes](CHANGELOG.md#v080---2026-08-31).
 
 ## What kern is not
 
