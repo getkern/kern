@@ -37,6 +37,17 @@ pub struct BuildDirective {
 /// `user`→`--user`, `volumes`→`-v`, `env`→`-e`, `ports`→`-p`, `secrets`→`--secret`; the rest share
 /// the flag's long name (`pids_limit`, `io_weight`, `nice`, `timeout`, `hostname`, `tun`, `tmpfs`,
 /// `cap_add`, `cap_drop`, `env_file`, `health_retries`/`_start_period`/`_timeout`/`_action`).
+/// The resource-profile kinds a compose file may name, and the ONE place that decides.
+///
+/// Read by `profile_tokens`, which turns `<kind>` + a name into the positional token `kern box`
+/// takes, and by the YAML reader, which accepts `x-kern-<kind>` for exactly these. A new kind is one
+/// entry here plus its field, and nothing else: `vgpu` is the one waiting, and it is deliberately
+/// ABSENT rather than listed-and-dead, because `kern_cli::config::classify` does not know a `vgpu:`
+/// token in this build and the CLI would answer `unexpected argument` on a token this crate had
+/// happily built. An unrecognised `x-kern-…` key is named at parse time instead, so a file written
+/// for a build that has it says so here rather than failing three layers down.
+pub const PROFILE_KINDS: [&str; 3] = ["vcpu", "vdisk", "vgpio"];
+
 #[derive(Default, Debug)]
 pub struct ComposeBox {
     pub name: String,
@@ -188,6 +199,11 @@ pub struct ComposeBox {
     pub vdisk: Vec<String>,
     /// Named GPIO/device profiles (`[[vgpio]] name = "leds"` → `vgpio:leds`).
     pub vgpio: Vec<String>,
+    /// `--security-profile <untrusted>`: the opt-in hardening bundle (seccomp allowlist +
+    /// `--cap-drop ALL` + `--read-only`). Compose has no way to say "this code is not trusted", and
+    /// the three flags it would take instead are easy to get half-right; naming the bundle is the
+    /// whole point of having one.
+    pub security_profile: Option<String>,
     /// Network aliases from a service's `networks.<net>.aliases` - extra names the service is reachable
     /// by inside the stack pod (Docker gives each service DNS for its aliases). `kern compose` adds
     /// each to the pod's shared `/etc/hosts` (→ `127.0.0.1`), so a peer that connects to an alias
@@ -289,6 +305,11 @@ impl ComposeBox {
     pub fn push_box_flags(&self, cmd: &mut std::process::Command) {
         if let Some(v) = &self.config {
             cmd.arg("--config").arg(v);
+        }
+        // `--security-profile` before anything a profile could also set: the bundle fills flags the
+        // caller did not give, so it must not be applied on top of an explicit choice.
+        if let Some(v) = &self.security_profile {
+            cmd.arg("--security-profile").arg(v);
         }
         if let Some(v) = &self.image {
             cmd.arg("--image").arg(v);
@@ -459,9 +480,9 @@ impl ComposeBox {
     pub fn profile_tokens(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (kind, names) in [
-            ("vcpu", &self.vcpu),
-            ("vdisk", &self.vdisk),
-            ("vgpio", &self.vgpio),
+            (PROFILE_KINDS[0], &self.vcpu),
+            (PROFILE_KINDS[1], &self.vdisk),
+            (PROFILE_KINDS[2], &self.vgpio),
         ] {
             for n in names.iter().filter(|n| !n.trim().is_empty()) {
                 let n = n.trim();

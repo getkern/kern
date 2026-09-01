@@ -95,6 +95,58 @@ file kern did not write; for a file you did, a typo should be named at once.
 refuses exactly what `up` would refuse: a dry run that disagreed with the bring-up would
 be worse than no dry run.
 
+### Resource profiles from a compose file
+
+A `docker-compose.yml` can name a `kern.toml` resource profile through the Compose Specification's
+own extension fields:
+
+```yaml
+services:
+  trainer:
+    image: tensorflow/tensorflow:2.20.0
+    cpus: 3.0            # already honoured, inline
+    mem_limit: 3g        # already honoured, inline
+    x-kern-vcpu: ml      # a [[vcpu]] profile in kern.toml
+    x-kern-vdisk: scratch
+    x-kern-vgpio: leds
+    x-kern-security-profile: untrusted
+```
+
+`x-kern-security-profile: untrusted` is the one that needs no `kern.toml` at all: it is the opt-in
+hardening bundle (seccomp allowlist, `--cap-drop ALL`, `--read-only`) under one name. Compose has no
+way to say "this code is not trusted", and the flags it would take instead are easy to get
+half-right. Measured on a service carrying it: `touch` in the rootfs answers `Read-only file system`
+and `CapEff` reads `0000000000000000`.
+
+They resolve to the `vcpu:`/`vdisk:`/`vgpio:` tokens `kern box` already takes, so `kern.toml` and a
+compose file reach the same profiles. `leds` and `vgpio:leds` name the same one.
+
+WHAT THEY BUY, which is only what compose cannot already say. `cpus`, `cpuset` and `mem_limit` are
+honoured inline and need no profile. A `vcpu` profile also carries `numa`, `nice`, `backend` and
+`extends`; a `vdisk` carries `size`, `persistent`, `backend`, `iops` and `bandwidth`; a `vgpio`
+carries nineteen device classes. None of those has a compose spelling.
+
+`x-kern-vgpio` is the one with no equivalent anywhere. A compose file reaches GPIO today by writing
+`devices: /dev/gpiochip0`, so the service file decides which hardware it may touch. With a profile
+the service declares intent and `kern.toml` holds the grant, so the operator decides what `leds`
+resolves to on this host - which matters because the grant is chip-granular rather than per-line.
+
+**The file stays portable, the grant does not.** `x-` is the spec's extension mechanism and Docker
+Compose validates these keys and echoes them back unchanged, so one file runs on both runtimes. It
+runs there WITHOUT the profile: a service relying on a `vdisk` size cap gets no cap under Docker, and
+nothing says so. Keep anything a workload needs for correctness in the inline fields both runtimes
+enforce, and use a profile for what only kern can grant.
+
+An unrecognised key in the `x-kern-` namespace is NAMED rather than ignored. The spec says a tool
+must ignore the extension fields it does not understand, and every other vendor's prefix is left
+alone, but this one is kern's: a typo (`x-kern-vgpi`) or a key from a build that has something this
+one does not (`x-kern-vgpu`) would otherwise do nothing and say nothing, which is the defect the
+mechanism exists to avoid.
+
+The profile must already exist: a compose file names a grant, it does not create one, which is the
+whole point of the split. `kern compose <file> config` refuses a name that does not resolve, with the
+`kern config add` line that creates it, and it refuses exactly what `up` would.
+
 `docker compose up -d` is the most common way anyone starts a stack, so `-d`/`--detach` is
 accepted and does exactly what it says: `kern compose <file> up` starts the services and
 returns, which is Docker's detached behaviour and kern's only one. It is accepted silently

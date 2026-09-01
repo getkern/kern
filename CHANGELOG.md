@@ -13,6 +13,75 @@ is in the git history.
 
 ## Unreleased
 
+### Added
+
+- **A `docker-compose.yml` can name a `kern.toml` resource profile**, through the Compose
+  Specification's own extension fields: `x-kern-vcpu`, `x-kern-vdisk`, `x-kern-vgpio`. They resolve
+  to the `vcpu:`/`vdisk:`/`vgpio:` tokens `kern box` already takes positionally, so the whole chain
+  downstream is the one the TOML spelling has always used, and `leds` and `vgpio:leds` name the same
+  profile.
+
+  WHAT THEY BUY, checked field by field rather than assumed. `cpus`, `cpuset` and `mem_limit` are
+  already honoured inline and need no profile. A `vcpu` profile also carries `numa`, `nice`,
+  `backend` and `extends`; a `vdisk` carries `size`, `persistent`, `backend`, `iops` and `bandwidth`;
+  a `vgpio` carries nineteen device classes. None of those has a compose spelling. An earlier draft
+  read only `x-kern-vgpio`, on the grounds that `cpus`/`cpuset` were covered inline: that was two
+  fields out of seven, and a surface that reads one key while silently dropping its two obvious
+  siblings teaches a pattern that then does nothing.
+
+  `x-kern-vgpio` is the one with no equivalent anywhere. A compose file reaches GPIO today by writing
+  `devices: /dev/gpiochip0`, so the service file decides which hardware it may touch. With a profile
+  the service declares intent and `kern.toml` holds the grant, so the operator decides what `leds`
+  resolves to on this host, which matters because the grant is chip-granular rather than per-line.
+
+  THE FILE STAYS PORTABLE, THE GRANT DOES NOT, and that is documented rather than left to be
+  discovered. `x-` is the spec's extension mechanism: Docker Compose v2 validates a file carrying
+  these keys and echoes them back unchanged, measured against 29.6.2, so one file runs on both
+  runtimes. It runs there WITHOUT the profile, and nothing says so, which is why
+  `docs/DOCKER-COMPAT.md` now says to keep anything a workload needs for correctness in the inline
+  fields both runtimes enforce.
+
+  A compose file NAMES a grant, it does not create one: letting the file create the profile would
+  hand the hardware decision back to whoever wrote the service, which is the thing this splits apart.
+
+- **`x-kern-security-profile: untrusted` in a compose file.** The opt-in hardening bundle (seccomp
+  allowlist, `--cap-drop ALL`, `--read-only`) under one name, and the only one of these keys that
+  needs no `kern.toml`. Compose has no way to say "this code is not trusted", and the three flags it
+  would take instead are easy to get half-right. Measured on a service carrying it: `touch` in the
+  rootfs answers `Read-only file system` and `CapEff` reads `0000000000000000`. The VALUE is not
+  validated in the compose crate: `kern box` owns that vocabulary and already refuses an unknown one
+  by name, and a second copy of the list is how the two come to disagree.
+
+- **An unrecognised key in the `x-kern-` namespace is named rather than ignored.** The spec says a
+  tool must ignore the extension fields it does not understand, and every other vendor's prefix still
+  is, but this one is kern's: `x-kern-vgpi` (a typo) and `x-kern-vgpu` (a kind this build does not
+  have) would otherwise do nothing and say nothing, which is the defect the whole mechanism exists to
+  avoid. The message lists what this build does read.
+
+  `vgpu` is deliberately ABSENT from the kind list rather than listed and dead: `classify` does not
+  know a `vgpu:` token here, so the CLI would answer `unexpected argument` on a token the compose
+  crate had happily built. `PROFILE_KINDS` is the one place that decides, read by both the token
+  builder and the YAML reader, so adding it later is one entry plus one field. A test asserts the
+  list's contents, so that stays a decision rather than something a future edit does by accident.
+
+### Fixed
+
+- **`kern compose <file> config` accepted a profile reference that `up` would refuse.** Introduced by
+  the keys above: `config` printed `profiles: vgpio:leds` and exited 0 while `up` failed with
+  `no [[vgpio]] profile named 'leds'`. This page's own rule is that a dry run which disagrees with
+  the bring-up is worse than no dry run, because it is the one people trust before committing a file.
+  `config` resolves through `apply_profile_list`, the function `kern box` itself calls, so the two
+  cannot drift into disagreeing about what resolves.
+
+- **A missing profile named the file but not the command.** The error pointed at `kern.toml` and the
+  docs; the person reading it is the operator who has to create the grant, so it now carries the
+  `kern config add <kind>:<name> …` line that does it.
+
+  Injection: verified - removing the resolve loop makes `config` accept a profile that does not
+  exist and turns `compose_config_refuses_a_profile_that_up_would_refuse` red. Its positive control
+  is that the same file passes once the profile IS declared, so a `config` that refused everything
+  could not satisfy it.
+
 ### Security
 
 - **Three helpers could hand `-1` to `kill`, which signals every process the user owns.** Found by

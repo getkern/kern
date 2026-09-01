@@ -819,11 +819,17 @@ fn resolve_vcpu_seen(
         return Err(format!("[[vcpu]] 'extends' cycle: {}", seen.join(" -> ")));
     }
     seen.push(name.to_string());
-    let e = cfg
-        .vcpu
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| format!("no [[vcpu]] profile named '{name}' in kern.toml"))?;
+    let e = cfg.vcpu.iter().find(|e| e.name == name).ok_or_else(|| {
+        // NAME THE COMMAND, not just the file. A compose file that references a profile through
+        // `x-kern-vcpu` is written by whoever wrote the service; the person reading this error
+        // is the operator who has to create the grant, and sending them to a document to find out
+        // how costs a round trip that one line removes. `config add` then lists the valid flags
+        // for the kind if the next attempt gets them wrong.
+        format!(
+            "no [[vcpu]] profile named '{name}' in kern.toml - create it with \
+                 `kern config add vcpu:{name} …`"
+        )
+    })?;
     // Same schema the forms/`config add` enforce, applied to a possibly hand-edited file so a bad
     // value fails HERE with a clear message rather than silently doing nothing.
     let ctx = |m: String| format!("[[vcpu]] '{name}': {m}");
@@ -885,11 +891,17 @@ pub struct ResolvedVgpio {
 /// `camera`/`audio`/…) are `/dev/*` paths, **canonicalized and re-checked to stay under `/dev/`** so
 /// a symlink can't redirect the bind outside `/dev`. Only paths that exist on this host are returned.
 pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, String> {
-    let e = cfg
-        .vgpio
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| format!("no [[vgpio]] profile named '{name}' in kern.toml"))?;
+    let e = cfg.vgpio.iter().find(|e| e.name == name).ok_or_else(|| {
+        // NAME THE COMMAND, not just the file. A compose file that references a profile through
+        // `x-kern-vgpio` is written by whoever wrote the service; the person reading this error
+        // is the operator who has to create the grant, and sending them to a document to find out
+        // how costs a round trip that one line removes. `config add` then lists the valid flags
+        // for the kind if the next attempt gets them wrong.
+        format!(
+            "no [[vgpio]] profile named '{name}' in kern.toml - create it with \
+                 `kern config add vgpio:{name} …`"
+        )
+    })?;
     // `backend` is MANDATORY (`gpio:<id>` or the reserved `host`): enforced here so an attached,
     // hand-edited profile with a missing/dangling backend fails loudly, not silently.
     let ctx = |m: String| format!("[[vgpio]] '{name}': {m}");
@@ -1365,11 +1377,17 @@ pub struct ResolvedVdisk {
 /// name) selects the physical disk pool the ext4 image is placed on; unknown/absent → a default is
 /// chosen at mount time.
 pub fn resolve_vdisk(cfg: &KernConfig, name: &str) -> Result<ResolvedVdisk, String> {
-    let e = cfg
-        .vdisk
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| format!("no [[vdisk]] profile named '{name}' in kern.toml"))?;
+    let e = cfg.vdisk.iter().find(|e| e.name == name).ok_or_else(|| {
+        // NAME THE COMMAND, not just the file. A compose file that references a profile through
+        // `x-kern-vdisk` is written by whoever wrote the service; the person reading this error
+        // is the operator who has to create the grant, and sending them to a document to find out
+        // how costs a round trip that one line removes. `config add` then lists the valid flags
+        // for the kind if the next attempt gets them wrong.
+        format!(
+            "no [[vdisk]] profile named '{name}' in kern.toml - create it with \
+                 `kern config add vdisk:{name} …`"
+        )
+    })?;
     validate_profile_name(&e.name).map_err(|m| format!("[[vdisk]] '{name}': {m}"))?;
     // `backend` is MANDATORY (`disk:<name>` or the reserved `ram` for a tmpfs): enforced here so an
     // attached, hand-edited profile with a missing/dangling backend fails loudly, not on RAM silently.

@@ -175,6 +175,79 @@ int main(int argc, char **argv) {
     return 0;
 }
 "#;
+/// `compose config` MUST REFUSE A PROFILE REFERENCE THAT `compose up` WOULD REFUSE.
+///
+/// `x-kern-vcpu`/`x-kern-vdisk`/`x-kern-vgpio` name a profile that lives in `kern.toml`, not in the
+/// compose file, so the file alone cannot say whether it resolves. When the keys were first read,
+/// `config` printed `profiles: vgpio:leds` and exited 0 while `up` failed with
+/// `no [[vgpio]] profile named 'leds'`. A dry run that disagrees with the bring-up is worse than no
+/// dry run, because it is the one people trust before committing a file.
+///
+/// NEEDS NO SANDBOX: `config` parses and resolves, it starts nothing, so this runs on a locked-down
+/// runner where the box tests skip.
+#[test]
+fn compose_config_refuses_a_profile_that_up_would_refuse() {
+    let dir = std::env::temp_dir().join(format!("kern-it-prof-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("kern")).expect("temp config dir");
+    let file = dir.join("stack.yml");
+    fs::write(
+        &file,
+        "services:\n  app:\n    image: alpine:latest\n    x-kern-vgpio: leds\n",
+    )
+    .expect("write compose file");
+
+    // An EMPTY kern.toml, so the reference cannot resolve. XDG_CONFIG_HOME points the loader here.
+    fs::write(dir.join("kern/kern.toml"), "").expect("write kern.toml");
+    let out = kern()
+        .env("XDG_CONFIG_HOME", &dir)
+        .args(["compose", file.to_str().unwrap_or_default(), "config"])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "config accepted a profile that does not exist: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        err
+    );
+    assert!(
+        err.contains("vgpio") && err.contains("leds"),
+        "the refusal must name the kind and the profile: {err}"
+    );
+    assert!(
+        err.contains("kern config add"),
+        "and it must name the command that creates it, not only the file: {err}"
+    );
+
+    // POSITIVE CONTROL: with the profile declared, the same file passes. Without this, a `config`
+    // that refused everything would satisfy the assertions above.
+    fs::write(
+        dir.join("kern/kern.toml"),
+        "[[gpio]]\nid = \"gpio:0\"\nchip = \"/dev/gpiochip0\"\n\n[[vgpio]]\nname = \"leds\"\nbackend = \"gpio:0\"\n",
+    )
+    .expect("write kern.toml");
+    let out = kern()
+        .env("XDG_CONFIG_HOME", &dir)
+        .args(["compose", file.to_str().unwrap_or_default(), "config"])
+        .output()
+        .expect("run kern");
+    let both = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "config refused a profile that IS declared: {both}"
+    );
+    assert!(
+        both.contains("vgpio:leds"),
+        "and it should report the profile it resolved: {both}"
+    );
+}
+
 /// A SIGKILL'D LAUNCHER MUST NOT LEAVE ITS HEALTH CHECKER PROBING FOREVER.
 ///
 /// The checker is a bare `fork` that loops on a timer. Every ordinary exit path stops it, but a

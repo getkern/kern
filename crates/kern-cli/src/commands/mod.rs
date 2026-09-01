@@ -4093,6 +4093,23 @@ fn run_terminal_verb(
                     bad.join("\n")
                 )));
             }
+            // `config` REFUSES WHAT `up` WOULD REFUSE, and resource profiles were the one thing it
+            // did not check. A file naming `x-kern-vgpio: leds` printed `profiles: vgpio:leds` and
+            // exited 0, and `up` then failed with `no [[vgpio]] profile named 'leds'`. A dry run that
+            // disagrees with the bring-up is worse than no dry run, because it is believed - the same
+            // rule this command already follows for ports, invalid images and port collisions.
+            //
+            // THE RUNTIME'S OWN RESOLVER, not a second copy of the rule: `apply_profile_list` is the
+            // function `kern box` calls, loading the same `kern.toml` through the same `--config`
+            // path, so the two cannot drift into disagreeing about what resolves.
+            for b in boxes.iter().filter(|b| selected(b)) {
+                let toks = b.profile_tokens();
+                if toks.is_empty() {
+                    continue;
+                }
+                let mut ap = AppliedProfiles::default();
+                apply_profile_list(&toks, b.config.as_deref(), &mut ap)?;
+            }
             println!("compose config: {} service(s) in {file}", boxes.len());
             // `config` reports the FILE, so it prints service names as written, not the
             // project-scoped box names the runtime uses.

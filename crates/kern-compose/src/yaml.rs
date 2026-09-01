@@ -20,7 +20,7 @@
 //! comments, double/single quotes. We REFUSE (with a clear error): tab indentation, block scalars
 //! (`|`/`>`), anchors/aliases, tags (`!!`), merge keys (`<<`), and 2nd+ documents (`---`).
 
-use super::{BuildDirective, ComposeBox};
+use super::{BuildDirective, ComposeBox, PROFILE_KINDS};
 
 /// Max indentation depth we track - a compose service tree is 3-4 deep; anything past this is refused
 /// rather than parsed, bounding work and stack (we're iterative, but this caps pathological input).
@@ -2123,7 +2123,58 @@ fn service_to_box(
                 "service '{name}': 'depends_completed:' is kern's TOML spelling - in a docker-compose.yml \
                  use `depends_on: {{ SERVICE: {{ condition: service_completed_successfully }} }}`"
             )),
-            // Service-level extension field: defined by the spec, ignored on purpose, silently.
+            // THREE EXTENSION FIELDS ARE READ, and the rest of the namespace is not.
+            //
+            // `x-` is the Compose Specification's own extension mechanism: a tool must ignore the
+            // keys it does not understand, and Docker Compose v2 validates a file carrying these and
+            // echoes them back unchanged (measured against 29.6.2), so one file still runs on both
+            // runtimes. That is what makes reading them additive rather than a dialect.
+            //
+            // WHAT THEY BUY, checked field by field. A `vcpu` profile carries `numa`, `nice`,
+            // `backend` and `extends`; a `vdisk` carries `size`, `persistent`, `backend`, `iops` and
+            // `bandwidth`; a `vgpio` carries nineteen device classes. Compose expresses `cpus`,
+            // `cpuset` and `mem_limit`, and nothing else on those lists.
+            //
+            // `vgpio` is the one with no equivalent anywhere: today a compose file reaches GPIO by
+            // writing `devices: /dev/gpiochip0`, so the SERVICE FILE decides which hardware it may
+            // touch. Here the service declares intent and `kern.toml` holds the grant, so the
+            // operator decides what "leds" resolves to on this host - which matters precisely
+            // because the grant is chip-granular rather than per-line.
+            //
+            // ALL THREE, NOT THE ONE WITH THE BEST STORY: a surface that reads one key and silently
+            // drops its two obvious siblings teaches a pattern that then does nothing, which is the
+            // same defect as a flag accepted and ignored.
+            //
+            // The value is pushed raw; `profile_tokens` adds the `kind:` prefix unless it is already
+            // there, so `leds` and `vgpio:leds` name the same profile exactly as they do in the TOML
+            // spelling. `x-kern-vgpu` is deliberately absent: there is no `vgpu` profile kind.
+            "x-kern-vcpu" => push_profile(&mut b.vcpu, node),
+            "x-kern-vdisk" => push_profile(&mut b.vdisk, node),
+            "x-kern-vgpio" => push_profile(&mut b.vgpio, node),
+            // `--security-profile <untrusted>`: the opt-in bundle (seccomp allowlist + `--cap-drop
+            // ALL` + `--read-only`). Compose has no way to say "this code is not trusted", and the
+            // three flags it would take instead are easy to get half-right. The VALUE is not checked
+            // here: `kern box` owns that vocabulary and already refuses an unknown one by name, and a
+            // second copy of the list in this crate is how the two come to disagree.
+            "x-kern-security-profile" => {
+                b.security_profile = node.scalar.as_deref().map(scalar_str)
+            }
+            // AN UNRECOGNISED KEY IN OUR OWN NAMESPACE IS NAMED, not silently dropped. The spec says
+            // a tool must ignore the `x-` fields it does not understand, and every other vendor's
+            // prefix is left alone below - but `x-kern-` is ours, so silence here would mean a typo
+            // (`x-kern-vgpi`) or a key from a build that has it (`x-kern-vgpu`) does nothing at all
+            // and says nothing at all, which is the defect this whole mechanism exists to avoid.
+            other if other.starts_with("x-kern-") => warn(&format!(
+                "service '{name}': '{other}:' is not read by this build - kern reads {}, and \
+                 x-kern-security-profile",
+                PROFILE_KINDS
+                    .iter()
+                    .map(|k| format!("x-kern-{k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            // Every other vendor's service-level extension field: defined by the spec, ignored on
+            // purpose, silently.
             other if other.starts_with("x-") => {}
             other => warn(&format!(
                 "service '{name}': '{other}:' ignored (unsupported)"
@@ -3115,6 +3166,19 @@ fn container_only_port_note(port: u16) -> String {
     )
 }
 
+/// Record a `x-kern-<kind>` profile reference, ignoring an empty or non-scalar value.
+///
+/// A list or a mapping under one of these keys is not a profile name, and a blank string names
+/// nothing: both are dropped rather than turned into a token that would then fail to resolve
+/// against `kern.toml` with a confusing message about a profile nobody wrote.
+fn push_profile(into: &mut Vec<String>, node: &Node) {
+    if let Some(v) = node.scalar.as_deref().map(scalar_str) {
+        if !v.trim().is_empty() {
+            into.push(v);
+        }
+    }
+}
+
 fn warn_once(msg: &str) {
     use std::cell::RefCell;
     use std::collections::HashSet;
@@ -3173,6 +3237,85 @@ mod tests {
         assert!(container_only_port_note(8000).contains("`8000`"));
         // The two are different sentences, which is the property the old literal could not have.
         assert_ne!(container_only_port_note(1), container_only_port_note(2));
+    }
+
+    /// A SERVICE MAY NAME A RESOURCE PROFILE THROUGH THE SPEC'S OWN EXTENSION FIELD.
+    ///
+    /// `x-kern-vcpu`, `x-kern-vdisk` and `x-kern-vgpio` resolve to the `vcpu:`/`vdisk:`/`vgpio:`
+    /// tokens `kern box` already takes positionally, so the whole chain downstream - normalisation,
+    /// argv, `kern.toml` lookup, `--config` - is the one the TOML spelling has always used.
+    ///
+    /// WHAT COMPOSE CANNOT SAY, which is the reason to read these at all and was checked field by
+    /// field rather than assumed. A `vcpu` profile carries `numa`, `nice`, `backend` and `extends`; a
+    /// `vdisk` carries `size`, `persistent`, `backend`, `iops` and `bandwidth`; a `vgpio` carries
+    /// nineteen device classes. Compose expresses `cpus`, `cpuset` and `mem_limit`, and nothing else
+    /// on that list. An earlier draft of this test asserted that only `vgpio` was read, on the
+    /// grounds that `cpus`/`cpuset` were already honoured inline - that was two fields out of seven,
+    /// and reading the other five is the difference between repetition and capability.
+    ///
+    /// ALL THREE OR NONE, and that is a correctness argument rather than tidiness: a surface that
+    /// reads one key and silently drops its two obvious siblings teaches the reader a pattern that
+    /// then does nothing, which is the same defect as a flag that is accepted and ignored.
+    ///
+    /// `x-` IS THE SPEC'S EXTENSION MECHANISM, not a private dialect: Docker Compose v2 validates a
+    /// file carrying these keys and echoes them back unchanged, measured against 29.6.2, so one file
+    /// still runs on both runtimes.
+    #[test]
+    fn a_service_names_a_resource_profile_through_the_extension_field() {
+        for (key, want) in [
+            ("x-kern-vcpu", "vcpu:ml"),
+            ("x-kern-vdisk", "vdisk:scratch"),
+            ("x-kern-vgpio", "vgpio:leds"),
+        ] {
+            let name = want.split_once(':').map(|(_, n)| n).unwrap_or_default();
+            let y = format!("services:\n  app:\n    image: alpine\n    {key}: {name}\n");
+            assert_eq!(
+                boxes(&y)[0].profile_tokens(),
+                vec![want.to_string()],
+                "{key} must reach the positional profile token `kern box` already understands"
+            );
+
+            // A value that already carries its prefix means the same profile, which is the rule
+            // `profile_tokens` documents for the TOML spelling; the YAML door must not differ.
+            let y = format!("services:\n  app:\n    image: alpine\n    {key}: {want}\n");
+            assert_eq!(boxes(&y)[0].profile_tokens(), vec![want.to_string()]);
+        }
+
+        // All three together, in the order the tokens are emitted rather than the order they appear.
+        let b = &boxes(
+            "services:\n  app:\n    image: alpine\n    x-kern-vgpio: leds\n    x-kern-vcpu: ml\n    x-kern-vdisk: scratch\n",
+        )[0];
+        assert_eq!(
+            b.profile_tokens(),
+            vec!["vcpu:ml", "vdisk:scratch", "vgpio:leds"]
+        );
+        // Reading a new key may not cost the rest of the service.
+        assert_eq!(b.image.as_deref(), Some("alpine"));
+
+        // NEGATIVE CONTROL: every OTHER extension field stays out of the profile list, so this is a
+        // decision about three keys and not a door opened to the whole `x-` namespace.
+        for key in ["x-kern-note", "x-kern-vgpu", "x-anything", "x-kern"] {
+            let y = format!("services:\n  app:\n    image: alpine\n    {key}: v\n");
+            assert!(
+                boxes(&y)[0].profile_tokens().is_empty(),
+                "{key} must not become a profile token"
+            );
+        }
+
+        // `--security-profile` comes through as itself, not as a profile token: it is a bundle of
+        // flags, not a `kern.toml` entry, so it must not end up in the positional list.
+        let b = &boxes(
+            "services:\n  app:\n    image: alpine\n    x-kern-security-profile: untrusted\n",
+        )[0];
+        assert_eq!(b.security_profile.as_deref(), Some("untrusted"));
+        assert!(b.profile_tokens().is_empty());
+
+        // THE KIND LIST IS THE ONE PLACE. `vgpu` is deliberately absent from it, because
+        // `classify` does not know a `vgpu:` token in this build and the CLI would answer
+        // `unexpected argument` on a token this crate had happily built. When it lands, it is one
+        // entry here and one field - and this assertion is what makes that a decision rather than
+        // something a future edit does by accident.
+        assert_eq!(PROFILE_KINDS, ["vcpu", "vdisk", "vgpio"]);
     }
 
     fn boxes(y: &str) -> Vec<ComposeBox> {
