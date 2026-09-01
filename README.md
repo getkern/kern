@@ -115,35 +115,28 @@ threat model): [docs/FAQ.md](docs/FAQ.md).
 ## Quickstart
 
 ```sh
-kern box dev --image alpine -it -- sh              # a throwaway shell in a real OCI image
+kern box dev --image alpine -it -- sh       # a shell in a real OCI image
+kern box svc --image nginx:alpine -d -p 8080:80    # a service, published
 kern run --memory 256M --cpus 0.5 -- ./crunch      # cap a process, no sandbox
-kern box svc --image nginx:alpine -d -p 8080:80 \  # a service: published, restarted, health-checked
-  --restart --health-cmd 'wget -qO- localhost:80' -- nginx -g 'daemon off;'
-kern ps                                            # what is running, with PORTS and HEALTH
-kern exec svc -it -- sh                            # shell into it
-kern stop svc                                      # its signal, its grace, then the code it exited with
-kern top                                           # live TUI: boxes, CPU/RAM, profiles, volumes
-kern compose stack.toml up                         # a multi-box stack (examples/) or a compose.yml
-kern compose stack.toml down                       # and take it down again
+kern ps                                     # what runs, with PORTS and HEALTH
+kern top                                    # live TUI: boxes, profiles, volumes
+kern compose stack.toml up                  # a whole stack, one command
 ```
 
-Untrusted code, one flag for the bundle:
+Untrusted code, one flag:
 
 ```sh
-kern box job --image python:3.12-slim --security-profile untrusted --memory 256m \
-  -v ./job:/w -- python3 /w/x.py
+kern box job --image python:3.12-slim --security-profile untrusted -- python3 /w/x.py
 ```
 
-`--security-profile untrusted` is the seccomp **allowlist** + `--cap-drop ALL` + `--read-only` in one
-opt-in flag (spell them out by hand if you prefer); add `--require-limits` to refuse to start unless the
-memory/pids caps are actually enforced. No network unless you ask, dangerous capabilities dropped,
-seccomp always on. Ninety runnable examples, each doing one thing: [examples/](examples/).
+`--security-profile untrusted` is the seccomp **allowlist** + `--cap-drop ALL` + `--read-only`
+in one flag. No network unless you ask, and seccomp is on either way. Ninety runnable
+examples, each doing one thing: [examples/](examples/).
 
 Every read verb also answers in JSON, so nothing has to parse a table:
 
 ```sh
 kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
-kern volume ls --json          # ps · images · stats · inspect · builds · pod ls · config list · diff
 ```
 
 ## Stacks
@@ -336,11 +329,11 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done, and the CLI is frozen since v0.7.0.** 970 Rust, 340 Python and 61 Node tests,
-clippy-clean and `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino
-UNO Q. Verbs, flags and `--json` shapes change incompatibly only on a minor bump, one release after
-a deprecation entry, and `cli_surface_is_frozen` holds the build to it. Config-file keys can still
-evolve: [CHANGELOG.md](CHANGELOG.md).
+**The core is done, and the CLI is frozen.** 970 Rust, 340 Python and 61 Node tests, clippy-clean
+and `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q. Verbs,
+flags and `--json` shapes change incompatibly only after a deprecation entry a release earlier, and
+`cli_surface_is_frozen` holds the build to it. Config-file keys can still evolve:
+[CHANGELOG.md](CHANGELOG.md).
 
 ## What kern is not
 

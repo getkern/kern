@@ -558,6 +558,7 @@ fn a_recycled_pid_does_not_let_exec_into_a_strangers_namespaces() {
     }
     let kern_bin = env!("CARGO_BIN_EXE_kern");
     let script = r#"
+echo STARTED
 export XDG_RUNTIME_DIR=$2; mkdir -p $XDG_RUNTIME_DIR/kern/instances
 sleep 300 & INIT=$!
 ST=$(awk '{print $22}' /proc/$INIT/stat)
@@ -599,6 +600,21 @@ echo RECYCLED
     );
     let _ = fs::remove_dir_all(&xdg);
 
+    // THE SCAFFOLDING MAY BE REFUSED BEFORE IT RUNS, and that is not this test failing. `unshare -Ur`
+    // writes /proc/self/uid_map, and a GitHub runner's AppArmor profile denies that write while
+    // `userns_plausible()` above still reports the namespaces available: the guard measures whether a
+    // user namespace can be CREATED, and this is a different refusal one step later. MEASURED on the
+    // hosted x86 and aarch64 runners: "unshare: write failed /proc/self/uid_map: Operation not
+    // permitted". `STARTED` is the discriminant, and it is the first line of the script for that
+    // reason: without it the scaffolding never entered, so there is nothing to conclude either way,
+    // and with it any later silence is the product's and gets asserted on below.
+    if !text.contains("STARTED") {
+        eprintln!(
+            "skip: the user namespace scaffolding was refused before it ran: {}",
+            text.trim()
+        );
+        return;
+    }
     for reason in ["SKIP_NS_LAST_PID", "SKIP_NO_RECYCLE", "SKIP_SAME_TICK"] {
         if text.contains(reason) {
             eprintln!("skip: {reason}");
