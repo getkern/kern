@@ -363,7 +363,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 943 Rust, 340 Python and 61 Node tests,
+**The core is done. Everything above works today:** 944 Rust, 340 Python and 61 Node tests,
 clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
 Arduino UNO Q. **v0.7.0 is the first published release, and the CLI is stable from it**: verbs,
 flags and `--json` shapes change incompatibly only on a minor bump, after a deprecation entry at

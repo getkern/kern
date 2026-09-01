@@ -30,7 +30,14 @@ would be looking for.
   that the service can still write them.
 - **An image `USER` the image cannot resolve now refuses to start the box.** It used to run the
   workload as box root after a note on stderr, so a box that STARTED now exits 1. Pass
-  `--user <uid[:gid]>` to choose one, or `--user 0` for the old behaviour, made explicit.
+  `--user <uid[:gid]>` to choose one, or `--user 0` to run as box root on purpose.
+
+  `--user 0` is NOT byte-identical to the old fallback, and the difference is stated rather than
+  glossed: measured on the same image, the old path gave
+  `uid=0 gid=0 groups=65534(nobody) x12, 0(root)` and `--user 0` gives `uid=0 gid=0` with no
+  supplementary groups. Those inherited groups are all the overflow gid inside the box and grant
+  nothing, so no permission depends on them, but "the old behaviour" would have been the wrong word
+  for it.
 - **An image reference the OCI grammar cannot hold is refused where you type it.**
   `kern build -t Foo-BAR:latest` and `kern pull Foo-BAR:latest` used to be accepted and to fail
   later, at push time or against a registry. Lowercase the reference; the error prints the exact
@@ -180,6 +187,21 @@ shape, and it is stated rather than left to be noticed.
   no longer reads as good news one row under the warning that caps do not bind.
 
 ### Fixed
+
+- **`kern <typo> --help` printed the whole reference and exited 0.** `kern frobnicate` on its own
+  had always answered `unknown command`; asking for help about it was the one spelling that hid the
+  mistake, and a reader could not tell a typo from a real verb with no section of its own.
+
+  "Found no lines in the reference" could not be the test, and that was measured rather than
+  assumed: `install` and `docker` also fall through to the full page, and neither is a verb
+  (`kern install` and `kern docker` each answer `unknown command`; the docker shim is argv0 only).
+  The parser is its own oracle now, so there is no second list of verbs to keep in step: the bare
+  verb is parsed and only `UnknownCommand` is treated as a spelling problem. A verb that needs
+  arguments, or a compose file that is not in this directory, still gets help.
+
+  Injection: verified - removing the check turns the test red with
+  `Ok((GlobalOpts, HelpFor("frobnicate")))`. Non-regression measured across all 48 verbs the
+  reference lists plus the eight real ones outside it: none lost its help.
 
 - **A `kern config add` that failed had already changed your config file.** The physical block a
   profile needs is materialised BEFORE the profile is validated, so a refusal landed after the

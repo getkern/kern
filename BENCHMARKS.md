@@ -440,7 +440,7 @@ kern box mem --image alpine --memory 512M -- sh -c 'tr -dc 0 </dev/zero | head -
 The cold-start, throughput and concurrency tables all come from one self-contained script. It warms
 each runtime once, then reports latency as **total divided by N** over N sequential runs (at sub-ms
 scale a per-call timer's own fork/exec would dominate), throughput as `1000 / ms`, and concurrency as
-the wall-clock to fan out `--conc` starts at once. Under the hood:
+the wall-clock to fan out `benchmark.py --conc N` starts at once (that flag is the script's, not `kern bench`'s). Under the hood:
 
 ```sh
 kern box b --rootfs $ROOTFS -- /bin/busybox true         # KERN_NO_SCOPE=1 = no cgroup scope

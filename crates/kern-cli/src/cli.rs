@@ -611,13 +611,26 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             // everything was the same answer `kern pod --help` and four others gave, and the reader
             // then has to find their verb in it. `help_for` falls back to the full page when the
             // verb has no lines of its own, so nothing becomes less discoverable than it was.
-            return Ok((
-                opts,
-                match rest.first().copied() {
-                    Some(v) if !v.starts_with('-') => Command::HelpFor(v.to_string()),
-                    _ => Command::Help,
-                },
-            ));
+            //
+            // BUT A VERB THAT DOES NOT EXIST IS STILL AN ERROR. `kern frobnicate --help` used to
+            // print that same full page and exit 0, so a typo was indistinguishable from a real
+            // verb with no section of its own, and `install` and `docker` are two such verbs, which
+            // is why "found no lines" cannot be the test. `kern frobnicate` without `--help` has
+            // always said `unknown command`; asking for help about it should not be the one spelling
+            // that hides the typo.
+            //
+            // THE PARSER IS ITS OWN ORACLE: parse the bare verb and look only for `UnknownCommand`.
+            // A list of known verbs kept next to this line would be a second copy of the match below,
+            // and copies drift. Any other parse error (a verb that needs arguments, a compose file
+            // that is not in this directory) is not a spelling problem, so help is still the answer.
+            // The recursion terminates because the argument vector it builds carries no `--help`.
+            if let Some(v) = rest.first().copied().filter(|v| !v.starts_with('-')) {
+                if let Err(Error::UnknownCommand(_)) = parse(&[v.to_string()]) {
+                    return Err(Error::UnknownCommand(v.to_string()));
+                }
+                return Ok((opts, Command::HelpFor(v.to_string())));
+            }
+            return Ok((opts, Command::Help));
         }
     }
     let cmd = match rest.first().copied() {
@@ -3152,6 +3165,49 @@ mod tests {
     /// to authenticate because of a spelling mistake, and the image they named never appears in any
     /// message. `push` had the same shape through its `filter(|a| !a.starts_with('-'))`.
     ///
+    /// ASKING FOR HELP ABOUT A VERB THAT DOES NOT EXIST IS STILL AN ERROR.
+    ///
+    /// `kern frobnicate --help` printed the whole 180-line reference and exited 0, so a typo was
+    /// indistinguishable from a real verb that has no section of its own, while `kern frobnicate`
+    /// on its own had always said `unknown command`. Asking for help was the one spelling that hid
+    /// the mistake.
+    ///
+    /// "found no lines in the reference" cannot be the test, and that is measured, not assumed:
+    /// `install` and `docker` also fall through to the full page, and both are genuinely NOT verbs
+    /// (`kern install` and `kern docker` each answer `unknown command`; the docker shim is argv0
+    /// only). The parser is its own oracle instead, so there is no second list of verbs to drift.
+    #[test]
+    fn help_for_a_verb_that_does_not_exist_is_an_error_not_the_whole_reference() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+        for typo in ["frobnicate", "bx", "puul", "install", "docker"] {
+            match p(&[typo, "--help"]) {
+                Err(Error::UnknownCommand(v)) => {
+                    assert_eq!(v, typo, "the error must name the typo")
+                }
+                other => panic!("`kern {typo} --help` must be an unknown command: {other:?}"),
+            }
+        }
+
+        // POSITIVE CONTROLS, and the second one is the one that matters: `wait` has no section of
+        // its own in the reference, so a fix that keyed on "no lines found" would have broken it.
+        assert_eq!(
+            p(&["box", "--help"]).unwrap().1,
+            Command::HelpFor("box".to_string())
+        );
+        assert_eq!(
+            p(&["wait", "--help"]).unwrap().1,
+            Command::HelpFor("wait".to_string())
+        );
+        // A verb that needs arguments is not a spelling problem: help is still the answer.
+        assert_eq!(
+            p(&["exec", "--help"]).unwrap().1,
+            Command::HelpFor("exec".to_string())
+        );
+        // And a bare `--help` is still the whole reference.
+        assert_eq!(p(&["--help"]).unwrap().1, Command::Help);
+    }
+
     /// A REFERENCE NO REGISTRY WILL ACCEPT IS REFUSED WHERE THE USER TYPED IT.
     ///
     /// `kern build -t Foo-BAR:latest` used to succeed and put that name in the local cache, so the
