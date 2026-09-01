@@ -10,7 +10,7 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-<sub>3.5 ms is one machine and one workload, not a guarantee: [how it was measured](BENCHMARKS.md)</sub>
+<sub>3.5 ms is one machine and one workload: [how it was measured](BENCHMARKS.md)</sub>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
@@ -280,6 +280,9 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 
 ## kern vs Docker vs Podman
 
+All three columns measured on one host, same workload, same day: an Intel i7-14700KF running Linux
+7.0.0, with the method in [BENCHMARKS.md](BENCHMARKS.md).
+
 | | kern | Docker | Podman |
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
@@ -290,7 +293,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one static binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
-| `docker-compose.yml` | yes, read as-is (one port per service across the stack, or `--no-pod`) | yes | partial |
+| `docker-compose.yml` | yes, read as-is ([one caveat](#stacks)) | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
 | GPU | on the roadmap | yes | yes |
 
@@ -339,7 +342,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | [docs/INSTALL.md](docs/INSTALL.md) | install on Linux, WSL2 and ARM boards, from source |
 | [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) | what of Docker works, what does not, and where it differs |
 | [docs/RESOURCES.md](docs/RESOURCES.md) · [docs/CONFIG.md](docs/CONFIG.md) · [docs/STORAGE.md](docs/STORAGE.md) · [docs/EGRESS.md](docs/EGRESS.md) | the two-verb model, the `kern.toml` schema, volumes and egress |
-| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [OPEN_ITEMS.md](OPEN_ITEMS.md) | the threat model (structured, then per-mechanism), and the known gaps |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) · [OPEN_ITEMS.md](OPEN_ITEMS.md) | the threat model (structured, then per-mechanism), why a userspace VRAM cap is not a boundary, and the known gaps |
 | [BENCHMARKS.md](BENCHMARKS.md) · [EDGE.md](EDGE.md) | measurements, and running on a Pi, Jetson or UNO Q |
 | [examples/](examples/) · [blog/](blog/) | 88 runnable scripts, and longer write-ups |
 | [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the `kern-sandbox` SDK: embed kern in Python or Node |

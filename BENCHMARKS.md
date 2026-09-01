@@ -390,6 +390,16 @@ flattering: most of those 48.5 ms are nginx's own shutdown, identical on all thr
 | `parent:name-check` | 27 us |
 | `volumes` | 2 us |
 
+The `seccomp` line is the deny-by-default ALLOWLIST, which is the shipped default, and it is only
+marginally more expensive than the wider denylist it replaced. It first cost ~0.2 ms more, back when
+it compiled one comparison per allowed number; a range-merge (a binary search over the ALLOW set's
+contiguous runs rather than its individual numbers) cut the program from ~1273 instructions to
+**178** on x86_64, against the denylist's **86**. The install phase went from ~385 us to the 185 us
+above, of which the allowlist is about **20 us more** than the denylist: below run-to-run noise. The
+per-syscall cost is a log2 search over 27 runs, and the compiled program is cached per
+`(mode, allow_nesting)`, so it is built once per process rather than once per box.
+`KERN_SECCOMP=denylist` restores the marginally cheaper filter and the weaker posture.
+
 The largest item is the pivot and the `/proc` mount, and the two hardening phases that follow it,
 `seccomp` and `proc-mask`, cost 358 us together. That is the price of the boundary, listed rather
 than folded into a total so it can be argued with. `unshare(CLONE_NEWNET)` on its own costs **430
@@ -403,7 +413,7 @@ each other.
 
 | | |
 |---|---:|
-| **kern** binary | **1.91 MB** x86_64, **1.67 MB** aarch64 from a plain `cargo build --release` (the size-optimized release build is **1.52 MB / 1.25 MB**), static and stripped, one Rust dependency (`libc`); OCI pull shells out to the system `curl`/`tar` |
+| **kern** binary | **1563480 B** x86_64 and **1313104 B** aarch64, read off the published v0.8.0 tarballs on 2026-09-01 (754538 and 718386 B compressed). A plain `cargo build --release` on this desktop is 1983608 B x86_64; the size-optimized release build is a different toolchain, not a different program. static and stripped, one Rust dependency (`libc`); OCI pull shells out to the system `curl`/`tar` |
 | kern resident memory at rest | **0**: no daemon |
 | kern memory per box, marginal | **0.35 MB** PSS, at 50 live boxes |
 | kern memory per box, one box alone | 1.65 MB PSS / 4.6 MB RSS |
