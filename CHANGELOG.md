@@ -11,9 +11,10 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
-## Unreleased
+## v0.8.5 - 2026-09-01
 
 ### Added
+
 
 - **A `docker-compose.yml` can name a `kern.toml` resource profile**, through the Compose
   Specification's own extension fields: `x-kern-vcpu`, `x-kern-vdisk`, `x-kern-vgpio`. They resolve
@@ -66,6 +67,7 @@ is in the git history.
 
 ### Changed
 
+
 - **The block-scalar chomping indicator now decides something, and that changes existing files.**
   `|`, `|-` and `|+` all produced the same value: every trailing blank line was dropped and nothing
   was added back. MEASURED on an `environment` value of `ab` delivered into a running box, all three
@@ -78,7 +80,18 @@ is in the git history.
   suite, 2 encoded the old behaviour and now encode YAML's. A stack whose `command` or `environment`
   ends in a block scalar is where an operator would notice.
 
+- **A compose file that names a `vgpio` profile is now refused unless the person running it says so
+  on the command line** (`--allow-device-grants`). Every other profile kind NARROWS: the file names a
+  want, `kern.toml` holds the grant, and the local grant is a ceiling, so "the local one wins" is
+  conservative by construction. A `vgpio` profile does not narrow, because its resolution is a DEVICE
+  rather than a bound and device nodes have no ordering: `/dev/gpiochip0` is not a smaller
+  `/dev/gpiochip1`, and one host's `leds` may be an LED where another's is a relay board. The refusal
+  names the exact paths. The gate is on the property (did this resolve to a device?) and not on a list
+  of kinds, so a future kind resolving to hardware inherits it; the acknowledgement is a command-line
+  flag, where a downloaded file cannot reach.
+
 ### Fixed
+
 
 - **`kern top`'s output muting stole the stdout of the whole process, not of its own work.** The
   helper that runs a lifecycle key with fd 1 and fd 2 pointed at `/dev/null` - so a reused CLI
@@ -136,16 +149,6 @@ is in the git history.
   `exec` inside the workload's namespace and resolves the cgroup through the wrong pid. The rule is
   now the init exactly ONE level below the resolving process - relative, never a constant, because
   inside a container kern is itself nested and a fixed depth would pass here and fail on a CI runner.
-
-- **A compose file that names a `vgpio` profile is now refused unless the person running it says so
-  on the command line** (`--allow-device-grants`). Every other profile kind NARROWS: the file names a
-  want, `kern.toml` holds the grant, and the local grant is a ceiling, so "the local one wins" is
-  conservative by construction. A `vgpio` profile does not narrow, because its resolution is a DEVICE
-  rather than a bound and device nodes have no ordering: `/dev/gpiochip0` is not a smaller
-  `/dev/gpiochip1`, and one host's `leds` may be an LED where another's is a relay board. The refusal
-  names the exact paths. The gate is on the property (did this resolve to a device?) and not on a list
-  of kinds, so a future kind resolving to hardware inherits it; the acknowledgement is a command-line
-  flag, where a downloaded file cannot reach.
 
 - **`kern compose <file> config` reports what each profile name resolved to on THIS host.** A file
   names a grant and does not carry one, so two machines can read one file completely differently:
@@ -253,49 +256,6 @@ is in the git history.
   is that the same file passes once the profile IS declared, so a `config` that refused everything
   could not satisfy it.
 
-### Security
-
-- **A pid that cannot be a process read as a live one.** The fail-open face of the entry below.
-  `kill(0, 0)` probes the caller's own process group and `kill(-1, 0)` probes every process the user
-  owns, so both succeed and a liveness probe answers yes; in `registry::is_alive` the start-time
-  comparison did not rescue it either, because `/proc/0/stat` is unreadable, `proc_starttime` answers
-  0, and the arm that exists so an unreadable start time is not a mismatch then returned true.
-  MEASURED before the fix: `is_alive(0, x)` was true, so a registry entry holding 0 named a box that
-  read as running, kept its name claimed and counted against the fleet cap. Fixed in the three places
-  that probe a recorded pid: the box registry, the pod holder and the pod marker. Found by auditing
-  every `kill` call site before tagging, after the entry below fixed the signalling direction.
-
-- **Three helpers could hand `-1` to `kill`, which signals every process the user owns.** Found by
-  auditing the change below rather than by a report, and it is older than that change.
-
-  `fork_detached` decided with `child != 0`, so a FAILED fork (-1) came back as `Some(-1)`; the
-  `--timeout` watchdog it builds then reached `libc::kill(tp, SIGKILL)`. `spawn_health_checker`
-  returned a bare pid with the same shape, and its teardown reached `kill(hp, SIGTERM)`.
-  `kill(-1, sig)` is not a no-op and not an error: POSIX sends the signal to every process the caller
-  has permission to signal, which for a normal user is their whole session. The trigger is precisely
-  a failed fork, that is `EAGAIN` under `RLIMIT_NPROC` or memory pressure - a host already running
-  many boxes, not an idle one.
-
-  `Option` could not express the fork-failure state, because `None` already meant "you are the
-  child": reporting failure that way would have made the PARENT run the watchdog body and never
-  return. The three states are now a `Forked` enum, the two spawners return `Option<i32>`, and every
-  helper signal goes through one `signal_helper` that refuses a non-positive pid.
-
-- **`signal_box` could send the stop signal, then `SIGKILL`, to the caller's own process group.** A
-  box is registered with `pid1: 0` and re-registered once its init exists. In that window the
-  recorded value is 0, `pidfd_open` on it fails so the plain-`kill` fallback is taken, and
-  `init_catches_signal` returns `true` for `pid1 <= 0`, so the graceful arm is ENTERED rather than
-  skipped. `kill(0, sig)` means the caller's process group, so a `kern stop` landing there would have
-  signalled the stopper's own shell. The fallback now requires `pid1 > 0`.
-
-  Injection: verified. Both guards are asserted from a child in its OWN process group (`setsid`
-  first), because the failure being tested is "kills my whole group" and running it in the test
-  process would take the harness down with it. Removing either guard turns its own test red; the
-  positive control is that `signal_helper` still delivers to a live pid, so a version that always
-  refuses cannot pass.
-
-### Fixed
-
 - **A foreground box took `--health-cmd` and never evaluated it.** The checker was armed in exactly
   one place, the detached launch path, so a box started without `-d` accepted the flag, exited 0, and
   left `kern ps` showing an empty HEALTH column. No warning, no error.
@@ -337,6 +297,48 @@ is in the git history.
   process behind and turns `a_killed_foreground_launcher_takes_its_health_checker_with_it` red. Each
   test carries the detached case as its positive control, in the same run, so neither can pass by
   measuring nothing.
+
+### Security
+
+
+- **A pid that cannot be a process read as a live one.** The fail-open face of the entry below.
+  `kill(0, 0)` probes the caller's own process group and `kill(-1, 0)` probes every process the user
+  owns, so both succeed and a liveness probe answers yes; in `registry::is_alive` the start-time
+  comparison did not rescue it either, because `/proc/0/stat` is unreadable, `proc_starttime` answers
+  0, and the arm that exists so an unreadable start time is not a mismatch then returned true.
+  MEASURED before the fix: `is_alive(0, x)` was true, so a registry entry holding 0 named a box that
+  read as running, kept its name claimed and counted against the fleet cap. Fixed in the three places
+  that probe a recorded pid: the box registry, the pod holder and the pod marker. Found by auditing
+  every `kill` call site before tagging, after the entry below fixed the signalling direction.
+
+- **Three helpers could hand `-1` to `kill`, which signals every process the user owns.** Found by
+  auditing the change below rather than by a report, and it is older than that change.
+
+  `fork_detached` decided with `child != 0`, so a FAILED fork (-1) came back as `Some(-1)`; the
+  `--timeout` watchdog it builds then reached `libc::kill(tp, SIGKILL)`. `spawn_health_checker`
+  returned a bare pid with the same shape, and its teardown reached `kill(hp, SIGTERM)`.
+  `kill(-1, sig)` is not a no-op and not an error: POSIX sends the signal to every process the caller
+  has permission to signal, which for a normal user is their whole session. The trigger is precisely
+  a failed fork, that is `EAGAIN` under `RLIMIT_NPROC` or memory pressure - a host already running
+  many boxes, not an idle one.
+
+  `Option` could not express the fork-failure state, because `None` already meant "you are the
+  child": reporting failure that way would have made the PARENT run the watchdog body and never
+  return. The three states are now a `Forked` enum, the two spawners return `Option<i32>`, and every
+  helper signal goes through one `signal_helper` that refuses a non-positive pid.
+
+- **`signal_box` could send the stop signal, then `SIGKILL`, to the caller's own process group.** A
+  box is registered with `pid1: 0` and re-registered once its init exists. In that window the
+  recorded value is 0, `pidfd_open` on it fails so the plain-`kill` fallback is taken, and
+  `init_catches_signal` returns `true` for `pid1 <= 0`, so the graceful arm is ENTERED rather than
+  skipped. `kill(0, sig)` means the caller's process group, so a `kern stop` landing there would have
+  signalled the stopper's own shell. The fallback now requires `pid1 > 0`.
+
+  Injection: verified. Both guards are asserted from a child in its OWN process group (`setsid`
+  first), because the failure being tested is "kills my whole group" and running it in the test
+  process would take the harness down with it. Removing either guard turns its own test red; the
+  positive control is that `signal_helper` still delivers to a live pid, so a version that always
+  refuses cannot pass.
 
 ## v0.8.0 - 2026-08-31
 
