@@ -43,7 +43,7 @@ can reach: two NVIDIA hosts, a Raspberry Pi 5 and a Jetson Orin Nano, none of wh
 SR-IOV partition in sysfs. It is a cooperative
 quota: real and useful for density, fairness, accidental overcommit and accounting across trusted and
 semi-trusted tenants, and **not a boundary against malicious code**. The words *isolation*, *secure*
-and *hard* are refused for it, mechanically, in [`crates/kern-cli/src/gpu.rs`](crates/kern-cli/src/gpu.rs)
+and *hard* are refused for it, mechanically, in [`crates/kern-cli/src/gpu.rs`](../crates/kern-cli/src/gpu.rs)
 and again over the assembled `doctor` row.
 
 There is **no middle tier**, and its absence is a measurement rather than an omission. A
@@ -103,8 +103,8 @@ seccomp. Those are all-or-nothing and they work, which is why an earlier claim t
 mechanism" passes the test was too wide. A box with no GPU is contained. A box with a GPU and a
 number attached to it is not.
 
-Run it: [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) with
-[`pentest/gpu-raw-ioctl.c`](pentest/gpu-raw-ioctl.c), T1 to T9.
+Run it: [`pentest/pentest-gpu-claims.sh`](../pentest/pentest-gpu-claims.sh) with
+[`pentest/gpu-raw-ioctl.c`](../pentest/gpu-raw-ioctl.c), T1 to T9.
 
 The probe deliberately allocates nothing, and that bounds the claim. Measured: an unprivileged
 process with no vendor library reaches the driver and is answered. NOT measured: that every

@@ -763,7 +763,7 @@ mod tests {
     /// count can drift silently (the class that has already produced ~1273, ~1174 and a stale denylist
     /// figure): the allowlist is 178 on x86_64 after the range-merge (173 for a nesting box), the
     /// denylist 86 (72 nesting). A change to an emitter or the ALLOW set fails this test and forces the
-    /// OPEN_ITEMS/seccomp docs that cite these four numbers to be updated in the same change.
+    /// ROADMAP/seccomp docs that cite these four numbers to be updated in the same change.
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
@@ -783,11 +783,11 @@ mod tests {
                     assert_eq!(
                         len, allow_expected,
                         "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
-                         {allow_expected}. If intentional, update OPEN_ITEMS.md (cites 178) + the doc-comment."
+                         {allow_expected}. If intentional, update ROADMAP.md (cites 178) + the doc-comment."
                     );
                 }
             }
-            // The denylist counts are cited in the same OPEN_ITEMS note (86 / 72), so pin them too - the
+            // The denylist counts are cited in the same ROADMAP note (86 / 72), so pin them too - the
             // reviewer's point: the number the docs cite for the denylist had no guard, same drift class.
             let deny = build_filter(nesting).len();
             assert!(
@@ -800,7 +800,7 @@ mod tests {
                 assert_eq!(
                     deny, deny_expected,
                     "x86_64 denylist instruction count changed (nesting={nesting}): {deny} vs \
-                     {deny_expected}. If intentional, update OPEN_ITEMS.md (cites 86)."
+                     {deny_expected}. If intentional, update ROADMAP.md (cites 86)."
                 );
             }
         }
@@ -1341,11 +1341,11 @@ mod tests {
                 ],
             ),
             ("README.md", vec![format!("kern's {total} escape syscalls")]),
-            // OPEN_ITEMS.md states the ENOSYS count in words, and it went stale the moment `clone3`
+            // ROADMAP.md states the ENOSYS count in words, and it went stale the moment `clone3`
             // joined the set: the file said "Nine denied syscalls" while the filter denied ten. It
             // was not covered here, which is exactly why nobody noticed. Word forms are checked
             // rather than digits because that is how the page is written.
-            ("OPEN_ITEMS.md", vec![format!("{word} denied syscalls")]),
+            ("ROADMAP.md", vec![format!("{word} denied syscalls")]),
         ];
         for (file, needles) in expect {
             let path = dir.join(file);

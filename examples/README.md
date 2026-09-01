@@ -29,8 +29,11 @@ background service; each isolated, daemonless, and gone when it's done.
 (PID / filesystem / capability / device isolation, read-only root, and 50 boxes at once) that
 shows the boundaries holding.
 
-A tighter **minimal set**: start a box, a service, mounts, resource limits, lives in
-[`essentials/`](essentials/), if you want the four-line version before the full tour.
+**In a hurry?** Four scripts are the minimal set, one per everyday task:
+[`essentials-run.sh`](essentials-run.sh) (a box from a clean image),
+[`essentials-service.sh`](essentials-service.sh) (a published service),
+[`essentials-mount.sh`](essentials-mount.sh) (your own code mounted in) and
+[`essentials-limits.sh`](essentials-limits.sh) (hard CPU and memory caps).
 
 | Example | What it shows |
 |---|---|
@@ -155,7 +158,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | [code-interpreter.py](code-interpreter.py) | A stateful notebook-style session where **file** state persists turn to turn (write CSV → aggregate → format), a dep installed once via `setup=` |
 | [agent-code-interpreter.py](agent-code-interpreter.py) | The same idea taken to its edges: a `pip install` under an **egress allowlist** (PyPI reachable, exfiltration not), stdout **streamed** as it runs, a matplotlib figure returned as a mime-typed result with no Jupyter kernel, timeout/OOM/blocked-syscall as data, snapshot-and-resume, and the same box running JavaScript |
 | [warm-kernel.py](warm-kernel.py) | The **warm kernel** (`sbx.kernel()`): one persistent interpreter so **in-memory** state persists across cells and each cell is **sub-millisecond** (vs ~14 ms cold), with rich chart results, confined errors, network still off, and a per-cell timeout that tears it down |
-| [mcp-code-interpreter.md](mcp-code-interpreter.md) | Wire **`kern-mcp`** into Claude Desktop / Cursor / Windsurf: a local, **network-off** code interpreter (run_code / write_file / read_file / list_files, charts as image blocks); `KERN_MCP_KERNEL=1` routes it through the warm kernel |
+| [kern-mcp setup](../bindings/python/README.md#use-it-from-claude-desktop--cursor-mcp) | Wire **`kern-mcp`** into Claude Desktop / Cursor / Windsurf: a local, **network-off** code interpreter, with every knob in one table |
 | [per-request-workers.py](per-request-workers.py) | A stdlib-only pool mapping N requests to N fresh throwaway boxes, so one request's timeout/crash is contained to its own box |
 | [sandboxed-eval.sh](sandboxed-eval.sh) | The shell angle for agents that shell out: eval an untrusted snippet `--read-only --network none` + capped, using the exit code as the signal (benign / blocked / timeout-killed) |
 
@@ -204,7 +207,7 @@ with truncation flags, wall time). Ideal for running LLM/agent-generated code or
 
 | Example | What it shows |
 |---|---|
-| [windows-wsl2.md](windows-wsl2.md) | kern on Windows runs inside WSL2, same commands, real kernel-enforced caps; honest note that it uses the WSL2 kernel (no VM of its own) |
+| [Windows via WSL2](../docs/INSTALL.md) | kern on Windows runs inside WSL2, same commands, real kernel-enforced caps, with the measured cost of crossing from PowerShell |
 
 > Edge / ARM (Jetson, Pi, …): see **[../EDGE.md](../EDGE.md)**: the daemonless footprint is the
 > killer feature on RAM-constrained boards.

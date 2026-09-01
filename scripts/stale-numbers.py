@@ -67,7 +67,7 @@ STALE: list[tuple[str, str, str, set[str]]] = [
     # a correct line, which is how a gate gets switched off.
     # No STALE rule for the binary size. It was tried and removed: a bare "1.7 MB" also names the RSS
     # of three processes in BENCHMARKS.md, and "1.81 MB" is the recorded measurement of an earlier
-    # release in the binary-size entry of OPEN_ITEMS.md. Both are correct where they stand, so the
+    # release in the binary-size entry of ROADMAP.md. Both are correct where they stand, so the
     # rule fired on true statements. A gate with false positives is switched off, which is worse
     # than no gate.
     # Nor is there an agreement check any more: the front page stopped claiming a size at all on

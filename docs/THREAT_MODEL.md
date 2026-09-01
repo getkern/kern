@@ -2,7 +2,7 @@
 
 This is the structured view: who the attacker is, what they are after, where they get in, and which
 boundaries hold against them. It is the map; [SECURITY.md](../SECURITY.md) is the per-mechanism
-detail (every flag, syscall and check, with the bypasses named) and [OPEN_ITEMS.md](../OPEN_ITEMS.md)
+detail (every flag, syscall and check, with the bypasses named) and [ROADMAP.md](../ROADMAP.md#known-gaps-and-what-would-settle-them)
 is the register of what is not yet known or done. Where a number matters, ask the binary
 (`kern box <name> --image <ref> --show-config`) rather than trusting a figure copied into prose.
 
@@ -87,7 +87,7 @@ box's network.
 | Peer secret / posture theft | inverted-default registry guard at **every** host-path entry, by device+inode identity | the operator's own trusted source paths are trusted as such |
 | Secret disclosure | `/run/secrets` tmpfs mode 0400, off argv, `O_EXCL\|O_NOFOLLOW` | inline `NAME=value` is visible in the host `ps`, and is warned about |
 | Forged supervision signal | watchdogs forked before the pid namespace; target from `fork()` or the host-only registry; pidfd-pinned | a same-uid pid-reuse window on `--health-action restart`, sub-quantum and not attacker-targetable |
-| Syscall-surface enumeration | a denied call is byte-identical to one the kernel lacks (`ENOSYS`) | whether a mapped filter helps an attacker who already has code execution is recorded open in [OPEN_ITEMS.md](../OPEN_ITEMS.md) |
+| Syscall-surface enumeration | a denied call is byte-identical to one the kernel lacks (`ENOSYS`) | whether a mapped filter helps an attacker who already has code execution is recorded open in [ROADMAP.md](../ROADMAP.md#known-gaps-and-what-would-settle-them) |
 
 ## Non-goals and residual risk
 

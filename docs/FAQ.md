@@ -1,7 +1,7 @@
 # FAQ
 
 Short, honest answers to the questions that come up first. The threat model in full is
-[SECURITY.md](../SECURITY.md); the honest open items are [OPEN_ITEMS.md](../OPEN_ITEMS.md).
+[SECURITY.md](../SECURITY.md); the honest open items are [ROADMAP.md](../ROADMAP.md#known-gaps-and-what-would-settle-them).
 
 ## Is kern a Docker replacement?
 

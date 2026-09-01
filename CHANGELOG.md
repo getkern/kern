@@ -1047,4 +1047,4 @@ each with a `.sha256`, from a GPG-signed and independently timestamped tag. Ever
   `-Cpanic=immediate-abort` (~22% smaller than a plain stable `--release`, which a from-source
   `cargo install` still yields), reproducible byte-for-byte with the pinned toolchain. The source
   stays 100% stable Rust, so `cargo test` runs on the same source a release would ship. The exact
-  sizes and the panic-diagnostics tradeoff this buys are in [OPEN_ITEMS.md](OPEN_ITEMS.md).
+  sizes and the panic-diagnostics tradeoff this buys are in [OPEN_ITEMS.md](ROADMAP.md#known-gaps-and-what-would-settle-them).

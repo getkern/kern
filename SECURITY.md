@@ -225,7 +225,7 @@ So the errno discloses nothing: a filtered call is byte-identical to one this ke
 implement. What is cheap to enumerate is the **permitted** set, and always was, since a permitted
 syscall runs and returns its own errno. Whether mapping a filter helps an attacker who already has
 code execution in the box is a separate and open question, recorded as unresolved in
-[OPEN_ITEMS.md](OPEN_ITEMS.md) rather than argued either way here.
+[ROADMAP.md](ROADMAP.md#known-gaps-and-what-would-settle-them) rather than argued either way here.
 
 ### Read-only and cgroup-mask integrity
 

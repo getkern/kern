@@ -306,17 +306,27 @@ runs it on your machine, and charts come back as images the model can see. Point
 ```
 
 Tools: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`. File state persists across
-calls (a workspace on disk); each call is a fresh, **network-off** box. Optional env: `KERN_MCP_IMAGE`,
-`KERN_MCP_SETUP` (a one-time `pip install`), `KERN_MCP_MEMORY_MB`, `KERN_MCP_TIMEOUT`, `KERN_MCP_WORKSPACE`
-(persist the workspace), `KERN_MCP_PROFILES` (comma-separated kern.toml profiles, e.g.
-`vcpu:heavy,vgpio:sensors`, the only way to grant an edge agent a hardware device set). Run it standalone
-with `python -m kern_sandbox.mcp`.
+calls (a workspace on disk); each call is a fresh, **network-off** box. Run it standalone with
+`python -m kern_sandbox.mcp`.
 
-Two knobs change what the model is told, so they are worth naming: `KERN_MCP_KERNEL=1` routes Python
-through one persistent warm interpreter, which makes in-memory state persist across calls and is the one
-case where "a fresh box per call" above stops being true (the tool description says so to the model as
-well, rather than leaving it to guess). `KERN_MCP_QUIET=0` restores kern's non-fatal notes, which are off
-by default so a tool call returns only the cell's own output.
+| Env var | Default | What it does |
+|---|---|---|
+| `KERN_MCP_IMAGE` | `python:3.12-slim` | OCI image the boxes run in |
+| `KERN_MCP_SETUP` | (none) | one-time `pip install ...`, the ONLY network-on moment; every `run_code` after is network-off |
+| `KERN_MCP_MEMORY_MB` | `1024` | hard RAM cap per box (cgroup) |
+| `KERN_MCP_TIMEOUT` | `60` | per-call wall-clock deadline |
+| `KERN_MCP_WORKSPACE` | temp dir | persist file state at this path across calls |
+| `KERN_MCP_PROFILES` | (none) | attach `kern.toml` profiles, e.g. `vcpu:heavy,vgpio:sensors`: the only way to grant an edge agent a hardware device |
+| `KERN_MCP_KERNEL` | off | `1` routes Python through one warm interpreter: in-memory state persists and each call is sub-millisecond instead of a ~10 ms boot. Still network-off, and the one case where "a fresh box per call" stops being true, which the tool description tells the model rather than leaving it to guess |
+| `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes, off by default so a tool call returns only the cell's own output |
+
+**Why local rather than a hosted interpreter.** E2B, Modal and Daytona need an account, an API key and a
+network round-trip, and the model's code runs on someone else's machine. This runs on yours: no account,
+no egress, works air-gapped, same shape. Because it is `kern box` underneath, the network is off by
+default, the box is memory/pids/CPU capped, and a blocked syscall or an OOM comes back as data rather
+than a crash. The honest threat model is in
+[SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md): a kernel-boundary sandbox for your
+own or semi-trusted agent code, not a hostile-multi-tenant microVM.
 
 ## Use it from LangChain
 

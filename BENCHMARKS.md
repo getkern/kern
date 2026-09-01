@@ -405,7 +405,7 @@ The largest item is the pivot and the `/proc` mount, and the two hardening phase
 than folded into a total so it can be argued with. `unshare(CLONE_NEWNET)` on its own costs **430
 us**, 17% of a box start, and is the price of network isolation.
 
-⚠️ These are ABSOLUTE phase durations. `OPEN_ITEMS.md` quotes smaller figures for some of the same
+⚠️ These are ABSOLUTE phase durations. `ROADMAP.md` quotes smaller figures for some of the same
 names, and those are DELTAS: what the feature added when it landed. They must not be subtracted from
 each other.
 
