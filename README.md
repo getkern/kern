@@ -130,8 +130,8 @@ kern box job --image python:3.12-slim --security-profile untrusted -- python3 /w
 ```
 
 `--security-profile untrusted` is the seccomp **allowlist** + `--cap-drop ALL` + `--read-only`
-in one flag. No network unless you ask, and seccomp is on either way. Ninety runnable
-examples, each doing one thing: [examples/](examples/).
+in one flag. No network unless you ask, and seccomp is on either way. One runnable example per
+thing kern does: [examples/](examples/).
 
 Every read verb also answers in JSON, so nothing has to parse a table:
 
@@ -163,6 +163,21 @@ kern compose stack.toml up          # or point it at your compose.yaml instead
 Both official images start, `web` reaches `db` by service name, and the port is published. Warm, the
 web tier serves in **~0.3 s** and the stack costs only what postgres and adminer use (~66 MB here),
 with no daemon underneath. A resource profile attaches here too: `vcpu = "heavy"` on a service.
+
+A compose file can also name kern's own things, in the spec's extension namespace, and still run
+under Docker unchanged:
+
+```yaml
+services:
+  api:
+    image: alpine
+    x-kern-vcpu: heavy                   # a resource profile from your kern.toml
+    x-kern-security-profile: untrusted   # seccomp allowlist + cap-drop ALL + read-only
+```
+
+kern reads those; every other runtime ignores an `x-` field, which is what the namespace is for. A
+typo inside it is reported rather than dropped: a key of ours that does nothing and says nothing is
+the defect the mechanism exists to avoid.
 
 One constraint comes with the speed: a stack is one pod on one network namespace, so **two services
 cannot both listen on the same container port**, even when their published ports differ. `kern
