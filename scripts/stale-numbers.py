@@ -70,10 +70,9 @@ STALE: list[tuple[str, str, str, set[str]]] = [
     # release in the binary-size entry of OPEN_ITEMS.md. Both are correct where they stand, so the
     # rule fired on true statements. A gate with false positives is switched off, which is worse
     # than no gate.
-    # The size is not unchecked, though: `size_claims_agree()` below compares the claim in the two
-    # files that PRODUCE the front page (the demo SVG and the GIF's generator, neither of them a `.md`
-    # and so invisible to the scan above) against the README's headline. An agreement check cannot
-    # fire on a true statement, which is exactly why the size gets one and not a blacklist.
+    # Nor is there an agreement check any more: the front page stopped claiming a size at all on
+    # 2026-09-01, so there is nothing left for a claimant to disagree with. See the note where
+    # `size_claims_agree()` used to be, further down.
     (
         r"\bENOSYS[^.\n]{0,80}\bfive\b|\bfive [a-z]* ?syscalls? [^.\n]{0,40}ENOSYS",
         "nine",
@@ -263,51 +262,15 @@ def provenance_counts_agree() -> list[str]:
     return bad
 
 
-def size_claims_agree() -> list[str]:
-    """The binary size claimed OUTSIDE the .md set must equal the one the README states.
-
-    This gate defaults to tracked `.md`, so a number baked into an asset is invisible to it, and on
-    2026-08-20 that is exactly what happened: the front-page GIF said 1.84 MB and the demo SVG said
-    ~1.8 MB while the README three lines away said 1.58. Nobody lied; the generator's constant simply
-    had no gate on it. The GIF is pixels, but the three files that PRODUCE the claim are text.
-
-    Deliberately an AGREEMENT check, not a STALE rule: the note above records that a blacklist on the
-    size fired on true statements (a bare "1.7 MB" is also an RSS in BENCHMARKS.md) and a gate with
-    false positives gets switched off. Comparing a claim against the canonical one cannot cry wolf,
-    because there is exactly one right answer and the README holds it.
-    """
-    readme = re.search(
-        r"out of one\s+([\d.]+)\s*MB binary", open("README.md", encoding="utf-8").read()
-    )
-    if not readme:
-        return ["README.md no longer states the binary size in its headline, so nothing can be "
-                "checked against it. Restore the claim or drop this check."]
-    canonical = readme.group(1)
-    # Only a size sitting NEXT TO the word it measures counts, so the generator's own history note
-    # ("the GIF kept claiming ~2 ms and 1.6 MB") is not a claim about today's binary and is skipped.
-    # The gap in the third alternative forbids DIGITS, not just newlines. With `[^\n]{0,24}` it was
-    # greedy enough to eat into the number itself: "binary is 1.58 MB" captured `8`, and the gate would
-    # then have reported a disagreement against a file that agreed. A rule that invents a mismatch is
-    # the same failure as one that misses a real one, so the gap may not cross a digit.
-    claim = re.compile(
-        r'BINARY_SIZE\s*=\s*"~?([\d.]+)\s*MB"'
-        r'|~?([\d.]+)\s*MB(?=[^\n]{0,24}\bbinary\b)'
-        r'|\bbinary\b[^\d\n]{0,24}([\d.]+)\s*MB'
-    )
-    bad = []
-    for path in ("assets/demo.svg", "assets/make-demo-gif.py"):
-        try:
-            text = open(path, encoding="utf-8").read()
-        except OSError:
-            continue  # a claimant that no longer exists is not a disagreement
-        for lineno, line in enumerate(text.split("\n"), 1):
-            for m in claim.finditer(line):
-                said = next(g for g in m.groups() if g)
-                if said != canonical:
-                    bad.append(
-                        f"{path}:{lineno} claims a {said} MB binary, README.md says {canonical} MB"
-                    )
-    return bad
+# `size_claims_agree()` USED TO LIVE HERE, and it was deleted on purpose rather than left to rot.
+# It compared the binary size claimed in `assets/demo.svg` and in the GIF generator against the
+# README's headline, because a number baked into an asset is invisible to a gate that reads only
+# `.md` - which is exactly how the front page once said 1.84 MB three lines above a README saying
+# 1.58. On 2026-09-01 the owner removed every binary-size claim from the front page: the headline,
+# the install comment, the comparison table, both image captions and the generator's own constant.
+# There is now no canonical size for a claimant to disagree with, and the gate said so itself when
+# it fired ("Restore the claim or drop this check"). Bringing a size back to the README means
+# bringing this function back with it; the git history holds it.
 
 
 def _rust_string_literal_after(src: str, marker: str) -> str:
@@ -677,12 +640,6 @@ def main(argv: list[str]) -> int:
         print("       one measurement, several homes: the headline is canonical and every other "
               "claimant is checked against it. Edit README.md first, then the others; if the GIF "
               "generator moved, re-run it: python3 assets/make-demo-gif.py")
-    for problem in size_claims_agree():
-        total += 1
-        print(f"\n{problem}")
-        print("       the front page states the size in an asset as well as in prose, and this "
-              "gate reads only .md, so the asset drifts silently. Edit the generator, then "
-              "re-run it: python3 assets/make-demo-gif.py")
     for problem in example_count_agrees():
         total += 1
         print(f"\n{problem}")

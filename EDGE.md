@@ -12,7 +12,7 @@ That difference is the whole game on a device where memory is the scarce resourc
 |---|---|---|
 | resident memory at rest | **0** | 154 to 160 MB (dockerd + containerd) |
 | per box | ~7 MB, gone on exit | shared daemon state |
-| binary | **1.25 MB** static (musl aarch64; 1.52 MB x86_64), size-optimized release | tens of MB + daemon |
+| binary | one static musl binary, size-optimized release | tens of MB + daemon |
 | install | drop one static binary | service + socket + root setup |
 | privileges | rootless (user namespaces) | typically a root daemon/group |
 

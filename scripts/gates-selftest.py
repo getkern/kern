@@ -104,11 +104,18 @@ CASES: list[Case] = [
      prepend("Measured: bubblewrap is 0.8 ms ahead of kern.")),
     ("stale-numbers", "two documents disagreeing on box start latency", "docs/FAQ.md",
      sub_once(r"from an OCI image in ~?[0-9.]+ ms", "from an OCI image in ~9.9 ms")),
-    ("stale-numbers", "a binary size that contradicts the release", "assets/demo.svg",
-     sub_once(r"[0-9]\.[0-9]+ MB binary", "9.9 MB binary")),
+    # IL CASO SULLA SIZE DEL BINARIO E' STATO TOLTO, insieme al controllo che provava. Iniettava
+    # "9.9 MB binary" in assets/demo.svg e si aspettava che `size_claims_agree()` diventasse rosso.
+    # Il 01/09/2026 ogni dichiarazione di size e' sparita dalla prima pagina (titolo, tabella,
+    # didascalie, costante del generatore), quindi non c'e' piu' un valore canonico contro cui
+    # disaccordare e la funzione e' stata cancellata. Un caso che inietta in un testo che non esiste
+    # piu' resterebbe verde per assenza di bersaglio, che e' peggio di nessun caso.
     # --- test-count ---
     ("test-count", "a README test count that does not match the suite", "README.md",
-     sub_once(r"works today:\*\* [0-9]+ Rust", "works today:** 12345 Rust")),
+     # Ancorato a `** N Rust` e non alla frase intera: la sezione Status e' stata riscritta il
+     # 01/09/2026 e l'ancora precedente ("works today:**") sparì col testo, lasciando il caso senza
+     # bersaglio. Il numero preceduto dal grassetto e' la forma che il cancello legge davvero.
+     sub_once(r"\*\* [0-9]+ Rust", "** 12345 Rust")),
     # --- flat-continuation: la forma VERA del difetto, con una virgola prima della corsa.
     #
     # La prima stesura del cancello pretendeva una minuscola a sinistra e quindi non vedeva questo

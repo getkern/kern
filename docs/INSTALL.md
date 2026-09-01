@@ -3,8 +3,8 @@
 One static binary and no daemon. Its only Rust dependency is `libc`, and a box built from a
 `--rootfs` needs nothing else on the host. The image path is the exception and is stated as one:
 `kern pull` and `--image` shell out to the system `curl` and `tar` rather than linking a TLS stack
-and a decompressor, which is most of why the release binary is 1.52 MB (a from-source build is
-1.91 MB; the size optimization is release-only). `kern doctor` reports whether both
+and a decompressor, which is most of why the release binary is smaller than a from-source build
+(the size optimization is release-only). `kern doctor` reports whether both
 are present. This page is the long form of the [README](../README.md).
 
 Every release ships static binaries for `x86_64` and `aarch64`, each with a `.sha256` next to it, and
@@ -197,8 +197,7 @@ cargo install --git https://github.com/getkern/kern getkern --locked
 was tested with. This is the one route that does need a Rust toolchain.
 
 **📦 Offline / air-gapped** (a board or locked-down server with no internet). kern is a single
-static binary (1.91 MB from a source build; 1.52 MB x86_64 / 1.25 MB aarch64 in the size-optimized
-release build), so copying that one file *is* the install:
+static binary, so copying that one file *is* the install:
 
 ```sh
 scp kern pi@raspberrypi:~/          # then:  ssh pi@raspberrypi kern box dev --image alpine -- sh
@@ -270,8 +269,7 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 
 
 **Linux, multi-architecture.** kern builds to a static (musl) binary for **`linux-x86_64`** and
-**`linux-aarch64`**: one file per arch (1.91 MB x86_64 / 1.67 MB aarch64 from a source build; the
-size-optimized release build is 1.52 MB / 1.25 MB), no Rust deps beyond `libc` (the pull path shells
+**`linux-aarch64`**: one file per arch, no Rust deps beyond `libc` (the pull path shells
 out to system `curl`/`tar`). Prebuilt binaries ship with every release, checksummed, for both
 architectures; building from source stays supported and produces the larger figures above.
 

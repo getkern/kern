@@ -4,10 +4,10 @@
 
 **kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
 
-**A real, kernel-enforced container in ~3.5 ms, out of one 1.52 MB binary with no daemon.**
+**A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a 1.52 MB binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
@@ -19,7 +19,7 @@
 </div>
 
 ```sh
-# install the release binary (static, 1.52 MB, checksum-verified by the script)
+# install the release binary (static, checksum-verified by the script)
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 
 # a throwaway shell in a real OCI image: rootless, kernel-enforced, a few ms
@@ -34,61 +34,35 @@ kern box dev --image alpine -it -- sh
 
 **One binary that manages resources, of which isolation is the first.** That is why there is no
 single row for kern in a comparison table: it is a container runtime, a sandbox, a resource slicer
-and a stack runner at once, in 1.52 MB with no daemon.
+and a stack runner at once, in one static binary with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.5 ms.
-- **A sandbox, always rootless.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
+- **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
+- **A sandbox for code you did not write.** Agent tool-calls, LLM-generated snippets, CI jobs, build
+  steps, notebook cells: a fresh box per call, network off, memory and pid caps, capabilities
+  dropped, and a timeout enforced from outside the box. A timeout, an OOM-kill or a blocked syscall
+  comes back as data on the result, not as an exception. `kern-sandbox` for Python and Node, and an
+  MCP server for Claude Desktop or Cursor. [bindings/python/README.md](bindings/python/README.md)
 - **Resource profiles, not just isolation.** CPU (`vcpu:`), memory, disk (`vdisk:`) and devices
   (`vgpio:`), declared once in a `kern.toml` and attached by name. `kern run` applies the same caps
   to a process on the host, with no sandbox at all, plus `--landlock-rw <path>` to confine that
   process's writes with the kernel's own LSM. [docs/RESOURCES.md](docs/RESOURCES.md)
-- **Stacks, in kern's own format or in Docker's.** `kern compose <file> up` takes a `kern-compose.toml`
-  (`[box.NAME]` tables, with the resource profiles above) or the `docker-compose.yml` you already have,
-  with no conversion step. One stack to one pod, services reaching each other by name.
+- **Stacks, in kern's own format or in the one you already have.** `kern compose <file> up` takes a
+  `stack.toml` (`[box.NAME]` tables, with the resource profiles above) or a `docker-compose.yml`, with
+  no conversion step. One stack to one pod, services reaching each other by name.
 - **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
-  `doctor`, plus a Python and Node SDK and an MCP server for agents. The Python binding also plugs
-  into LangChain twice: as a code tool, and as an execution policy for its shell middleware, where it
-  is a peer of the Docker one. [bindings/python/README.md](bindings/python/README.md)
+  `doctor`. The Python binding also plugs into LangChain twice: as a code tool, and as an execution
+  policy for its shell middleware.
 
 Its entire Rust dependency tree is `libc`: JSON and OCI manifests are parsed by hand, and `pull`
-shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack. (1.52 MB
-is the size-optimized release build; a plain `cargo install` from source is 1.91 MB.)
+shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack.
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~297 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one 1.52 MB static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~297 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one static binary, no daemon.">
 </p>
-
-## What kern is not
-
-- **Not a hypervisor.** The boundary is the Linux kernel, so a kernel privilege-escalation bug is an
-  escape. Docker and Podman share that condition, which is why gVisor and Firecracker exist.
-
-  Read with the tagline, that is one line seen from both sides: untrusted and AI-generated code is
-  what kern is FOR, because you chose to run it and own the blast radius (agent tool-calls, CI jobs,
-  build steps, code cells). What it is not for is hostile code from strangers, multi-tenant, on a
-  kernel you serve other tenants from. kern does start rootless always, where Docker's is opt-in.
-- **Not free of the userns trade.** Its isolation is built on an unprivileged user namespace, a
-  fertile source of kernel LPE bugs. [SECURITY.md](SECURITY.md) states this before any claim.
-- **Not a wall around what you mount in.** `-v $HOME:/host` gives the box your home directory: a
-  mount is a trust decision you make, not a boundary kern enforces. `--net host` and `--privileged`
-  are opt-outs by name. (The one path kern refuses to bind is its own runtime registry.)
-- **Not a Docker Engine reimplementation.** It speaks Docker's *formats*, not its API: no overlay
-  networks, no plugins, no Swarm. Matrix: [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
-- **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
-- **Not shipping GPU slices.** On the [roadmap](ROADMAP.md). What ships is the *judgement*, not the
-  capability: `kern doctor` reads sysfs and tells you what a VRAM cap on each GPU would be worth
-  (`TIER-HW` where a MIG or SR-IOV partition is present, which the device enforces rather than the
-  tenant, though kern reads its presence and has not measured the VRAM split; `TIER-SOFT` for
-  everything else, which on consumer hardware is a cooperative quota,
-  NOT a boundary against malicious code).
-  Nothing intercepts a driver call, nothing caps a GPU, and the detection is read-only, so there is
-  still nothing here to attack.
-
-What it does not know or does not do yet is in [OPEN_ITEMS.md](OPEN_ITEMS.md) rather than left for
-you to find.
 
 ## Install
 
@@ -97,8 +71,7 @@ and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q); there is **no native
 WSL2 (kern ships a pre-baked WSL rootfs).
 
 **On a Mac** there is no native build either, and there will not be one: macOS has no namespaces and
-no cgroups. kern runs on a Mac **inside a Linux VM** (colima, Lima, OrbStack, UTM, or the one Docker
-Desktop already runs), where it is the ordinary Linux kern, same binary and same CLI as your CI box.
+no cgroups. kern runs on a Mac **inside a Linux VM** (colima, Lima, OrbStack, UTM, or one you already run), where it is the ordinary Linux kern, same binary and same CLI as your CI box.
 Verified on Apple Silicon with an Ubuntu 24.04 guest. Read
 [docs/INSTALL.md](docs/INSTALL.md) first: two obstacles are certain there, and the resource caps do
 not bite on a default guest.
@@ -173,44 +146,40 @@ kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
 kern volume ls --json          # ps · images · stats · inspect · builds · pod ls · config list · diff
 ```
 
-## Docker Compose files, without Docker Desktop
+## Stacks
 
-kern speaks `docker-compose.yml`. Point it at the stack you already have and `kern compose up` runs it
-with no daemon and no Docker Desktop, the same on Linux, WSL2 and ARM boards. One constraint comes
-with that: a stack is one pod sharing one network namespace, so **two services cannot both listen on
-the same container port**, even when their published ports differ. That is what makes a stack start
-in milliseconds, and `kern compose up` refuses the collision by name before it starts anything, so
-you meet it in a second rather than in production. **Or run the stack with `--no-pod`**: each service
-gets its own network namespace, the constraint disappears, and the file needs no edit. The trade is
-name resolution, measured rather than assumed: under `--no-pod` a service no longer resolves another
-by name, so a file whose services address each other by hostname wants the pod.
-[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+One file, one command. kern reads its own format, and it reads the `docker-compose.yml` you already
+have, unchanged.
 
-```yaml
-# compose.yaml - a real stack, unchanged
-services:
-  db:
-    image: postgres:alpine
-    environment: { POSTGRES_PASSWORD: secret, POSTGRES_DB: app }
-  web:
-    image: adminer
-    ports: ["8080:8080"]
-    depends_on: [db]
+```toml
+# stack.toml - one table per service, keys spelled like the `kern box` flags
+[box.db]
+image = "postgres:alpine"
+env   = ["POSTGRES_PASSWORD=secret", "POSTGRES_DB=app"]
+
+[box.web]
+image      = "adminer"
+ports      = ["8080:8080"]
+depends_on = ["db"]
 ```
 
 ```sh
-kern compose compose.yaml up
+kern compose stack.toml up          # or point it at your compose.yaml instead
 ```
 
-Both official images start, `web` reaches `db` by service name, and the port is published to the host.
-Warm (images cached) the web tier serves in **~0.3 s**, and the stack costs only what postgres and adminer
-actually use (~66 MB here) with **zero daemon** on top, where Docker Desktop is a background VM before your
-first container.
+Both official images start, `web` reaches `db` by service name, and the port is published. Warm, the
+web tier serves in **~0.3 s** and the stack costs only what postgres and adminer use (~66 MB here),
+with no daemon underneath. A resource profile attaches here too: `vcpu = "heavy"` on a service.
 
-Official images that drop to a non-root user (postgres, redis, ...) want `uidmap` and a `/etc/subuid`
-line, and outbound image pulls want `pasta`; both are one `apt install` on a dev box, and `kern doctor`
-names either if it is missing. This is the local dev loop, not a production orchestrator: no Swarm, no
-overlay networks.
+One constraint comes with the speed: a stack is one pod on one network namespace, so **two services
+cannot both listen on the same container port**, even when their published ports differ. `kern
+compose up` refuses the collision by name before starting anything. **Or pass `--no-pod`**: each
+service gets its own namespace and the constraint goes away, at the price of name resolution, which
+is measured rather than assumed. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+
+Official images that drop to a non-root user (postgres, redis, ...) want `uidmap` and an
+`/etc/subuid` line, and outbound pulls want `pasta`; both are one `apt install`, and `kern doctor`
+names either if it is missing. This is the local dev loop, not a production orchestrator.
 
 ## Embed it: Python & Node
 
@@ -309,7 +278,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Cold start, from an OCI image | **~3.5 ms** | ~297 ms | ~293 ms |
 | Stop a service (init handles SIGTERM) | **~1.9 ms** | ~310 ms | ~380 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
-| Footprint | **one 1.52 MB binary** | daemon stack | multi-binary install |
+| Footprint | **one static binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
 | `docker-compose.yml` | yes, read as-is (one port per service across the stack, or `--no-pod`) | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
@@ -367,13 +336,29 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 950 Rust, 340 Python and 61 Node tests,
-clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
-Arduino UNO Q. **v0.7.0 is the first published release, and the CLI is stable from it**: verbs,
-flags and `--json` shapes change incompatibly only on a minor bump, after a deprecation entry at
-least one release earlier, and a `cli_surface_is_frozen` test holds the build to it. Internal
-config-file keys can still evolve; that is the part still called out in
-[CHANGELOG.md](CHANGELOG.md).
+**The core is done, and the CLI is frozen since v0.7.0.** 970 Rust, 340 Python and 61 Node tests,
+clippy-clean and `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino
+UNO Q. Verbs, flags and `--json` shapes change incompatibly only on a minor bump, one release after
+a deprecation entry, and `cli_surface_is_frozen` holds the build to it. Config-file keys can still
+evolve: [CHANGELOG.md](CHANGELOG.md).
+
+## What kern is not
+
+- **Not a hypervisor.** The boundary is the Linux kernel, so a kernel privilege-escalation bug is an
+  escape. kern is for code you chose to run and whose blast radius you own, not for hostile code from
+  strangers on a kernel you serve other tenants from.
+- **Not free of the userns trade.** Its isolation is built on an unprivileged user namespace, a
+  fertile source of kernel LPE bugs. [SECURITY.md](SECURITY.md) says so before any claim.
+- **Not a wall around what you mount in.** `-v $HOME:/host` gives the box your home directory.
+  `--net host` and `--privileged` are opt-outs by name.
+- **Not a Docker Engine reimplementation.** The *formats*, not the API: no overlay networks, no
+  plugins, no Swarm. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+- **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
+- **Not shipping GPU slices.** On the [roadmap](ROADMAP.md). `kern doctor` reports what a VRAM cap
+  would be worth per GPU; on consumer hardware that is a cooperative quota,
+  NOT a boundary against malicious code. Nothing intercepts a driver call and nothing caps a GPU.
+
+Known gaps: [OPEN_ITEMS.md](OPEN_ITEMS.md).
 
 ## Contributing
 
@@ -384,10 +369,6 @@ gates; contributions are covered by the [CLA](CLA.md).
 
 Alessandro Polito, [@realexhub](https://github.com/realexhub), Italy. Earlier commits carry
 [@getkerndev](https://github.com/getkerndev), the account the project was published from.
-
-**The commits are not signed; the release TAG is.** That is what to verify:
-`git verify-tag v0.7.1` against the key in [provenance/](provenance/), whose fingerprint is in
-[SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -34,7 +34,6 @@ from PIL import Image, ImageDraw, ImageFont
 # image one, so the number shown here has to be the image one.
 KERN_MS = "3.5 ms"
 DOCKER_MS = "297 ms"
-BINARY_SIZE = "1.52 MB"
 HOST = "Intel i7-14700KF, Linux 7.0"
 
 COMMAND = 'kern box app --image alpine -- echo "hello from a real container"'
@@ -114,7 +113,7 @@ def render(font: ImageFont.FreeTypeFont) -> list[Image.Image]:
             )
             d.text(
                 (X0, ROWS["meta"]),
-                f"real OCI image  .  rootless  .  {BINARY_SIZE}  .  no daemon",
+                "real OCI image  .  rootless  .  static binary  .  no daemon",
                 font=font,
                 fill=META,
             )
