@@ -59,6 +59,12 @@ pub fn holder_pid(name: &str) -> Option<i32> {
         .trim()
         .parse()
         .ok()?;
+    // Same reason as `marker_alive` above: `kill(0, 0)` and `kill(-1, 0)` succeed, so a degenerate
+    // value in the holder file would pass the liveness probe. The netns identity check below happens
+    // to reject it too, but that is an accident of `/proc/0` not existing, not a guard.
+    if pid <= 0 {
+        return None;
+    }
     if unsafe { libc::kill(pid, 0) } != 0 {
         return None; // holder gone
     }
@@ -90,6 +96,11 @@ fn starter_alive(dir: &std::path::Path) -> bool {
     let Ok(pid) = pid_s.parse::<i32>() else {
         return false;
     };
+    // `kill(0, 0)` and `kill(-1, 0)` both SUCCEED, so a marker holding 0 or -1 would read as a live
+    // process; with a bare-pid marker the back-compat arm below then answers `true` outright.
+    if pid <= 0 {
+        return false;
+    }
     if unsafe { libc::kill(pid, 0) } != 0 {
         return false; // no such live process
     }

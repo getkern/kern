@@ -255,6 +255,16 @@ is in the git history.
 
 ### Security
 
+- **A pid that cannot be a process read as a live one.** The fail-open face of the entry below.
+  `kill(0, 0)` probes the caller's own process group and `kill(-1, 0)` probes every process the user
+  owns, so both succeed and a liveness probe answers yes; in `registry::is_alive` the start-time
+  comparison did not rescue it either, because `/proc/0/stat` is unreadable, `proc_starttime` answers
+  0, and the arm that exists so an unreadable start time is not a mismatch then returned true.
+  MEASURED before the fix: `is_alive(0, x)` was true, so a registry entry holding 0 named a box that
+  read as running, kept its name claimed and counted against the fleet cap. Fixed in the three places
+  that probe a recorded pid: the box registry, the pod holder and the pod marker. Found by auditing
+  every `kill` call site before tagging, after the entry below fixed the signalling direction.
+
 - **Three helpers could hand `-1` to `kill`, which signals every process the user owns.** Found by
   auditing the change below rather than by a report, and it is older than that change.
 

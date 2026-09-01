@@ -349,7 +349,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done, and the CLI is frozen.** 970 Rust, 340 Python and 61 Node tests, clippy-clean
+**The core is done, and the CLI is frozen.** 971 Rust, 340 Python and 61 Node tests, clippy-clean
 and `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q. Verbs,
 flags and `--json` shapes change incompatibly only after a deprecation entry a release earlier, and
 `cli_surface_is_frozen` holds the build to it. Config-file keys can still evolve:

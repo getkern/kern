@@ -1833,6 +1833,16 @@ pub fn pid_is_still(pid: i32, starttime: u64) -> bool {
 /// the process it replaced, which made the test inconclusive rather than red. Narrow, but it is a
 /// property of the mechanism and not of the test, so it belongs here.
 fn is_alive(pid: i32, starttime: u64) -> bool {
+    // A NON-POSITIVE PID IS NOT A LIVE PROCESS, and `kill` cannot say so: `kill(0, 0)` probes the
+    // caller's own process group and `kill(-1, 0)` probes every process the user owns, so BOTH
+    // succeed and read as "that recorded pid is alive". The starttime comparison below does not
+    // rescue it either, because `/proc/0/stat` cannot be read, `proc_starttime` answers 0, and the
+    // `live == 0` arm - there to avoid being strict when the start time is unreadable - then makes
+    // the answer `true`. Measured: `is_alive(0, _)` returned true. This is the fail-OPEN face of the
+    // same defect the v0.8.x security entry fixed in the signalling direction.
+    if pid <= 0 {
+        return false;
+    }
     if unsafe { libc::kill(pid, 0) } != 0 {
         return false;
     }
@@ -2811,6 +2821,38 @@ mod tests {
             assert!(
                 !is_namespace_init_below(*pid, my_depth),
                 "an init TWO levels down belongs to the workload, not to the box: {pid}"
+            );
+        }
+    }
+
+    /// A DEGENERATE PID READ AS A LIVE PROCESS, which is the fail-open face of the defect the
+    /// security entry fixed in the signalling direction.
+    ///
+    /// `kill(0, 0)` probes the caller's own process group and `kill(-1, 0)` probes every process the
+    /// user owns, so BOTH succeed and the liveness probe answers yes. The start-time comparison did
+    /// not rescue it: `/proc/0/stat` cannot be read, `proc_starttime` answers 0, and the `live == 0`
+    /// arm - which exists so an unreadable start time is not treated as a mismatch - then returns
+    /// true. Measured before the fix: `is_alive(0, x)` and `is_alive(-1, x)` were both true, so a
+    /// registry entry holding 0 named a box that read as running.
+    ///
+    /// The positive control is this process, which really is alive: without it the test would pass
+    /// against an `is_alive` that always answers false.
+    #[test]
+    fn a_pid_that_cannot_be_a_process_is_not_alive() {
+        let me = std::process::id() as i32;
+        let real = proc_starttime(me);
+        assert!(
+            is_alive(me, real),
+            "positive control: this process must read as alive"
+        );
+        for bad in [0, -1, -2, i32::MIN] {
+            assert!(
+                !is_alive(bad, real),
+                "pid {bad} is not a process and must never read as alive"
+            );
+            assert!(
+                !is_alive(bad, 0),
+                "pid {bad} must not read as alive through the unreadable-start-time arm either"
             );
         }
     }
