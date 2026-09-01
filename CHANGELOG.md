@@ -11,6 +11,52 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## Unreleased
+
+### Fixed
+
+- **A foreground box took `--health-cmd` and never evaluated it.** The checker was armed in exactly
+  one place, the detached launch path, so a box started without `-d` accepted the flag, exited 0, and
+  left `kern ps` showing an empty HEALTH column. No warning, no error.
+
+  NOT A CORNER OF THE CLI, which is why it went unnoticed and why it mattered: `--restart
+  always`/`unless-stopped` installs a systemd unit whose `ExecStart` deliberately STRIPS `-d`
+  (`Type=simple`, systemd is the supervisor), so EVERY persistent box runs on the foreground path. A
+  `kern compose` stack carrying `restart:` under `--no-pod` therefore gated on a status nobody
+  computed: `depends_on: condition: service_healthy` waited the full 120 s and failed with
+  `last status: 'none yet'` while the service underneath was up and serving. Reported against v0.8.0
+  on a four-service stack; measured here from a two-line `kern box` with no compose and no systemd
+  involved, which is the smaller and truer statement of the same defect.
+
+  The checker is forked BEFORE the sandbox unshares its pid namespace, for the reason the timeout
+  watchdog already documents: a process forked after `unshare(CLONE_NEWPID)` lands inside the box's
+  namespace, where it becomes an un-reapable zombie on exit and deadlocks the teardown. It needs
+  nothing from PID 1 at fork time, since it re-reads `pid1` from the registry each round.
+
+  Measured end to end: the reported case went from a 120 s timeout to the dependent service starting
+  after 7 s.
+
+- **A SIGKILL'd launcher left its health checker probing forever.** Every ordinary exit stops the
+  checker, but a SIGKILL runs no teardown at all, and one orphan survived each kill, sleeping and
+  probing a box that no longer existed. The box itself never leaked that way because it already
+  carries a `PR_SET_PDEATHSIG` link; the checker now carries the same one, with the usual re-read of
+  `getppid` after arming to close the fork/prctl race. Measured: one orphan per kill before, zero
+  after, on both launch paths.
+
+  The teardown is one function used by both paths rather than a copy in each, because a copy is how
+  the two would drift again.
+
+- **The README named the port constraint without naming the way out.** `--no-pod` lifts it entirely
+  and was documented only in `docs/DOCKER-COMPAT.md`, so a reader met the constraint in the README,
+  renumbered a port, and never learned the flag existed. The trade is stated with it, and measured
+  rather than assumed: under `--no-pod` a service no longer resolves another by name.
+
+  Injection: verified on both fixes. Removing the foreground arm returns an empty health status and
+  turns `a_foreground_box_evaluates_its_health_check` red; removing the `PDEATHSIG` guard leaves one
+  process behind and turns `a_killed_foreground_launcher_takes_its_health_checker_with_it` red. Each
+  test carries the detached case as its positive control, in the same run, so neither can pass by
+  measuring nothing.
+
 ## v0.8.0 - 2026-08-31
 
 **This is a MINOR bump (0.8.0), not a patch.** Not because the command surface moved: it did not.

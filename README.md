@@ -180,7 +180,11 @@ with no daemon and no Docker Desktop, the same on Linux, WSL2 and ARM boards. On
 with that: a stack is one pod sharing one network namespace, so **two services cannot both listen on
 the same container port**, even when their published ports differ. That is what makes a stack start
 in milliseconds, and `kern compose up` refuses the collision by name before it starts anything, so
-you meet it in a second rather than in production. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+you meet it in a second rather than in production. **Or run the stack with `--no-pod`**: each service
+gets its own network namespace, the constraint disappears, and the file needs no edit. The trade is
+name resolution, measured rather than assumed: under `--no-pod` a service no longer resolves another
+by name, so a file whose services address each other by hostname wants the pod.
+[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
 ```yaml
 # compose.yaml - a real stack, unchanged
@@ -307,7 +311,7 @@ than a boundary. Naming a device node, as `i2c` above does, grants that node and
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one 1.52 MB binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
-| `docker-compose.yml` | yes, read as-is (one port per service across the stack) | yes | partial |
+| `docker-compose.yml` | yes, read as-is (one port per service across the stack, or `--no-pod`) | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
 | GPU | on the roadmap | yes | yes |
 
@@ -363,7 +367,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done. Everything above works today:** 944 Rust, 340 Python and 61 Node tests,
+**The core is done. Everything above works today:** 946 Rust, 340 Python and 61 Node tests,
 clippy-clean, `cargo-deny`-clean, on real hardware: Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano,
 Arduino UNO Q. **v0.7.0 is the first published release, and the CLI is stable from it**: verbs,
 flags and `--json` shapes change incompatibly only on a minor bump, after a deprecation entry at

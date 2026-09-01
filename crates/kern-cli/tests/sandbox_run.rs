@@ -175,6 +175,306 @@ int main(int argc, char **argv) {
     return 0;
 }
 "#;
+/// A SIGKILL'D LAUNCHER MUST NOT LEAVE ITS HEALTH CHECKER PROBING FOREVER.
+///
+/// The checker is a bare `fork` that loops on a timer. Every ordinary exit path stops it, but a
+/// SIGKILL'd launcher runs no teardown at all, and MEASURED before this guard: exactly one orphan
+/// survived each kill, sleeping and probing a box that no longer existed. The box itself does not
+/// leak in that case because it already carries a `PR_SET_PDEATHSIG` link to the launcher; the
+/// checker had none, because until now it only ever ran under a supervisor that stopped it by hand.
+///
+/// COUNTED BY `/proc/<pid>/exe`, NOT BY COMMAND LINE, and that is the point rather than a detail: a
+/// `fork` with no `exec` inherits the parent's argv, so the checker and the launcher are byte-identical
+/// on the command line and a `pgrep -f` cannot tell them apart. The unique box name narrows the count
+/// to this test's own processes, because this suite runs in parallel and a global count of `kern`
+/// processes would be measuring the rest of the file.
+#[test]
+fn a_killed_foreground_launcher_takes_its_health_checker_with_it() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "health-orphan");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let name = format!("hc-orphan-{}", std::process::id());
+    let xdg = std::env::temp_dir().join(format!("kern-it-horph-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    // Processes that are BOTH this test binary's `kern` and carry this box's unique name.
+    let mine = |name: &str| -> usize {
+        let exe = PathBuf::from(env!("CARGO_BIN_EXE_kern"));
+        let Ok(rd) = fs::read_dir("/proc") else {
+            return 0;
+        };
+        rd.filter_map(|e| e.ok())
+            .filter(|e| {
+                let p = e.path();
+                if fs::read_link(p.join("exe")).ok().as_ref() != Some(&exe) {
+                    return false;
+                }
+                fs::read(p.join("cmdline"))
+                    .map(|c| String::from_utf8_lossy(&c).contains(name))
+                    .unwrap_or(false)
+            })
+            .count()
+    };
+
+    let mut fg = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            &rootfs,
+            "--health-cmd",
+            "true",
+            "--health-interval",
+            "1",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "60",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn foreground kern");
+
+    // Wait until BOTH the launcher and its checker exist: two processes carrying this name is the
+    // state whose cleanup is under test, and asserting on the count before it is reached would pass
+    // without ever creating an orphan to lose.
+    let mut peak = 0;
+    for _ in 0..150 {
+        peak = mine(&name);
+        if peak >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if peak < 2 {
+        // The box never got far enough to fork a checker (a locked-down runner, a missing shell):
+        // skip rather than assert on a state this host could not produce.
+        eprintln!("skip: the launcher never forked a checker here (saw {peak})");
+        let _ = fg.kill();
+        let _ = fg.wait();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+
+    let _ = fg.kill();
+    let _ = fg.wait();
+    let mut left = peak;
+    for _ in 0..100 {
+        left = mine(&name);
+        if left == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", &name])
+        .output();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["prune", &name])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert_eq!(
+        left, 0,
+        "a SIGKILL'd launcher left {left} process(es) behind (peak was {peak}): the health checker \
+         outlived the box it was probing"
+    );
+}
+
+/// A FOREGROUND BOX'S `--health-cmd` MUST BE EVALUATED, NOT SILENTLY IGNORED.
+///
+/// `spawn_health_checker` had exactly one call site, inside `run_detached`, so a box started
+/// WITHOUT `-d` accepted `--health-cmd`, exited 0, and never wrote a health status at all. `kern ps`
+/// showed an empty HEALTH column for a box that had explicitly asked to be probed: a flag that is
+/// taken and does nothing, with no warning and no error.
+///
+/// THIS IS NOT A CORNER OF THE CLI. `--restart always`/`unless-stopped` installs a systemd unit
+/// whose `ExecStart` deliberately STRIPS `-d` (`Type=simple`, systemd is the supervisor), so every
+/// persistent box runs on the foreground path. A `kern compose` stack that carries `restart:` and
+/// runs with `--no-pod` therefore gates on a health status nobody ever computes, and a
+/// `depends_on: condition: service_healthy` waits the full timeout and fails with
+/// `last status: 'none yet'` while the service underneath is up and serving. Reported against
+/// v0.8.0 on a four-service stack and reduced to the two commands below.
+///
+/// THE DETACHED CASE IS THE POSITIVE CONTROL, in the same test, on the same rootfs, with the same
+/// probe: if this harness ever stops observing health at all, the control fails instead of the
+/// subject passing by absence.
+#[test]
+fn a_foreground_box_evaluates_its_health_check() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "health-fg");
+    // The probe runs INSIDE the box as `/bin/sh -c <cmd>`, so the rootfs needs a shell. busybox is
+    // the shell when it is invoked under that name.
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-hfg-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    // Read the health field `kern ps --json` reports for `name`, or None while the box is absent.
+    // Parsed by field name rather than by position so a new column cannot silently shift it.
+    let health_of = |name: &str| -> Option<String> {
+        // Retry on EMPTY stdout, for the reason `kern_out` documents at the top of this file: under
+        // this suite's parallelism `Command::output()`'s pipe occasionally returns nothing even
+        // though the command ran. Without this the CONTROL below flaked on the first run of this
+        // test, which is worse than having no control at all: a control that can fail on its own
+        // teaches the reader to ignore it.
+        let mut txt = String::new();
+        for _ in 0..4 {
+            let out = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["ps", "--json"])
+                .output()
+                .ok()?;
+            txt = String::from_utf8_lossy(&out.stdout).to_string();
+            if !txt.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let key = format!("\"name\":\"{name}\"");
+        let at = txt.find(&key)?;
+        let tail = &txt[at..];
+        let h = tail.find("\"health\":\"")?;
+        let rest = &tail[h + 10..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    };
+
+    // WAIT FOR A STATUS, NOT FOR "ANY STATUS". The first value a healthy box publishes is
+    // `starting`, not `healthy`: the checker writes `starting` the moment it forks and only flips
+    // after the first probe returns. An earlier draft returned the first NON-EMPTY value and so
+    // compared `starting` against `healthy`, which made the control fail three runs out of three
+    // and pass whenever anything slowed the loop down - a race dressed as a flake.
+    //
+    // Returns the LAST status seen, so the two cases stay distinguishable: a box whose checker runs
+    // ends on `healthy`, and a box whose checker never ran has nothing to report and ends on "".
+    let wait_healthy = |name: &str| -> String {
+        let mut last = String::new();
+        for _ in 0..120 {
+            if let Some(h) = health_of(name) {
+                if h == "healthy" {
+                    return h;
+                }
+                last = h;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        last
+    };
+
+    // ---- POSITIVE CONTROL: the detached path, which has always worked.
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "hc-detached",
+            "--rootfs",
+            &rootfs,
+            "-d",
+            "--health-cmd",
+            "true",
+            "--health-interval",
+            "1",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "20",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let detached = wait_healthy("hc-detached");
+
+    // ---- SUBJECT: the same box, same probe, without `-d`. A foreground box blocks, so it is a
+    // child this test kills at the end rather than a `.output()` that would never return.
+    let mut fg = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "hc-foreground",
+            "--rootfs",
+            &rootfs,
+            "--health-cmd",
+            "true",
+            "--health-interval",
+            "1",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "20",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn foreground kern");
+    let foreground = wait_healthy("hc-foreground");
+
+    // Tear everything down BEFORE asserting, so a failure does not leave a box and a rootfs behind.
+    let _ = fg.kill();
+    let _ = fg.wait();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "hc-detached", "hc-foreground"])
+        .output();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["prune", "hc-detached"])
+        .output();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["prune", "hc-foreground"])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert_eq!(
+        detached, "healthy",
+        "the CONTROL failed: a detached box no longer records health, so this test is measuring \
+         nothing and the assertion below would be meaningless"
+    );
+    assert_eq!(
+        foreground, "healthy",
+        "a foreground box took --health-cmd and never evaluated it (health was {foreground:?}); \
+         every `restart:` box runs on this path, because the systemd unit strips -d"
+    );
+}
 
 /// Pull the hex value of a `CapXxx:` line out of `/proc/self/status` text (the last whitespace field).
 fn cap_hex<'a>(status: &'a str, cap: &str) -> Option<&'a str> {

@@ -1184,6 +1184,37 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let timeout_wd = (args.timeout > 0 && !managed)
         .then(|| spawn_foreground_timeout(args.timeout))
         .flatten();
+    // `--health-cmd` ON THE FOREGROUND PATH TOO. It used to be armed only in `run_detached`, so a box
+    // started without `-d` accepted the flag and never evaluated it: `kern ps` showed an empty HEALTH
+    // column, with no warning and exit 0. That is not a corner of the CLI - `--restart
+    // always`/`unless-stopped` installs a systemd unit whose `ExecStart` strips `-d` (`Type=simple`,
+    // systemd is the supervisor), so EVERY persistent box runs here. A `kern compose` stack carrying
+    // `restart:` under `--no-pod` therefore gated on a status nobody computed, and
+    // `depends_on: condition: service_healthy` timed out with `last status: 'none yet'` while the
+    // service underneath was up. Reported against v0.8.0.
+    //
+    // FORKED HERE, BEFORE `run_in_sandbox_with`, for the same reason the timeout watchdog above is: a
+    // process forked after the `unshare(CLONE_NEWPID)` lands INSIDE the box's pid namespace, where it
+    // becomes an un-reapable zombie on box exit and deadlocks the namespace teardown. The checker does
+    // not need PID 1 at fork time - it re-reads `pid1` from the registry each round, which is also how
+    // it follows a `--restart` - so there is nothing to wait for.
+    //
+    // Keyed by THIS process's pid, the same value the entry above was registered under, so
+    // `set_health` and `kern ps` agree on where the status lives.
+    let health_wd = args.health_cmd.map(|cmd| {
+        spawn_health_checker(
+            name.as_str().to_string(),
+            std::process::id() as i32,
+            OwnedHealth {
+                cmd: cmd.to_string(),
+                interval: args.health_interval,
+                retries: args.health_retries,
+                start_period: args.health_start_period,
+                timeout: args.health_timeout,
+                action: health_action,
+            },
+        )
+    });
     // Egress filter: spawn BOTH helpers NOW, while box_run is still in the HOST pid namespace (before
     // `run_in_sandbox_with` does `unshare(CLONE_NEWPID)`). Spawning them from the `on_started` callback
     // instead would land them in the BOX pid namespace (box_run's `pid_for_children` is the box pidns by
@@ -1242,6 +1273,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     );
     pt.mark("box lifetime (spawn->exit)");
     cancel_foreground_timeout(timeout_wd);
+    // The box has exited: stop the checker and drop its status. This path leaves via `process::exit`,
+    // which skips Drop, so an unstopped checker would outlive the box as an orphan - the shape the
+    // `--timeout` watchdog was once found leaking in.
+    stop_health_checker(health_wd, name.as_str(), std::process::id() as i32);
     // The box has exited: SIGKILL the egress helpers NOW (this foreground path leaves via
     // `process::exit`, which skips Drop, so an implicit drop would leak the proxy + pump).
     drop(egress_guard);
@@ -2187,13 +2222,7 @@ fn run_detached(
             crate::eintr::reap(tp);
         }
     }
-    if let Some(hp) = health_pid {
-        unsafe {
-            libc::kill(hp, libc::SIGTERM);
-            crate::eintr::reap(hp);
-        }
-        registry::clear_health(name.as_str(), pid);
-    }
+    stop_health_checker(health_pid, name.as_str(), pid);
     if let Some(p) = path {
         registry::unregister(&p);
     }

@@ -20,8 +20,25 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> i
     if child != 0 {
         return child;
     }
-    // CHILD: shed inherited fds (the detached box's readiness pipe would otherwise hang `box -d`),
-    // then quiet stdio so probe output doesn't land in the box log.
+    // CHILD: die with the launcher. Without this a SIGKILL'd parent (which skips every teardown,
+    // including `stop_health_checker`) left this loop probing a box that no longer exists, forever -
+    // measured: one orphan per SIGKILL, and the box itself does not leak because it already carries
+    // the same link. The box's PDEATHSIG is set for exactly this reason; the checker had no such
+    // guard because it only ever ran under a supervisor that stopped it explicitly.
+    //
+    // The prctl has a well-known race: if the parent dies between the `fork` and here, the signal has
+    // already been delivered to nobody. Re-reading `getppid` after arming closes it - a changed
+    // parent means we were reparented, so there is nothing left to probe for.
+    //
+    // Safe on BOTH launch paths: `box_run`'s only scope re-exec happens before either fork site, so
+    // this process's parent keeps its pid for as long as the box lives.
+    let launcher = unsafe { libc::getppid() };
+    arm_pdeathsig();
+    if unsafe { libc::getppid() } != launcher {
+        unsafe { libc::_exit(0) };
+    }
+    // Shed inherited fds (the detached box's readiness pipe would otherwise hang `box -d`), then
+    // quiet stdio so probe output doesn't land in the box log.
     kern_isolation::shed_inherited_fds(-1);
     detach_stdio(None);
     registry::set_health(&name, pid, "starting");
@@ -678,6 +695,28 @@ pub(crate) fn feed_timeout_pid(wd: Option<(i32, i32)>, pid1: i32) {
 /// still-blocked watchdog reads EOF and gives up), then SIGKILL and reap it. Reaping before we return
 /// means the watchdog's pid can't be reused, and closing/killing a still-sleeping one stops it before
 /// it can signal. No-op when no timeout is armed.
+/// Stop a health checker and drop the status it published.
+///
+/// SIGTERM rather than SIGKILL: the checker is a plain loop with no state to flush, but a terminated
+/// child still has to be reaped or the launcher leaves a zombie, and `--restart` boxes start and
+/// stop often enough for that to accumulate. `clear_health` then removes the sidecar so `kern ps`
+/// does not report the health of a box that is gone.
+///
+/// ONE FUNCTION FOR BOTH LAUNCH PATHS. The detached path had this inline and the foreground path had
+/// no checker at all; giving the foreground path its own copy of the teardown is how the two drift.
+/// `key_pid` is the pid the registry entry is keyed by (the supervisor's when detached, the
+/// launcher's in the foreground), which is what `set_health` wrote under.
+pub(crate) fn stop_health_checker(checker: Option<i32>, name: &str, key_pid: i32) {
+    let Some(hp) = checker else {
+        return;
+    };
+    unsafe {
+        libc::kill(hp, libc::SIGTERM);
+        crate::eintr::reap(hp);
+    }
+    registry::clear_health(name, key_pid);
+}
+
 pub(crate) fn cancel_foreground_timeout(wd: Option<(i32, i32)>) {
     if let Some((wd_pid, wfd)) = wd {
         unsafe {
