@@ -6,6 +6,12 @@
 # gate. When CI goes red, run this to reproduce it without pushing.
 set -eu
 kern="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
+
 
 # Use the current repo if run from inside one, else a throwaway stand-in project.
 if root="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -f "$root/ci/build.sh" ]; then

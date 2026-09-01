@@ -304,6 +304,30 @@ volumes    = ["/data:/data:ro", "/etc/app:/app"]  # --volume / -v  (repeatable)
 | `ulimits`           | `--ulimit`          |
 | `stop_grace_period` | `--stop-timeout`    |
 | `vcpu`/`vdisk`/`vgpio` | positional `vcpu:<name>` … |
+| `security_profile`  | `--security-profile` |
+
+### `[kern] allow_device_grants`
+
+A compose stack that names a `vgpio` profile is REFUSED unless the person running it says so, because
+that profile resolves to host device nodes and, unlike a cpu or disk profile, there is no sense in
+which the local grant is the smaller one: `/dev/gpiochip0` is not a smaller `/dev/gpiochip1`. The
+acknowledgement is `--allow-device-grants` on the command line, or this key:
+
+```toml
+[kern]
+allow_device_grants = true
+```
+
+It exists for the case the command line cannot reach. A service with `restart:` becomes a systemd unit
+whose `ExecStart` nobody types, so without a persistent grant such a service either never restarts
+after a reboot (and nobody finds out until the machine reboots) or the generated unit has to carry the
+permission itself, which is a self-perpetuating hardware grant on a machine nobody is watching.
+
+**This key is read from YOUR config only.** A stack file can name its own config (`config =
+"other.toml"`), so honouring the key from there would let a downloaded bundle ship its own permission.
+Only the default config (or `KERN_CONFIG`, which is equally yours) is consulted, and a config that
+cannot be read is not a grant. Run `kern compose <file> config` first: it prints the exact device paths
+each profile name reaches on this host.
 
 Everything else shares the flag's long name. **Two keys have no flag**, `port` and `expose`: they
 declare what a service listens on so `compose` can refuse a port collision inside the shared pod

@@ -46,12 +46,19 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
     // quiet stdio so probe output doesn't land in the box log.
     kern_isolation::shed_inherited_fds(-1);
     detach_stdio(None);
+    // PIN THE LAUNCHER'S PID, read here while it is provably still our parent. `pid` is this
+    // checker's only handle on its box: every round resolves the box through it, and a pid is a
+    // number the kernel may hand to someone else once its owner is gone. See `pid_is_still`.
+    let launcher_start = registry::proc_starttime(pid);
     registry::set_health(&name, pid, "starting");
     let probe = ["/bin/sh".to_string(), "-c".to_string(), hc.cmd];
     let mut elapsed = 0u64; // seconds since the checker started
     let mut fails = 0u32; // consecutive failures
     let mut acted = false; // acted on the *current* unhealthy episode (reset when healthy again)
     let mut first = true;
+    // The name we ourselves last wrote a status under, so the terminal state below never has to
+    // ask the pid (which, at the moment we need it, has stopped being ours).
+    let mut last_name = name.clone();
     loop {
         // The FIRST probe runs after a short fixed delay, NOT after a full `interval`: a dependent box
         // gated on `service_healthy` should start as soon as the dependency is actually ready, not wait
@@ -70,10 +77,40 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
         // `name_for_pid` is a readdir + filename match (no per-entry file reads), far cheaper than a
         // `list()`. Then `find(cur)` opens ONLY this box's entry - a full `list()` per interval per
         // checker would be O(N²) steady-state across N checkers.
+        // OUR LAUNCHER, OR NOBODY. Asked before the pid is used for anything: once it is gone there
+        // is no box to check, and a recycled pid would make every lookup below answer about someone
+        // else's box - including `set_health`, which would then be writing a health status onto a
+        // stranger. Exiting is the whole of the correct behaviour here, and it does not depend on
+        // PDEATHSIG having been prompt.
+        //
+        // IT SAYS SO ON THE WAY OUT, because this is the one guard in the checker whose failure is
+        // QUIET. A false match keeps probing a stranger and is loud in its own way; a false mismatch
+        // stops checking a LIVE box, and `healthy` means "healthy as of the last check" with nothing
+        // in the record saying when that was. A frozen status is indistinguishable from a box that
+        // keeps answering the same way, so the exit writes a terminal state rather than leaving the
+        // reader to infer one from a timestamp nobody displays.
+        //
+        // Under `last_name`, never a name resolved from the pid: we have just proved that pid is no
+        // longer ours, so anything it resolves to belongs to someone else, and the record we may
+        // write is the one we ourselves last wrote.
+        if !registry::pid_is_still(pid, launcher_start) {
+            // AN UPDATE, NEVER A RESURRECTION. `kern stop` clears the health sidecar from a DIFFERENT
+            // process, so a checker that wakes after that clear would otherwise recreate a record for
+            // a box that is gone, and nothing sweeps the health directory. Writing only over a record
+            // that is still there keeps the terminal state to the case it is for: a checker that
+            // outlived its launcher while the record still exists.
+            note_checker_gave_up(&last_name, pid);
+            unsafe { libc::_exit(0) };
+        }
         let cur = registry::name_for_pid(pid).unwrap_or_else(|| name.clone());
+        last_name = cur.clone();
         let entry = registry::find(&cur);
-        let pid1 = entry.as_ref().map(|b| b.pid1).unwrap_or(0);
-        let status = if pid1 > 0 {
+        // Through `live_pid1`, never the raw field: this runs on a TIMER, so it is the one consumer
+        // that re-reads the recorded pid over and over while the box may be dying underneath it. A pid
+        // recycled between two rounds would otherwise send the probe into a stranger's namespaces.
+        // Unresolvable reads as "no init yet" - the box is `starting`, which is what the window means.
+        let pid1 = entry.as_ref().and_then(registry::Instance::live_pid1);
+        let status = if let Some(pid1) = pid1 {
             // Probe under the box's RECORDED seccomp mode, read from the same entry as `pid1`, so the
             // probe's filter matches PID 1 by construction - not by the assumption that the checker's
             // environment still equals the box's creation environment.
@@ -104,12 +141,14 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
             acted = true;
             match hc.action {
                 HealthAction::None => {}
-                // Restart: kill box PID 1 so the supervisor's on-failure policy re-runs it. Signal
-                // via a pidfd taken now, so a pid recycled during a restart gap can't be the victim
-                // (the registry-supplied `pid1` could be stale between the box exiting and the
-                // supervisor re-registering the new one). Falls back to `kill` on kernels < 5.3.
+                // Restart: kill box PID 1 so the supervisor's on-failure policy re-runs it. Two
+                // separate guards, because they answer different questions. `live_pid1` (above) says
+                // the NUMBER is still the process we registered - a pidfd cannot say that, since it
+                // faithfully pins whoever holds the pid at the moment of the open, stranger included.
+                // The pidfd then closes the remaining TOCTOU between that instant and the signal.
+                // Falls back to `kill` on kernels < 5.3.
                 HealthAction::Restart => {
-                    if pid1 > 0 {
+                    if let Some(pid1) = pid1 {
                         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
                         unsafe { signal_box(pidfd, pid1, libc::SIGKILL) };
                         if pidfd >= 0 {
@@ -757,6 +796,24 @@ pub(crate) fn feed_timeout_pid(wd: Option<(i32, i32)>, pid1: i32) {
 /// no checker at all; giving the foreground path its own copy of the teardown is how the two drift.
 /// `key_pid` is the pid the registry entry is keyed by (the supervisor's when detached, the
 /// launcher's in the foreground), which is what `set_health` wrote under.
+/// Record that a checker stopped checking, over a record that still exists.
+///
+/// AN UPDATE, NEVER A RESURRECTION, and that is the whole of the logic worth asserting. `kern stop`
+/// clears the health sidecar from a DIFFERENT process and nothing sweeps that directory, so a checker
+/// that wakes after the clear would otherwise recreate a record for a box that is gone and leave it
+/// there forever. Writing only over a record that is still present keeps the terminal state to the
+/// case it exists for.
+///
+/// Split out of the loop because the loop cannot be reached from a test: the branch that calls this
+/// needs a recycled pid, and forcing one means running the counter to `pid_max`. The condition and
+/// the text can be asserted without that.
+pub(crate) fn note_checker_gave_up(name: &str, pid: i32) {
+    if registry::health_of(name, pid).is_empty() {
+        return;
+    }
+    registry::set_health(name, pid, "stopped checking: launcher pid changed");
+}
+
 pub(crate) fn stop_health_checker(checker: Option<i32>, name: &str, key_pid: i32) {
     let Some(hp) = checker else {
         return;

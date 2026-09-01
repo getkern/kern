@@ -418,6 +418,27 @@ pub fn gc(images: bool) -> Result<(), Error> {
             );
         }
     }
+    // LAST, AFTER EVERY REAPER. The health sidecars are the one artefact nothing swept: measured,
+    // SIGKILL a detached box's supervisor and both its entry and its health record survive; the
+    // reapers above remove the entry and used to leave the record, so a host accumulated one file per
+    // abnormally-terminated box, forever. Placed here and not earlier for a measured reason: an
+    // orphaned box is still LIVE in the registry until the reaper above collects it, so a sweep that
+    // ran first saw it as live and kept its record.
+    let live: Vec<(String, i32)> = registry::list()
+        .into_iter()
+        .map(|b| (b.name, b.pid))
+        .collect();
+    let swept_health = registry::sweep_health(&live);
+    if swept_health > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}swept{} {swept_health} stale health record{}",
+            p.g,
+            p.z,
+            if swept_health == 1 { "" } else { "s" }
+        );
+    }
+
     Ok(())
 }
 

@@ -20,7 +20,7 @@ pub struct Instance {
     pub pid: i32,
     /// PID 1 inside the box (host pid-namespace numbering), for `kern exec` to join its
     /// namespaces. 0 until the supervisor learns it (or for an older registry entry).
-    pub pid1: i32,
+    pub pid1_recorded: i32,
     pub rootfs: String,
     pub command: String,
     /// Unix start time (seconds).
@@ -28,6 +28,13 @@ pub struct Instance {
     /// The pid's kernel start-time (`/proc/<pid>/stat` field 22, clock ticks since boot). Pins
     /// the identity of the pid so a reused pid can't masquerade as a live box.
     pub starttime: u64,
+    /// [`pid1`](Self::pid1)'s kernel start-time, recorded the moment the supervisor learns it. What
+    /// [`starttime`](Self::starttime) does for the supervisor pid, this does for the box's INIT: every
+    /// consumer that enters the box by opening `/proc/<pid1>/ns/*` (`exec`, `cp`, `commit`, the egress
+    /// pump, the health probe) would otherwise be resolving a bare pid, and a recycled pid on a busy
+    /// host puts them in a STRANGER's namespaces. `0` for an entry written before this field existed,
+    /// which [`live_pid1`](Self::live_pid1) treats as "unknown" exactly as [`is_alive`] does.
+    pub pid1_starttime: u64,
     /// Published ports summary for `kern ps` (e.g. `8080->80, 127.0.0.1:443->443`); empty if none.
     pub ports: String,
     /// Comma-separated **named volumes** this box mounts (from `-v name:/dst`) - so `kern volume rm`
@@ -110,6 +117,9 @@ pub struct Instance {
     /// cap in `capdrops`/`capadds`, or an unrecognised `seccompmode`). `exec` refuses on a corrupt
     /// record rather than apply a partial posture that could be less restrictive than the box's.
     /// Derived at parse time; never serialised.
+    /// A field is PRESENT but unreadable, so the record cannot be trusted and `exec` refuses. Named
+    /// for the posture fields it was built for, and no longer only theirs: `pid1starttime` joins it,
+    /// because a value that cannot be parsed must not degrade to the permissive default.
     pub posture_corrupt: bool,
     /// The box's DEDICATED cgroup v2 path (absolute, under `/sys/fs/cgroup`), recorded once PID 1 is
     /// known. EMPTY for a box with no dedicated cgroup (no systemd-user: its processes share kern's own
@@ -144,18 +154,48 @@ impl Instance {
         self.volumes.split(',').filter(|v| !v.is_empty())
     }
 
+    /// The box's PID 1, **only if it is still the process we registered** - the SOLE way to reach a
+    /// recorded `pid1` for anything that then enters `/proc/<pid1>/ns/*`.
+    ///
+    /// Reading `self.pid1_recorded` directly is the bug this exists to prevent. `pid1` is a bare pid, so once
+    /// the init exits, the kernel is free to hand that number to an unrelated process; a consumer that
+    /// `setns`-es into it lands in a STRANGER's namespaces and runs the caller's command there. The
+    /// health checker makes that reachable on a TIMER rather than only on a user's command, which is
+    /// what turns a narrow race into an exposure worth pinning.
+    ///
+    /// `None` means "don't trust this number": not recorded yet (`0`, the pre-init window), or a
+    /// recorded start-time that no longer matches. Callers fall back to `child_of(self.pid)`, which
+    /// resolves through the SUPERVISOR - itself start-time pinned - and so cannot name a recycled pid.
+    /// [`is_alive`]'s tolerance is deliberately shared: an entry from before `pid1starttime` existed,
+    /// or a `/proc` read that transiently fails, reads as "unknown" and is accepted, exactly as the
+    /// supervisor's own liveness test does.
+    pub fn live_pid1(&self) -> Option<i32> {
+        (self.pid1_recorded > 0 && is_alive(self.pid1_recorded, self.pid1_starttime))
+            .then_some(self.pid1_recorded)
+    }
+
+    /// Record the box's PID 1 the moment the supervisor learns it. The SOLE writer of [`pid1`], so the
+    /// number and the start-time that pins it cannot be written apart: assigning the field by hand at
+    /// one of the two launch paths and forgetting the other is precisely how [`live_pid1`] would come
+    /// to answer `Some` for a pid it can no longer vouch for. Reads `/proc` while the child is known
+    /// alive (we are its parent, called from the `on_started` callback), so the pin is the real one.
+    pub fn record_pid1(&mut self, pid1: i32) {
+        self.pid1_recorded = pid1;
+        self.pid1_starttime = proc_starttime(pid1);
+    }
+
     /// The pid to resolve the box's DEDICATED cgroup from (for `pause`/`stats`/`update`/freeze).
     /// Use the box's in-box PID 1 (`pid1`, host-namespace numbering) - it always lives in the box's
     /// real cgroup on BOTH cap paths: the direct `kern.slice/kern-box-*` path (where the SUPERVISOR
     /// pid does NOT - it stays in the launcher's cgroup) and the systemd-scope re-exec path (where
     /// both do). Fall back to the supervisor `pid` when `pid1` isn't learned yet (0) or for an older
-    /// registry entry, matching the pre-existing behaviour.
+    /// registry entry, matching the pre-existing behaviour - and equally when the recorded `pid1` is
+    /// no longer the process we registered, because `pause`/`update` WRITE to the cgroup this resolves:
+    /// reading it out of a recycled pid's `/proc` would point those writes at a stranger's cgroup. The
+    /// supervisor is start-time pinned by [`is_alive`] on the way out of the registry, so falling back
+    /// to it is the conservative answer, not a second unpinned guess.
     pub fn cgroup_pid(&self) -> i32 {
-        if self.pid1 > 0 {
-            self.pid1
-        } else {
-            self.pid
-        }
+        self.live_pid1().unwrap_or(self.pid)
     }
 }
 
@@ -198,6 +238,44 @@ pub fn health_of(name: &str, pid: i32) -> String {
 }
 
 /// Remove a box's health sidecar (on stop / de-register).
+/// Remove every health record whose `<name>-<pid>` is no longer a live box, and report how many.
+///
+/// NOTHING SWEPT THIS DIRECTORY. Measured: SIGKILL a detached box's supervisor and both its registry
+/// entry and its health record survive; `kern gc` then removes the entry and leaves the record, so a
+/// host accumulates one file per abnormally-terminated box, forever, in `$XDG_RUNTIME_DIR`. Small,
+/// unbounded, and the reason the checker's terminal state has to guard against resurrecting a record
+/// rather than simply writing one.
+///
+/// Keyed on the FULL `<name>-<pid>`, like every other identity in this file: a name alone would
+/// delete the record of a live box that reused a stopped box's name.
+pub fn sweep_health(live: &[(String, i32)]) -> usize {
+    let Ok(d) = health_dir() else {
+        return 0;
+    };
+    let Ok(rd) = fs::read_dir(&d) else {
+        return 0;
+    };
+    // A SET, not a linear scan per record. Both sides grow with the fleet: a host with many boxes has
+    // many live entries AND many stale records, so the pairwise form is quadratic in exactly the case
+    // this function exists for. Built once, borrowed as `(&str, i32)` so the lookup allocates nothing.
+    let live: std::collections::HashSet<(&str, i32)> =
+        live.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+    let mut n = 0;
+    for e in rd.flatten() {
+        let fname = e.file_name();
+        let Some((name, pid)) = entry_split(&fname) else {
+            continue; // not a `<name>-<pid>` record; leave anything we do not recognise alone
+        };
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        if !live.contains(&(name, pid)) && fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn clear_health(name: &str, pid: i32) {
     if let Ok(d) = health_dir() {
         let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
@@ -907,10 +985,10 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\n",
         inst.name,
         inst.pid,
-        inst.pid1,
+        inst.pid1_recorded,
         one_line(&inst.rootfs),
         one_line(&inst.command),
         inst.started,
@@ -937,6 +1015,7 @@ fn encode(inst: &Instance) -> String {
         inst.cgroup_id
             .map(|(d, i)| format!("{d}:{i}"))
             .unwrap_or_default(),
+        inst.pid1_starttime,
     )
 }
 
@@ -1731,6 +1810,28 @@ pub fn volumes_in_use() -> std::collections::HashSet<String> {
 /// entry on a momentary read failure is fail-DANGEROUS - it would drop a running box from `ps`/
 /// `stop` and let `volume prune` delete a volume it still mounts. Pid-reuse is still caught whenever
 /// the live read succeeds (the overwhelmingly common case).
+/// Is `pid` STILL the process whose start-time we recorded? The registry's own reuse rule
+/// ([`is_alive`]), exposed for a caller that holds a pid across time and has no registry entry to
+/// re-read it from.
+///
+/// The health checker is the one that needs it: it is forked from the launcher, keeps the launcher's
+/// pid for as long as it runs, and resolves its box through that number every round. `PR_SET_PDEATHSIG`
+/// means it should never outlive that launcher - MEASURED, a detached box with a health check runs one
+/// more process than one without, and after the supervisor is SIGKILLed both converge to the same
+/// count, so the checker does die with it. But that is a timing argument about signal delivery, and
+/// the number it holds admits the wrong answer regardless: if the launcher's pid were ever recycled by
+/// another `kern` that registered a box, the lookup would resolve to a STRANGER'S box and the checker
+/// would write health for it. Asking this first makes the guarantee structural instead of prompt.
+pub fn pid_is_still(pid: i32, starttime: u64) -> bool {
+    is_alive(pid, starttime)
+}
+
+/// RESOLUTION LIMIT, measured rather than assumed: `starttime` is in CLOCK TICKS (100 Hz on the hosts
+/// this runs on), so two processes created inside one tick share it. A pid recycled within a tick of
+/// its original's start is therefore indistinguishable to this rule. Found by accident while forcing a
+/// real recycle through `ns_last_pid`: the first attempt produced a decoy with the SAME start-time as
+/// the process it replaced, which made the test inconclusive rather than red. Narrow, but it is a
+/// property of the mechanism and not of the test, so it belongs here.
 fn is_alive(pid: i32, starttime: u64) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0 {
         return false;
@@ -1763,23 +1864,170 @@ pub(crate) fn stat_field(stat: &str, n: usize) -> Option<&str> {
 /// The sole child of `ppid` (a box supervisor forks exactly one child - PID 1 of the box), found
 /// by scanning `/proc/*/stat` for a process whose parent is `ppid`. Fallback for `kern exec` when
 /// the supervisor hadn't yet recorded PID 1. `None` if no such process exists.
-pub fn child_of(ppid: i32) -> Option<i32> {
-    let want = ppid.to_string();
+/// The pid of the box init supervised by `supervisor`: the descendant that is **PID 1 inside its own
+/// pid namespace**, which is what a box init is and what nothing else under a supervisor is.
+///
+/// REPLACES A FALLBACK THAT COULD NOT SUCCEED. The old rule was "the supervisor's sole child", and
+/// MEASURED on this build the supervisor has two children even for a box with no health check, while
+/// the init is a GRANDCHILD: the old `child_of` therefore returned a `kern` helper and every consumer
+/// that fell back to it failed with "box is not running (its namespaces are gone)". A recovery path
+/// that cannot recover is worse than none, because callers are written as though it works - and the
+/// pid pin sends MORE cases down it, since a refused pin lands here by design.
+///
+/// THE TEST IS THE NAMESPACE, not the position in the tree. `/proc/<pid>/status` reports `NSpid` as
+/// the pid in each namespace from the outermost inward, so a process that is `1` in its innermost
+/// namespace is an init. Restricting that to descendants of `supervisor` is what makes it OUR init
+/// rather than any box on the host.
+///
+/// WALKS DOWN, NOT ACROSS. A first version scanned every entry in `/proc` and read `status` for each:
+/// MEASURED, one `exec` on this path opened `/proc/<pid>/status` **523 times** on a host with 522
+/// processes, because the cost was the size of the process table rather than the size of the box.
+/// Descending through `children` reads only the supervisor's own descendants, which is a handful.
+/// The scan survives as a FALLBACK for a kernel built without `CONFIG_PROC_CHILDREN`, where the
+/// `children` file does not exist and walking down is not possible.
+///
+/// Bounded on both paths: the descent visits at most [`MAX_DESCENDANTS`] processes, so a `/proc` that
+/// changes underneath (a pid recycled into a cycle while we walk) cannot spin. Returns `None` rather
+/// than a guess when nothing matches: a wrong pid here is a consumer entering the wrong namespaces,
+/// which is the entire class this file spent the branch closing.
+pub fn box_init_under(supervisor: i32) -> Option<i32> {
+    if supervisor <= 0 {
+        return None;
+    }
+    // Our own depth, read once: every candidate is judged against it rather than against a constant.
+    let Some((my_depth, _)) = nspid_depth_and_last(std::process::id() as i32) else {
+        return None; // no `NSpid` on this kernel: we cannot tell a box init from a nested one
+    };
+    let mut queue: Vec<i32> = vec![supervisor];
+    let mut visited = 0usize;
+    let mut saw_children_file = false;
+    while let Some(pid) = queue.pop() {
+        visited += 1;
+        if visited > MAX_DESCENDANTS {
+            return None;
+        }
+        let kids = children_of(pid);
+        saw_children_file |= kids.is_some();
+        for child in kids.unwrap_or_default() {
+            if is_namespace_init_below(child, my_depth) {
+                return Some(child);
+            }
+            queue.push(child);
+        }
+    }
+    // No `children` file anywhere on the walk: this kernel does not expose it, so the descent could
+    // not have found anything and the whole-table scan is the only way left.
+    if saw_children_file {
+        return None;
+    }
+    box_init_by_scan(supervisor)
+}
+
+/// Cap on the descendants a single [`box_init_under`] walk will visit. A box supervisor has a handful;
+/// a number this far above it can only mean `/proc` changed underneath the walk.
+const MAX_DESCENDANTS: usize = 4096;
+
+/// The direct children of `pid`, or `None` when this kernel has no `children` file (pre-4.x, or
+/// `CONFIG_PROC_CHILDREN=n`). Reads every thread's list, because a process may fork from a thread
+/// other than its main one and the file is per-thread.
+fn children_of(pid: i32) -> Option<Vec<i32>> {
+    let tasks = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut out = Vec::new();
+    let mut any = false;
+    for t in tasks.flatten() {
+        let Some(tid) = t.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(list) = fs::read_to_string(format!("/proc/{pid}/task/{tid}/children")) else {
+            continue;
+        };
+        any = true;
+        out.extend(
+            list.split_ascii_whitespace()
+                .filter_map(|s| s.parse::<i32>().ok()),
+        );
+    }
+    any.then_some(out)
+}
+
+/// [`box_init_under`] for a kernel with no `children` file: scan the whole process table and keep the
+/// nested init whose parent chain reaches `supervisor`. O(processes on the host), which is why it is
+/// the fallback and not the rule.
+fn box_init_by_scan(supervisor: i32) -> Option<i32> {
+    let (my_depth, _) = nspid_depth_and_last(std::process::id() as i32)?;
     let entries = fs::read_dir("/proc").ok()?;
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
             continue;
         };
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        // Post-')' fields: state ppid ... → ppid is the 2nd token (field 4).
-        if stat_field(&stat, 4) == Some(want.as_str()) {
+        if pid > 0 && is_namespace_init_below(pid, my_depth) && has_ancestor(pid, supervisor) {
             return Some(pid);
         }
     }
     None
+}
+
+/// Is `pid` the init of a pid namespace **exactly one level below ours**?
+///
+/// `NSpid` in `/proc/<pid>/status` lists the pid in each namespace, outermost first, so its FIELD
+/// COUNT is the process's namespace depth and its last field is the pid in the innermost one. An init
+/// is a process whose last field is `1`.
+///
+/// THE DEPTH IS THE HALF THAT MATTERS, and it was missing. "Last field is 1" accepts every nested
+/// init under the supervisor, and a box whose own workload creates a pid namespace has TWO of them:
+/// MEASURED with `--privileged` and a workload of `unshare -p --fork`, the supervisor's descendants
+/// were `NSpid: <p> 1` (the box init) and `NSpid: <p> 2 1` (the workload's). Both qualified, so which
+/// one the walk returned was an artefact of `children` ordering rather than a decision - and the
+/// wrong one puts `exec` inside the workload's namespace and resolves the cgroup through the wrong
+/// pid, which is the pair of `[P0]`s this file spent the branch closing.
+///
+/// RELATIVE TO THE CALLER, never an absolute `2`. Inside a container kern is itself already nested,
+/// so the box's init sits at OUR depth plus one whatever that is - a fixed number would work on this
+/// host and fail on a CI runner, which is the one environment this branch has never seen.
+fn is_namespace_init_below(pid: i32, my_depth: usize) -> bool {
+    let Some((depth, last)) = nspid_depth_and_last(pid) else {
+        return false;
+    };
+    depth == my_depth + 1 && last == 1
+}
+
+/// `(namespace depth, pid in the innermost namespace)` from `NSpid`, or `None` when the kernel does
+/// not report it (pre-4.1) or the process is gone. `None` costs the fallback a candidate and never
+/// mis-identifies one.
+fn nspid_depth_and_last(pid: i32) -> Option<(usize, i32)> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let rest = status.lines().find_map(|l| l.strip_prefix("NSpid:"))?;
+    let mut count = 0usize;
+    let mut last = None;
+    for f in rest.split_ascii_whitespace() {
+        count += 1;
+        last = f.parse::<i32>().ok();
+    }
+    Some((count, last?))
+}
+
+/// Does `pid`'s parent chain reach `ancestor`? Bounded to 64 hops: `/proc` is read live, so a chain
+/// that changes mid-walk must terminate rather than loop.
+fn has_ancestor(pid: i32, ancestor: i32) -> bool {
+    let mut cur = pid;
+    for _ in 0..64 {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            return false;
+        };
+        // Post-')' fields: state ppid ... → ppid is the 2nd token (field 4).
+        let Some(ppid) = stat_field(&stat, 4).and_then(|s| s.parse::<i32>().ok()) else {
+            return false;
+        };
+        if ppid == ancestor {
+            return true;
+        }
+        if ppid <= 1 {
+            return false;
+        }
+        cur = ppid;
+    }
+    false
 }
 
 /// A pid's start-time from `/proc/<pid>/stat` field 22 (clock ticks since boot), or 0.
@@ -1892,6 +2140,7 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut name, mut pid) = (None, None);
     let (mut rootfs, mut command, mut ports) = (String::new(), String::new(), String::new());
     let (mut pid1, mut started, mut starttime) = (0i32, 0u64, 0u64);
+    let mut pid1_starttime = 0u64;
     let (mut volumes, mut pod) = (String::new(), String::new());
     let (mut egress, mut landlock_rw) = (String::new(), String::new());
     let (mut memory_max, mut pids_max) = (None, None);
@@ -1937,6 +2186,19 @@ fn parse(body: &str) -> Option<Instance> {
             "command" => command = v.to_string(),
             "started" => started = v.parse().unwrap_or(0),
             "starttime" => starttime = v.parse().unwrap_or(0),
+            // PRESENT-BUT-UNPARSEABLE IS CORRUPTION, absent is compatibility, and `unwrap_or(0)`
+            // could not tell them apart. MEASURED with it: `pid1starttime=` empty, `abc` and `-1`
+            // all collapsed onto `0`, which `is_alive` reads as "unknown, accept", so a mangled
+            // record SILENTLY DISABLED the pid guard on every consumer. Same shape as the posture
+            // fields above and treated the same way: a value we cannot read invalidates the record
+            // rather than degrading it to the permissive default.
+            //
+            // Writes are atomic (staged in a temp, renamed over), so a half-written value is not a
+            // thing that happens by accident: present-and-broken means the file was edited.
+            "pid1starttime" => match v.parse() {
+                Ok(t) => pid1_starttime = t,
+                Err(_) => posture_corrupt = true,
+            },
             "ports" => ports = v.to_string(),
             "volumes" => volumes = v.to_string(),
             "pod" => pod = v.to_string(),
@@ -2016,11 +2278,12 @@ fn parse(body: &str) -> Option<Instance> {
     Some(Instance {
         name: name?,
         pid: pid?,
-        pid1,
+        pid1_recorded: pid1,
         rootfs,
         command,
         started,
         starttime,
+        pid1_starttime,
         ports,
         volumes,
         pod,
@@ -2129,7 +2392,8 @@ impl Instance {
         }
         if self.posture_corrupt {
             return Err(crate::error::Error::Sandbox(format!(
-                "box '{}' has a corrupt security-posture record; refusing to exec - restart the box",
+                "box '{}' has a corrupt registry record (a field is present but unreadable); \
+                 refusing to exec - restart the box",
                 self.name
             )));
         }
@@ -2421,11 +2685,12 @@ mod tests {
         let inst = Instance {
             name: "wd".into(),
             pid: 11,
-            pid1: 12,
+            pid1_recorded: 12,
             rootfs: "/r".into(),
             command: "sleep 1".into(),
             started: 1,
             starttime: 2,
+            pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
             pod: "stack".into(),
@@ -2470,16 +2735,198 @@ mod tests {
         );
     }
 
+    /// THE FALLBACK PICKS THE INIT ONE LEVEL DOWN, NOT ANY NESTED INIT UNDER THE SUPERVISOR.
+    ///
+    /// `box_init_under` finds the box by looking for a descendant that is PID 1 in its own pid
+    /// namespace. A box whose WORKLOAD creates a pid namespace has two of those: MEASURED with
+    /// `--privileged` and a workload of `unshare -p --fork`, the supervisor's descendants were
+    /// `NSpid: <p> 1` and `NSpid: <p> 2 1`. Both satisfy "last field is 1", so which one the walk
+    /// returned was an artefact of `children` ordering rather than a decision - and the deeper one
+    /// puts `exec` in the workload's namespace and resolves the cgroup through the wrong pid.
+    ///
+    /// THE RULE IS RELATIVE, never a constant `2`: inside a container kern is itself nested, so the
+    /// box's init is at OUR depth plus one whatever that is. A fixed depth passes on this host and
+    /// fails on a CI runner, which is the one environment this branch has never run in.
+    ///
+    /// Asserted on the PREDICATE rather than on the walk, because on the topology above the old code
+    /// happened to return the right pid: a test through the walk would be green for a build that had
+    /// no rule at all, and would prove the ordering rather than the decision.
+    #[test]
+    fn the_fallback_accepts_the_init_one_level_down_and_refuses_a_deeper_one() {
+        let Some((my_depth, _)) = nspid_depth_and_last(std::process::id() as i32) else {
+            eprintln!("skip: this kernel does not report NSpid");
+            return;
+        };
+        // Two levels of nesting in one command: the outer fork is one level below us, the inner one
+        // two. `-Ur` is what lets an ordinary user create the pid namespace at all.
+        let mut child = match std::process::Command::new("unshare")
+            .args(["-Ur", "-p", "--fork", "--"])
+            .args(["unshare", "-p", "--fork", "--", "sleep", "30"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("skip: unshare(1) unavailable");
+                return;
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        // Collect every nested init in the subtree, by depth.
+        let mut at_plus_one = Vec::new();
+        let mut deeper = Vec::new();
+        if let Ok(rd) = fs::read_dir("/proc") {
+            for e in rd.flatten() {
+                let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                    continue;
+                };
+                if pid <= 0 || !has_ancestor(pid, child.id() as i32) && pid != child.id() as i32 {
+                    continue;
+                }
+                match nspid_depth_and_last(pid) {
+                    Some((d, 1)) if d == my_depth + 1 => at_plus_one.push(pid),
+                    Some((d, 1)) if d > my_depth + 1 => deeper.push(pid),
+                    _ => {}
+                }
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if at_plus_one.is_empty() || deeper.is_empty() {
+            eprintln!(
+                "skip: could not build both depths here (one-level={at_plus_one:?} deeper={deeper:?})"
+            );
+            return;
+        }
+        for pid in &at_plus_one {
+            assert!(
+                is_namespace_init_below(*pid, my_depth),
+                "the init one level below us is the box's own, and must be accepted: {pid}"
+            );
+        }
+        for pid in &deeper {
+            assert!(
+                !is_namespace_init_below(*pid, my_depth),
+                "an init TWO levels down belongs to the workload, not to the box: {pid}"
+            );
+        }
+    }
+
+    /// A recorded `pid1` is a bare pid, and the kernel reuses pids. Everything that enters the box
+    /// (`exec`, `cp`, `commit`, the health probe) opens `/proc/<pid1>/ns/*`, so trusting the number
+    /// after its process is gone means running the caller's command in a STRANGER's namespaces.
+    /// `live_pid1` is the single gate; this asserts it refuses the recycled shape while still
+    /// resolving the live one (the positive control, so a `None` can't pass for the right answer).
+    #[test]
+    fn a_recorded_pid1_is_refused_once_it_stops_being_the_process_we_registered() {
+        let me = std::process::id() as i32;
+        let real = proc_starttime(me);
+        assert!(
+            real > 0,
+            "positive control: /proc must yield a start-time for this very process, or the whole \
+             test below is asserting against a `0` that means UNKNOWN and accepts everything"
+        );
+
+        // A pre-`pid1starttime` entry: the field is simply absent from the body.
+        let body =
+            format!("name=h\npid=1\npid1={me}\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\n");
+        let mut inst = parse(&body).expect("an older entry must still parse");
+        assert_eq!(
+            inst.pid1_starttime, 0,
+            "an entry from before the field must read as UNKNOWN, not as a bogus pin"
+        );
+        assert_eq!(
+            inst.live_pid1(),
+            Some(me),
+            "unknown must stay usable: refusing here would break every box already running \
+             across an upgrade, which `is_alive` decided long before this field existed"
+        );
+
+        inst.record_pid1(me);
+        assert_eq!(
+            inst.pid1_starttime, real,
+            "the sole writer must pin the pid it records"
+        );
+        assert_eq!(
+            inst.live_pid1(),
+            Some(me),
+            "positive control: the pid we recorded, still itself, must resolve"
+        );
+
+        // The recycled shape: the NUMBER is alive and signalable, but it is not what we registered.
+        inst.pid1_starttime = real + 1;
+        assert_eq!(
+            inst.live_pid1(),
+            None,
+            "a live pid whose start-time moved is a DIFFERENT process wearing that number"
+        );
+
+        inst.record_pid1(0);
+        assert_eq!(
+            inst.live_pid1(),
+            None,
+            "the pre-init window (`pid1: 0`) is not a pid: `kill(0, sig)` is the caller's own \
+             process group and `/proc/0` does not exist"
+        );
+
+        // THE PIN THE HEALTH CHECKER HOLDS ON ITS LAUNCHER, asserted in both directions. The
+        // checker keeps its launcher's pid for its whole life and resolves the box through it every
+        // round; `pid_is_still` is what stops that number from answering about a stranger, and its
+        // failure is the QUIET one in that loop, because a false mismatch stops checking a LIVE box.
+        // So the match direction is asserted too: a predicate that answered `false` for everything
+        // would satisfy the refusal on its own and silence every checker there is.
+        assert!(
+            pid_is_still(me, real),
+            "a live pid with the start-time we recorded is still that process"
+        );
+        assert!(
+            !pid_is_still(me, real + 1),
+            "a live pid whose start-time moved is somebody else wearing the number"
+        );
+        assert!(
+            pid_is_still(me, 0),
+            "an unrecorded start-time is UNKNOWN, and unknown must not silence a checker"
+        );
+
+        // `cgroup_pid` is the most dangerous consumer of the three - `pause` freezes and `update`
+        // WRITES limits into whatever cgroup it names - so pin its fallback CHOICE, not just that it
+        // refuses: a stale pin must land on the supervisor (start-time pinned on the way out of the
+        // registry), never on `0` and never on the number it just refused.
+        inst.record_pid1(me);
+        inst.pid = 424_242;
+        assert_eq!(inst.cgroup_pid(), me, "a live, matching init is the answer");
+        inst.pid1_starttime = real + 1;
+        assert_eq!(
+            inst.cgroup_pid(),
+            424_242,
+            "a stale pin falls back to the supervisor, so `pause`/`update` cannot act on a cgroup \
+             read out of a stranger's /proc"
+        );
+
+        // The pin has to survive the wire, or every consumer reads UNKNOWN and the gate is decorative.
+        inst.record_pid1(me);
+        let round = parse(&encode(&inst)).expect("re-parse");
+        assert_eq!(
+            round.pid1_starttime, real,
+            "the pin must survive encode/parse"
+        );
+        assert_eq!(round.live_pid1(), Some(me));
+    }
+
     #[test]
     fn encode_parse_roundtrips_0_6_7_fields() {
         let inst = Instance {
             name: "rt".into(),
             pid: 7,
-            pid1: 8,
+            pid1_recorded: 8,
             rootfs: "/r".into(),
             command: "sleep 1".into(),
             started: 1,
             starttime: 2,
+            pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
             pod: "stack".into(),
@@ -2834,11 +3281,12 @@ mod tests {
             register(&Instance {
                 name: name.to_string(),
                 pid: p,
-                pid1: 0,
+                pid1_recorded: 0,
                 rootfs: String::new(),
                 command: String::new(),
                 started: 1,
                 starttime: proc_starttime(pid),
+                pid1_starttime: 0,
                 ports: String::new(),
                 volumes: String::new(),
                 pod: String::new(),
@@ -2908,11 +3356,12 @@ mod tests {
         let path = register(&Instance {
             name: old.clone(),
             pid,
-            pid1: 0,
+            pid1_recorded: 0,
             rootfs: String::new(),
             command: String::new(),
             started: 1,
             starttime: proc_starttime(pid),
+            pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),
@@ -2985,11 +3434,12 @@ mod tests {
         let path = register(&Instance {
             name: name.clone(),
             pid,
-            pid1: 0,
+            pid1_recorded: 0,
             rootfs: String::new(),
             command: String::new(),
             started: 1,
             starttime: proc_starttime(pid),
+            pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),

@@ -10,6 +10,12 @@
 #                        non-invasive to your image cache)
 set -eu
 kern="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
+
 
 echo "==> kern doctor - is this host able to run boxes, and what's available?"
 # Exit status is non-zero if the host can't run boxes at all; keep going either way so the rest

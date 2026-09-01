@@ -360,7 +360,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"pids_max\":{}}}",
             json_str(&b.name),
             b.pid,
-            b.pid1,
+            b.pid1_recorded,
             json_str(&b.rootfs),
             json_str(&b.command),
             b.started,
@@ -383,8 +383,17 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         // `BoxName`; rootfs/command are untrusted, so they go through `scrub`.
         println!("{}{}{}{}", p.b, p.c, b.name, p.z);
         row("pid", &b.pid.to_string());
-        if b.pid1 != 0 {
-            row("pid1", &b.pid1.to_string());
+        if b.pid1_recorded != 0 {
+            // MARKED WHEN THE GATE REFUSES IT. The recorded number is what this row is for, and
+            // printing it bare made a pid the runtime will NOT use indistinguishable from one it
+            // will: a reader comparing `inspect` against `ps` or `/proc` would be reasoning about a
+            // number that no consumer trusts. `stale` here means the process at that pid is not the
+            // one we registered, so every consumer falls back to the supervisor's child instead.
+            let pid1 = match b.live_pid1() {
+                Some(_) => b.pid1_recorded.to_string(),
+                None => format!("{} (stale: not the process recorded)", b.pid1_recorded),
+            };
+            row("pid1", &pid1);
         }
         row("uptime", &fmt_uptime(up));
         row("rootfs", &crate::ui::scrub(&b.rootfs));
@@ -808,7 +817,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             // reparented and reaped itself. An exit code is not worth turning a self-healing case
             // into a leak, so those boxes keep the unguarded read.
             if b.stop_grace > 0 && !b.orphaned && !b.cgroup.is_empty() {
-                ReaperHold::new(b.pid, b.pid1)
+                ReaperHold::new(b.pid, b.pid1_recorded)
             } else {
                 ReaperHold(None)
             }
@@ -821,9 +830,12 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             } else {
                 libc::SIGTERM
             };
-            if b.pid1 > 0 {
-                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, b.pid1, 0) as i32 };
-                unsafe { signal_box(fd, b.pid1, sig) };
+            // Through `live_pid1`: the recorded number is only a victim we can name while it is still
+            // the init we registered. Between an init exiting and its supervisor unregistering, that
+            // pid can already belong to someone else, and `stop` would send them SIGTERM.
+            if let Some(pid1) = b.live_pid1() {
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
+                unsafe { signal_box(fd, pid1, sig) };
                 if fd >= 0 {
                     unsafe { libc::close(fd) };
                 }
@@ -872,9 +884,9 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         // it (`/proc/<pid1>/cgroup`). After the SIGKILL below the pid1 lingers as a zombie, so the general
         // orphan-sweep would skip the dir until it's reaped; we `rmdir` the (now-empty) dir ourselves right
         // after. No-op for a systemd-scope box (not a `kern-box-*` leaf → `None`). See `box_cgroup_dir`.
-        let box_cgroup = (b.pid1 > 0)
-            .then(|| kern_isolation::box_cgroup_dir(b.pid1))
-            .flatten();
+        // Also `live_pid1`: this dir is read from `/proc/<pid1>/cgroup` and then `rmdir`ed, so a
+        // recycled pid would have us resolve, and delete, a cgroup that is not the box's.
+        let box_cgroup = b.live_pid1().and_then(kern_isolation::box_cgroup_dir);
         // Recovery path for a box left FROZEN by a `commit` that died past its signal trap (SIGKILL / OOM
         // / panic=abort): thaw it before killing. SIGKILL is honoured on a frozen cgroup-v2 task anyway,
         // but thawing first guarantees prompt delivery and means a stuck-frozen box is never unrecoverable
@@ -892,7 +904,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             // An older entry (0/0) keeps the historical immediate SIGKILL.
             kill_box_graceful(
                 b.pid,
-                b.pid1,
+                // The gate, not the raw number: this signals the pid. `None` (never recorded, or no
+                // longer the init we registered) passes 0, which the callee already reads as "no init
+                // to signal" and answers by tearing down through the supervisor instead.
+                b.live_pid1().unwrap_or(0),
                 if b.stop_signal > 0 {
                     b.stop_signal
                 } else {

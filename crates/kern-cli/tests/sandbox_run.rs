@@ -175,77 +175,555 @@ int main(int argc, char **argv) {
     return 0;
 }
 "#;
-/// `compose config` MUST REFUSE A PROFILE REFERENCE THAT `compose up` WOULD REFUSE.
+/// `compose config` AND `compose up` MUST AGREE ABOUT WHAT THE FILE MAY SAY, ASSERTED AS A PAIR.
 ///
-/// `x-kern-vcpu`/`x-kern-vdisk`/`x-kern-vgpio` name a profile that lives in `kern.toml`, not in the
-/// compose file, so the file alone cannot say whether it resolves. When the keys were first read,
-/// `config` printed `profiles: vgpio:leds` and exited 0 while `up` failed with
-/// `no [[vgpio]] profile named 'leds'`. A dry run that disagrees with the bring-up is worse than no
-/// dry run, because it is the one people trust before committing a file.
+/// Every case below runs through BOTH verbs in the same fixture, because the defect this guards is a
+/// DISAGREEMENT and neither verb can show one on its own. Asserting `config` refuses in one test and
+/// `up` refuses in another is the shape that already let this through once: when the `x-kern-*` keys
+/// were first read, `config` printed `profiles: vgpio:leds` and exited 0 while `up` failed with
+/// `no [[vgpio]] profile named 'leds'`, and both single-verb tests were green. A dry run that
+/// disagrees with the bring-up is worse than no dry run, because it is the one people trust before
+/// committing a file.
 ///
-/// NEEDS NO SANDBOX: `config` parses and resolves, it starts nothing, so this runs on a locked-down
-/// runner where the box tests skip.
+/// NO NETWORK, AND FAST: the images name a registry on loopback port 1, which answers ECONNREFUSED
+/// at once. An earlier draft used a `.invalid` hostname and the test took 60 s, all of it DNS
+/// timeouts on the two ACCEPTED rows (the refused ones never reach the pull). MEASURED, `up`
+/// refuses on these keys strictly before it pulls anything (`error: usage: kern
+/// --security-profile: expected untrusted` with the image never touched). The accepted case is
+/// asserted by what its failure is NOT: `up` fails at the unreachable pull, and must not fail on the
+/// key, which is what "config accepted it and up agreed" means when the box cannot actually start.
 #[test]
-fn compose_config_refuses_a_profile_that_up_would_refuse() {
-    let dir = std::env::temp_dir().join(format!("kern-it-prof-{}", std::process::id()));
+fn compose_config_and_up_agree_on_what_the_file_may_say() {
+    let dir = std::env::temp_dir().join(format!("kern-it-pair-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("kern")).expect("temp config dir");
-    let file = dir.join("stack.yml");
-    fs::write(
-        &file,
-        "services:\n  app:\n    image: alpine:latest\n    x-kern-vgpio: leds\n",
-    )
-    .expect("write compose file");
-
-    // An EMPTY kern.toml, so the reference cannot resolve. XDG_CONFIG_HOME points the loader here.
-    fs::write(dir.join("kern/kern.toml"), "").expect("write kern.toml");
-    let out = kern()
-        .env("XDG_CONFIG_HOME", &dir)
-        .args(["compose", file.to_str().unwrap_or_default(), "config"])
-        .output()
-        .expect("run kern");
-    let err = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(
-        !out.status.success(),
-        "config accepted a profile that does not exist: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        err
-    );
-    assert!(
-        err.contains("vgpio") && err.contains("leds"),
-        "the refusal must name the kind and the profile: {err}"
-    );
-    assert!(
-        err.contains("kern config add"),
-        "and it must name the command that creates it, not only the file: {err}"
-    );
-
-    // POSITIVE CONTROL: with the profile declared, the same file passes. Without this, a `config`
-    // that refused everything would satisfy the assertions above.
+    // A kern.toml that declares `vgpio:leds` and nothing else, so one profile reference resolves and
+    // its neighbour does not - the discriminant, rather than a file where everything fails.
     fs::write(
         dir.join("kern/kern.toml"),
-        "[[gpio]]\nid = \"gpio:0\"\nchip = \"/dev/gpiochip0\"\n\n[[vgpio]]\nname = \"leds\"\nbackend = \"gpio:0\"\n",
+        // No `chip =` here: `[[gpio]]` has no such key, and the fixture carried one until the
+        // unknown-key warning named it. A key that does nothing in a test fixture is the same
+        // defect as one in a user's config, and this test would have kept passing either way.
+        "[[gpio]]\nid = \"gpio:0\"\n\n[[vgpio]]\nname = \"leds\"\nbackend = \"gpio:0\"\n",
     )
     .expect("write kern.toml");
-    let out = kern()
-        .env("XDG_CONFIG_HOME", &dir)
-        .args(["compose", file.to_str().unwrap_or_default(), "config"])
+
+    // (label, service key, refused, a word the refusal must carry)
+    let cases: [(&str, &str, bool, &str); 5] = [
+        ("a declared profile", "x-kern-vgpio: leds", false, "vgpio"),
+        (
+            "a profile kern.toml does not declare",
+            "x-kern-vcpu: nosuchprofile",
+            true,
+            "nosuchprofile",
+        ),
+        (
+            "a security profile that is not a name kern takes",
+            "x-kern-security-profile: bogus",
+            true,
+            "security-profile",
+        ),
+        (
+            "the security profile that is",
+            "x-kern-security-profile: untrusted",
+            false,
+            "untrusted",
+        ),
+        // Not a refusal on EITHER side: an unread key in our namespace is a warning, and warning is
+        // not refusing. Without this row the corpus would only prove that both verbs can say no.
+        (
+            "an extension key this build does not read",
+            "x-kern-vgpi: leds",
+            false,
+            "not read by this build",
+        ),
+    ];
+
+    for (label, key, refused, needle) in cases {
+        let file = dir.join(format!("{}.yml", key.replace([' ', ':'], "_")));
+        fs::write(
+            &file,
+            format!(
+                "services:\n  app:\n    image: 127.0.0.1:1/nope:1\n    {key}\n    command: [\"/bin/true\"]\n"
+            ),
+        )
+        .expect("write compose file");
+        let path = file.to_str().unwrap_or_default().to_string();
+        let run = |verb: &str| {
+            let out = kern()
+                .env("XDG_CONFIG_HOME", &dir)
+                .args(["compose", &path, verb])
+                .output()
+                .expect("run kern");
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        };
+        let (config_ok, config_out) = run("config");
+        let (_, up_out) = run("up");
+
+        assert_eq!(
+            config_ok, !refused,
+            "config disagrees with the corpus on {label}: {config_out}"
+        );
+        if refused {
+            assert!(
+                config_out.contains(needle),
+                "config's refusal must name the thing it refused ({label}): {config_out}"
+            );
+            // THE PAIR. `up` must refuse the same file for the same reason - not merely fail, which
+            // it would do anyway on an unreachable registry.
+            assert!(
+                up_out.contains(needle),
+                "up refused {label} for a different reason than config did: {up_out}"
+            );
+        } else {
+            // Accepted by `config`, so `up` must not be the one to object to this key. It still fails
+            // (nothing can pull from a closed port), and that failure must not mention it.
+            assert!(
+                !up_out.contains("is not a security profile")
+                    && !up_out.contains("no [[")
+                    && !up_out.contains("expected `untrusted`"),
+                "config accepted {label} and up rejected it: {up_out}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// THE FALLBACK THAT RUNS WHEN THE PID PIN REFUSES MUST ACTUALLY FIND THE BOX.
+///
+/// A box whose `pid1` is unrecorded (an entry written before the field existed) or whose pin no
+/// longer matches falls back to locating the init from the supervisor. That fallback was "the
+/// supervisor's sole child", and MEASURED on this build the supervisor has TWO children even for a
+/// box with no health check, while the init is a GRANDCHILD: the fallback returned a `kern` helper
+/// and every consumer built on it failed with "box is not running (its namespaces are gone)".
+///
+/// A recovery path that cannot recover is worse than none, because the callers are written as though
+/// it works - and the pin sends MORE traffic down it, since a refused pin lands here by design. The
+/// rule is now "the descendant that is PID 1 in its own pid namespace", which is what a box init is.
+///
+/// BOTH SHAPES, because the checker is what made the old rule ambiguous: with it the supervisor has a
+/// third child, and a rule that picks by position rather than by property picks differently.
+#[test]
+fn the_pid1_fallback_finds_the_box_init_with_and_without_a_health_checker() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "fallback");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+
+    for with_checker in [false, true] {
+        let xdg = std::env::temp_dir().join(format!(
+            "kern-it-fb-{}-{}",
+            std::process::id(),
+            u8::from(with_checker)
+        ));
+        let _ = fs::remove_dir_all(&xdg);
+        fs::create_dir_all(&xdg).expect("temp runtime dir");
+        let name = format!("fb-{}-{}", std::process::id(), u8::from(with_checker));
+
+        let mut args: Vec<String> = vec![
+            "box".into(),
+            name.clone(),
+            "--rootfs".into(),
+            rootfs.clone(),
+            "-d".into(),
+        ];
+        if with_checker {
+            args.extend([
+                "--health-cmd".into(),
+                "true".into(),
+                "--health-interval".into(),
+                "1".into(),
+            ]);
+        }
+        args.extend([
+            "--".into(),
+            "/bin/busybox".into(),
+            "sleep".into(),
+            "30".into(),
+        ]);
+        let started = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&args)
+            .output()
+            .expect("run kern");
+        if !started.status.success() {
+            eprintln!(
+                "skip: could not start the box: {}",
+                String::from_utf8_lossy(&started.stderr)
+            );
+            let _ = fs::remove_dir_all(&xdg);
+            continue;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // Force the fallback: erase the recorded pid1 and its pin, exactly as a pre-upgrade entry
+        // (or a refused pin) leaves the record.
+        let mut erased = false;
+        if let Ok(rd) = fs::read_dir(xdg.join("kern/instances")) {
+            for e in rd.flatten() {
+                if let Ok(body) = fs::read_to_string(e.path()) {
+                    let stripped: String = body
+                        .lines()
+                        .filter(|l| !l.starts_with("pid1starttime="))
+                        .map(|l| {
+                            if l.starts_with("pid1=") {
+                                "pid1=0".to_string()
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if fs::write(e.path(), format!("{stripped}\n")).is_ok() {
+                        erased = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            erased,
+            "the test could not force the fallback, so it tested nothing"
+        );
+
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["exec", &name, "/bin/busybox", "echo", "ALIVE"])
+            .output()
+            .expect("run kern exec");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", &name])
+            .output();
+        let _ = fs::remove_dir_all(&xdg);
+
+        assert!(
+            text.contains("ALIVE"),
+            "the fallback did not reach the box init ({}a health checker): {text}",
+            if with_checker { "with " } else { "without " }
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A DOWNLOADED STACK CANNOT GRANT ITSELF HOST HARDWARE BY SHIPPING ITS OWN `kern.toml`.
+///
+/// A profile that resolves to a device node is gated, and the acknowledgement can live in the
+/// operator's `kern.toml` (`[kern] allow_device_grants = true`) so a `restart:` service - whose
+/// systemd unit nobody types by hand - can come back after a reboot without the generated unit
+/// carrying the permission itself.
+///
+/// THAT OPENS THE ONE HOLE THIS TEST EXISTS FOR. The native stack format lets a file name its own
+/// config (`config = "bundled.toml"`), so a bundle could ship a `kern.toml` that sets the key. The
+/// permission is therefore read from the DEFAULT config only, never from a path the file chose, and
+/// this asserts both halves: the operator's config permits, the bundle's identical config does not.
+///
+/// Without the second half the first is not a security property, it is a spelling.
+#[test]
+fn a_bundled_config_cannot_grant_itself_a_device_and_the_operators_config_can() {
+    // A `[[vgpio]]` resolving to something that exists on any Linux host with an LED class. If the
+    // host has none, the profile resolves to nothing, the gate has nothing to gate, and the case is
+    // inconclusive rather than green.
+    let led = match fs::read_dir("/sys/class/leds")
+        .ok()
+        .and_then(|mut d| d.next().and_then(Result::ok))
+    {
+        Some(e) => e.file_name().to_string_lossy().to_string(),
+        None => {
+            eprintln!("skip: no /sys/class/leds entry to grant");
+            return;
+        }
+    };
+    let dir = std::env::temp_dir().join(format!("kern-it-grant-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("kern")).expect("temp config dir");
+    let profile =
+        format!("[[gpio]]\nid = \"gpio:0\"\n\n[[vgpio]]\nname = \"leds\"\nbackend = \"gpio:0\"\nleds = [\"{led}\"]\n");
+    let permit = format!("[kern]\nallow_device_grants = true\n\n{profile}");
+
+    // The bundle: its own config, carrying the permission, named BY THE FILE.
+    fs::write(dir.join("bundled.toml"), &permit).expect("write bundled config");
+    fs::write(
+        dir.join("stack.toml"),
+        "[box.app]\nimage = \"alpine:latest\"\ncommand = [\"true\"]\nconfig = \"bundled.toml\"\nvgpio = \"leds\"\n",
+    )
+    .expect("write stack");
+    // The operator's config: the same profile, WITHOUT the permission.
+    fs::write(dir.join("kern/kern.toml"), &profile).expect("write operator config");
+
+    let run_verb = |stack: &str, verb: &str| -> (bool, String) {
+        let out = kern()
+            .current_dir(&dir)
+            .env("XDG_CONFIG_HOME", &dir)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .args(["compose", stack, verb])
+            .output()
+            .expect("run kern");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    // WHETHER THIS HOST CAN EXERCISE THE CASE IS DECIDED WITHOUT ASKING THE GATE. An earlier version
+    // skipped when the gate did not fire, which made the skip swallow the exact failure under test:
+    // sabotage the permission lookup, the gate stops firing, and the test reported itself
+    // inconclusive instead of red. `config` reports the RESOLUTION whether or not anything is gated,
+    // so it answers "does this profile reach a device here" independently.
+    let (_, preview) = run_verb("stack.toml", "config");
+    if !preview.contains("/sys/class/leds") {
+        eprintln!("skip: the profile does not resolve to a device on this host: {preview}");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let (ok, text) = run_verb("stack.toml", "up");
+    assert!(
+        !ok,
+        "a bundle that ships its own permitting kern.toml granted itself a device: {text}"
+    );
+    assert!(
+        text.contains("asks for"),
+        "and the refusal must be the device gate, not some other failure: {text}"
+    );
+
+    // POSITIVE CONTROL: the same permission, in the OPERATOR's config, does lift the gate. Without
+    // this the assertion above would hold for a build that never lifts it at all.
+    fs::write(dir.join("kern/kern.toml"), &permit).expect("permit in the operator config");
+    let (_, text) = run_verb("stack.toml", "up");
+    assert!(
+        !text.contains("asks for"),
+        "the operator's own config must be able to lift the gate: {text}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A GENUINELY RECYCLED PID MUST NOT LET A CONSUMER INTO A STRANGER'S NAMESPACES.
+///
+/// This is the case the whole pid-identity work exists to prevent, and it was believed unreachable:
+/// I wrote that forcing a recycle meant running the counter to `pid_max`. That is false.
+/// `/proc/sys/kernel/ns_last_pid` sets the NEXT pid to be allocated and is writable with
+/// `CAP_SYS_ADMIN` over the current pid namespace, which `unshare -Ur -p --fork` hands an ordinary
+/// user. Measured: writing `700` there makes the next child land on exactly 701.
+///
+/// So the box's init is created, recorded, killed, and its pid handed to an UNRELATED process, and
+/// then a consumer is asked to enter the box. Every other test of this pins the predicate; this one
+/// exercises the thing the predicate is for.
+///
+/// TWO INCONCLUSIVE SHAPES, BOTH SKIPPED RATHER THAN FAILED. The recycle may not land (another
+/// process can take the number between the write and the fork), and - measured on the first run of
+/// this - the two processes can share a start-time, because it is counted in CLOCK TICKS and both
+/// were created inside one. The second is a real limit of the mechanism, not of the test: a recycle
+/// that happens within a tick of the original's start is invisible to the pin. The `sleep` below
+/// pushes the decoy past that boundary so the discriminant exists at all.
+#[test]
+fn a_recycled_pid_does_not_let_exec_into_a_strangers_namespaces() {
+    if std::process::Command::new("unshare")
+        .arg("--version")
         .output()
-        .expect("run kern");
-    let both = format!(
+        .is_err()
+    {
+        eprintln!("skip: no unshare(1)");
+        return;
+    }
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let kern_bin = env!("CARGO_BIN_EXE_kern");
+    let script = r#"
+export XDG_RUNTIME_DIR=$2; mkdir -p $XDG_RUNTIME_DIR/kern/instances
+sleep 300 & INIT=$!
+ST=$(awk '{print $22}' /proc/$INIT/stat)
+sleep 300 & SUP=$!
+SST=$(awk '{print $22}' /proc/$SUP/stat)
+printf 'name=rec\npid=%s\npid1=%s\nrootfs=/tmp\ncommand=sleep\nstarted=1\nstarttime=%s\nstopsig=15\nstopgrace=10\ncapdropall=0\ncapdrops=\ncapadds=\nseccompmode=allowlist\napparmor=\npid1starttime=%s\n' \
+  "$SUP" "$INIT" "$SST" "$ST" > $XDG_RUNTIME_DIR/kern/instances/rec-$SUP
+kill -9 $INIT 2>/dev/null; wait $INIT 2>/dev/null
+sleep 1
+echo $((INIT-1)) > /proc/sys/kernel/ns_last_pid 2>/dev/null || { echo SKIP_NS_LAST_PID; exit 0; }
+sleep 300 & DECOY=$!
+[ "$DECOY" != "$INIT" ] && { echo SKIP_NO_RECYCLE; exit 0; }
+DST=$(awk '{print $22}' /proc/$DECOY/stat)
+[ "$DST" = "$ST" ] && { echo SKIP_SAME_TICK; exit 0; }
+echo RECYCLED
+"$1" exec rec /bin/echo ENTERED 2>&1
+"#;
+    let xdg = std::env::temp_dir().join(format!("kern-it-recycle-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let out = std::process::Command::new("unshare")
+        .args([
+            "-Ur",
+            "-p",
+            "--fork",
+            "--mount-proc",
+            "sh",
+            "-c",
+            script,
+            "sh",
+        ])
+        .arg(kern_bin)
+        .arg(&xdg)
+        .output()
+        .expect("run unshare");
+    let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&xdg);
+
+    for reason in ["SKIP_NS_LAST_PID", "SKIP_NO_RECYCLE", "SKIP_SAME_TICK"] {
+        if text.contains(reason) {
+            eprintln!("skip: {reason}");
+            return;
+        }
+    }
     assert!(
-        out.status.success(),
-        "config refused a profile that IS declared: {both}"
+        text.contains("RECYCLED"),
+        "the scaffolding did not reach the recycle, so nothing below was tested: {text}"
     );
+    // THE FIRST ASSERTION IS NOT ENOUGH ON ITS OWN, and finding that out is most of this test's
+    // value. `ENTERED` on stdout would mean the command ran inside whatever process now holds that
+    // pid. But MEASURED with the guard removed, `exec` still refuses here - with a DIFFERENT message
+    // ("box is not running (its namespaces are gone)"), because the decoy shares this process's
+    // namespaces and a later check catches it. Both outcomes are safe, so absence of `ENTERED`
+    // proves the property and NOT the mechanism: a test that stopped here would be green with the
+    // pin deleted, which is what the first version of it was.
     assert!(
-        both.contains("vgpio:leds"),
-        "and it should report the profile it resolved: {both}"
+        !text.contains("ENTERED"),
+        "exec entered a recycled pid's namespaces: {text}"
     );
+    // SO ASSERT WHICH REFUSAL FIRED. `live_pid1` refusing the recycled number sends the caller to
+    // `child_of(supervisor)`, and this supervisor has no children, so the refusal is the fallback's.
+    // Remove the start-time check and the message changes, because a different guard answers.
+    assert!(
+        text.contains("could not locate the box's main process"),
+        "the refusal must come from the pin's fallback, not from a later guard that happens to \
+         catch this scaffolding: {text}"
+    );
+}
+
+/// A `nice` THE KERNEL WILL NOT GRANT MUST NOT BE ACCEPTED IN SILENCE.
+///
+/// A field report on v0.8.0 found `nice = -5` in a `[[vcpu]]` profile accepted, echoed back, and
+/// dropped: effective nice 0, no warning at any stage. It read as a profile bug and it is not one -
+/// MEASURED, the flag does it too (`--nice -5` and `--nice -1` both left the workload at 0 while
+/// `--nice 5` and `--nice 19` took effect), because `setpriority`'s return value was discarded at
+/// both call sites. Lowering the nice value needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom, which a
+/// rootless box does not have by default.
+///
+/// ASSERTED IN BOTH DIRECTIONS, so the test needs no guess about the host it runs on: the warning
+/// must appear exactly when the value did NOT take. A machine that can lower nice (root, or a raised
+/// `RLIMIT_NICE`) exercises the other branch and would catch a warning printed unconditionally -
+/// which is the obvious wrong fix for this, and would be just as dishonest as the silence.
+#[test]
+fn a_nice_the_kernel_refuses_is_reported_rather_than_dropped() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "nice");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-nice-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    fs::create_dir_all(&xdg).expect("temp runtime dir");
+
+    // Field 19 of `/proc/self/stat` is the nice value. `/proc/self/status` has no `Nice` line on
+    // every kernel this suite runs on, and reading a field that is simply absent would make the
+    // assertions below compare two empty strings and pass for the wrong reason.
+    let run = |n: &str| -> (String, String) {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                &format!("nice-{n}-{}", std::process::id()),
+                "--rootfs",
+                &rootfs,
+                "--nice",
+                n,
+                "--",
+                "/bin/busybox",
+                "awk",
+                "{print $19}",
+                "/proc/self/stat",
+            ])
+            .output()
+            .expect("run kern");
+        (
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // POSITIVE CONTROL FIRST: raising the nice value needs no privilege anywhere, so if this does not
+    // land, the reader above is broken and every other assertion here is meaningless.
+    let (eff, err) = run("5");
+    if eff.is_empty() {
+        eprintln!("skip: could not read the box's nice value ({err})");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert_eq!(eff, "5", "a nice the kernel grants must be applied: {err}");
+    assert!(
+        !err.contains("not applied"),
+        "and it must not be warned about: {err}"
+    );
+
+    // THE REPORTED CASE. Either the host granted it, or it must say that it did not.
+    let (eff, err) = run("-5");
+    if eff == "-5" {
+        assert!(
+            !err.contains("not applied"),
+            "this host DID lower the nice value, so warning about it is a false report: {err}"
+        );
+    } else {
+        assert_eq!(
+            eff, "0",
+            "a refused nice leaves the inherited value, it does not land somewhere else: {err}"
+        );
+        assert!(
+            err.contains("nice -5 not applied"),
+            "a nice the kernel refused must be named, not silently dropped: {err}"
+        );
+        assert!(
+            err.contains("CAP_SYS_NICE") || err.contains("RLIMIT_NICE"),
+            "and the reader must be told what would make it work: {err}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
 }
 
 /// A SIGKILL'D LAUNCHER MUST NOT LEAVE ITS HEALTH CHECKER PROBING FOREVER.
@@ -1459,9 +1937,15 @@ fn a_short_stop_timeout_is_not_held_to_a_longer_one_in_the_same_teardown() {
     std::thread::sleep(std::time::Duration::from_millis(700));
 
     let started_at = std::time::Instant::now();
+    // Piped, not inherited: this `stop` has to run WHILE the test polls, so it cannot be `.output()`
+    // (which waits), and a bare `.spawn()` leaves the product's own "stopped '<name>' (pid N)" on the
+    // suite's stdout, where it reads as an unexplained line between test results. The test asserts on
+    // timing, not on this text, so the streams are simply captured.
     let mut stop = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
         .args(["stop", "gracelong", "graceshort"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn kern stop");
     let mut short_died = None;
@@ -5267,11 +5751,15 @@ fn box_cp_round_trips_a_file_host_box_host() {
     );
 }
 
-/// `KERN_MAX_CONCURRENT=N` admits exactly N live boxes and refuses the overflow. `#[ignore]`d: the
-/// fleet cap is HOST-GLOBAL, so the parallel suite's other boxes would count toward it and make the
-/// tally non-deterministic. Run it alone: `cargo test -- --ignored box_fleet_cap`.
+/// `KERN_MAX_CONCURRENT=N` admits exactly N live boxes and refuses the overflow.
+///
+/// IT USED TO BE `#[ignore]`d, and that was the wrong fix for a real problem. The cap counts LIVE
+/// CLAIMS, which live under `$XDG_RUNTIME_DIR`, so with the ambient one the parallel suite's other
+/// boxes counted toward it and the tally was non-deterministic. A private runtime dir makes the count
+/// see only this test's claims, which is exactly what the unit-level `claim_name_capped` test already
+/// did. A test that runs only when someone remembers `--ignored` is an assertion that does not
+/// assert, and it was contributing to a number used as a status.
 #[test]
-#[ignore]
 fn box_fleet_cap_admits_exactly_n_refuses_the_rest() {
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
@@ -5283,11 +5771,17 @@ fn box_fleet_cap_admits_exactly_n_refuses_the_rest() {
     }
     let root = build_rootfs(&busybox, "fleetcap");
     let rootfs = root.to_str().unwrap();
+    // The isolation that replaces `#[ignore]`: claims live under the runtime dir, so a private one
+    // means the global count sees this test's boxes and nothing else.
+    let xdg = std::env::temp_dir().join(format!("kern-it-fleet-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    fs::create_dir_all(&xdg).expect("temp runtime dir");
     let n = 2;
     let mut admitted = 0;
     for i in 0..(n + 2) {
         let name = format!("fleetcap{i}");
         let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
             .env("KERN_MAX_CONCURRENT", n.to_string())
             .args([
                 "box",
@@ -5312,9 +5806,14 @@ fn box_fleet_cap_admits_exactly_n_refuses_the_rest() {
         }
     }
     for i in 0..(n + 2) {
-        kern().args(["stop", &format!("fleetcap{i}")]).output().ok();
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", &format!("fleetcap{i}")])
+            .output()
+            .ok();
     }
     let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
     assert_eq!(
         admitted, n,
         "KERN_MAX_CONCURRENT={n} must admit exactly {n} live boxes, got {admitted}"

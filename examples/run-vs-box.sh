@@ -18,6 +18,12 @@
 set -eu
 
 KERN="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$KERN" || echo "$KERN")" "$("$KERN" --version 2>&1 | head -1)" >&2
+
 command -v "$KERN" >/dev/null 2>&1 || { echo "kern not on PATH (set KERN=./target/release/kern)"; exit 1; }
 
 # One probe, run three ways. `/proc/1/comm` rather than `ps`, so it reads the same under busybox

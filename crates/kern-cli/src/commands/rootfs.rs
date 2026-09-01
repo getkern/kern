@@ -986,7 +986,10 @@ pub(crate) fn own_only_dir(dir: &std::path::Path) -> std::io::Result<()> {
 pub(crate) fn apply_chmod(path: &std::path::Path, mode: Option<&str>) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
     let Some(mode) = mode else { return Ok(()) };
-    let cleaned = mode.trim().trim_start_matches("0o");
+    // `strip_prefix`, not `trim_start_matches`: the trim family strips REPEATEDLY, so `0o0o755`
+    // read as 755 - a mode nobody wrote, accepted in place of the error it should have been.
+    let cleaned = mode.trim();
+    let cleaned = cleaned.strip_prefix("0o").unwrap_or(cleaned);
     let bits = u32::from_str_radix(cleaned, 8).map_err(|_| {
         Error::Sandbox(format!(
             "--chmod: invalid mode '{mode}' (use an octal mode like 755 or 0644)"
@@ -1004,7 +1007,10 @@ pub(crate) fn apply_chmod(path: &std::path::Path, mode: Option<&str>) -> Result<
 /// (e.g. 0644) on the dir can't block our own descent.
 pub(crate) fn apply_chmod_tree(target: &std::path::Path, mode: Option<&str>) -> Result<(), Error> {
     let Some(mode) = mode else { return Ok(()) };
-    let cleaned = mode.trim().trim_start_matches("0o");
+    // `strip_prefix`, not `trim_start_matches`: the trim family strips REPEATEDLY, so `0o0o755`
+    // read as 755 - a mode nobody wrote, accepted in place of the error it should have been.
+    let cleaned = mode.trim();
+    let cleaned = cleaned.strip_prefix("0o").unwrap_or(cleaned);
     let bits = u32::from_str_radix(cleaned, 8).map_err(|_| {
         Error::Sandbox(format!(
             "--chmod: invalid mode '{mode}' (use an octal mode like 755 or 0644)"

@@ -13,6 +13,12 @@
 #  interval scheduling; a job that should run "every N seconds and then stop" wants this loop.)
 set -eu
 kern="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
+
 
 interval="${INTERVAL:-2}"   # seconds between runs (kept short for the demo)
 runs="${RUNS:-3}"           # number of iterations to show

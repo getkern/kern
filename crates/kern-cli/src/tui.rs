@@ -317,6 +317,7 @@ struct TermGuard {
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
+        ALT_SCREEN_TID.store(0, std::sync::atomic::Ordering::SeqCst);
         let mut out = std::io::stdout();
         let _ = out.write_all(b"\x1b[?7h\x1b[?1049l\x1b[?25h");
         let _ = out.flush();
@@ -444,6 +445,8 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J"); // alt screen, hide cursor, clear
     let _ = out.flush();
+    // Set AFTER the guard exists, so every path out of here clears it again.
+    ALT_SCREEN_TID.store(this_tid(), std::sync::atomic::Ordering::SeqCst);
 
     let p = Palette::detect();
     let mut tab = 0usize;
@@ -987,9 +990,53 @@ fn perform_pending(action: Pending) -> Option<String> {
     }
 }
 
+/// The OS thread id that raised the alternate screen, 0 while it is down (cleared by
+/// `TermGuard::drop`). It is the ONLY thing that licenses `quiet_io` to touch fd 1 and fd 2, which
+/// are process-wide and not that function's to borrow. See `quiet_io` for what went wrong without it.
+///
+/// A bool would have said "an alt screen is up somewhere". What `quiet_io` has to know is "*I* am the
+/// thread that put it up", because the descriptors it swaps belong to every thread in the process.
+/// Only the TUI loop raises it, and that holds today by TOPOLOGY, not by construction: a caller added
+/// on another thread would inherit exactly the defect the flag was introduced to remove. Carrying the
+/// tid makes the precondition enforce itself in release and fail loudly in debug.
+static ALT_SCREEN_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// This thread's kernel id. `gettid`, not `pthread_self`: it must survive a `fork`, where the child
+/// is a new thread of a new process and its `pthread_t` may repeat the parent's.
+fn this_tid() -> i32 {
+    unsafe { libc::gettid() }
+}
+
 /// Run `f` with fd 1 and fd 2 redirected to `/dev/null`, then restored - so a reused CLI helper's
 /// `println!`/`eprintln!` can't corrupt the alt-screen. Used for the lifecycle key actions.
+///
+/// THE REDIRECT ONLY HAPPENS WHILE THE ALT SCREEN IS UP, and that guard is load-bearing rather than
+/// decorative. `dup2` onto 1 and 2 rewrites the file descriptor table of the whole PROCESS, not of
+/// the calling thread, so every other thread's output lands in `/dev/null` for the duration. `kern
+/// top` is single-threaded and there is nothing else printing, but the unit tests are not: libtest
+/// runs them on parallel threads and prints the results from another one. The measured effect was
+/// that this binary silently dropped up to a hundred lines of its own test report, INCLUDING the
+/// `test result:` summary, while still exiting 0 - so a failure could have been reported into
+/// `/dev/null`, and `scripts/test-count.py` had nothing to parse. Two overlapping calls could also
+/// interleave save and restore and leave fd 1 on `/dev/null` for good.
+///
+/// Outside the alt screen there is no alt screen to protect, so the swap is pure damage: the helper's
+/// own `println!` is then wanted output. The condition is exact rather than a test-mode sniff - the
+/// key handlers that call this are only reachable from the interactive loop, which sets the flag.
 fn quiet_io<T>(f: impl FnOnce() -> T) -> T {
+    let owner = ALT_SCREEN_TID.load(std::sync::atomic::Ordering::SeqCst);
+    if owner == 0 {
+        return f();
+    }
+    let me = this_tid();
+    debug_assert_eq!(
+        owner, me,
+        "quiet_io ran on a thread that did not raise the alt screen: the fd swap is process-wide, so \
+         it would send THAT thread's output to /dev/null too"
+    );
+    if owner != me {
+        return f();
+    }
     let _ = std::io::stdout().flush();
     let (s1, s2) = unsafe { (libc::dup(1), libc::dup(2)) };
     let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
@@ -1907,7 +1954,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         // supervisor lives in the host netns with the kernel's trivial uid_map, which would falsely flag
         // every box. `pid1 == 0` (unrecorded / old entry) → the /proc reads fail → no flag, no false
         // positive.
-        let iso = box_isolation(b.pid1);
+        let iso = box_isolation(b.live_pid1().unwrap_or(0));
         let mut sec = String::new();
         if !b.egress.is_empty() {
             sec.push_str("egress");
@@ -3280,6 +3327,60 @@ mod tests {
             r: "",
             z: "",
         }
+    }
+
+    /// `quiet_io` may take the PROCESS's stdout only while there is an alt screen to protect.
+    ///
+    /// It `dup2`s over fd 1 and fd 2, which belong to the process and not to the calling thread, so
+    /// while it is inside `f` every other thread writes into `/dev/null`. This binary is the proof:
+    /// libtest runs tests on parallel threads and prints from another one, and the tui tests calling
+    /// through `quiet_io` were silently eating up to a hundred lines of the test report, the
+    /// `test result:` summary among them, while the binary still exited 0. Measured before the fix:
+    /// 6 runs out of 8 ended with no summary at all; after it, 0 out of 8.
+    ///
+    /// The negative half runs HERE, in the live multi-threaded harness, because that is the situation
+    /// that was broken. The positive control runs in a forked child: with the flag set the redirect is
+    /// real and process-wide, and performing it in this process would drop the harness's output again,
+    /// which is precisely the defect being pinned.
+    #[test]
+    fn quiet_io_takes_the_process_stdout_only_under_the_alt_screen() {
+        fn fd1() -> String {
+            std::fs::read_link("/proc/self/fd/1")
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        }
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(
+            ALT_SCREEN_TID.load(SeqCst),
+            0,
+            "no test may leave the flag set"
+        );
+        let before = fd1();
+        assert!(!before.is_empty(), "cannot read /proc/self/fd/1 to compare");
+        assert_eq!(
+            quiet_io(fd1),
+            before,
+            "quiet_io redirected the whole process's stdout with no alt screen up"
+        );
+        assert_eq!(fd1(), before, "fd 1 changed across a no-op quiet_io");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // `this_tid()` in the child, not the inherited value: after a fork the child is a new
+            // thread of a new process, and storing the parent's tid would make the owner check fail
+            // for the wrong reason and hide whether the swap happens at all.
+            ALT_SCREEN_TID.store(this_tid(), SeqCst);
+            let inside = quiet_io(fd1);
+            let ok = inside == "/dev/null" && fd1() == before;
+            unsafe { libc::_exit(i32::from(!ok)) };
+        }
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid, "waitpid");
+        assert!(
+            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
+            "under the alt screen quiet_io must redirect fd 1 to /dev/null and put it back"
+        );
     }
 
     /// A lifecycle key that FAILS must say so on screen.

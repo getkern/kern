@@ -460,6 +460,9 @@ pub enum Command {
         /// Which compose verb to run (see [`commands::ComposeAction`]).
         action: commands::ComposeAction,
         no_pod: bool,
+        /// `--allow-device-grants`: see [`commands::ComposeOpts::allow_device_grants`]. CLI-only on
+        /// purpose, so a compose file cannot grant itself the hardware it names.
+        allow_device_grants: bool,
         /// `--tail N` for `logs`.
         tail: Option<usize>,
         /// `-f/--follow` for `logs` (one service only).
@@ -1197,6 +1200,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut file: Option<String> = None;
             let mut action: Option<commands::ComposeAction> = None;
             let mut no_pod = false;
+            let mut allow_device_grants = false;
             let mut tail: Option<usize> = None;
             let mut follow = false;
             let mut all = false;
@@ -1205,6 +1209,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             while let Some(a) = it.next() {
                 match *a {
                     "--no-pod" => no_pod = true,
+                    "--allow-device-grants" => allow_device_grants = true,
                     "-f" | "--follow" => follow = true,
                     "-a" | "--all" => all = true,
                     "-p" | "--project-name" => {
@@ -1287,6 +1292,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 files,
                 action: action.unwrap_or(commands::ComposeAction::Up),
                 no_pod,
+                allow_device_grants,
                 tail,
                 follow,
                 all,
@@ -1306,6 +1312,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 commands::ComposeAction::Up
             };
             let no_pod = rest.contains(&"--no-pod");
+            let allow_device_grants = rest.contains(&"--allow-device-grants");
             let file = discover_compose_file().ok_or_else(|| {
                 Error::Compose(
                     "no compose file in this directory (looked for docker-compose.yml, compose.yml, compose.yaml, kern.toml)".to_string(),
@@ -1315,6 +1322,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 files: vec![file],
                 action,
                 no_pod,
+                allow_device_grants,
                 tail: None,
                 follow: false,
                 all: false,
@@ -3114,6 +3122,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             files,
             action,
             no_pod,
+            allow_device_grants,
             tail,
             follow,
             all,
@@ -3125,6 +3134,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             files: &files,
             action,
             no_pod,
+            allow_device_grants,
             tail,
             follow,
             all,

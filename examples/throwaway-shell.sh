@@ -5,6 +5,12 @@
 # thrown away when the shell exits. The cached image stays pristine for the next run.
 set -eu
 kern="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
+
 
 # Non-interactive demo of a throwaway session (swap the `-c '...'` for nothing to get a real
 # interactive shell when run from a terminal):

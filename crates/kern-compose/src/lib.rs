@@ -30,6 +30,24 @@ pub struct BuildDirective {
     pub args: Vec<String>,
 }
 
+/// The resource-profile kinds a compose file may name.
+///
+/// The kind → field pairing is [`ComposeBox::profile_list`], not this array: `profile_tokens` walks
+/// these kinds and asks that function for each list, and the YAML reader accepts `x-kern-<kind>` for
+/// whatever it resolves. A test asserts the two agree, so a kind added here without its field is a
+/// failing test rather than a key that parses and does nothing.
+///
+/// `vgpu` is deliberately ABSENT rather than listed-and-dead: `kern_cli::config::classify` does not
+/// know a `vgpu:` token in this build, so the CLI would answer `unexpected argument` on a token this
+/// crate had happily built. [`ABSENT_PROFILE_KINDS`] carries it instead, so a file written for a
+/// build that has it is told exactly that rather than being told it looks like a typo.
+pub const PROFILE_KINDS: [&str; 3] = ["vcpu", "vdisk", "vgpio"];
+
+/// Profile kinds that are real elsewhere and are NOT in this build - the difference between "you
+/// mistyped a key" and "this key is for a build kern does not have here", which are different
+/// problems and deserve different sentences.
+pub const ABSENT_PROFILE_KINDS: [&str; 1] = ["vgpu"];
+
 /// One service in a compose file. Most fields mirror a `kern box` flag (`None`/empty/`false` =
 /// "flag absent"); `name`/`command`/`depends_on` are structural - `depends_on` is compose-only, and
 /// `push_box_flags` deliberately skips all three. Frozen key ↔ flag map (non-obvious names):
@@ -37,17 +55,6 @@ pub struct BuildDirective {
 /// `user`→`--user`, `volumes`→`-v`, `env`→`-e`, `ports`→`-p`, `secrets`→`--secret`; the rest share
 /// the flag's long name (`pids_limit`, `io_weight`, `nice`, `timeout`, `hostname`, `tun`, `tmpfs`,
 /// `cap_add`, `cap_drop`, `env_file`, `health_retries`/`_start_period`/`_timeout`/`_action`).
-/// The resource-profile kinds a compose file may name, and the ONE place that decides.
-///
-/// Read by `profile_tokens`, which turns `<kind>` + a name into the positional token `kern box`
-/// takes, and by the YAML reader, which accepts `x-kern-<kind>` for exactly these. A new kind is one
-/// entry here plus its field, and nothing else: `vgpu` is the one waiting, and it is deliberately
-/// ABSENT rather than listed-and-dead, because `kern_cli::config::classify` does not know a `vgpu:`
-/// token in this build and the CLI would answer `unexpected argument` on a token this crate had
-/// happily built. An unrecognised `x-kern-…` key is named at parse time instead, so a file written
-/// for a build that has it says so here rather than failing three layers down.
-pub const PROFILE_KINDS: [&str; 3] = ["vcpu", "vdisk", "vgpio"];
-
 #[derive(Default, Debug)]
 pub struct ComposeBox {
     pub name: String,
@@ -306,8 +313,10 @@ impl ComposeBox {
         if let Some(v) = &self.config {
             cmd.arg("--config").arg(v);
         }
-        // `--security-profile` before anything a profile could also set: the bundle fills flags the
-        // caller did not give, so it must not be applied on top of an explicit choice.
+        // Position in argv carries no meaning here, and an earlier draft of this comment claimed it
+        // did. Measured: `kern box` assigns each flag in one pass and validates the combinations after
+        // it, so `--security-profile untrusted --cap-add ALL` and the reverse produce the identical
+        // refusal. The flag sits here because the field does, and for no other reason.
         if let Some(v) = &self.security_profile {
             cmd.arg("--security-profile").arg(v);
         }
@@ -477,13 +486,37 @@ impl ComposeBox {
     /// `vcpu = "db"` or `vcpu = "vcpu:db"` and mean the same profile; anything else gets the prefix
     /// its key implies. Split out from `push_box_flags` so the normalisation is unit-testable without
     /// building a `Command`.
+    /// The profile list for one [`PROFILE_KINDS`] entry, or `None` for a kind this build has no field
+    /// for. THE kind → field pairing: `profile_tokens` reads through it and the YAML door writes
+    /// through [`profile_list_mut`](Self::profile_list_mut), so neither spells a kind's field name
+    /// itself and the two cannot come to disagree about which list `x-kern-vdisk` fills.
+    pub fn profile_list(&self, kind: &str) -> Option<&Vec<String>> {
+        match kind {
+            "vcpu" => Some(&self.vcpu),
+            "vdisk" => Some(&self.vdisk),
+            "vgpio" => Some(&self.vgpio),
+            _ => None,
+        }
+    }
+
+    /// [`profile_list`](Self::profile_list), for the reader that fills these from `x-kern-<kind>`.
+    pub fn profile_list_mut(&mut self, kind: &str) -> Option<&mut Vec<String>> {
+        match kind {
+            "vcpu" => Some(&mut self.vcpu),
+            "vdisk" => Some(&mut self.vdisk),
+            "vgpio" => Some(&mut self.vgpio),
+            _ => None,
+        }
+    }
+
     pub fn profile_tokens(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for (kind, names) in [
-            (PROFILE_KINDS[0], &self.vcpu),
-            (PROFILE_KINDS[1], &self.vdisk),
-            (PROFILE_KINDS[2], &self.vgpio),
-        ] {
+        for kind in PROFILE_KINDS {
+            // `continue`, never a panic or an `unwrap`: a kind listed with no field is a bug the
+            // pairing test catches, not something this function may take the process down over.
+            let Some(names) = self.profile_list(kind) else {
+                continue;
+            };
             for n in names.iter().filter(|n| !n.trim().is_empty()) {
                 let n = n.trim();
                 if n.starts_with(&format!("{kind}:")) {
@@ -725,6 +758,7 @@ impl ComposeBox {
             restart_max,
             stop_signal,
             stop_grace_period,
+            security_profile,
         );
         // Booleans: an override can only turn one ON (its `false` is indistinguishable from absent).
         macro_rules! flag {
@@ -767,6 +801,24 @@ impl ComposeBox {
             depends_healthy,
             depends_completed,
         );
+        // PROFILE LISTS REPLACE, unlike every other list above, and the difference is not tidiness.
+        // A `vcpu:` profile does NOT stack (the first to set each cap wins, with a warning), so an
+        // override that APPENDED would leave the base's caps in force and the override's ignored,
+        // which is the reverse of what an override means. The compose spelling is a scalar
+        // (`x-kern-vcpu: ml`), so a reader who writes a different name in an override expects that
+        // name and not both.
+        //
+        // MEASURED BEFORE THIS EXISTED: an override adding `x-kern-vgpio: leds` reached the struct
+        // and was dropped in silence - `config` printed no `profiles:` line and the box got no
+        // device. Accepted-and-ignored, in the merge, which is the shape this file's own comment
+        // eight lines up warns about.
+        //
+        // Removal is NOT expressible: an empty value contributes no entries and so reads as "not
+        // mentioned". Said here rather than discovered, because an override CANNOT take a grant away.
+        macro_rules! replace_seq {
+            ($($f:ident),* $(,)?) => { $( if !o.$f.is_empty() { self.$f = o.$f; } )* };
+        }
+        replace_seq!(vcpu, vdisk, vgpio);
         // argv REPLACES: appending two commands would run neither.
         if !o.command.is_empty() {
             self.command = o.command;
@@ -1001,6 +1053,11 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "vcpu" => b.vcpu = parse_scalar_or_array(val).map_err(|e| line_err(i, &e))?,
             "vdisk" => b.vdisk = parse_scalar_or_array(val).map_err(|e| line_err(i, &e))?,
             "vgpio" => b.vgpio = parse_scalar_or_array(val).map_err(|e| line_err(i, &e))?,
+            // The native spelling of `--security-profile`, which the YAML door has as
+            // `x-kern-security-profile`. Missing until now, so the native format could not say
+            // something the compose format could, and the merge test (which is a TOML fixture)
+            // could not cover the field at all.
+            "security_profile" => b.security_profile = Some(s(val)?),
             "volumes" => b.volumes = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "env" => b.env = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "env_file" => b.env_file = parse_string_array(val).map_err(|e| line_err(i, &e))?,
@@ -2554,6 +2611,10 @@ mod dotenv_tests {
             "restart_max = \"3\"\n",
             "stop_signal = \"SIGINT\"\n",
             "stop_grace_period = \"30\"\n",
+            "vcpu = \"ml\"\n",
+            "vdisk = \"scratch\"\n",
+            "vgpio = \"leds\"\n",
+            "security_profile = \"untrusted\"\n",
             "read_only = true\n",
             "net = true\n",
             "uid_range = true\n",

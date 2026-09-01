@@ -469,15 +469,15 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     let inst = registry::find_ref(box_ref).ok_or_else(|| {
         Error::Sandbox(format!("no running box '{box_ref}'; `kern ps` lists them"))
     })?;
-    // PID 1 inside the box: the registry value when known, else the supervisor's sole child.
-    let pid1 = if inst.pid1 > 0 {
-        inst.pid1
-    } else {
-        registry::child_of(inst.pid).ok_or_else(|| {
+    // PID 1 inside the box: the registry value when it is still the process we registered, else the
+    // supervisor's sole child.
+    let pid1 = match inst.live_pid1() {
+        Some(p) => p,
+        None => registry::box_init_under(inst.pid).ok_or_else(|| {
             Error::Sandbox(format!(
                 "box '{box_ref}' has no resolvable init pid (is it still running?)"
             ))
-        })?
+        })?,
     };
     let root = std::path::PathBuf::from(format!("/proc/{pid1}/root"));
     std::fs::metadata(&root).map_err(|e| {

@@ -38,6 +38,22 @@ Every entry below is a mistake this project actually made, caught only because s
 contradicted it. They are listed as environment facts, not as advice, because each one produced a
 confident wrong answer first and a correction second.
 
+- **`trim_start_matches` / `trim_end_matches` / `trim_matches` strip AS MANY TIMES AS THEY FIND,
+  which is almost never what a parser means.** Reach for `strip_prefix`/`strip_suffix` whenever the
+  thing being removed is a SEMANTIC marker rather than padding. Removing repeated `/`, `.`, spaces or
+  quotes is fine and is what most of the uses here do. Removing a word is not: measured, and each of
+  these accepted a malformed value as a well-formed one, in silence.
+
+  ```
+  x-kern-x-kern-vcpu     read as the x-kern-vcpu key
+  on-failure:on-failure:3  read as a clean retry count of 3
+  0o0o755                read as mode 755
+  ```
+
+  This is the same defect three times, and it is a grep. It belongs with the other parsers that
+  accepted an input they did not understand and produced a value that did not correspond to it
+  (`parse_binary_size` on `31.2G`, `split_top_commas` on an escaped quote): the fix is never a wider
+  accept, it is refusing the input or letting it fall onto the path that already reports it.
 - **A green test proves nothing until you have seen it go red.** Sabotage the fix and watch the
   test fail. If it stays green, either the test or the sabotage is blind, and you do not yet know
   which.

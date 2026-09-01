@@ -30,8 +30,22 @@ pub fn strip_comment(line: &str) -> &str {
 }
 
 /// A double-quoted string value → its contents (the surrounding quotes removed).
+///
+/// A MULTI-LINE STRING (`"""…"""`, `'''…'''`) IS REFUSED BY NAME, not stripped once and handed on.
+/// MEASURED before this: `image = """alpine"""` removed a single pair of quotes and produced the
+/// value `""alpine""`, so the box was started on an image name nobody wrote and the only error came
+/// later, from a registry, about a tag that does not exist. The literal-string form (`'x'`) was
+/// already refused with its own message; this closes the other half of the same gap. The parser does
+/// not implement TOML multi-line strings, and saying so is the whole fix - a value it cannot read
+/// must not become a value it invents.
 pub fn quoted_string(v: &str) -> Result<String, String> {
     let v = v.trim();
+    if v.starts_with("\"\"\"") || v.starts_with("'''") {
+        return Err(format!(
+            "multi-line strings (`\"\"\"` / `'''`) are not supported here - use a single-line \
+             double-quoted string: `{v}`"
+        ));
+    }
     if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
         Ok(v[1..v.len() - 1].to_string())
     } else {
@@ -109,5 +123,26 @@ mod tests {
         assert_eq!(strip_comment(r#"x = "v"  # note"#).trim_end(), r#"x = "v""#);
         // A # inside a normal quoted value is kept.
         assert_eq!(strip_comment(r##"x = "a#b""##), r##"x = "a#b""##);
+    }
+
+    /// A MULTI-LINE STRING IS REFUSED BY NAME, not stripped once.
+    ///
+    /// `"""alpine"""` used to lose ONE pair of quotes and yield `""alpine""`: a value nobody wrote,
+    /// carried to a registry that then complained about a tag that does not exist. The parser does
+    /// not implement TOML multi-line strings; saying so is the fix, because a value it cannot read
+    /// must not become one it invents.
+    #[test]
+    fn a_multiline_string_is_refused_rather_than_half_stripped() {
+        for v in [r#""""alpine""""#, "'''alpine'''"] {
+            let err = quoted_string(v).expect_err("a multi-line string must be refused");
+            assert!(
+                err.contains("multi-line"),
+                "the refusal must name the form: {err}"
+            );
+        }
+        // POSITIVE CONTROL: the ordinary form still parses, and its contents are exact.
+        assert_eq!(quoted_string(r#""alpine""#).as_deref(), Ok("alpine"));
+        // And the empty string is a string, not a multi-line marker.
+        assert_eq!(quoted_string(r#""""#).as_deref(), Ok(""));
     }
 }

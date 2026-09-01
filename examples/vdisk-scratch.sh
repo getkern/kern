@@ -13,6 +13,12 @@
 # The vdisk is a SEPARATE mount, so it stays writable even under --read-only (scratch by design).
 set -eu
 kern="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
+
 
 # A minimal kern.toml defining one small vdisk profile. Kept small (10m) because the rootless tmpfs
 # backend counts against RAM. Written to a temp dir and removed on exit.

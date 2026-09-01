@@ -11,6 +11,12 @@
 # just a two-line shell snippet that calls `kern box`. It's printed below, then demoed for real.
 set -eu
 kern="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
+
 
 # ---------------------------------------------------------------------------
 # The hook itself. Copy this into .git/hooks/pre-commit (chmod +x) in a real repo:

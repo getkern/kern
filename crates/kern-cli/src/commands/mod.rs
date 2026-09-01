@@ -860,7 +860,8 @@ fn apply_profile_list(
     if profiles.is_empty() {
         return Ok(());
     }
-    let cfg = crate::config::load(config).map_err(Error::Config)?;
+    // Memoised: this runs once per box, and a large stack made it a per-service disk read.
+    let cfg = crate::config::load_cached(config).map_err(Error::Config)?;
     // Multiple `vcpu:` profiles on one box do NOT merge: the FIRST to set each field wins (documented),
     // so a second `vcpu:` is a silent no-op on every field the first already set. That is almost always a
     // typo, so name it - which profile is in force, which are ignored - rather than pick one quietly.
@@ -3715,6 +3716,133 @@ fn reconcile_decision(running: &registry::Instance, want: &str) -> Reconcile {
 /// Not gated on `use_pod`'s third term (`any(!b.net)`) on purpose: services on the HOST network share
 /// the host's namespace, so their internal ports collide just as surely. `use_pod` answers "create a
 /// pod?", this answers "can these ports coexist?" - different questions that happen to share two terms.
+/// Refuse a stack whose profiles resolve to HOST DEVICE NODES, unless the person running it said so
+/// on the command line.
+///
+/// EVERY OTHER PROFILE KIND NARROWS. The file names a want, `kern.toml` holds the grant, and the local
+/// grant is a ceiling: a downloaded compose file naming `x-kern-vdisk: scratch` cannot get more than
+/// this host's `scratch` allows, whatever its author meant. "The local one wins" is the conservative
+/// answer there by construction, because local is the smaller of the two authorities.
+///
+/// A `vgpio` PROFILE DOES NOT NARROW, and that is the whole reason this exists. Its resolution is a
+/// device, not a bound, and there is no ordering on device nodes: `/dev/gpiochip0` is not a smaller
+/// `/dev/gpiochip1`. One host's `leds` may be an LED; another's may be a relay board or a motor
+/// controller. There is no direction in which taking the local grant is the safe one.
+///
+/// SO THE GATE IS ON THE PROPERTY, not on a list of kinds: does this profile resolve to a host path?
+/// A future kind that also resolves to hardware inherits this without anyone remembering to add it.
+///
+/// NOT GATED OUTSIDE COMPOSE, and the reason is the root of trust rather than who typed the command.
+/// `kern box vgpio:leds` is ungated, and so is a profile reached from `kern.toml` by any other route,
+/// because `kern.toml` IS the authority on what a name grants in this model. "The person typed it"
+/// would be the wrong reason: it breaks the day somebody proposes reading profiles from a system
+/// directory or a package, where nobody typed anything.
+///
+/// The acknowledgement is UNFORGEABLE BY THE FILE: `--allow-device-grants` is a command-line flag, so
+/// the author of a downloaded stack cannot put it in the YAML. It is not a prompt, because kern has
+/// none and adding one for this would be a worse trade: the person typing the flag has read what
+/// `kern compose <file> config` printed, which names the exact devices.
+/// The dry-run rule has exactly ONE declared exception, and this array is what keeps it at one.
+///
+/// The rule is that `kern compose <file> config` refuses whatever the bring-up refuses, because a dry
+/// run that disagrees is worse than none: it is the output people trust before committing a file.
+/// Device grants are the exception, for the reason spelled out on [`device_grant_problem`].
+///
+/// AN EXCEPTION IS ONLY USEFUL WHILE THERE IS ONE. A second turns the rule into "usually", and a rule
+/// with several exceptions stops applying itself. A test asserts this array's LENGTH, so adding the
+/// second is a decision somebody makes on purpose rather than a precedent they inherit.
+const DRY_RUN_REFUSAL_EXCEPTIONS: [&str; 1] = ["device grants (config reports, bring-up refuses)"];
+
+/// The problem text, or `None` when there is none. Callers decide what to DO with it, and they do
+/// not agree on purpose: a bring-up refuses, and `config` only reports.
+///
+/// `config` MAY NOT REFUSE THIS ONE, and it is the single exception to the rule that a dry run
+/// rejects whatever the bring-up rejects. The refusal tells the reader to run `config` to see which
+/// devices a name reaches, so a `config` that refused would make its own advice circular, and the
+/// flag is meant to be passed by somebody who has READ that output. A verb that starts nothing can
+/// state the verdict without enforcing it.
+/// Is a persistent device grant recorded in the operator's OWN `kern.toml`?
+///
+/// READ FROM THE DEFAULT CONFIG ONLY, and that is the security property rather than a detail. The
+/// native stack format lets a file point at its own config (`config = "bundled.toml"`), so a bundle
+/// downloaded from anywhere could otherwise ship a `kern.toml` that sets `allow_device_grants = true`
+/// and grant itself the hardware the gate exists to withhold. `load(None)` resolves the operator's
+/// config (or `KERN_CONFIG`, which is equally theirs and equally outside the file), and nothing a
+/// compose file says can redirect it.
+///
+/// A config that cannot be read is NOT a grant: an unreadable or malformed file answers `false`, so
+/// the gate stays closed. Failing open here would make a corrupt config a permission.
+fn device_grants_allowed_by_config() -> bool {
+    match crate::config::load_cached(None) {
+        Ok(cfg) => cfg.kern.allow_device_grants,
+        Err(_) => false,
+    }
+}
+
+fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Option<String> {
+    // The command line, or the operator's own config. Never the compose file, and never a config the
+    // compose file named: see `device_grants_allowed_by_config`.
+    if allow || device_grants_allowed_by_config() {
+        return None;
+    }
+    for b in boxes {
+        let toks = b.profile_tokens();
+        if toks.is_empty() {
+            continue;
+        }
+        let mut ap = AppliedProfiles::default();
+        // A profile that does not resolve is somebody else's error, reported by the resolver that
+        // runs beside this one. Silence here rather than a second, worse-worded version of it.
+        if apply_profile_list(&toks, b.config.as_deref(), &mut ap).is_err() {
+            continue;
+        }
+        if let Some(msg) = device_grant_refusal(b.service_name(), &ap.vgpio) {
+            return Some(msg);
+        }
+    }
+    None
+}
+
+/// The refusal text for a resolved set of `vgpio` profiles, or `None` when they grant no hardware.
+///
+/// THE PREDICATE IS OBSERVATIONAL, and the property it stands for is "does this grant access to
+/// hardware". A resolved host path is how that is observed TODAY. A future kind that grants a device
+/// by major/minor, by an inherited fd, or by a symbolic name inherits this gate only if its
+/// resolution also produces a path; if it does not, the predicate has to grow rather than the kind
+/// being added to a list.
+///
+/// TWO READS, ONE PATH. The gate resolves here and the box resolves again in its own process from the
+/// same `--config`, so a `kern.toml` edited in between could differ from what was shown. That is the
+/// validate-then-run shape, and it is accepted rather than closed: the file cannot reach it, because
+/// only `kern.toml` decides what a name grants and the compose file's own `config:` key is reported
+/// as `defined in:` when it names one. Closing it properly means passing a resolution across a
+/// process boundary that today carries tokens.
+///
+/// Split from the check so the DECISION can be asserted: whether a grant is a device grant is the
+/// whole of the behaviour, and it cannot be exercised end to end on a host with no gpiochip. The
+/// predicate is "did this resolve to any host path", never "is this kind called vgpio", so a profile
+/// that resolves to nothing is not gated and a future kind that resolves to hardware is.
+fn device_grant_refusal(service: &str, vgpio: &[crate::config::ResolvedVgpio]) -> Option<String> {
+    let devs: Vec<&str> = vgpio
+        .iter()
+        .flat_map(|g| g.devs.iter().chain(g.sysfs.iter()).map(String::as_str))
+        .collect();
+    if devs.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = vgpio.iter().map(|g| format!("vgpio:{}", g.name)).collect();
+    Some(format!(
+        "service '{service}' asks for {}, which on THIS host resolves to {}. A profile name says \
+         nothing about which hardware it reaches: another machine's '{}' may be something else \
+         entirely, and unlike a cpu or disk profile there is no sense in which the local grant is \
+         the smaller one. Check what it resolves to with `kern compose <file> config`, then pass \
+         --allow-device-grants to run it.",
+        names.join(" "),
+        devs.join(" "),
+        vgpio.first().map(|g| g.name.as_str()).unwrap_or("")
+    ))
+}
+
 fn check_pod_global_conflicts(
     boxes: &[crate::compose::ComposeBox],
     no_pod: bool,
@@ -3758,13 +3886,40 @@ fn check_pod_global_conflicts(
             if let Some(other) = seen.insert((port, udp), short(b)) {
                 if other != b.service_name() {
                     let proto = if udp { "udp" } else { "tcp" };
+                    // THIS REFUSAL IS THE PRODUCT. There is no configuration that gives a stack both
+                    // "two services on one internal port" and "peers resolve by name", so the whole
+                    // of what kern can do for this file is explain the trade well, once, here.
+                    //
+                    // It shows the edit rather than describing it, and it prices BOTH routes.
+                    // `--no-pod` used to be named with no cost attached, and MEASURED it is not free:
+                    // in a pod `getent hosts db` answers `127.0.0.1 db db`, under `--no-pod` nothing.
+                    // Sending someone from a loud port collision into a silent resolution failure
+                    // inside their own code is not help.
+                    //
+                    // `PORT` IS NAMED AS A CONVENTION, not as a contract. kern really does pass it
+                    // (measured: `port: 8081` clears the collision and the box gets PORT=8081), but
+                    // an image is free to read a variable of its own instead, and for those the "two
+                    // line edit" is two lines PLUS knowing which variable. Quoting the cheaper number
+                    // and leaving the reader to find the rest is the same defect one level up.
+                    //
+                    // THE EDIT IS SPELLED, NOT DESCRIBED - inline rather than as a YAML block,
+                    // because `ui::scrub` strips every control character from an error on the way
+                    // out. That is deliberate and right: this message interpolates names that came
+                    // from the file, and a newline is the cheap end of the same channel a terminal
+                    // escape uses. Formatting is not worth weakening it for.
+                    let svc = short(b);
+                    let alt = port.saturating_add(1);
                     return Err(Error::Compose(format!(
-                        "services '{}' and '{}' both listen on container port {port}/{proto}. Services \
-                         in a stack share ONE network namespace (like a Kubernetes pod), so only one \
-                         can bind it: declare a different internal port with `port:` on one of them \
-                         (kern passes it as PORT, which most images read), or run with --no-pod.",
-                        other,
-                        short(b)
+                        "services '{other}' and '{svc}' both listen on container port {port}/{proto}. \
+                         Services in a stack share ONE network namespace (like a Kubernetes pod), so \
+                         only one of them can bind it. Either give one a different internal port - add \
+                         `port: {alt}` under service '{svc}', and the stack keeps resolving peers by \
+                         service name (kern passes it as PORT={alt}; PORT is a convention, not a \
+                         contract, so an image that reads a variable of its own needs that one set \
+                         instead). Or run with --no-pod: each service gets its own network namespace \
+                         and both keep port {port}, and then they no longer resolve each other by \
+                         name, so any address a service holds for a peer has to be a published \
+                         127.0.0.1:PORT."
                     )));
                 }
             }
@@ -3827,6 +3982,83 @@ fn check_pod_global_conflicts(
 /// a guaranteed bind (an nginx reconfigured off :80 will not collide), so it warns, never refuses.
 /// Cache-only via [`PullPolicy::Never`]: it never pulls just to warn, so an uncached service is
 /// skipped (and warned about, if it collides, once its image is present - e.g. the second `up`).
+/// `--no-pod` gives each service its own network namespace, which is exactly why peers stop resolving
+/// each other by service name. Say it once, at bring-up.
+///
+/// The two are the same fact seen from both ends: a shared namespace is what makes `db` an entry in
+/// the pod's `/etc/hosts`, and it is also what makes two services unable to bind one port. Whoever
+/// passes `--no-pod` is buying the second and paying the first, and until now nothing said so - a
+/// service that resolved `db` yesterday simply fails to connect today, from inside its own code,
+/// where the reason is invisible. Silent for a single service (it has no peers to lose).
+/// What a resolved set of profiles actually granted, one line per kind, for `compose config`.
+///
+/// Separated from the printing so it can be asserted: the value of this output is entirely in WHICH
+/// facts it carries, and a function that only writes to stdout can be checked by nothing. Empty when
+/// the profiles granted nothing this host can name, which is itself worth seeing.
+fn resolved_profile_lines(ap: &AppliedProfiles) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cpu = Vec::new();
+    if let Some(c) = ap.cpus {
+        cpu.push(format!("cpus {}", crate::ui::fmt_cpus(c)));
+    }
+    if let Some(c) = &ap.cpuset {
+        cpu.push(format!("cpuset {c}"));
+    }
+    if let Some(n) = ap.nice {
+        cpu.push(format!("nice {n}"));
+    }
+    if let Some(m) = ap.memory {
+        cpu.push(format!("memory {}", human_bytes(m)));
+    }
+    if !cpu.is_empty() {
+        out.push(format!("resolves to: {}", cpu.join(", ")));
+    }
+    for d in &ap.vdisk {
+        let mut f = vec![match d.size {
+            Some(s) => format!("size {}", human_bytes(s)),
+            None => "uncapped".to_string(),
+        }];
+        if d.persistent {
+            f.push("persistent".to_string());
+        }
+        if let Some(i) = d.iops {
+            f.push(format!("{i} iops"));
+        }
+        if let Some(bw) = d.bandwidth {
+            f.push(format!("{}/s", human_bytes(bw)));
+        }
+        out.push(format!("vdisk:{} resolves to: {}", d.name, f.join(", ")));
+    }
+    for g in &ap.vgpio {
+        // The DEVICE NODES, because that is the grant. A name says nothing about which hardware a
+        // host's `leds` reaches, and this is the one place an operator can see it before it runs.
+        let mut paths: Vec<&str> = g.devs.iter().map(String::as_str).collect();
+        paths.extend(g.sysfs.iter().map(String::as_str));
+        let what = if paths.is_empty() {
+            "nothing present on this host".to_string()
+        } else {
+            paths.join(" ")
+        };
+        out.push(format!("vgpio:{} resolves to: {what}", g.name));
+    }
+    out
+}
+
+/// Returns the note rather than printing it, like `container_only_port_note`: the DECISION of when to
+/// say this is the whole of the behaviour, and a function that only writes to stderr can be asserted
+/// on by nothing.
+fn no_pod_peer_names_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) -> Option<String> {
+    if !no_pod || boxes.len() < 2 {
+        return None;
+    }
+    Some(
+        "kern: note: --no-pod gives each service its own network namespace, so they no longer resolve \
+         each other by service name; a peer address has to be a published 127.0.0.1:PORT. Without it, \
+         the stack shares one namespace: names resolve, and no two services may bind the same port."
+            .to_string(),
+    )
+}
+
 fn warn_image_expose_collisions(boxes: &[crate::compose::ComposeBox], no_pod: bool) {
     if no_pod || boxes.len() < 2 {
         return;
@@ -4030,6 +4262,8 @@ struct TerminalOpts<'a> {
     /// Needed by the read-only verbs too: `config` and `systemd` answer questions ABOUT a bring-up,
     /// so they have to know whether that bring-up would share a namespace.
     no_pod: bool,
+    /// See [`ComposeOpts::allow_device_grants`]; `config`/`systemd` refuse what `up` would.
+    allow_device_grants: bool,
 }
 
 /// Run the compose verbs that never launch a box, and report whether one ran.
@@ -4045,6 +4279,7 @@ fn run_terminal_verb(
 ) -> Result<bool, Error> {
     let (pod, file, tail, follow, all, services, no_pod) =
         (o.pod, o.file, o.tail, o.follow, o.all, o.services, o.no_pod);
+    let allow_device_grants = o.allow_device_grants;
     let selected =
         |b: &crate::compose::ComposeBox| services.is_empty() || services.contains(&b.name);
 
@@ -4059,6 +4294,11 @@ fn run_terminal_verb(
             validate_conditions(boxes)?;
             check_port_collisions(boxes)?;
             check_pod_global_conflicts(boxes, no_pod)?;
+            // REFUSES, unlike `config` below: this emits a unit that a machine will run unattended,
+            // so it is a bring-up with a delay rather than a dry run.
+            if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
+                return Err(Error::Compose(msg));
+            }
             crate::systemd::print_unit(file, pod)?;
             return Ok(true);
         }
@@ -4073,6 +4313,31 @@ fn run_terminal_verb(
             // will come up, so every rejection `up` performs has to be reachable from here. Reporting
             // a clean dry run for a stack that `up` then refuses is worse than not having the verb.
             check_pod_global_conflicts(boxes, no_pod)?;
+            // The `--no-pod` trade belongs here too, not only at bring-up: `config` is the command
+            // that answers "what will this file be", and `--no-pod` changes the answer. Measured
+            // before this: `up --no-pod` said what it cost and `config --no-pod` said nothing, so
+            // the reader who checks a file first was the one who did not hear it.
+            if let Some(note) = no_pod_peer_names_note(boxes, no_pod) {
+                eprintln!("{note}");
+            }
+            // REPORTS, and does not refuse. The device-grant refusal tells its reader to run THIS
+            // verb to see which devices a profile name reaches; a `config` that refused would make
+            // that advice circular, and the flag exists to be passed by somebody who has read this
+            // output. The single deliberate exception to "a dry run refuses what the bring-up
+            // refuses", and it is stated here rather than left as an inconsistency to be discovered.
+            if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
+                // THE LIST DECIDES, not this branch: drop the entry from
+                // `DRY_RUN_REFUSAL_EXCEPTIONS` and `config` goes back to refusing, which is what
+                // makes the list a mechanism rather than a note somebody has to remember.
+                if DRY_RUN_REFUSAL_EXCEPTIONS
+                    .iter()
+                    .any(|e| e.starts_with("device grants"))
+                {
+                    eprintln!("kern: warning: {msg}");
+                } else {
+                    return Err(Error::Compose(msg));
+                }
+            }
             // Validate every published spec HERE, with the same parser the box uses. `config` is the
             // verb people run to check a file, so a typo must surface without starting anything (as
             // `docker compose config` does) instead of failing one box at bring-up. ALL bad specs are
@@ -4104,11 +4369,24 @@ fn run_terminal_verb(
             // path, so the two cannot drift into disagreeing about what resolves.
             for b in boxes.iter().filter(|b| selected(b)) {
                 let toks = b.profile_tokens();
-                if toks.is_empty() {
-                    continue;
+                if !toks.is_empty() {
+                    let mut ap = AppliedProfiles::default();
+                    apply_profile_list(&toks, b.config.as_deref(), &mut ap)?;
                 }
-                let mut ap = AppliedProfiles::default();
-                apply_profile_list(&toks, b.config.as_deref(), &mut ap)?;
+                // The same rule for the same reason, one field over: `x-kern-security-profile: bogus`
+                // used to print a clean preview and exit 0, and `up` then refused it with
+                // `--security-profile: expected untrusted`. THE RUNTIME'S OWN VOCABULARY answers, so
+                // this cannot drift from what `kern box` accepts - the compose crate deliberately does
+                // not carry a copy of the list.
+                if let Some(sp) = b.security_profile.as_deref() {
+                    if SecurityProfile::parse(sp).is_none() {
+                        return Err(Error::Compose(format!(
+                            "config: service '{}': x-kern-security-profile: '{sp}' is not a \
+                             security profile - kern box takes `untrusted`",
+                            b.service_name()
+                        )));
+                    }
+                }
             }
             println!("compose config: {} service(s) in {file}", boxes.len());
             // `config` reports the FILE, so it prints service names as written, not the
@@ -4164,6 +4442,50 @@ fn run_terminal_verb(
                     if let Some(c) = &b.config {
                         println!("      defined in: {c}");
                     }
+                    // WHAT THE NAME RESOLVED TO ON THIS HOST, not just the name.
+                    //
+                    // A compose file names a grant and does not carry it, which is the right way round:
+                    // a file downloaded from anywhere must not be able to grant itself hardware, so the
+                    // LOCAL `kern.toml` always wins. The cost is that two hosts can read one file
+                    // completely differently and say the same thing about it. MEASURED before this:
+                    // `x-kern-vdisk: scratch` against a `scratch` of 64m and against a `scratch` of 50g
+                    // printed the identical line, `profiles: vdisk:scratch`, on both.
+                    //
+                    // For `vgpio` that is the sharp case: the token is a name, and what it resolves to
+                    // is a set of DEVICE NODES on this machine. An operator who runs somebody else's
+                    // file is entitled to see which ones before anything starts, from the command whose
+                    // whole job is explaining the file.
+                    //
+                    // Resolution errors are not reported here: the validation pass above already ran
+                    // the same function and returned them, so reaching this line means it resolves.
+                    let mut ap = AppliedProfiles::default();
+                    if apply_profile_list(&tokens, b.config.as_deref(), &mut ap).is_ok() {
+                        let lines = resolved_profile_lines(&ap);
+                        if lines.is_empty() {
+                            // SILENCE IS NOT AN ANSWER. A profile that resolves to nothing printed
+                            // no line at all, so `profiles: vcpu:ml` with nothing under it read the
+                            // same as a profile whose output this command simply does not show. It
+                            // is also exactly what a MISTYPED key produces (`cores` where the key is
+                            // `cpus`), which is the case this whole pairing exists to make visible.
+                            println!(
+                                "      resolves to: nothing (this build reads no cap from it - \
+                                 check the [[...]] block for keys it does not have)"
+                            );
+                        }
+                        for line in lines {
+                            println!("      {line}");
+                        }
+                    }
+                }
+                // THE ONE KEY THIS FILE CARRIES THAT DOCKER WILL NOT ENFORCE, named with what it does
+                // rather than left to a reader who has to know what the bundle contains. `config` is
+                // the command that exists to explain the file, and a hardening bundle that is silent
+                // here is a security posture the operator has to take on trust.
+                if let Some(sp) = &b.security_profile {
+                    println!(
+                        "    security-profile: {sp} (seccomp allowlist + --cap-drop ALL + \
+                         --read-only; kern only, Docker ignores it)"
+                    );
                 }
                 // `config` answers "what did kern understand", so it must show a declared `port:`:
                 // it is what the pod preflight reserves AND what the service receives as `PORT`, so
@@ -4337,6 +4659,20 @@ pub struct ComposeOpts<'a> {
     pub files: &'a [String],
     pub action: ComposeAction,
     pub no_pod: bool,
+    /// `--allow-device-grants`: run a stack whose profiles resolve to HOST DEVICE NODES.
+    ///
+    /// Every other profile kind narrows: the file names a want, `kern.toml` holds a grant, and the
+    /// local grant is a ceiling, so "the local one wins" is the conservative answer by construction.
+    /// A `vgpio` profile does not narrow, because its resolution is a device rather than a bound and
+    /// there is no ordering on device nodes: `/dev/gpiochip0` is not a smaller `/dev/gpiochip1`. One
+    /// host's `leds` may be an LED and another's may be a relay board, and a downloaded compose file
+    /// naming `x-kern-vgpio: leds` gets whichever this host has, silently.
+    ///
+    /// So a device grant asked for BY A COMPOSE FILE is refused unless the person running it says
+    /// otherwise HERE, on the command line, where the file cannot reach. The gate is on the property
+    /// (does this profile resolve to a device node?) and not on a list of kinds, so a future kind
+    /// that also resolves to hardware inherits it without anyone remembering to add it.
+    pub allow_device_grants: bool,
     pub tail: Option<usize>,
     pub follow: bool,
     /// `-a/--all` for `ps`: also list the stack's recently-exited services.

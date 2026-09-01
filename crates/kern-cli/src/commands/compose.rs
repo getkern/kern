@@ -80,6 +80,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         files,
         action,
         no_pod,
+        allow_device_grants,
         tail,
         follow,
         all,
@@ -202,6 +203,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             all,
             services,
             no_pod,
+            allow_device_grants,
         },
     )? {
         return Ok(());
@@ -279,10 +281,23 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // Self-gated (see its doc comment): `config` and `systemd` reach the SAME rejection through the
     // same call, so the dry run can never disagree with the bring-up about what is startable.
     check_pod_global_conflicts(&boxes, no_pod)?;
+    // Self-explaining (see its doc): a device grant a compose file asked for needs a command-line
+    // acknowledgement, because the file cannot reach the command line.
+    if let Some(msg) = device_grant_problem(&boxes, allow_device_grants) {
+        return Err(Error::Compose(msg));
+    }
     // Softer sibling: two services whose IMAGES expose the same port without either DECLARING it (two
     // nginx on :80, two node apps on :3000). Best-effort and cache-only (never pulls just to warn),
     // a WARNING not an error because an image's EXPOSE is a hint, not a guaranteed bind.
     warn_image_expose_collisions(&boxes, no_pod);
+    // THE ESCAPE HATCH SAYS WHAT IT COSTS. `--no-pod` is what the port-collision refusal sends people
+    // to, and it is not free: MEASURED on the same two-service stack, `getent hosts db` answers
+    // `127.0.0.1 db db` in a pod and NOTHING under `--no-pod`. Trading a loud refusal at bring-up for
+    // a silent name-resolution failure inside a service, with nothing said in between, is the shape
+    // this project treats as the expensive kind of defect. Once per bring-up, not once per service.
+    if let Some(note) = no_pod_peer_names_note(&boxes, no_pod) {
+        eprintln!("{note}");
+    }
     // A pod shares ONE network namespace, so a `net.*` sysctl written on one service applies to every
     // service in the stack and the last one to start wins. The file makes it look per-service; say so
     // rather than let an operator tune one service and silently retune the others.

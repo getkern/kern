@@ -73,10 +73,17 @@ services:
   admin:  { image: node:20-slim, port: 3100 }
 ```
 
-kern passes it as `PORT`, which most images read, and reserves it for that service, so
-peers keep using the name (`http://admin:3100`) with nothing remapped at run time.
-Docker's own `expose:` says the same thing and is honoured identically, so a stack that
-already uses it needs no edit.
+kern passes it as `PORT` and reserves it for that service, so peers keep using the name
+(`http://admin:3100`) with nothing remapped at run time. Docker's own `expose:` says the
+same thing and is honoured identically, so a stack that already uses it needs no edit.
+
+`PORT` is a **convention, not a contract.** Most images read it; an image that reads a
+variable of its own needs that one set instead, so for those the edit is this line plus
+knowing which variable the image honours. The refusal says so, and it spells the change it
+wants, naming the service and a port to use rather than describing the shape of an edit,
+because there is no configuration that gives one stack BOTH two services on a single
+internal port AND peers resolving by name. `--no-pod` buys the first and sells the second,
+measured: `getent hosts db` answers `127.0.0.1 db db` in a pod, and nothing without one.
 
 Three spellings, one space: `ports:` (published), `port:` (declared and passed as
 `PORT`), `expose:` (declared only). A service that publishes nothing is visible to the
@@ -137,15 +144,74 @@ runs there WITHOUT the profile: a service relying on a `vdisk` size cap gets no 
 nothing says so. Keep anything a workload needs for correctness in the inline fields both runtimes
 enforce, and use a profile for what only kern can grant.
 
-An unrecognised key in the `x-kern-` namespace is NAMED rather than ignored. The spec says a tool
-must ignore the extension fields it does not understand, and every other vendor's prefix is left
-alone, but this one is kern's: a typo (`x-kern-vgpi`) or a key from a build that has something this
-one does not (`x-kern-vgpu`) would otherwise do nothing and say nothing, which is the defect the
-mechanism exists to avoid.
+**A key that GRANTS and a key that CONSTRAINS fail in opposite directions, and the second one is the
+dangerous one.** Drop `x-kern-vdisk` and the service gets less than it asked for: it runs slower, or
+it fills a disk, and the failure is loud and in front of you. Drop `x-kern-security-profile` - or run
+the same file under Docker, which drops it for you - and the service runs with every capability and a
+writable rootfs, which is the failure that shows nothing at all. Judge each key by what its absence
+does: kern reads this one because the alternative is three separate flags that are easy to get
+half-right, but **do not treat a file carrying it as hardened until you know which runtime read it.**
+`kern compose <file> config` prints the line, marked as kern-only, so at least the runtime that
+enforces it says so out loud. Docker cannot be made to.
+
+**A `tmpfs` size cap is honoured, and it is charged to the box's memory cap.** The short form is what
+both runtimes read: `tmpfs: ["/scratch:size=64m"]` keeps its `size=` and drops Docker's other options
+with a warning. The cap itself holds - measured on the flag it becomes, a 16m tmpfs written with 64m
+leaves a file of exactly 16777216 bytes. But those pages are the box's memory, so a tmpfs larger than
+`mem_limit` is an OOM waiting for a workload to find it: measured, a 256m tmpfs under a 64m
+`mem_limit` writing 128m is killed, exit 137. Size the two together. The LONG form (`volumes: [{type:
+tmpfs, target: /s, tmpfs: {size: N}}]`) is not read - kern warns and skips it, so a service relying on
+it gets no tmpfs at all:
+
+```
+kern compose: service volume long-form {type: tmpfs, target: /s2, ...} has no usable
+              source+target (tmpfs: use kern --tmpfs) - skipped
+```
+
+An unrecognised key in the `x-kern-` namespace is NAMED rather than ignored, and a typo and a key
+from another build are told apart. The spec says a tool must ignore the extension fields it does not
+understand, and every other vendor's prefix is left alone, but this one is kern's, so silence would
+mean a mistyped key does nothing and says nothing. The two cases get different sentences because they
+need different fixes:
+
+```
+x-kern-vgpi:  'x-kern-vgpi:' is not read by this build - kern reads x-kern-vcpu,
+              x-kern-vdisk, x-kern-vgpio, and x-kern-security-profile
+x-kern-vgpu:  'x-kern-vgpu:' names the 'vgpu' profile kind, which this build of kern
+              does not have - the key is ignored, and the service runs without it
+```
+
+Telling the author of `x-kern-vgpu` how `x-kern-vdisk` is spelled would send them looking for a
+mistake they did not make.
+
+**A `vgpio` profile is gated, and the reason is structural rather than a judgement about severity.**
+Every other kind NARROWS: the file names a want, `kern.toml` holds the grant, and the local grant is a
+ceiling, so a downloaded file naming `x-kern-vdisk: scratch` cannot get more than this host allows and
+"the local one wins" is the conservative answer by construction. A `vgpio` profile does not narrow,
+because its resolution is a DEVICE rather than a bound and device nodes have no ordering:
+`/dev/gpiochip0` is not a smaller `/dev/gpiochip1`. One host's `leds` may be an LED, another's a relay
+board. So a stack that resolves to any host device is refused, naming the exact paths, unless the
+person running it passes `--allow-device-grants` - a command-line flag, where the compose file cannot
+reach. The gate is on the property (did this resolve to a device?) and not on a list of kinds, so a
+future kind that also resolves to hardware inherits it.
+
+**What a name means here is not what it meant there, and `config` says so.** `kern compose <file>
+config` prints what each profile resolved to on THIS host: the caps for a `vcpu`, the size and flags
+for a `vdisk`, and the device paths for a `vgpio`. One file against two machines used to print the
+identical line while one meant a 64 MB scratch and the other a 50 GB persistent one.
+
+**Deliberately not built:** a key carrying the author's expectation (`scratch` was 64m where they
+wrote it) so kern could report the difference. A purely COMPARATIVE annotation would pass the delete
+test, since removing it removes an explanation and nothing runs less confined. A CONDITIONAL one - the
+same key making kern refuse on a mismatch - would not, because it is a constraint expressed in a
+portable file that Docker drops in silence. The line is between reporting and refusing, and the second
+version is the one to say no to.
 
 The profile must already exist: a compose file names a grant, it does not create one, which is the
 whole point of the split. `kern compose <file> config` refuses a name that does not resolve, with the
-`kern config add` line that creates it, and it refuses exactly what `up` would.
+`kern config add` line that creates it, and it refuses exactly what `up` would - including an
+`x-kern-security-profile` value `kern box` does not take, which it asks the runtime's own vocabulary
+about rather than keeping a second copy of the list.
 
 `docker compose up -d` is the most common way anyone starts a stack, so `-d`/`--detach` is
 accepted and does exactly what it says: `kern compose <file> up` starts the services and

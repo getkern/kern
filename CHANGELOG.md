@@ -64,7 +64,178 @@ is in the git history.
   builder and the YAML reader, so adding it later is one entry plus one field. A test asserts the
   list's contents, so that stays a decision rather than something a future edit does by accident.
 
+### Changed
+
+- **The block-scalar chomping indicator now decides something, and that changes existing files.**
+  `|`, `|-` and `|+` all produced the same value: every trailing blank line was dropped and nothing
+  was added back. MEASURED on an `environment` value of `ab` delivered into a running box, all three
+  arrived as 2 bytes where YAML says 3, 2 and 4. Default now keeps exactly one break, `-` none, `+`
+  all of them; an empty body still gets none, because there is no content for a break to follow.
+
+  FILED UNDER CHANGED, NOT FIXED, because a value that already worked can now differ by trailing
+  newlines - the default `|` gained one. The blast radius was measured rather than assumed: no block
+  scalar appears in any content kern itself parses, and of the 6 fixtures that use one in the test
+  suite, 2 encoded the old behaviour and now encode YAML's. A stack whose `command` or `environment`
+  ends in a block scalar is where an operator would notice.
+
 ### Fixed
+
+- **`kern top`'s output muting stole the stdout of the whole process, not of its own work.** The
+  helper that runs a lifecycle key with fd 1 and fd 2 pointed at `/dev/null` - so a reused CLI
+  command's `println!` cannot corrupt the alt-screen - does that with `dup2`, which rewrites the
+  file descriptor table of the PROCESS. `kern top` is single-threaded and never noticed. Its own
+  unit tests are not: libtest runs tests on parallel threads and prints from another one, and
+  MEASURED, this binary silently dropped up to a hundred lines of its own test report - the
+  `test result:` summary among them, in 6 runs out of 8 - while still exiting 0. A failing test
+  could have reported into `/dev/null`, and `scripts/test-count.py` had nothing to parse. Two
+  overlapping calls could also interleave save and restore and leave fd 1 on `/dev/null` for good.
+  The redirect now happens only while the alternate screen is actually up, which is the only thing
+  it was ever there to protect. 0 runs out of 12 lose a line now.
+
+- **A NUL byte in a compose file travelled into a value instead of being refused.** U+0001 was
+  already barred, but only because it is the YAML reader's private newline sentinel, so the
+  neighbouring check read as a general control-byte policy it was not. MEASURED, a U+0000 reached an
+  image name intact and printed raw to the operator's terminal. Everything downstream of a compose
+  value is a C string or a path, so a NUL is either truncated in silence or refused a long way from
+  the file that carries it. Refused at the same door as U+0001, with its own message.
+
+- **A key written twice in one service is refused instead of resolved to the last one.** A YAML
+  mapping has no duplicate keys, and two services with one name, or two `x-kern-vcpu` in one service,
+  were already refused. `image` was the exception: MEASURED, a second `image` at the bottom of a
+  service silently won, which is the cheapest way to make a downloaded file run an image other than
+  the one a reader sees at the top. A local key that also exists in a MERGED base is not a duplicate:
+  that is what `<<:` is for, and it still wins.
+
+- **A folded block scalar folded breaks it may not fold.** In `>` a line break becomes a space only
+  between two lines that are both at the block's indentation; a break next to a MORE-INDENTED line is
+  kept. Every break was folded, so an embedded snippet came out as one line: measured, `alp` /
+  `<2 spaces>ine` / `fine` became `alp   ine fine`. The service still ran and emitted a different
+  text, which is the "runs and lies" shape rather than the "refuses" one.
+
+- **A tab after the colon was refused as if it were indentation.** The rule was "this line has leading
+  spaces AND contains a tab anywhere", so `image:<TAB>alpine` was rejected with a message pointing at
+  the indentation, and a shell script pasted into a block scalar (which is full of tabs) went the same
+  way. Only the indentation prefix is checked now.
+
+- **A TOML multi-line string produced a value nobody wrote.** `image = """alpine"""` removed a
+  single pair of quotes and yielded `""alpine""`, carried to a registry that then complained about a
+  tag that does not exist. The parser does not implement multi-line strings and now says so, like it
+  already did for the literal-string form.
+
+- **An unterminated `${` was silently kept as a literal.** The comment there assumed "a downstream
+  parse error will surface if it matters", and MEASURED it does not: `image: "${NONCHIUSA"` parsed
+  clean and the image name became the literal text. Kept literal (the same text can appear inside a
+  block scalar carrying a shell script, so refusing would reject files that work) and now warned
+  about, once per fragment.
+
+- **The pid1 fallback could pick a nested init instead of the box's own.** It looks for a descendant
+  that is PID 1 in its own pid namespace, and a box whose WORKLOAD creates a pid namespace has two of
+  those: MEASURED with `--privileged` and a workload of `unshare -p --fork`, the supervisor's
+  descendants were `NSpid: <p> 1` and `NSpid: <p> 2 1`. Both satisfied the rule, so which one the
+  walk returned was an artefact of traversal order rather than a decision, and the deeper one puts
+  `exec` inside the workload's namespace and resolves the cgroup through the wrong pid. The rule is
+  now the init exactly ONE level below the resolving process - relative, never a constant, because
+  inside a container kern is itself nested and a fixed depth would pass here and fail on a CI runner.
+
+- **A compose file that names a `vgpio` profile is now refused unless the person running it says so
+  on the command line** (`--allow-device-grants`). Every other profile kind NARROWS: the file names a
+  want, `kern.toml` holds the grant, and the local grant is a ceiling, so "the local one wins" is
+  conservative by construction. A `vgpio` profile does not narrow, because its resolution is a DEVICE
+  rather than a bound and device nodes have no ordering: `/dev/gpiochip0` is not a smaller
+  `/dev/gpiochip1`, and one host's `leds` may be an LED where another's is a relay board. The refusal
+  names the exact paths. The gate is on the property (did this resolve to a device?) and not on a list
+  of kinds, so a future kind resolving to hardware inherits it; the acknowledgement is a command-line
+  flag, where a downloaded file cannot reach.
+
+- **`kern compose <file> config` reports what each profile name resolved to on THIS host.** A file
+  names a grant and does not carry one, so two machines can read one file completely differently:
+  measured, `x-kern-vdisk: scratch` against a 64m `scratch` and against a 50g persistent one printed
+  the identical `profiles: vdisk:scratch` on both, from the command whose whole job is explaining the
+  file. It now prints the caps for a `vcpu`, the size and flags for a `vdisk`, and the device paths
+  for a `vgpio`. A profile that resolves to nothing present says so rather than printing a blank.
+
+- **A `kern.toml` key this build does not read is now named.** The parser is deliberately tolerant of
+  unknown keys, so a config shared with another kern edition still loads, but tolerance and silence
+  are different things: a hand-written `[[vcpu]]` with `cores = 6`, where the key is `cpus`, produced
+  a profile that granted nothing and said nothing, and the new resolution output then reported it as
+  resolving to the defaults, which reads as success. A warning, never a refusal, deduplicated per key.
+
+- **Every example script now prints which `kern` it resolved, on stderr, before it runs anything.**
+  They all use `kern="${KERN:-kern}"`, so a run that forgets to set `KERN` silently measures whatever
+  is on `PATH`. That happened here: `examples/compose-declared-ports.sh` was run against the branch,
+  passed, and printed the INSTALLED release's older message, which was caught only by recognising the
+  text. A validation that measures the wrong binary does not produce a weak result, it produces a
+  green one for code that never ran. 81 scripts, one line each: `# using <path> (<version>)`.
+
+- **A health checker that gives up now says so in the record.** The checker exits when its launcher's
+  pid stops being that process, and that guard's failure is the quiet one: a wrong mismatch stops
+  checking a LIVE box, while `healthy` means "healthy as of the last check" and nothing in the record
+  says when that was. A frozen status is indistinguishable from a box that keeps answering the same
+  way, so the exit writes `stopped checking: launcher pid changed` first. It writes only OVER a record
+  that still exists, never creating one: `kern stop` clears the sidecar from another process, and
+  nothing sweeps the health directory.
+
+- **Three parsers accepted a malformed value as a well-formed one, all through the same mistake.**
+  `trim_start_matches` strips its argument AS MANY TIMES AS IT FINDS IT, which is almost never what a
+  parser means: `x-kern-x-kern-vcpu` was read as the `x-kern-vcpu` key, `on-failure:on-failure:3` as a
+  clean retry count of 3, and `0o0o755` as mode 755. All three now `strip_prefix` once, so a malformed
+  value falls onto the error or warning that already exists for it rather than being reinterpreted.
+  The rule is written down in `CONTRIBUTING.md` beside the other traps, because the family is a grep
+  and this is its fourth appearance in the same shape as `parse_binary_size` on `31.2G`.
+
+- **The health checker held its launcher's pid across time without pinning it.** It resolves its box
+  every round through that number, and a pid is a number the kernel may hand to someone else. The
+  checker is not supposed to outlive its launcher, and MEASURED it does not: a detached box with a
+  health check runs one process more than one without, and after the supervisor is SIGKILLed both
+  converge to the same count. But that is an argument about how promptly a signal is delivered, and
+  the number admits the wrong answer regardless, so the checker now records the launcher's start-time
+  at fork and exits when the pid stops being that process. Same rule as the box's own PID 1, one
+  process out.
+
+- **The port-collision refusal sent readers to `--no-pod` without saying what it costs.** A stack
+  shares one network namespace, so two services cannot both bind one container port, and the refusal
+  named two ways out while pricing neither. MEASURED on one two-service stack, `getent hosts db`
+  answers `127.0.0.1 db db` in a pod and NOTHING under `--no-pod`, so the second way out traded a
+  loud refusal at bring-up for a silent connect failure inside a service, where the reason is
+  invisible. The refusal now spells the edit it wants, naming the service to change and a port to
+  use, and prices both routes. It also says that `PORT` is a convention rather than a contract: most
+  images read it, an image that reads a variable of its own needs that one set instead, and for those
+  the two-line edit is two lines plus knowing which variable. `--no-pod` says the same thing itself,
+  once per bring-up, when the stack has more than one service (a single service has no peer to lose,
+  and a stack in a pod has given nothing up). Verified end to end: two services on the same internal
+  port 8080 come up under `--no-pod`, published on 7001 and 7002, both answering, no edit to the
+  file, and the edit the refusal dictates does clear it.
+
+- **A `nice` the kernel refuses was accepted, echoed back, and silently dropped.** A field report on
+  v0.8.0 found `nice = -5` in a `[[vcpu]]` profile leaving the workload at effective nice 0 with no
+  warning at any stage. The profile is only one of the two routes to it: MEASURED, the flag does the
+  same, `--nice -5` and `--nice -1` both landing at 0 while `--nice 5` and `--nice 19` take effect.
+  `setpriority`'s return value was discarded at both call sites (`kern box` and `kern run`), and
+  LOWERING a nice value needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom, which a rootless box does not
+  have by default. One function now applies it and names what happened: a warning naming the errno and
+  what would make it work, never a refusal, because raising a nice still works everywhere and a
+  scheduling preference is not a boundary. A flag accepted and ignored is the defect; a flag that
+  cannot apply and says so is not.
+
+- **A recycled PID could put `exec`, `cp`, `commit`, `stop` and the health probe in a stranger's
+  namespaces.** The registry records the box's PID 1 as a bare number, and every consumer that enters
+  the box opens `/proc/<pid1>/ns/*` from it. Once the init exits, the kernel may hand that number to an
+  unrelated process, and the recorded value stays until the supervisor unregisters. `kern stop`
+  signalled it, `pause`/`update` resolved a cgroup from it and wrote there, and `stop` `rmdir`ed a
+  cgroup read out of it. The pid's kernel start-time is now recorded beside it - what the registry has
+  always done for the supervisor pid, whose field carries the comment "pins the identity of the pid so
+  a reused pid can't masquerade as a live box" - and a single accessor is the only way to reach the
+  number, falling back to resolving through the start-time-pinned supervisor. A single writer records
+  the pair, because the two launch paths each set the pid by hand and only one of them was updated
+  first. The pidfd already taken by the restart path does NOT cover this: it faithfully pins whoever
+  holds the pid at the moment of the open, stranger included, and closes the TOCTOU after it.
+
+- **`kern compose <file> config` accepted an `x-kern-security-profile` value that `up` would refuse.**
+  The same class as the profile entry below, one field over: `x-kern-security-profile: bogus` printed
+  a clean preview and exited 0, and `up` then refused with `--security-profile: expected untrusted`.
+  `config` now asks the runtime's own vocabulary, so the compose crate still keeps no second copy of
+  the list. `config` also prints the profile it read, marked as kern-only, since a hardening bundle
+  that is silent in the command that exists to explain the file is a posture taken on trust.
 
 - **`kern compose <file> config` accepted a profile reference that `up` would refuse.** Introduced by
   the keys above: `config` printed `profiles: vgpio:leds` and exited 0 while `up` failed with

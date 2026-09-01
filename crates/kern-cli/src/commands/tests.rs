@@ -953,11 +953,12 @@ mod net_resource_tests {
         registry::Instance {
             name: name.to_string(),
             pid,
-            pid1: 0,
+            pid1_recorded: 0,
             rootfs: String::new(),
             command: String::new(),
             started: 0,
             starttime: 0,
+            pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
             pod: pod.to_string(),
@@ -2843,11 +2844,12 @@ mod label_filter_tests {
         registry::Instance {
             name: "b".into(),
             pid: 1,
-            pid1: 0,
+            pid1_recorded: 0,
             rootfs: String::new(),
             command: String::new(),
             started: 0,
             starttime: 0,
+            pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),
@@ -2967,11 +2969,12 @@ mod drift_tests {
         registry::Instance {
             name: "a".into(),
             pid: 1,
-            pid1: 0,
+            pid1_recorded: 0,
             rootfs: String::new(),
             command: String::new(),
             started: 0,
             starttime: 0,
+            pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
             pod: String::new(),
@@ -3340,6 +3343,238 @@ mod port_collision_tests {
         }
     }
 
+    /// A CHECKER THAT GIVES UP UPDATES ITS RECORD, AND NEVER RECREATES ONE.
+    ///
+    /// The checker exits when its launcher's pid stops being that process, and that exit was silent:
+    /// a frozen status is indistinguishable from a box that keeps answering the same way, because
+    /// `healthy` means "healthy as of the last check" and nothing says when that was.
+    ///
+    /// THE SECOND HALF IS THE ONE FOUND BY REASONING RATHER THAN BY MEASUREMENT, so it is the one
+    /// most worth pinning: `kern stop` clears the health sidecar from a DIFFERENT process and nothing
+    /// sweeps that directory, so a checker waking after the clear would recreate a record for a box
+    /// that no longer exists and leave it there forever. An update, never a resurrection.
+    ///
+    /// The branch that calls this needs a recycled pid, which cannot be forced without running the
+    /// counter to `pid_max`. The condition and the text do not need one.
+    #[test]
+    fn a_checker_that_gives_up_updates_a_record_and_never_creates_one() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        let tmp = std::env::temp_dir().join(format!("kern-gaveup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+
+        let (name, pid) = ("gaveup", 4242);
+        // NO RECORD: nothing to update, so nothing may appear. Asserted FIRST, because a function
+        // that always writes would pass the update case below and leak a file per orphaned checker.
+        note_checker_gave_up(name, pid);
+        assert!(
+            registry::health_of(name, pid).is_empty(),
+            "a cleared record must not be resurrected by a checker on its way out"
+        );
+
+        // A LIVE RECORD: updated in place, and the text says what happened rather than freezing on a
+        // status that is no longer being maintained.
+        registry::set_health(name, pid, "healthy");
+        note_checker_gave_up(name, pid);
+        let got = registry::health_of(name, pid);
+        assert_ne!(got, "healthy", "the stale status must not be left standing");
+        assert!(
+            got.contains("stopped checking"),
+            "and it must say the checking stopped, not merely change: {got}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    /// THE DRY-RUN RULE HAS ONE EXCEPTION, AND ONE IS THE ASSERTION.
+    ///
+    /// `config` refuses whatever the bring-up refuses, because a dry run that disagrees is the output
+    /// people trust before committing a file. Device grants are the exception: the refusal tells its
+    /// reader to run `config` to see which devices a name reaches, so a `config` that refused would
+    /// make its own advice circular.
+    ///
+    /// A COUNTER, NOT A COMMENT. An exception is only useful while there is one; a second turns the
+    /// rule into "usually", and a rule with several exceptions stops applying itself. This fails on
+    /// the second one, so adding it is a decision somebody makes rather than a precedent they inherit.
+    #[test]
+    fn the_dry_run_rule_has_exactly_one_declared_exception() {
+        assert_eq!(
+            DRY_RUN_REFUSAL_EXCEPTIONS.len(),
+            1,
+            "a second exception is a decision about the rule itself, not a new case under it: {:?}",
+            DRY_RUN_REFUSAL_EXCEPTIONS
+        );
+        assert!(
+            DRY_RUN_REFUSAL_EXCEPTIONS[0].contains("device grants"),
+            "and the one that exists is the device-grant gate: {:?}",
+            DRY_RUN_REFUSAL_EXCEPTIONS
+        );
+    }
+
+    /// A DEVICE GRANT ASKED FOR BY A COMPOSE FILE NEEDS AN ANSWER FROM THE COMMAND LINE.
+    ///
+    /// Every other profile kind NARROWS: the file names a want, `kern.toml` holds the grant, and the
+    /// local grant is a ceiling, so a downloaded file naming `x-kern-vdisk: scratch` cannot get more
+    /// than this host allows and "local wins" is conservative by construction.
+    ///
+    /// `vgpio` does not narrow, and that is the whole reason this gate exists. Its resolution is a
+    /// DEVICE, not a bound, and device nodes have no ordering: `/dev/gpiochip0` is not a smaller
+    /// `/dev/gpiochip1`. One host's `leds` may be an LED and another's a relay board. There is no
+    /// direction in which taking the local grant is the safe one, so there is nothing for kern to
+    /// decide and the person running the file has to say.
+    ///
+    /// GATED ON THE PROPERTY, NOT ON A LIST OF KINDS, so a future kind that also resolves to hardware
+    /// inherits this without anyone remembering. Which is what the second case asserts: a profile
+    /// that resolves to NOTHING is not a device grant, and gating on the word `vgpio` would refuse it.
+    #[test]
+    fn a_profile_that_resolves_to_hardware_is_gated_and_one_that_resolves_to_nothing_is_not() {
+        let dev = crate::config::ResolvedVgpio {
+            name: "leds".into(),
+            devs: vec!["/dev/gpiochip0".into()],
+            ..Default::default()
+        };
+        let msg = device_grant_refusal("app", std::slice::from_ref(&dev))
+            .expect("a profile resolving to a device node must be gated");
+        assert!(
+            msg.contains("/dev/gpiochip0"),
+            "the refusal must name the DEVICE, since the profile name does not: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-device-grants"),
+            "and the acknowledgement that lifts it, which lives on the command line where the \
+             compose file cannot reach: {msg}"
+        );
+        assert!(
+            msg.contains("app") && msg.contains("vgpio:leds"),
+            "and the service and profile that asked: {msg}"
+        );
+
+        // NOT A DEVICE GRANT: the name resolves, and to nothing this host has. Gating on the KIND
+        // would refuse this; gating on the property does not, which is the difference the doc claims.
+        let empty = crate::config::ResolvedVgpio {
+            name: "leds".into(),
+            ..Default::default()
+        };
+        assert!(
+            device_grant_refusal("app", std::slice::from_ref(&empty)).is_none(),
+            "a profile that grants no hardware is not a hardware grant"
+        );
+        // And a stack with no vgpio at all is never gated, or every compose file would need the flag.
+        assert!(device_grant_refusal("app", &[]).is_none());
+    }
+
+    /// A PROFILE NAME IS RESOLVED LOCALLY, SO `config` HAS TO SAY WHAT IT RESOLVED TO.
+    ///
+    /// The case this exists for: someone downloads a `docker-compose.yml` that says
+    /// `x-kern-vdisk: scratch`. The file names a grant and does not carry one, which is the right way
+    /// round, because a file from anywhere must not be able to grant itself hardware: the LOCAL
+    /// `kern.toml` always decides. A missing profile is refused by name, by both `config` and `up`.
+    ///
+    /// The one that is not refused is the dangerous one: a profile that EXISTS under that name and
+    /// means something else. MEASURED before this output existed, one file against a `scratch` of 64m
+    /// and against a `scratch` of 50g printed the identical line on both hosts, `profiles:
+    /// vdisk:scratch`, from the command whose whole job is explaining the file.
+    ///
+    /// `vgpio` is the sharp end, and the reason the device paths are in here rather than a count: a
+    /// name says nothing about which hardware this host's `leds` reaches.
+    #[test]
+    fn config_reports_what_a_profile_name_resolved_to_on_this_host() {
+        let mut ap = AppliedProfiles {
+            cpus: Some(6.0),
+            memory: Some(17_179_869_184),
+            ..Default::default()
+        };
+        ap.vdisk.push(crate::config::ResolvedVdisk {
+            name: "scratch".into(),
+            size: Some(53_687_091_200),
+            persistent: true,
+            ..Default::default()
+        });
+        ap.vgpio.push(crate::config::ResolvedVgpio {
+            name: "leds".into(),
+            devs: vec!["/dev/gpiochip0".into()],
+            ..Default::default()
+        });
+        let out = resolved_profile_lines(&ap).join("\n");
+
+        assert!(
+            out.contains("cpus 6") && out.contains("16G"),
+            "the caps a name resolved to must be visible: {out}"
+        );
+        assert!(
+            out.contains("size 50G") && out.contains("persistent"),
+            "and a disk's real size, which is what differs between two hosts: {out}"
+        );
+        assert!(
+            out.contains("/dev/gpiochip0"),
+            "and the DEVICE a vgpio name reaches, which the name itself does not say: {out}"
+        );
+
+        // A grant that resolves to nothing present is said out loud rather than printed as an empty
+        // line, because "this host has no such hardware" is the answer somebody needs most.
+        let mut bare = AppliedProfiles::default();
+        bare.vgpio.push(crate::config::ResolvedVgpio {
+            name: "leds".into(),
+            ..Default::default()
+        });
+        assert!(
+            resolved_profile_lines(&bare)
+                .join("\n")
+                .contains("nothing present on this host"),
+            "an empty resolution is a fact, not a blank"
+        );
+
+        // NEGATIVE CONTROL: no profiles, no lines. A function that always spoke would satisfy every
+        // assertion above and put a resolution line under services that named nothing.
+        assert!(
+            resolved_profile_lines(&AppliedProfiles::default()).is_empty(),
+            "nothing resolved means nothing to report"
+        );
+    }
+
+    /// THE ESCAPE HATCH DECLARES WHAT IT TAKES AWAY, AND ONLY WHEN THERE IS SOMETHING TO TAKE.
+    ///
+    /// `--no-pod` is what the port-collision refusal sends people to, and it is not free: MEASURED on
+    /// one two-service stack, `getent hosts db` answers `127.0.0.1 db db` in a pod and NOTHING under
+    /// `--no-pod`. A service that resolved a peer yesterday then fails to connect from inside its own
+    /// code, where the reason is invisible - a loud refusal traded for a silent failure.
+    ///
+    /// THE GATE IS THE BEHAVIOUR, so both halves are asserted. A note printed on every bring-up is
+    /// noise, and noise is how a reader stops reading the line that matters: a stack in a pod has not
+    /// given anything up, and a SINGLE service under `--no-pod` has no peers to lose.
+    #[test]
+    fn the_no_pod_note_appears_only_when_a_peer_name_is_actually_lost() {
+        let two = [svc("a", &["7001:8080"]), svc("b", &["7002:9090"])];
+        let one = [svc("a", &["7001:8080"])];
+
+        let note =
+            no_pod_peer_names_note(&two, true).expect("two services under --no-pod lose peers");
+        assert!(
+            note.contains("no longer resolve each other by service name"),
+            "the note must say what was lost: {note}"
+        );
+        assert!(
+            note.contains("127.0.0.1:PORT"),
+            "and what to use instead, or it is a complaint rather than a note: {note}"
+        );
+
+        assert!(
+            no_pod_peer_names_note(&two, false).is_none(),
+            "a stack in a pod has given nothing up"
+        );
+        assert!(
+            no_pod_peer_names_note(&one, true).is_none(),
+            "a single service has no peer to lose"
+        );
+    }
+
     /// THE REFUSAL NAMES THE SERVICES, and it used to name the boxes.
     ///
     /// By the time this check runs, `ComposeBox::name` is the BOX name - `<project>-<service>`, or a
@@ -3367,6 +3602,39 @@ mod port_collision_tests {
         assert!(
             !msg.contains("myapp-"),
             "the message must not quote the box name: {msg}"
+        );
+
+        // BOTH WAYS OUT, AND WHAT EACH COSTS. This message is the only place a reader meets the
+        // choice, and it used to name `--no-pod` with no mention of the price: MEASURED, `getent
+        // hosts db` answers `127.0.0.1 db db` in a pod and nothing under `--no-pod`. Sending someone
+        // from a loud port collision into a silent name-resolution failure is not help, so the
+        // refusal has to carry the trade rather than leave it in a document they are not reading.
+        assert!(
+            msg.contains("--no-pod") && msg.contains("port: "),
+            "the refusal must name both ways out: {msg}"
+        );
+        assert!(
+            msg.contains("no longer resolve each other by name"),
+            "and what --no-pod costs, or it is an unsigned recommendation: {msg}"
+        );
+        assert!(
+            msg.contains("keeps resolving peers by service name"),
+            "and what staying in the pod buys, so the two are comparable: {msg}"
+        );
+
+        // IT SPELLS THE EDIT RATHER THAN DESCRIBING IT: the service to change and a port to use,
+        // so the line can be acted on without a second lookup. Verified separately that the edit
+        // this dictates does clear the refusal.
+        assert!(
+            msg.contains("add `port: 8081` under service 'api'"),
+            "the refusal must name the exact edit, not the shape of one: {msg}"
+        );
+        // AND PRICES IT HONESTLY. `PORT` is a convention: kern passes it, an image is free to read
+        // its own variable, and for those images the two-line edit is two lines PLUS knowing which
+        // variable. Quoting the cheaper number is the same defect this message exists to prevent.
+        assert!(
+            msg.contains("convention, not a contract"),
+            "and it must not sell PORT as a guarantee: {msg}"
         );
 
         // 2. THE HOST-PORT refusal, same rule, different function - so fixing one and not the other

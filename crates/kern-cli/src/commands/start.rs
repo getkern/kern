@@ -141,6 +141,41 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
 ///
 /// A warning, never a refusal: the box itself is fine, only the ssh login will not be, and the caller
 /// may well be starting it to run `kern exec` against.
+/// Apply `nice`, and SAY SO when the kernel refuses it.
+///
+/// `setpriority`'s return value was discarded at both call sites (`kern box` and `kern run`), and the
+/// difference matters in exactly one direction: LOWERING the nice value - a negative number, meaning
+/// more CPU - needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom, and a rootless box has neither by
+/// default. MEASURED on this host (`ulimit -e` 0): `--nice -5` and `--nice -1` both left the workload
+/// at nice 0, while `--nice 5` and `--nice 19` took effect, and nothing was printed in any of the four
+/// cases. A field report found the same thing through a `[[vcpu]]` profile's `nice = -5` and read it
+/// as a profile bug; the profile is only one of the two routes to this line.
+///
+/// A WARNING, NOT A REFUSAL. Raising the nice value works everywhere, lowering it works for a caller
+/// who has the privilege, and a `nice` is a scheduling preference rather than a boundary: refusing the
+/// box would punish the hosts where it legitimately cannot apply. What the project does refuse is
+/// accepting a flag and silently doing nothing with it.
+///
+/// The message reports the ERRNO and what the box is left with, and does not guess a cause beyond what
+/// `setpriority` documents for that errno.
+fn apply_nice(n: i32) {
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) } == 0 {
+        return;
+    }
+    let e = std::io::Error::last_os_error();
+    if n < 0 {
+        eprintln!(
+            "kern: warning: nice {n} not applied ({e}): lowering the nice value needs CAP_SYS_NICE \
+             or RLIMIT_NICE headroom (`ulimit -e`), which a rootless box does not have by default - \
+             the workload keeps the nice it inherited"
+        );
+    } else {
+        eprintln!(
+            "kern: warning: nice {n} not applied ({e}) - the workload keeps the nice it inherited"
+        );
+    }
+}
+
 fn warn_if_ssh_lacks_a_uid_range(ssh_port: Option<u16>) {
     if ssh_port.is_none() {
         return;
@@ -598,7 +633,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let started_fd = cloexec_started_fd(started_fd);
     // A profile's `nice` set here is inherited by the forked box workload.
     if let Some(n) = nice {
-        unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) };
+        apply_nice(n);
     }
 
     // Close the start/start race on the name (the `name_taken` check at the top is advisory -
@@ -1140,7 +1175,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         let inst = registry::Instance {
             name: name.as_str().to_string(),
             pid,
-            pid1: 0,
+            pid1_recorded: 0,
+            pid1_starttime: 0,
             rootfs: spec.root.clone(),
             command: spec.command.join(" "),
             started: registry::now_unix(),
@@ -1243,7 +1279,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         |pid1| {
             feed_timeout_pid(timeout_wd, pid1);
             if let Some((inst, path)) = reg_state.as_mut() {
-                inst.pid1 = pid1;
+                inst.record_pid1(pid1);
                 // Record the box's DEDICATED cgroup PATH and its `(dev, ino)` IDENTITY now that PID 1
                 // exists: `list()` uses them to tell an ORPHANED box (supervisor dead, cgroup still
                 // populated) from an exited one WITHOUT a live pid, and to make the reap identity-safe
@@ -1534,7 +1570,7 @@ pub fn run(
     // Pin CPUs via affinity (works with no cgroup cpuset delegation), and apply a profile's `nice`.
     kern_isolation::set_cpu_affinity(cpuset.as_deref());
     if let Some(n) = nice {
-        unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, n) };
+        apply_nice(n);
     }
     // Bump the daemonless run-throughput counter (one atomic on a shared mmap) so `kern top` can show
     // live runs/sec - done here, in the final process that actually runs the workload (past any
@@ -1706,11 +1742,10 @@ pub fn exec(
     }
     // PID 1 of the box. Older entries (or a race before the supervisor recorded it) → fall back
     // to the supervisor's sole child.
-    let pid1 = if inst.pid1 > 0 {
-        inst.pid1
-    } else {
-        registry::child_of(inst.pid)
-            .ok_or_else(|| Error::Sandbox("could not locate the box's main process".to_string()))?
+    let pid1 = match inst.live_pid1() {
+        Some(p) => p,
+        None => registry::box_init_under(inst.pid)
+            .ok_or_else(|| Error::Sandbox("could not locate the box's main process".to_string()))?,
     };
 
     // `-it`: allocate a PTY and (when our own stdin is a terminal) put it in raw mode + forward
@@ -1918,7 +1953,7 @@ fn supervise_box(
                 spec,
                 ready,
                 |pid1| {
-                    inst.pid1 = pid1;
+                    inst.record_pid1(pid1);
                     // Record the box's DEDICATED cgroup PATH and its `(dev, ino)` IDENTITY now that PID 1
                     // exists: `list()` uses them to recognise an ORPHANED box (this supervisor
                     // SIGKILL'd/OOM'd, PID 1 + `-p` forwarder still alive and holding the port) instead
@@ -2146,7 +2181,8 @@ fn run_detached(
     let mut inst = registry::Instance {
         name: name.as_str().to_string(),
         pid,
-        pid1: 0,
+        pid1_recorded: 0,
+        pid1_starttime: 0,
         rootfs: spec.root.clone(),
         command: spec.command.join(" "),
         started: registry::now_unix(),

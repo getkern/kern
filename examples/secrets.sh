@@ -12,6 +12,12 @@
 # `-e API_KEY=...` (which leaks into the child's environment and `/proc/<pid>/environ`).
 set -eu
 kern="${KERN:-kern}"
+# WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently
+# resolves to whatever `kern` is on PATH: a validation that forgets to set KERN measures the
+# INSTALLED release while believing it measured the build under test, and reports green for
+# code that never ran. A wrong binary has to be visible in the output, not inferred from it.
+printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
+
 
 # A host secret file (chmod 600 - a world-writable secret source is refused, group/world-readable
 # is warned about). Cleaned up on exit.

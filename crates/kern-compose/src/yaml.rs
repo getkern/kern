@@ -9,18 +9,40 @@
 //! **Security posture (this is semi-trusted input - a compose from a third-party repo).**
 //!  * Never a panic on any input: only `char_indices`/byte-safe slicing, iterative (no recursion → no
 //!    stack overflow on deep nesting), and a nesting cap. Property-fuzzed (see `fuzz/`).
-//!  * **Anchors/aliases (`&`/`*`) are NOT expanded** - a `&a [*a]` billion-laughs is not even
-//!    representable because we refuse the document on sight of a structural anchor/alias, never follow
-//!    the reference. (Hand-rolled means WE control this, not a library that might expand first.)
+//!  * **Anchors and merge keys ARE expanded; the billion-laughs SHAPE is refused by form.** An alias
+//!    used as a token inside an inline collection (`[*a]`, `{k: *a}`) is rejected outright, and that is
+//!    exactly the construction a bomb needs (`&a [x,x]`, `&b [*a,*a]`, `&c [*b,*b]`…): measured, a
+//!    ten-level bomb is refused in 3 ms at 6.7 MB RSS. What IS expanded is the useful subset - a
+//!    block-style anchor, a merge key (`<<: *base`, `<<: [*a, *b]`), an alias as a whole value - and
+//!    that expansion additionally spends from a node budget. An earlier version of this paragraph said
+//!    anchors were never expanded at all, which was a stronger claim than the code makes and the wrong
+//!    kind of claim to leave standing in a security note.
 //!  * Every value is treated as a raw string - no numeric coercion, so YAML 1.1's sexagesimal trap
 //!    (`22:22` → 1342) can't fire on a port.
 //!  * `build:` `context`/`dockerfile` are paths the caller CONFINES under the compose dir (traversal).
 //!
 //! The grammar we accept: space-indented `key: value`, `- ` list items, inline `[…]`/`{…}`, `#`
-//! comments, double/single quotes. We REFUSE (with a clear error): tab indentation, block scalars
-//! (`|`/`>`), anchors/aliases, tags (`!!`), merge keys (`<<`), and 2nd+ documents (`---`).
+//! comments, double/single quotes, **block scalars** (`|` keeps its line breaks, `>` folds them; both
+//! are folded onto one logical line by `fold_multiline`), **block-style anchors and merge keys**
+//! (`<<: *base`, `<<: [*a, *b]`), and an **alias used as a whole value**.
+//!
+//! ONE DELIBERATE LENIENCY, measured and left in place: an alias may appear BEFORE its anchor
+//! (`<<: *base` above the `&base` that defines it). YAML requires the anchor first and a strict
+//! reader refuses the document; this one collects every anchor before resolving, so a forward
+//! reference resolves to what its author meant rather than being lost. Nothing is mis-converted and
+//! nothing is silently dropped - the file is simply accepted where another runtime would refuse it,
+//! which is the direction that costs the author an error elsewhere rather than a wrong box here.
+//! Making it strict means either a line number on every node or a single ordered pass through the
+//! resolver, and that is surgery on the one component in this crate that is property-fuzzed for
+//! panic-freedom. Written down rather than changed on a whim.
+//!
+//! We REFUSE (with a clear error): tab indentation, type tags (`!!`), 2nd+ documents (`---`), a NUL
+//! byte (U+0000) or a U+0001 anywhere in the file, and an **alias used as a token inside an inline
+//! collection** (`[*a]`, `{k: *a}`) unless the line is a merge key. Each of those was verified against
+//! this parser rather than assumed: an earlier version of this list named block scalars, anchors and
+//! merge keys as refused, and all three are supported.
 
-use super::{BuildDirective, ComposeBox, PROFILE_KINDS};
+use super::{BuildDirective, ComposeBox, ABSENT_PROFILE_KINDS, PROFILE_KINDS};
 
 /// Max indentation depth we track - a compose service tree is 3-4 deep; anything past this is refused
 /// rather than parsed, bounding work and stack (we're iterative, but this caps pathological input).
@@ -295,6 +317,13 @@ fn fold_multiline(text: &str) -> Result<String, String> {
     if text.contains(BLOCK_NL) {
         return Err("control character U+0001 is not allowed in a compose file".into());
     }
+    // U+0000 is refused for a different reason than U+0001, which is only barred because it is the
+    // sentinel above. Every consumer of a compose value downstream is a C string or a path, so a NUL
+    // is either truncated silently or rejected far from the file that carries it. It was measured
+    // reaching an image name intact and printing raw to the terminal. Refused here, at the same door.
+    if text.contains('\0') {
+        return Err("NUL byte (U+0000) is not allowed in a compose file".into());
+    }
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
@@ -304,7 +333,7 @@ fn fold_multiline(text: &str) -> Result<String, String> {
         let indent = code.len() - code.trim_start_matches(' ').len();
 
         // Block scalar: gather the indented body (raw - comments literal) until a dedent.
-        if let Some((prefix, folded)) = block_intro(code) {
+        if let Some((prefix, folded, chomp)) = block_intro(code) {
             let mut body: Vec<String> = Vec::new();
             let mut base: Option<usize> = None;
             let mut j = i + 1;
@@ -323,15 +352,59 @@ fn fold_multiline(text: &str) -> Result<String, String> {
                 body.push(l[b.min(l.len())..].to_string());
                 j += 1;
             }
+            // COUNT the trailing blank lines before dropping them: the chomping indicator decides how
+            // many come back. Dropping them all unconditionally is what made `|`, `|-` and `|+`
+            // indistinguishable.
+            let mut trailing_blanks = 0usize;
             while body.last().is_some_and(String::is_empty) {
-                body.pop(); // clip trailing blanks (default/`-` chomp - enough for compose)
+                body.pop();
+                trailing_blanks += 1;
             }
-            let sep = if folded {
-                " ".to_string()
+            // FOLDING IS PER LINE BREAK, not one separator for the whole body. In a `>` scalar a
+            // break folds to a space only BETWEEN two lines that are both at the block's own
+            // indentation and both non-empty; a break next to a MORE-INDENTED line, or next to a
+            // blank one, is kept. Joining everything with spaces was measured to turn
+            // `alp / <2 spaces>ine / fine` into `alp   ine fine`, one line where YAML says three:
+            // a more-indented run inside a folded scalar is exactly how a shell snippet or a
+            // formatted paragraph is embedded, and flattening it changes the text a service emits.
+            //
+            // The extra indentation is still IN the stored line (only the base indent was stripped
+            // above), so "more indented" is "starts with a space" and needs no second pass.
+            let joined = if folded {
+                let mut acc =
+                    String::with_capacity(body.iter().map(String::len).sum::<usize>() + body.len());
+                for (idx, line) in body.iter().enumerate() {
+                    if idx > 0 {
+                        let prev = &body[idx - 1];
+                        let keep_break = line.starts_with(' ')
+                            || prev.starts_with(' ')
+                            || line.is_empty()
+                            || prev.is_empty();
+                        acc.push(if keep_break { BLOCK_NL } else { ' ' });
+                    }
+                    acc.push_str(line);
+                }
+                acc
             } else {
-                BLOCK_NL.to_string()
+                body.join(&BLOCK_NL.to_string())
             };
-            out.push(format!("{prefix}{}", body.join(&sep)));
+            // THE TRAILING BREAKS THE INDICATOR ASKED FOR. `-` none, default exactly one, `+` every
+            // one that was there. An empty body gets none whatever the indicator says: there is no
+            // content for a break to follow.
+            let tail = if joined.is_empty() {
+                0
+            } else {
+                match chomp {
+                    Chomp::Strip => 0,
+                    Chomp::Clip => 1,
+                    Chomp::Keep => 1 + trailing_blanks,
+                }
+            };
+            let mut value = joined;
+            for _ in 0..tail {
+                value.push(BLOCK_NL);
+            }
+            out.push(format!("{prefix}{value}"));
             for _ in (i + 1)..j {
                 out.push(String::new());
             }
@@ -441,27 +514,53 @@ fn fold_multiline(text: &str) -> Result<String, String> {
 }
 
 /// A block-scalar introducer → (line prefix up to & including the `key:`/`- ` marker, is-folded `>`).
-fn block_intro(code: &str) -> Option<(String, bool)> {
-    let indicator = |v: &str| -> Option<bool> {
+/// What a block scalar does with the line breaks at its END.
+///
+/// The indicator was PARSED AND DISCARDED: `|`, `|-` and `|+` all produced the same value, so an
+/// author who wrote `+` on purpose got `-` behaviour and nothing said so. MEASURED on an
+/// `environment` value of `ab`: all three yielded 2 bytes, where YAML says 3, 2 and 4.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chomp {
+    /// Default: exactly one trailing line break is kept.
+    Clip,
+    /// `-`: no trailing line break.
+    Strip,
+    /// `+`: every trailing line break is kept.
+    Keep,
+}
+
+fn block_intro(code: &str) -> Option<(String, bool, Chomp)> {
+    let indicator = |v: &str| -> Option<(bool, Chomp)> {
         let mut c = v.chars();
         let folded = match c.next()? {
             '|' => false,
             '>' => true,
             _ => return None,
         };
-        c.all(|ch| ch == '-' || ch == '+' || ch.is_ascii_digit())
-            .then_some(folded)
+        // The rest is the (optional) chomping indicator and an explicit indentation digit, in either
+        // order per the spec. The digit is read and ignored, as before: this parser derives the block
+        // indentation from the first body line, which is what every real compose file relies on.
+        let mut chomp = Chomp::Clip;
+        for ch in c {
+            match ch {
+                '-' => chomp = Chomp::Strip,
+                '+' => chomp = Chomp::Keep,
+                d if d.is_ascii_digit() => {}
+                _ => return None,
+            }
+        }
+        Some((folded, chomp))
     };
     if let Some(ci) = colon_index(code) {
-        if let Some(f) = indicator(code[ci + 1..].trim()) {
-            return Some((format!("{}: ", &code[..ci]), f));
+        if let Some((f, ch)) = indicator(code[ci + 1..].trim()) {
+            return Some((format!("{}: ", &code[..ci]), f, ch));
         }
     }
     let trimmed = code.trim_start();
     let indent = &code[..code.len() - trimmed.len()];
     if let Some(rest) = trimmed.strip_prefix("- ") {
-        if let Some(f) = indicator(rest.trim()) {
-            return Some((format!("{indent}- "), f));
+        if let Some((f, ch)) = indicator(rest.trim()) {
+            return Some((format!("{indent}- "), f, ch));
         }
     }
     None
@@ -513,10 +612,15 @@ fn prescreen(text: &str) -> Result<(), String> {
         if t.is_empty() {
             continue;
         }
-        // Tab indentation is invalid YAML and a classic parser trap - refuse rather than guess.
-        if line.starts_with('\t')
-            || (line.len() > line.trim_start_matches(' ').len() && line.contains('\t'))
-        {
+        // Tab INDENTATION is invalid YAML and a classic parser trap - refuse rather than guess. Only
+        // the indentation, though: a tab is an ordinary character everywhere else, and the previous
+        // rule ("this line has leading spaces AND contains a tab anywhere") refused
+        // `image:<TAB>alpine`, which is valid, with a message that pointed at the indentation. A
+        // script pasted into a block scalar is full of tabs and would have been refused for the same
+        // reason. Measured before the fix: `image:\talpine` answered "line 3: tab indentation not
+        // supported".
+        let indent = &line[..line.len() - line.trim_start().len()];
+        if indent.contains('\t') {
             return Err(format!(
                 "line {ln}: tab indentation not supported (use spaces)"
             ));
@@ -1918,6 +2022,28 @@ fn service_to_box(
     // args - the box would run `/init here` and silently discard `command`). See the merge below.
     let mut entrypoint_is_shell_form = false;
 
+    // A KEY WRITTEN TWICE IN ONE SERVICE IS REFUSED, not resolved to the last one.
+    //
+    // YAML mappings have no duplicate keys, and this file already refuses two services with one name
+    // and two `x-kern-vcpu` in one service. `image` was the exception: MEASURED, a second `image` at
+    // the bottom of a service silently won, which is the cheapest way to make a downloaded file run an
+    // image other than the one a reader sees at the top. Three shapes of the same mistake had three
+    // different answers; now they have one.
+    //
+    // Counted on the keys as the SERVICE carries them, after any merge key has been resolved, so a
+    // local key that also exists in a merged base is not a duplicate - it is the override that
+    // `<<:` exists for, and `ANC-01` asserts it still wins.
+    {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (key, _) in &svc.children {
+            if !seen.insert(key.as_str()) {
+                return Err(format!(
+                    "service '{name}': key '{key}' appears twice - a YAML mapping has no duplicate \
+                     keys, so which one wins would be this parser's invention. Remove one."
+                ));
+            }
+        }
+    }
     for (key, node) in &svc.children {
         match key.as_str() {
             "image" => b.image = node.scalar.as_deref().map(scalar_str),
@@ -2148,31 +2274,50 @@ fn service_to_box(
             // The value is pushed raw; `profile_tokens` adds the `kind:` prefix unless it is already
             // there, so `leds` and `vgpio:leds` name the same profile exactly as they do in the TOML
             // spelling. `x-kern-vgpu` is deliberately absent: there is no `vgpu` profile kind.
-            "x-kern-vcpu" => push_profile(&mut b.vcpu, node),
-            "x-kern-vdisk" => push_profile(&mut b.vdisk, node),
-            "x-kern-vgpio" => push_profile(&mut b.vgpio, node),
             // `--security-profile <untrusted>`: the opt-in bundle (seccomp allowlist + `--cap-drop
             // ALL` + `--read-only`). Compose has no way to say "this code is not trusted", and the
             // three flags it would take instead are easy to get half-right. The VALUE is not checked
             // here: `kern box` owns that vocabulary and already refuses an unknown one by name, and a
-            // second copy of the list in this crate is how the two come to disagree.
+            // second copy of the list in this crate is how the two come to disagree. `kern compose
+            // config` asks that same vocabulary, so a dry run refuses what the bring-up would.
             "x-kern-security-profile" => {
                 b.security_profile = node.scalar.as_deref().map(scalar_str)
             }
+            // ONE DOOR FOR THE WHOLE `x-kern-` NAMESPACE, so the set of keys we read is the set of
+            // kinds we publish and cannot drift from it. `profile_list_mut` owns the kind → field
+            // pairing; this function does not name a single field.
+            //
             // AN UNRECOGNISED KEY IN OUR OWN NAMESPACE IS NAMED, not silently dropped. The spec says
             // a tool must ignore the `x-` fields it does not understand, and every other vendor's
             // prefix is left alone below - but `x-kern-` is ours, so silence here would mean a typo
-            // (`x-kern-vgpi`) or a key from a build that has it (`x-kern-vgpu`) does nothing at all
-            // and says nothing at all, which is the defect this whole mechanism exists to avoid.
-            other if other.starts_with("x-kern-") => warn(&format!(
-                "service '{name}': '{other}:' is not read by this build - kern reads {}, and \
-                 x-kern-security-profile",
-                PROFILE_KINDS
-                    .iter()
-                    .map(|k| format!("x-kern-{k}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            // does nothing at all and says nothing at all, which is the defect this whole mechanism
+            // exists to avoid. A typo and a kind from a build kern does not have here are DIFFERENT
+            // problems, so they get different sentences: see `unread_kern_key_note`.
+            other if other.starts_with("x-kern-") => {
+                // `strip_prefix`, not `trim_start_matches`: the latter strips the prefix REPEATEDLY,
+                // so `x-kern-x-kern-vcpu` would be read as a `vcpu` key. The guard above already
+                // proved the prefix is there, so the fallback is unreachable rather than a default.
+                let kind = other.strip_prefix("x-kern-").unwrap_or(other);
+                match b.profile_list_mut(kind) {
+                    Some(list) => push_profile(list, node),
+                    None => warn(&unread_kern_key_note(name, other, kind)),
+                }
+            }
+            // A CASE VARIANT OF OUR OWN PREFIX IS NAMED, AND STILL NOT READ. YAML keys are
+            // case-sensitive, so `X-KERN-VCPU` is genuinely a different key and reading it would be
+            // kern claiming a namespace it does not own. But the person who typed it meant ours, and
+            // silence would leave them with a key that does nothing and says nothing - which is the
+            // whole reason the branch above exists. Warned, never honoured.
+            other
+                if other.len() > 7
+                    && other[..7].eq_ignore_ascii_case("x-kern-")
+                    && !other.starts_with("x-kern-") =>
+            {
+                warn(&format!(
+                    "service '{name}': '{other}:' looks like a kern extension field but kern's keys \
+                     are lower-case ('x-kern-...'), so this one is ignored"
+                ))
+            }
             // Every other vendor's service-level extension field: defined by the spec, ignored on
             // purpose, silently.
             other if other.starts_with("x-") => {}
@@ -2528,8 +2673,21 @@ fn interpolate_depth(text: &str, depth: usize, dotenv: &crate::DotEnv) -> String
             continue;
         };
         let Some(end) = matching_brace_end(inner) else {
-            // Unterminated `${` - leave it literal (the prescreen doesn't reject it here); a downstream
-            // parse error will surface if it matters. Don't loop forever.
+            // Unterminated `${` - kept literal, and SAID. The previous comment here assumed "a
+            // downstream parse error will surface if it matters", and MEASURED it does not:
+            // `image: "${NONCHIUSA"` parsed clean and the image name became the literal
+            // `${NONCHIUSA`, so the only error arrived much later, from a registry, about a tag
+            // nobody wrote. Someone who types `${` means interpolation, and turning that into a
+            // literal is a reinterpretation - silent is what makes it a defect.
+            //
+            // A warning rather than a refusal: the same text can legitimately appear inside a block
+            // scalar carrying a shell script, and interpolation runs over the whole document, so
+            // refusing would reject files that work today. Warned once per distinct fragment.
+            warn_once(&format!(
+                "unterminated '${{' in a value - kept literally as written, NOT interpolated \
+                 (close the brace, or write '$$' for a literal dollar): {}",
+                &inner[..inner.len().min(40)]
+            ));
             out.push_str("${");
             rest = inner;
             continue;
@@ -3081,8 +3239,14 @@ fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
         // you said", which is what the syntax exists for.
         other if other.starts_with("on-failure:") => {
             b.restart = true;
+            // `strip_prefix`, never `trim_start_matches`: the trim family removes the prefix AS
+            // MANY TIMES AS IT FINDS IT, so `on-failure:on-failure:3` parsed as a clean retry count
+            // of 3 - a malformed value accepted as a valid one. Stripping ONCE leaves
+            // `on-failure:3`, which fails to parse and falls onto the warning right below, which is
+            // where a value we cannot read belongs.
             b.restart_max = other
-                .trim_start_matches("on-failure:")
+                .strip_prefix("on-failure:")
+                .unwrap_or(other)
                 .trim()
                 .parse::<u32>()
                 .ok()
@@ -3166,6 +3330,31 @@ fn container_only_port_note(port: u16) -> String {
     )
 }
 
+/// What to say about an `x-kern-…` key this build does not read.
+///
+/// TWO PROBLEMS, TWO SENTENCES. `x-kern-vgpi` is a typo: the fix is to correct the key, so the note
+/// lists what kern does read. `x-kern-vgpu` is not a typo at all - it names a real profile kind that
+/// this build has no `classify` token for - so telling its author about the spelling of `vdisk` sends
+/// them looking for a mistake they did not make. Both are ignored either way; the difference is
+/// entirely in what the reader is told to do next, which is the whole value of not being silent.
+fn unread_kern_key_note(service: &str, key: &str, kind: &str) -> String {
+    if ABSENT_PROFILE_KINDS.contains(&kind) {
+        return format!(
+            "service '{service}': '{key}:' names the '{kind}' profile kind, which this build of kern \
+             does not have - the key is ignored, and the service runs without it"
+        );
+    }
+    format!(
+        "service '{service}': '{key}:' is not read by this build - kern reads {}, and \
+         x-kern-security-profile",
+        PROFILE_KINDS
+            .iter()
+            .map(|k| format!("x-kern-{k}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// Record a `x-kern-<kind>` profile reference, ignoring an empty or non-scalar value.
 ///
 /// A list or a mapping under one of these keys is not a profile name, and a blank string names
@@ -3237,6 +3426,34 @@ mod tests {
         assert!(container_only_port_note(8000).contains("`8000`"));
         // The two are different sentences, which is the property the old literal could not have.
         assert_ne!(container_only_port_note(1), container_only_port_note(2));
+    }
+
+    /// A NUL BYTE IS REFUSED BY THE FILE, NOT BY WHATEVER SYSCALL TRIPS OVER IT LATER.
+    ///
+    /// U+0001 was already barred, but only because it is this module's private newline sentinel, so a
+    /// reader could conclude control bytes in general were handled. They were not: measured, a U+0000
+    /// travelled intact into an image name and printed raw to the operator's terminal. Everything that
+    /// consumes a compose value downstream is a C string or a path, so a NUL is either truncated in
+    /// silence or refused a long way from the file that carries it.
+    ///
+    /// The positive control is the same document without the byte: it must still parse, otherwise this
+    /// would pass against a check that refused the shape rather than the NUL.
+    #[test]
+    fn a_nul_byte_is_refused_and_the_same_file_without_it_parses() {
+        let clean = "services:\n  a:\n    image: alpine\n";
+        let err = parse("services:\n  a:\n    image: alp\0ine\n")
+            .expect_err("a NUL inside a value must be refused");
+        assert!(
+            err.contains("NUL") && err.contains("U+0000"),
+            "the refusal must name the byte: {err}"
+        );
+        assert_eq!(
+            parse(clean)
+                .expect("the same file without the NUL must parse")
+                .len(),
+            1,
+            "the check must bar the byte, not the document shape"
+        );
     }
 
     /// A SERVICE MAY NAME A RESOURCE PROFILE THROUGH THE SPEC'S OWN EXTENSION FIELD.
@@ -3316,6 +3533,198 @@ mod tests {
         // entry here and one field - and this assertion is what makes that a decision rather than
         // something a future edit does by accident.
         assert_eq!(PROFILE_KINDS, ["vcpu", "vdisk", "vgpio"]);
+    }
+
+    /// EVERY PUBLISHED KIND HAS A FIELD, AND THEY ARE DIFFERENT FIELDS.
+    ///
+    /// `PROFILE_KINDS` says which `x-kern-<kind>` keys are read; `profile_list` says which list each
+    /// one fills. Nothing in the type system ties them together, so a kind added to the array with no
+    /// arm in that match would parse, resolve to nothing and say nothing - the accepted-and-ignored
+    /// defect, arriving through the very mechanism built to prevent it. This is the tie.
+    ///
+    /// The DISTINCTNESS half matters just as much as the existence half: an arm that returns the
+    /// wrong list (`"vdisk" => &self.vcpu`, one word wrong) still resolves for every kind, and would
+    /// silently file every `x-kern-vdisk` under `vcpu:`. Filling one list at a time and reading all
+    /// three back is what tells those two apart.
+    #[test]
+    fn every_published_profile_kind_has_its_own_field() {
+        for kind in PROFILE_KINDS {
+            let y = format!("services:\n  app:\n    image: alpine\n    x-kern-{kind}: only\n");
+            assert_eq!(
+                boxes(&y)[0].profile_tokens(),
+                vec![format!("{kind}:only")],
+                "x-kern-{kind} is published but does not reach its own list"
+            );
+        }
+        // And a kind kern does NOT publish must resolve to no list at all, or the door above would
+        // open on whatever the match's fallthrough happened to be.
+        let mut b = ComposeBox::default();
+        for kind in ABSENT_PROFILE_KINDS {
+            assert!(
+                b.profile_list_mut(kind).is_none(),
+                "'{kind}' is not a kind this build has, so it must not resolve to a field"
+            );
+        }
+    }
+
+    /// A TYPO AND A KIND FROM ANOTHER BUILD GET DIFFERENT SENTENCES.
+    ///
+    /// Both are ignored, so the runtime behaviour is identical and only the words differ - which is
+    /// the entire point: telling the author of `x-kern-vgpu` that kern reads `x-kern-vdisk` sends them
+    /// hunting for a spelling mistake they did not make, while telling the author of `x-kern-vgpi`
+    /// that their key belongs to a build kern does not have here is simply false.
+    #[test]
+    fn an_unread_extension_key_is_told_which_of_the_two_problems_it_is() {
+        let typo = unread_kern_key_note("app", "x-kern-vgpi", "vgpi");
+        let absent = unread_kern_key_note("app", "x-kern-vgpu", "vgpu");
+        assert_ne!(typo, absent, "one sentence for two different problems");
+        assert!(
+            typo.contains("x-kern-vdisk") && typo.contains("x-kern-security-profile"),
+            "a typo is told what kern does read: {typo}"
+        );
+        assert!(
+            absent.contains("this build") && !absent.contains("x-kern-vdisk"),
+            "a real kind kern lacks is told exactly that, and not to check its spelling: {absent}"
+        );
+        for note in [&typo, &absent] {
+            assert!(note.contains("app"), "the service must be named: {note}");
+        }
+    }
+
+    /// THE CHOMPING INDICATOR DECIDES THE TRAILING BREAKS, and it used to decide nothing.
+    ///
+    /// `|`, `|-` and `|+` all produced the same value: the parser dropped every trailing blank line
+    /// and added nothing back. MEASURED on an `environment` value of `ab` delivered into a running
+    /// box, all three arrived as 2 bytes where YAML says 3, 2 and 4. An indicator an author writes on
+    /// purpose that changes nothing is the accepted-and-ignored shape, on a character whose only job
+    /// is to say what the trailing breaks should be.
+    ///
+    /// All three in one test, because the bug was that they were indistinguishable: any two of them
+    /// agreeing is the failure.
+    #[test]
+    fn the_chomping_indicator_decides_the_trailing_breaks() {
+        let v = |ind: &str, body: &str| -> String {
+            boxes(&format!(
+                "services:\n  app:\n    image: alpine\n    hostname: {ind}\n{body}"
+            ))[0]
+                .hostname
+                .clone()
+                .unwrap_or_default()
+        };
+        assert_eq!(v("|", "      ab\n"), "ab\n", "clip keeps exactly one break");
+        assert_eq!(v("|-", "      ab\n"), "ab", "strip keeps none");
+        assert_eq!(
+            v("|+", "      ab\n\n"),
+            "ab\n\n",
+            "keep keeps every break that was there"
+        );
+        // An empty body gets no trailing break whatever the indicator says: there is no content for a
+        // break to follow, and inventing one would make `|+` on nothing produce a newline.
+        assert_eq!(
+            v("|+", "    command: [true]\n"),
+            "",
+            "nothing in, nothing out"
+        );
+    }
+
+    /// A FOLDED SCALAR FOLDS ONLY THE BREAKS IT MAY FOLD.
+    ///
+    /// In `>` a line break becomes a space only between two lines that are both at the block's own
+    /// indentation and both non-empty. A break next to a MORE-INDENTED line is kept, which is how a
+    /// shell snippet or a formatted paragraph is embedded in a folded scalar.
+    ///
+    /// MEASURED before this: every break became a space, so `alp / <2 spaces>ine / fine` came out as
+    /// the single line `alp   ine fine`. The service still ran; the text it emitted was a different
+    /// text, which is the "runs and lies" shape rather than the "refuses" one.
+    ///
+    /// `|` is the control: it keeps every break, so a bug that collapsed both would pass a test that
+    /// only looked at the folded case.
+    #[test]
+    fn a_folded_scalar_keeps_the_breaks_around_a_more_indented_line() {
+        // The value a consumer sees carries REAL newlines: the sentinel is internal to the fold and
+        // `scalar_str` decodes it on the way out. Asserting on the sentinel would pin the encoding
+        // rather than the behaviour, and would pass a build that never decoded it.
+        let folded_flat = boxes("services:\n  app:\n    image: >\n      alp\n      ine\n")[0]
+            .image
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(
+            folded_flat, "alp ine\n",
+            "two lines at the block indent fold to one space"
+        );
+
+        let folded_deep =
+            boxes("services:\n  app:\n    image: >\n      alp\n        ine\n      fine\n")[0]
+                .image
+                .clone()
+                .unwrap_or_default();
+        assert_eq!(
+            folded_deep, "alp\n  ine\nfine\n",
+            "a more-indented line keeps the breaks around it, and its own indentation"
+        );
+
+        let literal = boxes("services:\n  app:\n    image: |\n      alp\n      ine\n")[0]
+            .image
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(
+            literal,
+            "alp\nine\n",
+            "control: a literal block keeps every break, so a fix that collapsed both would fail here"
+        );
+    }
+
+    /// A KEY WRITTEN TWICE IN ONE SERVICE IS REFUSED, and a MERGED key overridden locally is not.
+    ///
+    /// The two look identical after a merge is resolved and they are opposites. `image: a` twice is a
+    /// file whose author cannot have meant both, and MEASURED before this the second one silently won:
+    /// the cheapest way to make a downloaded file run an image other than the one a reader sees at the
+    /// top. A local key that also exists in a merged base is the whole point of `<<:`.
+    ///
+    /// Both halves asserted here, because a check that refused the second case would break every file
+    /// that uses a template, and a check that allowed the first is where this started.
+    #[test]
+    fn a_duplicate_key_is_refused_and_a_merge_override_is_not() {
+        let dup = "services:\n  app:\n    image: alpine\n    command: [true]\n    image: adminer\n";
+        let err = parse(dup).expect_err("a service with two `image` keys must be refused");
+        assert!(
+            err.contains("appears twice") && err.contains("image"),
+            "the refusal must name the key: {err}"
+        );
+
+        // The override, which must NOT read as a duplicate: `command` is written once in the service
+        // and once in the base it merges.
+        let merged = concat!(
+            "x-base: &base\n",
+            "  image: alpine\n",
+            "  command: [echo, DALBASE]\n",
+            "services:\n",
+            "  app:\n",
+            "    <<: *base\n",
+            "    command: [echo, LOCALE]\n",
+        );
+        let boxes = parse(merged).expect("a merge override is not a duplicate");
+        assert_eq!(
+            boxes[0].command,
+            vec!["echo".to_string(), "LOCALE".to_string()],
+            "the local key must win over the merged one"
+        );
+    }
+
+    /// THE PREFIX IS STRIPPED ONCE.
+    ///
+    /// `trim_start_matches` strips a prefix REPEATEDLY, so with it `x-kern-x-kern-vcpu` resolved to
+    /// the `vcpu` field: a key nobody defined, quietly setting a profile. `strip_prefix` removes one.
+    #[test]
+    fn a_doubled_extension_prefix_is_not_a_profile_key() {
+        let b = &boxes(
+            "services:\n  app:\n    image: alpine\n    x-kern-x-kern-vcpu: ml\n    x-kern-vcpu: real\n",
+        )[0];
+        assert_eq!(
+            b.profile_tokens(),
+            vec!["vcpu:real"],
+            "only the single-prefix key may name a profile"
+        );
     }
 
     fn boxes(y: &str) -> Vec<ComposeBox> {
@@ -4298,16 +4707,22 @@ services:
         let c = &boxes(y)[0].command;
         assert_eq!(c[0], "-c");
         assert_eq!(
-            c[1], "echo one   # not a yaml comment\necho two",
-            "literal | keeps newlines and inline #"
+            // The trailing newline is YAML's default ("clip") chomping: a block scalar keeps
+            // exactly one. This expectation used to omit it, pinning a deviation the parser has
+            // since stopped making - `|`, `|-` and `|+` all produced the same value, so an
+            // indicator an author wrote on purpose did nothing.
+            c[1],
+            "echo one   # not a yaml comment\necho two\n",
+            "literal | keeps newlines, the inline #, and one trailing break"
         );
     }
 
     #[test]
     fn block_scalar_folded_joins_with_spaces() {
         let y = "services:\n  a:\n    image: alpine\n    command: >\n      echo\n      hello\n      world\n";
-        // folded `>` → one line; a scalar command is wrapped in `sh -c`.
-        assert_eq!(boxes(y)[0].command, ["sh", "-c", "echo hello world"]);
+        // folded `>` → one line; a scalar command is wrapped in `sh -c`. The trailing newline is
+        // clip chomping, which this expectation used to omit.
+        assert_eq!(boxes(y)[0].command, ["sh", "-c", "echo hello world\n"]);
     }
 
     #[test]

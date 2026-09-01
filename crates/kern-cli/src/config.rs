@@ -44,6 +44,21 @@ pub struct KernSettings {
     pub log_level: Option<String>,
     /// Persistent allocation tracking for crash recovery (default off).
     pub crash_recovery: bool,
+    /// `allow_device_grants` - let a compose stack use a profile that resolves to HOST DEVICE NODES
+    /// without `--allow-device-grants` on every invocation. Default `false`.
+    ///
+    /// THIS KEY IS ONLY EVER READ FROM THE DEFAULT CONFIG, never from a `--config`/`config =` path a
+    /// compose file chose. The whole point of the gate is that a file obtained from anywhere cannot
+    /// grant itself hardware, and the native stack format lets a file name its own `kern.toml`
+    /// (`config = "bundled.toml"`): honouring this key from there would let a downloaded bundle ship
+    /// its own permission. The reader that enforces that is `device_grants_allowed_by_config`.
+    ///
+    /// It exists because the command line is not reachable in every context: a `restart:` service
+    /// becomes a systemd unit whose `ExecStart` no human types, so without a persistent grant such a
+    /// service either never restarts after a reboot (and nobody finds out until the machine reboots)
+    /// or the generated unit carries the flag itself, which is the self-perpetuating grant on an
+    /// unattended machine that the gate exists to prevent.
+    pub allow_device_grants: bool,
 }
 
 // ─────────────────────────────── CPU (implemented) ───────────────────────────────
@@ -445,12 +460,45 @@ fn enter_section(cfg: &mut KernConfig, path: &str, n: usize) -> Result<Ctx, Stri
 // ── per-section key handlers. An unrecognized key is ignored (not an error), so a kern.toml written
 //    by another kern edition - with keys this build doesn't model - still loads. ──
 
+/// Name a key this build does not read, once per distinct key.
+///
+/// The parser is TOLERANT of unknown keys by design, so a `kern.toml` shared with another kern
+/// edition still loads. Tolerance and silence are different things, though, and the silence is what
+/// costs: a hand-written `[[vcpu]]` with `cores = 6` where the key is `cpus` produces a profile that
+/// grants nothing and says nothing, and `kern compose <file> config` then reports it resolving to
+/// whatever the defaults are, which reads as success. That is worse for a DOWNLOADED compose file
+/// naming a locally hand-written profile, where nobody involved wrote both halves.
+///
+/// A warning, never a refusal: refusing would break the forward compatibility the tolerance is for.
+/// DEDUPLICATED PER (SECTION, KEY), and the message says so, because the rule has a cost: three
+/// `[[vcpu]]` blocks that each carry the same bad key produce ONE line, and an operator who fixes
+/// only the block they were looking at leaves two broken. The alternative - one line per occurrence -
+/// makes a config parsed several times per invocation print the same sentence a dozen times, which is
+/// how a reader learns to skip warnings. Naming the rule in the text is what makes the trade honest.
+fn warn_unknown_key(section: &str, key: &str) {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static SEEN: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    }
+    let id = format!("{section}.{key}");
+    let first = SEEN.with(|s| s.borrow_mut().insert(id));
+    if first {
+        eprintln!(
+            "kern: warning: kern.toml: [[{section}]] has no key '{key}' in this build - it is \
+             ignored, so anything it was meant to set is not set (reported once per key: if you \
+             wrote it in several [[{section}]] blocks, every one of them is affected)"
+        );
+    }
+}
+
 fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
     match key {
         "config_version" => k.config_version = Some(value_u32(v)?),
         "log_level" => k.log_level = Some(value_string(v)?),
         "crash_recovery" => k.crash_recovery = value_bool(v)?,
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        "allow_device_grants" => k.allow_device_grants = value_bool(v)?,
+        _ => warn_unknown_key("kern", key),
     }
     Ok(())
 }
@@ -472,7 +520,7 @@ fn apply_cpu(e: &mut CpuEntry, key: &str, v: &str) -> Result<(), String> {
                     .into(),
             )
         }
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        _ => warn_unknown_key("cpu", key),
     }
     Ok(())
 }
@@ -515,7 +563,7 @@ fn apply_vcpu(e: &mut VCpuEntry, key: &str, v: &str) -> Result<(), String> {
                 "'priority' was removed: use 'nice' (-20 high .. 19 low, the --nice flag)".into(),
             )
         }
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        _ => warn_unknown_key("vcpu", key),
     }
     Ok(())
 }
@@ -543,7 +591,7 @@ fn apply_gpio(e: &mut GpioEntry, key: &str, v: &str) -> Result<(), String> {
         "display" => e.display = value_str_array(v)?,
         "net" => e.net = value_str_array(v)?,
         "extra" => e.extra = value_str_array(v)?,
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        _ => warn_unknown_key("gpio", key),
     }
     Ok(())
 }
@@ -555,7 +603,7 @@ fn apply_usb_port(e: &mut UsbPortEntry, key: &str, v: &str) -> Result<(), String
         "usb" => e.usb = Some(value_string(v)?),
         "name" => e.name = Some(value_string(v)?),
         "reserved" => e.reserved = Some(value_string(v)?),
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        _ => warn_unknown_key("usb_port", key),
     }
     Ok(())
 }
@@ -582,7 +630,7 @@ fn apply_vgpio(e: &mut VGpioEntry, key: &str, v: &str) -> Result<(), String> {
         "display" => e.display = value_str_array(v)?,
         "net" => e.net = value_str_array(v)?,
         "extra" => e.extra = value_str_array(v)?,
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        _ => warn_unknown_key("vgpio", key),
     }
     Ok(())
 }
@@ -599,7 +647,7 @@ fn apply_disk(e: &mut DiskEntry, key: &str, v: &str) -> Result<(), String> {
         "bandwidth" => e.bandwidth = Some(value_string(v)?),
         "device" => e.device = Some(value_string(v)?),
         "model" => e.model = Some(value_string(v)?),
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        _ => warn_unknown_key("disk", key),
     }
     Ok(())
 }
@@ -612,7 +660,7 @@ fn apply_vdisk(e: &mut VDiskEntry, key: &str, v: &str) -> Result<(), String> {
         "iops" => e.iops = Some(value_u64(v)?),
         "bandwidth" => e.bandwidth = Some(value_string(v)?),
         "persistent" => e.persistent = value_bool(v)?,
-        _ => {} // unrecognized key: ignored (forward/cross-version config compat)
+        _ => warn_unknown_key("vdisk", key),
     }
     Ok(())
 }
@@ -743,6 +791,51 @@ fn active_path_impl(
 /// error (with its line).
 pub fn load(path: Option<&str>) -> Result<KernConfig, String> {
     load_impl(path, std::env::var_os("KERN_CONFIG"), &default_path())
+}
+
+/// [`load`], memoised for the life of this process.
+///
+/// MEASURED BOTTLENECK. A 200-service compose stack whose services name a profile opened
+/// `kern.toml` **601 times** - three per service, because the validation pass, the printing pass and
+/// the device gate each resolve per box and each resolution loaded the file from disk and re-parsed
+/// it. The work is identical every time: one invocation of `kern` sees one config.
+///
+/// Keyed on the RESOLVED source, not on the caller's argument, so `--config x.toml` and the default
+/// that happens to be `x.toml` share one entry and an explicit path never collides with the default.
+/// The key includes `KERN_CONFIG`, which `load` also consults.
+///
+/// A FAILED LOAD IS CACHED TOO. An unreadable or malformed config is a property of the file, and
+/// re-reading it inside one process cannot change the answer while it can change the ERROR (a file
+/// edited mid-run would make two consumers disagree about the same stack). Callers that want the
+/// current state of the disk are separate invocations, which is what `config` and `up` already are.
+///
+/// Thread-local rather than a global lock: this is a one-shot CLI, the cache is per-thread state with
+/// no sharing, and there is no lock to contend or to deadlock on.
+pub fn load_cached(path: Option<&str>) -> Result<std::rc::Rc<KernConfig>, String> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Result<Rc<KernConfig>, String>>> =
+            RefCell::new(HashMap::new());
+    }
+    let key = format!(
+        "{}\u{1}{}",
+        path.unwrap_or_default(),
+        std::env::var_os("KERN_CONFIG")
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    CACHE.with(|c| {
+        // Borrow, look up, DROP the borrow before loading: `load` runs arbitrary parsing code and a
+        // borrow held across it would be a `RefCell` panic waiting for the first re-entrant caller.
+        if let Some(hit) = c.borrow().get(&key) {
+            return hit.clone();
+        }
+        let fresh = load(path).map(Rc::new);
+        c.borrow_mut().insert(key, fresh.clone());
+        fresh
+    })
 }
 
 /// Testable core of [`load`]. Precedence: explicit `--config` > `KERN_CONFIG` env > default location.

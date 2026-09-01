@@ -74,16 +74,15 @@ fn classify(spec: &str) -> Side {
     let Some(inst) = crate::registry::find_ref(name) else {
         return Side::NoSuchBox(name.to_string());
     };
-    let pid1 = if inst.pid1 > 0 {
-        inst.pid1
-    } else {
-        match crate::registry::child_of(inst.pid) {
+    let pid1 = match inst.live_pid1() {
+        Some(p) => p,
+        None => match crate::registry::box_init_under(inst.pid) {
             Some(p) => p,
             // Registered, but its init is already gone: a box on its way out. "No such box" is the
             // truthful answer to "can I copy into it right now", and the alternative was to treat
             // the whole spec as a host path and write a file called `name:path` in the cwd.
             None => return Side::NoSuchBox(name.to_string()),
-        }
+        },
     };
     Side::Boxed(pid1, path.to_string())
 }
