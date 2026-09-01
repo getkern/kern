@@ -10,11 +10,13 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
+<sub>3.5 ms is one machine and one workload, not a guarantee: [how it was measured](BENCHMARKS.md)</sub>
+
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20(WSL2)%20%C2%B7%20macOS%20(Linux%20VM)%20%C2%B7%20ARM%20boards-informational.svg)](docs/INSTALL.md)
+[![Runs on](https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20ARM%20boards%20%C2%B7%20Windows%20via%20WSL2%20%C2%B7%20macOS%20via%20a%20Linux%20VM-informational.svg)](docs/INSTALL.md)
 
 </div>
 
@@ -349,6 +351,11 @@ and `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Ard
 flags and `--json` shapes change incompatibly only after a deprecation entry a release earlier, and
 `cli_surface_is_frozen` holds the build to it. Config-file keys can still evolve:
 [CHANGELOG.md](CHANGELOG.md).
+
+Upgrading from 0.7? The behaviour changes are listed under
+[v0.8.0](CHANGELOG.md#v080---2026-08-31): a numeric `USER` now takes its group from the image's
+`/etc/passwd`, an image `USER` that cannot be resolved refuses to start the box instead of running
+as root, and a repository name must be lowercase at build time rather than failing later at push.
 
 ## What kern is not
 
