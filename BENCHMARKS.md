@@ -413,12 +413,10 @@ each other.
 
 | | |
 |---|---:|
-| **kern** binary | **1563480 B** x86_64 and **1313104 B** aarch64, read off the published v0.8.0 tarballs on 2026-09-01 (754538 and 718386 B compressed). A plain `cargo build --release` on this desktop is 1983608 B x86_64; the size-optimized release build is a different toolchain, not a different program. static and stripped, one Rust dependency (`libc`); OCI pull shells out to the system `curl`/`tar` |
+| **kern** binary | one static, stripped file per architecture, with `libc` its only Rust dependency (OCI pull shells out to the system `curl`/`tar`). No size is quoted anywhere in these documents: it moves with every build and toolchain bump, so a number written here is stale before it is read. Measure the one you have: `ls -l $(command -v kern)` |
 | kern resident memory at rest | **0**: no daemon |
 | kern memory per box, marginal | **0.35 MB** PSS, at 50 live boxes |
 | kern memory per box, one box alone | 1.65 MB PSS / 4.6 MB RSS |
-| bubblewrap binary | 70 KB (launcher only) |
-| runc binary | ~10 MB |
 | **Docker** resident | **154 to 160 MB RSS** with zero containers running (`dockerd` + `containerd`; it moves with the version and with how much the daemon has done, which is why it is a range) |
 
 PSS rather than RSS is the honest measure here: kern runs two processes per box and both are the same

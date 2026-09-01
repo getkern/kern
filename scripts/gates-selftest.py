@@ -61,6 +61,10 @@ def prepend(line: str):
     return lambda text: line + "\n" + text
 
 
+def append(line: str):
+    return lambda text: text + line
+
+
 def replace_once(old: str, new: str):
     def go(text: str) -> str | None:
         return text.replace(old, new, 1) if old in text else None
@@ -110,6 +114,12 @@ CASES: list[Case] = [
     # didascalie, costante del generatore), quindi non c'e' piu' un valore canonico contro cui
     # disaccordare e la funzione e' stata cancellata. Un caso che inietta in un testo che non esiste
     # piu' resterebbe verde per assenza di bersaglio, che e' peggio di nessun caso.
+    # La regola sulla size del binario. Le due versioni precedenti furono RITIRATE perche' mettevano in
+    # blacklist numeri precisi e scattavano su affermazioni vere (un "1.7 MB" e' anche un RSS). Questa
+    # pretende che la cifra stia ACCANTO alla parola che misura, quindi qualunque corrispondenza e' una
+    # violazione della regola e non una cifra forse vecchia. Il caso inietta la forma vietata.
+    ("stale-numbers", "una dimensione del binario dichiarata in prosa", "EDGE.md",
+     append("\nThe kern binary is 1.52 MB, static.\n")),
     # --- test-count ---
     ("test-count", "a README test count that does not match the suite", "README.md",
      # Ancorato a `** N Rust` e non alla frase intera: la sezione Status e' stata riscritta il

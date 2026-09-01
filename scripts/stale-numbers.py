@@ -317,6 +317,49 @@ def _rust_string_literal_after(src: str, marker: str) -> str:
     return "".join(out)
 
 
+def no_binary_size_claim() -> list[str]:
+    """No document may state the size of a binary.
+
+    The owner's rule, 2026-09-01: a binary size changes with every build and every toolchain bump, so
+    a number written into prose is stale before anyone reads it. This has already cost the project
+    twice, once when the front page said 1.84 MB three lines above a README saying 1.58, and once when
+    six documents still quoted v0.7.0 figures after v0.8.0 shipped at a different size. The fix is not
+    to keep them in sync, it is to stop making the claim: `ls -l $(command -v kern)` answers it for the
+    build the reader actually has.
+
+    THE EARLIER ATTEMPT AT A SIZE RULE WAS WITHDRAWN TWICE, and the note above records why: it
+    blacklisted particular numbers, and a bare "1.7 MB" is also an RSS in BENCHMARKS.md, so it fired
+    on true statements. This one cannot have that failure, because it does not judge whether a number
+    is right. It requires the size to sit NEXT TO the word it measures, so a memory figure, a
+    throughput and an image size are all untouched, and any match at all is a policy violation rather
+    than a possibly-stale figure.
+
+    CHANGELOG.md is exempt everywhere in this file, and for the usual reason: a log whose old entries
+    get edited is not a log.
+    """
+    pat = re.compile(
+        r"(?:binary|binaries)[^.\n]{0,40}?\b\d+(?:\.\d+)?\s*(?:MB|KB|MiB|KiB)\b"
+        r"|\b\d+(?:\.\d+)?\s*(?:MB|KB|MiB|KiB)\b[^.\n]{0,25}?(?:binary|binaries)",
+        re.I,
+    )
+    out = []
+    docs = subprocess.run(
+        ["git", "ls-files", "*.md"], capture_output=True, text=True
+    ).stdout.split()
+    for path in sorted(docs):
+        if os.path.basename(path) in ALWAYS_ALLOWED:
+            continue
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.split("\n"), 1):
+            m = pat.search(line)
+            if m:
+                out.append(f"{path}:{lineno} states a binary size: {m.group(0).strip()!r}")
+    return out
+
+
 def example_count_agrees() -> list[str]:
     """The README's count of runnable examples must be the number of files in `examples/`.
 
@@ -640,6 +683,12 @@ def main(argv: list[str]) -> int:
         print("       one measurement, several homes: the headline is canonical and every other "
               "claimant is checked against it. Edit README.md first, then the others; if the GIF "
               "generator moved, re-run it: python3 assets/make-demo-gif.py")
+    for problem in no_binary_size_claim():
+        total += 1
+        print(f"\n{problem}")
+        print("       a binary size changes with every build, so a number in prose is stale before "
+              "it is read. Say what it is (one static binary) and let the reader measure the one "
+              "they have: ls -l $(command -v kern)")
     for problem in example_count_agrees():
         total += 1
         print(f"\n{problem}")
