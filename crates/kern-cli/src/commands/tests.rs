@@ -2609,6 +2609,66 @@ mod image_rm_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// `signal_box` must still deliver when the pidfd path does not.
+    ///
+    /// FOUND ON SOMEONE ELSE'S HOST, not on mine: a sandboxed container reported
+    /// `kill_box_reaps_a_foreground_sigterm_ignoring_init` failing with "kill_box must confirm the
+    /// foreground box is gone", and it does not reproduce on a stock kernel. The cause is that
+    /// `pidfd_send_signal`'s result was discarded, so a call that never delivered was indistinguishable
+    /// from one that did. It matters beyond the test: for a FOREGROUND box the group sweep next to it
+    /// is a no-op (a non-leader init has no group of its own), so that syscall is the only thing that
+    /// reaches the init, and a policy filtering it left `kern stop` reporting Unconfirmed over a box
+    /// that was still running.
+    ///
+    /// Reproduced WITHOUT that sandbox, by handing the call a descriptor that is real but is not a
+    /// pidfd: it fails with EBADF, which is not ESRCH, so the fallback is the only thing that can kill
+    /// the child. Before the fix this test hangs on a live child and fails.
+    #[test]
+    fn signal_box_falls_back_when_the_pidfd_call_cannot_deliver() {
+        use std::os::unix::io::AsRawFd;
+        let not_a_pidfd = std::fs::File::open("/dev/null").expect("open /dev/null");
+        // SAFETY: fork in a test binary; the child only spins until it is killed.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            loop {
+                std::hint::spin_loop();
+            }
+        }
+        // SAFETY: the child is this process's own, and SIGKILL cannot be caught or ignored.
+        unsafe {
+            libc::usleep(50_000);
+            assert_eq!(libc::kill(child, 0), 0, "the child should be running");
+            crate::commands::lifecycle::signal_box(not_a_pidfd.as_raw_fd(), child, libc::SIGKILL);
+        }
+        // Reap, then assert. `waitpid` returning the child is itself the proof it terminated; the
+        // bounded loop is there so a surviving child fails the test instead of hanging the suite.
+        let mut gone = false;
+        for _ in 0..200 {
+            let mut st: libc::c_int = 0;
+            // SAFETY: waits on this process's own child, without blocking.
+            let r = unsafe { libc::waitpid(child, &mut st, libc::WNOHANG) };
+            if r == child {
+                gone = true;
+                break;
+            }
+            // SAFETY: sleeps this thread.
+            unsafe { libc::usleep(10_000) };
+        }
+        if !gone {
+            // SAFETY: clean up the survivor so a failure does not leak a spinning process.
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+                let mut st: libc::c_int = 0;
+                libc::waitpid(child, &mut st, 0);
+            }
+        }
+        assert!(
+            gone,
+            "signal_box must fall back to kill when the pidfd call fails with anything but ESRCH"
+        );
+    }
+
     #[test]
     fn kill_box_reaps_a_foreground_sigterm_ignoring_init() {
         // Reproduces the reported bug: a FOREGROUND box's init is NOT a process-group leader, so the

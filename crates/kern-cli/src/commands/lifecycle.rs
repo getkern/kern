@@ -416,8 +416,26 @@ pub(crate) unsafe fn wait_for_box_exit(pidfd: i32, ms: u64) -> bool {
 /// watchdog child.
 pub(crate) unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
     if pidfd >= 0 {
-        libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig, 0, 0);
-    } else if pid1 > 0 {
+        if libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig, 0, 0) == 0 {
+            return;
+        }
+        // THE RESULT USED TO BE DISCARDED, so a `pidfd_send_signal` that never delivered looked
+        // exactly like one that did. Reported from a sandboxed container (root, no systemd, kernel
+        // 6.12.8): `kill_box_graceful` returned Unconfirmed for a FOREGROUND box, because the group
+        // sweep beside it is a no-op there - a foreground init is not a process-group leader, so
+        // `kill(-pid)` is a harmless ESRCH and this call is the only thing that reaches it. A policy
+        // that filters this syscall left the box running and kern saying it could not confirm.
+        //
+        // ESRCH IS THE ONE ERROR NOT WORTH RETRYING, and retrying it would be unsafe: it means the
+        // process is already gone, and its pid may already have been recycled onto someone else's,
+        // which is precisely the reuse the pidfd exists to rule out. Every other errno (ENOSYS on a
+        // kernel below 5.1, EPERM under a seccomp policy) means the signal did NOT go out while the
+        // target is still the process we opened, so the plain `kill` is both needed and correct.
+        if *libc::__errno_location() == libc::ESRCH {
+            return;
+        }
+    }
+    if pid1 > 0 {
         libc::kill(pid1, sig);
     }
 }
