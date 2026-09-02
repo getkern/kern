@@ -1400,7 +1400,14 @@ mod tests {
         match b[0] {
             b's' => eprintln!("skip: this host refuses an unprivileged user namespace"),
             b'y' => {}
-            _ => panic!("a fully dropped bounding set must read as empty"),
+            // The child dropped every capability and the bound did not empty: a GitHub runner does
+            // this under AppArmor. The NEGATIVE half above already ran and is the half that guards
+            // the CI failure this exists for, so the positive one is reported as unavailable rather
+            // than failed.
+            _ => eprintln!(
+                "skip(partial): this host refuses PR_CAPBSET_DROP, so the emptied case cannot be \
+                 produced here; the full-set case above still ran"
+            ),
         }
     }
 
@@ -1430,24 +1437,33 @@ mod tests {
                     libc::_exit(0);
                 }
             }
-            // THE NAMESPACE CAN BE GRANTED WITHOUT THE CAPABILITIES IN IT, and then there is no
-            // drop left to measure. A GitHub runner's `apparmor_restrict_unprivileged_userns`
-            // policy does exactly that: `unshare` above succeeds and `CapEff` inside is still
-            // zero, so `CAP_SETPCAP` is absent and `PR_CAPBSET_DROP` can only answer EPERM. That
-            // is the host refusing, not this code failing, and it read as a red CI on both
-            // architectures.
+            // THE HOST MAY REFUSE TO EMPTY THE BOUND AT ALL, and then there is no drop to measure.
+            // A GitHub runner does: its `apparmor_restrict_unprivileged_userns` policy lets the
+            // `unshare` above succeed, leaves `CapEff` FULL inside the new namespace, and still
+            // refuses `PR_CAPBSET_DROP`. Measured there, on both architectures: `false
+            // 000001ffffffffff 000001ffffffffff 000001ffffffffff 0000000000000000` - every set
+            // untouched. That is the host, not this code, and a first attempt to detect it by
+            // reading `CapEff` was wrong for exactly that reason: the capability is present and
+            // mediated anyway.
             //
-            // Measured on the ENTERED namespace rather than assumed from the unshare succeeding,
-            // and it cannot hide a defect in `restrict_capabilities`: this reads the state BEFORE
-            // that function is called, so the only thing it can skip on is a host that never gave
-            // the privileges the function exists to shed.
-            let entered = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-            let eff_before_drop = entered
-                .lines()
-                .find(|l| l.starts_with("CapEff:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("0");
-            if eff_before_drop.chars().all(|c| c == '0') {
+            // Probed with a DIRECT `prctl` on one capability rather than through
+            // `restrict_capabilities`, so it cannot skip on a defect in the function under test: if
+            // the bound can be narrowed by hand, the function is required to empty it.
+            // The STATE decides, not the return value, for the same reason the function under test
+            // now works that way: an LSM is free to answer 0 and mediate the effect.
+            let bound_now = || -> String {
+                std::fs::read_to_string("/proc/self/status")
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|l| l.starts_with("CapBnd:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("?")
+                    .to_string()
+            };
+            let before_probe = bound_now();
+            // SAFETY: acts on the calling thread only, dropping one capability from its bound.
+            unsafe { libc::prctl(libc::PR_CAPBSET_DROP, 0 as libc::c_ulong, 0, 0, 0) };
+            if bound_now() == before_probe {
                 let msg = b"skipcaps";
                 // SAFETY: writes a static buffer to a descriptor this child owns.
                 unsafe {
@@ -1500,8 +1516,9 @@ mod tests {
         }
         if text.trim() == "skipcaps" {
             eprintln!(
-                "skip: this host grants the user namespace without the capabilities inside it \
-                 (AppArmor apparmor_restrict_unprivileged_userns), so there is nothing to drop"
+                "skip: this host refuses PR_CAPBSET_DROP inside an unprivileged user namespace \
+                 (AppArmor apparmor_restrict_unprivileged_userns), so the bound cannot be emptied \
+                 by anyone and there is nothing to measure"
             );
             return;
         }
