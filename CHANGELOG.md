@@ -165,6 +165,13 @@ is in the git history.
   signal delivered while the inotify read blocks returns `EINTR`, and a caller reading -1 as "no
   events" would stop rebuilding after the first `SIGWINCH`.
 
+- **A relay refusal bundled two unrelated causes into one sentence.** "the two boxes share one
+  network namespace (or their namespaces could not be read)" fired on a real host because a service
+  had DIED, and the message sent four rounds of diagnosis hunting a namespace problem that did not
+  exist. The two have nothing in common: one means the caller handed kern a `--net` box, the other
+  means a box is gone and its logs are where the answer is. They are now separate messages, and the
+  second names the pid.
+
 - **`kern --help` now describes `compose watch` and `compose port`.** Both verbs shipped listed in the
   compose verb line and explained nowhere, so a reader saw `watch|port` and had to guess. Two lines,
   in the same column as their neighbours. `cli_surface_is_frozen` was regenerated deliberately: the

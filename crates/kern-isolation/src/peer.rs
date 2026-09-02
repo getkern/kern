@@ -681,15 +681,35 @@ fn connector_main(
 /// Fails CLOSED (`true` on any read failure): a relay between two boxes that are really the same
 /// namespace would bind and connect in one place, which is not a relay but a loop, and refusing it
 /// costs nothing.
-fn same_netns(a_pid1: i32, b_pid1: i32) -> bool {
+/// How two pids' network namespaces relate, or which one could not be read.
+///
+/// THE TWO ARE NOT ONE ANSWER, and folding them into a bool cost four rounds of diagnosis on a real
+/// host. A refusal that said "the two boxes share one network namespace (or their namespaces could
+/// not be read)" was emitted because a service had DIED (its busybox had no `httpd` applet), and the
+/// message sent the reader looking for a namespace problem that did not exist. The two causes have
+/// nothing in common: one means the caller handed us a `--net` box, the other means a box is gone.
+#[derive(Debug, PartialEq, Eq)]
+enum NetnsRelation {
+    /// Both readable and equal: there is nothing to relay between them.
+    Same,
+    /// Both readable and different: a relay makes sense.
+    Different,
+    /// This pid's `/proc/<pid>/ns/net` could not be read, which for a box that was alive a moment ago
+    /// means it exited. Fails closed at the call site either way.
+    Unreadable(i32),
+}
+
+fn netns_relation(a_pid1: i32, b_pid1: i32) -> NetnsRelation {
     let ino = |pid: i32| -> Option<(u64, u64)> {
         let md = std::fs::metadata(format!("/proc/{pid}/ns/net")).ok()?;
         use std::os::unix::fs::MetadataExt;
         Some((md.dev(), md.ino()))
     };
     match (ino(a_pid1), ino(b_pid1)) {
-        (Some(x), Some(y)) => x == y,
-        _ => true,
+        (None, _) => NetnsRelation::Unreadable(a_pid1),
+        (_, None) => NetnsRelation::Unreadable(b_pid1),
+        (Some(x), Some(y)) if x == y => NetnsRelation::Same,
+        _ => NetnsRelation::Different,
     }
 }
 
@@ -720,12 +740,21 @@ pub fn spawn(
     if port == 0 {
         return Err("peer relay: port 0 is not a port".to_string());
     }
-    if same_netns(a_pid1, b_pid1) {
-        return Err(
-            "peer relay: the two boxes share one network namespace (or their namespaces could not \
-             be read); there is nothing to relay"
-                .to_string(),
-        );
+    match netns_relation(a_pid1, b_pid1) {
+        NetnsRelation::Different => {}
+        NetnsRelation::Same => {
+            return Err(
+                "peer relay: the two boxes share one network namespace, so there is nothing \
+                        to relay between them"
+                    .to_string(),
+            )
+        }
+        NetnsRelation::Unreadable(pid) => {
+            return Err(format!(
+                "peer relay: cannot read the network namespace of pid {pid}, which means that box \
+                 exited between the check and here; check its logs rather than the relay"
+            ))
+        }
     }
     if !assert_cmsg_fits() {
         return Err(
@@ -1492,7 +1521,11 @@ mod tests {
     #[test]
     fn two_boxes_in_one_namespace_are_refused() {
         let me = std::process::id() as i32;
-        assert!(same_netns(me, me), "a pid shares a namespace with itself");
+        assert_eq!(
+            netns_relation(me, me),
+            NetnsRelation::Same,
+            "a pid shares a namespace with itself"
+        );
         let me_ref = BoxRef {
             pid1: me,
             starttime: 0,
@@ -1507,9 +1540,17 @@ mod tests {
         )
         .expect_err("must refuse");
         assert!(e.contains("share one network namespace"), "{e}");
-        assert!(
-            same_netns(me, 1_000_000_000),
-            "an unreadable namespace fails CLOSED"
+        // AND IT SAYS WHICH PID, rather than folding "unreadable" into "same". A refusal that bundled
+        // the two sent a reader hunting a namespace problem when a service had simply died.
+        assert_eq!(
+            netns_relation(me, 1_000_000_000),
+            NetnsRelation::Unreadable(1_000_000_000),
+            "an unreadable namespace fails closed, naming the pid"
+        );
+        assert_eq!(
+            netns_relation(1_000_000_000, me),
+            NetnsRelation::Unreadable(1_000_000_000),
+            "whichever side it is"
         );
     }
 
