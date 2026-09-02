@@ -6,6 +6,23 @@
 //! A child module still reaches its ancestors' private items, so the tests assert on exactly the
 //! internals they did before, without widening one item's visibility.
 
+/// Does an unwritable directory actually block the unlink of what it holds?
+///
+/// It does for a normal user, and NOT for root: `CAP_DAC_OVERRIDE` ignores the permission bits, so a
+/// plain `remove_dir_all` over a `0o555` directory SUCCEEDS there. Two tests below pin a bug whose
+/// fixture is exactly such a directory, and as root that fixture stops reproducing the bug: they
+/// failed on an Ubuntu-as-root host with "the fixture no longer reproduces the bug", which is the
+/// fixture reporting itself, not the code under test misbehaving.
+///
+/// Gated on the EUID rather than on a trial removal. A trial would ask the same question the positive
+/// control asks, so using it as the gate would make the control vacuous: an environment where
+/// `remove_dir_all` wrongly succeeded would silently disarm the very assertion that would have caught
+/// it. The EUID is an independent, named cause that no defect in `remove_tree_forced` can produce.
+fn permission_bits_block_unlink() -> bool {
+    // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() != 0 }
+}
+
 #[cfg(test)]
 mod helper_signal_guard_tests {
     use crate::commands::*;
@@ -848,10 +865,21 @@ mod gc_clears_read_only_image_dirs {
         std::fs::write(ro.join("kmsg"), b"x").expect("write");
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod");
 
-        assert!(
-            std::fs::remove_dir_all(root.join("img")).is_err(),
-            "remove_dir_all unexpectedly succeeded - the fixture no longer reproduces the bug"
-        );
+        if crate::commands::tests::permission_bits_block_unlink() {
+            assert!(
+                std::fs::remove_dir_all(root.join("img")).is_err(),
+                "remove_dir_all unexpectedly succeeded - the fixture no longer reproduces the bug"
+            );
+        } else {
+            // The forced removal below is still exercised; only the control that the PLAIN call
+            // fails first is unavailable, because root's `CAP_DAC_OVERRIDE` walks straight through a
+            // `0o555` directory. Said out loud: a run that quietly dropped half a test would be worse
+            // than the failure this replaces.
+            eprintln!(
+                "SKIP(partial): running as root, so a 0o555 directory does not block the unlink and \
+                 the positive control cannot be armed; the forced removal is still asserted"
+            );
+        }
 
         remove_tree_forced(&root).expect("forced removal");
         assert!(!root.exists(), "the tree must be gone");
@@ -2123,13 +2151,47 @@ mod net_resource_tests {
 mod scratch_tests {
     use crate::commands::{fs_magic_of, OVERLAYFS_SUPER_MAGIC};
 
+    /// Is `/tmp` an overlay mount, according to a channel `fs_magic_of` does not use?
+    ///
+    /// `/proc/mounts` is parsed rather than `statfs`, because the assertion below is ABOUT what
+    /// `statfs` reports: gating it on `fs_magic_of`'s own answer would let a version that always
+    /// returned `OVERLAYFS_SUPER_MAGIC` disarm the test that would have caught it.
+    ///
+    /// The mount that GOVERNS `/tmp` is the longest mount point that is a path-prefix of it, not a
+    /// line whose point is literally `/tmp`. Matching the literal was wrong and a container said so:
+    /// under Docker `/tmp` is not its own mount, it is part of the overlay mounted at `/`, so the
+    /// literal match found nothing, called it "not an overlay", and disagreed with a `statfs` that
+    /// correctly said it was. Ties go to the LAST line, since a later mount on the same point shadows
+    /// an earlier one.
+    fn proc_mounts_call_tmp_an_overlay() -> bool {
+        let governs = |point: &str| {
+            point == "/" || std::path::Path::new("/tmp").starts_with(std::path::Path::new(point))
+        };
+        std::fs::read_to_string("/proc/mounts")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace().skip(1);
+                let (point, fstype) = (f.next()?, f.next()?);
+                governs(point).then_some((point.len(), fstype))
+            })
+            .enumerate()
+            .max_by_key(|(i, (len, _))| (*len, *i))
+            .is_some_and(|(_, (_, fstype))| fstype == "overlay")
+    }
+
     #[test]
     fn fs_magic_probes_the_deepest_existing_ancestor() {
-        // /tmp exists → Some(magic), and on a dev host it is never overlayfs.
+        // /tmp exists → Some(magic). Whether it reads as overlayfs is not a constant: it is false on
+        // a dev host and TRUE in a container that overlays /tmp, where this test used to fail with
+        // "/tmp must not read as overlayfs on a host". So assert that `statfs` AGREES WITH
+        // `/proc/mounts` instead of asserting one fixed answer - which pins `fs_magic_of` harder than
+        // the original did, in both environments, and skips in neither.
         let m = fs_magic_of(std::path::Path::new("/tmp")).expect("statfs /tmp");
-        assert_ne!(
-            m, OVERLAYFS_SUPER_MAGIC,
-            "/tmp must not read as overlayfs on a host"
+        assert_eq!(
+            m == OVERLAYFS_SUPER_MAGIC,
+            proc_mounts_call_tmp_an_overlay(),
+            "fs_magic_of and /proc/mounts disagree about whether /tmp is an overlay"
         );
         // A path that does not exist yet resolves via its ancestors (same magic as /tmp itself).
         let ghost = std::path::Path::new("/tmp/kern-test-does-not-exist-xyz/scratch/deeper");
@@ -2292,11 +2354,20 @@ mod image_rm_tests {
         let mut p = std::fs::metadata(&ro).unwrap().permissions();
         p.set_mode(0o555);
         std::fs::set_permissions(&ro, p).unwrap();
-        // The plain call is expected to fail here - that is the bug being pinned.
-        assert!(
-            std::fs::remove_dir_all(&base).is_err(),
-            "fixture is wrong: the plain remove succeeded, so it proves nothing"
-        );
+        // The plain call is expected to fail here - that is the bug being pinned. Not as root, where
+        // `CAP_DAC_OVERRIDE` ignores the write bit this fixture removes; see
+        // `permission_bits_block_unlink`. The forced removal below is asserted either way.
+        if crate::commands::tests::permission_bits_block_unlink() {
+            assert!(
+                std::fs::remove_dir_all(&base).is_err(),
+                "fixture is wrong: the plain remove succeeded, so it proves nothing"
+            );
+        } else {
+            eprintln!(
+                "SKIP(partial): running as root, so the 0o555 directory does not block the unlink \
+                 and the fixture cannot pin the bug; the forced removal is still asserted"
+            );
+        }
         force_remove_dir_all(&base);
         assert!(
             !base.exists(),
