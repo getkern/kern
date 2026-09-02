@@ -32,6 +32,33 @@ pub(crate) fn waitpid(
     }
 }
 
+/// `read(2)`, restarted on `EINTR`.
+///
+/// The third blocking syscall kern makes directly, added when `compose watch` began reading an
+/// inotify fd: a signal delivered while that read blocks returns -1/`EINTR`, and a caller that reads
+/// -1 as "no events" would silently stop rebuilding after the first `SIGWINCH`. The same class the
+/// module header describes, in a third place.
+///
+/// Returns the byte count, or -1 with `errno` set for a real failure. `EAGAIN` is NOT retried: on a
+/// non-blocking fd it means "nothing to read", which is an answer rather than an interruption, and
+/// looping on it would spin.
+///
+/// # Safety
+///
+/// `buf` must point to at least `len` writable bytes for the duration of the call. The signature is
+/// `unsafe`-free because every caller in this tree passes a stack buffer it owns; the pointer pair is
+/// the shape `read(2)` takes.
+pub(crate) fn read(fd: libc::c_int, buf: *mut libc::c_void, len: usize) -> isize {
+    loop {
+        // SAFETY: the caller's contract above - `buf` is `len` writable bytes it owns.
+        let r = unsafe { libc::read(fd, buf, len) };
+        if r == -1 && errno() == libc::EINTR {
+            continue;
+        }
+        return r;
+    }
+}
+
 /// Reap a child whose exit status nobody reads, restarted on `EINTR`.
 ///
 /// Separate from [`waitpid`] because the callers that discard the status passed a null pointer, and

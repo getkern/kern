@@ -11,6 +11,322 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## Unreleased
+
+### Added
+
+- **Peer reachability under `--no-pod`.** Services in a stack started with `--no-pod` now resolve and
+  reach each other by name, without a pod and without a bridge, a DNS server or any IPAM beyond a
+  per-stack counter.
+
+  Each service gets a stack-wide loopback alias, `127.0.0.2` upward by file order. A service resolves
+  its OWN name to `127.0.0.1`, where its listener is, and every peer to that peer's alias, where a
+  relay is bound inside this box. One shared hosts file cannot say both, so each box gets its own
+  entries; getting that line wrong is a service that cannot reach itself.
+
+  THE RELAY IS TWO PROCESSES, because one cannot do the job. MEASURED: from inside box A's user
+  namespace, `open("/proc/<B>/ns/user")` fails `EACCES`, one step before `setns` is reached. So a
+  listener enters A and binds `alias:<port>`, a connector enters B and connects to `127.0.0.1:<port>`,
+  and the accepted socket travels between them as an `SCM_RIGHTS` message, which works because file
+  descriptors are not namespaced. Both are forked from the host namespaces before either enters
+  anything, and both arm `PR_SET_PDEATHSIG` with a `getppid` re-check that closes the fork-to-prctl
+  race.
+
+  A HOLDER PROCESS OWNS THEM, for the same reason `kern __pod-holder` exists: `up` exits as soon as
+  the stack is up, and relays forked by `up` would die with it seconds after being created. The plan
+  travels in a file rather than argv, because a four-service stack with two ports each is 24 relays
+  and a kilobyte of addresses on a command line makes every quoting rule this module's problem. It is
+  fail-closed: if any relay cannot be spawned the holder reports the first failure and exits, leaving
+  the boxes running, because a stack where three peers of four are reachable fails later for a reason
+  nothing printed.
+
+  A PEER ARRIVES AS ITSELF, not as loopback. The connector binds the calling service's alias as the
+  SOURCE address before connecting, so the receiving service sees `127.0.0.2` for one peer and
+  `127.0.0.3` for another (verified from inside a box: `netstat -tn` in the target reports the
+  caller's alias). Without it every peer would arrive on `127.0.0.1`, indistinguishable from a
+  connection the service made itself, and loopback is the most trusted source in most default
+  configurations: a stack that asked for separation would have got localhost-equivalence back between
+  exactly the pairs kern connected. The address is checked once at start-up rather than per
+  connection, so a namespace where it cannot be bound is a spawn error and not a per-client mystery.
+
+  BOTH HALVES DROP EVERY CAPABILITY once they are set up, and refuse to serve if the drop fails. The
+  listener narrows to `CAP_NET_BIND_SERVICE` alone BEFORE its bind and to zero after, so the window
+  that holds anything is one capability wide rather than forty-one. `PR_SET_NO_NEW_PRIVS` first, then
+  `PR_CAP_AMBIENT_CLEAR_ALL` (a separate set, cleared explicitly rather than by inference), then the
+  bounding set up to `cap_last_cap` READ FROM THE KERNEL rather than a hard-coded 63 (a fixed ceiling
+  means EINVAL on the tail on a kernel with fewer capabilities, and this refuses to serve on a
+  failure), then `capset` with `_LINUX_CAPABILITY_VERSION_3` and two data words, because version 1
+  covers only capabilities 0 to 31 and this host has capabilities above 31.
+  MEASURED: a process reads `CapEff: 0000000000000000` before `setns(CLONE_NEWUSER)` into a box's user
+  namespace and `000001ffffffffff` after, and the halves keep the HOST mount namespace, so they are
+  the only processes in the stack with a host filesystem view reachable over a socket from inside a
+  box. The listener drops after its bind rather than before, because a service on a privileged port
+  puts the alias bind under `CAP_NET_BIND_SERVICE`.
+
+  THE NAMESPACE IS PINNED BEFORE IT IS TRUSTED, and by ONE `/proc/<pid>` directory descriptor rather
+  than by three path resolutions. `ns/user`, `ns/net` and `stat` are reached with `openat` from that
+  one descriptor, so they are the same generation by construction; the start-time comparison then only
+  has to answer whether that generation is the right one. Three separate paths would be three moments:
+  if the box's init exits between the first two, the second resolves against whatever now holds the
+  pid, and under `watch` (which stops and restarts a service all day) the recycled process is
+  plausibly another kern box, so the later start-time read can match while the two descriptors
+  straddle two boxes. MEASURED on 7.0.0: `openat` on a `/proc/<pid>` directory descriptor returns
+  ESRCH for `ns/net`, `ns/user` and `stat` alike once the process has exited, which is what makes the
+  single-descriptor form sound. Without any of this, a listener could bind its alias on the HOST,
+  reachable by everything on the machine.
+
+  THE CONNECTOR BOUNDS ITS OWN FORKS, reaping with `WNOHANG` before each one instead of leaving
+  `SIGCHLD` ignored: the kernel would reap them either way, but then nothing knows how many are live,
+  and a bound needs a count. The cap is the STACK's budget of 1,024 pumps divided by the number of
+  relays in the plan, floored at 16 and ceilinged at 256, because a flat per-relay number is never the
+  binding constraint: 256 across the 24 relays of a four-service, three-port stack is 6,144 processes,
+  which meets `RLIMIT_NPROC` and the cgroup `pids` limit long first. This relay's listening socket is
+  inside a box, so the party that can saturate it is a container.
+
+  THE HOLDER REPAIRS ITS RELAYS instead of sleeping through their deaths or ending the stack over one
+  of them. A dead half takes its own edge down and the edge is rebuilt against the namespaces that
+  exist now; a box whose PID 1 has moved has exactly the edges touching it rebuilt. Every rebuild is
+  logged, including one that succeeds first time, because an edge that dies twice a minute would
+  otherwise look healthy. An edge that keeps failing is named in a `degraded` file that
+  `kern compose ps` prints as `peer edge DOWN`, and it is still retried, so a service that is merely
+  restarting brings its edges back with no command run. Fail-closed still applies at SPAWN, where a
+  plan that cannot be realised is a stack-level fact `up` reports.
+
+  BOTH HALVES INSTALL A SECCOMP FILTER after shedding their privileges, and the per-connection pumps
+  inherit it through `fork`. It is a DENYLIST where a box gets an allowlist: a box runs arbitrary
+  tenant code, while a half runs this crate in a straight line and parses no tenant bytes, and an
+  allowlist over its syscall set would have to be right on every architecture kern publishes, where
+  musl picks spellings per target. Denied are the calls that make a host mount view worth anything:
+  `execve`, the file-opening family, `mount`, `ptrace`, `process_vm_*`, `setns`, `unshare`, `bpf` and
+  the module calls. Verified on x86_64 and on a Raspberry Pi 5: every half reads `Seccomp: 2`,
+  `NoNewPrivs: 1` and all four capability sets empty, while a service on port 80 still serves.
+
+  A SHARED INTERNAL PORT COSTS ONLY THE WILDCARD SIDE, and which side that is is MEASURED rather than
+  assumed. On one port, two SPECIFIC binds on different addresses do not conflict, while a specific
+  bind and a WILDCARD bind refuse each other in both orders, `SO_REUSEADDR` or not. A compose file
+  declares a port and never an address, so the plan cannot decide it; the holder reads
+  `/proc/<pid1>/net/tcp` for the box that would HOST each relay, after the services have bound, and
+  that reports the pid's network namespace so it needs no `setns` and no privilege.
+
+  A wildcard listener owns every address on its port, so that direction is named with both remedies. A
+  specific listener leaves the alias free, so that direction is served. Verified end to end with two
+  services both declaring 8080, one binding `127.0.0.1:8080` and one binding `0.0.0.0:8080`: the first
+  reaches the second, and only the reverse is reported down. A service that has NOT bound yet is a
+  third answer rather than "specific", because binding the alias then would make its own later
+  `bind(0.0.0.0)` fail and the loser of that race would be the user's application; those are deferred
+  and re-measured, so a service that restarts bound differently changes the answer with no command
+  run.
+
+  `kern compose ps` prints every direction that is down, with its reason.
+
+  MEASURED COST: on a four-service stack with 12 relays, `up --no-pod` is not slower than `up` in a
+  pod (186 ms against 191 ms, mean of three, debug binary, so the absolute figures are not comparable
+  with the published benchmarks).
+
+  `relays/` is AUTHORITATIVE in the registry's classification, deliberately: a box able to write a
+  line into a plan would redirect where a PEER's traffic goes, and a box able to rewrite the holder
+  pid would aim `compose down`'s kill at a process of its choosing.
+
+- **`kern compose <file> watch [service...]`**: rebuild and restart ONE service when its `build:`
+  context changes, and nothing else. Blocks until Ctrl-C, printing the cycle time. MEASURED on this
+  desktop, a full edit-to-serving cycle for a one-instruction image: **258 to 261 ms**, of which the
+  restart is the small part.
+
+  It exists because the speed a stack starts with is a number a developer reads once and never feels:
+  a stack goes up in the morning and stays up. The loop that runs dozens of times a day is edit,
+  rebuild, restart, and without this one kern was WORSE than the alternative there, because that loop
+  had to be driven by hand.
+
+  WHAT IS WATCHED is each service's `build.context`, recursively, and it is not configurable on
+  purpose: the context is already the set of files that decides the image's content, so watching it
+  is watching exactly what a rebuild would read. No `develop.watch` key is invented. A service with
+  no `build:` is excluded and the refusal says why, rather than a terminal that looks busy and can
+  never fire.
+
+  THE CYCLE IS THREE EXISTING VERBS: `kern build`, `kern stop` for the one box, and
+  `kern compose <file> start`, which launches what is not running and leaves the peers alone. The
+  module decides WHEN, never HOW, so nothing about building or starting is reimplemented behind a
+  second door.
+
+  Nine failure modes are handled and written down where the code is, rather than found later: inotify
+  absent (refused with the errno), the watch limit (`ENOSPC` reported with the sysctl to raise, and
+  refused rather than watching half a tree), editors that save by rename (`IN_MOVED_TO`, not
+  `IN_CLOSE_WRITE` alone), directories created after start (each gets its own watch, since inotify
+  does not recurse), event storms (folded into a per-service dirty bit in a fixed stack buffer),
+  queue overflow (`IN_Q_OVERFLOW` rebuilds everything, because the kernel will not say what it
+  dropped), an edit during a build (read afterwards, not lost and not a second build), Ctrl-C (a flag
+  the poll loop observes, so no build dies halfway), and a context that escapes the project.
+
+  That last one is shared rather than repeated: the confinement `resolve_builds` applies is now
+  `resolved_build_context`, called by both. A second reader of `build.context` with its own traversal
+  check is the shape in which one copy later stops refusing `context: ../../../etc`.
+
+  `eintr::read` joins `waitpid` and `poll` in that module for the same reason they are there: a
+  signal delivered while the inotify read blocks returns `EINTR`, and a caller reading -1 as "no
+  events" would stop rebuilding after the first `SIGWINCH`.
+
+- **`kern compose <file> port <service> <container-port>`**, the twin of `docker compose port`. It
+  prints the host address serving that box port, on stdout and alone, and exits non-zero when there
+  is no answer: the service is not running, it publishes nothing, or that container port is not among
+  what it published. The exit code is the contract as much as the output, because the shape this
+  serves is `addr=$(kern compose f port web 8000) || exit 1`.
+
+  READ FROM THE RUNNING BOX, NOT FROM THE FILE. The file says what was asked for and the registry
+  says what was actually bound; a stack brought up from a since-edited file would otherwise print an
+  address nothing serves. The cost is that the service has to be running, which is what
+  `docker compose port` requires too.
+
+  Additive: no verb, flag or `--json` shape changed meaning, and `cli_surface_is_frozen` was updated
+  deliberately for the one new sub-verb rather than by accident.
+
+  Two things this needed on the way. `ports::parse_display` is now the documented INVERSE of
+  `ports::fmt`, living beside it with a round-trip test, because the published mapping is stored as
+  the string `fmt` produced and a hand-rolled split at each reader is how one of them ends up
+  disagreeing with the writer; it is total, allocation-free, and refuses fifteen malformed shapes by
+  test. And the service selection upstream, which rewrites every positional into a scoped box name,
+  now knows that `port` takes `<service> <port>`: it used to report a mistyped NUMBER as an unknown
+  service, sending the reader to look for something their file never contained.
+
+### Fixed
+
+- **`kern compose <file> up` without `--no-pod`, on a stack running without one, silently moved it
+  back into a pod.** The plan file on disk is how a stack remembers its mode, and `start` carries it,
+  but `up` without the flag is ambiguous: a forgotten flag, or a deliberate move back. Both readings
+  are defensible, which is exactly when inferring is wrong. It now refuses, names the plan file, and
+  gives both ways forward. The check sits BEFORE the reconciler, because `up` on a stack whose
+  definitions still match returns "already up to date" and exits 0 without reaching anything after it.
+
+- **`kill_holder` signalled the previous relay holder and returned without waiting for it to die.**
+  The holder is not a child, so there is no `waitpid`; the caller then spawned a replacement while the
+  old holder's `PDEATHSIG` cascade was still tearing down relays in the same boxes, with the new
+  relays binding aliases the dying ones still held. That race is near-invisible on a hand-run `start`
+  and constant under `watch`, which performs the sequence on every save.
+
+- **Every box start paid for a garbage collection it did not need.** Deciding which cgroup path to
+  cap through called `ensure_kern_slice`, whose fast path swept the slice for cgroups left by boxes
+  whose supervisor had been killed. That sweep stats `/proc/<pid>` per entry, so its cost grows with
+  the slice, and MEASURED with 61 entries it was **193 us, 7.4% of a 2.6 ms box start**, in front of
+  every box. Orphans are rare by construction: a box that stops normally removes its own cgroup, so
+  only a killed supervisor leaves one. It now runs AFTER the spawn, overlapping the workload rather
+  than preceding it, and the slice is swept just as often.
+
+  `parent:config+volumes` fell from **288 us to 93 us**. The runtime directories are also resolved
+  once per process instead of on every helper that needs one, which halved the `mkdir`s that return
+  EEXIST; the memo runs BELOW the registry classification chokepoint, because the first version
+  returned early and skipped it, and three tests said so.
+
+  Interleaved against bubblewrap, 16 alternating batches of 50 runs on the same machine: kern
+  **2.412 ms** uncapped and **2.425 ms** capped against bubblewrap's **2.655 ms**, about 9% either
+  way, and the capped one is the default and does strictly more (a real cgroup cap, a registry entry,
+  a masked `/proc`). Repeated across sessions the edge lands between 5 and 11% depending on machine
+  load, and the ranges overlap, so it is a median edge rather than a separation.
+
+- **A `--no-pod` stack could ask for more processes than the host allows.** The relay mesh is
+  quadratic and the 253-service alias range does not bound it: 253 services with one port each is
+  63,756 relays and 127,513 processes, against an `RLIMIT_NPROC` of 126,965 on the machine this was
+  measured on. `up` now refuses past 1,024 relays, BEFORE starting anything, and states the count, the
+  process cost and the way out. Measured to set it: 32 services is 992 relays, 1,987 processes, 474 MB
+  resident and 1.54 s.
+
+- **The relay holder burned 2.75% of a core on an idle stack.** It read and pruned the whole registry
+  every 250 ms to notice a box that had restarted, and asked twice per relay. MEASURED on an
+  eight-service stack with 56 relays, release build. The two things it watches cost very differently:
+  reaping a dead child is a `waitpid` that costs nothing, while a restart scan needs the registry. The
+  rates are now separate (2 s for the scan, unchanged for the reap, and an immediate read whenever a
+  child died or an edge is waiting), which measures at **0.10%** with the rebuild still landing on the
+  next pass. Their relationship is a `const` assertion, so collapsing them again does not compile.
+
+- **`kern compose ps` named peer edges as down for a holder that no longer existed.** `degraded` is
+  written by the holder and removed by `down`; a holder that is killed leaves it behind, and the view
+  read the file rather than asking whether a holder owns it. Same stale-state class as the mode
+  inference, now closed the same way: the liveness of a process, not the presence of a file.
+
+- **A service declaring only UDP ports was unreachable under `--no-pod`, silently.** A peer relay is a
+  `SOCK_STREAM` pump, so UDP ports were filtered out of the address plan with no report: a `statsd` or
+  a DNS service simply had no peers and nothing said so, which is the accepted-and-ignored shape this
+  codebase treats as a defect. `up` now names any service whose only declared ports are UDP, and any
+  service that keeps its TCP ports while losing its UDP ones.
+
+- **Every peer edge of a multi-service `--no-pod` stack was reported blocked.** The holder decides
+  each relay by measuring what the hosting box bound, and "nothing is listening on that port" was read
+  as the racy case for every pair. It is only racy when the host DECLARES the port and has not bound
+  it yet; a service that never uses that port will never bind it, so the alias is free forever. With
+  the declaration missing from the decision, a four-service stack came up with twelve blocked edges,
+  all of them fine. Found by running a stack shaped like a real one, which is now a test: `db` and
+  `cache` behind an `api` behind a `web`, asserting a fetched body over every hop.
+
+- **The relay plan parser accepted box names a box cannot have.** `relays/` is AUTHORITATIVE in the
+  registry's classification precisely because a line written into it redirects where a PEER's traffic
+  goes, so the parser is a boundary; it checked names for emptiness and nothing else, and accepted a
+  space, a path separator or a terminal escape. It now applies the same `[A-Za-z0-9_.-]` charset the
+  rest of the tree uses, through the single function that states it.
+
+- **A relay pump outlived the teardown that was supposed to remove it.** `PR_SET_PDEATHSIG` is not
+  inherited across `fork`, so the two relay halves died with the holder while the per-connection pumps
+  did not. MEASURED: killing the holder left one process alive, still holding a connection open
+  between two boxes' namespaces, and a peer blocked in `read` never saw the connection end.
+  `compose down` takes the same path, so a stack could be brought down and still be relaying. Each
+  pump now arms `PDEATHSIG` against the connector.
+
+  Measuring the consequence answered a question that had been recorded as unmeasured: a peer observes
+  a clean FIN and end-of-file when the relay goes, not a reset, so the correct client response is a
+  reconnect.
+
+- **A relay listener kept `CAP_NET_BIND_SERVICE` in its bounding set after claiming every set was
+  empty.** The listener narrows to that one capability before its bind and drops to zero after, and
+  the narrowing skipped `mask`'s bits in the `PR_CAPBSET_DROP` loop. The second call could then not
+  remove the bit, because `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective set and the first
+  call had just dropped it. MEASURED on a live stack: `CapBnd: 0000000000000400` with `CapEff: 0`.
+
+  The exposure was nil, since the bounding set only limits what can be GAINED across an `execve` and
+  `NO_NEW_PRIVS` was already set. The defect was the claim. Dropping the whole bounding set in the
+  first call is correct, because removing a capability from the bound does not remove it from
+  permitted or effective, so the privileged-port bind still works: verified with a service on port 80,
+  which serves its peer while all four halves read `CapEff`, `CapPrm`, `CapBnd` and `CapAmb` as zero.
+
+  It was found by measuring a claim rather than by reading the code, and it is the composition of two
+  changes that are each correct alone.
+
+- **A `--no-pod` stack lost every peer when ONE service restarted, silently.** Relays are pinned by
+  `setns` to namespaces obtained when the stack came up; a restarted service gets a new one, and the
+  relay halves sitting in the old one keep it alive rather than erroring. MEASURED: `kern compose
+  <file> start` after stopping one service exited 0, printed nothing, and `nc -w 3 peer PORT` still
+  SUCCEEDED, because the relay's listener is up in the box that did not restart and accepts before
+  discovering it has nowhere to forward to. Only a request that fetches a BODY shows it.
+
+  `kern compose <file> watch` runs exactly that cycle on every edit, so the combination that broke is
+  the one shipped to be run all day.
+
+  A stack now remembers that it is a no-pod stack (the relay plan on disk is that memory, and `down`
+  removes it), `start` keeps the mode and says so, and the relays are re-established against the
+  namespaces that exist now.
+
+- **`kern compose <file> start` deleted the relay plan it had just written.** `spawn_holder` wrote the
+  plan and then killed the previous holder, and `kill_holder` removes the plan, the pid file and the
+  directory. It never fired on a fresh `up`, where there is no holder file and `kill_holder` returns
+  before deleting anything; it fired on every `up` against a running stack and every `start` after
+  one, as `peer relays: cannot read the relay plan`.
+
+- **`kern compose <file> ps` reported every service of a `--no-pod` stack as not running.** The view
+  filters the registry by pod, and a no-pod box carries an empty pod field, so a stack with two boxes
+  up and visible in `kern ps` printed `0/2 services running`. A status view that reports a running
+  service as gone is worse than one that refuses, because it is what a person consults to decide
+  whether something is wrong.
+
+- **`kern compose up --no-pod` never returned under a pipe.** The relay holder inherited the caller's
+  stderr and its relay children inherited the same descriptor, so processes that outlive the command
+  by hours held the write end open. The pod path, which spawns no holder, closed and returned; that
+  contrast is what identified it.
+
+- **Concurrent `kern box -d` children garbled their confirmation lines.** `stderr` is unbuffered, each
+  fragment of a format is its own `write`, and nothing locks a descriptor across processes, so two
+  services starting in one level produced `✔✔ started started ''a b''`. One string, one write.
+
+
+- **A compose error listed scoped box names to a reader who typed service names.** `no service 'x' in
+  file (services: pod-token-web)` answered a typo with names the file does not contain. It lists what
+  the file calls them now.
+
 ## v0.8.5 - 2026-09-01
 
 ### Added

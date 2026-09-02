@@ -31,11 +31,15 @@ mod egress;
 mod eintr;
 mod error;
 mod gpu;
+/// Peer addressing and hosts files for a `--no-pod` stack.
+mod nopod;
 mod openat2;
 mod pod;
 mod ports;
 mod pty;
 mod registry;
+/// Ownership and lifetime of a `--no-pod` stack's peer relays.
+mod relayhold;
 mod runstats;
 mod sandbox;
 mod secret;

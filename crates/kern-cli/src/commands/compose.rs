@@ -179,13 +179,32 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 
     // A `--filter`/service selection narrows the read-only verbs to the named services; empty = all.
     // Validated up front so a typo names itself instead of silently matching nothing.
-    for want in services {
+    //
+    // `port` IS THE ONE VERB WHOSE POSITIONALS ARE NOT ALL SERVICE NAMES: it takes
+    // `<service> <container-port>`. Running the port through this check reported a mistyped NUMBER as
+    // an unknown service, which sends the reader to look for a service that was never meant to exist.
+    // Only the first positional is a name here; the arm itself validates the port, and does it as a
+    // port.
+    let to_validate: &[String] = if action == ComposeAction::Port {
+        services.get(..1).unwrap_or(&[])
+    } else {
+        services
+    };
+    for want in to_validate {
         if !boxes.iter().any(|b| &b.name == want) {
             return Err(Error::Compose(format!(
-                "no service '{want}' in {file} (services: {})",
+                // `b.service` is the name as WRITTEN IN THE FILE; `b.name` is the scoped box name
+                // kern gives it. Listing the latter answered a typo with names the reader's file does
+                // not contain, which is a worse sentence than saying nothing.
+                "no service '{}' in {file} (services: {})",
                 boxes
                     .iter()
-                    .map(|b| b.name.as_str())
+                    .find(|b| &b.name == want)
+                    .map(|b| b.service.as_str())
+                    .unwrap_or(want.as_str()),
+                boxes
+                    .iter()
+                    .map(|b| b.service.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
@@ -207,6 +226,50 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         },
     )? {
         return Ok(());
+    }
+
+    // A STACK'S MODE IS READ FROM THE REGISTRY, NOT FROM A FILE'S PRESENCE.
+    //
+    // The first version inferred it from the relay plan existing on disk, which is a presence test
+    // standing in for a state: `down` removes that directory but a SIGKILL, an OOM or a reboot does
+    // not, so a leftover file made the next `up` behave as though a stack were running when none was.
+    // The registry holds facts about processes that exist, and a no-pod box carries an EMPTY pod
+    // field (measured), so "some box of this stack is up and is in no pod" is the same question asked
+    // of something that cannot be stale.
+    let running_without_pod: Vec<String> = boxes
+        .iter()
+        .filter(|b| registry::find(&b.name).is_some_and(|i| i.pod.is_empty() && !b.net))
+        .map(|b| b.service.clone())
+        .collect();
+
+    // `up` WITHOUT `--no-pod` ON SUCH A STACK IS AMBIGUOUS, so it is refused.
+    //
+    // It is either a forgotten flag or a deliberate move back into a pod, and nothing on disk can say
+    // which. Both readings are defensible, which is exactly when inferring is wrong: one of them
+    // silently changes the stack's network topology. `start` answers differently and carries the
+    // mode, because "put back what was running" has only one reading.
+    //
+    // THIS SITS BEFORE THE RECONCILER, and the first version did not. Placed after it, `up` on a
+    // stack whose definitions still match returns "already up to date" and exits 0 without ever
+    // reaching the check, which is the same silent success it was written to prevent.
+    if action == ComposeAction::Up && !no_pod && !running_without_pod.is_empty() {
+        return Err(Error::Compose(format!(
+            "this stack is already running WITHOUT a pod: {} {} up with no pod. `up` without \
+             --no-pod would move {} back into one, and kern will not guess which you meant. Either \
+             pass --no-pod to keep the stack as it is, or run `kern compose {file} down` first to \
+             bring it up in a pod.",
+            running_without_pod.join(", "),
+            if running_without_pod.len() == 1 {
+                "is"
+            } else {
+                "are"
+            },
+            if running_without_pod.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+        )));
     }
 
     let mut levels = crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
@@ -357,7 +420,32 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // Auto-pod: a multi-service stack gets a shared network (name resolution + outbound) unless the
     // user opts out or every box already shares the host net (`--net`). Reuse an existing pod so
     // `up` is idempotent.
-    let use_pod = !no_pod && boxes.len() >= 2 && boxes.iter().any(|b| !b.net);
+    let mut use_pod = !no_pod && boxes.len() >= 2 && boxes.iter().any(|b| !b.net);
+    // `start` CARRIES THE MODE, from the same registry fact the refusal above uses.
+    //
+    // MEASURED, and it is the reason this exists rather than a precaution. Bring a stack up with
+    // `--no-pod`, stop ONE service, and run `kern compose <file> start` (which is exactly what
+    // `watch` does on every edit): without this, the flag is gone, the restarted service joins a pod
+    // the others are not in, its peers' relays still point into the namespace it no longer has, and
+    // `start` exits 0. A `nc` to the peer still CONNECTS, because the relay's listener is up in the
+    // box that did not restart, so even a careful check reports success while no byte crosses.
+    //
+    // It is announced rather than applied in silence: a flag that takes effect without having been
+    // typed is worth one line.
+    if use_pod && !running_without_pod.is_empty() {
+        use_pod = false;
+        eprintln!(
+            "kern: note: this stack is running without a pod ({} {} up with no pod); starting in \
+             the same mode, so peers stay reachable",
+            running_without_pod.join(", "),
+            if running_without_pod.len() == 1 {
+                "is"
+            } else {
+                "are"
+            },
+        );
+    }
+    let use_pod = use_pod;
     if use_pod && crate::pod::holder_pid(&pod).is_none() {
         // Map a uid RANGE into the pod's shared user ns when ANY member needs it (`wants_uid_range`,
         // the single statement of that rule). A pod member setns's into the holder's user ns and writes
@@ -413,6 +501,92 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         }
     }
 
+    // THE `--no-pod` ADDRESS PLAN, built before a single box starts.
+    //
+    // Without a pod each service holds only its own loopback, so peers are unreachable by name and by
+    // address. Every service is given a stack-wide alias (127.0.0.2 upward) and every box is told, via
+    // `--add-host`, to resolve its peers there and ITSELF at 127.0.0.1. The relays that make those
+    // aliases answer are spawned after the boxes exist, in `peer_relays_for`.
+    //
+    // Built here rather than per box so a refusal (an unusable service name, a duplicate, a stack
+    // larger than the address range) happens once and before anything is launched, instead of leaving
+    // half a stack up behind an error about the other half.
+    let address_plan: Vec<crate::nopod::Assigned> = if !use_pod && boxes.len() > 1 {
+        // A UDP PORT GETS NO RELAY, AND THAT IS SAID RATHER THAN LEFT TO BE DISCOVERED. The relay is
+        // a `SOCK_STREAM` pump, so a UDP peer is not addressed; filtering silently would make a
+        // `statsd` or a DNS service unreachable under `--no-pod` with nothing having reported it,
+        // which is the accepted-and-ignored shape this codebase treats as a defect of its own. A
+        // service whose ONLY declared ports are UDP loses every peer, so it is named; one that also
+        // has TCP ports keeps those, and the UDP ones are named per service.
+        let mut udp_only: Vec<String> = Vec::new();
+        let mut udp_ports: Vec<String> = Vec::new();
+        let services: Vec<(String, String, Vec<u16>)> = boxes
+            .iter()
+            .map(|b| {
+                let declared = declared_container_ports(b);
+                let tcp: Vec<u16> = declared
+                    .iter()
+                    .filter(|(_, udp)| !*udp)
+                    .map(|(p, _)| *p)
+                    .collect();
+                let udp: Vec<u16> = declared
+                    .iter()
+                    .filter(|(_, udp)| *udp)
+                    .map(|(p, _)| *p)
+                    .collect();
+                if !udp.is_empty() {
+                    let list = udp
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if tcp.is_empty() {
+                        udp_only.push(format!("{} ({list}/udp)", b.service));
+                    } else {
+                        udp_ports.push(format!("{} ({list}/udp)", b.service));
+                    }
+                }
+                (b.service.clone(), b.name.clone(), tcp)
+            })
+            .collect();
+        for who in &udp_only {
+            eprintln!(
+                "kern: note: {who} declares only UDP ports, and a peer relay carries TCP, so no peer \
+                 can reach it under --no-pod. Keep the stack in its pod if that service is talked to."
+            );
+        }
+        for who in &udp_ports {
+            eprintln!(
+                "kern: note: {who} keeps its TCP ports reachable, but its UDP ports are not relayed."
+            );
+        }
+        let plan = crate::nopod::assign_aliases(&services).map_err(Error::Compose)?;
+        // THE MESH IS QUADRATIC, and the 253-service alias cap does not bound it: 253 services with
+        // one port each is 63,756 relays and 127,513 processes, more than the `RLIMIT_NPROC` of the
+        // machine this was measured on. Refused with the arithmetic, because the alternative is
+        // failing somewhere in the middle with an errno from a fork nobody can attribute.
+        //
+        // CHECKED HERE, BEFORE A SINGLE BOX STARTS, and the first version checked it after. The relay
+        // block runs once the boxes are up, so refusing there left the stack running with no relays
+        // and an error, which is the worst of both: the user pays the bring-up and gets nothing. The
+        // count follows from the file alone, so nothing has to run to know it.
+        let n = crate::nopod::relay_plan(&plan).len();
+        if n > kern_isolation::peer::MAX_RELAYS {
+            return Err(Error::Compose(format!(
+                "this stack needs {n} peer relays under --no-pod ({} services and their declared \
+                 ports), which is {} processes: kern refuses past {}. A relay costs two processes and \
+                 about 240 kB, and a mesh this wide is not what --no-pod is for. Keep the stack in \
+                 its pod, where peers reach each other with no relays at all, or declare fewer ports.",
+                plan.len(),
+                2 * n + 1,
+                kern_isolation::peer::MAX_RELAYS
+            )));
+        }
+        plan
+    } else {
+        Vec::new()
+    };
+
     // Count what will actually be LAUNCHED, not how many services the file has: with drift
     // reconciliation the levels may already have been filtered down to the changed ones, and a
     // header promising more boxes than it starts is the kind of small untruth this codebase avoids.
@@ -457,8 +631,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         let b = boxes.iter().find(|b| &b.name == name)?;
                         // `boxes` is no longer captured: it was here only to ask whether some peer
                         // waited on this box's completion, and every box gets the exit key now.
-                        let (started, pod, up_token, self_exe, project_dir) =
-                            (&started, &pod, &up_token, &self_exe, &project_dir);
+                        let (started, pod, up_token, self_exe, project_dir, address_plan) = (
+                            &started,
+                            &pod,
+                            &up_token,
+                            &self_exe,
+                            &project_dir,
+                            &address_plan[..],
+                        );
                         // `Some(...)`: `filter_map` wants an `Option`, and the `?` above is the
                         // miss. The spawn itself always succeeds.
                         Some(scope.spawn(move || -> Result<(), Error> {
@@ -487,6 +667,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // A box not on the host net joins the stack pod → reachable by name from peers.
                             if use_pod && !b.net {
                                 cmd.arg("--pod").arg(pod);
+                            }
+                            // Without a pod, the same reachability is spelled out: every peer at its
+                            // alias, this box at its own loopback. A box on the host net is skipped -
+                            // it already resolves whatever the host resolves, and pointing its name
+                            // at a loopback alias would break that.
+                            if !b.net {
+                                if let Some(entries) =
+                                    crate::nopod::add_host_args(address_plan, &b.service)
+                                {
+                                    for e in entries {
+                                        cmd.arg("--add-host").arg(e);
+                                    }
+                                }
                             }
                             // EVERY box gets the stack+run-scoped exit KEY, and that key is CLEARED
                             // before the spawn. Each box owns a unique one (it carries this `up`'s
@@ -568,6 +761,37 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // Healthy services are left RUNNING. A stack whose database holds data in a volume must not be
     // torn down because an unrelated service failed; the exit code and the message carry the failure.
+    // PEER RELAYS, after the boxes exist and before the death report.
+    //
+    // They need every box's PID 1, which is recorded by its supervisor, so this cannot run earlier.
+    // It runs before the death check so a stack that is up but unreachable is reported as the
+    // reachability failure it is, rather than as whatever the first service does when its peer never
+    // answers.
+    //
+    // The holder is a detached process that OWNS the relays: `up` exits, and relays forked here would
+    // die with it through their own PDEATHSIG. `down` kills the holder, and every relay goes with it.
+    if !use_pod && !address_plan.is_empty() {
+        let relays = crate::nopod::relay_plan(&address_plan);
+        if !relays.is_empty() {
+            let dir = crate::relayhold::stack_dir(&pod)?;
+            let report = crate::relayhold::spawn_holder(&dir, &relays)?;
+            if report.up > 0 {
+                eprintln!(
+                    "\u{2192} {} peer relay(s) up: services reach each other by name without a pod",
+                    report.up
+                );
+            }
+            // THE BLOCKED PAIRS ARE NAMED BY THE HOLDER, which measured them, rather than guessed at
+            // from the file before anything ran. A relay listens on `alias:port` inside the holder,
+            // and MEASURED on one port: two specific binds on different addresses do not conflict,
+            // while a specific bind and a WILDCARD bind refuse each other in both orders with or
+            // without SO_REUSEADDR. So the pair is only lost when the holder binds `0.0.0.0`, which
+            // is a fact about a running process and not about a declaration.
+            for line in &report.blocked {
+                eprintln!("kern: note: {line}");
+            }
+        }
+    }
     let dead = settle_and_collect_dead(&boxes, &pod, &up_token);
     if !dead.is_empty() {
         return Err(Error::Compose(format!(

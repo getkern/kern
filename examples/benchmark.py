@@ -11,7 +11,7 @@ timer (its own fork+exec) would dominate, so we never time a single run on its o
     python3 examples/benchmark.py --conc 50       # lighter concurrency (e.g. on an edge board)
     KERN=./target/release/kern python3 examples/benchmark.py
 
-It prints the same three tables as BENCHMARKS.md - cold-start (median/min/max), throughput
+It prints the cold-start table BENCHMARKS.md publishes, plus throughput
 (runs/s, same data), and concurrency (N parallel, wall-clock) - for whatever runtimes are
 installed, so anyone can reproduce the published numbers on their own machine. Stdlib only,
 no dependencies. Honest caveat: the top tier sits within a couple ms of each

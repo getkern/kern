@@ -1138,6 +1138,21 @@ pub fn join_box_cgroup_for_exec(pid1: i32) -> ExecCgroupJoin {
 /// Memoized for the process lifetime: `reexec`'s `direct_caps_available()` and `apply_limits` both need
 /// it, and a kern invocation starts one box, so the ~4 ms bootstrap AND the orphan sweep run exactly once
 /// (not once per call site). A short-lived box-start process never sees the slice's availability change.
+/// Reap cgroups left by boxes whose supervisor died without cleaning up.
+///
+/// CALLED AFTER A BOX IS SPAWNED, NOT BEFORE, and the distinction is the point. This is garbage
+/// collection: it has no bearing on whether the box that is starting can be capped, and running it
+/// first put its cost (193 us with 61 entries, measured) in front of every start. Called from the
+/// launcher once the child exists, it overlaps the workload instead.
+///
+/// Best-effort and bounded by `SWEEP_LIMIT`, exactly as before. A no-op when the slice is not the
+/// path this host caps through, because then there is nothing of ours in it.
+pub fn sweep_orphans_off_hot_path() {
+    if let Some(slice) = ensure_kern_slice() {
+        sweep_orphan_boxes(&slice, SWEEP_LIMIT);
+    }
+}
+
 fn ensure_kern_slice() -> Option<PathBuf> {
     static ENSURED: OnceLock<Option<PathBuf>> = OnceLock::new();
     ENSURED.get_or_init(ensure_kern_slice_uncached).clone()
@@ -1147,7 +1162,18 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     let slice = kern_slice_path()?;
     // Already present + delegated? (its `cgroup.controllers` is populated only when delegated.)
     if slice_can_cap(&slice) {
-        sweep_orphan_boxes(&slice, SWEEP_LIMIT); // reap dead-supervisor leftovers (bounded on the hot path)
+        // THE SWEEP USED TO RUN HERE, ON THE HOT PATH OF EVERY BOX START, and it does not belong to
+        // starting a box. MEASURED on this desktop with 61 entries in the slice: 193 us, 7.4% of a
+        // 2.6 ms start, spent reaping cgroups left by BOXES THAT ALREADY EXITED. Its cost grows with
+        // the number of entries, because it stats `/proc/<pid>` for each.
+        //
+        // It is also work almost nobody needs: a box that stops normally removes its own cgroup, so
+        // an orphan exists only where a SUPERVISOR was killed without running cleanup. Paying for
+        // that on every start is paying for a rare event at the highest possible rate.
+        //
+        // Moved to [`sweep_orphans_off_hot_path`], which the launcher calls AFTER the box is spawned,
+        // so it overlaps the workload instead of preceding it. Nothing about the outcome changes: the
+        // slice is swept just as often (once per box start), one box later.
         return Some(slice);
     }
     // As REAL ROOT kern OWNS the cgroup tree, so it creates a persistent, fully-controlled `kern.slice`

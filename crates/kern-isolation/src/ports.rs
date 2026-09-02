@@ -342,7 +342,7 @@ fn forwarder_child(sock: i32, m: PortMap) -> ! {
 /// Create and bind the HOST-side socket for one mapping (and `listen` it, for TCP), in the host net
 /// ns this process was forked into. Returns the fd, or the `errno` that stopped us - an `errno`
 /// rather than a message so the child stays allocation-free and the parent formats it.
-fn bind_host_socket(bind_ip: u32, host_port: u16, udp: bool) -> Result<i32, i32> {
+pub(crate) fn bind_host_socket(bind_ip: u32, host_port: u16, udp: bool) -> Result<i32, i32> {
     let ty = if udp {
         libc::SOCK_DGRAM
     } else {
@@ -394,7 +394,7 @@ fn same_netns(box_pid1: i32) -> bool {
 }
 
 /// The current `errno`, or `EIO` if the OS somehow reported none (never `unwrap`).
-fn errno() -> i32 {
+pub(crate) fn errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO)
@@ -458,26 +458,255 @@ fn tcp_forwarder(listener: i32, box_pid1: i32, box_port: u16, net: BoxNet) -> ! 
 /// construction: `setns(CLONE_NEWUSER)` succeeds, and the following `setns(CLONE_NEWNET)` into the
 /// HOST's net ns is then refused `EPERM`, because that ns is owned by the initial user ns in which we
 /// no longer hold `CAP_SYS_ADMIN`.
-fn enter_box_ns(box_pid1: i32) -> bool {
-    let open_ns = |kind: &str| -> i32 {
-        let path = format!("/proc/{box_pid1}/ns/{kind}\0");
+pub(crate) fn enter_box_ns(box_pid1: i32) -> bool {
+    enter_box_ns_pinned(box_pid1, 0)
+}
+
+/// A process's kernel start-time (`/proc/<pid>/stat` field 22) from an ALREADY-OPEN descriptor.
+///
+/// THERE IS NO PATH-BASED VERSION ANY MORE, deliberately. Resolving `/proc/<pid>/stat` by path is a
+/// separate moment from resolving `/proc/<pid>/ns/user`, and this value exists precisely to decide
+/// whether those namespaces belong to the generation the caller means. Reading it from a descriptor
+/// obtained through the same `/proc/<pid>` directory descriptor keeps all of them in one generation
+/// by construction, so the only spelling available is the correct one.
+///
+/// `0` means "unknown", and [`enter_box_ns_pinned`] never treats it as a match; an EXPECTATION of `0`
+/// means the caller had nothing to pin with and skips the comparison entirely.
+///
+/// Reading the fd rather than the path is what keeps the check in the same generation as the
+/// namespace descriptors beside it: a path would be resolved again, and a resolution is a moment.
+/// Does not take ownership, and does not disturb the descriptor's offset for a caller that reuses it
+/// (it does not: this is read once and closed).
+fn starttime_of_fd(fd: i32) -> u64 {
+    let mut buf = [0u8; 512];
+    // SAFETY: reads at most `buf.len()` bytes into a buffer this function owns.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n <= 0 {
+        return 0;
+    }
+    let Ok(text) = std::str::from_utf8(&buf[..n as usize]) else {
+        return 0;
+    };
+    parse_starttime(text)
+}
+
+/// Field 22 of a `/proc/<pid>/stat` body.
+///
+/// Parsed from the LAST `)` rather than by splitting on whitespace from the left, because field 2 is
+/// the executable name in parentheses and it may itself contain spaces and a `)`. Splitting from the
+/// left is the classic way this number silently becomes a different field.
+fn parse_starttime(stat: &str) -> u64 {
+    let Some(after) = stat.rfind(')').and_then(|i| stat.get(i + 1..)) else {
+        return 0;
+    };
+    // Fields after the closing paren start at field 3 (state), so start-time (field 22) is the 20th.
+    after
+        .split_whitespace()
+        .nth(19)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// [`enter_box_ns`], but the pid is checked AFTER the namespace descriptors are open.
+///
+/// THE ORDER IS THE WHOLE POINT, and the other order is a real hole rather than a tidiness argument.
+/// A caller that validates `pid` and then hands the number here has two operations with a window
+/// between them: if the box's init dies in that window and the kernel hands its number to a HOST
+/// process, `open("/proc/<pid>/ns/net")` resolves to the HOST's network namespace. The listener would
+/// then bind its alias on the host, reachable by everything on the machine, and the connector would
+/// connect to whatever the host runs on that port. That is the worst outcome this module has, and it
+/// needs a crash plus load rather than an attacker.
+///
+/// Opening the descriptors first PINS those specific namespace instances: recycling the pid
+/// afterwards cannot change what the fds refer to. So the check moves after the open, where it
+/// answers the only question left, which is whether the pid was already someone else's before it. An
+/// `expect_starttime` of `0` skips the check, for the callers (the `-p` forwarder) that hold a pid
+/// resolved through a start-time-pinned supervisor and have nothing further to compare.
+pub(crate) fn enter_box_ns_pinned(box_pid1: i32, expect_starttime: u64) -> bool {
+    // ONE DIRECTORY DESCRIPTOR, THREE `openat`s, ONE GENERATION.
+    //
+    // The previous version opened `/proc/<pid>/ns/user` and `/proc/<pid>/ns/net` as two separate
+    // paths and then read `/proc/<pid>/stat` as a third. Three path resolutions are three moments: if
+    // the box's init exits between the first two, the second resolves against whatever now holds that
+    // pid, and the halves straddle two generations. Under `watch`, where a service is stopped and
+    // restarted all day, the recycled process is plausibly ANOTHER kern box, so the start-time read a
+    // moment later can match and the check passes on a pair of descriptors from two different boxes.
+    //
+    // MEASURED on 7.0.0: a `/proc/<pid>` directory descriptor stops resolving once the process exits.
+    // `openat` on it returns ESRCH for `ns/net`, `ns/user` and `stat` alike. So opening the directory
+    // once and reaching everything through it makes all three reads the same generation BY
+    // CONSTRUCTION, and the start-time comparison below then only has to answer whether that one
+    // generation is the right one. It needs no new persisted state and no pidfd.
+    let dir_path = format!("/proc/{box_pid1}\0");
+    // SAFETY: the path is NUL-terminated above and lives for the call.
+    let dirfd = unsafe {
+        libc::open(
+            dir_path.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return false;
+    }
+    let at = |name: &str| -> i32 {
+        let p = format!("{name}\0");
+        // SAFETY: `dirfd` is open for the length of this closure and `p` is NUL-terminated.
         unsafe {
-            libc::open(
-                path.as_ptr() as *const libc::c_char,
+            libc::openat(
+                dirfd,
+                p.as_ptr() as *const libc::c_char,
                 libc::O_RDONLY | libc::O_CLOEXEC,
             )
         }
     };
+    let (user, net, stat) = (at("ns/user"), at("ns/net"), at("stat"));
+    // SAFETY: every descriptor below was produced by this function and is closed exactly once.
     unsafe {
-        let (user, net) = (open_ns("user"), open_ns("net"));
-        if user < 0 || net < 0 {
+        if user < 0 || net < 0 || stat < 0 {
+            for fd in [user, net, stat, dirfd] {
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+            }
             return false;
         }
+        libc::close(dirfd);
+        // The descriptors now pin ONE generation; this asks whether it is the right one. Read from
+        // the `stat` descriptor rather than by path, so it cannot be a fourth moment either.
+        if expect_starttime != 0 && starttime_of_fd(stat) != expect_starttime {
+            libc::close(user);
+            libc::close(net);
+            libc::close(stat);
+            return false;
+        }
+        libc::close(stat);
         let ok = libc::setns(user, libc::CLONE_NEWUSER) == 0
             && libc::setns(net, libc::CLONE_NEWNET) == 0;
         libc::close(user);
         libc::close(net);
         ok
+    }
+}
+
+/// Drop every capability this process holds, permanently, and forbid regaining any.
+///
+/// MEASURED, and it is why this exists: a process that has entered a box's user namespace holds a
+/// FULL effective capability set in it. On this host, `CapEff` reads `0000000000000000` before
+/// `setns(CLONE_NEWUSER)` and `000001ffffffffff` after. The relay halves also keep the HOST mount
+/// namespace, so between the two they are the only processes in the system with a host filesystem
+/// view that is reachable over a socket from inside a box. Nothing they do afterwards needs a
+/// capability, so holding one is a liability with no counterpart.
+///
+/// ORDER MATTERS FOR THE LISTENER: it must bind first. A compose service on port 80 puts the alias
+/// bind under `CAP_NET_BIND_SERVICE`, so dropping before the bind would break exactly the stacks that
+/// use privileged ports.
+///
+/// `PR_SET_NO_NEW_PRIVS` first, then the bounding set, then the sets themselves: no-new-privs is what
+/// makes the drop irreversible across an `execve` of a setuid binary, and the bounding set is what
+/// stops a capability being raised back into the permitted set.
+///
+/// Returns `false` if any step fails, so a caller can refuse to run unprivileged-only code with
+/// privileges it thought it had shed.
+pub(crate) fn drop_all_capabilities() -> bool {
+    restrict_capabilities(0)
+}
+
+/// Keep ONLY the capabilities in `mask` (a bitmask over capability numbers), permanently.
+///
+/// MEASURED, and it is why this exists: a process that has entered a box's user namespace holds a
+/// FULL effective set in it. On this host `CapEff` reads `0000000000000000` before
+/// `setns(CLONE_NEWUSER)` and `000001ffffffffff` after. The relay halves also keep the HOST mount
+/// namespace, so between the two they are the only processes in the system with a host filesystem
+/// view reachable over a socket from inside a box. Nothing they do afterwards needs a capability, so
+/// holding one is a liability with no counterpart.
+///
+/// `mask` is not always zero, because the listener has ONE thing left to do that can need a
+/// capability: a compose service on port 80 puts its alias bind under `CAP_NET_BIND_SERVICE`. It
+/// therefore narrows to that single capability BEFORE binding and to zero after, which makes the
+/// window that holds anything at all one capability wide instead of forty-one.
+///
+/// Order, and each step is load-bearing:
+///  1. `PR_SET_NO_NEW_PRIVS`, so the drop cannot be undone by executing a setuid binary.
+///  2. `PR_CAP_AMBIENT_CLEAR_ALL`. The ambient set is separate, and while it is bounded by permitted
+///     it is cleared explicitly rather than by inference, because this function claims the sets are
+///     empty and a claim should be enforced where it is made.
+///  3. The WHOLE bounding set, `mask` or no `mask`, up to `cap_last_cap` READ FROM THE KERNEL rather
+///     than a hard-coded 63. An unreadable or unparseable file falls back to 63, which is safe rather
+///     than fail-open: `PR_CAPBSET_DROP` answers `EINVAL` for a capability the kernel does not know,
+///     that return is deliberately IGNORED here, and the `capset` below still empties every set. Only
+///     `PR_SET_NO_NEW_PRIVS` and `capset` decide this function's result, because they are the two
+///     steps whose failure would leave a privilege behind.
+///  4. `capset` with `_LINUX_CAPABILITY_VERSION_3` and TWO data elements. Version 1 covers only
+///     capabilities 0 to 31, and this host has capabilities above 31 (`000001ffffffffff`), so a v1
+///     header would leave the high word untouched while reporting success.
+///
+/// Returns `false` if any step fails, so a caller can refuse to run unprivileged-only code with
+/// privileges it thought it had shed.
+pub(crate) fn restrict_capabilities(mask: u64) -> bool {
+    // SAFETY: every call below acts on the calling process only and takes no pointer to memory this
+    // function does not own. `capset` is handed a header this function fills completely.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return false;
+        }
+        // PR_CAP_AMBIENT = 47, PR_CAP_AMBIENT_CLEAR_ALL = 4. Not exposed by this `libc` version.
+        // A kernel without ambient capabilities answers EINVAL, which is not a failure to drop them.
+        libc::prctl(47, 4, 0, 0, 0);
+        let last = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(63);
+        // THE WHOLE BOUNDING SET GOES, INCLUDING WHAT `mask` KEEPS. Dropping a capability from the
+        // bounding set does not remove it from this thread's permitted or effective sets, so the
+        // listener's bind still works with `CAP_NET_BIND_SERVICE` effective while that bit is gone
+        // from the bound.
+        //
+        // MEASURED, and it is why the `mask` exception was removed: with the bit kept in the bound by
+        // the first call, the SECOND call could not drop it. `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in
+        // the effective set, and the first call had already narrowed effective to
+        // `CAP_NET_BIND_SERVICE` alone, so `CAP_SETPCAP` was gone and every drop in the second call
+        // failed EPERM. `/proc/<pid>/status` for a live listener read `CapBnd: 0000000000000400`
+        // while `CapEff` read zero: this function claimed every set was empty and one was not.
+        //
+        // The practical exposure was nil, because the bounding set only limits what can be GAINED
+        // across an `execve` and `NO_NEW_PRIVS` is already set. The defect was the claim, which is
+        // the kind this codebase treats as expensive on its own.
+        for cap in 0..=last {
+            libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0);
+        }
+        #[repr(C)]
+        struct CapHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let mut hdr = CapHeader {
+            version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+            pid: 0,
+        };
+        let (lo, hi) = (mask as u32, (mask >> 32) as u32);
+        let mut data = [
+            CapData {
+                effective: lo,
+                permitted: lo,
+                inheritable: 0,
+            },
+            CapData {
+                effective: hi,
+                permitted: hi,
+                inheritable: 0,
+            },
+        ];
+        libc::syscall(
+            libc::SYS_capset,
+            &mut hdr as *mut CapHeader,
+            data.as_mut_ptr(),
+        ) == 0
     }
 }
 
@@ -502,7 +731,7 @@ fn connector_main(box_pid1: i32, box_port: u16, conn: i32, net: BoxNet) {
 /// Create an `AF_INET` socket of type `ty` (`SOCK_STREAM`/`SOCK_DGRAM`) in the CURRENT net ns and
 /// connect it to the box's `127.0.0.1:box_port`. Caller must already be in the box namespaces (see
 /// [`enter_box_ns`]). Returns the fd, or `-1` on any failure.
-fn connect_box_loopback(box_port: u16, ty: libc::c_int) -> i32 {
+pub(crate) fn connect_box_loopback(box_port: u16, ty: libc::c_int) -> i32 {
     unsafe {
         let s = libc::socket(libc::AF_INET, ty, 0);
         if s < 0 {
@@ -514,6 +743,62 @@ fn connect_box_loopback(box_port: u16, ty: libc::c_int) -> i32 {
             return -1;
         }
         s
+    }
+}
+
+/// [`connect_box_loopback`], but with the SOURCE address pinned to `src_ip`.
+///
+/// WHY THE SOURCE IS SET AT ALL. A peer relay connects from inside box B to `127.0.0.1:<port>`, so
+/// without this B sees every peer as loopback, indistinguishable from a connection made by B itself.
+/// Loopback is the most trusted source in most default configurations, so a stack run with
+/// `--no-pod` asked for network separation and got localhost-equivalence back between exactly the
+/// pairs kern connected. It is no worse than the pod path, where peers really are on one loopback,
+/// but it is a promise the flag implies and would otherwise not keep.
+///
+/// Binding the CALLING service's own alias makes the source meaningful: B sees `127.0.0.2` for one
+/// peer and `127.0.0.3` for another, and a per-source rule inside B can tell them apart again.
+///
+/// MEASURED: `bind(127.0.0.2:0)` followed by `connect(127.0.0.1:<port>)` succeeds and the accepting
+/// side reads the peer as `127.0.0.2`. The whole `127.0.0.0/8` is local on `lo`, so the alias needs
+/// no address to have been added to the interface.
+///
+/// Returns the fd, or `-1` on any failure INCLUDING the bind: a connection whose source could not be
+/// set is not silently made anyway, because that would put it back on `127.0.0.1` and hand B the
+/// ambiguity this exists to remove.
+pub(crate) fn connect_box_loopback_from(src_ip: u32, box_port: u16, ty: libc::c_int) -> i32 {
+    unsafe {
+        let s = libc::socket(libc::AF_INET, ty, 0);
+        if s < 0 {
+            return -1;
+        }
+        let src = addr_in(src_ip, 0); // ephemeral port on the peer's own alias
+        if libc::bind(s, &src as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
+            libc::close(s);
+            return -1;
+        }
+        let addr = addr_in(0x7f00_0001, box_port); // 127.0.0.1:box_port (box net ns)
+        if libc::connect(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
+            libc::close(s);
+            return -1;
+        }
+        s
+    }
+}
+
+/// Whether `src_ip` can be used as a source address in the CURRENT network namespace.
+///
+/// Called once, at relay start-up, so a source address that cannot be bound is reported then rather
+/// than as a connection that fails for every client later. Binds and closes; it never connects.
+pub(crate) fn source_address_is_bindable(src_ip: u32) -> bool {
+    unsafe {
+        let s = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        if s < 0 {
+            return false;
+        }
+        let src = addr_in(src_ip, 0);
+        let ok = libc::bind(s, &src as *const _ as *const libc::sockaddr, ADDR_LEN) == 0;
+        libc::close(s);
+        ok
     }
 }
 
@@ -544,7 +829,7 @@ fn set_sock_flag(s: i32, opt: libc::c_int) {
 ///
 /// Set on BOTH sides: the accepted client socket and the socket into the box. Either one left with
 /// Nagle on can stall the direction it writes.
-fn set_nodelay(s: i32) {
+pub(crate) fn set_nodelay(s: i32) {
     let one: libc::c_int = 1;
     unsafe {
         libc::setsockopt(
@@ -728,7 +1013,7 @@ fn pump_dgram(a: i32, b: i32) {
 const ADDR_LEN: libc::socklen_t = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
 /// `sockaddr_in` for `ip` (host byte order; `0` = 0.0.0.0) and `port` (host byte order).
-fn addr_in(ip: u32, port: u16) -> libc::sockaddr_in {
+pub(crate) fn addr_in(ip: u32, port: u16) -> libc::sockaddr_in {
     let mut a: libc::sockaddr_in = unsafe { mem::zeroed() };
     a.sin_family = libc::AF_INET as libc::sa_family_t;
     a.sin_port = port.to_be();
@@ -737,7 +1022,7 @@ fn addr_in(ip: u32, port: u16) -> libc::sockaddr_in {
 }
 
 /// Bidirectional byte pump until both read sides close; each EOF half-closes the peer's write side.
-fn pump_bidir(a: i32, b: i32) {
+pub(crate) fn pump_bidir(a: i32, b: i32) {
     let mut buf = [0u8; 16384];
     let (mut a_open, mut b_open) = (true, true);
     while a_open || b_open {
@@ -1002,5 +1287,103 @@ mod tests {
             t.local_addr().unwrap().port()
         };
         assert!(preflight(&[pm(free)]).is_ok(), "a free port should pass");
+    }
+
+    /// EVERY SET IS EMPTY AFTER A NARROWED DROP, INCLUDING THE BOUNDING SET.
+    ///
+    /// MEASURED as a live defect before this test existed. The relay listener narrows to
+    /// `CAP_NET_BIND_SERVICE` before its bind and drops to zero after, and the first version of
+    /// `restrict_capabilities` skipped `mask`'s bits in the `PR_CAPBSET_DROP` loop. That left the bit
+    /// in the bounding set, and the SECOND call could not remove it: `PR_CAPBSET_DROP` needs
+    /// `CAP_SETPCAP` in the effective set, which the first call had just dropped. A live listener read
+    /// `CapBnd: 0000000000000400` while `CapEff` read zero, so the function claimed every set was
+    /// empty and one was not.
+    ///
+    /// Runs in a FORKED CHILD, because dropping capabilities is irreversible and doing it in the test
+    /// process would silently change what every later test in this binary runs as. The child reports
+    /// through a pipe; the parent asserts. Both calls are made in the child, in the listener's order,
+    /// because the defect was in their COMPOSITION and neither call is wrong alone.
+    #[test]
+    fn a_narrowed_drop_still_empties_the_bounding_set() {
+        const CAP_NET_BIND_SERVICE: u32 = 10;
+        let mut fds = [0i32; 2];
+        // SAFETY: fills a two-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: fork in a test binary; the child only reads /proc, writes a pipe and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // SAFETY: the read end belongs to the parent.
+            unsafe { libc::close(fds[0]) };
+            // A USER NAMESPACE FIRST, because this function RESTRICTS and never grants: asking for
+            // `CAP_NET_BIND_SERVICE` from a process that does not hold it is a request to GAIN one,
+            // and `capset` answers EPERM. The relay half holds a full set because it has just entered
+            // the box's user namespace, and this is the cheapest way to stand in the same place.
+            // SAFETY: unshare in a single-threaded forked child.
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                let msg = b"skip";
+                // SAFETY: writes a static buffer to a descriptor this child owns.
+                unsafe {
+                    libc::write(fds[1], msg.as_ptr() as *const libc::c_void, msg.len());
+                    libc::close(fds[1]);
+                    libc::_exit(0);
+                }
+            }
+            let ok =
+                restrict_capabilities(1u64 << CAP_NET_BIND_SERVICE) && restrict_capabilities(0);
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let line = |k: &str| -> String {
+                status
+                    .lines()
+                    .find(|l| l.starts_with(k))
+                    .map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            let out = format!(
+                "{} {} {} {} {}",
+                ok,
+                line("CapEff:"),
+                line("CapPrm:"),
+                line("CapBnd:"),
+                line("CapAmb:")
+            );
+            // SAFETY: writes a buffer this child owns to a descriptor it owns.
+            unsafe {
+                libc::write(fds[1], out.as_ptr() as *const libc::c_void, out.len());
+                libc::close(fds[1]);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: the write end belongs to the child.
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 256];
+        // SAFETY: reads at most `buf.len()` into a buffer this function owns.
+        let n = unsafe { libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        // SAFETY: the child is this process's, and `st` is written by the kernel.
+        unsafe {
+            libc::close(fds[0]);
+            let mut st: libc::c_int = 0;
+            libc::waitpid(pid, &mut st, 0);
+        }
+        assert!(n > 0, "the child reported nothing");
+        let text = String::from_utf8_lossy(&buf[..n as usize]).to_string();
+        if text.trim() == "skip" {
+            eprintln!("skip: this host refuses an unprivileged user namespace");
+            return;
+        }
+        let f: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(f.len(), 5, "unexpected report: {text}");
+        assert_eq!(f[0], "true", "the drop must report success: {text}");
+        for (name, value) in [
+            ("CapEff", f[1]),
+            ("CapPrm", f[2]),
+            ("CapBnd", f[3]),
+            ("CapAmb", f[4]),
+        ] {
+            assert!(
+                value.chars().all(|c| c == '0'),
+                "{name} must be empty after the drop, not {value} (whole report: {text})"
+            );
+        }
     }
 }

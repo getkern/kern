@@ -625,6 +625,123 @@ static SECCOMP_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 /// Whether a seccomp filter has been installed in THIS process. The workload exec path fails closed
 /// unless this is true, so no code path can reach `execvp` before the filter is in force.
+/// Syscalls a peer relay half is killed for, installed after it has entered a box and shed its
+/// privileges.
+///
+/// A DENYLIST HERE, WHILE A BOX GETS AN ALLOWLIST, and the asymmetry is deliberate rather than a
+/// weaker version of the same thing.
+///
+/// A box runs arbitrary tenant code, so nothing but "everything not named is refused" is meaningful
+/// there. A relay half runs ~1,200 lines of this crate, in a straight line, and PARSES NO TENANT
+/// BYTES: it moves descriptors and pumps bytes it never interprets. Its syscall set after setup is
+/// exactly `accept`, `sendmsg`, `recvmsg`, `socket`, `bind`, `connect`, `setsockopt`, `poll`, `read`,
+/// `write`, `shutdown`, `close`, `clone`, `wait4` and `exit_group`.
+///
+/// An allowlist over that set would have to be right on every architecture kern publishes, and musl
+/// picks syscall spellings per architecture (`fork` against `clone`, `open` against `openat`, `poll`
+/// against `ppoll`, `accept` against `accept4`). One missing spelling is a `SIGSYS` on a board rather
+/// than a test failure, and it would buy nothing over what is denied here, because the only thing
+/// worth taking away from this process is the set below.
+///
+/// WHAT IT TAKES AWAY IS THE POINT. These halves keep the HOST mount namespace: they are the only
+/// processes in a stack with a host filesystem view reachable over a socket from inside a box. That
+/// view is worth something only with a syscall that opens, executes, mounts or inspects with it, and
+/// after setup this process legitimately uses none of them. Denying them costs nothing that can be
+/// measured and removes every primitive an escalation would need.
+///
+/// `open`/`openat` are in the list even though `enter_box_ns_pinned` uses them, because the filter is
+/// installed AFTER the namespaces are entered and nothing opens a file again.
+fn relay_denied() -> Vec<libc::c_long> {
+    let mut v: Vec<libc::c_long> = vec![
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_openat,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_setns,
+        libc::SYS_unshare,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_kexec_load,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_add_key,
+        libc::SYS_keyctl,
+    ];
+    // `open` and `creat` DO NOT EXIST ON EVERY ARCHITECTURE: aarch64 has only `openat`, so naming
+    // them unconditionally would not compile there. Extending from a per-architecture slice rather
+    // than pushing inside a `cfg` block keeps `v` mutable on every target; a `cfg` push made the
+    // binding needlessly mutable on aarch64 and the build was refused, which is the same
+    // "right on the machine I tested on" shape as the `msg_controllen` cast this module's neighbour
+    // had to fix.
+    v.extend_from_slice(arch_only_denied());
+    v
+}
+
+/// Denied syscalls that exist only on some architectures.
+#[cfg(target_arch = "x86_64")]
+fn arch_only_denied() -> &'static [libc::c_long] {
+    &[libc::SYS_open, libc::SYS_creat]
+}
+
+/// Nothing to add: this architecture reaches the same handlers through `openat`, already denied.
+#[cfg(not(target_arch = "x86_64"))]
+fn arch_only_denied() -> &'static [libc::c_long] {
+    &[]
+}
+
+/// Install [`relay_denied`] on the calling process, killing it on any of those syscalls.
+///
+/// # Errors
+///
+/// The failing `prctl`, so a caller can refuse to serve unfiltered rather than serve and hope.
+pub fn install_relay_filter() -> Result<(), Error> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(Error::last("prctl(NO_NEW_PRIVS)"));
+    }
+    let mut prog: Vec<libc::sock_filter> = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 1, 0), // ==arch → skip the kill below
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The x32 ABI reaches the same handlers with a bit set, so a filter that only compares the
+        // number can be walked past by setting it. Same rule the box filters apply.
+        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1));
+        prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    }
+    for nr in relay_denied() {
+        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (kill); else skip
+        prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    }
+    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut libc::sock_filter,
+    };
+    let r = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+            std::ptr::addr_of!(fprog) as libc::c_ulong,
+            0,
+            0,
+        )
+    };
+    if r != 0 {
+        return Err(Error::last("prctl(SET_SECCOMP)"));
+    }
+    Ok(())
+}
+
 pub fn is_installed() -> bool {
     SECCOMP_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -695,10 +812,11 @@ fn cached_program(mode: SeccompFilter, allow_nesting: bool) -> &'static [libc::s
 #[cfg(test)]
 mod tests {
     use super::{
-        build_allowlist_filter, build_filter, denylist, errno_syscalls, nesting_syscalls, AF_VSOCK,
-        AUDIT_ARCH, BPF_ABS, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JGT, BPF_JMP, BPF_JSET, BPF_K, BPF_LD,
-        BPF_RET, BPF_W, CLONE_NEW_MASK, OFF_ARCH, OFF_ARG0, OFF_NR, SECCOMP_RET_ALLOW,
-        SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_LOG,
+        build_allowlist_filter, build_filter, denylist, errno_syscalls, install_relay_filter,
+        nesting_syscalls, AF_VSOCK, AUDIT_ARCH, BPF_ABS, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JGT,
+        BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W, CLONE_NEW_MASK, OFF_ARCH, OFF_ARG0,
+        OFF_NR, SECCOMP_RET_ALLOW, SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
+        SECCOMP_RET_LOG,
     };
 
     /// A minimal classic-BPF interpreter for the seccomp program: enough opcodes to execute what
@@ -1509,5 +1627,104 @@ mod tests {
                 "nesting must STILL deny (errno) {nr}"
             );
         }
+    }
+
+    /// THE RELAY FILTER KILLS ON A DENIED CALL AND LETS THE RELAY'S OWN WORK THROUGH.
+    ///
+    /// Both halves are asserted in one forked child, because a filter that allows everything would
+    /// pass the second half alone and a filter that kills everything would pass the first alone.
+    ///
+    /// The denied call under test is `openat`, which is the one that matters: these halves keep the
+    /// HOST mount namespace, so opening a file is the primitive that makes that view worth anything.
+    /// The permitted calls under test are a socketpair and a byte through it, which is the shape of
+    /// everything a half does after setup.
+    ///
+    /// Runs in a forked child because the filter is irreversible and installing it in the test
+    /// process would silently constrain every later test in this binary.
+    #[test]
+    fn the_relay_filter_kills_on_openat_and_allows_the_relay_s_own_syscalls() {
+        let mut fds = [0i32; 2];
+        // SAFETY: fills a two-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: fork in a test binary; the child only makes the calls named below.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // SAFETY: the read end belongs to the parent.
+            unsafe { libc::close(fds[0]) };
+            if install_relay_filter().is_err() {
+                let m = b"noinstall";
+                // SAFETY: writes a static buffer to a descriptor this child owns.
+                unsafe {
+                    libc::write(fds[1], m.as_ptr() as *const libc::c_void, m.len());
+                    libc::_exit(0);
+                }
+            }
+            // THE ALLOWED HALF FIRST, so a child killed on these would report nothing and the parent
+            // would see the same "no message" as a child killed on `openat`. Reporting "ok" before
+            // the denied call is what separates the two outcomes.
+            let mut sp = [0i32; 2];
+            // SAFETY: fills a two-element array.
+            let made =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) };
+            let byte = b"x";
+            // SAFETY: descriptors this child owns, one byte from a buffer it owns.
+            let moved = unsafe {
+                libc::write(sp[1], byte.as_ptr() as *const libc::c_void, 1);
+                let mut got = [0u8; 1];
+                libc::read(sp[0], got.as_mut_ptr() as *mut libc::c_void, 1)
+            };
+            let m = if made == 0 && moved == 1 {
+                b"ok"
+            } else {
+                b"no"
+            };
+            // SAFETY: writes a static buffer to a descriptor this child owns.
+            unsafe { libc::write(fds[1], m.as_ptr() as *const libc::c_void, m.len()) };
+            // AND NOW THE DENIED ONE. `std::fs` would work equally well; the raw call is used so the
+            // syscall under test is the one named in the filter and not whatever a wrapper chooses.
+            let path = b"/etc/passwd\0";
+            // SAFETY: a NUL-terminated path in this child's own memory.
+            unsafe {
+                libc::openat(
+                    libc::AT_FDCWD,
+                    path.as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY,
+                );
+                // Unreachable if the filter works. Reaching it is the failure the parent reports.
+                let m = b" survived";
+                libc::write(fds[1], m.as_ptr() as *const libc::c_void, m.len());
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: the write end belongs to the child.
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 64];
+        // SAFETY: reads at most `buf.len()` into a buffer this function owns.
+        let n = unsafe { libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let mut st: libc::c_int = 0;
+        // SAFETY: waits on this process's own child.
+        unsafe {
+            libc::close(fds[0]);
+            libc::waitpid(pid, &mut st, 0);
+        }
+        let msg = String::from_utf8_lossy(&buf[..n.max(0) as usize]).to_string();
+        if msg.starts_with("noinstall") {
+            eprintln!("skip: this host refuses PR_SET_SECCOMP");
+            return;
+        }
+        assert!(
+            msg.starts_with("ok"),
+            "the filter must let a socketpair and a byte through: {msg:?}"
+        );
+        assert!(
+            !msg.contains("survived"),
+            "openat must not return under the relay filter: {msg:?}"
+        );
+        // `SIGSYS` is the signal a `SECCOMP_RET_KILL_PROCESS` delivers.
+        assert!(
+            libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGSYS,
+            "the child must die of SIGSYS, not exit: status {st}"
+        );
     }
 }

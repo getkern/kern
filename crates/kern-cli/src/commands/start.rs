@@ -1273,6 +1273,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     }
     let mut egress_guard: Option<crate::egress::EgressFilter> = None;
     pt.mark("parent:setup->spawn");
+    // GARBAGE COLLECTION, DELIBERATELY AFTER THE SPAWN. Reaping cgroups left by boxes whose
+    // supervisor was killed has nothing to do with starting THIS box, and doing it first cost 193 us
+    // on every start (measured with 61 entries in the slice, 7.4% of a 2.6 ms box). Here it overlaps
+    // the workload rather than delaying it, and the slice is still swept once per box start.
+    kern_isolation::sweep_orphans_off_hot_path();
     let result = run_in_sandbox_with(
         &spec,
         None,
@@ -1897,14 +1902,19 @@ fn await_box_started(
     // changes - stderr is the same terminal - and the box's name is an ARGUMENT the caller already
     // holds, so there is no identifier to print in its place (unlike `docker run -d`, which prints a
     // container id it generated).
-    eprintln!(
-        "{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}",
-        p.g, gl.ok, p.z, p.b, p.z, p.d, p.z
+    // ONE STRING, ONE WRITE, and that is not a style preference. `compose up` starts a level's
+    // services in parallel, each as its own `kern box -d` process sharing this stderr. Two
+    // `eprintln!`s here are several `write` calls each (`Stderr` is unbuffered, so every fragment of
+    // the format goes out on its own), and nothing locks a descriptor ACROSS processes. MEASURED on a
+    // two-service stack: `✔✔ started started ''kern-…-cli kern-…-srv''`, one unreadable line where
+    // two boxes reported. Assembling first makes it a single `write`, which a pipe delivers atomically
+    // under `PIPE_BUF` and a terminal delivers as one call; the worst case left is whole lines out of
+    // order, which reads fine.
+    let msg = format!(
+        "{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} kern logs {n} {} kern stop {n}{}\n",
+        p.g, gl.ok, p.z, p.b, p.z, p.d, p.z, p.d, gl.dot, gl.dot, p.z
     );
-    eprintln!(
-        "  {}next: kern ps {} kern logs {n} {} kern stop {n}{}",
-        p.d, gl.dot, gl.dot, p.z
-    );
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
     Ok(())
 }
 

@@ -44,6 +44,8 @@ pub fn landlock_confine_writes(rw: &[String]) -> Result<bool, Error> {
     landlock::apply_rw_allowlist_host(rw)
 }
 mod outcome;
+/// Peer-to-peer reachability between boxes in separate network namespaces.
+pub mod peer;
 mod ports;
 mod real;
 mod sandbox;
@@ -80,6 +82,7 @@ pub use cgroup::scope_accepts_oom_policy;
 /// all running boxes at the kernel. The real-enforcement backstop to the cooperative box counter. See
 /// [`cgroup::set_fleet_caps`].
 pub use cgroup::set_fleet_caps;
+pub use cgroup::sweep_orphans_off_hot_path;
 /// The systemd manager kern drives for its scope/slice: `--system` as real root, else `--user`. See
 /// [`cgroup::systemd_scope_mode`].
 pub use cgroup::systemd_scope_mode;

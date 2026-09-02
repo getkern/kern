@@ -35,7 +35,19 @@ pub struct Instance {
     /// host puts them in a STRANGER's namespaces. `0` for an entry written before this field existed,
     /// which [`live_pid1`](Self::live_pid1) treats as "unknown" exactly as [`is_alive`] does.
     pub pid1_starttime: u64,
-    /// Published ports summary for `kern ps` (e.g. `8080->80, 127.0.0.1:443->443`); empty if none.
+    /// Published ports, as the string [`crate::ports::fmt`] produces (e.g.
+    /// `8080->80, 127.0.0.1:443->443`); empty if none.
+    ///
+    /// NO LONGER ONLY A DISPLAY STRING, and the comment used to say it was. `compose port` reads this
+    /// field back through [`crate::ports::parse_display_list`], the documented inverse of `fmt`, so
+    /// the text here is a WIRE FORMAT with a machine consumer. Changing how a mapping is rendered
+    /// changes what that consumer parses.
+    ///
+    /// The drift is gated rather than trusted: `fmt` and `parse_display` sit beside each other with a
+    /// round-trip test, so a formatting change that the parser cannot read back fails the suite. That
+    /// gate is the reason this stays a string; storing the structured mapping and formatting at
+    /// display time is the better shape and is recorded in `ROADMAP.md`, because taking it means
+    /// changing a persisted format while boxes are running.
     pub ports: String,
     /// Comma-separated **named volumes** this box mounts (from `-v name:/dst`) - so `kern volume rm`
     /// can refuse to delete a volume still in use. Empty when none; absent in older entries.
@@ -322,7 +334,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 8] = [
+const AUTHORITATIVE_DIRS: [&str; 9] = [
     "instances",
     "claims",
     "exit",
@@ -330,6 +342,12 @@ const AUTHORITATIVE_DIRS: [&str; 8] = [
     "health",
     "pods",
     "ssh",
+    // `relays/` holds a `--no-pod` stack's peer address plan: which box forwards which alias:port
+    // into which other box. AUTHORITATIVE for the same reason `mounts/` is, and more directly: a box
+    // able to write a line there redirects where a PEER's traffic goes, which is a forgery vector
+    // rather than opaque box bytes. It also holds the relay holder's pid, and a box able to rewrite
+    // that would aim `compose down`'s kill at a process of its choosing.
+    "relays",
     // `mounts/` is where a network volume (sshfs/nfs/smb) is staged before it is bound into a box,
     // and it is AUTHORITATIVE for two reasons rather than one: what is mounted there is a PEER's
     // remote filesystem, and the path itself is a location kern acts on during that peer's start, so
@@ -820,7 +838,50 @@ fn runtime_subdir_candidates(leaf: &str) -> Vec<PathBuf> {
     candidates
 }
 
+/// [`runtime_subdir`] for callers outside this module. The classification chokepoint runs inside it,
+/// so a new child still cannot be created without being classified first.
+pub(crate) fn runtime_subdir_public(leaf: &str) -> io::Result<PathBuf> {
+    runtime_subdir(leaf)
+}
+
 fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
+    // MEMOIZED PER PROCESS, because the answer cannot change within one and the walk is not free.
+    // MEASURED on a box start: `mkdir("/run/user/1000/kern/instances")` was issued FOUR times and
+    // `kern` twice, each returning EEXIST, because every helper that needs a runtime path resolves it
+    // from scratch. 8 failing `mkdir`s at 52 us on a 2.5 ms start is not the biggest cost there is,
+    // but it is one of the few that buys nothing at all.
+    //
+    // Keyed by leaf and holding the PATH, not the result: an error is not cached, so a first call
+    // that failed because the directory was not yet writable is retried rather than remembered.
+    // THE CLASSIFICATION CHOKEPOINT RUNS FIRST, ON EVERY CALL, memo or no memo. The first version of
+    // this cache returned early and skipped it, and three tests said so: `assert_registry_child` is
+    // what stops a new registry child from existing without being classified authoritative or opaque,
+    // and a cache that bypasses a check is not a cache, it is a hole. 40 us is not worth one.
+    assert_registry_child(leaf);
+    // KEYED ON THE ENVIRONMENT TOO, because `runtime_subdir_candidates` reads `XDG_RUNTIME_DIR` and
+    // the answer changes with it. Production never moves it mid-process; the test suite does, and a
+    // memo that ignored it handed back a directory under the previous root.
+    let key = (
+        leaf.to_string(),
+        std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
+    );
+    static MEMO: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, std::ffi::OsString), PathBuf>>,
+    > = OnceLock::new();
+    let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(m) = memo.lock() {
+        if let Some(p) = m.get(&key) {
+            return Ok(p.clone());
+        }
+    }
+    let made = runtime_subdir_uncached(leaf)?;
+    if let Ok(mut m) = memo.lock() {
+        m.insert(key, made.clone());
+    }
+    Ok(made)
+}
+
+fn runtime_subdir_uncached(leaf: &str) -> io::Result<PathBuf> {
     // Create every component we own as **0700**: `$XDG_RUNTIME_DIR`/`/run/user/<uid>` are already
     // owner-only, but the `/tmp/kern-<uid>` fallback lives under world-traversable `/tmp`, and this
     // tree can hold private material (the `--ssh` throwaway key). `DirBuilder` only sets the mode on

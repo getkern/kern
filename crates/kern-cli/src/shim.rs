@@ -508,7 +508,8 @@ fn translate_exec(rest: &[String]) -> Result<Vec<String>, ShimError> {
 /// The `docker compose` sub-verbs kern implements. Used only to decide where the sub-command starts,
 /// so a flag after it is routed to the sub-command instead of to `compose` itself.
 const COMPOSE_VERBS: &[&str] = &[
-    "up", "down", "stop", "start", "restart", "ps", "logs", "build", "pull", "config",
+    "up", "down", "stop", "start", "restart", "ps", "logs", "build", "pull", "config", "port",
+    "watch",
 ];
 
 fn translate_compose(rest: &[String]) -> Result<Vec<String>, ShimError> {

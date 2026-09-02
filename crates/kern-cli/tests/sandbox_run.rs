@@ -4743,6 +4743,1252 @@ fn images_strips_terminal_escapes_from_untrusted_ref() {
 }
 
 /// End-to-end: a `compose` file using the extended box schema (resources + env + read-only)
+/// `compose port` ANSWERS WITH ITS EXIT CODE AS MUCH AS WITH ITS OUTPUT.
+///
+/// The shape it exists to serve is `addr=$(kern compose f port web 8000) || exit 1`, so every path
+/// that has no answer must be non-zero rather than an empty line with status 0. Asserted here for
+/// the four ways there is no answer, plus the one where there is, because a verb that only ever
+/// succeeded would pass a test that checked the success path alone.
+///
+/// The address is read from the RUNNING box, so the last case is the stack brought down: that must
+/// fail rather than answer from the file, which is the difference between "what is published" and
+/// "what was asked for".
+#[test]
+fn compose_port_prints_the_published_address_and_fails_when_there_is_none() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // A free host port, chosen by the kernel and released before the stack claims it, so this test
+    // cannot collide with anything else on the machine.
+    let host_port = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => match l.local_addr() {
+            Ok(a) => a.port(),
+            Err(e) => {
+                eprintln!("skip: cannot read a bound port: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skip: cannot bind a host port: {e}");
+            return;
+        }
+    };
+
+    let root = build_rootfs(&busybox, "cport");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-cport-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-cport-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.web]\nrootfs = \"{rootfs}\"\nports = [\"{host_port}:8000\"]\ncommand = [\"/bin/busybox\", \"sleep\", \"12\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let port_cmd = |args: &[&str]| -> (bool, String, String) {
+        let mut a = vec!["compose", toml.to_str().unwrap(), "port"];
+        a.extend_from_slice(args);
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .expect("run kern");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // Not running yet: the answer must be an error, not the file's own mapping.
+    let (ok, _, err) = port_cmd(&["web", "8000"]);
+    assert!(
+        !ok && err.contains("is not running"),
+        "a stopped service must not answer from the file: ok={ok} err={err}"
+    );
+
+    let up = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", toml.to_str().unwrap(), "up"])
+        .output()
+        .expect("run kern");
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if up_err.contains("user namespaces") || up_err.contains("newuidmap") {
+        eprintln!("skip: the stack could not start here");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let (ok, addr, err) = port_cmd(&["web", "8000"]);
+    assert!(
+        ok && addr == format!("127.0.0.1:{host_port}"),
+        "the published address must be printed alone on stdout: ok={ok} addr={addr:?} err={err}"
+    );
+
+    let (ok, out, err) = port_cmd(&["web", "9999"]);
+    assert!(
+        !ok && out.is_empty() && err.contains("is not published"),
+        "an unpublished container port is an error with nothing on stdout: ok={ok} out={out:?}"
+    );
+
+    let (ok, _, err) = port_cmd(&["nosuch", "8000"]);
+    assert!(
+        !ok && err.contains("no service 'nosuch'"),
+        "an unknown service names itself: ok={ok} err={err}"
+    );
+
+    // A mistyped PORT must be reported as a port, not as a service that does not exist. That was the
+    // first behaviour, because the selection upstream validates every positional as a service name.
+    let (ok, _, err) = port_cmd(&["web", "abc"]);
+    assert!(
+        !ok && err.contains("is not a container port"),
+        "a bad port is a bad port, not a missing service: ok={ok} err={err}"
+    );
+
+    let (ok, _, err) = port_cmd(&["web"]);
+    assert!(
+        !ok && err.contains("exactly two arguments"),
+        "one argument is a usage error: ok={ok} err={err}"
+    );
+
+    kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", toml.to_str().unwrap(), "down"])
+        .output()
+        .ok();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_file(&toml);
+}
+
+/// A STACK IS ONE NETWORK TRUST DOMAIN, AND THE HOST IS OUTSIDE IT.
+///
+/// Both halves of the same fact, because the docs stated only the inconvenient one (two services
+/// cannot share a container port) and left the security-relevant one unwritten: services in a pod
+/// share a loopback, so a peer reaches a port that was never published. The other half is the part
+/// that has to hold: the HOST's loopback is not reachable from inside, so the boundary sits between
+/// the stack and the host rather than between the services of one stack.
+///
+/// The host side is asserted with a positive control, a port this test opens on the host itself, so
+/// "unreachable" cannot be a listener that was never there.
+#[test]
+fn a_pod_shares_loopback_between_services_and_not_with_the_host() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // The host-side control: a real listener on a free port, closed when this test ends.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a host port");
+    let host_port = listener.local_addr().unwrap().port();
+
+    let root = build_rootfs(&busybox, "podnet");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-podnet-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-podnet-{}.toml", std::process::id()));
+    // `quiet` listens on 9999 and publishes NOTHING. `nosy` reports what it can reach.
+    let probe = format!(
+        // THIS busybox `nc` HAS NO `-z`: its usage is `nc [-iN] [-wN] [-l] [-p PORT] ...`, so a
+        // connect test is `nc -wN HOST PORT </dev/null` read through the exit status. Found by the
+        // first run failing with `nc: invalid option` rather than with a wrong answer, which is the
+        // good way for a probe to be wrong.
+        "sleep 2; nc -w2 127.0.0.1 9999 </dev/null && echo PEER=yes || echo PEER=no; \
+         nc -w2 127.0.0.1 {host_port} </dev/null && echo HOST=yes || echo HOST=no; sleep 2"
+    );
+    fs::write(
+        &toml,
+        format!(
+            "[box.quiet]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"nc\", \"-l\", \"-p\", \"9999\"]\n\n\
+             [box.nosy]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let up = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", toml.to_str().unwrap(), "up"])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&up.stderr).to_string();
+    if err.contains("user namespaces") || err.contains("newuidmap") {
+        eprintln!("skip: the stack could not start here");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    let logs = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", toml.to_str().unwrap(), "logs", "nosy"])
+        .output()
+        .expect("run kern");
+    let seen = String::from_utf8_lossy(&logs.stdout).to_string();
+    kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", toml.to_str().unwrap(), "down"])
+        .output()
+        .ok();
+
+    assert!(
+        seen.contains("PEER=yes"),
+        "a stack is one network domain: a peer's unpublished port is reachable, and saying otherwise \
+         in the docs would be the lie this test exists to prevent: {seen}"
+    );
+    assert!(
+        seen.contains("HOST=no"),
+        "and the host is OUTSIDE that domain: a listener on the host's own loopback must not be \
+         reachable from a service (control: this test is holding port {host_port} open): {seen}"
+    );
+
+    drop(listener);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_file(&toml);
+}
+
+/// A `--no-pod` SERVICE STILL HOLDS ONLY LOOPBACK, AND NOW RESOLVES ITS PEERS ANYWAY.
+///
+/// This test was written for the opposite claim and is kept, inverted, because the claim it refuted
+/// is worth keeping refuted. The README and DOCKER-COMPAT used to say the flag cost "name
+/// resolution", which an operator reads as "DNS is gone but the peers are still reachable by
+/// address". MEASURED from a field report on v0.8.5: without a pod a service's network namespace
+/// holds ONLY loopback and NO routes, so a peer was unreachable by address as much as by name.
+///
+/// Peer relays changed the second half and NOT the first, and that split is exactly what is asserted
+/// here. The namespace is still solo: one interface, zero routes, no shortcut taken to make names
+/// work. What changed is that the peer's name is now in `/etc/hosts` pointing at its ALIAS, not at
+/// `127.0.0.1` - the distinction matters, because a peer mapped to `127.0.0.1` would resolve and then
+/// connect to the service's own listener, which is a silent wrong answer rather than a failure.
+///
+/// The pod half is still asserted. Without it, a build where pods stopped writing peer names would
+/// pass while breaking every stack that works today.
+#[test]
+fn no_pod_leaves_a_service_with_loopback_and_nothing_else() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "nopod");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-nopod-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-nopod-{}.toml", std::process::id()));
+    // `peera` reports what its namespace holds; `peerb` exists only to be a peer worth naming.
+    let probe =
+        "cat /etc/hosts; echo IFACE_START; cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d ' '; \
+                 echo IFACE_END; echo ROUTES=$(tail -n +2 /proc/net/route | wc -l); sleep 3";
+    fs::write(
+        &toml,
+        format!(
+            "[box.peera]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]\n\n\
+             [box.peerb]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sleep\", \"6\"]\n"
+        ),
+    )
+    .unwrap();
+
+    // TWO CHANNELS, KEPT APART ON PURPOSE. The first attempt returned `stderr + logs` as one string
+    // and asserted the peer name was absent from it. It failed against a CORRECT build: `up` prints
+    // the box names it is starting, so "peerb" was in the stderr of the very command under test. An
+    // assertion about what a service saw has to read only what that service printed.
+    let run = |extra: &[&str]| -> (String, String) {
+        let mut args = vec!["compose", toml.to_str().unwrap(), "up"];
+        args.extend_from_slice(extra);
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&args)
+            .output()
+            .expect("run kern");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let logs = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", toml.to_str().unwrap(), "logs", "peera"])
+            .output()
+            .expect("run kern");
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", toml.to_str().unwrap(), "down"])
+            .output()
+            .ok();
+        (
+            String::from_utf8_lossy(&out.stderr).to_string(),
+            String::from_utf8_lossy(&logs.stdout).to_string(),
+        )
+    };
+
+    let (pod_err, pod) = run(&[]);
+    if pod_err.contains("user namespaces") || pod_err.contains("newuidmap") {
+        eprintln!(
+            "skip: the stack could not start here: {}",
+            pod_err.lines().next().unwrap_or("")
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+        return;
+    }
+    assert!(
+        pod.contains("peerb"),
+        "a pod must put the peer's name in /etc/hosts, or the other half of this test proves nothing: {pod}"
+    );
+
+    let (_, solo) = run(&["--no-pod"]);
+    // The peer resolves, and to its ALIAS. `127.0.0.3` is peerb's address (second service, so
+    // index 1, so `127.0.0.(1+2)`); `peera` itself must stay on `127.0.0.1`, where its own listener
+    // is. A build that mapped a peer to `127.0.0.1` would satisfy "the name resolves" and then send
+    // every peer connection into the service's own socket.
+    assert!(
+        solo.contains("127.0.0.3\tpeerb") || solo.contains("127.0.0.3 peerb"),
+        "a no-pod peer must resolve to its own alias: {solo}"
+    );
+    assert!(
+        solo.contains("127.0.0.1\tpeera") || solo.contains("127.0.0.1 peera"),
+        "and a service must still resolve ITSELF to 127.0.0.1: {solo}"
+    );
+    let ifaces: Vec<&str> = solo
+        .split("IFACE_START")
+        .nth(1)
+        .and_then(|t| t.split("IFACE_END").next())
+        .map(|t| t.split_whitespace().collect())
+        .unwrap_or_default();
+    assert_eq!(
+        ifaces,
+        vec!["lo"],
+        "a no-pod service must still hold loopback and nothing else: relays reach peers from INSIDE \
+         this namespace, and adding an interface to make names work would have given the flag away: \
+         {solo}"
+    );
+    assert!(
+        solo.contains("ROUTES=0"),
+        "and no routes at all, for the same reason: {solo}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_file(&toml);
+}
+
+/// RESTARTING ONE SERVICE OF A `--no-pod` STACK MUST NOT SILENTLY CUT ITS PEERS OFF.
+///
+/// Peer relays are pinned by `setns` to namespaces obtained once, when the stack came up. Restart one
+/// service and it gets a NEW network namespace, while every relay half that entered the old one is
+/// still sitting in a namespace nothing is listening in. Nothing errors: the old namespace stays
+/// alive because the relay is in it.
+///
+/// MEASURED before the fix, and this is why the assertion below fetches a BYTE rather than opening a
+/// socket. `kern compose <file> start` after stopping one service exited 0, printed nothing, and
+/// `nc -w 3 peer PORT` still SUCCEEDED, because the relay's listener is up in the box that did not
+/// restart and accepts the connection before discovering it has nowhere to forward it. A reachability
+/// check that stops at connect reports a working stack while no data crosses. The payload is the
+/// discriminant.
+///
+/// `kern compose <file> watch` runs exactly this cycle on every edit, so the combination that breaks
+/// is the one shipped to be run all day.
+///
+/// Both halves are asserted: the payload must arrive BEFORE the restart too, or a build where relays
+/// never worked at all would pass.
+#[test]
+fn restarting_one_service_of_a_no_pod_stack_keeps_its_peers_reachable() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "nopodrestart");
+    let rootfs = root.to_str().unwrap();
+    let _ = fs::create_dir_all(root.join("tmp"));
+    fs::write(root.join("tmp/hello"), "PAYLOAD_OK\n").expect("payload");
+    let xdg = std::env::temp_dir().join(format!("kern-it-npr-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-npr-{}.toml", std::process::id()));
+
+    // `cli` fetches a real body from `srv` in a loop, so the log records whether DATA crossed rather
+    // than whether a socket opened.
+    let probe = "while :; do sleep 1; R=$(printf 'GET /hello HTTP/1.0\\r\\n\\r\\n' | nc -w 2 srv \
+                 7311 2>/dev/null); case \"$R\" in *PAYLOAD_OK*) echo DATA_OK ;; *) echo DATA_FAIL \
+                 ;; esac; done";
+    fs::write(
+        &toml,
+        format!(
+            "[box.srv]\nrootfs = \"{rootfs}\"\nport = 7311\n\
+             command = [\"/bin/busybox\", \"httpd\", \"-f\", \"-p\", \"7311\", \"-h\", \"/tmp\"]\n\n\
+             [box.cli]\nrootfs = \"{rootfs}\"\nport = 7312\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut a = vec!["compose", toml.to_str().unwrap()];
+        a.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .expect("run kern")
+    };
+    let logs_of =
+        |svc: &str| -> String { String::from_utf8_lossy(&run(&["logs", svc]).stdout).to_string() };
+    let cleanup = |root: &std::path::Path, xdg: &std::path::Path, toml: &std::path::Path| {
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(xdg);
+        let _ = fs::remove_file(toml);
+    };
+
+    let up = run(&["up", "--no-pod"]);
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if up_err.contains("user namespaces") || up_err.contains("newuidmap") {
+        eprintln!(
+            "skip: the stack could not start here: {}",
+            up_err.lines().next().unwrap_or("")
+        );
+        run(&["down"]);
+        cleanup(&root, &xdg, &toml);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(4500));
+    let before = logs_of("cli");
+    if !before.contains("DATA_OK") {
+        // No relay came up at all (a host that refuses `setns` into a child user namespace, which
+        // this suite already skips for elsewhere). Skipping is right; asserting the SECOND half
+        // against a stack that never worked would report a regression that is not one.
+        eprintln!("skip: peer relays did not carry data on this host: {before}");
+        run(&["down"]);
+        cleanup(&root, &xdg, &toml);
+        return;
+    }
+
+    // Stop ONE service, then bring the stack back with plain `start`, exactly as `watch` does.
+    // `kern ps`, not `compose ps`: this test must not depend on the compose view's own filtering to
+    // find the box it is about to stop, or a defect there would show up here as a skip.
+    let srv_box = String::from_utf8_lossy(
+        &kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .arg("ps")
+            .output()
+            .expect("run kern")
+            .stdout,
+    )
+    .lines()
+    .find_map(|l| {
+        l.split_whitespace()
+            .next()
+            .filter(|n| n.ends_with("-srv"))
+            .map(str::to_string)
+    });
+    let Some(srv_box) = srv_box else {
+        eprintln!("skip: could not find the srv box in `compose ps`");
+        run(&["down"]);
+        cleanup(&root, &xdg, &toml);
+        return;
+    };
+    let stop = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", &srv_box])
+        .output()
+        .expect("run kern");
+    assert!(stop.status.success(), "stopping one service must work");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let start = run(&["start"]);
+    assert!(
+        start.status.success(),
+        "start must succeed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    // The mode is carried, and said out loud rather than inferred in silence.
+    assert!(
+        String::from_utf8_lossy(&start.stderr).contains("without a pod"),
+        "start must say it is keeping the stack out of a pod: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(6000));
+    let after = logs_of("cli");
+    let tail: String = after.lines().rev().take(3).collect::<Vec<_>>().join(" ");
+    run(&["down"]);
+    cleanup(&root, &xdg, &toml);
+    assert!(
+        tail.contains("DATA_OK"),
+        "after restarting one service the peer must still deliver a BODY, not merely accept a \
+         connection: {tail}"
+    );
+}
+
+/// `up` WITHOUT `--no-pod` ON A STACK RUNNING WITHOUT ONE IS REFUSED, AND `start` IS NOT.
+///
+/// The plan file on disk is how a stack remembers it is a no-pod stack. `start` means "put back what
+/// was running" and has one reading, so it carries the mode. `up` without the flag has two: a
+/// forgotten `--no-pod`, or a deliberate move back into a pod. The file cannot say which, and
+/// choosing either one silently changes the stack's network topology.
+///
+/// THE REFUSAL HAS TO SIT BEFORE THE RECONCILER, and the first version did not. `up` on a stack whose
+/// definitions still match returns "already up to date" and exits 0, so a check placed after it never
+/// runs. This test would have passed against that build if it only asserted on a stack that needed
+/// changes, so it asserts against a stack that is fully up to date, which is the case that broke.
+///
+/// `up --no-pod` on the same stack must stay idempotent, or the refusal has cost more than it bought.
+#[test]
+fn up_without_no_pod_on_a_no_pod_stack_is_refused_and_names_the_plan() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "nopodmode");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-npm-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-npm-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.one]\nrootfs = \"{rootfs}\"\nport = 7321\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"sleep 20\"]\n\n\
+             [box.two]\nrootfs = \"{rootfs}\"\nport = 7322\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"sleep 20\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut a = vec!["compose", toml.to_str().unwrap()];
+        a.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+    };
+
+    let up = run(&["up", "--no-pod"]);
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if !up.status.success() || !up_err.contains("peer relay") {
+        eprintln!(
+            "skip: no relay plan was produced on this host: {}",
+            up_err.lines().next().unwrap_or("")
+        );
+        run(&["down"]);
+        cleanup();
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    // The refusal, against a stack that is fully up to date.
+    let plain = run(&["up"]);
+    let plain_err = String::from_utf8_lossy(&plain.stderr).to_string();
+    // And `--no-pod` again is still a no-op rather than a second refusal.
+    let again = run(&["up", "--no-pod"]);
+    let again_ok = again.status.success();
+    run(&["down"]);
+    cleanup();
+
+    assert!(
+        !plain.status.success(),
+        "`up` without the flag must refuse, not reconcile: {plain_err}"
+    );
+    // IT NAMES THE SERVICES, not a file. The mode is read from the registry now, so the refusal can
+    // point at the running things that make it true rather than at a path that may be stale.
+    assert!(
+        plain_err.contains("already running WITHOUT a pod")
+            && plain_err.contains("one")
+            && plain_err.contains("two"),
+        "and it must name the services that are up with no pod: {plain_err}"
+    );
+    assert!(
+        plain_err.contains("--no-pod") && plain_err.contains("down"),
+        "and give both ways forward: {plain_err}"
+    );
+    assert!(
+        again_ok,
+        "`up --no-pod` on the same stack must stay idempotent"
+    );
+}
+
+/// KILLING THE RELAY HOLDER MUST LEAVE NOTHING BEHIND, INCLUDING AN IN-FLIGHT PUMP.
+///
+/// `PR_SET_PDEATHSIG` is NOT inherited across `fork`. The two relay halves arm it against the holder,
+/// so they die with it; the per-connection pumps the connector forks did not arm anything, so they
+/// did not. MEASURED before the fix: killing the holder left ONE process alive, still holding a
+/// connection open between two boxes' namespaces, and a peer blocked in `read` never saw it end.
+///
+/// That is worse than a leaked process. A pump IS the thing that bridges two isolation domains, and
+/// it was outliving the teardown meant to remove it, which `compose down` performs by the same path.
+///
+/// THE TEST HOLDS A CONNECTION OPEN ON PURPOSE, because with no traffic there is no pump and the
+/// defect cannot appear: the positive control is that a pump exists before the kill.
+#[test]
+fn killing_the_relay_holder_leaves_no_pump_behind() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // Every relay process shares the holder's command line, because they are forked without `exec`,
+    // and that line carries the STACK'S OWN runtime directory. Matching on the directory rather than
+    // on `__relay-holder` alone is what makes this count immune to another stack running at the same
+    // time: the first version counted every relay on the machine and failed against a correct build
+    // because an unrelated stack was up.
+    let relay_procs = |scope: &str| -> Vec<i32> {
+        let mut out = Vec::new();
+        let Ok(dir) = fs::read_dir("/proc") else {
+            return out;
+        };
+        for e in dir.flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            if let Ok(c) = fs::read(format!("/proc/{pid}/cmdline")) {
+                let line = String::from_utf8_lossy(&c);
+                if line.contains("__relay-holder") && line.contains(scope) {
+                    out.push(pid);
+                }
+            }
+        }
+        out
+    };
+
+    let root = build_rootfs(&busybox, "pumpleak");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-pump-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    // Declared after `xdg` exists: the scope IS that directory, which is what every relay
+    // process of this stack carries on its command line.
+    let scope = xdg.to_string_lossy().to_string();
+    let toml = std::env::temp_dir().join(format!("kern-pump-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.srv]\nrootfs = \"{rootfs}\"\nport = 7341\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \
+             \"while :; do (echo hi; sleep 120) | nc -l -p 7341; sleep 1; done\"]\n\n\
+             [box.cli]\nrootfs = \"{rootfs}\"\nport = 7342\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \
+             \"sleep 4; while :; do sleep 120 | nc srv 7341; sleep 1; done\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut a = vec!["compose", toml.to_str().unwrap()];
+        a.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+    };
+
+    let before_others = relay_procs(&scope).len();
+    let up = run(&["up", "--no-pod"]);
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if !up.status.success() || !up_err.contains("peer relay") {
+        eprintln!(
+            "skip: no relay came up here: {}",
+            up_err.lines().next().unwrap_or("")
+        );
+        run(&["down"]);
+        cleanup();
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(7000));
+
+    // POSITIVE CONTROL, COUNTED EXACTLY rather than guessed at. A holder is one process and each
+    // relay is two halves, so anything beyond `1 + 2N` is a pump. The relay count comes from `up`'s
+    // own report, because a hard-coded guess is how this control silently stops controlling: the
+    // first version compared against a constant and skipped on a run that HAD a pump.
+    //
+    // Without a pump the defect cannot appear, and the assertion below would pass against it.
+    let n_relays: usize = up_err
+        .lines()
+        .find(|l| l.contains("peer relay(s) up"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find_map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+        })
+        .unwrap_or(0);
+    let live = relay_procs(&scope);
+    let expected_without_pumps = before_others + 1 + 2 * n_relays;
+    if n_relays == 0 || live.len() <= expected_without_pumps {
+        eprintln!(
+            "skip: no pump was forked here ({} procs, {n_relays} relays, {expected_without_pumps} \
+             would be halves alone)",
+            live.len()
+        );
+        run(&["down"]);
+        cleanup();
+        return;
+    }
+
+    let holder = fs::read_to_string(
+        xdg.join("kern/relays")
+            .read_dir()
+            .ok()
+            .and_then(|mut d| d.next())
+            .and_then(|e| e.ok())
+            .map(|e| e.path().join("relay-holder"))
+            .unwrap_or_default(),
+    )
+    .ok()
+    .and_then(|t| t.trim().parse::<i32>().ok());
+    let Some(holder) = holder.filter(|p| *p > 0) else {
+        eprintln!("skip: could not read the holder pid");
+        run(&["down"]);
+        cleanup();
+        return;
+    };
+    // SAFETY: the pid was read from a file this test's own `up` wrote and is guarded positive.
+    unsafe { libc::kill(holder, libc::SIGKILL) };
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let after = relay_procs(&scope);
+    run(&["down"]);
+    cleanup();
+    assert_eq!(
+        after.len(),
+        before_others,
+        "the holder's death must take every relay process with it, pumps included; {:?} survived",
+        after
+    );
+}
+
+/// A DEAD RELAY HALF TAKES ITS OWN EDGE DOWN AND THE HOLDER REBUILDS IT, RATHER THAN ENDING THE
+/// STACK.
+///
+/// The holder used to `pause()`, which slept through a dead half and left the stack reachable on some
+/// edges with nothing having said so. Total teardown replaced it and was worse in the way that
+/// matters to whoever diagnoses it: every edge dies at once, which reads as "kern broke", while the
+/// cause is one service.
+///
+/// So a runtime failure is repaired. This asserts the whole of that: the holder SURVIVES, the edge
+/// carries data again, and the process count returns to what it was, which is what separates a
+/// genuine rebuild from a half that simply never restarted.
+#[test]
+fn killing_one_relay_half_rebuilds_that_edge_and_leaves_the_stack_up() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "relayheal");
+    let rootfs = root.to_str().unwrap();
+    let _ = fs::create_dir_all(root.join("tmp"));
+    fs::write(root.join("tmp/hello"), "PAYLOAD_OK\n").expect("payload");
+    let xdg = std::env::temp_dir().join(format!("kern-it-heal-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-heal-{}.toml", std::process::id()));
+    let probe = "while :; do sleep 1; R=$(printf 'GET /hello HTTP/1.0\\r\\n\\r\\n' | nc -w 2 srv \
+                 7351 2>/dev/null); case \"$R\" in *PAYLOAD_OK*) echo DATA_OK ;; *) echo DATA_FAIL \
+                 ;; esac; done";
+    fs::write(
+        &toml,
+        format!(
+            "[box.srv]\nrootfs = \"{rootfs}\"\nport = 7351\n\
+             command = [\"/bin/busybox\", \"httpd\", \"-f\", \"-p\", \"7351\", \"-h\", \"/tmp\"]\n\n\
+             [box.cli]\nrootfs = \"{rootfs}\"\nport = 7352\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut a = vec!["compose", toml.to_str().unwrap()];
+        a.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+    };
+    let last_lines = |svc: &str, n: usize| -> String {
+        let out = String::from_utf8_lossy(&run(&["logs", svc]).stdout).to_string();
+        out.lines().rev().take(n).collect::<Vec<_>>().join(" ")
+    };
+
+    let up = run(&["up", "--no-pod"]);
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if !up.status.success() || !up_err.contains("peer relay") {
+        eprintln!(
+            "skip: no relay came up here: {}",
+            up_err.lines().next().unwrap_or("")
+        );
+        run(&["down"]);
+        cleanup();
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(4500));
+    if !last_lines("cli", 3).contains("DATA_OK") {
+        eprintln!("skip: the relay never carried data on this host");
+        run(&["down"]);
+        cleanup();
+        return;
+    }
+
+    let stack = xdg
+        .join("kern/relays")
+        .read_dir()
+        .ok()
+        .and_then(|mut d| d.next())
+        .and_then(|e| e.ok())
+        .map(|e| e.path());
+    let Some(stack) = stack else {
+        eprintln!("skip: no relay directory");
+        run(&["down"]);
+        cleanup();
+        return;
+    };
+    let holder: Option<i32> = fs::read_to_string(stack.join("relay-holder"))
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .filter(|p: &i32| *p > 0);
+    let Some(holder) = holder else {
+        eprintln!("skip: no holder pid");
+        run(&["down"]);
+        cleanup();
+        return;
+    };
+    // A half is a child of the holder. Read one from `/proc` rather than guessing a pid.
+    let a_half = fs::read_to_string(format!("/proc/{holder}/task/{holder}/children"))
+        .ok()
+        .and_then(|t| {
+            t.split_whitespace()
+                .next()
+                .and_then(|w| w.parse::<i32>().ok())
+        })
+        .filter(|p| *p > 0);
+    let Some(a_half) = a_half else {
+        eprintln!("skip: could not read the holder's children");
+        run(&["down"]);
+        cleanup();
+        return;
+    };
+    // SAFETY: the pid was read from this holder's own children list and is guarded positive.
+    unsafe { libc::kill(a_half, libc::SIGKILL) };
+    std::thread::sleep(std::time::Duration::from_millis(5000));
+
+    // SAFETY: signal 0 probes for existence without delivering anything.
+    let holder_alive = unsafe { libc::kill(holder, 0) } == 0;
+    let after = last_lines("cli", 3);
+    let log = fs::read_to_string(stack.join("holder.log")).unwrap_or_default();
+    run(&["down"]);
+    cleanup();
+
+    assert!(
+        holder_alive,
+        "one dead half must not end the holder, and with it every other edge"
+    );
+    assert!(
+        after.contains("DATA_OK"),
+        "the edge must carry data again after the rebuild: {after}"
+    );
+    assert!(
+        log.contains("rebuilt"),
+        "and the rebuild must be recorded, or a flapping edge looks healthy: {log}"
+    );
+}
+
+/// TWO SERVICES SHARING AN INTERNAL PORT ARE NOT AUTOMATICALLY LOST: the one that binds a SPECIFIC
+/// address keeps its peer, and only the one that binds the wildcard does not.
+///
+/// This is the case the feature used to refuse outright. A relay listens on `alias:port` inside the
+/// holder, and the compose file declares a PORT and never an address, so the first version assumed
+/// the worst and skipped every pair whose services shared a port. MEASURED, that was wider than the
+/// truth: two SPECIFIC binds on different addresses do not conflict on one port, so a service
+/// configured with `bind 127.0.0.1` leaves the peer's alias free.
+///
+/// The decision now belongs to the holder, which reads `/proc/<pid1>/net/tcp` after the services have
+/// bound, and both halves are asserted here because either one alone can pass against a wrong build:
+/// a build that refuses everything passes the second, and a build that tries everything passes the
+/// first while racing the tenant's own listener.
+#[test]
+fn a_shared_port_costs_only_the_service_that_binds_the_wildcard() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "sharedport");
+    let rootfs = root.to_str().unwrap();
+    let _ = fs::create_dir_all(root.join("tmp"));
+    fs::write(root.join("tmp/hello"), "PAYLOAD_OK\n").expect("payload");
+    let xdg = std::env::temp_dir().join(format!("kern-it-sp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-sp-{}.toml", std::process::id()));
+
+    // BOTH declare 7361. `a` binds it on 127.0.0.1 only; `b` binds the wildcard.
+    let a_cmd = "httpd -p 127.0.0.1:7361 -h /tmp; sleep 2; while :; do sleep 1; R=$(printf 'GET \
+                 /hello HTTP/1.0\\r\\n\\r\\n' | nc -w 2 b 7361 2>/dev/null); case \"$R\" in \
+                 *PAYLOAD_OK*) echo A_REACHES_B ;; *) echo A_FAILS ;; esac; done";
+    fs::write(
+        &toml,
+        format!(
+            "[box.a]\nrootfs = \"{rootfs}\"\nport = 7361\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"{a_cmd}\"]\n\n\
+             [box.b]\nrootfs = \"{rootfs}\"\nport = 7361\n\
+             command = [\"/bin/busybox\", \"httpd\", \"-f\", \"-p\", \"7361\", \"-h\", \"/tmp\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut v = vec!["compose", toml.to_str().unwrap()];
+        v.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&v)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+    };
+
+    let up = run(&["up", "--no-pod"]);
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if !up.status.success() || !up_err.contains("peer relay") {
+        eprintln!(
+            "skip: no relay came up here: {}",
+            up_err.lines().next().unwrap_or("")
+        );
+        run(&["down"]);
+        cleanup();
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(6000));
+    let a_log = String::from_utf8_lossy(&run(&["logs", "a"]).stdout).to_string();
+    let tail: String = a_log.lines().rev().take(3).collect::<Vec<_>>().join(" ");
+    let ps = String::from_utf8_lossy(&run(&["ps"]).stdout).to_string();
+    run(&["down"]);
+    cleanup();
+
+    // THE HALF THAT USED TO BE REFUSED: `a` binds a specific address, so b's alias is free inside it.
+    assert!(
+        tail.contains("A_REACHES_B"),
+        "the service that binds 127.0.0.1 must still reach its peer on the shared port: {tail}"
+    );
+    // THE HALF THAT IS GENUINELY LOST, named rather than left to be discovered.
+    assert!(
+        up_err.contains("cannot reach") && up_err.contains("0.0.0.0"),
+        "and the wildcard direction must be named with its reason: {up_err}"
+    );
+    assert!(
+        up_err.contains("bind 127.0.0.1:7361"),
+        "and the remedy must be the cheap one, not only a port change: {up_err}"
+    );
+    assert!(
+        ps.contains("peer edge DOWN"),
+        "and a status view must carry it, not just the bring-up output: {ps}"
+    );
+}
+
+/// A FOUR-SERVICE STACK SHAPED LIKE A REAL ONE REACHES ITSELF UNDER `--no-pod`.
+///
+/// Every other test here isolates one mechanism. This one is the shape a developer actually writes:
+/// `db` and `cache` behind an `api` behind a `web`, with `depends_on` between them, two services
+/// binding a specific address and two binding the wildcard, and four distinct ports. Twelve relays.
+///
+/// IT EXISTS BECAUSE IT FOUND A DEFECT THE UNIT TESTS COULD NOT. The holder decides each relay by
+/// measuring what the hosting box bound, and "nothing is listening on that port" was read as the racy
+/// case for every pair. That is only true when the host DECLARES the port and has not bound it yet; a
+/// service that never uses the port will never bind it, so the alias is free forever. With the
+/// declaration missing from the decision, this stack came up with twelve blocked edges, every one of
+/// them fine. A two-service test cannot show it, because there every pair shares the shape.
+///
+/// The assertion is a payload fetched over each hop, not a socket that opened: a relay accepts before
+/// it discovers whether it can forward, so a connect-only check reports a working stack over a dead
+/// one.
+#[test]
+fn a_four_service_stack_reaches_itself_without_a_pod() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "fourservice");
+    let rootfs = root.to_str().unwrap();
+    let _ = fs::create_dir_all(root.join("www"));
+    fs::write(root.join("www/d"), "DB_ROW\n").expect("db payload");
+    fs::write(root.join("www/c"), "CACHE_HIT\n").expect("cache payload");
+    // Scripts rather than inline `sh -c`: the command travels through TOML and then through a shell,
+    // and a quoting mistake in the probe reads exactly like a broken relay.
+    fs::write(
+        root.join("api.sh"),
+        "#!/bin/busybox sh\nhttpd -p 127.0.0.1:3000 -h /www\nsleep 5\nwhile :; do\n  \
+         D=$(wget -qO- http://db:5432/d 2>/dev/null)\n  \
+         C=$(wget -qO- http://cache:6379/c 2>/dev/null)\n  \
+         echo \"api: db=${D:-NO} cache=${C:-NO}\"\n  sleep 2\ndone\n",
+    )
+    .expect("api.sh");
+    fs::write(
+        root.join("web.sh"),
+        "#!/bin/busybox sh\nhttpd -f -p 8080 -h /www &\nsleep 7\nwhile :; do\n  \
+         A=$(wget -qO- http://api:3000/c 2>/dev/null)\n  echo \"web: api=${A:-NO}\"\n  sleep 2\ndone\n",
+    )
+    .expect("web.sh");
+
+    let xdg = std::env::temp_dir().join(format!("kern-it-four-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-four-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.db]\nrootfs = \"{rootfs}\"\nport = 5432\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"httpd -p 127.0.0.1:5432 -h /www; sleep 3600\"]\n\n\
+             [box.cache]\nrootfs = \"{rootfs}\"\nport = 6379\n\
+             command = [\"/bin/busybox\", \"httpd\", \"-f\", \"-p\", \"6379\", \"-h\", \"/www\"]\n\n\
+             [box.api]\nrootfs = \"{rootfs}\"\nport = 3000\ndepends_on = [\"db\", \"cache\"]\n\
+             command = [\"/bin/busybox\", \"sh\", \"/api.sh\"]\n\n\
+             [box.web]\nrootfs = \"{rootfs}\"\nport = 8080\ndepends_on = [\"api\"]\n\
+             command = [\"/bin/busybox\", \"sh\", \"/web.sh\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut v = vec!["compose", toml.to_str().unwrap()];
+        v.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&v)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+    };
+    let tail_of = |svc: &str| -> String {
+        String::from_utf8_lossy(&run(&["logs", svc]).stdout)
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let up = run(&["up", "--no-pod"]);
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    // SKIP ONLY FOR A HOST THAT CANNOT RUN THIS, never for a stack that came up wrong. The first
+    // version skipped when the output held no "peer relay", which is also what a build that blocks
+    // every relay produces: the negative control ran green against a deliberately broken tree,
+    // reporting a skip. A skip condition that a defect can satisfy is not a skip condition.
+    let host_cannot = [
+        "user namespaces",
+        "newuidmap",
+        "setns",
+        "Operation not permitted",
+    ]
+    .iter()
+    .any(|m| up_err.contains(m));
+    if host_cannot {
+        eprintln!(
+            "skip: this host cannot run the stack: {}",
+            up_err.lines().next().unwrap_or("")
+        );
+        run(&["down"]);
+        cleanup();
+        return;
+    }
+    assert!(
+        up.status.success(),
+        "bringing the stack up must succeed: {up_err}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(16000));
+    let api = tail_of("api");
+    let web = tail_of("web");
+    run(&["down"]);
+    cleanup();
+
+    // 4 services x 3 peers x 1 port each. Asserted so a build that plans fewer is caught here rather
+    // than by a reachability failure somewhere downstream.
+    assert!(
+        up_err.contains("12 peer relay(s) up"),
+        "a four-service stack with one port each needs twelve relays: {up_err}"
+    );
+    assert!(
+        !up_err.contains("cannot reach"),
+        "and none of them is blocked: no two services here share a port: {up_err}"
+    );
+    assert!(
+        api.contains("db=DB_ROW") && api.contains("cache=CACHE_HIT"),
+        "api must fetch a BODY from both of its dependencies: {api}"
+    );
+    assert!(
+        web.contains("api=CACHE_HIT"),
+        "and web must fetch one through api, so the whole chain carries data: {web}"
+    );
+}
+
+/// THE ORPHAN SWEEP STILL RUNS, NOW THAT IT NO LONGER RUNS FIRST.
+///
+/// Reaping cgroups left by boxes whose supervisor was killed used to happen on the hot path of every
+/// box start, inside the decision about which cgroup path to cap through. MEASURED on this desktop
+/// with 61 entries in the slice: 193 us, 7.4% of a 2.6 ms start, for work that has nothing to do with
+/// starting the box in front of it. It moved to after the spawn, where it overlaps the workload.
+///
+/// A move like that is exactly how a garbage collector quietly stops running, so this asserts the
+/// OUTCOME rather than the placement: an orphan directory planted before a box start is gone after
+/// it. The planted name carries a pid that cannot exist, which is what makes it an orphan.
+///
+/// Skipped where the direct `kern.slice` path is not the one this host caps through, because then
+/// there is no slice of ours to sweep. That is a host property, not a defect.
+#[test]
+fn a_box_start_still_reaps_an_orphan_cgroup() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // FIND THE SLICE WHERE KERN PUTS IT, not where this process's own cgroup would suggest. The
+    // first version derived it from `/proc/self/cgroup`, which is the TEST binary's cgroup: run from
+    // a terminal inside a systemd scope, that path has no `kern.slice` and never will, so the test
+    // skipped on every run and proved nothing. A bounded search under the user's own cgroup finds
+    // whichever one this host actually caps through.
+    let find_slice = || -> Option<std::path::PathBuf> {
+        let uid = unsafe { libc::getuid() };
+        let base = std::path::PathBuf::from(format!(
+            "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+        ));
+        let mut stack = vec![(base, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 4 {
+                continue;
+            }
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                if e.file_name() == "kern.slice" {
+                    return Some(p);
+                }
+                stack.push((p, depth + 1));
+            }
+        }
+        None
+    };
+
+    let root = build_rootfs(&busybox, "sweep");
+    let run_one = |name: &str| -> std::process::Output {
+        kern()
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                root.to_str().unwrap(),
+                "--",
+                "/bin/busybox",
+                "true",
+            ])
+            .output()
+            .expect("run kern")
+    };
+    // ONE BOX FIRST, so the slice exists to be searched for: it is created the first time a box caps
+    // through it.
+    let first = run_one("sweepwarm");
+    let Some(slice) = find_slice() else {
+        eprintln!(
+            "skip: no kern.slice under this user's cgroup, so this host caps another way: {}",
+            String::from_utf8_lossy(&first.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+    // A pid that cannot exist: `pid_max` is at most 2^22 on any Linux kern supports.
+    let orphan = slice.join("kern-box-sweeptest-4194400");
+    if fs::create_dir(&orphan).is_err() {
+        eprintln!("skip: could not plant an orphan in {}", slice.display());
+        return;
+    }
+    assert!(orphan.is_dir(), "the planted orphan must exist to be swept");
+
+    let out = run_one("sweepbox");
+    // The sweep runs after the spawn, so give the launcher a moment to reach it.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let still_there = orphan.is_dir();
+    let _ = fs::remove_dir(&orphan);
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(
+        out.status.success(),
+        "the box must start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !still_there,
+        "a box start must still reap an orphan cgroup, or the sweep moved itself out of existence"
+    );
+}
+
 /// A ONE-SHOT SERVICE THAT SUCCEEDS MUST NOT FAIL THE STACK.
 ///
 /// `up` is fail-closed on bring-up: a service that dies inside the settle window is reported and the

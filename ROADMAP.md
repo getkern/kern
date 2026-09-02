@@ -62,6 +62,159 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 What kern does not do yet, or does not know. Each entry says what it costs you and what would settle
 it.
 
+### A `--no-pod` stack reaches its peers, and a shared port costs only the wildcard side
+
+Peer relays ship. Each service gets a stack-wide loopback alias (`127.0.0.2` upward, by file order),
+its own name resolves to `127.0.0.1` where its listener actually is, and every peer resolves to that
+peer's alias, where a relay is bound inside this box. The relay is two processes and a socketpair:
+one enters box A and binds `alias:<port>`, one enters box B and connects to `127.0.0.1:<port>` from
+the calling service's own alias, and the accepted socket travels between them as `SCM_RIGHTS`,
+because descriptors are not namespaced.
+
+TWO PROCESSES BECAUSE ONE CANNOT DO IT, measured rather than assumed: from inside box A's user
+namespace, `open("/proc/<B>/ns/user")` fails `EACCES`, one step before `setns` is even reached.
+
+WHAT A SHARED PORT COSTS IS DECIDED BY MEASUREMENT, and this entry used to say it cost the pair. On
+one port, two SPECIFIC binds on different addresses do not conflict, while a specific bind and a
+WILDCARD bind refuse each other in both orders with or without `SO_REUSEADDR`. A compose file
+declares a port and never an address, so a decision taken from the file has to assume the worst, and
+that is what the first version did: it refused both directions of every pair that shared a port,
+including the ones that would have worked.
+
+The holder now reads `/proc/<pid1>/net/tcp` for the box that would HOST each relay, after the
+services have bound. A wildcard listener owns every address on its port, so that direction is
+reported by name with both remedies; a specific listener leaves the alias free, so that direction is
+served. Verified end to end: two services both declaring 8080, one binding `127.0.0.1:8080` and one
+binding `0.0.0.0:8080`, and the first reaches the second while only the reverse is named as down.
+
+Reading `/proc/<pid1>/net/*` reports that pid's NETWORK NAMESPACE, so the measurement needs no
+`setns` and no privilege. A service that has not bound yet is a third answer, not "specific": binding
+the alias then would make the service's own later `bind(0.0.0.0)` fail, and the loser of that race
+would be the user's application. Those are deferred and re-measured every pass, so a service that
+restarts bound differently changes the answer with no command run.
+
+### Falling back automatically on a port collision
+
+`kern compose up` refuses a stack whose services bind one container port, and the refusal now states
+what `--no-pod` would actually do: it may lose one direction, both, or neither, and kern says which
+once the services are running.
+
+Turning the refusal into an automatic fallback is still not taken, and the reason is narrower than it
+was. It is no longer "the fallback delivers a broken stack in 100% of the cases it fires", because
+the measurement means it often delivers a working one. It is that the collision is detected BEFORE
+anything starts, where the answer cannot yet be measured: the fallback would have to start the stack
+to find out, and a user who wanted a pod would get a silently different topology to be told
+afterwards which half of it works. A refusal that names both remedies costs one command and no
+surprise.
+
+### The relay's own privilege, bounded on both architectures kern publishes
+
+MEASURED on this host: a process reads `CapEff: 0000000000000000` before `setns(CLONE_NEWUSER)` into
+a box's user namespace and `000001ffffffffff` after. The relay halves also keep the HOST mount
+namespace, so between the two they are the only processes in a stack with a host filesystem view
+reachable over a socket from inside a box.
+
+Both halves shed all of it and refuse to serve if they cannot. The connector drops immediately after
+entering; the listener narrows to `CAP_NET_BIND_SERVICE` alone before its bind and to zero after,
+because a service on port 80 puts that bind under it. Each then installs a seccomp filter, which the
+per-connection pumps inherit through `fork`. Verified on a live stack on x86_64 AND on a Raspberry
+Pi 5: every half reads `CapEff`, `CapPrm`, `CapBnd` and `CapAmb` as zero, `NoNewPrivs: 1` and
+`Seccomp: 2`, while a service on port 80 still serves its peer.
+
+A DENYLIST HERE, WHILE A BOX GETS AN ALLOWLIST, and the asymmetry is the point rather than a weaker
+version of the same thing. A box runs arbitrary tenant code, so nothing but deny-by-default means
+anything there. A relay half runs this crate in a straight line and parses no tenant bytes; an
+allowlist over its syscall set would have to be right on every architecture kern publishes, where
+musl picks spellings per target, and one missing spelling is a `SIGSYS` on a board rather than a test
+failure. What is worth taking away from this process is the set that makes a host filesystem view
+worth anything, and that is what is denied: `execve`, the file-opening family, `mount`, `ptrace`,
+`process_vm_*`, `setns`, `unshare`, `bpf` and the module calls. A unit test asserts that `openat`
+kills with `SIGSYS` and that a socketpair and a byte still pass.
+
+### A relay that dies is rebuilt, and only an edge that cannot be is reported
+
+The holder used to `pause()`, which slept through a dead half and left a stack reachable on some
+edges with nothing having said so. Total teardown replaced that and was worse where it counts: every
+edge died at once, which reads as "kern broke" while the cause is one service, and the only trace was
+a log file nothing points at. A local, attributable failure had been turned into a global,
+misattributable one.
+
+The holder now watches its relays. A dead half takes its own edge down and that edge is rebuilt
+against the namespaces that exist NOW; a box whose PID 1 has moved has exactly the edges touching it
+rebuilt and no others. Every rebuild is recorded, including one that succeeds first time, because an
+edge that dies twice a minute would otherwise look healthy. An edge that has failed repeatedly is
+NAMED in a `degraded` file that `kern compose ps` prints as `peer edge DOWN: <a> -> <b> on <port>`,
+so the loss has somewhere to be seen. It is not abandoned there: retrying costs a registry read, so
+an edge whose service is merely restarting comes back on its own (measured: given up at attempt 12,
+rebuilt at attempt 114 when the box returned).
+
+FAIL-CLOSED STILL APPLIES AT SPAWN, and only at spawn. A plan that cannot be realised at all is a
+stack-level fact and `up` reports it. A half dying at hour three is a service-level fact and is
+repaired at service level.
+
+Because the holder heals itself, `compose start` no longer replaces it when the plan is unchanged:
+the same holder survives a `start` and a single-service restart, so a `watch` save costs the edges it
+changed rather than every relay in the stack.
+
+### Established connections are closed, not reset, when the holder exits
+
+MEASURED, and the answer needed a fix first. A peer blocked in `read` through a relay observes a
+clean FIN and end-of-file when the holder is killed, not a reset, so the correct client response is a
+reconnect rather than treating it as truncated data.
+
+Finding that out surfaced a defect worse than the question. `PR_SET_PDEATHSIG` is not inherited
+across `fork`, so while the two halves died with the holder, the per-connection pumps did NOT: one
+process survived, still holding a connection open between two boxes' namespaces, and the probe never
+saw the connection end. A pump IS the thing that bridges two isolation domains, and it was outliving
+the teardown meant to remove it, `compose down` included. Each pump now arms `PDEATHSIG` against the
+connector, and an integration test asserts that killing the holder leaves nothing behind, with a live
+connection open as its positive control.
+
+### The registry stores published ports as one string, read two ways
+
+`kern ps` renders a box's published ports from a string the registry holds, and `compose port` reads
+the same field back through `ports::parse_display`, the documented inverse of `ports::fmt`. Two
+readings of one field is a drift surface: a change to how a mapping is rendered that the parser
+cannot read back would make `compose port` answer "publishes nothing" for a box that publishes.
+
+STORING THE STRUCTURED VALUE AND FORMATTING AT DISPLAY TIME, which would delete the parser, is not
+available. `fmt`'s output IS the only wire format there is, so a decoder for it is `parse_display`
+under another name; adding a SECOND structured field would duplicate state rather than remove a
+parser; and changing the existing field's encoding would make a running kern read nothing for boxes a
+previous kern started, which is the silent wrong answer this codebase spends its effort avoiding.
+
+So the drift is closed by exhausting the space instead of by deleting a reader. The round trip is
+asserted over every bind-address shape `fmt` can emit, both ports at their boundaries and both
+protocols, in the single and the comma-joined forms, because the registry stores the joined one.
+Writing that test found the one asymmetry there is and it is deliberate: `parse_display` refuses port
+`0`, which means "any port" to `bind` and addresses nothing, so it is outside the space rather than a
+lost round trip.
+
+### A flat build copies the base, and on a filesystem without copy-on-write that is the whole base
+
+Where the unprivileged overlay mount is refused, or where the kernel does not record overlay opaque
+markers, `kern build` takes the FLAT path: it makes a mutable copy of the base rootfs and lets the
+`RUN`/`COPY` steps change it in place. `copy_tree` passes `cp -a --reflink=auto`, so on btrfs, xfs or
+bcachefs the base is CLONED and the copy is a metadata operation; on ext4 there is no reflink and the
+whole base is read and written. A field report measured 2m49s and 1.9 GB for a build whose only
+instruction after `FROM` was an `echo`, on a base of that size, and could not tell whether the cost
+was kern or the host. It is neither: it is whether the filesystem does copy-on-write, and the build
+line says which one happened while it happens.
+
+WHAT WOULD NOT FIX IT, written down because it is the obvious idea: caching a "flattened base" per
+image. There is no flattening to cache. The base already sits extracted in the image cache and is
+what gets copied; the copy exists because the build MUTATES it, not because anything is recomputed.
+Two different images from one base pay it twice for the same reason a second `cp` costs as much as
+the first. The finished-image cache (`flat_image_key`) already skips an unchanged rebuild entirely,
+which is the case that repeats.
+
+Hard-linking the base instead of copying would remove the cost and is unsafe: a `RUN` that edits a
+file in place would write through the link into the cached base and corrupt every later build from
+it. The safe version of that trick is exactly the overlay this path exists because it cannot use.
+
+So what is open here is narrow: on a non-CoW filesystem with no usable overlay, a flat build pays a
+full base copy and there is no known way around it. Say so rather than carry it as a task.
+
 ### No custom per-box seccomp profile from a file
 
 Docker takes `--security-opt seccomp=<profile.json>`; kern does not. A box picks between the shipped

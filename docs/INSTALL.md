@@ -60,8 +60,8 @@ typed inside the distro, against **70.5 ms** per command through `kern.exe`. So 
 inside the distro; use the bridge for the occasional command from a PowerShell you are already in, not for
 a loop that starts hundreds of boxes. Your project can live on `C:` either way, that made no measurable
 difference to box startup.
-[Benchmarks](../BENCHMARKS.md#windows-where-the-milliseconds-go) has the table, the variance, and what was
-not measured.
+Most of that is `wsl.exe` itself rather than the box: measured end to end, 167 ms against Docker
+Desktop's 690 on the same machine.
 
 **If your antivirus deletes `kern.exe`.** Some products remove an unsigned executable from
 `%LOCALAPPDATA%` on sight; kern is not signed. The Linux side is untouched and still works, and the

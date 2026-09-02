@@ -287,6 +287,11 @@ pub enum Command {
     },
     /// Hidden: the pod namespace holder process (spawned by `pod create`, not user-facing).
     PodHolder,
+    /// Hidden: owns a `--no-pod` stack's peer relays until killed. Argument is the stack's
+    /// runtime directory, where the plan file lives.
+    RelayHolder {
+        dir: String,
+    },
     /// Hidden: the re-exec'd egress filtering proxy (spawned by `--egress-allow`, not user-facing).
     EgressProxy {
         sock: String,
@@ -660,6 +665,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("pod") => parse_pod(&rest)?,
         // Hidden: the pod namespace holder (spawned by `pod create`).
         Some("__pod-holder") => Command::PodHolder,
+        // Hidden: the relay holder (spawned by `compose up --no-pod`).
+        Some("__relay-holder") => Command::RelayHolder {
+            dir: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
+        },
         Some("__egress-proxy") => Command::EgressProxy {
             sock: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
             allow: rest.get(2).map(|s| s.to_string()).unwrap_or_default(),
@@ -3047,6 +3056,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         }
         Command::PodRemove { names } => crate::pod::remove(&names),
         Command::PodHolder => crate::pod::run_holder(),
+        Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
         Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
         Command::EgressPump {
             read_fd,

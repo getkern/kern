@@ -183,9 +183,15 @@ the defect the mechanism exists to avoid.
 
 One constraint comes with the speed: a stack is one pod on one network namespace, so **two services
 cannot both listen on the same container port**, even when their published ports differ. `kern
-compose up` refuses the collision by name before starting anything. **Or pass `--no-pod`**: each
-service gets its own namespace and the constraint goes away, at the price of name resolution, which
-is measured rather than assumed. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+compose up` refuses the collision by name before starting anything.
+
+`--no-pod` lifts that constraint: each service gets its own network namespace, and peers stay
+reachable by name through per-service loopback aliases. A pair that shares an internal port keeps
+whichever direction it can: a service binding `0.0.0.0:PORT` owns every address on that port, so it
+cannot host a peer's alias there, while one binding `127.0.0.1:PORT` can. kern measures which it is
+once the services are running and names any direction it cannot serve, with both edits that clear
+it.
+[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
 Official images that drop to a non-root user (postgres, redis, ...) want `uidmap` and an
 `/etc/subuid` line, and outbound pulls want `pasta`; both are one `apt install`, and `kern doctor`
@@ -315,7 +321,7 @@ Two honest notes. **Nobody wins single-shot latency outright**: the floor for `u
 images, caps or lifecycle. The gap that means something is to the *engines*, two orders of magnitude
 above.
 
-Method, per-phase breakdown, board numbers and every caveat: **[BENCHMARKS.md](BENCHMARKS.md)**.
+The table and how to reproduce it: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
@@ -338,19 +344,20 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Documentation
 
-| | |
+| Document | What is in it |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | install on Linux, WSL2 and ARM boards, from source |
 | [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) | what of Docker works, what does not, and where it differs |
 | [docs/RESOURCES.md](docs/RESOURCES.md) · [docs/CONFIG.md](docs/CONFIG.md) · [docs/EGRESS.md](docs/EGRESS.md) | the two-verb model with volumes and vdisks, the `kern.toml` schema, and egress |
-| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) · [ROADMAP.md](ROADMAP.md#known-gaps-and-what-would-settle-them) | the threat model (structured, then per-mechanism), why a userspace VRAM cap is not a boundary, and the known gaps |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) | the threat model (structured, then per-mechanism), and why a userspace VRAM cap is not a boundary |
+| [ROADMAP.md](ROADMAP.md) | what is missing or unmeasured today, and what may come |
 | [BENCHMARKS.md](BENCHMARKS.md) · [EDGE.md](EDGE.md) | measurements, and running on a Pi, Jetson or UNO Q |
 | [examples/](examples/) · [blog/](blog/) | 92 runnable scripts, and longer write-ups |
 | [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the `kern-sandbox` SDK: embed kern in Python or Node |
 
 ## Status
 
-**The core is done and the CLI is frozen.** 972 Rust, 340 Python and 61 Node tests, clippy-clean and
+**The core is done and the CLI is frozen.** 1031 Rust, 340 Python and 61 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning

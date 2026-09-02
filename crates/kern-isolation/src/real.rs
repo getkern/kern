@@ -2427,6 +2427,22 @@ fn run_both_idmaps(r: &IdRange, pid: i32, euid: u32, egid: u32) -> bool {
 /// unprivileged process can only self-map a single id, the actual mapping is applied by a helper
 /// child that stays in the HOST user namespace (where the setuid `newuidmap`/`newgidmap` work) and
 /// targets us by pid, synchronized over pipes. Leaves `setgroups` allowed (newgidmap is the
+/// # A restructuring that MEASURED WORSE, so that nobody repeats it
+///
+/// The obvious cut here is the middle process: kern forks one helper, which then forks `newuidmap`
+/// and `newgidmap` itself, so three forks stand between the `unshare` and a mapped namespace. Forking
+/// the two setuid helpers DIRECTLY from kern, each waiting on its own gate and `execve`-ing, removes
+/// one process and one scheduling hop, and the result comes back as an exit status instead of a byte
+/// on a pipe. It is simpler and it is faster on a bench that isolates the dance: 0.83 ms against
+/// 0.68 ms over 40 rounds, and still faster with a 256 MB parent (8.4 ms against 3.6 ms), which was
+/// the first explanation tried for why the real program disagrees, and which the bench refuted.
+///
+/// IN KERN IT IS CONSISTENTLY SLOWER. Two binaries built from the same tree, alternated in one
+/// session, 32 paired batches of 30 `box --image` runs each: 3.482 ms with the middle process against
+/// 3.747 ms without it, and the direct form won 1 batch out of 32. The reason is not known. What is
+/// known is that a change which is slower in the program is a regression whatever a bench says, and
+/// that the bench did not model whatever decides it here.
+///
 /// privileged writer), so the box can use supplementary groups.
 fn apply_userns_range(
     ns_flags: libc::c_int,
@@ -3512,7 +3528,7 @@ fn shares_our_namespace(pid1: i32, kind: &str) -> bool {
 /// Bring the loopback interface (`lo`) up in the current network namespace via `SIOCSIFFLAGS`, so
 /// `127.0.0.1` works inside an otherwise-isolated box. Best-effort (a fresh net ns owned by our
 /// user namespace grants CAP_NET_ADMIN, so this normally succeeds; failures leave `lo` down).
-fn bring_loopback_up() {
+pub(crate) fn bring_loopback_up() {
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if sock < 0 {

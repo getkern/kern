@@ -3342,61 +3342,87 @@ fn exit_key_prefix(pod: &str) -> String {
 
 /// Resolve every service's compose `build:` into a built image via `kern build`, mutating the box's
 /// `image` to the built tag. See the call site for the four hardenings; this enforces them.
+/// The directory a `build.context` is confined under: the compose file's parent, canonical.
+///
+/// Its own function because TWO callers need the identical base - `resolve_builds`, which builds, and
+/// `compose watch`, which watches what a build would read. A second hand-written canonicalize is how
+/// one of them ends up confining against a different directory than the other.
+fn compose_base(file: &str) -> Result<std::path::PathBuf, Error> {
+    let dir = compose_dir(file);
+    std::fs::canonicalize(&dir)
+        .map_err(|e| Error::Compose(format!("resolving compose dir '{}': {e}", dir.display())))
+}
+
+/// Resolve ONE service's build context and dockerfile against `base`, applying the confinement rules
+/// in full, or `Ok(None)` when the service declares no `build:`.
+///
+/// THE GUARDS LIVE HERE AND NOWHERE ELSE. `resolve_builds` used to hold them inline, and adding a
+/// second reader of `build.context` (`watch`) would have meant a second copy of a traversal check -
+/// the exact shape in which one copy later drifts and stops refusing `context: ../../../etc`. Both
+/// callers now get the same answer or the same refusal.
+///
+/// Guard 1: the canonical `base/context` must stay beneath `base`, so a context in a third-party
+/// compose file cannot escape the project tree. Guard 1b: a `dockerfile:`, which Docker resolves
+/// relative to the CONTEXT, must stay beneath the context for the same reason.
+fn resolved_build_context(
+    b: &crate::compose::ComposeBox,
+    base: &std::path::Path,
+) -> Result<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>, Error> {
+    let Some(bd) = b.build.as_ref() else {
+        return Ok(None);
+    };
+    let ctx_abs = std::fs::canonicalize(base.join(&bd.context)).map_err(|e| {
+        Error::Compose(format!(
+            "service '{}': build context '{}': {e}",
+            b.name, bd.context
+        ))
+    })?;
+    if !ctx_abs.starts_with(base) {
+        return Err(Error::Compose(format!(
+            "service '{}': build context '{}' escapes the compose directory (refused)",
+            b.name, bd.context
+        )));
+    }
+    let dfile = match &bd.dockerfile {
+        Some(df) => {
+            let df_abs = std::fs::canonicalize(ctx_abs.join(df)).map_err(|e| {
+                Error::Compose(format!("service '{}': dockerfile '{df}': {e}", b.name))
+            })?;
+            if !df_abs.starts_with(&ctx_abs) {
+                return Err(Error::Compose(format!(
+                    "service '{}': dockerfile '{df}' escapes the build context (refused)",
+                    b.name
+                )));
+            }
+            Some(df_abs)
+        }
+        None => None,
+    };
+    Ok(Some((ctx_abs, dfile)))
+}
+
 fn resolve_builds(
     boxes: &mut [crate::compose::ComposeBox],
     file: &str,
     self_exe: &std::path::Path,
 ) -> Result<(), Error> {
-    // The directory that a `build.context` is confined under: the compose file's parent (canonical).
-    let compose_dir = compose_dir(file);
-    let base = std::fs::canonicalize(&compose_dir).map_err(|e| {
-        Error::Compose(format!(
-            "resolving compose dir '{}': {e}",
-            compose_dir.display()
-        ))
-    })?;
+    let base = compose_base(file)?;
 
     for b in boxes.iter_mut() {
-        let Some(bd) = b.build.clone() else { continue };
-        // Guard 1 - CONFINE context under the compose dir. Canonicalize `base/context` and require the
-        // result stays beneath `base`, so a `context: ../../../etc` in a third-party compose can't
-        // escape the project tree. (Same traversal class as image/volume/pod names in the saga.)
-        // NOTE (duale-di-Z2): confining the context ROOT here is not enough on its own - `kern build`
-        // then DESCENDS the context (COPY). That descent is itself confined: `copy_into_rootfs`
-        // canonicalizes each COPY source and requires `starts_with(ctx)` (a source symlink pointing out
-        // is rejected), and `cp -a` PRESERVES inner symlinks rather than following them (so a symlink
-        // buried in the tree lands in the image verbatim - dangling inside the pivoted rootfs - never
-        // read at build time). Verified live: a `leak -> /host/secret` inside the context does not leak
-        // the host file into the image. So root-confine here + no-follow descent in build = closed.
-        let ctx_abs = std::fs::canonicalize(base.join(&bd.context)).map_err(|e| {
-            Error::Compose(format!(
-                "service '{}': build context '{}': {e}",
-                b.name, bd.context
-            ))
-        })?;
-        if !ctx_abs.starts_with(&base) {
-            return Err(Error::Compose(format!(
-                "service '{}': build context '{}' escapes the compose directory (refused)",
-                b.name, bd.context
-            )));
-        }
-        // Guard 1 (dockerfile) - if given, confine it under the CONTEXT (Docker resolves `dockerfile`
-        // relative to the context). Reject an escaping dockerfile path.
-        let dfile = match &bd.dockerfile {
-            Some(df) => {
-                let df_abs = std::fs::canonicalize(ctx_abs.join(df)).map_err(|e| {
-                    Error::Compose(format!("service '{}': dockerfile '{df}': {e}", b.name))
-                })?;
-                if !df_abs.starts_with(&ctx_abs) {
-                    return Err(Error::Compose(format!(
-                        "service '{}': dockerfile '{df}' escapes the build context (refused)",
-                        b.name
-                    )));
-                }
-                Some(df_abs)
-            }
-            None => None,
+        // The guards moved into `resolved_build_context` so `watch` applies the identical ones; see
+        // its doc comment for why a second copy of a traversal check is the thing to avoid.
+        //
+        // NOTE (duale-di-Z2): confining the context ROOT is not enough on its own - `kern build` then
+        // DESCENDS the context (COPY). That descent is itself confined: `copy_into_rootfs`
+        // canonicalizes each COPY source and requires `starts_with(ctx)` (a source symlink pointing
+        // out is rejected), and `cp -a` PRESERVES inner symlinks rather than following them (so a
+        // symlink buried in the tree lands in the image verbatim, dangling inside the pivoted rootfs,
+        // never read at build time). Verified live: a `leak -> /host/secret` inside the context does
+        // not leak the host file into the image. So root-confine here + no-follow descent = closed.
+        let Some((ctx_abs, dfile)) = resolved_build_context(b, &base)? else {
+            continue;
         };
+        let Some(bd) = b.build.clone() else { continue };
 
         // Guard 4 - `image:` + `build:` = build AND tag as `image`; `build:` alone → synthesized tag.
         // Either way the box RUNS the freshly built image, never a stale registry one.
@@ -3586,6 +3612,13 @@ pub enum ComposeAction {
     Pull,
     /// Parse, interpolate and validate, then print the resolved services. No side effects.
     Config,
+    /// `watch [service...]`: rebuild and restart a service when its `build:` context changes, and
+    /// nothing else. Blocks until interrupted. See [`watch`] for the failure modes it handles.
+    Watch,
+    /// `port <service> <container-port>`: print the host address that serves that box port, read
+    /// from the RUNNING box rather than from the file, so it answers what is published now. Exits
+    /// non-zero when the service is not running or does not publish that port. No side effects.
+    Port,
     /// Print a systemd unit for this stack on stdout. Installs nothing: kern is daemonless, so the
     /// one thing it cannot do for itself is come back after a reboot, and where that unit belongs is
     /// a decision about the user's machine. No side effects.
@@ -3607,6 +3640,8 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
     ("build", ComposeAction::Build),
     ("pull", ComposeAction::Pull),
     ("config", ComposeAction::Config),
+    ("watch", ComposeAction::Watch),
+    ("port", ComposeAction::Port),
     ("systemd", ComposeAction::Systemd),
 ];
 
@@ -3640,6 +3675,33 @@ fn stop_stack(boxes: &[crate::compose::ComposeBox], pod: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Every container port a service declares, with its protocol, from all THREE spellings.
+///
+/// `port:` (declared, injected as `PORT`), `expose:` (declared, the Compose spelling) and the
+/// container side of each `ports:` mapping (published). They are one statement, "this service binds
+/// this port in its namespace", and a reader that looks at only one of them protects only the source
+/// it happened to look at: derived from `ports:` alone, the collision check saw only the services
+/// that publish, which is the smaller half of a stack.
+///
+/// Its own function because there are now TWO readers - the collision check and the `--no-pod` relay
+/// plan - and a second inline chain is how one of them later forgets `expose:`.
+///
+/// A malformed `ports:` spec contributes nothing here; the per-box path reports it precisely, and
+/// duplicating that message from a planner would give the same file two different errors.
+fn declared_container_ports(b: &crate::compose::ComposeBox) -> Vec<(u16, bool)> {
+    b.port
+        .map(|p| (p, false))
+        .into_iter()
+        .chain(b.expose.iter().copied())
+        .chain(b.ports.iter().flat_map(|spec| {
+            crate::ports::parse(spec)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.box_port, m.udp))
+        }))
+        .collect()
 }
 
 /// Fingerprint of everything that DEFINES a box, so `up` can tell a running service apart from the
@@ -3871,18 +3933,7 @@ fn check_pod_global_conflicts(
         // the Compose spelling) and the mappings from `ports:` (published). They are all the same
         // statement, "this service binds this port in the pod namespace", and have to be compared
         // together or the check protects only the source it happened to look at.
-        let declared = b.port.map(|p| (p, false));
-        for (port, udp) in
-            declared
-                .into_iter()
-                .chain(b.expose.iter().copied())
-                .chain(b.ports.iter().flat_map(|spec| {
-                    crate::ports::parse(spec) // malformed: the per-box path reports it precisely
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|m| (m.box_port, m.udp))
-                }))
-        {
+        for (port, udp) in declared_container_ports(b) {
             if let Some(other) = seen.insert((port, udp), short(b)) {
                 if other != b.service_name() {
                     let proto = if udp { "udp" } else { "tcp" };
@@ -3916,10 +3967,14 @@ fn check_pod_global_conflicts(
                          `port: {alt}` under service '{svc}', and the stack keeps resolving peers by \
                          service name (kern passes it as PORT={alt}; PORT is a convention, not a \
                          contract, so an image that reads a variable of its own needs that one set \
-                         instead). Or run with --no-pod: each service gets its own network namespace \
-                         and both keep port {port}, and then they no longer resolve each other by \
-                         name, so any address a service holds for a peer has to be a published \
-                         127.0.0.1:PORT."
+                         instead). Or run with --no-pod, where each service gets its own network \
+                         namespace and kern reaches peers through per-service loopback aliases: \
+                         that works for this pair too, IF the service that hosts the alias binds a \
+                         specific address rather than 0.0.0.0:{port}, since a wildcard listener owns \
+                         every address on its port. kern measures which it is once the services are \
+                         running and says so per direction, so with --no-pod you may lose one \
+                         direction, both, or neither. Making one of them bind 127.0.0.1:{port} \
+                         explicitly is usually a one-line change and costs no port renumber."
                     )));
                 }
             }
@@ -4051,10 +4106,28 @@ fn no_pod_peer_names_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) ->
     if !no_pod || boxes.len() < 2 {
         return None;
     }
+    // THE SECOND CLAUSE USED TO SAY "a peer address has to be a published 127.0.0.1:PORT", and that
+    // advice does not work. MEASURED: without a pod a service's namespace holds only loopback and no
+    // routes, so `127.0.0.1` inside a box is that box's OWN loopback. A port published to the host is
+    // reachable from the host (verified, it answers) and not from a peer (verified, it does not). The
+    // note was sending an operator to a workaround that fails, which is worse than saying nothing.
+    // THIS NOTE HAS BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS, and both times because it described the
+    // mechanism rather than the outcome.
+    //
+    // It first said a peer address "has to be a published 127.0.0.1:PORT", which does not work: a
+    // no-pod box holds only its own loopback, so that address is its own, and a port published to the
+    // host is not reachable from a peer (both measured). It was then rewritten to say the services
+    // "cannot reach each other at all", which was true when it was written and is no longer: peer
+    // relays now give them name resolution over per-service loopback aliases.
+    //
+    // What stays true in every case is the one thing a reader must act on: a service cannot host a
+    // peer's alias on a port it binds ITSELF, so two services sharing an internal port are still not
+    // mutually reachable. `up` names each such pair, with the port, immediately after this line.
     Some(
-        "kern: note: --no-pod gives each service its own network namespace, so they no longer resolve \
-         each other by service name; a peer address has to be a published 127.0.0.1:PORT. Without it, \
-         the stack shares one namespace: names resolve, and no two services may bind the same port."
+        "kern: note: --no-pod gives each service its own network namespace, and peers are reached \
+         through per-service loopback aliases instead of a shared one. A service cannot host a peer's \
+         alias on a port it binds itself, so two services that share an internal port are still not \
+         mutually reachable; any such pair is named below."
             .to_string(),
     )
 }
@@ -4521,25 +4594,181 @@ fn run_terminal_verb(
             }
             return Ok(true);
         }
+        ComposeAction::Watch => {
+            // The SAME confinement a build applies, by calling the same function: a context that
+            // `resolve_builds` would refuse is refused here too, before a single watch is added.
+            let base = compose_base(file)?;
+            let mut contexts: Vec<(String, std::path::PathBuf, Option<std::path::PathBuf>)> =
+                Vec::new();
+            for b in boxes.iter().filter(|b| selected(b)) {
+                if let Some((ctx, df)) = resolved_build_context(b, &base)? {
+                    contexts.push((b.name.clone(), ctx, df));
+                }
+            }
+            let selected_boxes: Vec<&crate::compose::ComposeBox> =
+                boxes.iter().filter(|b| selected(b)).collect();
+            let set = watch::watch_set(&selected_boxes, &contexts);
+            // Resolved here rather than threaded through `TerminalOpts`: `watch` is the only terminal
+            // verb that spawns kern again, and widening a struct six verbs share for one of them is
+            // the wrong trade.
+            let self_exe = std::env::current_exe()
+                .map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
+            return watch::run(set, file, &self_exe).map(|()| true);
+        }
+        ComposeAction::Port => {
+            // `kern compose <file> port <service> <container-port>` -> `IP:PORT` on stdout.
+            //
+            // READ FROM THE RUNNING BOX, NOT FROM THE FILE. The file says what was asked for; the
+            // registry entry says what was actually bound, and those differ exactly when it matters
+            // (a bind that failed refuses the box, but a stack brought up from an EDITED file that
+            // has not been re-upped would otherwise print an address nothing serves). The cost is
+            // that the service has to be running, which is also what `docker compose port` requires.
+            //
+            // Exit code is the contract as much as the output: a caller writes
+            // `addr=$(kern compose f port web 8000) || exit 1`, so every "no answer" path has to be
+            // an Err rather than an empty line with status 0.
+            let (svc, want) = match services {
+                [s, p] => (s.as_str(), p.as_str()),
+                _ => {
+                    return Err(Error::Compose(format!(
+                        "compose port takes exactly two arguments, the service and its container \
+                         port: `kern compose {file} port <service> <container-port>`"
+                    )))
+                }
+            };
+            // Parse the wanted port BEFORE looking anything up, so a typo is named as a typo instead
+            // of reported as "not published", which would send the reader to the wrong file.
+            let want_port: u16 = match want.parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    return Err(Error::Compose(format!(
+                        "'{want}' is not a container port; it must be a number in 1..=65535"
+                    )))
+                }
+            };
+            // BOTH SPELLINGS, because the caller's word has already been mapped: the selection
+            // above rewrites a known service name into its scoped box name, so `svc` arrives here as
+            // `<pod>-<token>-web` for a valid service and as the raw word for an unknown one. Match
+            // either, and report the FILE's names, which is what the reader typed.
+            let Some(b) = boxes.iter().find(|b| b.name == svc || b.service == svc) else {
+                let known: Vec<&str> = boxes.iter().map(|b| b.service.as_str()).collect();
+                return Err(Error::Compose(format!(
+                    "no service '{svc}' in {file}; it defines: {}",
+                    known.join(", ")
+                )));
+            };
+            let Some(inst) = registry::list().into_iter().find(|i| i.name == b.name) else {
+                return Err(Error::Compose(format!(
+                    "service '{}' is not running, so nothing is published for it; bring the stack \
+                     up first: `kern compose {file} up`",
+                    b.service
+                )));
+            };
+            let published = crate::ports::parse_display_list(&inst.ports);
+            if published.is_empty() {
+                return Err(Error::Compose(format!(
+                    "service '{}' publishes no ports",
+                    b.service
+                )));
+            }
+            // TCP first, then UDP, and never both: two protocols can legitimately share one box port,
+            // and printing two lines would break the `addr=$(...)` shape this exists to serve. TCP is
+            // the default protocol of a `ports:` entry, so it is the one a caller means by default.
+            let hit = published
+                .iter()
+                .find(|m| m.box_port == want_port && !m.udp)
+                .or_else(|| published.iter().find(|m| m.box_port == want_port));
+            let Some(m) = hit else {
+                let have: Vec<String> = published
+                    .iter()
+                    .map(|m| format!("{}{}", m.box_port, if m.udp { "/udp" } else { "" }))
+                    .collect();
+                // `b.service`, not `svc`: the caller's word was rewritten into the scoped box
+                // name upstream, and echoing `pod-token-web` back at someone who typed `web` makes
+                // them hunt for a name their file does not contain.
+                return Err(Error::Compose(format!(
+                    "container port {want_port} is not published by '{}'; it publishes: {}",
+                    b.service,
+                    have.join(", ")
+                )));
+            };
+            println!(
+                "{}.{}.{}.{}:{}",
+                m.bind_ip >> 24 & 0xff,
+                m.bind_ip >> 16 & 0xff,
+                m.bind_ip >> 8 & 0xff,
+                m.bind_ip & 0xff,
+                m.host
+            );
+            return Ok(true);
+        }
         ComposeAction::Ps => {
             // Reuse `kern ps` itself, scoped to this stack's pod - one renderer, so the compose view
             // can never drift from `kern ps` (same columns, same status rules, same --json). `-a`
             // threads straight through, so `compose ps -a` shows the stack's recently-exited services;
             // the phantom worry (a PRIOR run of the same pod name) is closed at the source by `down`
             // reaping its own boxes' sidecars precisely (see `ComposeAction::Down`).
-            let rc = ps(
-                false,
-                false,
-                all,
-                &[("pod".to_string(), pod.to_string())],
-                None,
-            );
+            // THE POD FILTER FINDS NOTHING IN A `--no-pod` STACK, and the report was not "no pod",
+            // it was "no services". MEASURED: two boxes up and visible in `kern ps`, and
+            // `kern compose <file> ps` printing `0/2 services running` for the same stack, because a
+            // no-pod box carries an EMPTY `pod` field and the filter compared it against the stack's
+            // name. A status view that reports a running service as gone is worse than one that
+            // refuses, since it is the view a person consults to decide whether something is wrong.
+            //
+            // The stack's box NAMES are the identity that holds in both modes, and they are already
+            // scoped `<pod>-<service>`, so a substring filter on `<pod>-` selects this stack and no
+            // other. Used only when the pod filter would match nothing, so a pod stack keeps the
+            // exact selection it had, including any member renamed by `container_name` (which the
+            // prefix would miss, and which keeps its `pod` field either way).
+            let in_pod = registry::list().iter().any(|b| b.pod == pod);
+            let filter = if in_pod {
+                ("pod".to_string(), pod.to_string())
+            } else {
+                ("name".to_string(), format!("{pod}-"))
+            };
+            let rc = ps(false, false, all, std::slice::from_ref(&filter), None);
+            // DEGRADED EDGES, NAMED HERE, because this is where a person looks to decide whether
+            // something is wrong. A `--no-pod` stack's relays repair themselves; an edge that could
+            // not be rebuilt is left alone so the rest keep working, and that trade is only
+            // acceptable if the loss is reported somewhere. Silence would make it the partial
+            // failure this codebase refuses.
+            // ONLY WHILE A LIVE HOLDER OWNS THE FILE. `degraded` is written by the holder and
+            // removed by `down`; a holder that is SIGKILLed or dies with the session leaves it
+            // behind, and reading it then reports edges that are down on a stack that has no relays
+            // at all. MEASURED: kill the holder without a `down` and `compose ps` kept naming two
+            // edges as down for a set of relays that no longer existed.
+            //
+            // The liveness of the holder is a fact about a process; the file is a leftover. This is
+            // the same rule the no-pod mode follows after it stopped being inferred from the plan
+            // file's presence.
+            if let Ok(rdir) = crate::relayhold::stack_dir(pod) {
+                if crate::relayhold::holder_pid(&rdir).is_some() {
+                    if let Ok(edges) =
+                        std::fs::read_to_string(crate::relayhold::degraded_path(&rdir))
+                    {
+                        for e in edges.lines().filter(|l| !l.is_empty()) {
+                            let p = crate::ui::Palette::detect();
+                            println!("{}peer edge DOWN: {e}{}", p.r, p.z);
+                        }
+                    }
+                }
+            }
             // Without `-a`, a running-only view cannot answer "which service died?" - point AT the
             // answer when the file defines more services than are up, instead of leaving the user to
             // know that the pod name is the stack name.
             if !all {
                 let defined = boxes.len();
-                let running = registry::list().iter().filter(|b| b.pod == pod).count();
+                // Counted the same way the view above selects, or the count contradicts the rows.
+                let running = registry::list()
+                    .iter()
+                    .filter(|b| {
+                        if in_pod {
+                            b.pod == pod
+                        } else {
+                            boxes.iter().any(|x| x.name == b.name)
+                        }
+                    })
+                    .count();
                 if running < defined {
                     let p = crate::ui::Palette::detect();
                     println!(
@@ -4599,6 +4828,13 @@ fn run_terminal_verb(
             return Ok(true);
         }
         ComposeAction::Down => {
+            // The relay holder FIRST, before the boxes stop. Killing it takes every relay with it
+            // through PDEATHSIG, and doing it first means no relay is left pumping into a box that is
+            // being torn down under it. Best-effort and idempotent: a stack that ran in a pod has no
+            // holder, and a second `down` finds no file.
+            if let Ok(dir) = crate::relayhold::stack_dir(pod) {
+                crate::relayhold::kill_holder(&dir);
+            }
             let names = stop_stack(boxes, pod);
             // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
             // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
@@ -5401,6 +5637,9 @@ mod system;
 pub use system::*;
 
 mod build;
+
+/// `compose watch`: rebuild and restart one service when its build context changes.
+mod watch;
 pub use build::*;
 
 mod images;

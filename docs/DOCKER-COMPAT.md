@@ -21,12 +21,23 @@ matrix: what is supported, what is not, and where the differences bite.
 **One stack, one network namespace.** The services of a `kern compose` stack share a
 single network namespace, like the containers of a Kubernetes pod: they reach each
 other by service name on `127.0.0.1`, with no bridge, no IPAM and no DNS server.
-That is what makes a stack start in milliseconds, and it has one consequence worth
-knowing before you choose kern: **two services cannot both listen on the same
+That is what makes a stack start in milliseconds, and it has two consequences worth
+knowing before you choose kern.
+
+The first is a limit: **two services cannot both listen on the same
 container port**, even when their published ports differ. Two apps that both default
 to `:3000` is the common case, so kern refuses it *before* starting anything and names
 both services. The same applies to `net.*` sysctls, which belong to the namespace and
 therefore to the whole stack.
+
+The second is a trust boundary, and it is the same fact read from the other side:
+**a stack is one network trust domain**. Every service reaches every other service's
+listening ports, published or not, because they share one loopback. MEASURED: a service
+listening on `9999` and publishing nothing is reachable from a peer in the same stack.
+The host's loopback is NOT reachable from inside (measured: the host's `:22` listener is
+invisible to a service), so the boundary is between the stack and the host, not between
+the services of one stack. Put a service you do not trust with its peers in its own
+stack, not in this one.
 
 **Outbound needs `pasta`, and kern says so when it is missing.** Reaching the internet
 from a rootless network namespace needs a userspace network stack, so `kern compose up`
@@ -82,8 +93,94 @@ variable of its own needs that one set instead, so for those the edit is this li
 knowing which variable the image honours. The refusal says so, and it spells the change it
 wants, naming the service and a port to use rather than describing the shape of an edit,
 because there is no configuration that gives one stack BOTH two services on a single
-internal port AND peers resolving by name. `--no-pod` buys the first and sells the second,
-measured: `getent hosts db` answers `127.0.0.1 db db` in a pod, and nothing without one.
+internal port AND peers that can reach each other on it.
+
+`--no-pod` is not the loss it used to be. Each service gets its own network namespace and a stack-wide
+loopback alias, `127.0.0.2` upward; a service resolves its own name to `127.0.0.1`, where its listener
+is, and each peer to that peer's alias, where a relay is bound inside this box. MEASURED on a native
+Linux host: under `--no-pod` a two-service stack answers `127.0.0.2 srv` for its peer and `127.0.0.1`
+for itself, `nc` connects, and the namespace still holds **only `lo` with no routes at all**. Nothing
+was traded away to make names work; the reachability is carried by a relay that lives inside the
+namespace rather than by an interface added to it. No box gets an `/etc/resolv.conf` either way: peer
+names travel through `/etc/hosts`.
+
+A peer also arrives with its OWN address rather than as loopback. The connector binds the calling
+service's alias as the SOURCE before it connects, so a service sees `127.0.0.2` for one peer and
+`127.0.0.3` for another (verified from inside a box: `netstat -tn` in the target shows the caller's
+alias, not `127.0.0.1`). That matters because loopback is the most trusted source in most default
+configurations, and a stack run with `--no-pod` asked for separation.
+
+WHAT A SHARED INTERNAL PORT COSTS UNDER `--no-pod` IS MEASURED, NOT ASSUMED. On one port, two
+SPECIFIC binds on different addresses do not conflict at all, while a specific bind and a WILDCARD
+bind refuse each other in both orders, `SO_REUSEADDR` or not. A service that binds `127.0.0.1:8080`
+explicitly leaves `127.0.0.2:8080` free and its relay works; only a service on `0.0.0.0:8080` takes
+the whole port.
+
+A compose file declares a port and never an address, so kern reads `/proc/<pid1>/net/tcp` for the box
+that would host each relay once the services have bound. The direction whose host binds the wildcard
+is named with both remedies; the other direction is served. Two services that both declare 8080 may
+therefore lose one direction, both, or neither, and `up` says which. `kern compose ps` keeps printing
+any direction that is down.
+
+The two remedies are: change one internal port, or make one service bind `127.0.0.1` explicitly
+instead of `0.0.0.0`, which is often a one-line config change against a renumber that touches every
+caller.
+
+What relays cost, measured on an x86 desktop with the release binary, against the same stack in a
+pod. Throughput and connection rate are the price of the extra hop: bytes cross two TCP connections
+instead of one.
+
+| | in a pod | with relays | |
+|---|---|---|---|
+| bulk transfer | ~1270 MB/s | ~840 MB/s | -34% |
+| connection rate | ~1980 conn/s | ~1660 conn/s | -16% |
+
+The userspace copy is NOT what costs it: raising the pump's buffer from 16 KB to 64 KB moved
+throughput less than the run-to-run spread (635 to 851 MB/s across repeats either way), so `splice`
+would buy nothing here. The extra TCP connection is the cost, and it is inherent to the design.
+
+Bring-up scales sub-linearly in the relay count and the process count does not. Same machine, one
+port per service: 2 services is 2 relays and `up` in 187 ms; 8 is 56 relays and 218 ms; 16 is 240
+relays and 388 ms; 32 is 992 relays, 1,987 processes, 474 MB of resident memory and 1.54 s. A relay
+costs two processes and roughly 240 kB.
+
+That product is why `up` refuses a stack needing more than **1024 relays**, before starting anything.
+The 253-service alias range does not bound it: 253 services with one port each would be 63,756 relays
+and 127,513 processes, more than the `RLIMIT_NPROC` of the machine this was measured on. A mesh that
+wide is not what `--no-pod` is for, and the refusal says so with the arithmetic.
+
+An idle stack costs almost nothing: the holder measures **0.10% of a core** with 56 relays up and
+nothing wrong.
+
+A named volume shared by two services that run as **different users** behaves exactly as it does under
+Docker, which means the second service can be refused at runtime and nothing warns at start-up.
+MEASURED on a Raspberry Pi 5 (which has `newuidmap`, `newgidmap` and both `/etc/sub*id` allocations):
+`writer` running as `0:0` creates `/data/f` mode `0640` owned by `0:0`, `reader` running as `1000:1000`
+mounts the same volume, `up` exits 0 with no warning, and the read fails with `Permission denied`
+INSIDE the reader, seconds later.
+
+kern does not chown a shared volume to fit the second consumer, deliberately: that would silently
+rewrite ownership of data the first service owns, and it would differ from Docker on a file layout
+people already depend on. The answer is the same one Docker gives, so a stack that works there works
+here, and one that does not needs the same fix: matching users, a group both are in, or permissions
+that admit both. Under a user namespace the in-box uid is what matters, so `user:` is what decides it.
+
+Note that a service using `rootfs:` rather than `image:` keeps a SINGLE-uid map by default, and a
+`user:` naming any other uid is then refused at start-up rather than at runtime, naming
+`--uid-range` as the fix. That refusal is the loud half of this; the volume case above is the quiet
+half, and it is quiet because it is a filesystem permission and not a mapping.
+
+`kern compose <file> watch [service...]` is the development loop: it watches each selected service's
+`build.context` and, on a change, rebuilds that service's image and restarts that service alone,
+leaving its peers running. Measured on an x86 desktop, a full edit-to-serving cycle for a
+one-instruction image is 258 to 261 ms. It is not Docker Compose's `develop.watch`: kern invents no
+new compose key, and follows the build context because that is already the set of files a rebuild
+reads. A service that runs a published `image:` has no such set and is excluded, by name.
+
+`kern compose <file> port <service> <container-port>` answers the other direction, like
+`docker compose port`: it prints the host address serving that box port, read from the RUNNING box
+rather than from the file, and exits non-zero when there is no answer. Scripts can rely on the exit
+code: `addr=$(kern compose f port web 8000) || exit 1`.
 
 Three spellings, one space: `ports:` (published), `port:` (declared and passed as
 `PORT`), `expose:` (declared only). A service that publishes nothing is visible to the

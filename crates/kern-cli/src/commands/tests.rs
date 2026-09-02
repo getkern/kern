@@ -3556,13 +3556,24 @@ mod port_collision_tests {
 
         let note =
             no_pod_peer_names_note(&two, true).expect("two services under --no-pod lose peers");
+        // IT USED TO REQUIRE "cannot reach each other at all". That was true when peer relays did
+        // not exist and is false now: names resolve through per-service loopback aliases. What the
+        // note must still carry is the ONE case relays cannot serve, because it is the only thing
+        // left for a reader to act on.
         assert!(
-            note.contains("no longer resolve each other by service name"),
-            "the note must say what was lost: {note}"
+            note.contains("share an internal port") && note.contains("not mutually reachable"),
+            "the note must name the case relays cannot serve: {note}"
         );
         assert!(
-            note.contains("127.0.0.1:PORT"),
-            "and what to use instead, or it is a complaint rather than a note: {note}"
+            !note.contains("cannot reach each other at all"),
+            "and it must not still claim peers are wholly unreachable: {note}"
+        );
+        // IT USED TO REQUIRE "127.0.0.1:PORT" HERE, as the thing to use instead. That advice was
+        // false: a no-pod box's 127.0.0.1 is its own, and a port published to the host does not
+        // reach a peer. The requirement is now the opposite, that the note does NOT offer it.
+        assert!(
+            !note.contains("has to be a published 127.0.0.1:PORT"),
+            "the note must not offer a workaround that does not work: {note}"
         );
 
         assert!(
@@ -3613,9 +3624,45 @@ mod port_collision_tests {
             msg.contains("--no-pod") && msg.contains("port: "),
             "the refusal must name both ways out: {msg}"
         );
+        // THIS CLAUSE HAS BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS. It first said peers "no longer
+        // resolve each other by name" and offered a published 127.0.0.1:PORT instead, which does not
+        // reach a peer. It was then corrected to "cannot reach each other at all", true at the time.
+        // Peer relays made that false in turn: names DO resolve now.
+        //
+        // What is true for THIS refusal specifically, and is what the assertion pins, is narrower and
+        // more useful: the pair being refused shares a port, and a shared port is exactly what a relay
+        // cannot carry, because the holder's own listener owns it. So --no-pod does not rescue this
+        // pair even though it rescues others.
         assert!(
-            msg.contains("no longer resolve each other by name"),
-            "and what --no-pod costs, or it is an unsigned recommendation: {msg}"
+            msg.contains("works for this pair too, IF")
+                && msg.contains("a wildcard listener owns every address on its port"),
+            "the refusal must say that --no-pod MAY rescue this pair and on what it depends: {msg}"
+        );
+        // THE THIRD WORDING OF THIS CLAUSE, and each correction narrowed it. It first said peers
+        // "no longer resolve by name" and offered a published 127.0.0.1:PORT, which reaches no peer.
+        // It then said the pair "cannot reach each other at all", true before relays existed. It then
+        // said kern would not even try, which was the conservative guess this feature has since
+        // replaced with a measurement of what the services actually bound.
+        assert!(
+            msg.contains("measures which it is once the services are running"),
+            "and it must attribute the answer to a measurement, not to a rule: {msg}"
+        );
+        // AND THE THIRD WAY OUT, which the first two versions of this message did not have because
+        // the reasoning behind them was wrong. MEASURED: two SPECIFIC binds on different addresses
+        // and one port do not conflict, only a wildcard bind takes the whole port. So a service
+        // configured to bind 127.0.0.1 explicitly leaves the peer's alias free, and that is usually
+        // a one-line config change against a port renumber that touches every caller.
+        assert!(
+            msg.contains("bind 127.0.0.1:8080") && msg.contains("rather than 0.0.0.0:8080"),
+            "and it must offer the address change, not only the port change: {msg}"
+        );
+        assert!(
+            !msg.contains("cannot reach each other at all"),
+            "and must not carry the superseded blanket claim: {msg}"
+        );
+        assert!(
+            !msg.contains("has to be a published"),
+            "and it must not hand out a workaround that does not work: {msg}"
         );
         assert!(
             msg.contains("keeps resolving peers by service name"),
