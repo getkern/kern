@@ -642,6 +642,21 @@ pub(crate) fn drop_all_capabilities() -> bool {
 ///
 /// Returns `false` if any step fails, so a caller can refuse to run unprivileged-only code with
 /// privileges it thought it had shed.
+/// Is this thread's capability BOUNDING set empty, as `/proc/self/status` reports it?
+///
+/// Read from `/proc` rather than inferred from the `prctl` return values, because those cannot tell
+/// "the drop failed" from "there was nothing left to drop" - the second `restrict_capabilities` call
+/// hits the latter on every capability. An unreadable `/proc/self/status` answers `false`: this gates
+/// a claim that privileges are gone, and a claim that cannot be checked is not one worth making.
+fn bounding_set_is_empty() -> bool {
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|s| {
+        s.lines()
+            .find(|l| l.starts_with("CapBnd:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .is_some_and(|v| v.chars().all(|c| c == '0'))
+    })
+}
+
 pub(crate) fn restrict_capabilities(mask: u64) -> bool {
     // SAFETY: every call below acts on the calling process only and takes no pointer to memory this
     // function does not own. `capset` is handed a header this function fills completely.
@@ -671,8 +686,28 @@ pub(crate) fn restrict_capabilities(mask: u64) -> bool {
         // The practical exposure was nil, because the bounding set only limits what can be GAINED
         // across an `execve` and `NO_NEW_PRIVS` is already set. The defect was the claim, which is
         // the kind this codebase treats as expensive on its own.
+        // AND THE OUTCOME IS VERIFIED, which it was not: every drop could fail and this function
+        // still returned `true`. Caught by CI on a GitHub runner, where the
+        // `apparmor_restrict_unprivileged_userns` policy lets `unshare(CLONE_NEWUSER)` succeed
+        // WITHOUT granting the full set inside it, so `CAP_SETPCAP` is absent, every
+        // `PR_CAPBSET_DROP` answers EPERM, and `/proc/self/status` read `CapBnd: 000001ffffffffff`
+        // under a claim that every set was empty. Same defect as the `mask` exception documented
+        // above, one layer out: the exposure is nil (the bound only limits what an `execve` can
+        // GAIN, and NO_NEW_PRIVS is already set) and the false claim is the cost.
+        //
+        // THE STATE IS CHECKED, NOT THE CALLS, and the difference is the whole correctness of this.
+        // A first attempt failed the function when any `prctl` returned non-zero, and that broke the
+        // ordinary two-call sequence its own comment describes: the second `restrict_capabilities`
+        // runs with effective already narrowed, so it holds no `CAP_SETPCAP` and EVERY drop answers
+        // EPERM even though the first call had already emptied the bound. Measured here: with
+        // `cap_last_cap` = 40 and the privileges present, 0 of 41 drops fail; after the first call,
+        // all 41 do, with nothing left to remove. "Did the bound end up empty" is the question that
+        // survives both.
         for cap in 0..=last {
             libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0);
+        }
+        if !bounding_set_is_empty() {
+            return false;
         }
         #[repr(C)]
         struct CapHeader {
@@ -1303,6 +1338,72 @@ mod tests {
     /// process would silently change what every later test in this binary runs as. The child reports
     /// through a pipe; the parent asserts. Both calls are made in the child, in the listener's order,
     /// because the defect was in their COMPOSITION and neither call is wrong alone.
+    /// `bounding_set_is_empty` answers about the STATE, in both directions.
+    ///
+    /// The negative half is the one that matters: this test process has a full bounding set, so a
+    /// version that always said "empty" would let `restrict_capabilities` keep claiming success on a
+    /// host that grants no privileges to shed, which is the CI failure this was written for. The
+    /// positive half runs in a forked child so the drop cannot affect the rest of the suite.
+    #[test]
+    fn bounding_set_is_empty_reports_the_state_not_the_calls() {
+        assert!(
+            !bounding_set_is_empty(),
+            "this test process holds a full bounding set: {}",
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap_or_default()
+                .lines()
+                .find(|l| l.starts_with("CapBnd:"))
+                .unwrap_or("CapBnd: unreadable")
+        );
+        let mut fds = [0i32; 2];
+        // SAFETY: fills a two-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: fork in a test binary; the child only unshares, drops and writes one byte.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // SAFETY: the read end belongs to the parent, and the child exits without unwinding.
+            unsafe {
+                libc::close(fds[0]);
+                let verdict: &[u8] = if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                    b"s" // no user namespace here: nothing to conclude
+                } else {
+                    let last = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .unwrap_or(63);
+                    for cap in 0..=last {
+                        libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0);
+                    }
+                    if bounding_set_is_empty() {
+                        b"y"
+                    } else {
+                        b"n"
+                    }
+                };
+                libc::write(fds[1], verdict.as_ptr() as *const libc::c_void, 1);
+                libc::close(fds[1]);
+                libc::_exit(0);
+            }
+        }
+        let mut b = [0u8; 1];
+        // SAFETY: reads one byte into a buffer this function owns, then reaps its own child.
+        let n = unsafe {
+            libc::close(fds[1]);
+            let n = libc::read(fds[0], b.as_mut_ptr() as *mut libc::c_void, 1);
+            libc::close(fds[0]);
+            let mut st: libc::c_int = 0;
+            libc::waitpid(pid, &mut st, 0);
+            n
+        };
+        assert!(n == 1, "the child reported nothing");
+        match b[0] {
+            b's' => eprintln!("skip: this host refuses an unprivileged user namespace"),
+            b'y' => {}
+            _ => panic!("a fully dropped bounding set must read as empty"),
+        }
+    }
+
     #[test]
     fn a_narrowed_drop_still_empties_the_bounding_set() {
         const CAP_NET_BIND_SERVICE: u32 = 10;
@@ -1322,6 +1423,32 @@ mod tests {
             // SAFETY: unshare in a single-threaded forked child.
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 let msg = b"skip";
+                // SAFETY: writes a static buffer to a descriptor this child owns.
+                unsafe {
+                    libc::write(fds[1], msg.as_ptr() as *const libc::c_void, msg.len());
+                    libc::close(fds[1]);
+                    libc::_exit(0);
+                }
+            }
+            // THE NAMESPACE CAN BE GRANTED WITHOUT THE CAPABILITIES IN IT, and then there is no
+            // drop left to measure. A GitHub runner's `apparmor_restrict_unprivileged_userns`
+            // policy does exactly that: `unshare` above succeeds and `CapEff` inside is still
+            // zero, so `CAP_SETPCAP` is absent and `PR_CAPBSET_DROP` can only answer EPERM. That
+            // is the host refusing, not this code failing, and it read as a red CI on both
+            // architectures.
+            //
+            // Measured on the ENTERED namespace rather than assumed from the unshare succeeding,
+            // and it cannot hide a defect in `restrict_capabilities`: this reads the state BEFORE
+            // that function is called, so the only thing it can skip on is a host that never gave
+            // the privileges the function exists to shed.
+            let entered = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let eff_before_drop = entered
+                .lines()
+                .find(|l| l.starts_with("CapEff:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("0");
+            if eff_before_drop.chars().all(|c| c == '0') {
+                let msg = b"skipcaps";
                 // SAFETY: writes a static buffer to a descriptor this child owns.
                 unsafe {
                     libc::write(fds[1], msg.as_ptr() as *const libc::c_void, msg.len());
@@ -1369,6 +1496,13 @@ mod tests {
         let text = String::from_utf8_lossy(&buf[..n as usize]).to_string();
         if text.trim() == "skip" {
             eprintln!("skip: this host refuses an unprivileged user namespace");
+            return;
+        }
+        if text.trim() == "skipcaps" {
+            eprintln!(
+                "skip: this host grants the user namespace without the capabilities inside it \
+                 (AppArmor apparmor_restrict_unprivileged_userns), so there is nothing to drop"
+            );
             return;
         }
         let f: Vec<&str> = text.split_whitespace().collect();
