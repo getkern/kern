@@ -165,6 +165,12 @@ is in the git history.
   signal delivered while the inotify read blocks returns `EINTR`, and a caller reading -1 as "no
   events" would stop rebuilding after the first `SIGWINCH`.
 
+- **`kern --help` now describes `compose watch` and `compose port`.** Both verbs shipped listed in the
+  compose verb line and explained nowhere, so a reader saw `watch|port` and had to guess. Two lines,
+  in the same column as their neighbours. `cli_surface_is_frozen` was regenerated deliberately: the
+  diff is two added lines and nothing removed or renamed, which is what "additive" has to mean for a
+  surface declared stable.
+
 - **`kern compose <file> port <service> <container-port>`**, the twin of `docker compose port`. It
   prints the host address serving that box port, on stdout and alone, and exits non-zero when there
   is no answer: the service is not running, it publishes nothing, or that container port is not among

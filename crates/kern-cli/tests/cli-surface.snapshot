@@ -49,6 +49,8 @@ COMMANDS:
   Multi-box
     compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
     up [--no-pod] [-d] / down                                     Bring up / tear down the compose file in this dir
+    compose <file> watch [service...]                             Rebuild + restart ONE service when its `build:` context changes
+    compose <file> port <service> <container-port>                Print the host address serving that box port (non-zero if none)
     pod create <name> [--no-outbound] [--uid-range] / pod ls [--json] / pod rm <name>  Shared-network pod (boxes reach each other by name)
 
   Config & storage

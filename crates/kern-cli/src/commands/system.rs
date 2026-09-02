@@ -86,6 +86,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
   {d}Multi-box{z}
     {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
     {c}up{z} [--no-pod] [-d] / {c}down{z}                                     Bring up / tear down the compose file in this dir
+    {c}compose{z} <file> {c}watch{z} [service...]                             Rebuild + restart ONE service when its `build:` context changes
+    {c}compose{z} <file> {c}port{z} <service> <container-port>                Print the host address serving that box port (non-zero if none)
     {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls [--json] / pod rm <name>  Shared-network pod (boxes reach each other by name)
 
   {d}Config & storage{z}
