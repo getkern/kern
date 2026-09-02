@@ -1181,6 +1181,35 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
     Ok(order)
 }
 
+/// `wanted`, plus everything those boxes depend on, transitively.
+///
+/// `up <service>` has to start what that service NEEDS, or it starts something that cannot work: a
+/// `web` whose `depends_on` names `db` comes up against a database that was never launched. `stop`,
+/// `start` and `restart` do NOT expand (matching Docker Compose): there the named services are the
+/// whole instruction, and pulling in a dependency would stop or restart a service the user did not
+/// name.
+///
+/// A name in `wanted` that is not a box is kept as-is rather than dropped. The caller validates
+/// selectors before it gets here, and swallowing an unknown one would turn a typo into an empty
+/// selection, which reads as "nothing to do" instead of as a mistake.
+pub fn with_dependencies(boxes: &[ComposeBox], wanted: &[String]) -> HashSet<String> {
+    let by_name: HashMap<&str, &ComposeBox> = boxes.iter().map(|b| (b.name.as_str(), b)).collect();
+    let mut out: HashSet<String> = HashSet::new();
+    // Worklist rather than recursion: a cycle in the file would otherwise recurse until the stack
+    // ends, and `topo_levels` is what reports cycles as cycles. Here a cycle just terminates, because
+    // a name already in `out` is never queued twice.
+    let mut queue: Vec<String> = wanted.to_vec();
+    while let Some(n) = queue.pop() {
+        if !out.insert(n.clone()) {
+            continue;
+        }
+        if let Some(b) = by_name.get(n.as_str()) {
+            queue.extend(b.all_deps().into_iter().map(|d| d.to_string()));
+        }
+    }
+    out
+}
+
 /// Like [`topo_order`], but grouped into dependency LEVELS: every box in level `k` depends only on
 /// boxes in levels `< k`, so all boxes WITHIN one level are independent and can be started
 /// concurrently - a barrier between levels preserves `depends_on`. Same deterministic file-order
@@ -1581,6 +1610,52 @@ mod tests {
         // Every box appears exactly once across all levels.
         let total: usize = levels.iter().map(|l| l.len()).sum();
         assert_eq!(total, 4);
+    }
+
+    /// `with_dependencies` closes over the graph transitively, and stops at a cycle.
+    ///
+    /// The transitive step is the point: `up d` must bring `b`, and `b` needs `a`, so an expansion
+    /// that only looked one hop deep would start `d` against a service that was never launched. The
+    /// cycle case is here because the worklist is what makes it terminate; the same shape written
+    /// recursively runs off the stack, and this function is reached before `topo_levels` has had a
+    /// chance to report the cycle as one.
+    #[test]
+    fn with_dependencies_closes_transitively_and_survives_a_cycle() {
+        let doc = "[box.a]\nimage=\"x\"\n\
+                   [box.c]\nimage=\"x\"\n\
+                   [box.b]\nimage=\"x\"\ndepends_on=[\"a\"]\n\
+                   [box.d]\nimage=\"x\"\ndepends_on=[\"b\",\"c\"]";
+        let boxes = parse(doc).unwrap();
+        let got = |want: &[&str]| {
+            let mut v: Vec<String> = with_dependencies(
+                &boxes,
+                &want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            got(&["d"]),
+            vec!["a", "b", "c", "d"],
+            "d pulls in b, c and a"
+        );
+        assert_eq!(got(&["b"]), vec!["a", "b"], "b pulls in a only");
+        assert_eq!(got(&["a"]), vec!["a"], "a depends on nothing");
+        assert_eq!(got(&["c", "a"]), vec!["a", "c"], "two roots stay two");
+        // An empty selection expands to nothing, NOT to the whole stack: the callers read
+        // "no selector" from the list being empty before they ever call this.
+        assert!(got(&[]).is_empty());
+
+        let cyc =
+            "[box.x]\nimage=\"i\"\ndepends_on=[\"y\"]\n[box.y]\nimage=\"i\"\ndepends_on=[\"x\"]";
+        let cyclic = parse(cyc).unwrap();
+        let mut v: Vec<String> = with_dependencies(&cyclic, &["x".to_string()])
+            .into_iter()
+            .collect();
+        v.sort();
+        assert_eq!(v, vec!["x", "y"], "a cycle terminates instead of recursing");
     }
 
     #[test]

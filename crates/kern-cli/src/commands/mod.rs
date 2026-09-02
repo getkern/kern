@@ -3666,8 +3666,7 @@ impl ComposeAction {
 /// One race remains for pure name-scoping: `down A` stops A's `migrate`, a concurrent `up B`
 /// re-creates a `migrate` box, then A's reap would delete B's fresh sidecar. Closed BY CONSTRUCTION:
 /// a box's sidecars are reaped ONLY if that box is no longer alive.
-fn stop_stack(boxes: &[crate::compose::ComposeBox], pod: &str) -> Vec<String> {
-    let names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
+fn stop_stack(names: Vec<String>, pod: &str) -> Vec<String> {
     let _ = stop(&names, false); // best-effort - some may already be gone
     for n in &names {
         if !is_box_alive(n) {
@@ -4835,7 +4834,7 @@ fn run_terminal_verb(
             if let Ok(dir) = crate::relayhold::stack_dir(pod) {
                 crate::relayhold::kill_holder(&dir);
             }
-            let names = stop_stack(boxes, pod);
+            let names = stop_stack(boxes.iter().map(|b| b.name.clone()).collect(), pod);
             // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
             // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
             // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
@@ -4862,7 +4861,20 @@ fn run_terminal_verb(
             // pod with them. With no such member the pod still goes, because `kern stop` collapses a
             // pod once its LAST member exits (a deliberate, documented invariant - see `stop`); a
             // later `compose start` recreates it and services reach each other by name again.
-            let names = stop_stack(boxes, pod);
+            // ONLY THE SERVICES NAMED, and before this they were validated and then ignored: `stop b`
+            // on an a/b/c stack stopped all three and reported "3 box(es) stopped" for one name. A
+            // selector that is accepted and not honoured is the same class of defect as a cap that is
+            // accepted and not enforced, which is the one thing this codebase refuses to do quietly.
+            // No dependency expansion, matching Docker Compose: the named services are the whole
+            // instruction, and pulling in a dependency would stop something the user did not name.
+            let names = stop_stack(
+                boxes
+                    .iter()
+                    .filter(|b| selected(b))
+                    .map(|b| b.name.clone())
+                    .collect(),
+                pod,
+            );
             let pod_alive = crate::pod::holder_pid(pod).is_some();
             println!(
                 "compose stop: {} box(es) stopped, pod '{pod}' {}",
@@ -4877,7 +4889,16 @@ fn run_terminal_verb(
         }
         // `restart` = stop everything, then fall through to the full bring-up below.
         ComposeAction::Restart => {
-            let names = stop_stack(boxes, pod);
+            // Same selection as `stop`; the bring-up below narrows to the same names, so
+            // `restart b` stops and starts b and leaves its peers alone.
+            let names = stop_stack(
+                boxes
+                    .iter()
+                    .filter(|b| selected(b))
+                    .map(|b| b.name.clone())
+                    .collect(),
+                pod,
+            );
             println!(
                 "compose restart: {} box(es) stopped, restarting",
                 names.len()

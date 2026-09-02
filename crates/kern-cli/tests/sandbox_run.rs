@@ -7555,3 +7555,142 @@ fn run_landlock_rw_rejects_an_empty_or_missing_value() {
         );
     }
 }
+
+/// A SERVICE SELECTOR NARROWS `stop`, `start` AND `restart` INSTEAD OF BEING IGNORED.
+///
+/// `[service...]` is in the CLI surface and was validated on the way in, then dropped: on an a/b/c
+/// stack, `stop b` stopped all three and said "3 box(es) stopped" for one name, and `start b`
+/// launched all three. An argument that is accepted and not honoured is the same class of defect as
+/// a resource cap that is accepted and not enforced.
+///
+/// ASSERTED ON PIDS, not on a count. A count cannot tell "b was left alone" from "b was stopped and
+/// started again while I was not looking", and the whole claim here is that the peers are UNTOUCHED.
+///
+/// `b` depends on `a` so the one asymmetry is covered too: `up b` expands to its dependency (Docker
+/// Compose's rule for `up`), while `start` and `restart` do not expand.
+#[test]
+fn a_service_selector_narrows_stop_start_and_restart() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "svcsel");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-sel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-sel-{}.toml", std::process::id()));
+    let svc = |n: &str, dep: &str| {
+        format!(
+            "[box.{n}]\nrootfs = \"{rootfs}\"\n{dep}command = [\"/bin/busybox\", \"sleep\", \"300\"]\n\n"
+        )
+    };
+    fs::write(
+        &toml,
+        format!(
+            "{}{}{}",
+            svc("a", ""),
+            svc("b", "depends_on = [\"a\"]\n"),
+            svc("c", "")
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut v = vec!["compose", toml.to_str().unwrap()];
+        v.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&v)
+            .output()
+            .expect("run kern")
+    };
+    // service -> pid, read from `ps --json` so the tree-drawing characters in the table cannot be
+    // parsed as data (they can, and were, on the first attempt at this).
+    let live = || -> std::collections::BTreeMap<String, String> {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "--json"])
+            .output()
+            .expect("run kern ps");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut map = std::collections::BTreeMap::new();
+        for chunk in text.split('{').skip(1) {
+            let field = |k: &str| -> Option<String> {
+                let at = chunk.find(&format!("\"{k}\""))? + k.len() + 3;
+                let rest = chunk[at..].trim_start().trim_start_matches([':', ' ']);
+                let rest = rest.trim_start_matches('"');
+                let end = rest.find(['"', ',', '}'])?;
+                Some(rest[..end].to_string())
+            };
+            if let (Some(name), Some(pid)) = (field("name"), field("pid")) {
+                if let Some(svc) = name.rsplit('-').next() {
+                    map.insert(svc.to_string(), pid);
+                }
+            }
+        }
+        map
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+    };
+
+    run(&["up", "-d"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let all = live();
+    if all.len() != 3 {
+        run(&["down"]);
+        cleanup();
+        eprintln!("skip: the three-service stack did not come up here (got {all:?})");
+        return;
+    }
+
+    // stop ONE: the other two keep their pids, so they were not restarted either.
+    run(&["stop", "b"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let after_stop = live();
+    // start ONE: b comes back, and again the peers are untouched.
+    run(&["start", "b"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let after_start = live();
+    // restart ONE: only that pid changes.
+    run(&["restart", "c"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let after_restart = live();
+    run(&["down"]);
+    cleanup();
+
+    assert!(
+        !after_stop.contains_key("b"),
+        "`stop b` must stop b: {after_stop:?}"
+    );
+    assert_eq!(
+        (after_stop.get("a"), after_stop.get("c")),
+        (all.get("a"), all.get("c")),
+        "`stop b` must leave a and c running on the SAME pids: {after_stop:?} vs {all:?}"
+    );
+    assert!(
+        after_start.contains_key("b"),
+        "`start b` must bring b back: {after_start:?}"
+    );
+    assert_eq!(
+        (after_start.get("a"), after_start.get("c")),
+        (all.get("a"), all.get("c")),
+        "`start b` must not touch a and c: {after_start:?} vs {all:?}"
+    );
+    assert_ne!(
+        after_restart.get("c"),
+        after_start.get("c"),
+        "`restart c` must actually restart c: {after_restart:?}"
+    );
+    assert_eq!(
+        (after_restart.get("a"), after_restart.get("b")),
+        (after_start.get("a"), after_start.get("b")),
+        "`restart c` must leave a and b alone: {after_restart:?} vs {after_start:?}"
+    );
+}

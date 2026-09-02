@@ -276,6 +276,24 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `start` launches only what is NOT already running. Filtering the LEVELS (not `boxes`) keeps the
     // dependency graph exactly as computed - dropping a service from `boxes` would make its dependents
     // reference an unknown name - and keeps every level entry backed by a real box.
+    // A SERVICE SELECTION NARROWS WHAT IS STARTED, and it did not before: `start b` on an a/b/c
+    // stack launched all three, because the selector reached the read-only verbs and stopped there.
+    // Filtered on the LEVELS for the same reason `start` is just below - dropping a service from
+    // `boxes` would leave its dependents naming a box that is no longer there.
+    //
+    // `up` EXPANDS to what the named services depend on and the others do not, which is Docker
+    // Compose's split: `up web` has to bring the `db` it declares or it starts something that cannot
+    // work, while `start web` and `restart web` are instructions about web alone.
+    if !services.is_empty() {
+        let wanted: std::collections::HashSet<String> = if action == ComposeAction::Up {
+            crate::compose::with_dependencies(&boxes, services)
+        } else {
+            services.iter().cloned().collect()
+        };
+        for level in &mut levels {
+            level.retain(|n| wanted.contains(n));
+        }
+    }
     if action == ComposeAction::Start {
         for level in &mut levels {
             level.retain(|n| !is_box_alive(n));
