@@ -5724,13 +5724,24 @@ fn a_shared_port_costs_only_the_service_that_binds_the_wildcard() {
         "the service that binds 127.0.0.1 must still reach its peer on the shared port: {tail}"
     );
     // THE HALF THAT IS GENUINELY LOST, named rather than left to be discovered.
+    //
+    // WHICH wildcard is the image's choice, not this test's: busybox binds `::` here, and the report
+    // used to say `0.0.0.0` and advise `127.0.0.1` no matter what it had actually seen, which sends
+    // the user looking for a string that is not in their compose file and names an address an IPv6
+    // listener will never own. So the pair is asserted together: the address reported and the remedy
+    // offered have to be the same family.
+    let (wildcard, remedy) = if up_err.contains("it listens on :: for") {
+        ("::", "bind ::1:7361")
+    } else {
+        ("0.0.0.0", "bind 127.0.0.1:7361")
+    };
     assert!(
-        up_err.contains("cannot reach") && up_err.contains("0.0.0.0"),
+        up_err.contains("cannot reach") && up_err.contains(wildcard),
         "and the wildcard direction must be named with its reason: {up_err}"
     );
     assert!(
-        up_err.contains("bind 127.0.0.1:7361"),
-        "and the remedy must be the cheap one, not only a port change: {up_err}"
+        up_err.contains(remedy),
+        "and the remedy must be the cheap one, in the family the service actually binds: {up_err}"
     );
     assert!(
         ps.contains("peer edge DOWN"),

@@ -290,7 +290,12 @@ pub(crate) fn decode_plan(text: &str) -> Result<Vec<crate::nopod::RelayPlan>, St
 pub(crate) enum PortState {
     /// Something is listening on `0.0.0.0` or `::`, which owns the WHOLE port in that namespace: no
     /// other address, alias included, can be bound on it.
-    Wildcard,
+    ///
+    /// CARRIES WHICH ONE, because the report tells the user what to change in their own config and
+    /// the two are different lines in it. Saying "it listens on 0.0.0.0" to someone whose service
+    /// binds `::` sends them looking for a string that is not in their file, and the advice that
+    /// follows it ("bind 127.0.0.1 instead") is the wrong half of the stack for an IPv6 listener.
+    Wildcard(&'static str),
     /// Something is listening, and only on specific addresses. Another address on the same port is
     /// free.
     SpecificOnly,
@@ -318,6 +323,13 @@ pub(crate) enum PortState {
 /// does not report it, so the conservative reading is the one taken: at worst a relay is not created
 /// where it could have been, which is a missing edge that gets named rather than a service that
 /// fails to start.
+///
+/// MEASURED, not reasoned, and the cost is exactly one case wide. In a fresh netns with
+/// `bindv6only=0`: a listener on `::` with `IPV6_V6ONLY=0` makes a later `bind("127.0.0.2", p)` fail
+/// EADDRINUSE, and with `IPV6_V6ONLY=1` that same bind SUCCEEDS - while `/proc/net/tcp6` shows the
+/// identical all-zero line for both. So the false positive is real and it is confined to a service
+/// that deliberately sets `IPV6_V6ONLY`; the edge it costs is reported by name, with the address the
+/// kernel actually showed.
 pub(crate) fn port_state(pid1: i32, port: u16) -> PortState {
     let mut found = false;
     for family in ["tcp", "tcp6"] {
@@ -343,7 +355,9 @@ pub(crate) fn port_state(pid1: i32, port: u16) -> PortState {
             }
             found = true;
             if ip.bytes().all(|b| b == b'0') {
-                return PortState::Wildcard;
+                // The family the zeros came from IS the address the user wrote: 8 hex digits is an
+                // IPv4 `0.0.0.0`, 32 is an IPv6 `::`.
+                return PortState::Wildcard(if family == "tcp" { "0.0.0.0" } else { "::" });
             }
         }
     }
@@ -460,21 +474,21 @@ pub(crate) fn run_holder(dir: &str) -> ! {
                 slots.push(Slot::new(relay));
                 up += 1;
             }
-            Attempt::Blocked(why) => {
+            Attempt::Blocked(reason) => {
                 // NOT AN ERROR, and this is the difference the measurement bought. A pair whose
                 // holder owns the whole port cannot be served by anything kern can do, and refusing
                 // the stack over it would refuse every stack that has one such pair and nine good
                 // ones. It is reported by name and the rest are served.
-                // NAMED, or it is not a report. A note that says a holder binds the wildcard
-                // without saying WHICH holder and which peer is unusable in a stack with more than
-                // two services, which is every stack this feature exists for.
                 println!(
-                    "relay-blocked '{}' cannot reach '{}' on {}: {why}. Give one of them a \
-                     different internal \
-                     port, or make '{}' bind 127.0.0.1:{} instead of 0.0.0.0:{}",
-                    r.in_box, r.to_box, r.port, r.in_box, r.port, r.port
+                    "relay-blocked {}",
+                    BlockReport {
+                        reason,
+                        holder: &r.in_box,
+                        peer: &r.to_box,
+                        port: r.port,
+                    }
                 );
-                slots.push(Slot::blocked(why));
+                slots.push(Slot::blocked(reason));
             }
             Attempt::Failed(e) => {
                 // FAIL-CLOSED AT SPAWN, and only at spawn. A relay that cannot be created for a
@@ -622,7 +636,7 @@ struct Slot {
     given_up: bool,
     /// Why this edge cannot be served at all, when the reason is the holder's own listener rather
     /// than a failure. Kept so the degraded file can carry it and `compose ps` can print it.
-    blocked: Option<&'static str>,
+    blocked: Option<BlockReason>,
 }
 
 impl Slot {
@@ -647,7 +661,7 @@ impl Slot {
 
     /// A slot with no relay because the holder owns the whole port. Re-measured every pass, so it is
     /// not terminal: a service that restarts bound to a specific address clears it.
-    fn blocked(why: &'static str) -> Self {
+    fn blocked(why: BlockReason) -> Self {
         Self {
             relay: None,
             a: kern_isolation::peer::BoxRef {
@@ -667,6 +681,87 @@ impl Slot {
     }
 }
 
+/// Why a pair cannot be served right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockReason {
+    /// The holder binds this wildcard address, so it owns every address on that port. Carries the
+    /// address AS THE KERNEL REPORTED IT, so the report names the string that is in the user's own
+    /// config rather than a guess at which family they used.
+    Wildcard(&'static str),
+    /// The holder declares the port and has not bound it yet.
+    NotListeningYet,
+}
+
+impl BlockReason {
+    /// The loopback address of the same family as the wildcard, which is what the user should bind
+    /// instead. Telling an IPv6 listener to bind `127.0.0.1` names an address it will never own.
+    fn specific_instead(self) -> &'static str {
+        match self {
+            Self::Wildcard("::") => "::1",
+            _ => "127.0.0.1",
+        }
+    }
+}
+
+impl std::fmt::Display for BlockReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wildcard(addr) => write!(
+                f,
+                "it listens on {addr} for that port, which owns every address on it"
+            ),
+            Self::NotListeningYet => write!(
+                f,
+                "it declares that port and is not listening on it yet, so binding the peer's alias \
+                 now would make its own later bind fail"
+            ),
+        }
+    }
+}
+
+/// One `relay-blocked` line, worded in ONE place.
+///
+/// The first pass and the healing loop both report this fact, and they used to word it differently:
+/// only the first offered the fix, so an edge that went wrong ten minutes in told the user strictly
+/// less than one that was wrong from the start, about the same condition. Same class of defect as the
+/// other derived-condition duplications in this codebase, and closed the same way.
+pub(crate) struct BlockReport<'a> {
+    pub(crate) reason: BlockReason,
+    pub(crate) holder: &'a str,
+    pub(crate) peer: &'a str,
+    pub(crate) port: u16,
+}
+
+impl std::fmt::Display for BlockReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // NAMED, or it is not a report. A note that says a holder binds the wildcard without saying
+        // WHICH holder and which peer is unusable in a stack with more than two services, which is
+        // every stack this feature exists for.
+        write!(
+            f,
+            "'{}' cannot reach '{}' on {}: {}",
+            self.holder, self.peer, self.port, self.reason
+        )?;
+        match self.reason {
+            BlockReason::Wildcard(addr) => write!(
+                f,
+                ". Give one of them a different internal port, or make '{}' bind {}:{} instead of \
+                 {addr}",
+                self.holder,
+                self.reason.specific_instead(),
+                self.port
+            ),
+            // No bind advice here: the port is not owned by anyone yet, so there is nothing to move.
+            // What the user needs to know is that the edge waits on THIS service.
+            BlockReason::NotListeningYet => write!(
+                f,
+                ". The edge comes up on its own once '{}' binds that port",
+                self.holder
+            ),
+        }
+    }
+}
+
 /// What one attempt to create a relay produced.
 enum Attempt {
     /// It is running.
@@ -679,7 +774,7 @@ enum Attempt {
     ),
     /// The holder binds the whole port, so no address of that port is free inside it. Not a failure:
     /// nothing kern can do would change it, and the rest of the stack is unaffected.
-    Blocked(&'static str),
+    Blocked(BlockReason),
     /// Something else went wrong, carrying the reason.
     Failed(String),
 }
@@ -719,13 +814,8 @@ fn try_spawn_in(
         };
     }
     match port_state(a.pid1, r.port) {
-        PortState::Wildcard => Attempt::Blocked(
-            "it listens on 0.0.0.0 for that port, which owns every address on it",
-        ),
-        PortState::NotListening => Attempt::Blocked(
-            "it declares that port and is not listening on it yet, so binding the peer's alias now \
-             would make its own later bind fail",
-        ),
+        PortState::Wildcard(addr) => Attempt::Blocked(BlockReason::Wildcard(addr)),
+        PortState::NotListening => Attempt::Blocked(BlockReason::NotListeningYet),
         PortState::SpecificOnly => {
             match kern_isolation::peer::spawn(a, r.alias, b, r.port, r.from_alias, pump_cap) {
                 Ok(relay) => Attempt::Up((relay, a, b)),
@@ -1000,7 +1090,7 @@ fn rebuild_if_needed(
         old.stop();
     }
     match try_spawn_in(snapshot, r, pump_cap) {
-        Attempt::Blocked(why) => {
+        Attempt::Blocked(reason) => {
             // RE-MEASURED EVERY PASS, so a service that restarts bound to `127.0.0.1`
             // instead of `0.0.0.0` gets its edge without anyone running a command. The
             // reverse holds too: a service that starts binding the wildcard loses it, and
@@ -1008,11 +1098,16 @@ fn rebuild_if_needed(
             if !slot.given_up {
                 slot.given_up = true;
                 println!(
-                    "relay-blocked '{}' cannot reach '{}' on {}: {why}",
-                    r.in_box, r.to_box, r.port
+                    "relay-blocked {}",
+                    BlockReport {
+                        reason,
+                        holder: &r.in_box,
+                        peer: &r.to_box,
+                        port: r.port,
+                    }
                 );
             }
-            slot.blocked = Some(why);
+            slot.blocked = Some(reason);
             slot.dead = true;
         }
         Attempt::Up(relay) => {
@@ -1309,18 +1404,31 @@ mod tests {
                 say("bad");
                 return;
             };
+            // The IPv6 wildcard is a SEPARATE case, not a rewording of the IPv4 one: it is reported
+            // in `tcp6` rather than `tcp`, and it is the address the user has to change in their own
+            // config, so the state has to name which of the two it saw.
+            let Ok(wildcard6) = TcpListener::bind("[::]:0") else {
+                say("skip");
+                return;
+            };
+            let Ok(wp6) = wildcard6.local_addr().map(|a| a.port()) else {
+                say("bad");
+                return;
+            };
             let a = port_state(me, sp);
             let b = port_state(me, wp);
+            let e = port_state(me, wp6);
             drop(specific);
             drop(wildcard);
+            drop(wildcard6);
             // Nothing else exists in this namespace, so both ports are now genuinely free.
             let c = port_state(me, sp);
             let d = port_state(me, wp);
-            say(&format!("{a:?} {b:?} {c:?} {d:?}"));
+            say(&format!("{a:?} {b:?} {c:?} {d:?} {e:?}"));
         }
         // SAFETY: the write end belongs to the child.
         unsafe { libc::close(fds[1]) };
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 256];
         // SAFETY: reads at most `buf.len()` into a buffer this function owns.
         let n = unsafe { libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         // SAFETY: waits on this process's own child.
@@ -1336,9 +1444,10 @@ mod tests {
         }
         assert_eq!(
             msg.trim(),
-            "SpecificOnly Wildcard NotListening NotListening",
+            "SpecificOnly Wildcard(\"0.0.0.0\") NotListening NotListening Wildcard(\"::\")",
             "127.0.0.1 must not read as the wildcard (every relay would be refused), 0.0.0.0 must \
-             (a relay would race the service's own bind), and a closed port must be neither"
+             (a relay would race the service's own bind), a closed port must be neither, and each \
+             wildcard must name the address it was seen on"
         );
     }
 
