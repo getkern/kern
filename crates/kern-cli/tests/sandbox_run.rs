@@ -5963,6 +5963,21 @@ fn a_box_start_still_reaps_an_orphan_cgroup() {
     // ONE BOX FIRST, so the slice exists to be searched for: it is created the first time a box caps
     // through it.
     let first = run_one("sweepwarm");
+    // AND ITS EXIT IS THE ENVIRONMENT CHECK, which this test did not read. `userns_plausible()` above
+    // only proves a user namespace can be CREATED; the GitHub runners' AppArmor
+    // `apparmor_restrict_unprivileged_userns` policy allows exactly that and denies a step after it,
+    // so a box that cannot start there reached the final assertion as "the box must start" and turned
+    // a host property into a red CI on both x86 and aarch64. This box is a bare `busybox true` that
+    // exercises nothing the test measures, so its failure can only be the environment: a defect in the
+    // sweep itself leaves it succeeding and is still asserted on below.
+    if !first.status.success() {
+        eprintln!(
+            "skip: this host cannot start a plain box, so there is nothing to sweep through: {}",
+            String::from_utf8_lossy(&first.stderr).trim()
+        );
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
     let Some(slice) = find_slice() else {
         eprintln!(
             "skip: no kern.slice under this user's cgroup, so this host caps another way: {}",
