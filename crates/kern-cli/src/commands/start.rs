@@ -1565,6 +1565,44 @@ pub fn run(
         // caps it was given. systemd accepts `MemoryMax=`/`CPUQuota=` that the kernel cannot honour
         // and reports nothing, so verify the effective chain rather than trusting the assumption.
         kern_isolation::warn_unenforced_caps(memory, cpus, None);
+    } else if memory.is_none()
+        && cpus.is_none()
+        && !kern_common::env_flag("KERN_QUIET")
+        && !kern_common::env_flag("KERN_ALLOW_UNCAPPED")
+        && !kern_isolation::memory_cap_in_force_at_or_below(SCOPE_MEMORY_MAX_BYTES)
+    {
+        // THE DEFAULT CAP, WHICH NOBODY TYPED AND WHICH BOTH BRANCHES ABOVE ARE BLIND TO.
+        //
+        // A plain `kern run` is not uncapped: the scope it re-execs into carries `MemoryMax=512M`,
+        // `MemorySwapMax=0` and `TasksMax=512`, so a workload over that ceiling is OOM-killed and told
+        // why. `KERN_NO_SCOPE=1` skips that scope, and with it the default goes too. Both branches
+        // above are gated on a REQUEST (`memory.is_some() || cpus.is_some()`), so the case where
+        // nothing was typed said nothing at all.
+        //
+        // MEASURED on this host, allocating 800 MiB under a 512 MiB default:
+        //
+        //   kern run                       killed, rc 137, with the OOM message
+        //   KERN_NO_SCOPE=1 kern run       ran to completion, rc 0, and stderr was EMPTY
+        //
+        // and the process landed in whatever cgroup the caller happened to sit in, which on that run
+        // was an unrelated desktop application's scope, with `memory.max`, `memory.swap.max` and
+        // `pids.max` all at their host values.
+        //
+        // `kern box` already closed this exact gap on its own path, and its comment states the rule
+        // this branch is applying: memory and pids ALWAYS carry a default, so accepting a cap, default
+        // or requested, and enforcing nothing is the one thing this codebase does not do quietly. The
+        // rule was stated for boxes and `kern run` was left out of it.
+        //
+        // VERIFIED against the cgroup rather than inferred from `cg` or from the absence of an env
+        // var, for the same reason the sandbox path does it that way: the question is whether a cap is
+        // in force, and only the cgroup answers that.
+        eprintln!(
+            "kern: warning: KERN_NO_SCOPE skipped the systemd scope, and with it kern's DEFAULT \
+             memory cap - this command runs with no RAM ceiling and no OOM backstop, in the cgroup \
+             of whatever started it. Unset KERN_NO_SCOPE to get the default back, pass an explicit \
+             `--memory <size>` (applied best-effort on this path), or set KERN_ALLOW_UNCAPPED=1 to \
+             say the uncapped run is intended and silence this."
+        );
     }
     // `kern run` exec()s the workload IN PLACE - there is no supervisor left to reap it and drop the
     // guard afterwards. The guard's Drop would `rmdir` the cgroup we're about to exec into, which is

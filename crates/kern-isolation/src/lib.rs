@@ -68,9 +68,15 @@ pub use cgroup::gc_orphan_box_cgroups;
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
 /// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.
 pub use cgroup::memory_cap_enforceable;
+/// Is a memory cap of at most `bytes` actually in force on this process's cgroup chain?
+/// See [`cgroup::memory_cap_in_force_at_or_below`]: `true` when it cannot be told.
+pub use cgroup::memory_cap_in_force_at_or_below;
 /// Why no systemd user manager is reachable on THIS host, for the uncapped warning's middle clause.
 /// See [`cgroup::missing_manager_clause`].
 pub use cgroup::missing_manager_clause;
+/// How many processes the kernel's OOM killer has killed in this cgroup subtree.
+/// See [`cgroup::oom_kill_count`].
+pub use cgroup::oom_kill_count;
 /// Move kern's own processes out of the box's scope root, so the box's whole-box OOM kill takes the
 /// workload and not the supervisor that records its exit code. Call once, at process entry, before any
 /// fork. See [`cgroup::prepare_delegated_scope`].

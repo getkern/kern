@@ -6,7 +6,7 @@
 //! isolation still holds; only the resource cap is skipped. cgroup v2 only.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -59,6 +59,48 @@ fn current_v2_cgroup() -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from("/sys/fs/cgroup").join(rel))
+}
+
+/// How many processes the kernel's OOM killer has killed in this process's cgroup SUBTREE.
+///
+/// WHY A COUNTER AND NOT THE BOX'S OWN CGROUP
+///   A box killed by its `memory.max` leaves exit status 137 and nothing else. 137 is `128 + SIGKILL`
+///   and SIGKILL has many senders, so on its own it tells an operator nothing: measured on this
+///   codebase, `kern run -- python3 -c "bytearray(900*1024*1024)"` against the default 512 MiB cap
+///   exits 137 with EMPTY output, and the workload simply vanishes. That is kern applying a limit,
+///   the limit firing, and kern saying nothing, which is the one failure this codebase treats as
+///   expensive.
+///
+///   Reading the box's OWN cgroup would be exact and is not available: on the scope path systemd is
+///   asked for `--collect`, so the unit and its directory are gone by the time the launcher observes
+///   the exit. Measured: the `kern-box-*.scope` directory no longer exists after `reap` returns.
+///
+///   `memory.events` is HIERARCHICAL, so an ancestor that outlives the box carries the count. Read it
+///   before the box starts and again after it dies: an increase means the OOM killer fired somewhere
+///   in this subtree while the box was running. That is weaker than naming the process, and the
+///   caller's message says exactly that rather than claiming more.
+///
+/// The nearest readable ancestor is used, which minimises how much unrelated activity shares the
+/// counter: for a user session that is `app.slice`, the same directory systemd creates the box's
+/// transient scope in. `None` when no ancestor exposes the file (cgroup v1, no memory controller, or
+/// a box that lands under a slice this process is not below), and `None` is not a failure: the caller
+/// then reports nothing rather than guessing.
+pub fn oom_kill_count() -> Option<u64> {
+    let mut dir = current_v2_cgroup()?;
+    // Start at the PARENT: this process's own leaf does not contain the box, which is created as a
+    // sibling, so the leaf's counter would never move however many boxes were killed.
+    while dir.pop() {
+        if !dir.starts_with("/sys/fs/cgroup") || dir == Path::new("/sys/fs/cgroup") {
+            return None;
+        }
+        if let Ok(text) = fs::read_to_string(dir.join("memory.events")) {
+            return text
+                .lines()
+                .find_map(|l| l.strip_prefix("oom_kill "))
+                .and_then(|n| n.trim().parse().ok());
+        }
+    }
+    None
 }
 
 /// Is the direct fast-cap path usable here? True iff kern's delegated `kern.slice` can be ensured - then
@@ -1792,6 +1834,36 @@ fn is_real_limit(raw: &str) -> bool {
     !v.is_empty() && !v.starts_with("max")
 }
 
+/// This process's own cgroup directory, or `None` when the layout is not one this code models.
+///
+/// cgroup v2 line: `0::/user.slice/.../foo.scope`. Anything else is v1/hybrid, and staying quiet
+/// beats answering about a layout we did not inspect, so every caller treats `None` as "cannot tell"
+/// rather than as "not capped".
+fn own_cgroup_dir() -> Option<std::path::PathBuf> {
+    let raw = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = raw
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)
+        .filter(|p| p.starts_with('/'))?;
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+}
+
+/// Is a memory cap of at most `bytes` ACTUALLY in force on this process's cgroup chain?
+///
+/// For the caller that has to decide whether a cap nobody typed is still there. `warn_unenforced_caps`
+/// cannot answer this: every one of its checks is gated on the caller having ASKED, which is right for
+/// a flag and wrong for a default.
+///
+/// `true` WHEN WE CANNOT TELL, deliberately, and it is the opposite default from most of this file. A
+/// caller uses this to decide whether to warn, and a warning that fires because `/proc/self/cgroup`
+/// was unreadable is a warning with nothing behind it. The cost of the two errors is not symmetric
+/// here: staying quiet on an unknown host loses a notice, while crying wolf on every start teaches the
+/// reader to skip the line that matters.
+pub fn memory_cap_in_force_at_or_below(bytes: u64) -> bool {
+    own_cgroup_dir().is_none_or(|dir| memory_capped_at_or_below(&dir, bytes))
+}
+
 /// Warn for every cap the caller ASKED for that nothing in this process's cgroup chain enforces.
 ///
 /// The direct path already does this at the inner cgroup (see the `capped_in_tree` warnings above),
@@ -1811,20 +1883,9 @@ pub fn warn_unenforced_caps(memory: Option<u64>, cpus: Option<f64>, pids: Option
     if env_flag("KERN_QUIET") {
         return;
     }
-    let Ok(raw) = fs::read_to_string("/proc/self/cgroup") else {
+    let Some(dir) = own_cgroup_dir() else {
         return;
     };
-    // cgroup v2 line: `0::/user.slice/.../foo.scope`. Anything else is v1/hybrid, which this check
-    // does not model - staying quiet beats warning about a layout we did not inspect.
-    let Some(rel) = raw
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .map(str::trim)
-        .filter(|p| p.starts_with('/'))
-    else {
-        return;
-    };
-    let dir = std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
     // Each knob carries its OWN enforcement check, so the loop dispatches on the check, not on the
     // file name. The three differ on purpose:
     //   * memory - VALUE-aware (`AtOrBelow`): an ancestor `memory.max` larger than the request does not

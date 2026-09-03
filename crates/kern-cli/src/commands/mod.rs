@@ -1755,6 +1755,10 @@ fn scope_memory_max(memory: Option<u64>) -> u64 {
 /// On a byte: forward the catchable fatal signals to `child` (`systemd-run`), wait for it, and `exit`
 /// with its code - never returns. On EOF: reap `child` and RETURN, so the caller falls back.
 fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
+    // Read BEFORE the workload can allocate. The child was forked a moment ago and has not reached
+    // its own exec yet, so this is the baseline the comparison at the bottom needs. Cheap: one small
+    // read of one sysfs file, once per box, off the start path's critical section.
+    let oom_before = kern_isolation::oom_kill_count();
     let mut byte = [0u8; 1];
     let n = loop {
         let r = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
@@ -1799,6 +1803,33 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
     } else {
         1
     };
+    // A BOX KILLED BY ITS OWN MEMORY CAP MUST NOT VANISH IN SILENCE.
+    //
+    // 137 is `128 + SIGKILL` and SIGKILL has many senders, so on its own it tells an operator
+    // nothing. Measured before this: `kern run -- python3 -c "bytearray(900*1024*1024)"` against the
+    // default cap exits 137 with EMPTY output and the workload simply disappears. kern applied the
+    // limit, the limit fired, and kern said nothing, which is the failure this codebase calls the
+    // expensive one. It costs more on a device with UNIFIED memory, where GPU allocations are
+    // charged to the same cap: on a Jetson Orin Nano the vgpu probe was killed this way on every run
+    // until the cap was raised, and the only symptom was an empty screen.
+    //
+    // The claim is kept to what was measured. The box's own cgroup is gone (`--collect`), so this
+    // reads a hierarchical ancestor counter before and after, which says the OOM killer fired in
+    // this subtree and not which process it took. The wording says that.
+    if code == 128 + libc::SIGKILL {
+        let after = kern_isolation::oom_kill_count();
+        if let (Some(a), Some(b)) = (oom_before, after) {
+            if b > a {
+                eprintln!(
+                    "kern: the workload was killed by the kernel's OOM killer, which fired in \
+                     kern's cgroup while it ran. A box gets a memory cap it cannot exceed; raise it \
+                     with `--memory <size>` (or `memory = \"<size>\"` in a vcpu: profile) if the \
+                     workload needs more. On a device with unified memory, GPU allocations count \
+                     against the same cap."
+                );
+            }
+        }
+    }
     std::process::exit(code);
 }
 
