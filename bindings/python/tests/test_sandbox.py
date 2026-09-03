@@ -1250,6 +1250,7 @@ def test_a_failed_setup_keeps_a_workspace_the_caller_supplied(tmp_path):
     assert (theirs / "keep.txt").read_text() == "mine"
 
 
+@integration
 def test_a_missing_interpreter_is_a_typed_fault_naming_the_binary_and_the_image():
     """`language="node"` on the default image is the case a model hits: the enum advertises three
     languages and `python:3.12-slim` carries two.
@@ -1267,6 +1268,7 @@ def test_a_missing_interpreter_is_a_typed_fault_naming_the_binary_and_the_image(
     assert not r.success
 
 
+@integration
 def test_command_not_found_inside_the_users_own_script_is_not_a_fault():
     """The control for the test above, and the reason the recogniser matches kern's WORDING rather
     than exit 127: a shell returning 127 for a command the USER misspelled is the user's failure, and
@@ -1276,12 +1278,14 @@ def test_command_not_found_inside_the_users_own_script_is_not_a_fault():
     assert r.fault is None, "a shell's own command-not-found must stay an ordinary result"
 
 
+@integration
 def test_an_interpreter_the_image_does_have_is_untouched():
     """Second control: the new branch must not fire on a working call."""
     r = kern.run_code("print(1)", language="python", image="python:3.12-slim")
     assert r.fault is None and r.exit_code == 0 and r.success
 
 
+@integration
 def test_exit_126_is_the_other_half_of_the_pair_and_says_permission_not_absence():
     """EACCES at `execve` is the same third state as ENOENT (box started, workload never ran) with a
     different exit code, and the classifier catches it because it keys on kern's WORDING rather than
