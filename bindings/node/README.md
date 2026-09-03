@@ -115,6 +115,14 @@ A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it i
 
 | `exec_failed` | the box started but the command did not exist inside it. `runCode(code, {language:"node"})` on an image with no `node` is the ordinary way to reach it; the message names the binary AND the image, because the remedy is a different `language` or a different `image`. The `language` enum is a convenience, not a promise about the image: the default `python:3.12-slim` carries `python` and `bash`. A shell's own `command not found` inside your script stays an ordinary non-zero exit |
 
+**An enforced `pids` cap produces no fault, and that is deliberate.** When `pids` binds, the refused
+`fork` returns `EAGAIN`. Code that catches it exits 0, so the call reports `fault: null, success:
+true` and a contained fork bomb reads as a successful run. `EAGAIN` is an ordinary errno a program is
+allowed to handle, unlike a SIGKILL it cannot; labelling it a sandbox fault would misreport a process
+that exited cleanly. Code that does **not** catch it dies naming "Resource temporarily unavailable".
+The cap itself is enforced: on WSL2, `pids: 32` blocked at 29 forks while `pids: 256` let 120 through,
+same code and same image.
+
 A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
 seccomp/AppArmor/cgroup setup error, or a pull/image error) is **thrown** as a `SandboxError`, not
 returned as a fault, because the code never ran.

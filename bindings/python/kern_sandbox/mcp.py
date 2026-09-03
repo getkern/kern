@@ -19,7 +19,9 @@ Claude Desktop / Cursor config (``claude_desktop_config.json`` / MCP settings):
     }
 
 Environment knobs (all optional): ``KERN_MCP_IMAGE`` (default python:3.12-slim), ``KERN_MCP_SETUP``
-(a one-time ``pip install ...``), ``KERN_MCP_MEMORY_MB`` (default 1024), ``KERN_MCP_TIMEOUT`` (default
+(a one-time ``pip install ...``), ``KERN_MCP_MEMORY_MB`` (default 1024; set it to ``0`` to pass no
+``--memory`` at all, which is the only way to let a ``vcpu:`` profile's own ``memory=`` apply - simply
+unsetting it still sends the 1024 default and shadows the profile), ``KERN_MCP_TIMEOUT`` (default
 60s), ``KERN_MCP_WORKSPACE`` (persist the workspace at this path instead of a temp dir),
 ``KERN_MCP_PROFILES`` (comma-separated kern.toml profiles, e.g. ``vcpu:heavy,vgpio:sensors``),
 ``KERN_MCP_KERNEL`` (set to ``1`` to route python run_code through ONE persistent WARM interpreter:
@@ -72,6 +74,22 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return v if v > 0 else default
+
+
+def _env_cap(name: str, default: int) -> int | None:
+    """Like ``_env_int``, plus ``0`` as an explicit "let the profile decide": it returns ``None``, which
+    the SDK passes as no ``--memory`` flag at all, so a ``vcpu:`` profile's own ``memory=`` applies.
+
+    Unsetting the variable is NOT that: it yields ``default``, an explicit flag, and kern's "explicit
+    flag wins over profile" rule then shadows the profile's value. Without this sentinel a profile's
+    memory is unreachable from MCP, since every path here produces an int.
+
+    ``0`` with no profile attached means uncapped, which is the same thing the SDK does for
+    ``memory_mb=None``. Garbage and negatives still fall back to ``default``."""
+    raw = os.environ.get(name)
+    if raw is not None and raw.strip() == "0":
+        return None
+    return _env_int(name, default)
 
 _TOOLS = [
     {
@@ -159,7 +177,7 @@ class _Server:
             image = os.environ.get("KERN_MCP_IMAGE", "python:3.12-slim")
             setup = os.environ.get("KERN_MCP_SETUP") or None
             workspace = os.environ.get("KERN_MCP_WORKSPACE") or None
-            memory_mb = _env_int("KERN_MCP_MEMORY_MB", 1024)
+            memory_mb = _env_cap("KERN_MCP_MEMORY_MB", 1024)
             timeout_s = _env_int("KERN_MCP_TIMEOUT", 60)
             # Attach reusable kern.toml resource profiles (comma-separated), e.g.
             # KERN_MCP_PROFILES="vcpu:heavy,vdisk:scratch,vgpio:sensors". vgpio: is the ONLY way to grant

@@ -1298,3 +1298,31 @@ def test_a_newline_free_flood_does_not_grow_the_server(tmp_path):
     assert served_small and served_large, "the ping after the flood must still be answered"
     assert small is not None and large is not None
     assert large - small < 8, f"RSS grew {large - small:.1f} MB when the flood grew 3.1x"
+
+
+def test_memory_zero_is_the_only_way_to_reach_the_profiles_own_memory(monkeypatch):
+    """`0` means "send no --memory flag", so a vcpu: profile's own memory= applies.
+
+    The positive control is the second half: UNSETTING the variable is not the same thing. It yields
+    the 1024 default, an explicit flag, and kern's "explicit flag wins over profile" rule then shadows
+    the profile. Without the sentinel every path here produces an int and the profile's memory is
+    unreachable from MCP, which is the bug this asserts against."""
+    monkeypatch.setenv("KERN_MCP_MEMORY_MB", "0")
+    assert M._env_cap("KERN_MCP_MEMORY_MB", 1024) is None
+
+    monkeypatch.delenv("KERN_MCP_MEMORY_MB")
+    assert M._env_cap("KERN_MCP_MEMORY_MB", 1024) == 1024  # control: unset != 0
+
+
+def test_memory_cap_still_rejects_garbage_and_negatives(monkeypatch):
+    """The sentinel must not widen the hole `_env_int` exists to close: an operator's negative or
+    non-numeric value still falls back to the default rather than becoming an uncapped session."""
+    for bad in ("-1", "abc", "", " ", "1.5"):
+        monkeypatch.setenv("KERN_MCP_MEMORY_MB", bad)
+        assert M._env_cap("KERN_MCP_MEMORY_MB", 1024) == 1024, f"{bad!r} must not disable the cap"
+
+    monkeypatch.setenv("KERN_MCP_MEMORY_MB", " 0 ")  # padded by a shell/JSON config
+    assert M._env_cap("KERN_MCP_MEMORY_MB", 1024) is None
+
+    monkeypatch.setenv("KERN_MCP_MEMORY_MB", "512")
+    assert M._env_cap("KERN_MCP_MEMORY_MB", 1024) == 512  # control: a real value still passes through

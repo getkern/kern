@@ -68,6 +68,13 @@ differ, measure and claim your own number.
 | `run_code("print(1)")` (+ Python interpreter start) | 13.1 ms | 13.5 ms |
 | `docker run --rm python:3.12-slim python3 -c` | n/a | 290 ms |
 
+**The host is part of the row.** The same `run_code("print(1)")` on **WSL2** reads **40 ms minimum,
+42 ms median** over five calls after the first. That figure comes from an outside cross-check and is
+not re-measured here, and it is five calls against the twenty-five above, so treat it as an order of
+magnitude rather than a p50. It is about 3x the 13.1 ms on bare metal, on a call whose cost is
+dominated by the CPython start rather than by the box. Quote the row that matches the host you run on,
+and never compare a `run_code` number against a bare-box one.
+
 For reference, `kern box --image python:3.12-slim` **natively** (no Python wrapper) is 3.85 ms on the
 same machine in the same session, so the binding's own cost is inside the run-to-run spread here: one
 subprocess, two reader threads, and the flags the binding adds that the native run does not (`--ro`,
@@ -225,6 +232,14 @@ class ExecutionResult:
   `image=`. ⚠️ The `language` enum is a convenience, not a promise about the image: it offers
   `python`/`bash`/`node` and the default `python:3.12-slim` carries the first two. A shell's own
   `command not found` inside a script you wrote stays an ordinary non-zero exit, not this fault.
+
+**An enforced `pids` cap produces no fault, and that is deliberate.** When `pids` binds, the refused
+`fork` returns `EAGAIN`. Code that catches it exits 0, so the call reports `fault=None, success=True`
+and a contained fork bomb reads as a successful run. `EAGAIN` is an ordinary errno a program is
+allowed to handle, unlike a SIGKILL it cannot; labelling it a sandbox fault would misreport a process
+that exited cleanly. Code that does **not** catch it dies with a traceback naming "Resource
+temporarily unavailable", which is diagnosable. The cap itself is enforced: on WSL2, `pids=32` blocked
+at 29 forks while `pids=256` let 120 through, same code and same image.
 
 A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
 seccomp/AppArmor/cgroup setup error, or a pull/image error) is **raised** as a `SandboxError`, not
