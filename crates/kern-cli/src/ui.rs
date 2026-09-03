@@ -349,6 +349,46 @@ pub(crate) fn scrub(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// The same guard for a whole MESSAGE rather than for one field, which is a different job.
+///
+/// TWO ROLES SHARED ONE FUNCTION, and the wrong one won. [`scrub`] drops every control character,
+/// which is exactly right for a table cell: a newline in an image ref would let a hostile value
+/// forge a row. Applied to a whole error message it also drops the newlines KERN wrote, so every
+/// multi-line message reached the user collapsed into one paragraph. The comment at the call site
+/// said "no error message in this CLI is multi-line", and it was true when it was written; three
+/// `Error::*` constructions carry a `\n` today, including the one that lists the directories the
+/// vgpu library was not found in, which is a list printed as a run-on sentence.
+///
+/// WHAT THIS KEEPS. The attack that motivated the original guard is unchanged: measured on
+/// 2026-08-04, a `backend` value holding ESC[2K ESC[1A ESC[32m made a refusal erase its own line,
+/// move the cursor up and repaint in green, so a rejection could be made to read as a success. ESC
+/// is a control character and still goes. So does carriage return, which can overwrite a line
+/// without ESC at all, and every other C0 and C1 code.
+///
+/// WHAT IT ALLOWS, AND WHY THAT IS SAFE. A newline survives, because a newline cannot move a cursor
+/// or repaint anything. What it CAN do is forge line structure: a hostile string containing
+/// "\nerror: everything is fine" would produce a second line that looks like one kern printed. So
+/// every line after the first is INDENTED here. A forged line can never start at column 0, which is
+/// where kern's own prefixes live, and the reader can see that a continuation is a continuation.
+/// That is what makes allowing the newline a real fix rather than a trade of one defect for another.
+pub(crate) fn scrub_message(s: &str) -> String {
+    // Il rientro allinea sotto "error: " e "hint: ", cioe' sotto il testo e non sotto il prefisso.
+    const CONT: &str = "       ";
+    let cleaned: String = s
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for (i, line) in cleaned.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            out.push_str(CONT);
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// Sanitize, then truncate to at most `max` characters with an ellipsis when cut. Operates on
 /// `char`s so a multi-byte command is never split mid-character. Sanitizing FIRST means a control
 /// char can't be smuggled past the length budget.
@@ -375,6 +415,61 @@ pub(crate) fn fmt_cpus(c: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LE DUE PROPRIETA' INSIEME: la newline sopravvive, tutto il resto no.
+    #[test]
+    fn a_message_keeps_its_newlines_and_loses_every_other_control_character() {
+        // Il caso che ha motivato la correzione: un elenco stampato come frase unica.
+        let listed = scrub_message("Looked in:\n  /a/lib.so\n  /b/lib.so");
+        assert_eq!(
+            listed.lines().count(),
+            3,
+            "un elenco resta un elenco: {listed:?}"
+        );
+
+        // L'ATTACCO MISURATO IL 2026-08-04 deve restare chiuso: ESC se ne va.
+        let esc = scrub_message("bad \u{1b}[2K\u{1b}[1A\u{1b}[32m value");
+        assert!(!esc.contains('\u{1b}'), "ESC deve sparire: {esc:?}");
+        // E il ritorno a capo isolato, che riscrive una riga senza bisogno di ESC.
+        let cr = scrub_message("first\rOVERWRITTEN");
+        assert!(!cr.contains('\r'), "CR deve sparire: {cr:?}");
+        // Tab e altri C0.
+        assert!(!scrub_message("a\tb\u{7}c").contains('\t'));
+        assert!(!scrub_message("a\tb\u{7}c").contains('\u{7}'));
+
+        // Un messaggio pulito e su una riga sola non deve cambiare di un byte.
+        let plain = "a plain message with no controls";
+        assert_eq!(scrub_message(plain), plain);
+    }
+
+    /// IL CONTROLLO POSITIVO SULLA FALSIFICAZIONE, che e' il motivo per cui la newline puo' passare.
+    ///
+    /// Senza il rientro, permettere `\n` scambierebbe un difetto con un altro: un valore ostile
+    /// scriverebbe una riga che sembra stampata da kern. Il test chiede la cosa che conta davvero,
+    /// cioe' che NESSUNA riga dopo la prima cominci alla colonna 0, dove stanno i prefissi di kern.
+    #[test]
+    fn a_hostile_value_cannot_forge_a_line_at_column_zero() {
+        let hostile = "bad ref\nerror: everything is fine\n✔ all good";
+        let out = scrub_message(hostile);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "le righe ci sono ancora, non e' censura: {out:?}"
+        );
+        for (i, l) in lines.iter().enumerate().skip(1) {
+            assert!(
+                l.starts_with(' '),
+                "la riga {i} comincia alla colonna 0 e puo' fingersi una riga di kern: {l:?}"
+            );
+        }
+        // CONTROPROVA: la funzione per i CAMPI, che invece deve continuare a togliere la newline,
+        // perche' li' una riga in piu' falsificherebbe una RIGA DI TABELLA e il rientro non basta.
+        assert!(
+            !scrub(hostile).contains('\n'),
+            "scrub resta quello che era: nei campi la newline non passa"
+        );
+    }
 
     fn ascii_glyphs() -> Glyphs {
         Glyphs {

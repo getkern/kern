@@ -117,7 +117,7 @@ fn main() -> ExitCode {
         match shim::translate(&args) {
             Ok(translated) => args = translated,
             Err(e) => {
-                eprintln!("error: {}", ui::scrub(&e.to_string()));
+                eprintln!("error: {}", ui::scrub_message(&e.to_string()));
                 return ExitCode::FAILURE;
             }
         }
@@ -141,12 +141,27 @@ fn main() -> ExitCode {
             // never for this one.
             //
             // Scrubbed HERE rather than at the ~27 sites that format a config value, because the
-            // next message added would not be. No error message in this CLI is multi-line (checked
-            // across every `Error::*` construction), so dropping control characters joins nothing,
-            // and a clean message is byte-identical after the filter.
-            eprintln!("error: {}", ui::scrub(&e.to_string()));
+            // next message added would not be.
+            //
+            // `scrub_message` AND NOT `scrub`, and the difference is a defect this line used to
+            // carry. The comment here read "no error message in this CLI is multi-line (checked
+            // across every `Error::*` construction), so dropping control characters joins nothing".
+            // That was true when it was written and is not any more. Measured on this tree:
+            // `kern volume rm nonesiste1 nonesiste2` builds `"2 volume(s) not removed:\n  ..."` and
+            // reached the user as
+            //
+            //   error: 2 volume(s) not removed:  no volume named 'a'  no volume named 'b'
+            //
+            // one run-on line, because `scrub` dropped the newlines that made it a list. Two more
+            // constructions have the same shape today (a compose bring-up that lists the services
+            // that died, and the invalid-port-spec list).
+            //
+            // The newline now survives and every continuation line is INDENTED, so a hostile value
+            // still cannot forge a line at column 0, where kern's own `error:`/`hint:` prefixes
+            // live. See `ui::scrub_message`.
+            eprintln!("error: {}", ui::scrub_message(&e.to_string()));
             if let Some(hint) = e.hint() {
-                eprintln!("hint: {}", ui::scrub(&hint));
+                eprintln!("hint: {}", ui::scrub_message(&hint));
             }
             ExitCode::FAILURE
         }

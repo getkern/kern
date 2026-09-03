@@ -193,3 +193,57 @@ fn show_config_reports_the_uid_range_the_box_will_actually_get() {
     assert_eq!(field(&rootfs, "uid_range"), "false");
     assert_eq!(field(&rootfs, "uid_range_source"), "-");
 }
+
+/// `KERN_NO_SCOPE=1` drops kern's own DEFAULT memory cap, and has to say so.
+///
+/// A plain `kern run` is not uncapped: it re-execs into a transient systemd scope carrying
+/// `MemoryMax=512M`, `MemorySwapMax=0` and `TasksMax=512`, so a workload over that ceiling is
+/// OOM-killed and told why. The opt-out skips the scope, and the default goes with it. Both warnings
+/// on that path used to be gated on the caller having ASKED for a cap, so the case where nothing was
+/// typed ran uncapped in the caller's own cgroup and printed nothing at all.
+///
+/// SKIP-GRACEFUL, and the control is what decides it: if a plain `kern run` already warns, this host
+/// has no delegation to lose and there is nothing here to assert. A skip that says why beats a
+/// failure that blames the host.
+#[test]
+fn the_opt_out_that_drops_the_default_cap_says_so() {
+    let plain = kern()
+        .args(["run", "--", "/bin/true"])
+        .output()
+        .expect("run kern");
+    let plain_err = String::from_utf8_lossy(&plain.stderr).to_string();
+    if !plain.status.success() || !plain_err.is_empty() {
+        eprintln!(
+            "SKIP: a plain `kern run` is not silently capped on this host, so the default this test \
+             is about does not exist here. stderr: {plain_err}"
+        );
+        return;
+    }
+
+    let dropped = kern()
+        .env("KERN_NO_SCOPE", "1")
+        .args(["run", "--", "/bin/true"])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&dropped.stderr);
+    assert!(
+        err.contains("DEFAULT memory cap"),
+        "KERN_NO_SCOPE removed the default cap and said nothing. stderr: {err}"
+    );
+
+    // The two ways to mean it, each of which must return the command to silence: saying the uncapped
+    // run is intended, and an embedder whose channel is a machine one.
+    for (k, v) in [("KERN_ALLOW_UNCAPPED", "1"), ("KERN_QUIET", "1")] {
+        let quiet = kern()
+            .env("KERN_NO_SCOPE", "1")
+            .env(k, v)
+            .args(["run", "--", "/bin/true"])
+            .output()
+            .expect("run kern");
+        assert!(
+            quiet.stderr.is_empty(),
+            "{k} did not silence the notice. stderr: {}",
+            String::from_utf8_lossy(&quiet.stderr)
+        );
+    }
+}
