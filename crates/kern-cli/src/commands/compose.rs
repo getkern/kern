@@ -376,9 +376,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `127.0.0.1 db db` in a pod and NOTHING under `--no-pod`. Trading a loud refusal at bring-up for
     // a silent name-resolution failure inside a service, with nothing said in between, is the shape
     // this project treats as the expensive kind of defect. Once per bring-up, not once per service.
-    if let Some(note) = no_pod_peer_names_note(&boxes, no_pod) {
+    // THE UNDECLARED-PORT NOTE BELONGS HERE, at config time: it follows from the file alone, and its
+    // whole value is arriving before a service logs `Connection refused`.
+    if let Some(note) = no_pod_undeclared_ports_note(&boxes, no_pod) {
         eprintln!("{note}");
     }
+    // The peer-names note does NOT belong here: it promises the colliding pairs, and those are
+    // measured from the RUNNING services. Printed at this point it was separated from them by the
+    // whole build, so it moved next to them; see the relay block below.
     // A pod shares ONE network namespace, so a `net.*` sysctl written on one service applies to every
     // service in the stack and the last one to start wins. The file makes it look per-service; say so
     // rather than let an operator tune one service and silently retune the others.
@@ -793,6 +798,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         if !relays.is_empty() {
             let dir = crate::relayhold::stack_dir(&pod)?;
             let report = crate::relayhold::spawn_holder(&dir, &relays)?;
+            // THE NOTE AND THE PAIRS IT PROMISES, TOGETHER. It used to print before the build, and on
+            // a stack that builds first that put minutes between a sentence saying a pair would be
+            // named and the naming: reported from a real stack where the next line was
+            // `building 'sidecar'` and the reader concluded nothing had been named.
+            if let Some(note) = no_pod_peer_names_note(&boxes, no_pod) {
+                eprintln!("{note}");
+            }
             if report.up > 0 {
                 eprintln!(
                     "\u{2192} {} peer relay(s) up: services reach each other by name without a pod",
@@ -805,8 +817,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             // while a specific bind and a WILDCARD bind refuse each other in both orders with or
             // without SO_REUSEADDR. So the pair is only lost when the holder binds `0.0.0.0`, which
             // is a fact about a running process and not about a declaration.
+            // ITS OWN PREFIX, not `note:`, and that is not cosmetics. A field report: "we had
+            // filtered it out of our own output. A message that named the pair would have been hard
+            // to filter and harder to misread." They lost a debugging round with the line on screen,
+            // because the general note and the named pair shared a prefix and one `grep -v` took
+            // both. The note explains a model and can be skipped; this names TWO SERVICES OF YOURS,
+            // RIGHT NOW, and is the only actionable half. Follows the `kern: pod:` / `kern: vdisk:`
+            // convention already in this tree.
             for line in &report.blocked {
-                eprintln!("kern: note: {line}");
+                eprintln!("kern: unreachable: {line}");
             }
         }
     }

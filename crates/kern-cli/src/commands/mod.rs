@@ -4101,6 +4101,56 @@ fn resolved_profile_lines(ap: &AppliedProfiles) -> Vec<String> {
 /// Returns the note rather than printing it, like `container_only_port_note`: the DECISION of when to
 /// say this is the whole of the behaviour, and a function that only writes to stderr can be asserted
 /// on by nothing.
+/// Services that declare no port at all, which under `--no-pod` cannot be reached by name.
+///
+/// A relay is built per DECLARED port (`port:`, `expose:`, or the container side of `ports:`), so a
+/// service that declares none gets no relay and its peers get `Connection refused` at runtime, in a
+/// service log, rather than a line at config time.
+///
+/// REPORTED FROM A REAL STACK, and the reason it catches people is worth stating: in Docker,
+/// `expose:` grants nothing and is barely written any more, and kern IN A POD does not need it either
+/// because the shared namespace makes it moot. So the requirement shows up in exactly the mode where
+/// a file is most likely to have arrived unchanged from someone else.
+///
+/// Returns the note rather than printing it, like the other two, so a test can assert on the
+/// decision instead of on stderr.
+fn no_pod_undeclared_ports_note(
+    boxes: &[crate::compose::ComposeBox],
+    no_pod: bool,
+) -> Option<String> {
+    if !no_pod || boxes.len() < 2 {
+        return None;
+    }
+    let mute: Vec<&str> = boxes
+        .iter()
+        .filter(|b| declared_container_ports(b).is_empty())
+        .map(|b| b.service.as_str())
+        .collect();
+    if mute.is_empty() {
+        return None;
+    }
+    // A stack where NOTHING declares a port is not a stack whose peers talk to each other, so the
+    // note would be noise. It is the mixture that is a mistake: some services reachable, some not.
+    if mute.len() == boxes.len() {
+        return None;
+    }
+    let one = mute.len() == 1;
+    Some(format!(
+        "kern: note: {} {} no port (`port:`, `expose:` or `ports:`), so no peer relay is built for \
+         {} and a peer reaches {} with a connection refused rather than by name. Declare the port \
+         {} listens on to make {} reachable under --no-pod.",
+        mute.iter()
+            .map(|m| format!("'{m}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if one { "declares" } else { "declare" },
+        if one { "it" } else { "them" },
+        if one { "it" } else { "them" },
+        if one { "it" } else { "each one" },
+        if one { "it" } else { "them" },
+    ))
+}
+
 fn no_pod_peer_names_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) -> Option<String> {
     if !no_pod || boxes.len() < 2 {
         return None;
@@ -4121,12 +4171,18 @@ fn no_pod_peer_names_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) ->
     //
     // What stays true in every case is the one thing a reader must act on: a service cannot host a
     // peer's alias on a port it binds ITSELF, so two services sharing an internal port are still not
-    // mutually reachable. `up` names each such pair, with the port, immediately after this line.
+    // mutually reachable. `up` names each such pair, with the port.
+    //
+    // IT DOES NOT SAY "BELOW" ANY MORE. It did, and the pairs are measured from the RUNNING services,
+    // so on a stack that builds first they arrive minutes later: reported from a real stack where a
+    // TensorFlow build sat between the two, the line after this one was `building 'sidecar'` and the
+    // reader concluded that nothing had been named. The note now travels with the pairs instead of
+    // promising them.
     Some(
         "kern: note: --no-pod gives each service its own network namespace, and peers are reached \
          through per-service loopback aliases instead of a shared one. A service cannot host a peer's \
          alias on a port it binds itself, so two services that share an internal port are still not \
-         mutually reachable; any such pair is named below."
+         mutually reachable; any such pair is named with it."
             .to_string(),
     )
 }

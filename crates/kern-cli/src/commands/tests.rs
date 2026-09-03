@@ -3715,6 +3715,68 @@ mod port_collision_tests {
             no_pod_peer_names_note(&one, true).is_none(),
             "a single service has no peer to lose"
         );
+        // IT MUST NOT PROMISE THE PAIRS "BELOW". The pairs are measured from the running services, so
+        // on a stack that builds first they arrive minutes after this sentence: reported from a real
+        // stack where the next line was a TensorFlow build and the reader concluded, correctly from
+        // what was on screen, that nothing had been named. The note now travels WITH the pairs, and
+        // this asserts the word that made the old placement a promise.
+        assert!(
+            !note.contains("named below"),
+            "the note must not promise pairs 'below' when a build can sit between: {note}"
+        );
+    }
+
+    /// A SERVICE THAT DECLARES NO PORT CANNOT BE REACHED BY NAME, and that was discoverable only as
+    /// `Connection refused` in a peer's log.
+    ///
+    /// Reported from a real stack. It catches people because `expose:` grants nothing in Docker and
+    /// is barely written any more, and because kern IN A POD does not need it either: the requirement
+    /// appears in exactly the mode where a compose file is most likely to have arrived unchanged.
+    #[test]
+    fn a_service_with_no_declared_port_is_named_at_config_time() {
+        let svc = |name: &str, ports: &[&str]| crate::compose::ComposeBox {
+            name: name.to_string(),
+            service: name.to_string(),
+            ports: ports.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let mixed = [svc("web", &["7001:8080"]), svc("db", &[])];
+        let note = no_pod_undeclared_ports_note(&mixed, true)
+            .expect("a service with no declared port must be named");
+        assert!(
+            note.contains("'db'") && !note.contains("'web'"),
+            "it must name the mute service and only that one: {note}"
+        );
+        assert!(
+            note.contains("declares no port"),
+            "singular for one service: {note}"
+        );
+
+        // NOT IN A POD: the shared namespace makes the declaration moot, so the note would be noise.
+        assert!(
+            no_pod_undeclared_ports_note(&mixed, false).is_none(),
+            "a pod stack does not need declared ports to resolve peers"
+        );
+        // AND NOT WHEN NOBODY DECLARES ANYTHING: a stack where no service declares a port is not one
+        // whose peers were expected to talk. It is the MIXTURE that is a mistake.
+        let silent = [svc("a", &[]), svc("b", &[])];
+        assert!(
+            no_pod_undeclared_ports_note(&silent, true).is_none(),
+            "a stack that declares no ports at all is not making this mistake"
+        );
+        // Plural agreement, because the note names every one of them.
+        let two_mute = [
+            svc("web", &["7001:8080"]),
+            svc("db", &[]),
+            svc("cache", &[]),
+        ];
+        let plural = no_pod_undeclared_ports_note(&two_mute, true).expect("two mute services");
+        assert!(
+            plural.contains("declare no port")
+                && plural.contains("'db'")
+                && plural.contains("'cache'"),
+            "plural, and both named: {plural}"
+        );
     }
 
     /// THE REFUSAL NAMES THE SERVICES, and it used to name the boxes.

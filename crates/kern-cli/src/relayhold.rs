@@ -798,10 +798,27 @@ impl std::fmt::Display for BlockReport<'_> {
             self.holder, self.peer, self.port, self.reason
         )?;
         match self.reason {
+            // THE PORTABLE REMEDY FIRST, and "portable" here means BOTH RUNTIMES, not just both
+            // hosts. kern reads a `docker-compose.yml` as it is, so advice that makes a file work
+            // here and break under Docker is the wrong direction for that promise.
+            //
+            // This order was inverted for an hour on the argument that binding loopback is one line
+            // while renumbering is two plus the URLs that reference the old port. The argument is
+            // right about the cost and wrong about the consequence, and Docker settles it. MEASURED,
+            // same image and same mapping: a container serving on `127.0.0.1:8080` published as
+            // `18098:8080` answers nothing (curl exit 000), the same container on `0.0.0.0:8080`
+            // answers 200. Docker forwards a published port to the container's INTERFACE address,
+            // not to its loopback. kern's publisher reaches the box's loopback, so the same file
+            // would work here and fail there.
+            //
+            // The loopback bind is still offered, because it does free the alias and it is the
+            // cheaper edit for anyone not going back to Docker. It is offered SECOND and with what
+            // it costs attached, rather than first and silently.
             BlockReason::Wildcard(addr) => write!(
                 f,
-                ". Give one of them a different internal port, or make '{}' bind {}:{} instead of \
-                 {addr}",
+                ". Give one of them a different internal port, which keeps the file working under \
+                 Docker too. Making '{}' bind {}:{} instead of {addr} also frees the alias, but a \
+                 published port then answers under kern and not under Docker",
                 self.holder,
                 self.reason.specific_instead(),
                 self.port
@@ -1164,10 +1181,21 @@ pub(crate) fn kill_holder(dir: &Path) {
             }
         }
     }
-    let _ = std::fs::remove_file(holder_path(dir));
-    let _ = std::fs::remove_file(plan_path(dir));
-    let _ = std::fs::remove_file(holder_log_path(dir));
-    let _ = std::fs::remove_file(degraded_path(dir));
+    // EVERY FILE THE HOLDER WRITES IS NAMED HERE, and a new one that is not leaves the directory
+    // behind: `remove_dir` below refuses a non-empty directory, which is deliberate but means an
+    // omission here is silent. `served` and `rescan` were added with the start-wait fix and missed
+    // exactly that way, so `down` left an empty stack directory holding a stale `served`. The
+    // processes were gone; the promise that `down` cleans up was not kept.
+    for f in [
+        holder_path(dir),
+        plan_path(dir),
+        holder_log_path(dir),
+        degraded_path(dir),
+        served_path(dir),
+        poke_path(dir),
+    ] {
+        let _ = std::fs::remove_file(f);
+    }
     // And the directory itself, so `relays/` does not accumulate one empty entry per stack that ever
     // ran. `remove_dir` refuses a non-empty directory, which is the guard: anything left there is a
     // file this function did not expect and must not delete blindly.

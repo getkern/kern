@@ -5768,6 +5768,40 @@ fn a_shared_port_costs_only_the_service_that_binds_the_wildcard() {
         up_err.contains(remedy),
         "and the remedy must be the cheap one, in the family the service actually binds: {up_err}"
     );
+    // THE PORTABLE REMEDY COMES FIRST, and this assertion was written the other way round for an
+    // hour. The argument for putting the loopback bind first is real on cost (one line against two
+    // plus the URLs referencing the old port) and wrong on consequence: kern reads a
+    // `docker-compose.yml` as it is, and Docker forwards a published port to the container's
+    // INTERFACE address, not its loopback. Measured with the same image and mapping: bound to
+    // `127.0.0.1` the published port answers nothing, bound to `0.0.0.0` it answers 200. So the
+    // cheaper edit makes a file that works here and fails there, and the order asserts the one that
+    // works under both.
+    let line = up_err
+        .lines()
+        .find(|l| l.contains("cannot reach"))
+        .unwrap_or("");
+    let (bind_at, renumber_at) = (line.find("bind "), line.find("different internal port"));
+    assert!(
+        matches!((bind_at, renumber_at), (Some(b), Some(r)) if r < b),
+        "the remedy that works under Docker too must be offered first: {line}"
+    );
+    assert!(
+        line.contains("not under Docker"),
+        "and the cheaper edit must carry what it costs, or it reads as free: {line}"
+    );
+    // ITS OWN PREFIX, so one filter cannot take both. From a field report: "we had filtered it out
+    // of our own output. A message that named the pair would have been hard to filter and harder to
+    // misread." They lost a debugging round with the line on screen, because the general note and
+    // the named pair both began `kern: note:`. The note explains a model; this names two services of
+    // theirs, and only one of the two is worth interrupting someone for.
+    let named: Vec<&str> = up_err
+        .lines()
+        .filter(|l| l.contains("cannot reach"))
+        .collect();
+    assert!(
+        !named.is_empty() && named.iter().all(|l| l.starts_with("kern: unreachable:")),
+        "the named pair must not share the `kern: note:` prefix with the general note: {named:?}"
+    );
     assert!(
         ps.contains("peer edge DOWN"),
         "and a status view must carry it, not just the bring-up output: {ps}"
@@ -7832,4 +7866,97 @@ fn compose_stop_names_a_pod_only_when_there_is_one() {
             eprintln!("SKIP(partial): the pod stack did not come up, so only the no-pod half ran")
         }
     }
+}
+
+/// `compose down` LEAVES NOTHING BEHIND, INCLUDING ON DISK.
+///
+/// `kill_holder` names each file the holder writes and then calls `remove_dir`, which refuses a
+/// non-empty directory. That guard is deliberate (never delete a file this code did not create) but
+/// it makes an omission SILENT: add a file to the holder and forget to name it there, and `down`
+/// leaves the stack directory behind forever, holding stale state.
+///
+/// That is exactly what happened when `served` and `rescan` arrived with the start-wait fix, and a
+/// reviewer found it rather than the suite. Asserted on the DIRECTORY rather than on a list of file
+/// names, so a file added in future fails this test instead of quietly accumulating.
+#[test]
+fn compose_down_removes_the_relay_directory_it_created() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "downclean");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-dc-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-dc-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.a]\nrootfs = \"{rootfs}\"\nport = 7921\n\
+             command = [\"/bin/busybox\", \"sleep\", \"300\"]\n\n\
+             [box.b]\nrootfs = \"{rootfs}\"\nport = 7922\n\
+             command = [\"/bin/busybox\", \"sleep\", \"300\"]\n"
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> String {
+        let mut v = vec!["compose", toml.to_str().unwrap()];
+        v.extend_from_slice(args);
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&v)
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    let relays = xdg.join("kern/relays");
+    let stack_dirs = || -> Vec<String> {
+        fs::read_dir(&relays)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let up = run(&["up", "--no-pod"]);
+    if !up.contains("peer relay(s) up") {
+        run(&["down"]);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+        eprintln!(
+            "skip: no relay came up here: {}",
+            up.lines().next().unwrap_or("")
+        );
+        return;
+    }
+    let during = stack_dirs();
+    // A restart exercises the files only the healing path writes, so this covers them too.
+    run(&["stop", "b"]);
+    run(&["start"]);
+    run(&["down"]);
+    let after = stack_dirs();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_file(&toml);
+
+    assert!(
+        !during.is_empty(),
+        "the stack should have had a relay directory while running, or this proves nothing"
+    );
+    assert!(
+        after.is_empty(),
+        "`down` must remove the relay directory it created, leftovers: {after:?}"
+    );
 }
