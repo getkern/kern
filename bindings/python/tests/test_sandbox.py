@@ -1306,3 +1306,50 @@ def test_exit_126_is_the_other_half_of_the_pair_and_says_permission_not_absence(
     assert "Permission denied" in r.fault.message
     assert "not executable" in r.fault.message
     assert "does not exist" not in r.fault.message, "126 must not be reported as absence"
+
+
+@integration
+def test_a_fifo_the_box_planted_cannot_stall_or_fake_a_read():
+    """A box that plants a FIFO in the workspace must not be able to hang the host's call, and must
+    not be able to make it report an empty file either.
+
+    MEASURED BEFORE THE FIX, both halves, because the second one is what makes the first one's
+    obvious remedy wrong. `open(fifo, O_RDONLY)` with no writer does not return: the box decides how
+    long `read_file` takes, with no timeout to interrupt it. Adding `O_NONBLOCK` alone turns that into
+    a read of zero bytes, so `read_file` answered `b""` and the caller read an empty file where a pipe
+    had been planted: the stall became a silent lie, which is worse.
+
+    So the assertion is on BOTH: it returns promptly AND it refuses, rather than returning promptly
+    with the wrong answer. The control is the regular file at the end, which must still round-trip;
+    without it a `read_file` that refused everything would pass.
+    """
+    import time
+
+    with kern.Sandbox(image="python:3.12-slim") as sbx:
+        sbx.run_code("import os; os.mkfifo('/workspace/pipe.bin')", language="python")
+        started = time.time()
+        with pytest.raises(kern.SandboxError) as e:
+            sbx.read_file("pipe.bin")
+        elapsed = time.time() - started
+        assert elapsed < 5, f"read_file waited {elapsed:.1f}s on a writer-less FIFO"
+        assert "not a regular file" in str(e.value)
+        # The control: refusing everything would also satisfy the assertions above.
+        sbx.write_file("real.txt", b"still works")
+        assert sbx.read_file("real.txt") == b"still works"
+
+
+@integration
+def test_a_fifo_the_box_planted_cannot_stall_a_write_either():
+    """The write side of the same defect, which is the worse of the two: `open(fifo, O_WRONLY)` blocks
+    until a READER appears, so a box that plants a FIFO where the caller is about to write parks the
+    host there indefinitely. With `O_NONBLOCK` the open fails (ENXIO) instead, and the fstat refuses
+    anything that is not a regular file, so the call returns either way."""
+    import time
+
+    with kern.Sandbox(image="python:3.12-slim") as sbx:
+        sbx.run_code("import os; os.mkfifo('/workspace/target.txt')", language="python")
+        started = time.time()
+        with pytest.raises(kern.SandboxError):
+            sbx.write_file("target.txt", b"payload")
+        elapsed = time.time() - started
+        assert elapsed < 5, f"write_file waited {elapsed:.1f}s on a reader-less FIFO"

@@ -251,7 +251,11 @@ returned as a fault, because the code never ran.
 - `Sandbox(...).run_code(code, language="python"|"bash"|"node")`, run code on the session workspace (fresh box).
 - `Sandbox(...).run(argv_list)`, run an arbitrary command (an **argv list**, never a shell string).
 - `Sandbox(...).write_file(path, data)` / `.read_file(path)` / `.list_files(subdir="")`, workspace I/O,
-  confined to `/workspace` (symlink- and `..`-safe).
+  confined to `/workspace` (symlink- and `..`-safe). Also `O_NONBLOCK`, and a descriptor that is not a
+  REGULAR file is refused: a symlink is not the only thing a box can leave at a name, and `mkfifo
+  out.png` used to make `read_file("out.png")` wait for a writer that never comes, with no timeout, so
+  the box chose how long the host's call took. The flag alone would be worse than the hang, because a
+  non-blocking read of a writer-less FIFO returns zero bytes and the call would report an EMPTY FILE.
 - `Sandbox(...).snapshot(dest)` / `.restore(src)`, a portable `.tar.gz` FILESYSTEM checkpoint of the
   workspace (not a memory snapshot). `restore` refuses absolute, `..` and symlink members.
 

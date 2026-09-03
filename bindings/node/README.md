@@ -147,7 +147,12 @@ Every relaxing option says so in its name or docs:
 - **mounts refused**: sensitive host sources (`/`, `/etc`, `/root`, `/proc`, `/sys`, `/dev`, the docker
   socket, `$HOME`) and escaping targets are refused even when asked.
 - **workspace I/O contained**: `writeFile`/`readFile` reject `..` escapes and open the final component
-  `O_NOFOLLOW`, so a symlink the box plants cannot redirect host I/O outside the workspace.
+  `O_NOFOLLOW`, so a symlink the box plants cannot redirect host I/O outside the workspace. They also
+  open `O_NONBLOCK` and refuse a descriptor that is not a REGULAR file. A symlink is not the only thing
+  a box can leave at a name: `mkfifo out.png` used to make `readFile("out.png")` wait for a writer that
+  never comes, with no timeout, so the box chose how long the host's call took. The flag alone would be
+  worse than the hang, because a non-blocking read of a writer-less FIFO returns zero bytes and the
+  call would report an EMPTY FILE. Both halves ship: it returns promptly, and it refuses.
 
 ### Options
 

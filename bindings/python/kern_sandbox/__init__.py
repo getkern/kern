@@ -65,7 +65,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.33"
+__version__ = "0.1.34"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1380,22 +1380,54 @@ class Sandbox:
         """Open ``full`` (already lexically contained) descending from the workspace base ONE component at
         a time, each with ``O_NOFOLLOW`` via ``openat``, so a symlink the box planted in ANY component -
         not just the last - can't redirect host I/O outside the workspace. This also closes the TOCTOU a
-        plain lstat-then-open would leave. Returns an fd (caller owns it)."""
+        plain lstat-then-open would leave. Returns an fd (caller owns it).
+
+        TWO MORE PROPERTIES, HERE RATHER THAN AT EACH CALL SITE, because the next caller added would
+        not remember them:
+
+        ``O_NONBLOCK`` - opening a FIFO returns a descriptor instead of WAITING FOR A WRITER. Measured
+        before this flag: a box that runs ``mkfifo out.png`` makes ``read_file("out.png")`` hang with
+        no timeout and no way to interrupt it, so the box decides how long the host's call takes. On
+        the write side it is worse: opening a FIFO for writing blocks until a reader appears, and with
+        the flag it fails outright (ENXIO). ``O_NOFOLLOW`` does not touch either case, because a FIFO
+        is not a symlink.
+
+        ``fstat`` - and the flag ALONE would be worse than the hang. A non-blocking read of a
+        writer-less FIFO returns zero bytes, so ``read_file`` would answer ``b""`` and the caller
+        would read an empty file where the box had planted a pipe: a stall turned into a silent lie.
+        So the OPEN DESCRIPTOR (not a path, which can be swapped after the check) has to be a regular
+        file, or a directory when that is what was asked for."""
         base = self._ws
         rel = os.path.relpath(full, base)
         parts = [p for p in rel.split(os.sep) if p and p != "."]
         if not parts:
             raise SandboxError("refusing to open the workspace root as a file")
         cloexec = getattr(os, "O_CLOEXEC", 0)
+        nonblock = getattr(os, "O_NONBLOCK", 0)
         dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | cloexec)
         try:
             for part in parts[:-1]:
                 nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec, dir_fd=dir_fd)
                 os.close(dir_fd)
                 dir_fd = nxt
-            return os.open(parts[-1], flags | os.O_NOFOLLOW | cloexec, mode, dir_fd=dir_fd)
+            fd = os.open(parts[-1], flags | os.O_NOFOLLOW | cloexec | nonblock, mode, dir_fd=dir_fd)
         finally:
             os.close(dir_fd)
+        wanted_dir = bool(flags & getattr(os, "O_DIRECTORY", 0))
+        try:
+            mode_bits = os.fstat(fd).st_mode
+            ok = stat.S_ISDIR(mode_bits) if wanted_dir else stat.S_ISREG(mode_bits)
+        except OSError:
+            os.close(fd)
+            raise
+        if not ok:
+            os.close(fd)
+            kind = "directory" if wanted_dir else "regular file"
+            raise SandboxError(
+                f"refusing to open {os.path.basename(full)!r}: not a {kind} (a FIFO, device or "
+                f"socket planted in the workspace can stall or fake this operation)"
+            )
+        return fd
 
     def read_file(self, path: str, *, max_bytes: "int | None" = None) -> bytes:
         """Read ``path`` (workspace-relative) from the workspace - host-direct. Every path component is

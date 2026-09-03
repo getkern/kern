@@ -1086,3 +1086,34 @@ test("exit 126 says permission, not absence", { skip: !KERN_OK && "kern not inst
     fs.rmSync(ws, { recursive: true, force: true });
   }
 });
+
+// A box that plants a FIFO in the workspace must not be able to hang the host's call, and must not be
+// able to make it report an empty file either.
+//
+// MEASURED BEFORE THE FIX, both halves, because the second is what makes the first one's obvious
+// remedy wrong on its own. `open(fifo, O_RDONLY)` with no writer does not return: the box decides how
+// long `readFile` takes, with no timeout to interrupt it. Adding O_NONBLOCK alone turns that into a
+// read of zero bytes, so `readFile` answered an empty Buffer and the caller read an empty file where
+// a pipe had been planted: the stall became a silent lie, which is worse than the stall.
+test("a FIFO the box planted cannot stall or fake a read", exec, async () => {
+  await withSandbox(async (s) => {
+    await s.runCode("import os; os.mkfifo('/workspace/pipe.bin')");
+    const started = Date.now();
+    await assert.rejects(() => s.readFile("pipe.bin"), /not a regular file/);
+    assert.ok(Date.now() - started < 5000, "readFile waited on a writer-less FIFO");
+    // The control: refusing everything would satisfy the assertion above just as well.
+    await s.writeFile("real.txt", "still works");
+    assert.strictEqual((await s.readFile("real.txt")).toString(), "still works");
+  });
+});
+
+// The write side, which is the worse of the two: `open(fifo, O_WRONLY)` blocks until a READER appears,
+// so a box that plants a FIFO where the caller is about to write parks the host there indefinitely.
+test("a FIFO the box planted cannot stall a write either", exec, async () => {
+  await withSandbox(async (s) => {
+    await s.runCode("import os; os.mkfifo('/workspace/target.txt')");
+    const started = Date.now();
+    await assert.rejects(() => s.writeFile("target.txt", "payload"));
+    assert.ok(Date.now() - started < 5000, "writeFile waited on a reader-less FIFO");
+  });
+});

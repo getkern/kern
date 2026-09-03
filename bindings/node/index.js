@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.33";
+const VERSION = "0.1.34";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1307,15 +1307,29 @@ class Sandbox {
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
     let fd;
     try {
+      // O_NONBLOCK for the same reason as readFile, and the write side is the WORSE of the two: opening
+      // a FIFO for writing blocks until a reader appears, and with the flag it fails outright (ENXIO)
+      // instead. Either way the call returns to the caller rather than parking there.
       fd = fs.openSync(
         full,
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
+        fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_TRUNC |
+          fs.constants.O_NOFOLLOW |
+          fs.constants.O_NONBLOCK,
         0o644,
       );
     } catch (e) {
       throw new SandboxError(`cannot write ${JSON.stringify(rel)}: ${e.message}`);
     }
     try {
+      // The file the box left at this name has to be a REGULAR file before we write into it: writing
+      // into a device node or a socket the box planted is host I/O it chose the target of.
+      if (!fs.fstatSync(fd).isFile())
+        throw new SandboxError(
+          `refusing to write ${JSON.stringify(rel)}: not a regular file (a FIFO, device or socket ` +
+            `planted in the workspace can stall or redirect this write)`,
+        );
       fs.writeSync(fd, payload);
     } finally {
       fs.closeSync(fd);
@@ -1373,14 +1387,28 @@ class Sandbox {
     this._verifyParentDirs(full); // fast reject + nice error before we open (host-leak guard)
     let fd;
     try {
-      fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      // O_NONBLOCK: opening a FIFO returns a descriptor instead of WAITING FOR A WRITER. Measured
+      // before this flag: a box that runs `mkfifo out.png` makes `readFile("out.png")` hang with no
+      // timeout and no way to interrupt it, so the box decides how long the host's call takes. That is
+      // a denial of service the workspace hands out for free, and O_NOFOLLOW does not touch it.
+      fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (e) {
       throw new SandboxError(`cannot read ${JSON.stringify(rel)}: ${e.message}`);
     }
     try {
       this._assertFdInWorkspace(fd, rel); // race-free backstop: a swapped-in parent symlink is caught here
+      // AND THE FLAG ALONE WOULD BE WORSE THAN THE HANG. A non-blocking read of a writer-less FIFO
+      // returns zero bytes, so `readFile` would answer `<Buffer >` and the caller would read an empty
+      // file where the box had planted a pipe. Refuse anything that is not a REGULAR file: FIFO,
+      // device, socket, directory. Judged on the OPEN DESCRIPTOR, not on a path that can be swapped.
+      const st = fs.fstatSync(fd);
+      if (!st.isFile())
+        throw new SandboxError(
+          `refusing to read ${JSON.stringify(rel)}: not a regular file (a FIFO, device or socket ` +
+            `planted in the workspace can stall or fake this read)`,
+        );
       // maxBytes caps the read so a file a not-fully-trusted box wrote can't OOM the host.
-      if (maxBytes !== null && fs.fstatSync(fd).size > maxBytes)
+      if (maxBytes !== null && st.size > maxBytes)
         throw new SandboxError(`${JSON.stringify(rel)} exceeds maxBytes=${maxBytes}`);
       return fs.readFileSync(fd);
     } finally {
