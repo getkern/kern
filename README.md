@@ -338,7 +338,10 @@ bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net \
 
 Two honest notes. **The margin over bubblewrap is real but small**: 2.7 ms against 3.0 ms here, with
 the two ranges not overlapping (kern 2.6 to 2.7, bwrap 2.9 to 3.0), while kern is also installing a
-seccomp filter and recording a registry entry that bwrap does not. Both columns run WITHOUT a cgroup
+seccomp filter and recording a registry entry that bwrap does not. That comparison has since been run
+23 times on an idle machine, 92,000 starts, and kern led in 457 of 460 batches: **+9.2%** with the
+scheduler free and **+6.6%** with the core pinned, where both runtimes get 0.7 ms faster and part of
+the margin turns out to be scheduling rather than code. Both columns run WITHOUT a cgroup
 cap, which is what makes them the same job; the default `kern box` adds one. bubblewrap is a
 launcher, not a runtime, and fractions of a millisecond are not why you would pick either. **The gap that means
 something is to the engines**, two orders of magnitude above. On aarch64 the same matched comparison

@@ -9,7 +9,8 @@ timer (its own fork+exec) would dominate, so we never time a single run on its o
     python3 examples/benchmark.py                 # auto-detect everything, 200 runs + 200 parallel
     python3 examples/benchmark.py --runs 500
     python3 examples/benchmark.py --conc 50       # lighter concurrency (e.g. on an edge board)
-    KERN=./target/release/kern python3 examples/benchmark.py
+    python3 examples/benchmark.py            # picks the shipped musl build if it is there
+    KERN=/path/to/kern python3 examples/benchmark.py
 
 It prints the cold-start table BENCHMARKS.md publishes, plus throughput
 (runs/s, same data), and concurrency (N parallel, wall-clock) - for whatever runtimes are
@@ -23,6 +24,7 @@ import argparse
 import itertools
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -97,6 +99,46 @@ def bench(label, cmd_for, n, repeat, uid, env=None, budget_ms=None):
     return samples, n
 
 
+def default_kern():
+    """The binary a reader would DOWNLOAD, preferred over the one they happen to have built.
+
+    MEASURED on one commit, 8 alternating batches of 200: the static-pie musl build starts a box in
+    2.372 ms and the glibc build in 2.585, a 9% difference, because the glibc one pays `ld.so` twice
+    (the outer kern and the box-init re-exec). Releases ship musl. So `cargo build --release`, which
+    produces glibc on a normal distro, measures a binary nobody runs, and this script used to name
+    exactly that path in its own usage line.
+
+    The project has been here before: the same confusion was recorded in August and came back,
+    because nothing checks WHICH build a number came from. Now the default looks for the shipped one
+    first and the run says which it used, so the answer is on screen instead of in someone's memory.
+    """
+    for p in (
+        f"target/{platform.machine()}-unknown-linux-musl/release/kern",
+        "target/x86_64-unknown-linux-musl/release/kern",
+        "target/aarch64-unknown-linux-musl/release/kern",
+        "target/release/kern",
+    ):
+        if os.path.exists(p):
+            return p
+    return "kern"
+
+
+def warn_if_not_the_shipped_build(kern):
+    """Say out loud when the numbers below describe a build that is not what releases ship."""
+    out = subprocess.run(["file", "-b", kern], capture_output=True, text=True).stdout
+    if "static-pie" in out:
+        print(f"  binary: {kern} (static-pie musl, as shipped)")
+        return
+    if not out.strip():
+        return  # no `file` here; say nothing rather than guess
+    print(
+        f"  binary: {kern} (dynamically linked, NOT the shipped build)\n"
+        f"          releases ship static-pie musl, which starts ~9% faster because it does not pay\n"
+        f"          ld.so twice. Build it with:\n"
+        f"            cargo build --release --target {platform.machine()}-unknown-linux-musl"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description="Reproduce the kern Performance benchmark.")
     ap.add_argument("--runs", type=int, default=200, help="runs per batch (default 200)")
@@ -108,9 +150,10 @@ def main():
     ap.add_argument("--rootfs", help="an existing Alpine rootfs dir (else pulled with kern)")
     args = ap.parse_args()
 
-    kern = os.environ.get("KERN", "kern")
+    kern = os.environ.get("KERN") or default_kern()
     if not (have(kern) or os.path.exists(kern)):
         sys.exit(f"kern not found ({kern}) - set KERN=/path/to/kern")
+    warn_if_not_the_shipped_build(kern)
 
     work = tempfile.mkdtemp(prefix="kern-bench-")
     rootfs = args.rootfs or get_rootfs(kern, work)
