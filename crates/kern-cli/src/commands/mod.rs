@@ -4867,6 +4867,14 @@ fn run_terminal_verb(
             // accepted and not enforced, which is the one thing this codebase refuses to do quietly.
             // No dependency expansion, matching Docker Compose: the named services are the whole
             // instruction, and pulling in a dependency would stop something the user did not name.
+            // THE MODE IS READ BEFORE THE STOP, because afterwards there is nothing left to ask: a
+            // stopped box leaves no registry entry to carry it. A stack running under `--no-pod` has
+            // no pod at all, and the two-state message below called that "gone with its last member"
+            // - false twice over, since nothing was ever there and the other services were still
+            // running. Reported by an external reviewer against the released 0.8.6 binary.
+            let was_no_pod = boxes
+                .iter()
+                .any(|b| registry::find(&b.name).is_some_and(|i| i.pod.is_empty()));
             let names = stop_stack(
                 boxes
                     .iter()
@@ -4875,6 +4883,15 @@ fn run_terminal_verb(
                     .collect(),
                 pod,
             );
+            if was_no_pod {
+                // No pod is named, because none exists. `start` is still the way back, and it carries
+                // the mode forward on its own.
+                println!(
+                    "compose stop: {} box(es) stopped (this stack runs without a pod)",
+                    names.len()
+                );
+                return Ok(true);
+            }
             let pod_alive = crate::pod::holder_pid(pod).is_some();
             println!(
                 "compose stop: {} box(es) stopped, pod '{pod}' {}",

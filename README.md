@@ -191,6 +191,18 @@ whichever direction it can: a service binding `0.0.0.0:PORT` owns every address 
 cannot host a peer's alias there, while one binding `127.0.0.1:PORT` can. kern measures which it is
 once the services are running and names any direction it cannot serve, with both edits that clear
 it.
+
+Two verbs for the loop around a stack. `kern compose <file> watch` rebuilds and restarts a service
+when its build context changes, and nothing else. `kern compose <file> port <service> <port>` prints
+the host address serving that container port, read from the running box rather than from the file,
+so it answers what is published now.
+
+```sh
+kern compose stack.toml watch              # rebuild + restart on a change, until interrupted
+kern compose stack.toml port web 80        # the host address serving web's port 80
+kern compose stack.toml stop web           # one service; the rest keep running
+```
+
 [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
 Official images that drop to a non-root user (postgres, redis, ...) want `uidmap` and an
@@ -369,7 +381,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done and the CLI is frozen.** 1035 Rust, 340 Python and 61 Node tests, clippy-clean and
+**The core is done and the CLI is frozen.** 1036 Rust, 340 Python and 61 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning

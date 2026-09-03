@@ -7709,3 +7709,102 @@ fn a_service_selector_narrows_stop_start_and_restart() {
         "`restart c` must leave a and b alone: {after_restart:?} vs {after_start:?}"
     );
 }
+
+/// `compose stop` DOES NOT NAME A POD FOR A STACK THAT HAS NONE.
+///
+/// The message had two states where there are three. On a `--no-pod` stack `pod::holder_pid` is
+/// `None` because no pod was ever created, and the `else` branch read that as the pod having been
+/// collapsed: `stop a` answered "pod '<name>' gone with its last member" while `b` was still
+/// running. False twice over, and reported by an external reviewer against the released 0.8.6
+/// binary, whose behaviour was correct throughout.
+///
+/// BOTH MODES IN ONE TEST, because the bug is a confusion between them: a no-pod assertion alone
+/// would pass on a build that stopped naming the pod anywhere, which would lose a true statement
+/// the pod path depends on.
+#[test]
+fn compose_stop_names_a_pod_only_when_there_is_one() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "stopmsg");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-sm-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-sm-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.a]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sleep\", \"300\"]\n\n\
+             [box.b]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sleep\", \"300\"]\n"
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> String {
+        let mut v = vec!["compose", toml.to_str().unwrap()];
+        v.extend_from_slice(args);
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&v)
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+    };
+
+    let up = run(&["up", "--no-pod"]);
+    if !up.contains("box(es) started") {
+        run(&["down"]);
+        cleanup();
+        eprintln!("skip: the no-pod stack did not come up here: {}", up.trim());
+        return;
+    }
+    let nopod_stop = run(&["stop", "a"]);
+    run(&["down"]);
+
+    let up2 = run(&["up", "-d"]);
+    let pod_stop = if up2.contains("box(es) started") {
+        Some(run(&["stop", "a"]))
+    } else {
+        None
+    };
+    run(&["down"]);
+    cleanup();
+
+    assert!(
+        !nopod_stop.contains("pod '"),
+        "a --no-pod stack has no pod to name: {nopod_stop}"
+    );
+    assert!(
+        !nopod_stop.contains("last member"),
+        "and nothing went away with a last member, `b` is still running: {nopod_stop}"
+    );
+    assert!(
+        nopod_stop.contains("without a pod"),
+        "the mode is what the line should say instead: {nopod_stop}"
+    );
+    // The pod half is the control: it must STILL name the pod, or the fix above deleted a true
+    // statement rather than adding a missing one.
+    match pod_stop {
+        Some(m) => assert!(
+            m.contains("pod '") && m.contains("still up"),
+            "stopping one service of a POD stack must still name the pod that remains: {m}"
+        ),
+        None => {
+            eprintln!("SKIP(partial): the pod stack did not come up, so only the no-pod half ran")
+        }
+    }
+}
