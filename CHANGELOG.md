@@ -11,6 +11,24 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## v0.8.7 - 2026-09-03
+
+### Fixed
+
+- **`compose stop` named a pod that a `--no-pod` stack never had.** The message had two states where
+  there are three: on a `--no-pod` stack no pod is ever created, and "no pod holder" was read as "the
+  pod collapsed", so stopping one service answered `pod '<name>' gone with its last member` while the
+  other services were still running. False twice over. The behaviour was correct throughout; only the
+  sentence was wrong. Reported against the released 0.8.6 binary.
+
+### Documentation
+
+- **`compose watch` and `compose port` reached the README.** Both shipped in 0.8.6 and neither
+  appeared on the front page: `watch` was documented nowhere outside `kern --help`, and `port` only
+  under `docs/`. Found by auditing the README against the released binary rather than by reading it:
+  every verb and flag it uses exists, every command in it runs, and both TOML blocks pass `validate`
+  and `compose config`.
+
 ## v0.8.6 - 2026-09-03
 
 ### Added
