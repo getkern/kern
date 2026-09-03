@@ -4,7 +4,7 @@
 // (crates/kern-isolation/seccomp/moby-default-v27.3.1.json) MINUS the 35 syscalls kern denies
 // for being rootless, resolved to per-architecture numbers via the kernel UAPI headers.
 // Re-generate after bumping the pinned profile or a kernel headers update:
-//     python3 scripts/gen-seccomp-allowlist.py
+//     python3 scripts/gen-seccomp-allowlist.py --write
 // Counts: x86_64=317, aarch64=274. NAMES: 391 (see seccomp/allow-names.txt).
 
 #[cfg(target_arch = "x86_64")]

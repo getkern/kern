@@ -44,6 +44,7 @@ DASH = "\u2014"  # stated as an escape so this file does not contain what it hel
 # The exclusion is a NAMED LIST and not a pattern on purpose: a new gate is covered the day it lands,
 # and the only way to escape coverage is to write your name here, where it is read.
 NOT_A_GATE = {
+    "ab-measure": "a measuring instrument, not a gate: it answers a question rather than refusing",
     "gates-selftest": "this script, which runs the others by construction",
     "seccomp-audit": "not a gate: it needs a live workload and an audit log to read",
     "injection-declared": "reports rather than refuses: it always exits 0 by design, so a case that turned it red would be asserting the opposite of its contract",

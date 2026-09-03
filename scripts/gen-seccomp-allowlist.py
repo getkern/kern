@@ -21,7 +21,9 @@ INPUTS (all committed / on-disk, no network at generation time)
 OUTPUT
     crates/kern-isolation/src/seccomp_allow.rs   two sorted `&[u32]` arrays, one per target arch.
 
-Usage:  python3 scripts/gen-seccomp-allowlist.py
+Usage:  python3 scripts/gen-seccomp-allowlist.py            check only, writes nothing
+        python3 scripts/gen-seccomp-allowlist.py --check    the same, said explicitly
+        python3 scripts/gen-seccomp-allowlist.py --write    REGENERATE, then `cargo fmt`
 Exit:   0 on success; non-zero if a compiler is missing or the profile cannot be read.
 """
 
@@ -216,7 +218,7 @@ def rust_text(names: list[str]) -> tuple[str, list[str]]:
         "// (crates/kern-isolation/seccomp/moby-default-v27.3.1.json) MINUS the 35 syscalls kern denies\n"
         "// for being rootless, resolved to per-architecture numbers via the kernel UAPI headers.\n"
         "// Re-generate after bumping the pinned profile or a kernel headers update:\n"
-        "//     python3 scripts/gen-seccomp-allowlist.py\n"
+        "//     python3 scripts/gen-seccomp-allowlist.py --write\n"
         f"// Counts: {', '.join(counts)}. NAMES: {len(names)} (see seccomp/allow-names.txt).\n\n"
     )
     return header + "\n\n".join(blocks) + "\n", counts
@@ -259,6 +261,26 @@ def generate() -> int:
     text, counts = rust_text(names)
     OUT.write_text(text, encoding="utf-8")
     print(f"wrote {OUT} and {NAMES} ({', '.join(counts)}, {len(names)} names)")
+    # FORMATTED HERE, not left to whoever runs this next. The emitted Rust puts one number per line
+    # and the committed file is the compacted form `cargo fmt` produces, so a regeneration that
+    # stopped at the write left a 590-line diff on a generated file and a red `cargo fmt --check`,
+    # neither of which means anything about the allow-list. The tool that makes the mess cleans it.
+    fmt = shutil.which("cargo")
+    if fmt is None:
+        print(
+            "  NOTE: cargo was not found, so the emitted Rust is UNFORMATTED and `cargo fmt --check`\n"
+            "  will be red until you run `cargo fmt --all`. The CONTENT is correct either way.",
+            file=sys.stderr,
+        )
+        return 0
+    r = subprocess.run([fmt, "fmt", "--", str(OUT)], cwd=REPO, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(
+            f"  NOTE: `cargo fmt` on {OUT} failed ({r.stderr.strip()[:160]}); run `cargo fmt --all`.",
+            file=sys.stderr,
+        )
+        return 0
+    print("  formatted, so the tree is left in the shape the repository commits.")
     return 0
 
 
@@ -286,7 +308,9 @@ def check() -> int:
         if removed:
             print(f"  - would LEAVE the allow set: {', '.join(removed)}", file=sys.stderr)
         print(
-            "  Run `python3 scripts/gen-seccomp-allowlist.py` and review the diff before committing.",
+            "  Run `python3 scripts/gen-seccomp-allowlist.py --write` and review the diff before\n"
+                "  committing. WITHOUT `--write` this script only checks, so the bare command\n"
+                "  re-prints this message and changes nothing.",
             file=sys.stderr,
         )
         return 1
