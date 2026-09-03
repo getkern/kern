@@ -155,6 +155,25 @@ const _: () = assert!(
 /// Bounded because a box that is gone for good would otherwise be retried forever, once per poll,
 /// and each attempt forks two processes. Twelve attempts is three seconds at [`HEAL_POLL_MS`], which
 /// covers a service restarting and not a service that has been removed from the file.
+/// How long `spawn_holder` waits for a live holder to rebuild the edges a restart invalidated.
+///
+/// Measured on this desktop: after `stop b; start`, the halves are replaced about 290 ms later, one
+/// `HEAL_POLL_MS` plus the registry read. The budget is an order above that so a loaded machine
+/// still settles, and it is a ceiling rather than a delay: the ordinary case returns on the first
+/// poll.
+const EDGE_SETTLE_MS: u64 = 3_000;
+/// How often that wait re-reads. Short next to `HEAL_POLL_MS`, so the wait ends when the holder
+/// finishes rather than a poll later.
+const EDGE_POLL_MS: u64 = 25;
+const _: () = assert!(
+    EDGE_SETTLE_MS > HEAL_POLL_MS * 4,
+    "the budget must cover several heal passes"
+);
+const _: () = assert!(
+    EDGE_POLL_MS < HEAL_POLL_MS,
+    "polling slower than the holder repairs adds latency"
+);
+
 const HEAL_ATTEMPTS: u32 = 12;
 
 /// Edges this stack has given up rebuilding, one per line, read by `kern compose ps`.
@@ -165,6 +184,37 @@ const HEAL_ATTEMPTS: u32 = 12;
 /// reported, and `compose ps` is where a person already looks to decide whether something is wrong.
 pub(crate) fn degraded_path(dir: &Path) -> PathBuf {
     dir.join("degraded")
+}
+
+/// A file whose EXISTENCE asks the holder to read the registry on its next pass.
+///
+/// The periodic scan is deliberately slow (`REGISTRY_SCAN_MS`), and its comment argues that a second
+/// more before a restarted service's edges return is invisible next to the restart itself. That was
+/// true while nobody waited for it. `spawn_holder` now does, so that second became latency on
+/// `compose start`: measured 1.65 s against 0.7 s before the wait existed.
+///
+/// A `stat` per pass is what this costs, against the `registry::list()` the slow scan exists to
+/// avoid, so the gate it bypasses keeps protecting the idle stack: a holder nobody is waiting on
+/// still scans every two seconds and still costs 0.10% of a core.
+pub(crate) fn poke_path(dir: &Path) -> PathBuf {
+    dir.join("rescan")
+}
+
+/// The edges the holder is serving RIGHT NOW, each with the pids it was built against.
+///
+/// `compose start` on a live holder used to return the moment it saw the holder's pid file, and
+/// report every planned relay as up. MEASURED: after `stop b; start`, the relay halves are still the
+/// OLD ones for about 290 ms, because the holder repairs them on its own poll rather than being
+/// replaced. During that window the stale relay accepts the connection and cannot forward it, so a
+/// script doing `compose start && curl peer` fails intermittently while kern says the stack is up.
+/// A bare connect cannot see this: only a payload can, which is why it survived so long.
+///
+/// So the holder publishes what it is actually serving, and the caller waits for the pids to be the
+/// current ones. Replacing the holder instead would be the wrong trade: `compose watch` runs a
+/// `start` per save, and re-forking every relay in an eight-service stack is 336 processes to repair
+/// the two that changed.
+pub(crate) fn served_path(dir: &Path) -> PathBuf {
+    dir.join("served")
 }
 
 /// Where the holder and every relay it forks send their stderr.
@@ -580,7 +630,11 @@ fn heal_forever(
         // registry, and calling it every 250 ms cost a RELEASE holder 2.75% of a core, continuously,
         // on an eight-service stack where nothing was wrong. A developer leaving a stack up for a day
         // paid that for nothing.
-        let due = last_scan.elapsed() >= std::time::Duration::from_millis(REGISTRY_SCAN_MS);
+        // A caller waiting on `wait_for_fresh_edges` asks for the scan it needs, rather than paying
+        // the periodic one. Removed as it is read, so one request buys one scan.
+        let poked = std::fs::remove_file(poke_path(dir)).is_ok();
+        let due =
+            poked || last_scan.elapsed() >= std::time::Duration::from_millis(REGISTRY_SCAN_MS);
         let pending = slots.iter().any(|s| s.dead);
         if !any_died && !pending && !due {
             std::thread::sleep(std::time::Duration::from_millis(HEAL_POLL_MS));
@@ -612,6 +666,7 @@ fn heal_forever(
             })
             .collect();
         write_degraded(dir, &now);
+        write_served(dir, &slots, plan);
         std::thread::sleep(std::time::Duration::from_millis(HEAL_POLL_MS));
     }
 }
@@ -851,6 +906,26 @@ fn wait_for_listeners(plan: &[crate::nopod::RelayPlan]) {
 /// Removed rather than emptied when nothing is degraded: a present-but-empty file would make every
 /// reader distinguish "no degraded edges" from "no relays at all", and only one of those is worth a
 /// line in `kern compose ps`.
+/// Publish the live edges as `in_box:pid1 to_box:pid1`, one per line.
+///
+/// Only edges with a RUNNING relay are listed: a slot between a retirement and its replacement is
+/// exactly the state a caller must wait through, so listing it would defeat the wait. Written on
+/// every pass rather than only on change, because the values track pids that move.
+fn write_served(dir: &Path, slots: &[Slot], plan: &[crate::nopod::RelayPlan]) {
+    let mut body = String::new();
+    for (i, s) in slots.iter().enumerate() {
+        if s.relay.is_some() {
+            body.push_str(&format!(
+                "{}:{} {}:{}\n",
+                plan[i].in_box, s.a.pid1, plan[i].to_box, s.b.pid1
+            ));
+        }
+    }
+    if std::fs::read_to_string(served_path(dir)).ok().as_deref() != Some(body.as_str()) {
+        let _ = std::fs::write(served_path(dir), body);
+    }
+}
+
 fn write_degraded(dir: &Path, edges: &[String]) {
     let path = degraded_path(dir);
     if edges.is_empty() {
@@ -861,6 +936,44 @@ fn write_degraded(dir: &Path, edges: &[String]) {
     body.push('\n');
     if std::fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
         let _ = std::fs::write(&path, body);
+    }
+}
+
+/// Wait until the live holder is serving every edge against the pids that are running NOW.
+///
+/// An edge counts as settled when the holder lists it in `served` with both current pids, OR when it
+/// is in `degraded` - a blocked edge has no relay and never will, so requiring it here would wait out
+/// the whole budget on a stack that is working as designed.
+///
+/// BOUNDED, and it returns rather than failing when the budget runs out: the caller's job is to
+/// report a stack, not to refuse one because a repair is slow. The budget is generous next to the
+/// holder's own `HEAL_POLL_MS`, so the ordinary case costs one poll.
+fn wait_for_fresh_edges(dir: &Path, plan: &[crate::nopod::RelayPlan]) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(EDGE_SETTLE_MS);
+    // Ask for a scan instead of waiting out the periodic one; see `poke_path`.
+    let _ = std::fs::write(poke_path(dir), b"");
+    while std::time::Instant::now() < deadline {
+        let snapshot = crate::registry::list();
+        let served = std::fs::read_to_string(served_path(dir)).unwrap_or_default();
+        let degraded = std::fs::read_to_string(degraded_path(dir)).unwrap_or_default();
+        let stale = plan.iter().any(|r| {
+            if degraded.contains(&format!("{} -> {} on {}", r.in_box, r.to_box, r.port)) {
+                return false;
+            }
+            let (Some(a), Some(b)) = (
+                live_pid1_in(&snapshot, &r.in_box),
+                live_pid1_in(&snapshot, &r.to_box),
+            ) else {
+                // A box that is not running yet is not an edge this can settle: leave it to the
+                // holder, which is what rebuilds the edge once the box exists.
+                return false;
+            };
+            !served.contains(&format!("{}:{} {}:{}", r.in_box, a.pid1, r.to_box, b.pid1))
+        });
+        if !stale {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(EDGE_POLL_MS));
     }
 }
 
@@ -887,6 +1000,9 @@ pub(crate) fn spawn_holder(
     if holder_pid(dir).is_some()
         && std::fs::read_to_string(plan_path(dir)).ok().as_deref() == Some(wanted.as_str())
     {
+        // AND WAIT FOR IT TO BE SERVING THE BOXES THAT ARE RUNNING NOW, or this returns while the
+        // stale relays from before a restart are still in place. See `served_path`.
+        wait_for_fresh_edges(dir, plan);
         // The live holder's own view of what is blocked, which it keeps current as services restart
         // and rebind. Reading it here means a `start` reports the same thing an `up` would.
         return Ok(HolderReport {

@@ -5228,6 +5228,26 @@ fn restarting_one_service_of_a_no_pod_stack_keeps_its_peers_reachable() {
         String::from_utf8_lossy(&start.stderr)
     );
 
+    // NO SLEEP BEFORE THIS ONE, and the six-second wait below is exactly why the defect it guards
+    // survived. `start` returning is a promise that the stack is reachable; it was not, for about
+    // 1.65 s, because a live holder was left alone and its relays still pointed into the namespace
+    // of the box that had just been replaced. The stale relay ACCEPTS and cannot forward, so only a
+    // payload sees it, and a test that waits first never can.
+    let immediately = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "exec",
+            "cli",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "printf 'GET /hello HTTP/1.0\r\n\r\n' | nc -w 2 srv 7311",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
     std::thread::sleep(std::time::Duration::from_millis(6000));
     let after = logs_of("cli");
     let tail: String = after.lines().rev().take(3).collect::<Vec<_>>().join(" ");
@@ -5237,6 +5257,11 @@ fn restarting_one_service_of_a_no_pod_stack_keeps_its_peers_reachable() {
         tail.contains("DATA_OK"),
         "after restarting one service the peer must still deliver a BODY, not merely accept a \
          connection: {tail}"
+    );
+    assert!(
+        immediately.contains("PAYLOAD_OK"),
+        "and it must deliver on the FIRST attempt after `start` returns, with no settling time: \
+         {immediately}"
     );
 }
 
