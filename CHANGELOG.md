@@ -11,7 +11,7 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
-## Unreleased
+## v0.8.6 - 2026-09-03
 
 ### Added
 
@@ -200,7 +200,46 @@ is in the git history.
   now knows that `port` takes `<service> <port>`: it used to report a mistyped NUMBER as an unknown
   service, sending the reader to look for something their file never contained.
 
+### Changed
+
+- **`compose stop`, `start` and `restart` now act on the services you name.** `[service...]` was in
+  the CLI surface and validated on the way in, then dropped: `kern compose stack.toml stop b` on an
+  a/b/c stack stopped all three and reported "3 box(es) stopped" for the one name given, and
+  `start b` launched all three. An argument that is accepted and not honoured is the same class of
+  defect as a resource cap that is accepted and not enforced.
+
+  `up <service>` expands to what that service depends on, or it starts a service against a database
+  that was never launched. `stop`, `start` and `restart` do NOT expand, because there the named
+  services are the whole instruction and pulling in a dependency would touch something you did not
+  name. This is Docker Compose's split, and the behaviour scripts written against Compose expect.
+
+  IF YOU RELIED ON `stop <service>` STOPPING THE WHOLE STACK, drop the argument: `compose stop` with
+  no names still stops everything, exactly as before.
+
 ### Fixed
+
+- **`kern stop` could report a foreground box as unconfirmed while it kept running.** `signal_box`
+  discarded the result of `pidfd_send_signal`, so a call that never delivered was indistinguishable
+  from one that did. For a foreground box that syscall is the whole teardown: its init is not a
+  process-group leader, so the `kill(-pid)` sweep beside it is a harmless ESRCH. Where a sandbox
+  policy filters the syscall, nothing reached the init. It now falls back to a plain `kill` on every
+  errno except ESRCH, which is the one case where the pid may already belong to someone else, and
+  which is the reuse the pidfd exists to rule out. Reported by an external reviewer on a host none of
+  the maintainers has.
+
+- **A blocked peer edge named the wrong wildcard address.** The report said "it listens on 0.0.0.0"
+  and advised binding `127.0.0.1` whatever the service had actually bound, so a service listening on
+  `::` was told to look for a string that is not in its compose file and to move to an address an
+  IPv6 listener never owns. The address is now the one the kernel reported, and the remedy is the
+  loopback of that same family. The healing loop and the first pass also worded the same fact
+  differently, and only the first offered a fix; both now go through one report.
+
+- **Three tests failed as root, or with `/tmp` on overlayfs.** Two pin a bug whose fixture is an
+  unwritable directory, and root's `CAP_DAC_OVERRIDE` walks straight through it, so the positive
+  control could not be armed; they now skip only that control, say so, and still assert the fix. The
+  third assumed `/tmp` is never overlayfs, which is false in any container that overlays it; it now
+  requires `statfs` to agree with `/proc/mounts`, an independent channel, so it holds in both
+  environments and skips in neither.
 
 - **`kern compose <file> up` without `--no-pod`, on a stack running without one, silently moved it
   back into a pod.** The plan file on disk is how a stack remembers its mode, and `start` carries it,
@@ -339,6 +378,21 @@ is in the git history.
 - **A compose error listed scoped box names to a reader who typed service names.** `no service 'x' in
   file (services: pod-token-web)` answered a typo with names the file does not contain. It lists what
   the file calls them now.
+
+### Documentation
+
+- **README and BENCHMARKS.md gave different numbers for the same measurement.** One said kern and
+  bubblewrap both cold-start at ~2.3 ms and runc at ~18.6; the other said 2.7 / 2.7 / 14.0. Both now
+  carry one clean run of `examples/benchmark.py`: kern 2.7 ms, bubblewrap 3.0, runc 14.2, podman
+  288.1, docker 295.9. Two sentences were wrong beyond the digits. "kern and bubblewrap sit inside
+  each other's noise" no longer holds, because the ranges do not overlap; and "kern's figure includes
+  a real cgroup cap" was never true of that column, which is the bare box precisely so that it is the
+  same job as bwrap. The namespace-matched bwrap invocation is now published beside the table.
+
+- **kern against bubblewrap on aarch64**, which had never been measured. On a Jetson Orin Nano and an
+  Arduino UNO Q, at equal work kern is 21% faster; by default it is slower, because over SSH the
+  login cgroup sits outside `user@<uid>.service`, kern's delegated slice refuses a `memory.max`
+  write, and a `systemd-run --user --scope` per box is the only way to cap there at all.
 
 ## v0.8.5 - 2026-09-01
 
