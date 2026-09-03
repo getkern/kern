@@ -4556,6 +4556,64 @@ mod config_verbs_are_defined_in_one_place {
 /// a third is dropped. Scoped to the body so this test's own text cannot satisfy it.
 #[cfg(test)]
 mod the_plan_previews_every_profile_kind {
+    /// A preview that reports a profile it cannot attach has to EXIT saying so.
+    ///
+    /// Measured before this existed: `kern box … --config <file> vcpu:nope --plan` printed
+    /// `cannot attach: no [[vcpu]] profile named 'nope'` and exited 0, on all three families, while
+    /// the same command without `--plan` exited 1. A script running `--plan && launch` therefore
+    /// proceeded to a launch the preview had already established could not happen, and a pipeline
+    /// gating on the preview learned nothing from it.
+    ///
+    /// The control is the second half: a profile that DOES resolve, and a plan with no profiles at
+    /// all, must both stay `Ok`. Without them a `box_plan` that always failed would pass the first
+    /// assertion.
+    #[test]
+    fn a_plan_that_cannot_attach_a_profile_exits_saying_so() {
+        let dir = std::env::temp_dir().join(format!("kern-plan-rc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let toml = dir.join("kern.toml");
+        let _ = std::fs::write(
+            &toml,
+            "[kern]\nconfig_version = 1\n[[cpu]]\nid = \"cpu:0\"\n\
+             [[vcpu]]\nname = \"real\"\nbackend = \"cpu:0\"\ncpus = 1\n",
+        );
+        let path = toml.to_string_lossy().into_owned();
+
+        for missing in ["vcpu:nope", "vgpio:nope", "vdisk:nope"] {
+            let r = crate::commands::start::box_plan("planrc", &[missing.to_string()], Some(&path));
+            assert!(
+                r.is_err(),
+                "`--plan` with {missing} must not exit 0: the launch carrying it would fail"
+            );
+        }
+
+        // Two broken profiles are ONE error naming both, not the first one found: an operator fixing
+        // a configuration wants every problem in one pass.
+        let two = crate::commands::start::box_plan(
+            "planrc",
+            &["vcpu:nope".to_string(), "vdisk:nope".to_string()],
+            Some(&path),
+        );
+        match two {
+            Err(crate::error::Error::Cli(m)) => assert!(
+                m.contains('2'),
+                "the error must count both refusals, it says: {m}"
+            ),
+            other => panic!("two broken profiles must produce one counted error, got {other:?}"),
+        }
+
+        assert!(
+            crate::commands::start::box_plan("planrc", &["vcpu:real".to_string()], Some(&path))
+                .is_ok(),
+            "a profile that resolves must leave the plan Ok"
+        );
+        assert!(
+            crate::commands::start::box_plan("planrc", &[], Some(&path)).is_ok(),
+            "a plan with no profiles at all must be Ok"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn all_three_kinds_are_picked_and_resolved() {
         // `start.rs`, where `box_plan` lives since the verbs moved out of `mod.rs`. That move made this

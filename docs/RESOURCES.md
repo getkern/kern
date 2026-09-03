@@ -113,6 +113,22 @@ command reads and writes. The full schema, every field, the 7-layer precedence a
 **Both take resource slices;** the difference is the sandbox. `box` = isolation **+** slices; `run` =
 slices **without** the sandbox. They compose (`run` inside `box`). Both ship today.
 
+**Both also carry a default memory cap of 512 MiB, whether or not you ask for one.** It is not the
+absence of a limit that a command with no `--memory` gets: it is 512 MiB, plus no swap and a ceiling
+of 512 tasks, applied by the transient systemd scope kern re-execs into. A workload that goes past it
+is OOM-killed, and kern says so and names `--memory` as the fix. This is stated here because it was
+not stated anywhere: `kern box --help` has always printed `default 512m` and `kern run --help` printed
+only `e.g. 512m, 2g`, which reads as an example of the size format rather than as the value in force,
+so a 700 MiB script exiting 137 under `kern run` had no document to look it up in.
+
+Two ways to change it, and they are not the same:
+
+- `--memory <size>` raises or lowers the ceiling. This is the one you want.
+- `KERN_NO_SCOPE=1` removes the scope, and with it the default and the swap and task ceilings. The
+  command then runs in the cgroup of whatever started it, which is usually your shell's and may be
+  another application's entirely. kern warns when this happens; `KERN_ALLOW_UNCAPPED=1` says the
+  uncapped run is intended and silences the warning.
+
 **One boundary crosses the split.** `--landlock-rw <path>` works on `run` as well as on `box`, because
 Landlock restricts the calling process rather than requiring a mount namespace: no image, no
 `pivot_root`, nothing to build. So `kern run --landlock-rw ~/project -- ./agent` runs the binary you

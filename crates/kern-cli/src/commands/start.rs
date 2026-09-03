@@ -39,6 +39,17 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
     if vcpu.is_empty() && vgpio.is_empty() && vdisk.is_empty() {
         return Ok(());
     }
+    // A PROFILE THAT CANNOT ATTACH IS AN OUTCOME, NOT A LINE. The preview names every one of them and
+    // then exits non-zero, because the launch carrying that profile is going to fail. Measured before
+    // this: `kern box … --config <file> vcpu:nope --plan` printed the refusal and exited 0, while the
+    // same command without `--plan` exited 1, so `kern box … --plan && kern box …` walked on to a
+    // launch the preview had already established could not happen, and a pipeline gating on the
+    // preview learned nothing from it.
+    //
+    // COUNTED rather than returned at the first failure, so the whole plan still prints and every
+    // broken profile is visible in one pass. Stopping at the first would send an operator round the
+    // loop once per typo.
+    let mut refused = 0usize;
     // Loaded once for all three: `--plan` is a preview, but reading the same file three times would
     // let two kinds disagree if it changed underneath.
     //
@@ -72,7 +83,10 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
                     println!("  resource caps from vcpu:{n}: {}", caps.join(", "));
                 }
             }
-            Err(e) => println!("  vcpu:{n}: cannot attach: {e}"),
+            Err(e) => {
+                refused += 1;
+                println!("  vcpu:{n}: cannot attach: {e}");
+            }
         }
     }
     for n in vgpio {
@@ -95,7 +109,10 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
                     );
                 }
             }
-            Err(e) => println!("  vgpio:{n}: cannot attach: {e}"),
+            Err(e) => {
+                refused += 1;
+                println!("  vgpio:{n}: cannot attach: {e}");
+            }
         }
     }
     for n in vdisk {
@@ -128,8 +145,18 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
                     println!("    persistent (ext4-on-loop backend only)");
                 }
             }
-            Err(e) => println!("  vdisk:{n}: cannot attach: {e}"),
+            Err(e) => {
+                refused += 1;
+                println!("  vdisk:{n}: cannot attach: {e}");
+            }
         }
+    }
+    // THE EXIT CODE HAS TO AGREE WITH THE TEXT, which is why the count above is kept.
+    if refused > 0 {
+        return Err(Error::Cli(format!(
+            "{refused} profile(s) named above cannot attach, so this box would not start. The plan \
+             is printed in full so every one of them can be fixed in one pass."
+        )));
     }
     Ok(())
 }

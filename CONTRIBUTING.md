@@ -82,6 +82,27 @@ confident wrong answer first and a correction second.
   restore has already executed stale bytecode while `diff` reported no change.
 - **A gate's exit code is read bare.** Never through a pipe. See the `no-em-dash` and
   `stale-numbers` invocations.
+- **THE COMMONEST ONE HERE, and it has a name: reading a number before the thing it measures has
+  happened.** Five of the seven wrong answers in one measurement session were this single shape,
+  wearing a different costume each time, which is why it is worth naming rather than listing. A
+  timing loop ran `kern box NAME --rm ...` and timed a usage error, because `--rm` is not a flag
+  kern has; the figure was a clean 1.5 ms and a plausible box start. On the GPU branch, a probe
+  computed `(size_t)atof("0.05") * 1 GiB` and allocated zero bytes, so eleven cases reported "no
+  device" on a card with 14.5 GiB free; a concurrency floor was read from `pgrep`, which counts
+  processes that exist but have not allocated yet, and produced twelve false dips; a tok/s median
+  was taken over a single sample and read 30% noise as a regression; and a watchdog was armed after
+  the first call it was meant to guard, which is itself the call that hangs, so the deliberate
+  deadlock hung the program before the watchdog existed. **The defence is one question asked before
+  the number is believed: did the thing I am timing actually happen?** Print the exit status of
+  every timed command and assert it. Print the value the probe computed, not the value you passed
+  it. Assert a positive control that must produce a non-zero reading, and a negative control that
+  must produce none.
+- **An A/B needs a null control: the same binary in both columns.** Without it an ordering bias in
+  the harness reads as an effect of the change. Measured here: `kern doctor` timed against ITSELF
+  gives +300 us [-46, +512], so a +553 us "regression" attributed to a new branch was not
+  resolvable from the harness, and `strace` then proved that branch had never run. Run the null
+  control on the same workload, at the same sample size, and report the effect against it.
+  `scripts/ab-measure.py` does all of this and refuses the null control unless you declare it.
 
 ## Shipping a claim about a boundary
 
