@@ -6,16 +6,22 @@ filesystem.
 
 | runtime | cold start | 200 in parallel |
 |---|---:|---:|
-| **kern** `box --rootfs` | **2.7 ms** | **0.11 s** |
-| bubblewrap | 2.7 ms | 0.14 s |
-| runc (rootless) | 14.0 ms | 0.28 s |
-| podman `run --rm` | 288.9 ms | 45.4 s |
-| docker `run --rm` | 294.6 ms | 16.5 s |
+| **kern** `box --rootfs` | **2.7 ms** | **0.10 s** |
+| bubblewrap | 3.0 ms | 0.18 s |
+| runc (rootless) | 14.2 ms | 0.32 s |
+| podman `run --rm` | 288.1 ms | 43.7 s |
+| docker `run --rm` | 295.9 ms | 16.8 s |
 
-kern and bubblewrap sit inside each other's noise and nobody wins single-shot latency outright; the
-gap that matters is to the engines. kern's figure includes an overlay, a real cgroup cap and a
-registry entry, none of which bubblewrap does. `box --image` is 3.5 ms, of which 1 ms is the
-rootless uid-range mapping: two setuid helpers kern does not control.
+The bubblewrap column is namespace-matched, or it is not a comparison: `kern box` always makes a
+network namespace, so bwrap is given `--unshare-user --unshare-pid --unshare-ipc --unshare-uts
+--unshare-net --bind <rootfs> / --proc /proc --dev /dev`.
+
+kern leads bubblewrap by 0.3 ms and the two ranges do not overlap (2.6 to 2.7 against 2.9 to 3.0),
+which is a real margin and a small one. Both columns run WITHOUT a cgroup cap, which is what makes
+them the same job; kern is still installing a seccomp filter and writing a registry entry that bwrap
+does not, and the default `kern box` adds the cap on top. The gap that matters is to the engines.
+`box --image` is 3.5 ms, of which 1 ms is the rootless uid-range mapping: two setuid helpers kern
+does not control.
 
 The claim that survives is reach rather than milliseconds. On a Raspberry Pi 5, docker, podman,
 runc, crun, bwrap, nerdctl, lxc-start and systemd-nspawn were all absent, checked one at a time;

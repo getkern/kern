@@ -294,8 +294,8 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.3 ms** | ~297 ms | ~293 ms |
-| Cold start, from an OCI image | **~3.5 ms** | ~297 ms | ~293 ms |
+| Cold start, bare box | **~2.7 ms** | ~296 ms | ~288 ms |
+| Cold start, from an OCI image | **~3.5 ms** | ~296 ms | ~288 ms |
 | Stop a service (init handles SIGTERM) | **~1.9 ms** | ~310 ms | ~380 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one static binary** | daemon stack | multi-binary install |
@@ -311,15 +311,27 @@ Intel i7-14700KF, Linux 7.0.0, the release binary, one script you can run yourse
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.3 ms** | ~2.3 ms | ~18.6 ms | ~293 ms | ~297 ms |
-| 200 boxes in parallel | **~0.11 s** | ~0.16 s | ~0.35 s | ~44.8 s | ~16.2 s |
+| Cold start (bare box) | **~2.7 ms** | ~3.0 ms | ~14.2 ms | ~288 ms | ~296 ms |
+| 200 boxes in parallel | **~0.10 s** | ~0.18 s | ~0.32 s | ~43.7 s | ~16.8 s |
 
 Three thousand at once take ~2.2 s, and a live box costs ~0.3 MB of memory.
 
-Two honest notes. **Nobody wins single-shot latency outright**: the floor for `unshare` + `exec` is
-1 to 2 ms, so the whole top tier sits inside its own noise, and bubblewrap is a launcher with no
-images, caps or lifecycle. The gap that means something is to the *engines*, two orders of magnitude
-above.
+The bubblewrap column is namespace-matched, or it is not a comparison. `kern box` always makes a
+network namespace, and a bwrap invocation without `--unshare-net` is doing less work:
+
+```sh
+bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net \
+      --bind <rootfs> / --proc /proc --dev /dev /bin/true
+```
+
+Two honest notes. **The margin over bubblewrap is real but small**: 2.7 ms against 3.0 ms here, with
+the two ranges not overlapping (kern 2.6 to 2.7, bwrap 2.9 to 3.0), while kern is also installing a
+seccomp filter and recording a registry entry that bwrap does not. Both columns run WITHOUT a cgroup
+cap, which is what makes them the same job; the default `kern box` adds one. bubblewrap is a
+launcher, not a runtime, and fractions of a millisecond are not why you would pick either. **The gap that means
+something is to the engines**, two orders of magnitude above. On aarch64 the same matched comparison
+puts kern 21% ahead of bubblewrap, and the default slower, for a reason worth reading before quoting
+either number: [BENCHMARKS.md](BENCHMARKS.md).
 
 The table and how to reproduce it: **[BENCHMARKS.md](BENCHMARKS.md)**.
 

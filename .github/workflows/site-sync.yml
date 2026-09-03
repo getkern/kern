@@ -47,22 +47,12 @@ jobs:
 
       - name: the live page does not claim a GPU cap this build does not ship
         # THE SITE IS OUTSIDE THE REPO, so `stale-numbers.py` and its `gpu_claims_agree()` never see
-        # it. MEASURED on 2026-09-02: the live page had been saying "a `vgpu:` profile caps VRAM well
-        # enough that PyTorch and ollama size themselves to it", describing a shipping VRAM cap. kern
-        # ships NO GPU limit at all, which is what SECURITY.md, the README and `kern doctor` all say.
-        # A public page advertising a capability the product does not have is the most expensive kind
-        # of drift, and it survived because nothing here was looking. Now something is.
+        # it, and a public page advertising a capability the product does not have is the most
+        # expensive kind of drift.
         #
-        # `grep -q` on the FORBIDDEN phrasing, plus a positive control that the page still carries the
-        # honest one: without the second half a page that lost the whole section would pass.
-        run: |
-          if grep -qiE 'caps VRAM|vgpu:? profile caps|GPU (cap|limit|slice)s? (ship|work)' /tmp/live.html; then
-            echo "::error::getkern.dev claims a GPU cap. No GPU limit ships." >&2
-            grep -oiE '.{80}caps VRAM.{80}' /tmp/live.html >&2 || true
-            exit 1
-          fi
-          grep -q 'NOT a boundary against malicious code' /tmp/live.html || {
-            echo "::error::the live page no longer carries the cooperative-quota disclaimer, so the" >&2
-            echo "  check above would pass on a page that simply dropped the GPU section" >&2
-            exit 1; }
-          echo "the live page makes no GPU-cap claim, and still carries the disclaimer"
+        # The two `grep` calls that used to live here BOTH read the real page wrong, the day they
+        # were written: the forbidden pattern matched the page's own honest "No GPU limit ships"
+        # (the negation read as the claim), and the positive control searched raw HTML for a
+        # sentence that is wrapped across lines, so it could only ever fail. Moved into a script so
+        # it can be run against a fixture and is covered by `scripts/gates-selftest.py`.
+        run: python3 scripts/site-gpu-claims.py /tmp/live.html
