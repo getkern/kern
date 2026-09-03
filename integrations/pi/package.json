@@ -1,0 +1,24 @@
+{
+  "name": "pi-extension-kern",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "kern-sandbox": "^0.1.33"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@types/node": "^26.4.1",
+    "typescript": "^5.6.0"
+  }
+}

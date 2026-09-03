@@ -77,6 +77,11 @@ examples/clip.mp4
 # a build artefact that went in by accident (it did, in 0.6.20).
 clip.mp4
 
+# The Node SDK has NO dependencies, which is why this line never existed: nothing in the tree
+# produced a node_modules until integrations/pi, which needs pi's own package to typecheck against.
+# The lockfile IS tracked, so an installed tree is reproducible without committing 130 packages.
+node_modules/
+
 __pycache__/
 *.pyc
 kern-sandbox-*.tgz
