@@ -11,6 +11,54 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## v0.9.0 - 2026-09-04
+
+A minor bump because one exit code changes: see the first entry. Everything else is a defect fix.
+
+### Changed
+
+- **`kern box --plan` now exits non-zero when a profile it named cannot attach.** It printed
+  `cannot attach: no [[vcpu]] profile named 'nope'` and exited **0**, while the same command without
+  `--plan` exited 1, so `kern box ... --plan && kern box ...` walked on to a launch the preview had
+  already established could not happen. A script that gated on the preview and ignored its exit code
+  is unaffected; a script that gated on `&&` now stops where it should have stopped before. The whole
+  plan still prints and every broken profile is counted, so a configuration with three typos is fixed
+  in one pass rather than three.
+
+### Fixed
+
+- **A `kern run` that nobody capped said nothing, and one killed by the cap said nothing either.**
+  A plain `kern run` is not uncapped: the scope it re-execs into carries `MemoryMax=512M`.
+  `KERN_NO_SCOPE=1` skips that scope and the default goes with it, and both existing warnings were
+  gated on the caller having ASKED for a cap, so the case where nothing was typed ran in whatever
+  cgroup the caller sat in and printed nothing. Measured, allocating 800 MiB against the default:
+  `kern run` was killed at rc 137, `KERN_NO_SCOPE=1 kern run` completed at rc 0 with an EMPTY stderr.
+  Separately, a workload the OOM killer took exited 137 with no output at all; 137 is `128 + SIGKILL`
+  and SIGKILL has many senders, so on its own it told an operator nothing. Both now say what happened,
+  and the OOM message is kept to what is actually measured: the killer fired in kern's cgroup subtree
+  while the box ran, not which process it took.
+- **An error that lists things reached the user as one run-on line.** `kern volume rm a b` printed
+  `error: 2 volume(s) not removed:  no volume named 'a'  no volume named 'b'`, because the scrub that
+  strips control characters stripped the newlines that made it a list. Newlines survive now and every
+  continuation line is indented, so a hostile value still cannot forge a line at column 0 where kern's
+  own `error:` and `hint:` prefixes live.
+- **The seccomp allow-list generator promised to run `cargo fmt` and never ran it,** so `--write` left
+  623 changed lines on a file whose own header says DO NOT EDIT BY HAND and turned the format check
+  red. Three places also pointed at the bare command, which only CHECKS, including the failure message
+  the check itself prints: following it re-ran the check and changed nothing.
+- **`kern-sandbox` (Python and Node): a FIFO the box planted could stall the host's read, or fake it.**
+  `read_file`/`readFile` opened `O_NOFOLLOW`, which stops a symlink, and a symlink is not the only
+  thing a box can leave at a name. A box that runs `mkfifo out.png` made the host's read wait for a
+  writer that never comes, with no timeout: the box decided how long the caller's call took. Adding
+  `O_NONBLOCK` alone would have been worse, because a non-blocking read of a writer-less FIFO returns
+  zero bytes and the call would have reported an EMPTY FILE. Both halves ship: the open is
+  non-blocking AND a descriptor that is not a regular file is refused. Published as **0.1.34** on PyPI
+  and npm.
+- **The MCP server's memory default shadowed a profile's own.** `KERN_MCP_MEMORY_MB` defaulted to 1024
+  and was sent on every call, and an explicit flag beats a profile, so a `vcpu:` profile carrying its
+  own `memory=` could never apply it. Unsetting the variable did not help: it fell back to the same
+  default. `0` now means "send no `--memory` at all".
+
 ## v0.8.9 - 2026-09-03
 
 ### Fixed
