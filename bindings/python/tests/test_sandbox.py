@@ -1248,3 +1248,57 @@ def test_a_failed_setup_keeps_a_workspace_the_caller_supplied(tmp_path):
         with Sandbox(setup="exit 3", workspace=str(theirs), timeout_s=30):
             pass
     assert (theirs / "keep.txt").read_text() == "mine"
+
+
+def test_a_missing_interpreter_is_a_typed_fault_naming_the_binary_and_the_image():
+    """`language="node"` on the default image is the case a model hits: the enum advertises three
+    languages and `python:3.12-slim` carries two.
+
+    Before this, `_classify` said `startup_failed` and `_spawn` ERASED it, because "box started + a
+    kern: marker" is its signal that a workload forged the marker. kern signals started BEFORE it
+    execs, so an ENOENT on `execve` lands in exactly that hole and arrived as a bare exit 127 with
+    `fault=None`: indistinguishable from the user's own code failing."""
+    r = kern.run_code("console.log(1)", language="node", image="python:3.12-slim")
+    assert r.exit_code == 127
+    assert r.fault is not None, "a missing interpreter must not arrive as an ordinary non-zero exit"
+    assert r.fault.type == "exec_failed"
+    assert "node" in r.fault.message and "python:3.12-slim" in r.fault.message
+    assert "No such file or directory" in r.fault.message
+    assert not r.success
+
+
+def test_command_not_found_inside_the_users_own_script_is_not_a_fault():
+    """The control for the test above, and the reason the recogniser matches kern's WORDING rather
+    than exit 127: a shell returning 127 for a command the USER misspelled is the user's failure, and
+    labelling it `exec_failed` would blame the image for the script's own bug."""
+    r = kern.run_code("nosuchcommandanywhere", language="bash", image="python:3.12-slim")
+    assert r.exit_code == 127
+    assert r.fault is None, "a shell's own command-not-found must stay an ordinary result"
+
+
+def test_an_interpreter_the_image_does_have_is_untouched():
+    """Second control: the new branch must not fire on a working call."""
+    r = kern.run_code("print(1)", language="python", image="python:3.12-slim")
+    assert r.fault is None and r.exit_code == 0 and r.success
+
+
+def test_exit_126_is_the_other_half_of_the_pair_and_says_permission_not_absence():
+    """EACCES at `execve` is the same third state as ENOENT (box started, workload never ran) with a
+    different exit code, and the classifier catches it because it keys on kern's WORDING rather than
+    on 127. The message is the point: the first version said "does not exist in the box" for a file
+    that is present and not executable, which is the defect this fault was added to remove."""
+    import os as _os
+    import tempfile as _tf
+
+    ws = _tf.mkdtemp()
+    p = _os.path.join(ws, "noexec.sh")
+    with open(p, "w") as fh:
+        fh.write("#!/bin/sh\necho hi\n")
+    _os.chmod(p, 0o644)
+    with kern.Sandbox(image="python:3.12-slim", workspace=ws) as b:
+        r = b.run(["/workspace/noexec.sh"])
+    assert r.exit_code == 126
+    assert r.fault is not None and r.fault.type == "exec_failed"
+    assert "Permission denied" in r.fault.message
+    assert "not executable" in r.fault.message
+    assert "does not exist" not in r.fault.message, "126 must not be reported as absence"

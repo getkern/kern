@@ -113,6 +113,8 @@ A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it i
 | `oom` | the box was SIGKILLed and a `memoryMb` cap was **in force**: a breached `memory.max` is the cgroup OOM-killer (`memory.oom.group=1` kills the whole box). kern reports whether the cap actually bound on an unforgeable per-box channel (2nd byte of `KERN_STARTED_FD`), so this is an *enforced-cap* OOM |
 | `killed` | a SIGKILL **not** attributed to a cgroup OOM: no `memoryMb` cap was set, or kern reported the cap did not bind here (no cgroup delegation), so it is host pressure / an external kill. Older kern (no enforcement byte) falls back to `oom` when a cap was set |
 
+| `exec_failed` | the box started but the command did not exist inside it. `runCode(code, {language:"node"})` on an image with no `node` is the ordinary way to reach it; the message names the binary AND the image, because the remedy is a different `language` or a different `image`. The `language` enum is a convenience, not a promise about the image: the default `python:3.12-slim` carries `python` and `bash`. A shell's own `command not found` inside your script stays an ordinary non-zero exit |
+
 A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
 seccomp/AppArmor/cgroup setup error, or a pull/image error) is **thrown** as a `SandboxError`, not
 returned as a fault, because the code never ran.

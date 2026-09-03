@@ -1030,3 +1030,59 @@ test("closing a persistent kernel waits for the exit instead of sleeping a fixed
     assert.ok(ms < 145, `close() took ${ms} ms; it used to sleep a fixed 150 ms regardless`);
   });
 });
+
+test("a missing interpreter is a typed fault naming the binary and the image", { skip: !KERN_OK && "kern not installed" }, async () => {
+  // `language: "node"` on the default image is the case a model hits: the enum advertises three
+  // languages and `python:3.12-slim` carries two.
+  //
+  // Before this, the classifier said `startup_failed` and the caller ERASED it, because "box started
+  // + a kern: marker" is its signal that a workload forged the marker. kern signals started BEFORE it
+  // execs, so an ENOENT on `execve` lands in exactly that hole and arrived as a bare exit 127 with
+  // `fault === null`: indistinguishable from the user's own code failing.
+  const r = await runCode("console.log(1)", { language: "node", image: "python:3.12-slim" });
+  assert.strictEqual(r.exitCode, 127);
+  assert.ok(r.fault, "a missing interpreter must not arrive as an ordinary non-zero exit");
+  assert.strictEqual(r.fault.type, "exec_failed");
+  assert.match(r.fault.message, /node/);
+  assert.match(r.fault.message, /python:3\.12-slim/);
+  assert.match(r.fault.message, /No such file or directory/);
+  assert.strictEqual(r.success, false);
+});
+
+test("command-not-found inside the user's own script is not a fault", { skip: !KERN_OK && "kern not installed" }, async () => {
+  // The control for the test above, and the reason the recogniser matches kern's WORDING rather than
+  // exit 127: a shell returning 127 for a command the USER misspelled is the user's failure, and
+  // labelling it `exec_failed` would blame the image for the script's own bug.
+  const r = await runCode("nosuchcommandanywhere", { language: "bash", image: "python:3.12-slim" });
+  assert.strictEqual(r.exitCode, 127);
+  assert.strictEqual(r.fault, null, "a shell's own command-not-found must stay an ordinary result");
+});
+
+test("an interpreter the image does have is untouched", { skip: !KERN_OK && "kern not installed" }, async () => {
+  const r = await runCode("print(1)", { language: "python", image: "python:3.12-slim" });
+  assert.strictEqual(r.fault, null);
+  assert.strictEqual(r.exitCode, 0);
+  assert.strictEqual(r.success, true);
+});
+
+test("exit 126 says permission, not absence", { skip: !KERN_OK && "kern not installed" }, async () => {
+  // EACCES at `execve` is the same third state as ENOENT with a different exit code. The classifier
+  // catches it because it keys on kern's WORDING rather than on 127, and the message must not blame
+  // the image for a file that is present and merely not executable.
+  const os = require("node:os");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "kern-126-"));
+  const p = path.join(ws, "noexec.sh");
+  fs.writeFileSync(p, "#!/bin/sh\necho hi\n", { mode: 0o644 });
+  const box = new Sandbox({ image: "python:3.12-slim", workspace: ws });
+  await box.open();
+  try {
+    const r = await box.run(["/workspace/noexec.sh"]);
+    assert.strictEqual(r.exitCode, 126);
+    assert.ok(r.fault && r.fault.type === "exec_failed");
+    assert.match(r.fault.message, /Permission denied/);
+    assert.doesNotMatch(r.fault.message, /does not exist/);
+  } finally {
+    await box.close();
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});

@@ -219,6 +219,13 @@ class ExecutionResult:
   host memory pressure or an external kill rather than the box's own ceiling. Against an older kern that
   does not send the enforcement byte, a SIGKILL with a `memory_mb` cap set falls back to `oom`.
 
+- `exec_failed`, the box started but the command did not exist inside it. `run_code(language="node")`
+  on an image with no `node` is the ordinary way to reach this, and the message names both the binary
+  and the image, because the remedy is one of the two: a different `language=` or a different
+  `image=`. ⚠️ The `language` enum is a convenience, not a promise about the image: it offers
+  `python`/`bash`/`node` and the default `python:3.12-slim` carries the first two. A shell's own
+  `command not found` inside a script you wrote stays an ordinary non-zero exit, not this fault.
+
 A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
 seccomp/AppArmor/cgroup setup error, or a pull/image error) is **raised** as a `SandboxError`, not
 returned as a fault, because the code never ran.

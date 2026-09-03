@@ -624,6 +624,28 @@ function toRc(code, signal) {
 
 /** True iff kern (the PARENT, before the box exists) failed to start the box. Anchored on kern's OWN
  * diagnostic prefixes so the workload can't forge them by writing the marker to its own stderr. */
+const EXEC_FAILED_RE = /^kern: cannot start '([^']+)' in box: ([^\n]*)/m;
+
+/** The binary kern could not exec, or null.
+ *
+ * A THIRD state, and the reason this exists: kern signals "box started" on its unforgeable fd BEFORE
+ * it execs the workload, so an `execve` that fails with ENOENT leaves a box that demonstrably started
+ * and a command that never ran. The classifier gets that right (kern's own marker is on stderr, so it
+ * says `startup_failed`) and the caller then ERASES it, because "box started + a kern: marker" is its
+ * signal that a WORKLOAD forged the marker. For this case that inference is wrong: the workload never
+ * ran, so it cannot have written anything.
+ *
+ * Matched on kern's own wording rather than on exit 127 alone, because 127 is also what a shell
+ * returns for `command not found` inside a script the user wrote, which IS the user's failure.
+ *
+ * A workload CAN print this line and exit 127 to be labelled `exec_failed` instead of a plain
+ * failure. That is accepted: it downgrades nothing security-relevant, because timeout, OOM and
+ * blocked-escape are decided by EXIT CODE before any stderr is read. */
+function execFailureBinary(stderr) {
+  const m = EXEC_FAILED_RE.exec(stderr || "");
+  return m ? { what: m[1], reason: (m[2] || "").trim() } : null;
+}
+
 function looksLikeStartupFailure(stderr) {
   const markers = [
     "kern:",
@@ -1101,7 +1123,28 @@ class Sandbox {
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
         let fault = this._classify(rc, signal, stderr, timedOut, timeoutS, capSignal);
-        if (boxStarted && fault && fault.type === "startup_failed") {
+        const execFail = execFailureBinary(stderr);
+        if (execFail !== null && rc !== 0) {
+          // BEFORE the suppression below, which would erase it: the box started, so that branch
+          // would read kern's own marker as a workload forgery.
+          //
+          // The REASON is carried through rather than assumed. The first version said "does not
+          // exist in the box" for every case, and exit 126 (EACCES: the file is there and is not
+          // executable) and a script whose interpreter line names a missing binary both got a
+          // message blaming the image for a file that exists.
+          const { what, reason } = execFail;
+          let detail;
+          if (reason.includes("No such file or directory")) {
+            detail =
+              `No such file or directory. The image '${this.image}' does not provide it, or its ` +
+              `interpreter line names something the image lacks.`;
+          } else if (reason.includes("Permission denied")) {
+            detail = "Permission denied: it is present in the box but not executable there.";
+          } else {
+            detail = reason || "the box could not execute it";
+          }
+          fault = sandboxFault("exec_failed", `'${what}' could not be started in the box: ${detail}`);
+        } else if (boxStarted && fault && fault.type === "startup_failed") {
           // kern signalled the box STARTED, so a `startup_failed` here is only the stderr heuristic
           // matching a marker the WORKLOAD wrote (code-based faults are decided first). The box
           // demonstrably ran: this is the workload's own non-zero exit - reclassify to a normal result.

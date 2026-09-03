@@ -446,7 +446,7 @@ class SandboxFault:
     failure - never MISS a real one, so it fails in the safe direction. Pair this binding with the
     matching (or newer) kern release for the unforgeable guarantee."""
 
-    type: Literal["timeout", "oom", "escape_blocked", "killed", "startup_failed"]
+    type: Literal["timeout", "oom", "escape_blocked", "killed", "startup_failed", "exec_failed"]
     message: str
 
 
@@ -1145,7 +1145,28 @@ class Sandbox:
         stderr = err.buf.decode("utf-8", "replace")
         rc = proc.returncode if proc.returncode is not None else -1
         fault = self._classify(rc, stderr, we_timed_out, timeout_s, cap_signal)
-        if box_started and fault is not None and fault.type == "startup_failed":
+        exec_fail = _exec_failure_binary(stderr)
+        if exec_fail is not None and rc != 0:
+            # BEFORE the suppression below, which would erase it: the box started, so that branch
+            # would read kern's own marker as a workload forgery.
+            #
+            # The REASON is carried through rather than assumed. The first version said "does not
+            # exist in the box" for every case, and exit 126 (EACCES: the file is there and is not
+            # executable) and a script whose interpreter line names a missing binary both got a
+            # message blaming the image for a file that exists. That is the same defect this fault
+            # was added to remove: a message that sends the reader to the wrong place.
+            what, reason = exec_fail
+            if "No such file or directory" in reason:
+                detail = (
+                    f"No such file or directory. The image {self.image!r} does not provide it, or its "
+                    f"interpreter line names something the image lacks."
+                )
+            elif "Permission denied" in reason:
+                detail = "Permission denied: it is present in the box but not executable there."
+            else:
+                detail = reason or "the box could not execute it"
+            fault = SandboxFault("exec_failed", f"{what!r} could not be started in the box: {detail}")
+        elif box_started and fault is not None and fault.type == "startup_failed":
             # kern signalled the box STARTED, so a `startup_failed` here can only be the stderr heuristic
             # matching a marker the WORKLOAD wrote (the code-based faults are decided before it). The box
             # demonstrably ran: this is the workload's own non-zero exit - reclassify to a normal result.
@@ -2011,6 +2032,30 @@ class Kernel:
 
 def _unique_name() -> str:
     return "pysbx-" + uuid.uuid4().hex[:12]
+
+
+_EXEC_FAILED_RE = re.compile(r"^kern: cannot start '([^']+)' in box: ([^\n]*)", re.M)
+
+
+def _exec_failure_binary(stderr: str) -> "tuple[str, str] | None":
+    """The binary kern could not exec, or None.
+
+    A THIRD state, and the reason this exists: kern signals "box started" on its unforgeable fd BEFORE
+    it execs the workload, so an `execve` that fails with ENOENT leaves a box that demonstrably started
+    and a command that never ran. `_classify` gets that right (kern's own marker is on stderr, so it
+    says `startup_failed`) and `_spawn` then ERASES it, because "box started + a kern: marker" is its
+    signal that a WORKLOAD forged the marker. For this case that inference is wrong: the workload never
+    ran, so it cannot have written anything.
+
+    Matched on kern's own wording rather than on exit 127 alone, because 127 is also what a shell
+    returns for `command not found` inside a script the user wrote, which IS the user's failure.
+
+    A workload CAN print this line and exit 127 to be labelled `exec_failed` instead of a plain
+    failure. That is accepted: it downgrades nothing security-relevant, because timeout, OOM and
+    blocked-escape are decided by EXIT CODE before any stderr is read (see `_classify`).
+    """
+    m = _EXEC_FAILED_RE.search(stderr)
+    return (m.group(1), m.group(2).strip()) if m else None
 
 
 def _looks_like_startup_failure(stderr: str) -> bool:
