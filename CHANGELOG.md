@@ -11,6 +11,29 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## v0.8.9 - 2026-09-03
+
+### Fixed
+
+- **`compose start` returned while a restarted service was still unreachable, and said the opposite.**
+  A live holder serving the same plan is left alone on purpose, so after `stop b; start` its relays
+  are still the ones built against the box that has just been replaced. Measured: the relay halves
+  keep the old pids for about 290 ms while the line above them reads `2 peer relay(s) up`. A stale
+  relay ACCEPTS the connection and cannot forward it, so a bare connect sees a healthy stack and only
+  a payload sees the truth: `compose start && curl peer` failed intermittently in a script while kern
+  reported success.
+
+  The holder now publishes the edges it is serving and the pids each was built against, and `start`
+  waits for those to be the current ones. It also asks for the registry scan rather than waiting out
+  the periodic one, which brings `start` to about 336 ms: faster than the 700 ms it took while it was
+  wrong.
+
+  Reported as a timing miss in a tight stop/start loop, read at the time as an application race. It
+  was not: both the relay and the service were bound and the payload still failed.
+
+  The test that should have caught this slept for six seconds first, so a defect lasting 1.65 s could
+  never fail it. It now fetches a payload with no settling time, immediately after `start` returns.
+
 ## v0.8.7 - 2026-09-03
 
 ### Fixed
