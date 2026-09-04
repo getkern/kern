@@ -10,7 +10,7 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-<sub>3.5 ms is one machine and one workload: [how it was measured](BENCHMARKS.md)</sub>
+<sub>3.5 ms rounds a measured 3.4 up, on one machine and one workload: [how it was measured](BENCHMARKS.md)</sub>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
@@ -39,7 +39,7 @@ single row for kern in a comparison table: it is a container runtime, a sandbox,
 and a stack runner at once, in one static binary with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
-  `save`/`load`. A box from an image starts in ~3.5 ms.
+  `save`/`load`. A box from an image starts in ~3.4 ms.
 - **The sandbox an AI agent can afford to use on every call.** An agent's tool-call, a model's
   generated snippet, a notebook cell, a CI step: code that runs before anyone reads it. kern gives
   each call **its own box in ~2.4 ms** and throws it away after, which is cheap enough that "one
@@ -315,7 +315,7 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.5 ms** | ~288 ms | ~297 ms |
+| Cold start, bare box | **~2.4 ms** | ~288 ms | ~297 ms |
 | Cold start, from an OCI image | **~3.4 ms** | ~288 ms | ~297 ms |
 | Stop a service (init handles SIGTERM) | **~2.3 ms** | ~162 ms | ~194 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
@@ -332,10 +332,12 @@ first row and `python3 examples/benchmark.py` for the rest.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.35 ms** | ~2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
+| Cold start (bare box) | **~2.4 ms** | ~2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
 | 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
 
-Three thousand at once take ~2.2 s, and a live box costs ~0.3 MB of memory.
+Three thousand at once take ~2.7 s, and a live box costs ~0.3 MB of memory. That is PSS: kern's own
+code is mapped into every box and has to be counted once, so summing RSS instead reads ~2.8 MB per
+box and is the wrong number.
 
 **kern is faster than bubblewrap, by about 9%, and it takes care to show it.** Timed one runtime after
 the other, both read 2.5 ms: the gap is smaller than the drift between two batches minutes apart. With
@@ -389,8 +391,11 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning
-inside a `0.8.x`. Coming from 0.7, three things behave differently, and they are listed in the
-[0.8.0 notes](CHANGELOG.md#v080---2026-08-31).
+inside a patch release. **v0.9.0 changes one exit code**, which is why it is a minor bump and not a
+patch: `kern box --plan` now exits 1 when a profile it named cannot attach, where it used to print the
+refusal and exit 0. A script that read the preview is unaffected; one that chained on `&&` now stops
+where it should have. That, and everything else in the release, is in the
+[0.9.0 notes](CHANGELOG.md#v090---2026-09-04).
 
 ## What kern is not
 
