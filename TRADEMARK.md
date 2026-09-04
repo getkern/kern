@@ -1,16 +1,17 @@
-# kern Trademark Policy
+# kern Name and Logo Policy
 
 The **kern** source code is free and open source under [Apache-2.0](LICENSE), you may use, modify,
-embed, and redistribute it, no permission needed. This document is only about the **names and marks**,
-which are *not* covered by the code license.
+embed, and redistribute it, no permission needed. This document is only about the **name and the
+logo**, which are *not* covered by the code license.
 
-## The marks
+## The name and the logo
 
-**"kern"** and the kern logo are **unregistered** trademarks of the kern project (`getkern.dev` is its
-official domain). Unregistered is stated rather than left to be assumed: nothing is filed with the
-EUIPO or the USPTO today, so this page is a statement of intent and of use, not a registration you can
-look up. It is written now because a policy that appears the day it is first needed is worth less than
-one that was always here.
+**"kern"** and the kern logo identify this project. `getkern.dev` is its official site and
+`github.com/getkern/kern` its official source, and the name and the logo have been in continuous
+public use for this project since **18 July 2026**. Rights arising from that use are reserved.
+
+This page exists now rather than the day it is first needed, because a policy that shows up at the
+moment of a dispute is worth less than one that was always here.
 
 Trademark law protects users from confusion about *who stands behind* a piece of software. It is
 separate from, and does not restrict, your rights to the code.
@@ -21,7 +22,10 @@ separate from, and does not restrict, your rights to the code.
 - Use the name to refer to the kern project truthfully (articles, talks, tutorials, comparisons).
 - Redistribute **unmodified** official kern binaries/packages under the name.
 
-## What needs our permission
+## What we ask you not to do
+
+These are requests, not claims of legal power over you. They exist so that users can tell where a
+build came from, which is the whole point of a name.
 
 - Naming a **fork or a modified build** "kern" (or a confusingly similar name). If you distribute a
   modified version, **rename it** so users aren't misled, e.g. `open-sandbox`, `myco-runtime`.
@@ -44,8 +48,8 @@ never as an unqualified claim about what another tool cannot do.
 
 ## Why this exists
 
-The code is yours to build on freely. The **name** stays a reliable signal of the upstream project, so
-that "kern" always means *this* project. Same split used by Rust, Firefox, and CNCF projects:
-**open code, protected name.**
+The code is yours to build on freely. The **name** stays a reliable signal of where a build came from,
+so that "kern" points at *this* project. Same split used by Rust, Firefox, and CNCF projects:
+**open code, one clear origin.**
 
-Questions or permission requests: open an issue on the repository or email hello@getkern.dev.
+Questions or requests: open an issue on the repository or email hello@getkern.dev.

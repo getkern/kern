@@ -1,8 +1,9 @@
 # kern brand assets
 
-Official logo and marks for kern. The code is [Apache-2.0](../../LICENSE), but **"kern" is a
-trademark**: please do not use these marks for a fork, a modified build, or a competing product or
-service without permission. See [TRADEMARK.md](../../TRADEMARK.md), or ask at hello@getkern.dev.
+Official logo and wordmark for kern. The code is [Apache-2.0](../../LICENSE), the **name and the logo
+are not**: they identify this project, and Apache-2.0 does not license them (clause 6). We ask you not
+to use them for a fork, a modified build, or a competing product or service. See
+[TRADEMARK.md](../../TRADEMARK.md), or ask at hello@getkern.dev.
 
 ## Files
 - `kern-icon.png` . the K alone, 512x512 square, transparent - the avatar/profile mark (GitHub org

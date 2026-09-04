@@ -13,7 +13,7 @@ is in the git history.
 
 ## Unreleased
 
-Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.36** goes to PyPI
+Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.36** is on PyPI
 and npm, together with the `integrations/pi` extension that now requires it. The **runtime** has
 changed too, so this one does need a tag: two mount-posture fixes in `kern-isolation`, and one new
 `kern box` flag. The CLI change is additive (`--shm-size`), which the stability policy above allows on

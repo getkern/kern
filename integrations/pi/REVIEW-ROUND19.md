@@ -6,6 +6,24 @@ what has shipped, and the reason we are reopening rather than filing it and movi
 
 Everything below is measured. Where a control is missing it says so.
 
+
+> **OUTCOME, added after the owner ruled on the three questions below.** All three are answered and the
+> work has shipped, so the present tense in the rest of this document describes the state at the time it
+> was written, not now.
+>
+> 1. **`deps_readonly` flipped to default-True**, in both bindings, published as `kern-sandbox` 0.1.36.
+>    The cost the review asked to measure first turned out to be real and avoidable: with a setup that
+>    leaves no bytecode (`pip install --no-compile`), a read-only `.deps` costs +40 ms on EVERY call for
+>    the life of the session (250 ms against 290, measured on `requests`), because CPython cannot write
+>    `__pycache__` and silently recompiles. The setup box now runs `compileall` before the mount closes,
+>    which brings that case back to 250 and is a no-op when the bytecode is already there.
+> 2. **The read-only precompiled cache was NOT built.** The flip made the ordinary case free, which is
+>    what the bottleneck section was about, and the remaining win is the cold start rather than the
+>    refill, as the owner's reply said.
+> 3. **The 19 ms floor was not pursued**, for the reason given in that reply: the field data shows the
+>    pool never empties at agent cadence, so the burst case the number describes is not the one any
+>    measured session is bounded by.
+
 ## Clean code
 
 The rejection shape in `run_cell` / `runCell` was written five times in Python and three in Node, each
