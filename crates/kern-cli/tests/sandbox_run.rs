@@ -6074,6 +6074,128 @@ fn a_box_start_still_reaps_an_orphan_cgroup() {
     );
 }
 
+/// The supervisor's sibling leaf must be reaped too, and it must not accumulate.
+///
+/// MEASURED DEFECT this pins: the supervisor sits in `kern-box-<tag>-<pid>-sup`, whose last `-` field is
+/// the literal `sup` and parses as no pid, so the sweep never saw it. 434 of them piled up under
+/// `kern.slice` in one session, one per box. Empty and harmless individually; not harmless together,
+/// because the per-start sweep examines a BOUNDED number of entries, so the pile crowded out the orphans
+/// it exists to find and `a_box_start_still_reaps_an_orphan_cgroup` began failing on this host while
+/// passing in CI, where there is no `kern.slice` for anything to accumulate in.
+///
+/// Two assertions, because either alone passes on a broken build: a planted leaf with a dead pid must be
+/// REAPED (the parsing), and a run of real boxes must leave NONE behind (the leak itself).
+#[test]
+fn the_supervisor_leaf_is_reaped_and_does_not_accumulate() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // The SAME bounded search the orphan test uses, and for the reason its comment records: deriving the
+    // slice from `/proc/self/cgroup` finds the TEST binary's cgroup, which has no `kern.slice` under a
+    // terminal's scope, so the test would skip on every run and prove nothing.
+    let find_slice = || -> Option<std::path::PathBuf> {
+        let uid = unsafe { libc::getuid() };
+        let base = std::path::PathBuf::from(format!(
+            "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+        ));
+        let mut stack = vec![(base, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 4 {
+                continue;
+            }
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                if e.file_name() == "kern.slice" {
+                    return Some(p);
+                }
+                stack.push((p, depth + 1));
+            }
+        }
+        None
+    };
+    let count_sup = |slice: &std::path::Path| -> usize {
+        let Ok(rd) = fs::read_dir(slice) else {
+            return 0;
+        };
+        rd.flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("kern-box-") && n.ends_with("-sup")
+            })
+            .count()
+    };
+    let root = build_rootfs(&busybox, "supleaf");
+    let rootfs = root.to_string_lossy().to_string();
+    let run_one = |name: &str| -> std::process::Output {
+        kern()
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                &rootfs,
+                "--",
+                "/bin/busybox",
+                "true",
+            ])
+            .output()
+            .expect("run kern")
+    };
+    if !run_one("supleaf-probe").status.success() {
+        eprintln!("skip: this host cannot start a plain box");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let Some(slice) = find_slice() else {
+        eprintln!("skip: no kern.slice here, so nothing accumulates in one");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+    // 1. A planted leaf whose pid cannot exist must be reaped. `pid_max` is at most 2^22 on Linux.
+    let planted = slice.join("kern-box-supleaf-4194401-sup");
+    if fs::create_dir(&planted).is_err() {
+        eprintln!("skip: could not plant a leaf in {}", slice.display());
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let out = run_one("supleaf-sweep");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let planted_still_there = planted.is_dir();
+    let _ = fs::remove_dir(&planted);
+    // 2. Real boxes must leave none of their own behind.
+    let before = count_sup(&slice);
+    for i in 0..6 {
+        let _ = run_one(&format!("supleaf-run{i}"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after = count_sup(&slice);
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(
+        out.status.success(),
+        "the box must start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !planted_still_there,
+        "a dead supervisor's `-sup` leaf was not reaped: the sweep cannot see it"
+    );
+    assert!(
+        after <= before,
+        "six box starts left {} new `-sup` leaves behind (was {before}, now {after})",
+        after.saturating_sub(before)
+    );
+}
+
 /// A ONE-SHOT SERVICE THAT SUCCEEDS MUST NOT FAIL THE STACK.
 ///
 /// `up` is fail-closed on bring-up: a service that dies inside the settle window is reported and the

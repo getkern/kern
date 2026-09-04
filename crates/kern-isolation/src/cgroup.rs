@@ -1104,8 +1104,23 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
         let name = e.file_name();
         let name = name.to_string_lossy();
         // trailing `-<pid>` of `kern-box-<tag>-<pid>` (tag may contain '-', pid is always the last field).
+        //
+        // `-sup` FIRST, because the supervisor's sibling leaf is `kern-box-<tag>-<pid>-sup` and its last
+        // field is the literal `sup`, which parses as no pid at all: without this the leaf is invisible
+        // to the sweep and never reaped. MEASURED: 434 of them accumulated under `kern.slice` in one
+        // session, one per box. They are empty and harmless on their own, and they are not harmless in
+        // aggregate - this sweep examines at most `limit` entries per box start, so a pile of unreapable
+        // directories crowds out the orphans it exists to find. The `a_box_start_still_reaps_an_orphan_cgroup`
+        // test failed exactly that way, and passed again the moment the pile was cleared.
+        //
+        // The pid is the SUPERVISOR's in both names, so the liveness check is the same one: while that
+        // process runs, both its box dir and its leaf are skipped.
         let dead = name
             .strip_prefix("kern-box-")
+            .map(|s| match s.strip_suffix("-sup") {
+                Some(base) => base,
+                None => s,
+            })
             .and_then(|s| s.rsplit('-').next())
             .and_then(|p| p.parse::<u32>().ok())
             .is_some_and(|pid| !PathBuf::from(format!("/proc/{pid}")).exists());
