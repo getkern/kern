@@ -96,8 +96,8 @@ byte carrying a second path, unicode, `//workspace`, and four shapes of planted 
 host file, a link to a host DIRECTORY, a CHAIN of links, and one nested in a subdirectory. `/etc/passwd`
 is not readable through any of them, and `mkdir /workspace/linkdir/newdir` did not create `/etc/newdir`.
 On the bash side: a cwd that breaks out of the quoting, a malformed env key, an env value carrying
-`$(id)` and backticks, 300 KB of output, binary output, a fork bomb, and a 2 GB allocation under a 1 GB
-cap.
+`$(id)` and backticks, an output of 300 KB, an output of raw bytes, a fork bomb, and a 2 GB allocation
+under a 1 GB cap.
 
 ## 4. What is not covered, stated before you find it
 
