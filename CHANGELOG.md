@@ -13,11 +13,32 @@ is in the git history.
 
 ## Unreleased
 
-Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.37** is on PyPI
+Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.38** is on PyPI
 and npm, together with the `integrations/pi` extension that now requires it. The **runtime** has
 changed too, so this one does need a tag: two mount-posture fixes in `kern-isolation`, and one new
 `kern box` flag. The CLI change is additive (`--shm-size`), which the stability policy above allows on
 a patch; the snapshot in `crates/kern-cli/tests/cli-surface.snapshot` was regenerated for it.
+
+### Fixed (runtime, found by auditing what else reads the cgroup names)
+
+- **The registry recorded the SUPERVISOR's cgroup for every box, and `kern stop` writes `cgroup.kill`
+  into the path it records.** Measured on a detached box:
+  `cgroup=.../kern-box-regchk4-251796-sup`. That path holds the supervisor, not the workload, so a
+  stop would have killed the reporter and left the box running; `list()` uses the same path to tell an
+  orphaned box from an exited one.
+
+  Two causes, both closed. `is_kern_box_leaf` accepted anything starting with `kern-box-`, and the
+  supervisor's sibling leaf carries that prefix, so every consumer of that gate treated it as a box
+  cgroup: it now excludes the `-sup` suffix, in the one place the rule is defined. And
+  `box_cgroup_record` derived the path from `/proc/<pid1>/cgroup`, which is read in the window between
+  the fork and the child moving itself into the capped cgroup, where the child still shows the
+  supervisor's leaf: it now takes the directory `apply_limits` recorded when it created it, and keeps
+  the `/proc` read only as the fallback for paths that build no cgroup of their own.
+
+  **This was not found by reasoning about the change; it was found by asking what else reads those
+  names.** The batteries that followed also cover `ps`, `stats`, `gc`, orphan detection after the
+  supervisor is SIGKILLed, 40 parallel starts (no leak), `doctor`, and a two-service compose pod: all
+  behave as before.
 
 ### Fixed (SDK, shipped and corrected)
 

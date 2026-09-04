@@ -1232,7 +1232,24 @@ pub fn box_cgroup_dir(pid: i32) -> Option<PathBuf> {
 /// --scope bash` gives a user, and what `kern doctor` itself suggests running - must fail BOTH, or a
 /// box started in that shell would let kern reap or reshape the user's own session.
 fn is_kern_box_leaf(leaf: &str) -> bool {
-    leaf.starts_with("kern-box-")
+    // `-sup` IS NOT A BOX, and excluding it here rather than at each caller is the point of this
+    // function being the single definition.
+    //
+    // The supervisor sits in `kern-box-<tag>-<pid>-sup`, a sibling of the box's cgroup, so that a
+    // whole-box OOM cannot take the process that has to report it. That name carries kern's own prefix,
+    // so every consumer of this gate accepted it as a box cgroup.
+    //
+    // MEASURED, and the reason this is not cosmetic: a detached box recorded
+    // `cgroup=.../kern-box-regchk4-251796-sup` in its registry entry, because the PID-1 callback reads
+    // `/proc/<pid1>/cgroup` in the window between the fork and the child moving itself into the capped
+    // cgroup, and in that window the child still shows the supervisor's leaf. `kern stop` writes
+    // `cgroup.kill` into the recorded path: it would have killed the SUPERVISOR and left the workload
+    // running, which is the opposite of what it promises. The same wrong path also drives the
+    // orphan-vs-exited decision in `list()`.
+    //
+    // Refusing it here makes `box_cgroup_dir` return `None` for that window instead of a wrong path,
+    // and `None` is already the "no dedicated cgroup" case every caller handles.
+    leaf.starts_with("kern-box-") && !leaf.ends_with("-sup")
 }
 
 /// Parse a cgroup-v2 `/proc/<pid>/cgroup` body (`0::<path>`) into kern's own box-cgroup dir, or `None`.
@@ -2280,6 +2297,37 @@ pub fn memory_cap_signal() -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The supervisor's leaf is NOT a box cgroup, and every consumer of the gate depends on that.
+    ///
+    /// SHIPPED-SHAPED DEFECT this pins: `is_kern_box_leaf` accepted anything starting with
+    /// `kern-box-`, and the supervisor now sits in `kern-box-<tag>-<pid>-sup`, a sibling of the box's
+    /// own cgroup. Measured before the fix: a detached box recorded
+    /// `cgroup=.../kern-box-regchk4-251796-sup` in its registry entry, because the PID-1 callback reads
+    /// `/proc/<pid1>/cgroup` in the window between the fork and the child moving itself into the capped
+    /// cgroup, and in that window the child still shows the supervisor's leaf.
+    ///
+    /// What that costs is not cosmetic: `kern stop` writes `cgroup.kill` into the RECORDED path, so it
+    /// would have killed the supervisor and left the workload running, and `list()` uses the same path
+    /// to tell an orphaned box from an exited one.
+    ///
+    /// Asserted on the gate rather than on the message, because the gate is what every consumer shares.
+    #[test]
+    fn the_supervisor_leaf_is_not_accepted_as_a_box_cgroup() {
+        // A box's own dir and the scope kern names: both are kern's, both stay accepted.
+        assert!(is_kern_box_leaf("kern-box-web-1234"));
+        assert!(is_kern_box_leaf("kern-box-1234.scope"));
+        // The supervisor's sibling: kern's prefix, and NOT a box.
+        assert!(!is_kern_box_leaf("kern-box-web-1234-sup"));
+        assert!(!is_kern_box_leaf("kern-box-a-b-c-999-sup"));
+        // And the ambient scope this gate has always refused, so the change did not widen it.
+        assert!(!is_kern_box_leaf("run-p123-i456.scope"));
+        assert!(!is_kern_box_leaf("user@1000.service"));
+        // The parse built on top of it must refuse the leaf too, which is the path that reaches
+        // `cgroup.kill`.
+        assert!(parse_box_cgroup_line("0::/kern.slice/kern-box-web-1234-sup\n").is_none());
+        assert!(parse_box_cgroup_line("0::/kern.slice/kern-box-web-1234\n").is_some());
+    }
 
     /// THE PROPERTY THAT MAKES THE FIX A FIX: the answer depends on the PID, not on this process.
     ///

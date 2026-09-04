@@ -35,6 +35,22 @@ r.fault.type      # 'timeout'      the sandbox stopped it
 r.success         # False
 ```
 
+Every call returns an `ExecutionResult`:
+
+```python
+@dataclass
+class ExecutionResult:
+    stdout: str
+    stderr: str
+    exit_code: int
+    duration_ms: int
+    fault: SandboxFault | None   # set ONLY when the SANDBOX acted
+    files: list[FileInfo]        # workspace files created or modified this step (.deps excluded)
+    results: list[Result]        # rich mime-typed values: last expression, display(), matplotlib
+    truncated: bool              # output hit max_output_bytes and the overflow was discarded
+    success: bool                # exit_code == 0 AND fault is None
+```
+
 **A Python exception in the code is NOT a fault.** That is `exit_code != 0`, a traceback in `stderr`,
 and `fault is None`, because the code ran and the sandbox did nothing. `fault` is set only when the
 sandbox acted:
@@ -105,6 +121,10 @@ That is deliberate: it keeps the density (hundreds of ephemeral boxes, not hundr
 interpreters holding RAM). When you do want in-memory state, open a `kernel()`: one warm interpreter
 in a long-lived box, per-cell cost **sub-millisecond** instead of a ~12 ms CPython boot, with the
 explicit trade that cells share one process and one box.
+
+`sbx.kernel()` returns a `Kernel`, and a refused mount raises `MountRefused` rather than the generic
+`SandboxError`, so a caller can tell "you asked for something this sandbox will not do" from "the
+sandbox broke".
 
 ```python
 with kern.Sandbox() as sbx, sbx.kernel() as k:
@@ -222,6 +242,20 @@ The setup box compiles the bytecode before the mount closes, so the default cost
 that step a session whose setup skipped compilation paid +40 ms on every call, forever
 (250 ms against 290, measured on `requests`). Pass `deps_readonly=False` if a workload legitimately
 writes into `.deps` at run time, and note that it will get `EROFS` rather than a silent failure.
+
+**`egress_allow` is the middle setting between the two, and the one an agent usually wants.**
+`network=False` gives the run phase no network at all and `network=True` gives it the host's; an
+allowlist gives it a named few:
+
+```python
+kern.Sandbox(egress_allow=["pypi.org", "files.pythonhosted.org"])
+```
+
+The box stays in its own network namespace and reaches the internet only through kern's filtering
+proxy, which permits those domains and nothing else, so a workload can fetch from an index you chose
+and cannot exfiltrate elsewhere. Mutually exclusive with `network=True`. The `setup=` box keeps full
+network to install dependencies; the allowlist governs the untrusted run phase, which is the phase
+that runs code you did not read.
 
 **Network policy:** the network is on **only** during `setup=`, in a separate box that dies when
 setup ends. There is no per-call override; `network=True` is a session-level, explicit choice.

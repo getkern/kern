@@ -249,6 +249,25 @@ explicit flags that **override** a profile's values (and the `memoryMb` default 
 `memory`, so pass `memoryMb: null` to let the profile apply). The **MCP server** (`kern-mcp`, for Claude
 Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-sandbox`).
 
+## Egress: the setting between no network and the host's
+
+`network: false` gives the run phase no network and `network: true` gives it the host's. `egressAllow`
+is the middle one, and usually the one an agent wants:
+
+```js
+await withSandbox({ egressAllow: ["pypi.org", "files.pythonhosted.org"] }, async (sbx) => { /* ... */ });
+```
+
+The box stays in its own network namespace and reaches the internet only through kern's filtering
+proxy, which permits those domains and nothing else: a workload can fetch from an index you chose and
+cannot exfiltrate elsewhere. Mutually exclusive with `network: true`. The `setup` box keeps full
+network to install dependencies; the allowlist governs the run phase, which is the one executing code
+you did not read.
+
+`kernel()` returns a `Kernel`, and a refused mount throws `MountRefused` rather than the generic
+`SandboxError`, so a caller can tell "this sandbox will not do that" from "the sandbox broke".
+`DEFAULT_TMPFS_MB` and `version` are exported for callers that assert on them.
+
 ## Prewarming: a box ready before the call arrives
 
 `prewarm: N` keeps N boxes started in advance, each holding a booted interpreter that has run nothing,

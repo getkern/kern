@@ -944,8 +944,24 @@ pub fn box_cgroup(pid: i32) -> Option<PathBuf> {
 /// caller-relative check would wrongly return None. `(String::new(), None)` when there is no dedicated
 /// `kern-box-*` cgroup (no systemd-user): liveness then falls back to the supervisor pid, as before.
 pub fn box_cgroup_record(pid1: i32) -> (String, Option<(u64, u64)>) {
-    let Some(path) = kern_isolation::box_cgroup_dir(pid1) else {
-        return (String::new(), None);
+    // THE PATH KERN CREATED, before the one read back from the child's `/proc`.
+    //
+    // Reading `/proc/<pid1>/cgroup` is a guess about where the child ALREADY IS, and this runs in the
+    // window between the fork and the child moving itself into the capped cgroup. In that window the
+    // child still shows the supervisor's sibling leaf, so a detached box recorded
+    // `cgroup=.../kern-box-<tag>-<pid>-sup`. `kern stop` writes `cgroup.kill` into the recorded path,
+    // so it would have killed the supervisor and left the workload running; `list()` also uses the path
+    // to tell an orphaned box from an exited one.
+    //
+    // `this_box_cgroup_dir()` is not a guess: `apply_limits` records the directory it created, in this
+    // same process, before any fork. The `/proc` read stays as the fallback for the paths that build no
+    // dedicated cgroup of their own (the scope path, where the box's cgroup IS the scope).
+    let path = match kern_isolation::this_box_cgroup_dir() {
+        Some(dir) => dir.to_path_buf(),
+        None => match kern_isolation::box_cgroup_dir(pid1) {
+            Some(p) => p,
+            None => return (String::new(), None),
+        },
     };
     let s = path.to_string_lossy().into_owned();
     // Identity captured at the SAME instant as the path. A transient stat error here just yields no
