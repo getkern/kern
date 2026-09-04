@@ -52,8 +52,10 @@ A minor bump because one exit code changes: see the first entry. Everything else
   writer that never comes, with no timeout: the box decided how long the caller's call took. Adding
   `O_NONBLOCK` alone would have been worse, because a non-blocking read of a writer-less FIFO returns
   zero bytes and the call would have reported an EMPTY FILE. Both halves ship: the open is
-  non-blocking AND a descriptor that is not a regular file is refused. Published as **0.1.34** on PyPI
-  and npm.
+  non-blocking AND a descriptor that is not a regular file is refused. Published as **0.1.35** on PyPI
+  and npm, which also rewrites both package pages: the PyPI one went from 37,371 characters to 15,320
+  and now opens on running AI-generated code rather than on what kern is, with the LangChain
+  shell-middleware section moved whole to `bindings/python/LANGCHAIN-SHELL.md`.
 - **The MCP server's memory default shadowed a profile's own.** `KERN_MCP_MEMORY_MB` defaulted to 1024
   and was sent on every call, and an explicit flag beats a profile, so a `vcpu:` profile carrying its
   own `memory=` could never apply it. Unsetting the variable did not help: it fell back to the same
