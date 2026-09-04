@@ -2620,3 +2620,24 @@ def test_the_pool_recovers_if_its_worker_thread_dies(tmp_path):
         pool.refill(network=s.network, deadline=s._eff_timeout(None))
         assert pool._worker is not worker, "refill must replace a dead worker, not keep it"
         assert _warm(s), "the pool never refilled after its worker died"
+
+
+@integration
+def test_a_signal_death_is_reported_as_128_plus_n_not_as_minus_n():
+    """`exit_code` for a killed process must be 137, the value every other tool a reader compares
+    against reports: a shell, kern's own CLI, docker, and the Node binding.
+
+    FOUND BY AN EXTERNAL REVIEW running one timeout through both bindings: Python answered `-9` (the
+    `subprocess` convention, negative meaning "killed by signal N") and Node answered `137`. Same
+    event, two numbers, so a caller branching on `exit_code == 137` saw the timeout in one binding and
+    missed it in the other.
+
+    The control is the second assertion: an ordinary non-zero exit must be untouched. A conversion that
+    rewrote every code would satisfy the first one.
+    """
+    r = kern.run_code("import time; time.sleep(30)", timeout_s=2)
+    assert r.fault is not None and r.fault.type == "timeout"
+    assert r.exit_code == 137, f"a SIGKILL must read 137, not {r.exit_code}"
+    ordinary = kern.run_code("raise SystemExit(7)")
+    assert ordinary.exit_code == 7, "an ordinary exit code must pass through unchanged"
+    assert ordinary.fault is None

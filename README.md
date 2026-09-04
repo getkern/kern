@@ -406,7 +406,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done and the CLI is frozen.** 1055 Rust, 415 Python and 89 Node tests, clippy-clean and
+**The core is done and the CLI is frozen.** 1055 Rust, 416 Python and 89 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning

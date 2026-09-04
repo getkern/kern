@@ -1300,6 +1300,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }
     }
     let mut egress_guard: Option<crate::egress::EgressFilter> = None;
+    // Set by the PID-1 callback when the egress pump could not be confirmed listening. Checked
+    // after the sandbox call returns, because the callback cannot fail the start by itself.
+    let mut egress_failed: Option<String> = None;
     pt.mark("parent:setup->spawn");
     // GARBAGE COLLECTION, DELIBERATELY AFTER THE SPAWN. Reaping cgroups left by boxes whose
     // supervisor was killed has nothing to do with starting THIS box, and doing it first cost 193 us
@@ -1333,7 +1336,19 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 }
             }
             if let Some(p) = egress_pending.take() {
-                egress_guard = Some(p.deliver(pid1));
+                match p.deliver(pid1) {
+                    Ok(g) => egress_guard = Some(g),
+                    Err(e) => {
+                        // The in-box proxy port never came up, so this box has NO outbound access,
+                        // not even to the domains the caller allowed. Kill it here rather than let the
+                        // workload run against a dead proxy and fail with a `Connection refused` that
+                        // names neither the cause nor the flag: PID 1 is signalled before it reaches
+                        // the workload's exec, and the launcher turns the recorded message into the
+                        // box's own error.
+                        unsafe { libc::kill(pid1, libc::SIGKILL) };
+                        egress_failed = Some(e);
+                    }
+                }
             }
         },
         None,
@@ -1344,6 +1359,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         !managed,
     );
     pt.mark("box lifetime (spawn->exit)");
+    // THE EGRESS PUMP NEVER CAME UP, so the box we just ran had no outbound access at all, not
+    // even to the domains the caller allowed. PID 1 was SIGKILLed in the callback; report the
+    // cause here rather than let this surface as the workload's own exit code, which would say
+    // nothing about `--egress-allow` and leave the reader chasing a `Connection refused`.
+    if let Some(msg) = egress_failed.take() {
+        return Err(Error::Sandbox(msg));
+    }
     cancel_foreground_timeout(timeout_wd);
     // The box has exited: stop the checker and drop its status. This path leaves via `process::exit`,
     // which skips Drop, so an unstopped checker would outlive the box as an orphan - the shape the

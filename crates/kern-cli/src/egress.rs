@@ -266,21 +266,51 @@ pub struct EgressPending {
     pump: std::process::Child,
     sock_path: std::path::PathBuf,
     pid_writer: std::fs::File,
+    /// Read end of the pump's readiness pipe: one byte once it is listening inside the box, EOF if it
+    /// died before getting there. See the comment where the pipe is created.
+    ready_reader: std::fs::File,
 }
 
 impl EgressPending {
     /// Send the box init pid to the waiting pump (which then joins the box netns) and return the guard.
     /// Dropping `pid_writer` closes the pipe; the pump has already read its 4 bytes, so EOF is moot.
-    pub fn deliver(mut self, box_pid1: i32) -> EgressFilter {
+    pub fn deliver(mut self, box_pid1: i32) -> Result<EgressFilter, String> {
         let _ = self.pid_writer.write_all(&box_pid1.to_le_bytes());
         let _ = self.pid_writer.flush();
+        // WAIT FOR THE PUMP TO BE LISTENING before letting the workload run.
+        //
+        // Without this the box started with `http_proxy` set and nothing behind it, so a caller who
+        // asked for `--egress-allow` got a box with NO egress and a `Connection refused` that named
+        // neither the cause nor the flag. Reported from outside on a host where the in-box bind failed
+        // with EADDRNOTAVAIL.
+        //
+        // One byte means listening. EOF means the pump exited first, and it printed why before doing
+        // so. A short read of anything else is treated as failure for the same reason: the only thing
+        // that authorises the box to proceed is a positive confirmation.
+        let mut ack = [0u8; 1];
+        match self.ready_reader.read(&mut ack) {
+            Ok(1) => {}
+            Ok(_) => {
+                return Err(
+                    "--egress-allow: the in-box proxy port never came up, so the box would have had \
+                     no outbound access at all (not even to the allowed domains). Refusing to start it."
+                        .to_string(),
+                )
+            }
+            Err(e) => {
+                return Err(format!(
+                    "--egress-allow: cannot confirm the in-box proxy port is up ({e}), so the box \
+                     would have had no outbound access at all. Refusing to start it."
+                ))
+            }
+        }
         // Partial move: `pid_writer` stays behind and drops here, closing the pipe. EgressPending has no
         // Drop, so moving the other three fields out is allowed.
-        EgressFilter {
+        Ok(EgressFilter {
             proxy: self.proxy,
             pump: self.pump,
             sock_path: self.sock_path,
-        }
+        })
     }
 }
 
@@ -385,18 +415,47 @@ pub fn spawn(allow: &[String], box_port: u16) -> Result<EgressPending, String> {
     // box_run's write end must not be inherited by the box itself.
     unsafe { libc::fcntl(wfd, libc::F_SETFD, libc::FD_CLOEXEC) };
 
+    // THE READINESS PIPE, and it exists because the pump's failure used to be invisible.
+    //
+    // The pump joins the box netns and listens on `127.0.0.1:<port>` INSIDE it. That bind can fail: an
+    // external review hit `os error 99` (EADDRNOTAVAIL) on a host where the box's loopback was not
+    // usable, and the pump then printed one line and `_exit(1)`. Nobody read that exit. The box started
+    // anyway with `http_proxy` pointing at a port nothing listens on, so every request the caller made,
+    // including to the domains they had explicitly allowed, failed with `Connection refused`. The
+    // allowlist looked configured and no egress was possible at all.
+    //
+    // The pump now reports: one byte after a SUCCESSFUL bind, nothing on failure, where its exit closes
+    // this pipe and the reader sees EOF. `deliver` waits for that byte. Fail-closed either way; what
+    // changes is that the caller is told which of the two happened.
+    let mut ready = [0i32; 2];
+    if unsafe { libc::pipe2(ready.as_mut_ptr(), 0) } != 0 {
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+        return Err(format!(
+            "egress: ready pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let (ready_r, ready_w) = (ready[0], ready[1]);
+    unsafe { libc::fcntl(ready_r, libc::F_SETFD, libc::FD_CLOEXEC) };
+
     let exe = std::env::current_exe().map_err(|e| format!("egress: self exe: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__egress-pump")
         .arg(rfd.to_string())
         .arg(box_port.to_string())
         .arg(&sock_path)
+        .arg(ready_w.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     // Custom pre_exec: like `helper_pre_exec` but KEEP the pid-pipe read end (shed everything else).
     unsafe {
         cmd.pre_exec(move || {
-            kern_isolation::shed_inherited_fds(rfd);
+            // KEEP both: the pid pipe it reads, and the readiness pipe it answers on. Shedding the
+            // second would make the reader wait on a pipe with no writer left.
+            kern_isolation::shed_inherited_fds_keeping(&[rfd, ready_w]);
             libc::setsid();
             libc::prctl(
                 libc::PR_SET_PDEATHSIG,
@@ -419,20 +478,27 @@ pub fn spawn(allow: &[String], box_port: u16) -> Result<EgressPending, String> {
         }
     };
     // box_run drops its read end so the box (forked later, in run_in_sandbox_with) can't inherit it.
-    unsafe { libc::close(rfd) };
+    // The readiness WRITE end goes with it: only the pump may hold that, or the EOF which signals its
+    // failure would never arrive, because this process would still be holding the pipe open.
+    unsafe {
+        libc::close(rfd);
+        libc::close(ready_w);
+    }
     let pid_writer = unsafe { std::fs::File::from_raw_fd(wfd) };
+    let ready_reader = unsafe { std::fs::File::from_raw_fd(ready_r) };
     Ok(EgressPending {
         proxy,
         pump,
         sock_path,
         pid_writer,
+        ready_reader,
     })
 }
 
 /// Entry point for the re-exec'd box-netns pump (`kern __egress-pump <read_fd> <box_port> <sock>`). The
 /// box init pid arrives (4 bytes, little-endian) over the inherited `read_fd` pipe from box_run; only
 /// then does the pump join the box netns. Fresh process, so no inherited box capture pipes. Never returns.
-pub fn pump_reexec(read_fd: i32, box_port: u16, sock_path: &str) -> ! {
+pub fn pump_reexec(read_fd: i32, box_port: u16, sock_path: &str, ready_fd: i32) -> ! {
     drop_signals();
     let mut buf = [0u8; 4];
     let mut got = 0usize;
@@ -452,7 +518,12 @@ pub fn pump_reexec(read_fd: i32, box_port: u16, sock_path: &str) -> ! {
     }
     unsafe { libc::close(read_fd) };
     let box_pid1 = i32::from_le_bytes(buf);
-    pump_main(box_pid1, box_port, std::path::Path::new(sock_path));
+    pump_main(
+        box_pid1,
+        box_port,
+        std::path::Path::new(sock_path),
+        ready_fd,
+    );
 }
 
 /// Entry point for the re-exec'd filtering proxy (`kern __egress-proxy <sock_path> <allow-csv>`). Binds
@@ -638,7 +709,7 @@ fn http_target_port(request_line: &str) -> u16 {
 
 /// The box-netns pump: join the box's user+net ns, listen on `127.0.0.1:box_port` inside the box, and
 /// relay every accepted connection to the host-side UNIX socket where the proxy listens.
-fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path) -> ! {
+fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd: i32) -> ! {
     if !enter_box_ns(box_pid1) {
         eprintln!(
             "kern: egress pump: cannot join box netns: {}",
@@ -653,6 +724,20 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path) -> ! {
             unsafe { libc::_exit(1) };
         }
     };
+    // LISTENING. Tell the launcher, which is holding the box's workload until it hears this: without
+    // the byte it refuses the box rather than running it with a dead proxy behind `http_proxy`. Every
+    // failure path above exits instead, and the exit closes this pipe, which the launcher reads as EOF.
+    if ready_fd >= 0 {
+        let b = [1u8];
+        loop {
+            let n = unsafe { libc::write(ready_fd, b.as_ptr().cast(), 1) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        unsafe { libc::close(ready_fd) };
+    }
     for conn in listener.incoming() {
         let Ok(client) = conn else { continue };
         let sp = sock_path.to_path_buf();

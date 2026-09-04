@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.38"
+__version__ = "0.1.39"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1542,6 +1542,19 @@ class Sandbox:
         stdout = out.buf.decode("utf-8", "replace")
         stderr = err.buf.decode("utf-8", "replace")
         rc = proc.returncode if proc.returncode is not None else -1
+        # SIGNAL DEATHS ARE REPORTED AS 128+N, NOT AS -N.
+        #
+        # `subprocess` gives `-9` for a process killed by SIGKILL; the Node binding gives 137
+        # for the same event, because that is what a shell, kern's own CLI and docker report.
+        # Two bindings describing one event with two numbers is a contract defect: an external
+        # review ran the same timeout through both and got `-9` here and `137` there, so a
+        # caller branching on `exit_code == 137` saw the timeout in Node and missed it here.
+        #
+        # 137 agrees with everything else a reader compares against, so Python is the one that
+        # moves. `fault` was already correct on both sides and is what code should branch on;
+        # this aligns the number for code that does not.
+        if rc < 0:
+            rc = 128 + (-rc)
         fault = self._classify(rc, stderr, we_timed_out, timeout_s, cap_signal)
         exec_fail = _exec_failure_binary(stderr)
         if exec_fail is not None and rc != 0:
@@ -2872,7 +2885,11 @@ class _WarmBox:
         a SIGKILLed box is ``-9`` - so a constant here would make one failure look like two different
         ones depending on which path served it. That is the divergence prewarming must not introduce, and
         the parity suite caught it: cold timeouts reported ``-9`` while warm ones reported ``-1``."""
-        return self._rc if isinstance(self._rc, int) else -1
+        rc = self._rc if isinstance(self._rc, int) else -1
+        # 128 + N for a signal death, the same shape the cold path now reports. The parity suite
+        # caught this twice: cold `-9` against warm `-1`, and then cold `137` against warm `-9`
+        # when only the cold path was converted. That is why the conversion is in both places.
+        return 128 + (-rc) if rc < 0 else rc
 
     def sweep(self) -> None:
         """The bookkeeping after the workload is dead: our pipes, the started-fd and the private env

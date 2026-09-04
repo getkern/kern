@@ -3629,6 +3629,24 @@ fn drop_dangerous_caps(spec: &CapSpec) -> Result<(), Error> {
     Ok(())
 }
 
+/// The same shed, keeping SEVERAL descriptors instead of one.
+///
+/// The egress pump needs two: the pipe it reads the box pid from, and the pipe it answers its
+/// readiness on. Keeping only one of them would either leave it unable to be told which box to join,
+/// or unable to report that it is listening, and the second failure is silent by construction: the
+/// reader would wait on a pipe whose only writer had been closed underneath it.
+///
+/// `keep` is expected to be tiny (two entries today), so the linear scan per fd costs nothing next to
+/// the syscalls; correctness here is worth more than one `close_range` call. Best-effort like the
+/// single-fd version: closing an unopened fd is a harmless EBADF.
+pub fn shed_inherited_fds_keeping(keep: &[i32]) {
+    for fd in 3..1024 {
+        if !keep.contains(&fd) {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 /// After `fork()`, close every inherited fd `>= 3` except `keep` (pass `-1` to keep none). Two callers
 /// need it: a long-lived helper child (a `-p` forwarder, a health-checker) sheds the parent's fds -
 /// most importantly a detached box's readiness-pipe write end, whose lingering copy would stop the

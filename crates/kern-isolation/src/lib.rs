@@ -142,8 +142,8 @@ pub use real::keep_waiting_through_signals;
 pub use real::PhaseTimer;
 pub use real::{
     default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
-    set_cpu_affinity, shed_inherited_fds, sub_range, trusted_helper, username, CapSpec,
-    OverlayDirs, RealMounts, SandboxSpec, UidRange, VdiskMount, Volume,
+    set_cpu_affinity, shed_inherited_fds, shed_inherited_fds_keeping, sub_range, trusted_helper,
+    username, CapSpec, OverlayDirs, RealMounts, SandboxSpec, UidRange, VdiskMount, Volume,
 };
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};

@@ -13,11 +13,37 @@ is in the git history.
 
 ## Unreleased
 
-Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.38** is on PyPI
+Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.39** is on PyPI
 and npm, together with the `integrations/pi` extension that now requires it. The **runtime** has
 changed too, so this one does need a tag: two mount-posture fixes in `kern-isolation`, and one new
 `kern box` flag. The CLI change is additive (`--shm-size`), which the stability policy above allows on
 a patch; the snapshot in `crates/kern-cli/tests/cli-surface.snapshot` was regenerated for it.
+
+### Fixed (both found by an external review of 0.1.38)
+
+- **`--egress-allow` could leave a box with NO outbound access and say nothing.** The in-box pump joins
+  the box's netns and listens on `127.0.0.1:<port>`; when that bind failed it printed one line and
+  exited, and nobody read its exit. The box started anyway with `http_proxy` pointing at a dead port,
+  so every request, including to the domains the caller had explicitly allowed, failed with
+  `Connection refused` naming neither the cause nor the flag. Reported from a host where the bind
+  returned `EADDRNOTAVAIL`.
+
+  The pump now reports readiness over a pipe: one byte once it is listening, nothing on failure, where
+  its exit closes the pipe and the launcher reads EOF. The launcher waits for that byte, SIGKILLs PID 1
+  before the workload can exec, and refuses the box with a message that names `--egress-allow`.
+  Fail-closed either way; what changes is that the caller is told which of the two happened. Verified
+  by sabotaging the pump: the box exits 1 and the workload never runs, while a working host still
+  fetches an allowed domain, gets 403 on a disallowed one, and has no DNS at all without the flag.
+
+- **The two bindings reported one event with two numbers.** A timeout gave `exit_code = -9` in Python
+  (the `subprocess` convention) and `137` in Node, so a caller branching on `137` saw the timeout in
+  one binding and missed it in the other. Python now reports `128 + N`, which is what a shell, kern's
+  own CLI, docker and the Node binding all report. Ordinary exit codes pass through untouched.
+
+  The conversion had to go in TWO places, and the existing parity suite is what said so: converting
+  only the cold path left the prewarmed one at `-9`, and
+  `test_prewarm_faults_carry_the_same_type_and_exit_status_as_the_cold_path` failed on
+  `('timeout', 137) != ('timeout', -9)`. That test had already caught this shape once before.
 
 ### Fixed (runtime, found by auditing what else reads the cgroup names)
 

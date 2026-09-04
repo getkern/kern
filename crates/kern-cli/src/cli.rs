@@ -308,6 +308,9 @@ pub enum Command {
         read_fd: i32,
         box_port: u16,
         sock: String,
+        /// Write end of the readiness pipe: the pump writes one byte once it is listening inside
+        /// the box. `-1` when the launcher passed none, which is how an older launcher behaves.
+        ready_fd: i32,
     },
     /// `kern search <query> [--json]`: search Docker Hub for images.
     Search {
@@ -680,6 +683,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             read_fd: rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1),
             box_port: rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
             sock: rest.get(3).map(|s| s.to_string()).unwrap_or_default(),
+            // `-1` when absent: an older launcher spawning a newer pump is not waiting for
+            // the byte, so the pump skips it and the pair degrades to the old behaviour.
+            ready_fd: rest.get(4).and_then(|s| s.parse().ok()).unwrap_or(-1),
         },
         // `build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image.
         Some("build") => parse_build(&rest)?,
@@ -3078,7 +3084,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             read_fd,
             box_port,
             sock,
-        } => crate::egress::pump_reexec(read_fd, box_port, &sock),
+            ready_fd,
+        } => crate::egress::pump_reexec(read_fd, box_port, &sock, ready_fd),
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images { json } => commands::images(json),
         Command::Rmi { images } => commands::image_rm(&images),
