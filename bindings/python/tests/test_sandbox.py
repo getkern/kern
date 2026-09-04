@@ -1314,10 +1314,24 @@ def test_deps_readonly_blocks_cross_run_poisoning():
 
 
 def test_deps_readonly_is_the_default():
-    """The DEFAULT, asserted on the constructor rather than on behaviour, because the whole point of
-    this change is which value a caller who passes nothing gets."""
-    assert Sandbox().deps_readonly is True
-    assert Sandbox(deps_readonly=False).deps_readonly is False  # still an opt-out
+    """The DEFAULT, asserted on the declared field rather than on a constructed object, because the
+    whole point of this change is which value a caller who passes nothing gets.
+
+    READ FROM THE DATACLASS, not from `Sandbox()`. The first version constructed one, which resolves
+    the `kern` binary and raises `SandboxError` where it is absent: green here and RED in CI's
+    `python binding` job, which deliberately installs no kern. This repository has made that exact
+    mistake before, with four SDK tests that needed `@integration`. Marking this one `@integration`
+    would have hidden it instead, and the default is precisely the thing worth checking on a machine
+    with nothing installed.
+    """
+    import dataclasses
+
+    declared = {f.name: f.default for f in dataclasses.fields(Sandbox)}
+    assert declared["deps_readonly"] is True
+    # And the field is still a knob, not a constant: the opt-out has to remain expressible.
+    import inspect
+
+    assert inspect.signature(Sandbox).parameters["deps_readonly"].default is True
 
 
 @integration

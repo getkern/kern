@@ -7,8 +7,8 @@ logo**, which are *not* covered by the code license.
 ## The name and the logo
 
 **"kern"** and the kern logo identify this project. `getkern.dev` is its official site and
-`github.com/getkern/kern` its official source, and the name and the logo have been in continuous
-public use for this project since **18 July 2026**. Rights arising from that use are reserved.
+`github.com/getkern/kern` its official source. The name and the logo have been in continuous use for
+this project, and rights arising from that use are reserved.
 
 This page exists now rather than the day it is first needed, because a policy that shows up at the
 moment of a dispute is worth less than one that was always here.

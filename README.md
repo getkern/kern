@@ -191,8 +191,21 @@ runs the agent where you are and the sandbox where the board is. Measured on loo
 handshake is paid once per session and the marginal cost per call is 15 ms.
 [docs/MCP.md](docs/MCP.md) has the tools, every `KERN_MCP_*` variable, and what the remote form costs.
 
+**Prewarming, when the first millisecond is the one a user feels.** `prewarm=N` keeps N boxes started
+in advance, each holding a booted interpreter that has run nothing, and the refill happens on a worker
+thread while the agent thinks. Measured on `python:3.12-slim`: **14.2 ms p50 by default, 0.8 ms with
+`prewarm=4`**, and 30.9 ms against 0.9 for the first call. Each prewarmed box still serves ONE call and
+is thrown away, so the isolation is unchanged; only the moment of creation moves.
+
+**pi's coding tools, in a box.** [integrations/pi](integrations/pi/) routes
+[pi](https://github.com/earendil-works/pi)'s built-in `bash`, `read`, `write`, `edit`, `ls`, `grep` and
+`find` through the Node SDK into a kern box, with your working directory at `/workspace` so edits write
+through and nothing else survives. pi's default posture is no sandbox at all. The two halves are not
+confined by the same thing and its README says which is which: `bash` runs inside the box, while `read`
+and the staging half of `write` are host calls guarded by `O_NOFOLLOW` and a `/proc/self/fd` check.
+
 Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md) ·
-[bindings/node/README.md](bindings/node/README.md).
+[bindings/node/README.md](bindings/node/README.md) · [integrations/pi/](integrations/pi/).
 
 ## Stacks
 

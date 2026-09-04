@@ -13,11 +13,28 @@ is in the git history.
 
 ## Unreleased
 
-Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.36** is on PyPI
+Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.37** is on PyPI
 and npm, together with the `integrations/pi` extension that now requires it. The **runtime** has
 changed too, so this one does need a tag: two mount-posture fixes in `kern-isolation`, and one new
 `kern box` flag. The CLI change is additive (`--shm-size`), which the stability policy above allows on
 a patch; the snapshot in `crates/kern-cli/tests/cli-surface.snapshot` was regenerated for it.
+
+### Fixed (SDK, shipped and corrected)
+
+- **`kern-sandbox` 0.1.36 on npm could not be installed at all, and 0.1.37 is the correction.** Its
+  `package.json` declared `"kern-sandbox": "file:../../../../../../tmp/kern-sandbox-0.1.36.tgz"`, a
+  dependency on ITSELF via a path that exists on no machine but the one that published it, so
+  `npm install kern-sandbox@0.1.36` failed with `ENOENT`. Reproduced from a clean directory before
+  correcting it.
+
+  The cause is mechanical and worth naming: testing the pi extension involved `npm install <tarball>`
+  inside `bindings/node`, which rewrote `package.json` as a side effect, and `git add -A` plus
+  `npm publish` carried it out. The PyPI package of the same version is unaffected (it declares only
+  its two optional extras, and installs and imports cleanly), which is why version parity between the
+  two registries is checked by INSTALLING from each rather than by reading the version number.
+
+  0.1.36 is deprecated on npm with a message naming 0.1.37. It cannot be unpublished without breaking
+  anyone who already pinned it, and deprecation is what npm provides for exactly this.
 
 ### Fixed (runtime)
 

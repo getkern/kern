@@ -113,6 +113,47 @@ with kern.Sandbox() as sbx, sbx.kernel() as k:
     print(r.results[0].text)           # 499999500000
 ```
 
+## Prewarming: a box ready before the call arrives
+
+`prewarm=N` keeps N boxes started in advance, each holding a booted interpreter that has run nothing.
+A `run_code` then claims one instead of paying for a box start plus a CPython boot. Measured on this
+machine, `python:3.12-slim`, six calls each:
+
+| | first call | p50 |
+|---|---:|---:|
+| default | 30.9 ms | 14.2 ms |
+| `prewarm=4` | 0.9 ms | **0.8 ms** |
+
+The refill happens on a worker thread while your agent thinks, so it is off the caller's clock. That
+also says when it buys nothing: if calls arrive faster than the pool refills, the pool empties and you
+are back to the default cost. N is the burst you want covered, not a throughput setting.
+
+Each prewarmed box serves ONE call and is thrown away, so the isolation is exactly what it was: a
+fresh box per call, network off, the same caps. What changes is when the box was created, not how many
+calls share it. That is the difference from `kernel()`, which deliberately shares one process across
+cells and says so.
+
+```python
+with kern.Sandbox(image="python:3.12-slim", prewarm=4) as sbx:
+    r = sbx.run_code("print(1)")     # served from the pool
+```
+
+The pool key includes the image, the caps and the profiles, so a session with different settings never
+receives a box built for another one.
+
+## Run pi's coding tools in a box
+
+[`integrations/pi`](https://github.com/getkern/kern/tree/main/integrations/pi) is an extension for
+[pi](https://github.com/earendil-works/pi) that routes its built-in `bash`, `read`, `write`, `edit`,
+`ls`, `grep` and `find` tools through this SDK into a kern box. Your working directory is mounted at
+`/workspace`, so edits write through to the host and everything else a command touches dies with the
+box. pi's default posture is no sandbox at all: it runs as the user who launched it.
+
+The two halves are not confined by the same thing, and the extension's README states which is which:
+`bash` runs INSIDE the box (namespaces, seccomp allowlist, cgroup caps), while `read` and the staging
+half of `write` are host filesystem calls guarded by this SDK's `O_NOFOLLOW` plus the `/proc/self/fd`
+containment check. Needs Linux, the `kern` binary, and Node 22 or newer.
+
 ## Charts and rich results, without a Jupyter kernel
 
 `run_code` captures mime-typed values into `result.results` the way a notebook cell does, with no
@@ -218,8 +259,10 @@ same 200 MiB to `/tmp` returns ENOSPC and the box lives.
 `/dev/shm` is the one this SDK does not control: it is present in every box, it is a tmpfs with **no
 size at all** (measured at 15.6 GB, half of host RAM), and `tmpfs={"/dev/shm": ...}` is refused by
 kern because it would shadow the hardened `/dev`. It is charged to `memory_mb` like any tmpfs, so the
-memory cap is the only thing bounding it. Docker sizes this with `--shm-size`; kern has no equivalent
-yet. Its apparent size is a fact about the HOST rather than about your box: no `size=` means the
+memory cap is the only thing bounding it. **The runtime now takes `kern box --shm-size SIZE`**, and it
+reports the size the box actually has rather than the host's; this binding does not expose it yet, so
+from here the cap is still the only bound. Its apparent size is a fact about the HOST rather than
+about your box: no `size=` means the
 kernel's tmpfs default, half of host RAM, so the same code sees 2 GB on a 4 GB board and 64 GB on a
 128 GB server while `memory_mb` says 128. `mounts={host_dir: "/dev/shm"}` IS accepted and STACKS on top
 of kern's own mount rather than replacing it (the last mount is the one that resolves), and it is a real workaround rather than only an access fact: measured through the

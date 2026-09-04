@@ -249,6 +249,44 @@ explicit flags that **override** a profile's values (and the `memoryMb` default 
 `memory`, so pass `memoryMb: null` to let the profile apply). The **MCP server** (`kern-mcp`, for Claude
 Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-sandbox`).
 
+## Prewarming: a box ready before the call arrives
+
+`prewarm: N` keeps N boxes started in advance, each holding a booted interpreter that has run nothing,
+so a `runCode` claims one instead of paying for a box start plus an interpreter boot. Measured on
+`python:3.12-slim`, six calls each: **14.2 ms p50 by default against 0.8 ms with `prewarm: 4`**, and
+30.9 ms against 0.9 for the first call.
+
+The refill runs while your agent thinks, so it is off the caller's clock. That also says when it buys
+nothing: if calls arrive faster than the pool refills, the pool empties and you are back to the
+default cost. N is the burst you want covered, not a throughput knob.
+
+Each prewarmed box serves ONE call and is discarded, so the isolation is unchanged: a fresh box per
+call, network off, the same caps. Only the moment of creation moves. That is the difference from
+`kernel()`, which deliberately shares one process across cells.
+
+```js
+await withSandbox({ image: "python:3.12-slim", prewarm: 4 }, async (sbx) => {
+  const r = await sbx.runCode("print(1)");   // served from the pool
+});
+```
+
+The pool key includes the image, the caps and the profiles, so a session with different settings never
+receives a box built for another one.
+
+## Run pi's coding tools in a box
+
+[`integrations/pi`](https://github.com/getkern/kern/tree/main/integrations/pi) is an extension for
+[pi](https://github.com/earendil-works/pi) built on THIS binding: it routes pi's built-in `bash`,
+`read`, `write`, `edit`, `ls`, `grep` and `find` tools into a kern box. The working directory is
+mounted at `/workspace`, so edits write through to the host and everything else a command touches dies
+with the box. pi's default posture is no sandbox: it runs as the user who launched it.
+
+The two halves are not confined by the same thing, and the extension's README says which is which:
+`bash` runs INSIDE the box (namespaces, seccomp allowlist, cgroup caps), while `read` and the staging
+half of `write` are host filesystem calls guarded by this binding's `O_NOFOLLOW` and its
+`/proc/self/fd` containment check. Needs Linux, the `kern` binary, and **Node 22 or newer**: pi's own
+package manager imports `globSync` from `node:fs`, which landed in 22.
+
 ## Charts, rich results, live output, and checkpoints
 
 **Rich results (the "code interpreter" pattern).** `runCode` runs Python by default, and like a
